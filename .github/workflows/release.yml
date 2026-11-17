@@ -1,4 +1,4 @@
-name: Build Orbit (Multi-Host Binaries + Android APK + iOS IPA)
+name: Build & Release Orbit (CLI + macOS App + Android APK + iOS IPA)
 
 on:
   push:
@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   rust-quality-and-e2e:
@@ -22,7 +25,7 @@ jobs:
       - run: cargo test --workspace
 
   build-host-binaries:
-    name: Build Single Binary (Linux x64/ARM64 & macOS Apple Silicon)
+    name: Build CLI & Daemon (${{ matrix.artifact }})
     needs: rust-quality-and-e2e
     strategy:
       fail-fast: false
@@ -30,13 +33,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: orbit-linux-x86_64
+            artifact: orbit-cli-linux-x64
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            artifact: orbit-linux-aarch64
+            artifact: orbit-cli-linux-arm64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: orbit-macos-aarch64
+            artifact: orbit-cli-macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -48,10 +51,48 @@ jobs:
         run: |
           cargo build --release -p orbit-cli --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/release/orbit ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
+
+  build-macos-desktop:
+    name: Build macOS Desktop App (Orbit.dmg)
+    needs: rust-quality-and-e2e
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build liborbit_ffi.a for macOS Apple Silicon
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          cargo build --release -p orbit-ffi --target aarch64-apple-darwin
+          mkdir -p app/macos/RustFrameworks
+          cp target/aarch64-apple-darwin/release/liborbit_ffi.a app/macos/RustFrameworks/
+      - name: Build Orbit.app & Package Orbit-macOS-AppleSilicon.dmg
+        working-directory: app
+        run: |
+          flutter config --enable-macos-desktop
+          flutter pub get
+          flutter build macos --release
+          nm -gU build/macos/Build/Products/Release/Orbit.app/Contents/MacOS/Orbit | grep orbit_ffi_noise_client_init
+          codesign --force --deep --sign - build/macos/Build/Products/Release/Orbit.app
+          mkdir -p dmg-staging
+          cp -R build/macos/Build/Products/Release/Orbit.app dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+          hdiutil create -volname "Orbit" -srcfolder dmg-staging -ov -format UDZO Orbit-macOS-AppleSilicon.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Orbit-macOS-AppleSilicon.dmg
+          path: app/Orbit-macOS-AppleSilicon.dmg
 
   build-android-apk:
     name: Build Android APK (ARM64 + Rust Native FFI)
@@ -82,13 +123,14 @@ jobs:
           flutter analyze
           flutter test
           flutter build apk --release --target-platform android-arm64 || (sleep 5 && flutter build apk --release --target-platform android-arm64)
+          cp build/app/outputs/flutter-apk/app-release.apk Orbit-Android-arm64.apk
       - uses: actions/upload-artifact@v4
         with:
-          name: orbit-android-arm64-apk
-          path: app/build/app/outputs/flutter-apk/app-release.apk
+          name: Orbit-Android-arm64.apk
+          path: app/Orbit-Android-arm64.apk
 
   build-ios-ipa:
-    name: Build iOS App (.ipa for TestFlight / AltStore / SideStore)
+    name: Build iOS App (.ipa for Sideloading)
     needs: rust-quality-and-e2e
     runs-on: macos-latest
     steps:
@@ -115,8 +157,55 @@ jobs:
           nm -gU build/ios/iphoneos/Runner.app/Runner | grep orbit_ffi_noise_client_init
           mkdir -p Payload
           cp -r build/ios/iphoneos/Runner.app Payload/
-          zip -r -9 Orbit-iOS-unsigned.ipa Payload
+          zip -r -9 Orbit-iOS-sideload.ipa Payload
       - uses: actions/upload-artifact@v4
         with:
-          name: orbit-ios-ipa
-          path: app/Orbit-iOS-unsigned.ipa
+          name: Orbit-iOS-sideload.ipa
+          path: app/Orbit-iOS-sideload.ipa
+
+  publish-github-release:
+    name: Publish GitHub Release Assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-host-binaries
+      - build-macos-desktop
+      - build-android-apk
+      - build-ios-ipa
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all built release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-dist
+          merge-multiple: true
+      - name: Compute SHA-256 Checksums
+        working-directory: release-dist
+        run: |
+          chmod +x orbit-cli-*
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            ## Downloads (即下即用安装包)
+
+            | 平台 / 用途 | 下载文件 | 安装与使用说明 |
+            | :--- | :--- | :--- |
+            | **macOS 桌面端 App** (Apple Silicon) | `Orbit-macOS-AppleSilicon.dmg` | 双击打开拖入 `Applications`。首次打开未公证包如遇拦截，执行一次：`xattr -cr /Applications/Orbit.app` |
+            | **macOS 守护进程 & CLI** (Mac mini) | `orbit-cli-macos-arm64` | `chmod +x orbit-cli-macos-arm64 && sudo mv orbit-cli-macos-arm64 /usr/local/bin/orbit` |
+            | **Linux ARM64 守护进程 & Relay** | `orbit-cli-linux-arm64` | `chmod +x orbit-cli-linux-arm64 && mv orbit-cli-linux-arm64 ~/.local/bin/orbit` |
+            | **Linux x86_64 守护进程 & Relay** | `orbit-cli-linux-x64` | `chmod +x orbit-cli-linux-x64 && mv orbit-cli-linux-x64 ~/.local/bin/orbit` |
+            | **Android 手机客户端** | `Orbit-Android-arm64.apk` | 手机直接点击安装 |
+            | **iOS 侧载安装包** (iPhone / iPad) | `Orbit-iOS-sideload.ipa` | 可通过 AltStore / SideStore / Sideloadly 安装，或使用仓库内置 `Publish to TestFlight` 工作流推送至官方 TestFlight |
+          files: |
+            release-dist/Orbit-macOS-AppleSilicon.dmg
+            release-dist/orbit-cli-macos-arm64
+            release-dist/orbit-cli-linux-arm64
+            release-dist/orbit-cli-linux-x64
+            release-dist/Orbit-Android-arm64.apk
+            release-dist/Orbit-iOS-sideload.ipa
+            release-dist/SHA256SUMS.txt

@@ -100,6 +100,8 @@ jobs:
         with:
           targets: aarch64-apple-ios
       - name: Build liborbit_ffi.a for iOS ARM64
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "13.0"
         run: |
           cargo build --release -p orbit-ffi --target aarch64-apple-ios
           mkdir -p app/ios/RustFrameworks

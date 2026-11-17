@@ -52,6 +52,7 @@ class HostProfile {
     required this.daemonPubkeyB64,
     required this.directEndpoints,
     this.relayUrl,
+    this.lastConnectionError,
     this.routeState = HostRouteState.disconnected,
     this.availableProviders = const [
       ProviderKind.antigravity,
@@ -64,7 +65,8 @@ class HostProfile {
   String hostname;
   final String daemonPubkeyB64;
   final List<String> directEndpoints;
-  final String? relayUrl;
+  String? relayUrl;
+  String? lastConnectionError;
   HostRouteState routeState;
   List<ProviderKind> availableProviders;
 

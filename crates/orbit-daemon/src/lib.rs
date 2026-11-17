@@ -27,6 +27,7 @@ use orbit_crypto::{DaemonHandshake, HostIdentityKeypair, PairingOffer};
 use orbit_protocol::{HostInfo, PROTOCOL_VERSION, TerminalBinaryFrame, WireMessage};
 use orbit_providers::{discover_installed_providers, probe_all_provider_quotas};
 use orbit_store::OrbitStore;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungMsg};
 use tracing::{info, warn};
@@ -37,6 +38,91 @@ use crate::manager::{AgentOrchestrator, DaemonBroadcast, PtyBroadcast};
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
 const E2EE_FRAME_WIRE: u8 = 0x00;
 const E2EE_FRAME_TERMINAL: u8 = 0x01;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonPersistedConfig {
+    pub listen_addr: Option<SocketAddr>,
+    pub relay_url: Option<String>,
+}
+
+impl DaemonPersistedConfig {
+    pub fn load(home_dir: &Path) -> Self {
+        std::fs::read_to_string(home_dir.join("config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, home_dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(home_dir)?;
+        let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(home_dir.join("config.json"), raw)
+    }
+}
+
+/// Auto-discover non-loopback LAN / Tailscale IPv4 WebSocket endpoints on the current host.
+pub fn discover_lan_ws_endpoints(port: u16) -> Vec<String> {
+    let mut ips = Vec::new();
+
+    // 1. Primary outbound route interface IP via UDP connect trick (no packets sent!)
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
+        && sock.connect("8.8.8.8:80").is_ok()
+        && let Ok(local) = sock.local_addr()
+        && !local.ip().is_loopback()
+    {
+        ips.push(local.ip().to_string());
+    }
+
+    // 2. Also scan `ip -4 -o addr show` (Linux) or `ifconfig` (macOS) for Tailscale (`100.x`) / secondary LANs
+    if let Ok(out) = std::process::Command::new("ip")
+        .args(["-4", "-o", "addr", "show"])
+        .output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let iface = parts[1];
+                if iface == "lo" || iface.starts_with("docker") || iface.starts_with("br-") {
+                    continue;
+                }
+                if let Some(ip_cidr) = parts.iter().skip(2).find(|p| p.contains('/'))
+                    && let Some(ip) = ip_cidr.split('/').next()
+                    && !ip.starts_with("127.")
+                    && !ip.starts_with("198.18.")
+                    && !ips.contains(&ip.to_string())
+                {
+                    ips.push(ip.to_string());
+                }
+            }
+        }
+    } else if let Ok(out) = std::process::Command::new("ifconfig").output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("inet ")
+                && let Some(ip) = rest.split_whitespace().next()
+                && !ip.starts_with("127.")
+                && !ip.starts_with("169.254.")
+                && !ip.starts_with("198.18.")
+                && !ips.contains(&ip.to_string())
+            {
+                ips.push(ip.to_string());
+            }
+        }
+    }
+
+    if ips.is_empty() {
+        vec![format!("ws://127.0.0.1:{port}/ws")]
+    } else {
+        ips.into_iter()
+            .map(|ip| format!("ws://{ip}:{port}/ws"))
+            .collect()
+    }
+}
 
 pub struct DaemonConfig {
     pub home_dir: PathBuf,
@@ -117,25 +203,32 @@ impl DaemonRuntime {
 }
 
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
+    let persisted = DaemonPersistedConfig::load(&config.home_dir);
+    let effective_relay = config.relay_url.or(persisted.relay_url);
     let runtime = DaemonRuntime::bootstrap(&config.home_dir).await?;
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     let bound_addr = listener.local_addr()?;
 
-    let direct_ws = format!("ws://{bound_addr}/ws");
-    let offer = runtime.build_pairing_offer(vec![direct_ws], config.relay_url.clone());
+    let direct_eps = if bound_addr.ip().is_unspecified() {
+        discover_lan_ws_endpoints(bound_addr.port())
+    } else {
+        vec![format!("ws://{bound_addr}/ws")]
+    };
+    let offer = runtime.build_pairing_offer(direct_eps, effective_relay.clone());
 
     info!(
         host_id = %runtime.host_info.host_id,
         hostname = %runtime.host_info.hostname,
         providers = ?runtime.host_info.available_providers,
         listen = %bound_addr,
+        relay = ?effective_relay,
         "Orbit Daemon ready"
     );
     if let Ok(uri) = offer.to_qr_uri() {
         info!(pairing_uri = %uri, "Scan or import this Multi-Host pairing URI on Orbit Mobile");
     }
 
-    if let Some(relay_url) = config.relay_url {
+    if let Some(relay_url) = effective_relay {
         let rt_relay = runtime.clone();
         tokio::spawn(async move {
             outbound_relay_loop(rt_relay, relay_url).await;

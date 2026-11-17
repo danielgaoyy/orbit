@@ -24,38 +24,37 @@
 
 ## 快速上手（多机部署指南）
 
-### 1. 编译与安装单二进制
+### 1. 一键安装单二进制（Linux x64/ARM64 & macOS Apple Silicon）
 
 ```bash
-cargo build --release -p orbit-cli -p orbit-ffi
-mkdir -p ~/.local/bin
-cp target/release/orbit ~/.local/bin/orbit
+curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh
 
-# 一键体检本机身份公钥与已安装的 agy / codex / claude
+# 一键体检本机身份公钥、后台守护状态与已安装的 agy / codex / claude
 orbit doctor
 
 # 一键并发查询三大 CLI 实时 5h / 周配额与剩余 Credits
 orbit quotas
 ```
 
-### 2. 在你的 AWS 开发机上启动私有零知识中继（可选，供内网 Mac mini 穿透）
+### 2. 在你的云开发机 / VPS 上一键拉起私有零知识中继（外网远程穿透）
 
 ```bash
-# 仅允许你自己的机器公钥接入，陌生人 0 字节可蹭
-orbit relay \
-  --listen 0.0.0.0:7878 \
-  --allow-pubkey <你的工作站公钥> \
-  --allow-pubkey <你的MacMini公钥>
+# 自动写入 ~/.orbit/relay.json 并注册为后台常驻服务（仅放行你的机器公钥，陌生人 403 零消耗）
+orbit relay up --port 7878 --allow-pubkey <你的工作站公钥>
+
+# 后续新增机器（如家里的 Mac mini）时，随时追加授权并热重载：
+orbit relay allow <你的MacMini公钥>
 ```
 
-### 3. 在工作站 / Devbox / Mac mini 上启动 Daemon 并生成手机配对码
+### 3. 在工作站 / Mac mini 上一键挂载中继并生成配对码
 
 ```bash
-# 启动守护进程（若在 NAT 内网可附带 --relay ws://<你的AWS地址>:7878）
-orbit daemon --listen 0.0.0.0:6868 --relay ws://<你的AWS地址>:7878
+# 自动执行 WebSocket 连通性与白名单预检、持久化配置、重启后台 Daemon，并直接输出最新配对码！
+orbit use-relay <你的云服务器IP>:7878
 
-# 打印手机扫码/导入的 Multi-Host 配对 URI
-orbit pair --endpoint ws://<局域网或Tailscale_IP>:6868/ws --relay ws://<你的AWS地址>:7878
+# 若仅在局域网 / Tailscale 内直连使用：
+orbit daemon up
+orbit pair
 ```
 
 ### 4. 命令行直接驱动三大 CLI

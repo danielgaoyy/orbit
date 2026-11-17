@@ -1,3 +1,5 @@
+mod service;
+
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -6,14 +8,21 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use orbit_client_core::{ClientInboundEvent, connect_direct};
-use orbit_daemon::{DaemonConfig, DaemonRuntime, run_daemon};
+use orbit_daemon::{
+    DaemonConfig, DaemonPersistedConfig, DaemonRuntime, discover_lan_ws_endpoints, run_daemon,
+};
 use orbit_protocol::{
     AgentStatus, ProviderKind, SessionMode, TimelinePayload, ToolCallDetail, WireMessage,
 };
 use orbit_providers::{discover_installed_providers, probe_all_provider_quotas};
-use orbit_relay::{RelayConfig, run_relay};
+use orbit_relay::{RelayConfig, RelayPersistedConfig, run_relay};
 use orbit_shim::{ShimSpawnSpec, run_shim};
 use uuid::Uuid;
+
+use crate::service::{
+    RelayProbeOutcome, ServiceRole, check_local_health, default_daemon_listen, detect_public_ipv4,
+    install_and_start_service, normalize_relay_url, preflight_probe_relay, stop_service,
+};
 
 #[derive(Parser)]
 #[command(
@@ -69,36 +78,97 @@ impl From<CliMode> for SessionMode {
 }
 
 #[derive(Subcommand)]
+enum DaemonAction {
+    /// Install & start (or restart) `orbit daemon` in the background (systemd / launchd / daemon).
+    Up {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+        #[arg(long)]
+        relay: Option<String>,
+    },
+    /// Show background `orbit daemon` status, bound port, and attached Relay URL.
+    Status,
+    /// Restart background `orbit daemon` cleanly (running `orbit shim` sessions survive uninterrupted).
+    Restart,
+    /// Stop and disable background `orbit daemon`.
+    Down,
+}
+
+#[derive(Subcommand)]
+enum RelayAction {
+    /// Install & start (or restart) the `< 6MB` zero-knowledge E2EE Relay in the background.
+    Up {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+        /// Authorize one or more host public keys (merged into `~/.orbit/relay.json`).
+        #[arg(long = "allow-pubkey")]
+        allow_pubkeys: Vec<String>,
+        /// Replace the existing allowlist instead of merging.
+        #[arg(long)]
+        replace_allowlist: bool,
+        /// Optional public URL override for printed onboarding instructions.
+        #[arg(long)]
+        public_url: Option<String>,
+    },
+    /// Add host public key(s) to the Relay allowlist (`~/.orbit/relay.json`) and reload Relay immediately.
+    Allow {
+        #[arg(required = true)]
+        pubkeys: Vec<String>,
+    },
+    /// Show Relay health, bound port, and authorized public keys.
+    Status,
+    /// Stop and disable background `orbit relay`.
+    Down,
+}
+
+#[derive(Subcommand)]
 enum Commands {
-    /// Inspect current host environment, identity keypair, and installed AI CLIs (`agy`, `codex`, `claude`).
+    /// Inspect current host environment, identity keypair, Relay attachment, and installed AI CLIs.
     Doctor,
 
     /// Fetch live 5-hour / weekly usage quotas & remaining credits across Antigravity, Codex, and Claude Code.
     Quotas,
 
-    /// Print a Multi-Host QR pairing URI for mobile onboarding.
+    /// Attach (or detach with `--clear`) this machine to your E2EE Relay, verify connectivity, restart daemon, and print a fresh Pairing Code.
+    UseRelay {
+        /// Relay address (e.g. `203.0.113.10:7878`, `ws://203.0.113.10:7878`, or `wss://relay.example.com`).
+        relay_url: Option<String>,
+        /// Detach Relay and revert this host to LAN/Tailscale direct-only mode.
+        #[arg(long)]
+        clear: bool,
+    },
+
+    /// Print a Multi-Host QR pairing URI (auto-detects LAN/Tailscale IPs & persisted Relay URL).
     Pair {
-        #[arg(long = "endpoint", default_value = "ws://127.0.0.1:6868/ws")]
+        #[arg(long = "endpoint")]
         endpoints: Vec<String>,
         #[arg(long)]
         relay: Option<String>,
     },
 
-    /// Start the host-local Orbit Daemon.
+    /// Run or manage the host-local Orbit Daemon (`orbit daemon up | status | restart | down`).
     Daemon {
-        #[arg(long, default_value = "127.0.0.1:6868")]
-        listen: SocketAddr,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
         #[arg(long, env = "ORBIT_RELAY_URL")]
         relay: Option<String>,
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
     },
 
-    /// Start the `< 5MB` zero-knowledge E2EE Relay server (supports `--allow-pubkey` allowlisting).
+    /// Run or manage the `< 6MB` zero-knowledge E2EE Relay (`orbit relay up | allow | status | down`).
     Relay {
-        #[arg(long, default_value = "0.0.0.0:7878")]
-        listen: SocketAddr,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
         /// Restrict relay access strictly to your own Daemon public key(s). Repeatable.
         #[arg(long = "allow-pubkey")]
         allow_pubkeys: Vec<String>,
+        #[command(subcommand)]
+        action: Option<RelayAction>,
     },
 
     /// List managed agents on an Orbit Daemon.
@@ -173,6 +243,10 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Doctor => {
             let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
+            let persisted = DaemonPersistedConfig::load(&home_dir);
+            let listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+            let daemon_live = check_local_health(listen.port()).await;
+
             println!("=== Orbit Host Diagnostics ===");
             println!("Host ID      : {}", runtime.host_info.host_id);
             println!("Hostname     : {}", runtime.host_info.hostname);
@@ -182,6 +256,22 @@ async fn main() -> anyhow::Result<()> {
             );
             println!("Orbit Home   : {}", home_dir.display());
             println!("Public Key   : {}", runtime.host_info.public_key_b64);
+            println!(
+                "Daemon State : {} (port {})",
+                if daemon_live {
+                    "running"
+                } else {
+                    "stopped (run `orbit daemon up`)"
+                },
+                listen.port()
+            );
+            match &persisted.relay_url {
+                Some(r) => println!("Relay Route  : {r} (Noise NK E2EE)"),
+                None => println!(
+                    "Relay Route  : (not configured — LAN/Tailscale only; run `orbit use-relay <HOST:PORT>`)"
+                ),
+            }
+
             println!("\nDiscovered Coding Agent CLIs:");
             let providers = discover_installed_providers();
             if providers.is_empty() {
@@ -196,7 +286,13 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
+            println!("\nQuick Relay Setup (on your cloud VM / devbox):");
+            println!(
+                "  orbit relay up --allow-pubkey {}",
+                runtime.host_info.public_key_b64
+            );
         }
+
         Commands::Quotas => {
             println!("Probing real-time quotas across installed providers...");
             let snapshots = probe_all_provider_quotas().await;
@@ -224,30 +320,274 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Pair { endpoints, relay } => {
+
+        Commands::UseRelay { relay_url, clear } => {
+            let mut persisted = DaemonPersistedConfig::load(&home_dir);
+            let listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+            persisted.listen_addr = Some(listen);
+
+            if clear {
+                persisted.relay_url = None;
+                persisted.save(&home_dir)?;
+                let mgr = install_and_start_service(ServiceRole::Daemon, &home_dir, listen.port())
+                    .await?;
+                println!("[✓] Detached Relay configuration and restarted daemon via {mgr}.");
+                print_pairing_summary(&home_dir, Vec::new(), None).await?;
+                return Ok(());
+            }
+
+            let raw = relay_url.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Usage: `orbit use-relay <HOST:PORT>` (or `orbit use-relay --clear` to detach)"
+                )
+            })?;
+            let normalized = normalize_relay_url(&raw)?;
             let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
-            let offer = runtime.build_pairing_offer(endpoints, relay);
-            println!("{}", offer.to_qr_uri()?);
+            let pubkey = runtime.keypair.public_key_b64.clone();
+            drop(runtime);
+
+            println!("Probing Relay {normalized} with host pubkey `{pubkey}`...");
+            match preflight_probe_relay(&normalized, &pubkey).await {
+                RelayProbeOutcome::Authorized => {
+                    println!("[✓] Relay reachable & host public key authorized!");
+                }
+                RelayProbeOutcome::Forbidden403 => {
+                    println!(
+                        "[!] Relay is reachable, but rejected this host's public key (HTTP 403 Forbidden)."
+                    );
+                    println!(
+                        "    Run this command on your Relay server to authorize this machine:"
+                    );
+                    println!("      orbit relay allow {pubkey}");
+                    println!(
+                        "    (Saving Relay config now — local daemon will auto-connect within 2s once authorized.)"
+                    );
+                }
+                RelayProbeOutcome::Unreachable(reason) => {
+                    println!("[!] Could not reach {normalized} right now: {reason}");
+                    println!(
+                        "    Ensure `orbit relay up` is running on the server and its TCP port is open in your firewall / Security Group."
+                    );
+                    println!(
+                        "    (Saving Relay config now — local daemon will auto-connect in background as soon as reachable.)"
+                    );
+                }
+            }
+
+            persisted.relay_url = Some(normalized.clone());
+            persisted.save(&home_dir)?;
+
+            let mgr =
+                install_and_start_service(ServiceRole::Daemon, &home_dir, listen.port()).await?;
+            println!("[✓] Orbit Daemon active via {mgr} -> attached to {normalized}");
+            println!(
+                "\nCopy & import this updated Pairing Code in Orbit App (Mac / iOS / Android):"
+            );
+            print_pairing_summary(&home_dir, Vec::new(), Some(normalized)).await?;
         }
-        Commands::Daemon { listen, relay } => {
-            run_daemon(DaemonConfig {
-                home_dir,
-                listen_addr: listen,
-                relay_url: relay,
-            })
-            .await?;
+
+        Commands::Pair { endpoints, relay } => {
+            print_pairing_summary(&home_dir, endpoints, relay).await?;
         }
+
+        Commands::Daemon {
+            listen,
+            relay,
+            action,
+        } => match action {
+            None => {
+                let persisted = DaemonPersistedConfig::load(&home_dir);
+                let effective_listen = listen
+                    .or(persisted.listen_addr)
+                    .unwrap_or_else(default_daemon_listen);
+                let effective_relay = relay.or(persisted.relay_url);
+                run_daemon(DaemonConfig {
+                    home_dir,
+                    listen_addr: effective_listen,
+                    relay_url: effective_relay,
+                })
+                .await?;
+            }
+            Some(DaemonAction::Up {
+                port,
+                listen: sub_listen,
+                relay: sub_relay,
+            }) => {
+                let mut persisted = DaemonPersistedConfig::load(&home_dir);
+                let addr = if let Some(l) = sub_listen.or(listen) {
+                    l
+                } else if let Some(p) = port {
+                    SocketAddr::from(([0, 0, 0, 0], p))
+                } else {
+                    persisted.listen_addr.unwrap_or_else(default_daemon_listen)
+                };
+                persisted.listen_addr = Some(addr);
+                if let Some(r) = sub_relay.or(relay) {
+                    persisted.relay_url = Some(normalize_relay_url(&r)?);
+                }
+                persisted.save(&home_dir)?;
+
+                let mgr =
+                    install_and_start_service(ServiceRole::Daemon, &home_dir, addr.port()).await?;
+                println!("[✓] Orbit Daemon running in background via {mgr}");
+                println!("    Listen : {addr}");
+                println!(
+                    "    Relay  : {}",
+                    persisted
+                        .relay_url
+                        .as_deref()
+                        .unwrap_or("(none — LAN/Tailscale direct)")
+                );
+                println!("\nPairing Code for Orbit App:");
+                print_pairing_summary(&home_dir, Vec::new(), persisted.relay_url).await?;
+            }
+            Some(DaemonAction::Restart) => {
+                let persisted = DaemonPersistedConfig::load(&home_dir);
+                let addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+                let mgr =
+                    install_and_start_service(ServiceRole::Daemon, &home_dir, addr.port()).await?;
+                println!("[✓] Orbit Daemon restarted via {mgr} (existing agent shims preserved).");
+            }
+            Some(DaemonAction::Status) => {
+                let persisted = DaemonPersistedConfig::load(&home_dir);
+                let addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+                let healthy = check_local_health(addr.port()).await;
+                println!(
+                    "Orbit Daemon : {}",
+                    if healthy { "RUNNING" } else { "STOPPED" }
+                );
+                println!("Listen Addr  : {addr}");
+                println!(
+                    "Relay URL    : {}",
+                    persisted.relay_url.as_deref().unwrap_or("(not configured)")
+                );
+            }
+            Some(DaemonAction::Down) => {
+                stop_service(ServiceRole::Daemon, &home_dir)?;
+                println!("[✓] Orbit Daemon stopped.");
+            }
+        },
+
         Commands::Relay {
             listen,
             allow_pubkeys,
-        } => {
-            let allowed: HashSet<String> = allow_pubkeys.into_iter().collect();
-            run_relay(RelayConfig {
-                listen_addr: listen,
-                allowed_pubkeys: Arc::new(allowed),
-            })
-            .await?;
-        }
+            action,
+        } => match action {
+            None => {
+                let persisted = RelayPersistedConfig::load(&home_dir);
+                let effective_listen = listen.unwrap_or(persisted.listen_addr);
+                let mut allowed: HashSet<String> = if allow_pubkeys.is_empty() {
+                    persisted.allowed_pubkeys.into_iter().collect()
+                } else {
+                    allow_pubkeys.into_iter().collect()
+                };
+                allowed.retain(|k| !k.trim().is_empty());
+                run_relay(RelayConfig {
+                    listen_addr: effective_listen,
+                    allowed_pubkeys: Arc::new(allowed),
+                })
+                .await?;
+            }
+            Some(RelayAction::Up {
+                port,
+                listen: sub_listen,
+                allow_pubkeys: sub_keys,
+                replace_allowlist,
+                public_url,
+            }) => {
+                let mut persisted = RelayPersistedConfig::load(&home_dir);
+                if let Some(l) = sub_listen.or(listen) {
+                    persisted.listen_addr = l;
+                } else if let Some(p) = port {
+                    persisted.listen_addr = SocketAddr::from(([0, 0, 0, 0], p));
+                }
+                if replace_allowlist {
+                    persisted.allowed_pubkeys.clear();
+                }
+                for k in allow_pubkeys.into_iter().chain(sub_keys) {
+                    let trimmed = k.trim().to_string();
+                    if !trimmed.is_empty() && !persisted.allowed_pubkeys.contains(&trimmed) {
+                        persisted.allowed_pubkeys.push(trimmed);
+                    }
+                }
+                persisted.save(&home_dir)?;
+
+                let bound_port = persisted.listen_addr.port();
+                let mgr =
+                    install_and_start_service(ServiceRole::Relay, &home_dir, bound_port).await?;
+
+                let advertised_url = match public_url {
+                    Some(u) => normalize_relay_url(&u)?,
+                    None => {
+                        let host_part = detect_public_ipv4()
+                            .await
+                            .unwrap_or_else(|| "<YOUR_SERVER_IP>".to_string());
+                        format!("ws://{host_part}:{bound_port}")
+                    }
+                };
+
+                println!("[✓] Orbit Zero-Knowledge E2EE Relay running in background via {mgr}!");
+                println!("    Listen      : {}", persisted.listen_addr);
+                if persisted.allowed_pubkeys.is_empty() {
+                    println!(
+                        "    Allowlist   : (open — run `orbit relay allow <PUBKEY>` to lock strictly to your hosts)"
+                    );
+                } else {
+                    println!(
+                        "    Allowlist   : {} authorized host pubkey(s) (HTTP 403 to everyone else)",
+                        persisted.allowed_pubkeys.len()
+                    );
+                }
+                println!("    Relay URL   : {advertised_url}");
+                println!(
+                    "\nNext step — run this on each machine (workstation / Mac mini) to attach:"
+                );
+                println!("  orbit use-relay {advertised_url}");
+                println!(
+                    "\n(Tip: Make sure inbound TCP port {bound_port} is open in your cloud firewall / AWS Security Group)"
+                );
+            }
+            Some(RelayAction::Allow { pubkeys }) => {
+                let mut persisted = RelayPersistedConfig::load(&home_dir);
+                let mut added = 0usize;
+                for k in pubkeys {
+                    let trimmed = k.trim().to_string();
+                    if !trimmed.is_empty() && !persisted.allowed_pubkeys.contains(&trimmed) {
+                        persisted.allowed_pubkeys.push(trimmed);
+                        added += 1;
+                    }
+                }
+                persisted.save(&home_dir)?;
+                let mgr = install_and_start_service(
+                    ServiceRole::Relay,
+                    &home_dir,
+                    persisted.listen_addr.port(),
+                )
+                .await?;
+                println!(
+                    "[✓] Authorized {added} new key(s) ({} total in allowlist) and reloaded Relay via {mgr}.",
+                    persisted.allowed_pubkeys.len()
+                );
+            }
+            Some(RelayAction::Status) => {
+                let persisted = RelayPersistedConfig::load(&home_dir);
+                let healthy = check_local_health(persisted.listen_addr.port()).await;
+                println!(
+                    "Orbit Relay  : {}",
+                    if healthy { "RUNNING" } else { "STOPPED" }
+                );
+                println!("Listen Addr  : {}", persisted.listen_addr);
+                println!("Allowed Keys : {}", persisted.allowed_pubkeys.len());
+                for k in &persisted.allowed_pubkeys {
+                    println!("  - {k}");
+                }
+            }
+            Some(RelayAction::Down) => {
+                stop_service(ServiceRole::Relay, &home_dir)?;
+                println!("[✓] Orbit Relay stopped.");
+            }
+        },
+
         Commands::Ls { server } => {
             let client = connect_direct(&server, None).await?;
             let req_id = Uuid::new_v4();
@@ -277,6 +617,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
         Commands::Run {
             provider,
             mode,
@@ -333,6 +674,7 @@ async fn main() -> anyhow::Result<()> {
 
             stream_turn_to_stdout(&client, &mut sub_rx, &agent_id).await?;
         }
+
         Commands::Send {
             agent_id,
             prompt,
@@ -364,6 +706,7 @@ async fn main() -> anyhow::Result<()> {
             }
             stream_turn_to_stdout(&client, &mut sub_rx, &agent_id).await?;
         }
+
         Commands::Logs { agent_id, server } => {
             let client = connect_direct(&server, None).await?;
             let req_id = Uuid::new_v4();
@@ -384,12 +727,48 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
         Commands::Shim { socket, spec_json } => {
             let spec: ShimSpawnSpec = serde_json::from_str(&spec_json)?;
             run_shim(&socket, spec).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn print_pairing_summary(
+    home_dir: &std::path::Path,
+    explicit_endpoints: Vec<String>,
+    explicit_relay: Option<String>,
+) -> anyhow::Result<()> {
+    let persisted = DaemonPersistedConfig::load(home_dir);
+    let port = persisted
+        .listen_addr
+        .unwrap_or_else(default_daemon_listen)
+        .port();
+    let endpoints = if explicit_endpoints.is_empty() {
+        discover_lan_ws_endpoints(port)
+    } else {
+        explicit_endpoints
+    };
+    let relay = match explicit_relay {
+        Some(r) => Some(normalize_relay_url(&r)?),
+        None => persisted.relay_url,
+    };
+
+    let runtime = DaemonRuntime::bootstrap(home_dir).await?;
+    let offer = runtime.build_pairing_offer(endpoints.clone(), relay.clone());
+    eprintln!(
+        "Host `{}` ({}) | Direct: {} | Relay: {}",
+        runtime.host_info.hostname,
+        runtime.host_info.host_id,
+        endpoints.join(", "),
+        relay
+            .as_deref()
+            .unwrap_or("none (LAN only — run `orbit use-relay <HOST:PORT>` for remote)")
+    );
+    println!("{}", offer.to_qr_uri()?);
     Ok(())
 }
 

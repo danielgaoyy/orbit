@@ -1,16 +1,17 @@
-//! Ultra-lightweight (`< 5MB` RSS) zero-knowledge E2EE Relay for Orbit.
+//! Ultra-lightweight (`< 5.5MB` RSS) zero-knowledge E2EE Relay for Orbit.
 //!
 //! Designed to run on a personal AWS devbox or micro-VPS with `--allow-pubkey` admission locking
 //! so strangers or open-source users can NEVER consume memory or egress bandwidth on your server.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::{
     Router,
     extract::{
-        Path, Query, State,
+        Path as AxumPath, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
@@ -18,9 +19,40 @@ use axum::{
     routing::get,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tracing::{info, warn};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayPersistedConfig {
+    pub listen_addr: SocketAddr,
+    pub allowed_pubkeys: Vec<String>,
+}
+
+impl Default for RelayPersistedConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: SocketAddr::from(([0, 0, 0, 0], 7878)),
+            allowed_pubkeys: Vec::new(),
+        }
+    }
+}
+
+impl RelayPersistedConfig {
+    pub fn load(home_dir: &Path) -> Self {
+        let path = home_dir.join("relay.json");
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, home_dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(home_dir)?;
+        let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        std::fs::write(home_dir.join("relay.json"), raw)
+    }
+}
 
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -169,7 +201,7 @@ async fn ws_daemon_tunnel(
 
 async fn ws_client_connect(
     ws: WebSocketUpgrade,
-    Path(pubkey): Path<String>,
+    AxumPath(pubkey): AxumPath<String>,
     State(state): State<RelayState>,
 ) -> impl IntoResponse {
     if !is_pubkey_allowed(&state, &pubkey) {

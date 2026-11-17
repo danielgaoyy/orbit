@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../core/fleet_controller.dart';
 import '../core/models.dart';
@@ -95,7 +96,7 @@ class FleetHomeScreen extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             const Text(
-              'Run `orbit daemon` & `orbit pair` on your Devbox, Linux workstation, or Mac mini, then paste the `orbit://pair/...` link.',
+              'Run `orbit daemon up` (or `orbit use-relay <HOST:PORT>` for remote access) on your Devbox, Linux workstation, or Mac mini, then paste the `orbit://pair/...` link.',
               style: TextStyle(color: Colors.white70, height: 1.4),
               textAlign: TextAlign.center,
             ),
@@ -121,7 +122,8 @@ class FleetHomeScreen extends StatelessWidget {
 
     final (badgeText, badgeColor) = switch (host.routeState) {
       HostRouteState.onlineDirect => ('LAN Direct', Colors.greenAccent),
-      HostRouteState.onlineRelay => ('Noise E2EE Relay', const Color(0xFF38BDF8)),
+      HostRouteState.onlineRelay =>
+        ('Noise E2EE Relay', const Color(0xFF38BDF8)),
       HostRouteState.connecting => ('Connecting…', Colors.orangeAccent),
       HostRouteState.disconnected => ('Offline', Colors.redAccent),
     };
@@ -163,7 +165,8 @@ class FleetHomeScreen extends StatelessWidget {
                     decoration: BoxDecoration(
                       color: badgeColor.withValues(alpha: 0.14),
                       borderRadius: BorderRadius.circular(999),
-                      border: Border.all(color: badgeColor.withValues(alpha: 0.5)),
+                      border:
+                          Border.all(color: badgeColor.withValues(alpha: 0.5)),
                     ),
                     child: Text(
                       badgeText,
@@ -174,8 +177,95 @@ class FleetHomeScreen extends StatelessWidget {
                       ),
                     ),
                   ),
+                  PopupMenuButton<String>(
+                    tooltip: 'Host Options',
+                    icon: const Icon(Icons.more_vert_rounded, size: 18),
+                    onSelected: (action) async {
+                      if (action == 'relay') {
+                        _showEditRelaySheet(context, host);
+                      } else if (action == 'pubkey') {
+                        await Clipboard.setData(
+                          ClipboardData(text: host.daemonPubkeyB64),
+                        );
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(
+                              content: Text(
+                                'Copied host public key for `orbit relay allow`',
+                              ),
+                            ),
+                          );
+                        }
+                      } else if (action == 'remove') {
+                        await controller.removeHost(host.hostId);
+                      }
+                    },
+                    itemBuilder: (_) => const [
+                      PopupMenuItem(
+                        value: 'relay',
+                        child: Text('Configure Relay URL…'),
+                      ),
+                      PopupMenuItem(
+                        value: 'pubkey',
+                        child: Text('Copy Host Public Key'),
+                      ),
+                      PopupMenuItem(
+                        value: 'remove',
+                        child: Text('Remove Host'),
+                      ),
+                    ],
+                  ),
                 ],
               ),
+              const SizedBox(height: 6),
+              Text(
+                host.relayUrl != null && host.relayUrl!.isNotEmpty
+                    ? 'Relay: ${host.relayUrl}'
+                    : 'Relay: Not configured (LAN / Tailscale direct only)',
+                style: const TextStyle(fontSize: 11.5, color: Colors.white54),
+              ),
+              if (host.routeState == HostRouteState.disconnected &&
+                  host.lastConnectionError != null) ...[
+                const SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.redAccent.withValues(alpha: 0.10),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: Colors.redAccent.withValues(alpha: 0.35),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.info_outline_rounded,
+                        size: 15,
+                        color: Colors.orangeAccent,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          host.lastConnectionError!,
+                          style: const TextStyle(
+                            fontSize: 11.5,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () => _showEditRelaySheet(context, host),
+                        child: const Text(
+                          'Set Relay',
+                          style: TextStyle(fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               const SizedBox(height: 10),
               Wrap(
                 spacing: 8,
@@ -208,6 +298,7 @@ class FleetHomeScreen extends StatelessWidget {
                   ],
                   const Spacer(),
                   IconButton(
+                    tooltip: 'Reconnect',
                     visualDensity: VisualDensity.compact,
                     icon: const Icon(Icons.refresh_rounded, size: 18),
                     onPressed: () => controller.connectHost(host.hostId),
@@ -216,6 +307,72 @@ class FleetHomeScreen extends StatelessWidget {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  void _showEditRelaySheet(BuildContext context, HostProfile host) {
+    final relayCtrl = TextEditingController(text: host.relayUrl ?? '');
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => Padding(
+        padding: EdgeInsets.only(
+          left: 20,
+          right: 20,
+          top: 20,
+          bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              'Attach E2EE Relay for ${host.hostname}',
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Enter your Relay address (e.g. `203.0.113.10:7878` or `ws://203.0.113.10:7878`). Also make sure you ran `orbit use-relay` on the host machine.',
+              style: TextStyle(fontSize: 13, color: Colors.white70),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: relayCtrl,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Relay Server Address',
+                hintText: 'ws://203.0.113.10:7878',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                if (host.relayUrl != null && host.relayUrl!.isNotEmpty) ...[
+                  OutlinedButton(
+                    onPressed: () async {
+                      Navigator.of(ctx).pop();
+                      await controller.updateHostRelay(host.hostId, null);
+                    },
+                    child: const Text('Clear Relay'),
+                  ),
+                  const SizedBox(width: 12),
+                ],
+                Expanded(
+                  child: FilledButton(
+                    onPressed: () async {
+                      final text = relayCtrl.text.trim();
+                      Navigator.of(ctx).pop();
+                      await controller.updateHostRelay(host.hostId, text);
+                    },
+                    child: const Text('Save & Connect via Noise E2EE'),
+                  ),
+                ),
+              ],
+            ),
+          ],
         ),
       ),
     );
@@ -243,7 +400,7 @@ class FleetHomeScreen extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             const Text(
-              'Paste the `orbit://pair/...` URI generated by `orbit pair` on your machine:',
+              'Paste the `orbit://pair/...` URI generated by `orbit pair` or `orbit use-relay` on your machine:',
               style: TextStyle(fontSize: 13, color: Colors.white70),
             ),
             const SizedBox(height: 12),

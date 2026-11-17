@@ -135,6 +135,42 @@ class FleetController extends ChangeNotifier {
     notifyListeners();
   }
 
+  static String? normalizeRelayInput(String? raw) {
+    if (raw == null) return null;
+    final trimmed = raw.trim().replaceAll(RegExp(r'/+$'), '');
+    if (trimmed.isEmpty) return null;
+
+    final hadScheme = trimmed.contains('://');
+    var withScheme = trimmed;
+    if (trimmed.startsWith('http://')) {
+      withScheme = 'ws://${trimmed.substring(7)}';
+    } else if (trimmed.startsWith('https://')) {
+      withScheme = 'wss://${trimmed.substring(8)}';
+    } else if (!trimmed.startsWith('ws://') && !trimmed.startsWith('wss://')) {
+      withScheme = 'ws://$trimmed';
+    }
+
+    final idx = withScheme.indexOf('://');
+    final scheme = withScheme.substring(0, idx);
+    var authority = withScheme.substring(idx + 3).split('/').first.trim();
+    if (!hadScheme &&
+        !authority.contains(':') &&
+        (authority == 'localhost' ||
+            RegExp(r'^\d{1,3}(\.\d{1,3}){3}$').hasMatch(authority))) {
+      authority = '$authority:7878';
+    }
+    return '$scheme://$authority';
+  }
+
+  Future<void> updateHostRelay(String hostId, String? rawRelayUrl) async {
+    final profile = _hosts[hostId];
+    if (profile == null) return;
+    profile.relayUrl = normalizeRelayInput(rawRelayUrl);
+    await _persistHosts();
+    notifyListeners();
+    await connectHost(hostId);
+  }
+
   Future<void> _persistHosts() async {
     final prefs = await SharedPreferences.getInstance();
     final encoded =
@@ -149,6 +185,7 @@ class FleetController extends ChangeNotifier {
 
     _sessions.remove(hostId)?.dispose();
     profile.routeState = HostRouteState.connecting;
+    profile.lastConnectionError = null;
     notifyListeners();
 
     final ffi = OrbitFfiBridge.instance;
@@ -165,6 +202,7 @@ class FleetController extends ChangeNotifier {
         );
         _bindSessionStream(hostId, session);
         profile.routeState = HostRouteState.onlineDirect;
+        profile.lastConnectionError = null;
         _sessions[hostId] = session;
 
         session.sendWire({
@@ -184,11 +222,17 @@ class FleetController extends ChangeNotifier {
 
     // 2. Fallback to Private Self-Hosted Relay with `Noise_NK_25519_ChaChaPoly_SHA256` E2EE
     final relayBase = profile.relayUrl;
-    if (relayBase != null && relayBase.isNotEmpty && ffi.isNativeLoaded) {
+    if (relayBase == null || relayBase.isEmpty) {
+      profile.lastConnectionError =
+          'LAN direct unreachable & no Relay attached (run `orbit use-relay <HOST:PORT>` on host)';
+    } else if (!ffi.isNativeLoaded) {
+      profile.lastConnectionError =
+          'Native Noise E2EE engine (liborbit_ffi) unavailable on this build';
+    } else {
+      final cleanRelay = relayBase.endsWith('/')
+          ? relayBase.substring(0, relayBase.length - 1)
+          : relayBase;
       try {
-        final cleanRelay = relayBase.endsWith('/')
-            ? relayBase.substring(0, relayBase.length - 1)
-            : relayBase;
         final url = '$cleanRelay/v1/client/${profile.daemonPubkeyB64}';
         final ws = WebSocketChannel.connect(Uri.parse(url));
         await ws.ready.timeout(const Duration(seconds: 6));
@@ -211,6 +255,7 @@ class FleetController extends ChangeNotifier {
         );
         _bindBroadcastStream(hostId, session, bcast);
         profile.routeState = HostRouteState.onlineRelay;
+        profile.lastConnectionError = null;
         _sessions[hostId] = session;
 
         session.sendWire({
@@ -223,7 +268,19 @@ class FleetController extends ChangeNotifier {
         refreshAll(hostId);
         notifyListeners();
         return;
-      } catch (_) {}
+      } catch (e) {
+        final errStr = e.toString();
+        if (errStr.contains('502')) {
+          profile.lastConnectionError =
+              'Relay online ($cleanRelay), but host daemon has not connected to it yet (HTTP 502)';
+        } else if (errStr.contains('403')) {
+          profile.lastConnectionError =
+              'Relay rejected host pubkey (HTTP 403 — run `orbit relay allow` on relay server)';
+        } else {
+          profile.lastConnectionError =
+              'Cannot reach Relay ($cleanRelay) — check port & cloud firewall / Security Group';
+        }
+      }
     }
 
     profile.routeState = HostRouteState.disconnected;

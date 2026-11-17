@@ -2,26 +2,39 @@
 
 Orbit follows a strict **Bring-Your-Own-Relay (BYOR)** model so open-source maintainers never pay for public relay bandwidth, and users keep 100% control over their routing latency.
 
-## Option A: Single-Binary Private Relay on Your Own Cloud VM / AWS Devbox (`< 5MB` RAM)
+## Step 1: 1-Command Relay Setup on Your Cloud VM / AWS Devbox (`< 6MB` RAM)
 
-Copy the single `orbit` binary to your cloud machine and lock it strictly to your own hosts' public keys (printed by `orbit doctor` on your workstation / Devbox / Mac mini):
+Install Orbit and start the background Relay locked exclusively to your host public keys (printed by `orbit doctor` on your workstation / Mac mini):
 
 ```bash
-orbit relay \
-  --listen 0.0.0.0:7878 \
-  --allow-pubkey <YOUR_WORKSTATION_PUBKEY> \
-  --allow-pubkey <YOUR_DEVBOX_PUBKEY> \
-  --allow-pubkey <YOUR_MAC_MINI_PUBKEY>
+curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh
+
+orbit relay up --port 7878 --allow-pubkey <YOUR_HOST_PUBKEY>
 ```
 
+- **Persistent Background Service**: Automatically configures `systemd --user` (with `loginctl enable-linger` so it survives SSH logout), `launchd` on macOS, or detached PID supervisor.
 - **Zero-Knowledge**: All traffic is encrypted end-to-end with `Noise_NK_25519_ChaChaPoly_SHA256` (`orbit-relay-e2ee/1`). The relay only forwards opaque ciphertext records.
 - **Zero Abuse**: Any connection targeting a public key outside `--allow-pubkey` is rejected immediately with `HTTP 403 Forbidden` before upgrading WebSocket frames.
+- **Add More Machines Anytime**: Run `orbit relay allow <NEW_HOST_PUBKEY>` on the relay server.
 
-## Option B: Direct LAN / Tailscale / Public Devbox (No Relay Needed)
+> **Firewall / AWS Security Group Note**: Ensure inbound TCP port `7878` (or whichever `--port` you choose) is open in your cloud provider's Security Group.
 
-If your machine has a Tailscale IP, LAN IP, or public Devbox port, you do not even need a relay:
+## Step 2: 1-Command Attach on Each Host Machine (Workstation / Mac mini)
 
 ```bash
-orbit daemon --listen 0.0.0.0:6868
-orbit pair --endpoint ws://<TAILSCALE_OR_PUBLIC_IP>:6868/ws
+orbit use-relay <YOUR_RELAY_SERVER_IP>:7878
+```
+
+`orbit use-relay` automatically:
+1. Normalizes the WebSocket URL and runs a 4-second live preflight check against your Relay,
+2. Persists `relay_url` to `~/.orbit/config.json` and starts/restarts the background `orbit-daemon` service (existing `orbit shim` agent sessions stay alive uninterrupted),
+3. Prints the fresh `orbit://pair/...` Pairing Code containing both LAN direct IPs and the E2EE Relay route — ready to paste into **Orbit App** (macOS / iOS / Android)!
+
+## Direct LAN / Tailscale Mode (No Relay Needed)
+
+If your machine shares a LAN or Tailscale mesh with your Mac/phone:
+
+```bash
+orbit daemon up
+orbit pair
 ```

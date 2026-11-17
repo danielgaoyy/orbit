@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       bundle_id:
-        description: "Your Apple App Store Connect Bundle ID (e.g. dev.orbit.app or com.yourname.orbit)"
+        description: "Your Apple App Store Connect Bundle ID (e.g. com.yourname.orbit)"
         required: true
         default: "dev.orbit.app"
   push:
@@ -16,36 +16,45 @@ permissions:
 jobs:
   upload-to-testflight:
     name: Cloud-Sign & Upload IPA to TestFlight
-    # On tag push, only run automatically if TestFlight secrets are configured; always run on manual dispatch
-    if: github.event_name == 'workflow_dispatch' || env.HAS_ASC_KEY == 'true'
     runs-on: macos-latest
     env:
-      HAS_ASC_KEY: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER != '' }}
       APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
       APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
       APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
       CERTIFICATE_PRIVATE_KEY: ${{ secrets.CERTIFICATE_PRIVATE_KEY }}
       TARGET_BUNDLE_ID: ${{ inputs.bundle_id || vars.IOS_BUNDLE_ID || 'dev.orbit.app' }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify TestFlight Secrets
+      - name: Check TestFlight Credentials
+        id: creds
         run: |
           if [ -z "$APP_STORE_CONNECT_ISSUER_ID" ] || [ -z "$APP_STORE_CONNECT_KEY_IDENTIFIER" ] || [ -z "$APP_STORE_CONNECT_PRIVATE_KEY" ] || [ -z "$CERTIFICATE_PRIVATE_KEY" ]; then
-            echo "::error::Missing Apple TestFlight secrets! Follow deploy/TESTFLIGHT.md to set APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY, and CERTIFICATE_PRIVATE_KEY."
-            exit 1
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "::error::Missing Apple TestFlight secrets! Follow deploy/TESTFLIGHT.md to set APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY, and CERTIFICATE_PRIVATE_KEY."
+              exit 1
+            else
+              echo "::notice::TestFlight secrets not configured yet; skipping automatic TestFlight upload for tag push. See deploy/TESTFLIGHT.md."
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.creds.outputs.ready == 'true'
 
       - uses: subosito/flutter-action@v2
+        if: steps.creds.outputs.ready == 'true'
         with:
           channel: stable
           cache: true
 
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.creds.outputs.ready == 'true'
         with:
           targets: aarch64-apple-ios
 
       - name: Build Rust Native FFI (`liborbit_ffi.a`)
+        if: steps.creds.outputs.ready == 'true'
         env:
           IPHONEOS_DEPLOYMENT_TARGET: "13.0"
         run: |
@@ -54,9 +63,11 @@ jobs:
           cp target/aarch64-apple-ios/release/liborbit_ffi.a app/ios/RustFrameworks/
 
       - name: Install Codemagic Cloud Signing Tools
+        if: steps.creds.outputs.ready == 'true'
         run: pip3 install codemagic-cli-tools
 
       - name: Set Bundle Identifier & Auto-Provision Apple Signing Profile
+        if: steps.creds.outputs.ready == 'true'
         working-directory: app
         run: |
           sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = ${TARGET_BUNDLE_ID};/g" ios/Runner.xcodeproj/project.pbxproj
@@ -68,6 +79,7 @@ jobs:
           xcode-project use-profiles
 
       - name: Build Signed Release IPA & Upload to TestFlight
+        if: steps.creds.outputs.ready == 'true'
         working-directory: app
         run: |
           flutter pub get

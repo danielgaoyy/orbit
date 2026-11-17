@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-const String kOrbitAppVersion = '0.1.2';
+const String kOrbitAppVersion = '0.1.3';
 const String kOrbitGithubRepo = 'danielgaoyy/orbit';
 
 class ReleaseUpdateInfo {
@@ -13,6 +13,8 @@ class ReleaseUpdateInfo {
     required this.notes,
     required this.hasNewerVersion,
     this.macosDmgUrl,
+    this.linuxArm64TarUrl,
+    this.linuxX64TarUrl,
     this.androidApkUrl,
     this.iosIpaUrl,
   });
@@ -23,6 +25,8 @@ class ReleaseUpdateInfo {
   final String notes;
   final bool hasNewerVersion;
   final String? macosDmgUrl;
+  final String? linuxArm64TarUrl;
+  final String? linuxX64TarUrl;
   final String? androidApkUrl;
   final String? iosIpaUrl;
 
@@ -37,6 +41,8 @@ class ReleaseUpdateInfo {
     final notes = (json['body'] as String? ?? '').trim();
 
     String? dmgUrl;
+    String? linuxArmUrl;
+    String? linuxX64Url;
     String? apkUrl;
     String? ipaUrl;
     final assets = json['assets'] as List<dynamic>? ?? const [];
@@ -46,6 +52,8 @@ class ReleaseUpdateInfo {
       final url = item['browser_download_url']?.toString();
       if (url == null || url.isEmpty) continue;
       if (name.endsWith('.dmg')) dmgUrl = url;
+      if (name == 'Orbit-Linux-arm64.tar.gz') linuxArmUrl = url;
+      if (name == 'Orbit-Linux-x64.tar.gz') linuxX64Url = url;
       if (name.endsWith('.apk')) apkUrl = url;
       if (name.endsWith('.ipa')) ipaUrl = url;
     }
@@ -58,6 +66,10 @@ class ReleaseUpdateInfo {
       hasNewerVersion: AppUpdater.compareSemver(cleanVer, currentVersion) > 0,
       macosDmgUrl: dmgUrl ??
           'https://github.com/$kOrbitGithubRepo/releases/download/$tag/Orbit-macOS-AppleSilicon.dmg',
+      linuxArm64TarUrl: linuxArmUrl ??
+          'https://github.com/$kOrbitGithubRepo/releases/download/$tag/Orbit-Linux-arm64.tar.gz',
+      linuxX64TarUrl: linuxX64Url ??
+          'https://github.com/$kOrbitGithubRepo/releases/download/$tag/Orbit-Linux-x64.tar.gz',
       androidApkUrl: apkUrl ??
           'https://github.com/$kOrbitGithubRepo/releases/download/$tag/Orbit-Android-arm64.apk',
       iosIpaUrl: ipaUrl,
@@ -127,15 +139,7 @@ class AppUpdater {
       return;
     }
     if (Platform.isLinux) {
-      onProgress(0.3, '正在更新本机 Orbit CLI / Daemon…');
-      final res = await Process.run('/bin/sh', [
-        '-c',
-        'curl -fsSL https://raw.githubusercontent.com/$kOrbitGithubRepo/main/deploy/install.sh | sh',
-      ]);
-      if (res.exitCode != 0) {
-        throw Exception((res.stderr ?? 'install.sh failed').toString());
-      }
-      onProgress(1.0, '已更新至最新 ${release.tagName}！');
+      await _updateLinuxDesktopAndRelaunch(release, onProgress);
       return;
     }
     if (Platform.isAndroid) {
@@ -266,6 +270,104 @@ class AppUpdater {
   hdiutil detach '$sqMount' -quiet 2>/dev/null || hdiutil detach '$sqMount' -force -quiet 2>/dev/null || true
   rm -f '$sqDmg'
   open "\$DEST"
+) >/dev/null 2>&1 &
+''';
+
+    await Process.start(
+      '/bin/sh',
+      ['-c', updaterScript],
+      mode: ProcessStartMode.detached,
+    );
+
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    exit(0);
+  }
+
+  static Future<void> _updateLinuxDesktopAndRelaunch(
+    ReleaseUpdateInfo release,
+    void Function(double progress, String status) onProgress,
+  ) async {
+    final archRes = await Process.run('uname', ['-m']);
+    final arch = (archRes.stdout ?? '').toString().trim();
+    final tarUrl = (arch == 'aarch64' || arch == 'arm64')
+        ? release.linuxArm64TarUrl
+        : release.linuxX64TarUrl;
+    if (tarUrl == null || tarUrl.isEmpty) {
+      throw Exception('未找到 Linux ($arch) 桌面端安装包下载链接');
+    }
+
+    final tmpDir = Directory.systemTemp.path;
+    final myPid = pid;
+    final tarPath = '$tmpDir/Orbit-linux-${release.version}-$myPid.tar.gz';
+    final stageDir = '$tmpDir/orbit_linux_stage_$myPid';
+
+    onProgress(0.02, '正在下载 Linux 桌面端 ${release.tagName}…');
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15);
+    try {
+      final req = await client.getUrl(Uri.parse(tarUrl));
+      req.headers.set('User-Agent', 'Orbit-App/$kOrbitAppVersion');
+      final resp = await req.close();
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw Exception('下载失败 (HTTP ${resp.statusCode})');
+      }
+
+      final totalBytes = resp.contentLength;
+      var receivedBytes = 0;
+      final sink = File(tarPath).openWrite();
+      try {
+        await for (final chunk in resp) {
+          sink.add(chunk);
+          receivedBytes += chunk.length;
+          if (totalBytes > 0) {
+            final ratio = (receivedBytes / totalBytes).clamp(0.0, 1.0);
+            final mbDone = (receivedBytes / (1024 * 1024)).toStringAsFixed(1);
+            final mbTotal = (totalBytes / (1024 * 1024)).toStringAsFixed(1);
+            onProgress(
+              0.05 + ratio * 0.80,
+              '正在下载 ${release.tagName} ($mbDone / $mbTotal MB)…',
+            );
+          }
+        }
+      } finally {
+        await sink.flush();
+        await sink.close();
+      }
+    } finally {
+      client.close(force: true);
+    }
+
+    onProgress(0.90, '正在解压校验 Linux 桌面端安装包…');
+    await Directory(stageDir).create(recursive: true);
+    final untar = await Process.run('tar', ['-xzf', tarPath, '-C', stageDir]);
+    if (untar.exitCode != 0 ||
+        !File('$stageDir/orbit-desktop').existsSync()) {
+      throw Exception('解压安装包失败: ${untar.stderr}');
+    }
+
+    final exeFile = File(Platform.resolvedExecutable);
+    final home = Platform.environment['HOME'] ?? '';
+    final targetDir = exeFile.path.endsWith('/orbit-desktop')
+        ? exeFile.parent.path
+        : '$home/.local/opt/orbit';
+
+    onProgress(0.98, '正在自动替换并重启 Orbit 桌面端…');
+    final sqStage = stageDir.replaceAll("'", r"'\''");
+    final sqTarget = targetDir.replaceAll("'", r"'\''");
+    final sqTar = tarPath.replaceAll("'", r"'\''");
+
+    final updaterScript = '''
+(
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    kill -0 $myPid 2>/dev/null || break
+    sleep 0.25
+  done
+  mkdir -p '$sqTarget'
+  rm -rf '$sqTarget'/*
+  cp -a '$sqStage'/. '$sqTarget'/
+  chmod +x '$sqTarget/orbit-desktop'
+  rm -rf '$sqStage' '$sqTar'
+  nohup '$sqTarget/orbit-desktop' >/dev/null 2>&1 &
 ) >/dev/null 2>&1 &
 ''';
 

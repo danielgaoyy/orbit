@@ -94,6 +94,52 @@ jobs:
           name: Orbit-macOS-AppleSilicon.dmg
           path: app/Orbit-macOS-AppleSilicon.dmg
 
+  build-linux-desktop:
+    name: Build Linux Desktop App (${{ matrix.artifact }})
+    needs: rust-quality-and-e2e
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            flutter_arch: x64
+            artifact: Orbit-Linux-x64.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            flutter_arch: arm64
+            artifact: Orbit-Linux-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK3 & Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libstdc++-12-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build liborbit_ffi.so for Linux Desktop
+        run: |
+          cargo build --release -p orbit-ffi --target ${{ matrix.target }}
+          mkdir -p app/linux/RustLibs
+          cp target/${{ matrix.target }}/release/liborbit_ffi.so app/linux/RustLibs/
+      - name: Setup Flutter SDK & Build Linux Desktop Bundle
+        run: |
+          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          export PATH="$RUNNER_TEMP/flutter/bin:$PATH"
+          flutter config --no-analytics --enable-linux-desktop
+          cd app
+          flutter pub get
+          flutter build linux --release
+          test -f "build/linux/${{ matrix.flutter_arch }}/release/bundle/lib/liborbit_ffi.so"
+          tar -czf "../${{ matrix.artifact }}" -C "build/linux/${{ matrix.flutter_arch }}/release/bundle" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
   build-android-apk:
     name: Build Android APK (ARM64 + Rust Native FFI)
     needs: rust-quality-and-e2e
@@ -169,6 +215,7 @@ jobs:
     needs:
       - build-host-binaries
       - build-macos-desktop
+      - build-linux-desktop
       - build-android-apk
       - build-ios-ipa
     runs-on: ubuntu-latest
@@ -196,6 +243,8 @@ jobs:
             | 平台 / 用途 | 下载文件 | 安装与使用说明 |
             | :--- | :--- | :--- |
             | **macOS 桌面端 App** (Apple Silicon) | `Orbit-macOS-AppleSilicon.dmg` | 双击打开拖入 `Applications`。首次打开未公证包如遇拦截，执行一次：`xattr -cr /Applications/Orbit.app` |
+            | **Linux ARM64 桌面端 App** (Ubuntu / GNOME) | `Orbit-Linux-arm64.tar.gz` | 一键安装桌面图标：`curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install-desktop-linux.sh \| sh` |
+            | **Linux x86_64 桌面端 App** (Ubuntu / GNOME) | `Orbit-Linux-x64.tar.gz` | 一键安装桌面图标：`curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install-desktop-linux.sh \| sh` |
             | **macOS 守护进程 & CLI** (Mac mini) | `orbit-cli-macos-arm64` | `chmod +x orbit-cli-macos-arm64 && sudo mv orbit-cli-macos-arm64 /usr/local/bin/orbit` |
             | **Linux ARM64 守护进程 & Relay** | `orbit-cli-linux-arm64` | `chmod +x orbit-cli-linux-arm64 && mv orbit-cli-linux-arm64 ~/.local/bin/orbit` |
             | **Linux x86_64 守护进程 & Relay** | `orbit-cli-linux-x64` | `chmod +x orbit-cli-linux-x64 && mv orbit-cli-linux-x64 ~/.local/bin/orbit` |
@@ -203,6 +252,8 @@ jobs:
             | **iOS 侧载安装包** (iPhone / iPad) | `Orbit-iOS-sideload.ipa` | 可通过 AltStore / SideStore / Sideloadly 安装，或使用仓库内置 `Publish to TestFlight` 工作流推送至官方 TestFlight |
           files: |
             release-dist/Orbit-macOS-AppleSilicon.dmg
+            release-dist/Orbit-Linux-arm64.tar.gz
+            release-dist/Orbit-Linux-x64.tar.gz
             release-dist/orbit-cli-macos-arm64
             release-dist/orbit-cli-linux-arm64
             release-dist/orbit-cli-linux-x64

@@ -87,7 +87,10 @@ class OrbitFfiBridge {
       if (overridePath != null && overridePath.isNotEmpty) {
         return DynamicLibrary.open(overridePath);
       }
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
       for (final candidate in [
+        '$exeDir/lib/liborbit_ffi.so',
+        '$exeDir/liborbit_ffi.so',
         '../target/release/liborbit_ffi.so',
         '../target/debug/liborbit_ffi.so',
         'liborbit_ffi.so',

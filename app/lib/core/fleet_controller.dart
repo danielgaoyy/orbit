@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -103,7 +104,7 @@ class FleetController extends ChangeNotifier {
     return total;
   }
 
-  Future<void> loadSavedHosts() async {
+  Future<void> loadSavedHosts({bool autoDiscoverLocal = true}) async {
     final prefs = await SharedPreferences.getInstance();
     final savedList = prefs.getStringList('orbit_saved_hosts') ?? const [];
     for (final item in savedList) {
@@ -113,10 +114,56 @@ class FleetController extends ChangeNotifier {
         _hosts[profile.hostId] = profile;
       } catch (_) {}
     }
+
+    if (autoDiscoverLocal && (Platform.isLinux || Platform.isMacOS)) {
+      await _autoDiscoverLocalMachine();
+    }
+
     notifyListeners();
     for (final hostId in _hosts.keys) {
       unawaited(connectHost(hostId));
     }
+  }
+
+  /// If this desktop machine itself runs an Orbit Daemon (`~/.orbit/host-keypair.json`),
+  /// automatically register `127.0.0.1:6868` so Orbit Desktop connects out-of-the-box!
+  Future<void> _autoDiscoverLocalMachine() async {
+    try {
+      final home = Platform.environment['HOME'];
+      if (home == null || home.isEmpty) return;
+      if (!File('$home/.orbit/host-keypair.json').existsSync()) return;
+
+      String? orbitBin;
+      for (final cand in [
+        '$home/.local/bin/orbit',
+        '/usr/local/bin/orbit',
+        '/opt/homebrew/bin/orbit',
+      ]) {
+        if (File(cand).existsSync()) {
+          orbitBin = cand;
+          break;
+        }
+      }
+      if (orbitBin == null) return;
+
+      final res = await Process.run(orbitBin, ['pair']);
+      if (res.exitCode != 0) return;
+      final uriLine = (res.stdout ?? '')
+          .toString()
+          .split('\n')
+          .map((l) => l.trim())
+          .firstWhere((l) => l.startsWith('orbit://pair/'), orElse: () => '');
+      if (uriLine.isEmpty) return;
+
+      final localProfile = OrbitFfiBridge.instance.parsePairingUri(uriLine);
+      if (!localProfile.directEndpoints.contains('ws://127.0.0.1:6868/ws')) {
+        localProfile.directEndpoints.insert(0, 'ws://127.0.0.1:6868/ws');
+      }
+      if (!_hosts.containsKey(localProfile.hostId)) {
+        _hosts[localProfile.hostId] = localProfile;
+        await _persistHosts();
+      }
+    } catch (_) {}
   }
 
   Future<HostProfile> pairFromQrUri(String uri) async {

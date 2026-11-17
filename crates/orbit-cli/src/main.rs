@@ -1,6 +1,8 @@
 mod service;
+mod ssh_config;
 
 use std::collections::HashSet;
+use std::io::{IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,8 +23,10 @@ use uuid::Uuid;
 
 use crate::service::{
     RelayProbeOutcome, ServiceRole, check_local_health, default_daemon_listen, detect_public_ipv4,
-    install_and_start_service, normalize_relay_url, preflight_probe_relay, stop_service,
+    install_and_start_service, normalize_relay_url, preflight_probe_relay, self_upgrade_cli,
+    stop_service,
 };
+use crate::ssh_config::{discover_ssh_hosts, provision_relay_via_ssh};
 
 #[derive(Parser)]
 #[command(
@@ -133,10 +137,23 @@ enum Commands {
     /// Fetch live 5-hour / weekly usage quotas & remaining credits across Antigravity, Codex, and Claude Code.
     Quotas,
 
-    /// Attach (or detach with `--clear`) this machine to your E2EE Relay, verify connectivity, restart daemon, and print a fresh Pairing Code.
+    /// One-click self-upgrade `orbit` binary to the latest GitHub Release (and hot-restart active daemon/relay).
+    Upgrade {
+        /// Force reinstall even if already on the latest version.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Auto-discover `~/.ssh/config` or attach to an E2EE Relay, auto-deploy via SSH if given an SSH alias, and print Pairing Code.
     UseRelay {
-        /// Relay address (e.g. `203.0.113.10:7878`, `ws://203.0.113.10:7878`, or `wss://relay.example.com`).
+        /// SSH config host alias (e.g. `devbox`) OR Relay URL (`203.0.113.10:7878`). Omit to pick from `~/.ssh/config`.
         relay_url: Option<String>,
+        /// Relay TCP port when deploying/connecting via SSH alias (defaults to `7878`).
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        /// Skip automatic SSH relay provisioning when `relay_url` matches an SSH config alias.
+        #[arg(long)]
+        no_provision: bool,
         /// Detach Relay and revert this host to LAN/Tailscale direct-only mode.
         #[arg(long)]
         clear: bool,
@@ -286,11 +303,27 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
             }
-            println!("\nQuick Relay Setup (on your cloud VM / devbox):");
-            println!(
-                "  orbit relay up --allow-pubkey {}",
-                runtime.host_info.public_key_b64
-            );
+            let ssh_hosts = discover_ssh_hosts();
+            if !ssh_hosts.is_empty() {
+                println!("\nDiscovered SSH Config Servers (1-Command Auto-Deploy & Attach):");
+                for h in &ssh_hosts {
+                    println!(
+                        "  orbit use-relay {:<14} # auto-deploys Relay on {}",
+                        h.alias,
+                        h.display_target()
+                    );
+                }
+            } else {
+                println!("\nQuick Relay Setup (on your cloud VM / devbox):");
+                println!(
+                    "  orbit relay up --allow-pubkey {}",
+                    runtime.host_info.public_key_b64
+                );
+            }
+        }
+
+        Commands::Upgrade { force } => {
+            self_upgrade_cli(&home_dir, force).await?;
         }
 
         Commands::Quotas => {
@@ -321,7 +354,12 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::UseRelay { relay_url, clear } => {
+        Commands::UseRelay {
+            relay_url,
+            port,
+            no_provision,
+            clear,
+        } => {
             let mut persisted = DaemonPersistedConfig::load(&home_dir);
             let listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
             persisted.listen_addr = Some(listen);
@@ -336,15 +374,78 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
-            let raw = relay_url.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Usage: `orbit use-relay <HOST:PORT>` (or `orbit use-relay --clear` to detach)"
-                )
-            })?;
-            let normalized = normalize_relay_url(&raw)?;
             let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
             let pubkey = runtime.keypair.public_key_b64.clone();
             drop(runtime);
+
+            let ssh_hosts = discover_ssh_hosts();
+            let chosen_input = match relay_url {
+                Some(v) => v,
+                None => {
+                    if ssh_hosts.is_empty() {
+                        anyhow::bail!(
+                            "No SSH servers found in ~/.ssh/config. Usage: `orbit use-relay <SSH_ALIAS | HOST:PORT>`"
+                        );
+                    }
+                    println!("Discovered SSH servers in ~/.ssh/config:");
+                    for (idx, h) in ssh_hosts.iter().enumerate() {
+                        println!(
+                            "  [{}] {:<16} ({} -> ws://{}:{port})",
+                            idx + 1,
+                            h.alias,
+                            h.display_target(),
+                            h.host_name
+                        );
+                    }
+                    if !std::io::stdin().is_terminal() {
+                        anyhow::bail!(
+                            "Run `orbit use-relay {}` to 1-click deploy & attach via SSH.",
+                            ssh_hosts[0].alias
+                        );
+                    }
+                    print!(
+                        "\nSelect SSH host to auto-deploy & attach Relay [1-{}] (Enter = 1): ",
+                        ssh_hosts.len()
+                    );
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    let trimmed = line.trim();
+                    let choice: usize = if trimmed.is_empty() {
+                        1
+                    } else {
+                        trimmed
+                            .parse()
+                            .map_err(|_| anyhow::anyhow!("invalid selection"))?
+                    };
+                    let entry = ssh_hosts
+                        .get(choice.saturating_sub(1))
+                        .ok_or_else(|| anyhow::anyhow!("selection out of range"))?;
+                    entry.alias.clone()
+                }
+            };
+
+            let normalized = if let Some(ssh_entry) =
+                ssh_hosts.iter().find(|h| h.alias == chosen_input.trim())
+            {
+                if no_provision {
+                    format!("ws://{}:{port}", ssh_entry.host_name)
+                } else {
+                    println!(
+                        "Auto-deploying Orbit E2EE Relay onto SSH host `{}` ({})...",
+                        ssh_entry.alias,
+                        ssh_entry.display_target()
+                    );
+                    let deployed_url = provision_relay_via_ssh(ssh_entry, port, &pubkey)?;
+                    println!(
+                        "[✓] Relay deployed & authorized on `{}` -> {deployed_url}",
+                        ssh_entry.alias
+                    );
+                    normalize_relay_url(&deployed_url)?
+                }
+            } else {
+                normalize_relay_url(&chosen_input)?
+            };
 
             println!("Probing Relay {normalized} with host pubkey `{pubkey}`...");
             match preflight_probe_relay(&normalized, &pubkey).await {
@@ -366,7 +467,7 @@ async fn main() -> anyhow::Result<()> {
                 RelayProbeOutcome::Unreachable(reason) => {
                     println!("[!] Could not reach {normalized} right now: {reason}");
                     println!(
-                        "    Ensure `orbit relay up` is running on the server and its TCP port is open in your firewall / Security Group."
+                        "    Ensure TCP port {port} is open in your cloud firewall / AWS Security Group."
                     );
                     println!(
                         "    (Saving Relay config now — local daemon will auto-connect in background as soon as reachable.)"

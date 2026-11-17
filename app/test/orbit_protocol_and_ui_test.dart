@@ -3,9 +3,11 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:orbit_mobile/core/app_updater.dart';
 import 'package:orbit_mobile/core/fleet_controller.dart';
 import 'package:orbit_mobile/core/models.dart';
 import 'package:orbit_mobile/core/orbit_ffi_bridge.dart';
+import 'package:orbit_mobile/core/ssh_config.dart';
 import 'package:orbit_mobile/main.dart';
 import 'package:orbit_mobile/screens/agent_chat_screen.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -101,5 +103,57 @@ void main() {
     await tester.pump();
     expect(find.text('Waiting for timeline stream…'), findsOneWidget);
     expect(find.text('Message or steer active turn…'), findsOneWidget);
+  });
+
+  test('SshConfigService parses ~/.ssh/config hosts and skips git forges', () {
+    const sample = '''
+Host *
+  ServerAliveInterval 30
+
+Host github.com
+  HostName github.com
+  User git
+
+Host devbox
+  HostName 203.0.113.55
+  User ec2-user
+
+Host mini
+  HostName=198.51.100.8
+  User=admin
+  Port 2222
+''';
+    final entries = SshConfigService.parseConfigString(sample);
+    expect(entries.length, 2);
+    expect(entries[0].alias, 'devbox');
+    expect(entries[0].hostName, '203.0.113.55');
+    expect(entries[0].displayTarget, 'ec2-user@203.0.113.55');
+    expect(entries[0].relayWsUrl(7878), 'ws://203.0.113.55:7878');
+    expect(entries[1].alias, 'mini');
+    expect(entries[1].displayTarget, 'admin@198.51.100.8:2222');
+  });
+
+  test('AppUpdater compares semver and parses GitHub release metadata', () {
+    expect(AppUpdater.compareSemver('0.1.3', '0.1.2'), greaterThan(0));
+    expect(AppUpdater.compareSemver('v0.1.2', '0.1.2+3'), equals(0));
+    expect(AppUpdater.compareSemver('0.1.1', '0.1.2'), lessThan(0));
+
+    final info = ReleaseUpdateInfo.fromGithubJson(
+      {
+        'tag_name': 'v0.2.0',
+        'html_url': 'https://github.com/danielgaoyy/orbit/releases/tag/v0.2.0',
+        'body': 'One-click SSH relay + self-updater',
+        'assets': [
+          {
+            'name': 'Orbit-macOS-AppleSilicon.dmg',
+            'browser_download_url':
+                'https://example.com/Orbit-macOS-AppleSilicon.dmg',
+          },
+        ],
+      },
+      currentVersion: '0.1.2',
+    );
+    expect(info.hasNewerVersion, isTrue);
+    expect(info.macosDmgUrl, 'https://example.com/Orbit-macOS-AppleSilicon.dmg');
   });
 }

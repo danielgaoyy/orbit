@@ -515,6 +515,90 @@ pub fn default_daemon_listen() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 6868))
 }
 
+pub async fn self_upgrade_cli(home_dir: &Path, force: bool) -> anyhow::Result<()> {
+    let current_ver = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(format!("orbit-cli/{current_ver}"))
+        .build()?;
+
+    let meta: serde_json::Value = client
+        .get("https://api.github.com/repos/danielgaoyy/orbit/releases/latest")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let tag = meta
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("missing tag_name in GitHub release metadata"))?;
+    let latest_ver = tag.trim_start_matches('v');
+
+    if !force && latest_ver == current_ver {
+        println!("[✓] Orbit is already at the latest version (v{current_ver}).");
+        return Ok(());
+    }
+
+    let asset_name = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "orbit-cli-linux-x64",
+        ("linux", "aarch64") => "orbit-cli-linux-arm64",
+        ("macos", "aarch64") => "orbit-cli-macos-arm64",
+        (os, arch) => anyhow::bail!("unsupported auto-upgrade platform: {os}/{arch}"),
+    };
+
+    let download_url =
+        format!("https://github.com/danielgaoyy/orbit/releases/download/{tag}/{asset_name}");
+    println!("Downloading Orbit {tag} ({asset_name}) from GitHub Releases...");
+    let bytes = client
+        .get(&download_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+
+    let target_exe = fs::canonicalize(std::env::current_exe()?)?;
+    let parent_dir = target_exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve executable parent dir"))?;
+    let tmp_path = parent_dir.join(format!(".orbit.upgrade.{}.tmp", std::process::id()));
+    fs::write(&tmp_path, &bytes)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    fs::rename(&tmp_path, &target_exe)?;
+    println!(
+        "[✓] Upgraded Orbit v{current_ver} -> {tag} at {}",
+        target_exe.display()
+    );
+
+    // Automatically restart active background daemon / relay if running on this host!
+    let d_cfg = orbit_daemon::DaemonPersistedConfig::load(home_dir);
+    let d_port = d_cfg
+        .listen_addr
+        .unwrap_or_else(default_daemon_listen)
+        .port();
+    if check_local_health(d_port).await {
+        let mgr = install_and_start_service(ServiceRole::Daemon, home_dir, d_port).await?;
+        println!("[✓] Hot-restarted local Orbit Daemon ({mgr}) — active agent shims preserved.");
+    }
+
+    let r_cfg = orbit_relay::RelayPersistedConfig::load(home_dir);
+    if check_local_health(r_cfg.listen_addr.port()).await {
+        let mgr = install_and_start_service(ServiceRole::Relay, home_dir, r_cfg.listen_addr.port())
+            .await?;
+        println!("[✓] Restarted local Orbit Relay ({mgr}).");
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

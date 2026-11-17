@@ -36,23 +36,25 @@ orbit doctor
 orbit quotas
 ```
 
-### 2. 在你的云开发机 / VPS 上一键拉起私有零知识中继（外网远程穿透）
+### 2. 基于 `~/.ssh/config` 零登录一键部署并挂载私有中继（App & CLI 双端原生支持）
+
+- **在 macOS `Orbit.app` 客户端内**：点击机器卡片上的 **`Set Relay`**，App 会自动识别你本机 `~/.ssh/config` 中的所有远程服务器，点一下 **`一键部署并挂载`** 即可自动通过 SSH 在云端装好 `orbit`、写入公钥白名单、拉起常驻中继并建立 `Noise E2EE` 连接；右上角内置 **`一键在线更新`**，随时自动下载最新 Release 并平滑重启。
+- **在终端 CLI 内**：无需手动登录中继机，直接传 `~/.ssh/config` 里的主机别名即可全自动远程部署中继 + 本机挂载 + 输出配对码：
 
 ```bash
-# 自动写入 ~/.orbit/relay.json 并注册为后台常驻服务（仅放行你的机器公钥，陌生人 403 零消耗）
-orbit relay up --port 7878 --allow-pubkey <你的工作站公钥>
+# 自动读取 ~/.ssh/config（如 devbox），一键通过 SSH 远程部署白名单中继、重启本机 Daemon 并打印配对码！
+orbit use-relay devbox
 
-# 后续新增机器（如家里的 Mac mini）时，随时追加授权并热重载：
-orbit relay allow <你的MacMini公钥>
+# 或交互式从 ~/.ssh/config 列表中回车选择：
+orbit use-relay
+
+# 后续随时一键自更新本机 CLI / Daemon / Relay 到最新 GitHub Release：
+orbit upgrade
 ```
 
-### 3. 在工作站 / Mac mini 上一键挂载中继并生成配对码
+### 3. 局域网 / Tailscale 直连模式（无需中继）
 
 ```bash
-# 自动执行 WebSocket 连通性与白名单预检、持久化配置、重启后台 Daemon，并直接输出最新配对码！
-orbit use-relay <你的云服务器IP>:7878
-
-# 若仅在局域网 / Tailscale 内直连使用：
 orbit daemon up
 orbit pair
 ```

@@ -72,4 +72,4 @@ orbit ls
 ## 手机客户端（iOS & Android）构建
 
 - **Android APK**：参见 [`.github/workflows/release.yml`](.github/workflows/release.yml) 中的 `build-android-apk`（通过 `cargo-ndk` 编译 `liborbit_ffi.so` 后执行 `flutter build apk --release --target-platform android-arm64`）。
-- **iOS IPA**：无需本地配置 Xcode，推送到 GitHub 后 `build-ios-ipa` 工作流会自动在 `macos-14` 构建机上交叉编译 `aarch64-apple-ios` 静态库并打包产出 `Orbit-iOS-unsigned.ipa`（支持 AltStore / SideStore / Sideloadly 或 Apple 开发者证书签名安装）。
+- **iOS IPA**：无需本地配置 Xcode，推送到 GitHub 后 `build-ios-ipa` 工作流会自动在 `macos-latest` 构建机上交叉编译 `aarch64-apple-ios` 静态库并打包产出 `Orbit-iOS-unsigned.ipa`（支持 AltStore / SideStore / Sideloadly 或 Apple 开发者证书签名安装）。

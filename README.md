@@ -1,0 +1,75 @@
+# Orbit
+
+**Orbit** 是一个用纯 Rust 编写的超轻量、极低延迟、原生支持多主机舰队（Multi-Host Fleet）的本地 AI Coding Agent 编排与移动远程控制面（iOS & Android）。
+
+无论你的 AI 编程会话运行在云端 **Devbox**、**Linux 工作站**，还是家里的 **Mac mini** 上，你都可以通过 **Flutter 120Hz 原生客户端**（内嵌 Rust `liborbit_ffi` 原生加密与 Zstd 压缩内核）或 `orbit` CLI 随时随地以毫秒级响应查看流式进展、审批工具权限、回答澄清提问、审查 Git Diff、操控原生终端以及监控各账号实时额度。
+
+---
+
+## 核心特性（Phase 1 完备交付）
+
+1. **单静态二进制四合一（`9.1 MB` Single Binary Everything）**：
+   同一个 `orbit` 可执行文件同时包含 `daemon`（守护进程）、`shim`（热升级不死宿主壳）、`relay`（零知识端到端加密中继）和 `cli`（命令行客户端）。Linux (`x86_64` / `aarch64`) 与 macOS (`Apple Silicon`) 零 Node.js / Python 依赖即拷即用。
+2. **三大王牌 CLI 原生纯 Rust 驱动**：
+   - **Antigravity (`agy`)**：原生对接 `agy acp --stdio` + `transcript_full.jsonl` 字节偏移增量流（支持双向权限、`ask_question` & `elicitation/create` 多选问答、跨回合后台自治唤醒防死锁、`/usage` + `/credits` 实时额度探测）。
+   - **Codex (`codex`)**：原生对接 `codex app-server` 双向 JSON-RPC 2.0 协议（内置 SQLite 启动并发锁、会话创建与恢复、中途插话 `turn/steer`、权限与问答审批、`~/.codex/auth.json` Wham 实时额度与 Credits 探测）。
+   - **Claude Code (`claude`)**：纯 Rust 实现双向 `stream-json` Control Protocol（脱离 Node SDK 包袱，完整支持 `can_use_tool` 权限审批、`AskUserQuestion`、中途 `interrupt`、以及 Linux `.credentials.json` / macOS Keychain 实时额度探测）。
+3. **Daemon 热升级零中断（Detached Shim Architecture）**：
+   所有 CLI 子进程与 `portable-pty` 伪终端均由独立的 `orbit shim` 守护进程组托管并通过 Unix Domain Socket (`$ORBIT_HOME/shims/*.sock`) 接入 `orbit daemon`。随时重启或升级 Daemon 二进制，正在运行的会话与 PTY 终端不断流、不丢失。
+4. **专为跨国/弱网与开源零成本设计的混合网络（BYOR + Multi-Host）**：
+   - **Happy-Eyeballs 多路径竞速**：局域网 / Tailscale 直连优先，外网自动无缝切换至私有中继，配合 Zstd 实时帧压缩，跨国传输流量降低 75%+。
+   - **私有零知识白名单中继**：`orbit relay --allow-pubkey <KEY>` 采用 `Noise_NK_25519_ChaChaPoly_SHA256` 端到端加密与公钥白名单硬拦截，陌生请求在 HTTP Upgrade 阶段直接 `403` 丢弃，绝不消耗你的服务器内存与昂贵流量。
+
+---
+
+## 快速上手（多机部署指南）
+
+### 1. 编译与安装单二进制
+
+```bash
+cargo build --release -p orbit-cli -p orbit-ffi
+mkdir -p ~/.local/bin
+cp target/release/orbit ~/.local/bin/orbit
+
+# 一键体检本机身份公钥与已安装的 agy / codex / claude
+orbit doctor
+
+# 一键并发查询三大 CLI 实时 5h / 周配额与剩余 Credits
+orbit quotas
+```
+
+### 2. 在你的 AWS 开发机上启动私有零知识中继（可选，供内网 Mac mini 穿透）
+
+```bash
+# 仅允许你自己的机器公钥接入，陌生人 0 字节可蹭
+orbit relay \
+  --listen 0.0.0.0:7878 \
+  --allow-pubkey <你的工作站公钥> \
+  --allow-pubkey <你的MacMini公钥>
+```
+
+### 3. 在工作站 / Devbox / Mac mini 上启动 Daemon 并生成手机配对码
+
+```bash
+# 启动守护进程（若在 NAT 内网可附带 --relay ws://<你的AWS地址>:7878）
+orbit daemon --listen 0.0.0.0:6868 --relay ws://<你的AWS地址>:7878
+
+# 打印手机扫码/导入的 Multi-Host 配对 URI
+orbit pair --endpoint ws://<局域网或Tailscale_IP>:6868/ws --relay ws://<你的AWS地址>:7878
+```
+
+### 4. 命令行直接驱动三大 CLI
+
+```bash
+orbit run --provider agy "Refactor this module"
+orbit run --provider codex "Run cargo test and fix warnings"
+orbit run --provider claude "Explain ARCHITECTURE.md"
+orbit ls
+```
+
+---
+
+## 手机客户端（iOS & Android）构建
+
+- **Android APK**：参见 [`.github/workflows/release.yml`](.github/workflows/release.yml) 中的 `build-android-apk`（通过 `cargo-ndk` 编译 `liborbit_ffi.so` 后执行 `flutter build apk --release --target-platform android-arm64`）。
+- **iOS IPA**：无需本地配置 Xcode，推送到 GitHub 后 `build-ios-ipa` 工作流会自动在 `macos-14` 构建机上交叉编译 `aarch64-apple-ios` 静态库并打包产出 `Orbit-iOS-unsigned.ipa`（支持 AltStore / SideStore / Sideloadly 或 Apple 开发者证书签名安装）。

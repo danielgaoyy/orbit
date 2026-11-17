@@ -1,0 +1,17 @@
+[package]
+name = "orbit-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[lints]
+
+[dependencies]
+orbit-crypto.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zstd.workspace = true

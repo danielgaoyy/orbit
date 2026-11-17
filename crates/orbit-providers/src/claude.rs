@@ -1,0 +1,1047 @@
+//! Native Rust driver for Anthropic Claude Code (`claude` bidirectional `stream-json` Control Protocol
+//! + `~/.claude/.credentials.json` / macOS Keychain OAuth Usage).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use orbit_protocol::{
+    AgentStatus, ProviderKind, ProviderQuotaSnapshot, QuestionItem, QuotaWindow, SessionMode,
+    ToolCallDetail, ToolCallStatus,
+};
+use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, spawn_detached_shim};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
+
+pub async fn spawn_claude_session(
+    cfg: SessionLaunchConfig,
+) -> Result<ProviderSessionHandle, String> {
+    let perm_mode = claude_mode_flag(&cfg.mode);
+    let preassigned_session_id = cfg
+        .resume_session_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let mut args = vec![
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--permission-prompt-tool".to_string(),
+        "stdio".to_string(),
+        "--include-partial-messages".to_string(),
+        "--permission-mode".to_string(),
+        perm_mode.to_string(),
+        "--allow-dangerously-skip-permissions".to_string(),
+    ];
+
+    if let Some(ref resume_id) = cfg.resume_session_id {
+        args.push(format!("--resume={resume_id}"));
+    } else {
+        args.push(format!("--session-id={preassigned_session_id}"));
+    }
+
+    if let Some(ref m) = cfg.model {
+        args.push("--model".to_string());
+        args.push(m.clone());
+    }
+
+    let mut env = HashMap::new();
+    env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-ts".into());
+    env.insert(
+        "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".into(),
+        "true".into(),
+    );
+    env.insert("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into());
+    env.insert("NO_COLOR".into(), "1".into());
+
+    let spec = ShimSpawnSpec {
+        shim_id: format!("claude_{}", cfg.agent_id),
+        mode: ShimMode::Stdio,
+        program: cfg.executable.to_string_lossy().to_string(),
+        args,
+        cwd: cfg.cwd.clone(),
+        env,
+    };
+
+    let mut shim = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
+        .await
+        .map_err(|e| format!("failed to spawn claude shim: {e}"))?;
+
+    // Send mandatory `initialize` control_request handshake
+    let init_req = json!({
+        "request_id": "init_1",
+        "type": "control_request",
+        "request": {
+            "subtype": "initialize",
+            "forwardSubagentText": true,
+            "perTaskStopAffordance": true
+        }
+    })
+    .to_string();
+
+    shim.write_stdin_line(init_req)
+        .await
+        .map_err(|e| format!("failed to write claude initialize: {e}"))?;
+
+    wait_claude_init_response(&mut shim).await?;
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<DriverCommand>(64);
+    let (evt_tx, evt_rx) = mpsc::channel::<DriverEvent>(256);
+
+    tokio::spawn(run_claude_actor(
+        cfg,
+        preassigned_session_id,
+        shim,
+        cmd_rx,
+        evt_tx,
+    ));
+
+    Ok(ProviderSessionHandle { cmd_tx, evt_rx })
+}
+
+struct PendingClaudePerm {
+    control_request_id: String,
+    tool_use_id: String,
+    original_input: Value,
+    permission_suggestions: Value,
+    is_question: bool,
+    question_texts: Vec<String>,
+}
+
+async fn run_claude_actor(
+    cfg: SessionLaunchConfig,
+    mut session_id: String,
+    mut shim: orbit_shim::ShimClient,
+    mut cmd_rx: mpsc::Receiver<DriverCommand>,
+    evt_tx: mpsc::Sender<DriverEvent>,
+) {
+    let _ = evt_tx
+        .send(DriverEvent::SessionInitialized {
+            persistence_ref: session_id.clone(),
+            model: cfg.model.clone(),
+        })
+        .await;
+    let _ = evt_tx
+        .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+        .await;
+
+    let mut ctrl_seq: u64 = 2;
+    let mut active_turn_id: Option<String> = None;
+    let mut active_msg_id: String = "claude_msg_0".into();
+    let mut streamed_blocks: HashMap<u64, (String, String)> = HashMap::new(); // index -> (kind, accum)
+    let mut emitted_text_in_turn = false;
+    let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
+    let mut pending_perms: HashMap<String, PendingClaudePerm> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            maybe_cmd = cmd_rx.recv() => {
+                let Some(cmd) = maybe_cmd else { break; };
+                match cmd {
+                    DriverCommand::SendPrompt { turn_id, prompt } => {
+                        let priority = if active_turn_id.is_some() {
+                            Some("next")
+                        } else {
+                            active_turn_id = Some(turn_id.clone());
+                            streamed_blocks.clear();
+                            emitted_text_in_turn = false;
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                                    turn_id: turn_id.clone(),
+                                }))
+                                .await;
+                            None
+                        };
+
+                        let mut user_frame = json!({
+                            "type": "user",
+                            "session_id": session_id,
+                            "parent_tool_use_id": null,
+                            "uuid": Uuid::new_v4().to_string(),
+                            "message": {
+                                "role": "user",
+                                "content": [
+                                    { "type": "text", "text": prompt }
+                                ]
+                            }
+                        });
+                        if let Some(p) = priority {
+                            user_frame["priority"] = Value::String(p.to_string());
+                        }
+                        if shim.write_stdin_line(user_frame.to_string()).await.is_err() {
+                            break;
+                        }
+                    }
+                    DriverCommand::Interrupt => {
+                        let rid = format!("ctrl_{ctrl_seq}");
+                        ctrl_seq += 1;
+                        let req = json!({
+                            "request_id": rid,
+                            "type": "control_request",
+                            "request": {
+                                "subtype": "interrupt",
+                                "cancel_queued": true
+                            }
+                        });
+                        let _ = shim.write_stdin_line(req.to_string()).await;
+                    }
+                    DriverCommand::SetMode { mode } => {
+                        let rid = format!("ctrl_{ctrl_seq}");
+                        ctrl_seq += 1;
+                        let req = json!({
+                            "request_id": rid,
+                            "type": "control_request",
+                            "request": {
+                                "subtype": "set_permission_mode",
+                                "mode": claude_mode_flag(&mode)
+                            }
+                        });
+                        let _ = shim.write_stdin_line(req.to_string()).await;
+                    }
+                    DriverCommand::ResolvePermission { request_id, decision } => {
+                        if let Some(p) = pending_perms.remove(&request_id) {
+                            let resp = if decision == "allow" || decision == "allow_always" {
+                                let (updated_perms, classification) = if decision == "allow_always" {
+                                    (p.permission_suggestions, "user_permanent")
+                                } else {
+                                    (json!([]), "user_temporary")
+                                };
+                                json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "success",
+                                        "request_id": p.control_request_id,
+                                        "response": {
+                                            "behavior": "allow",
+                                            "updatedInput": p.original_input,
+                                            "updatedPermissions": updated_perms,
+                                            "toolUseID": p.tool_use_id,
+                                            "decisionClassification": classification
+                                        }
+                                    }
+                                })
+                            } else {
+                                json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "success",
+                                        "request_id": p.control_request_id,
+                                        "response": {
+                                            "behavior": "deny",
+                                            "message": "User denied permission from Orbit",
+                                            "interrupt": false,
+                                            "toolUseID": p.tool_use_id,
+                                            "decisionClassification": "user_reject"
+                                        }
+                                    }
+                                })
+                            };
+                            let _ = shim.write_stdin_line(resp.to_string()).await;
+                            if let Some(ref tid) = active_turn_id {
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                                        turn_id: tid.clone(),
+                                    }))
+                                    .await;
+                            }
+                        }
+                    }
+                    DriverCommand::AnswerQuestion { request_id, answers } => {
+                        if let Some(p) = pending_perms.remove(&request_id)
+                            && p.is_question
+                        {
+                            let mut answers_obj = serde_json::Map::new();
+                            for (idx, q_text) in p.question_texts.iter().enumerate() {
+                                let ans_str = answers
+                                    .get(idx)
+                                    .map(|v| v.join(", "))
+                                    .unwrap_or_default();
+                                answers_obj.insert(q_text.clone(), Value::String(ans_str));
+                            }
+                            let mut updated = p.original_input.clone();
+                            if let Some(obj) = updated.as_object_mut() {
+                                obj.insert("answers".into(), Value::Object(answers_obj));
+                            }
+                            let resp = json!({
+                                "type": "control_response",
+                                "response": {
+                                    "subtype": "success",
+                                    "request_id": p.control_request_id,
+                                    "response": {
+                                        "behavior": "allow",
+                                        "updatedInput": updated,
+                                        "toolUseID": p.tool_use_id
+                                    }
+                                }
+                            });
+                            let _ = shim.write_stdin_line(resp.to_string()).await;
+                            if let Some(ref tid) = active_turn_id {
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                                        turn_id: tid.clone(),
+                                    }))
+                                    .await;
+                            }
+                        }
+                    }
+                    DriverCommand::Shutdown => {
+                        let _ = shim.kill().await;
+                        break;
+                    }
+                }
+            }
+
+            maybe_frame = shim.rx.recv() => {
+                let Some(frame) = maybe_frame else { break; };
+                match frame {
+                    ShimFrame::StdoutLine { line } => {
+                        let Ok(val) = serde_json::from_str::<Value>(&line) else { continue; };
+                        let Some(frame_type) = val.get("type").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        match frame_type {
+                            "system" => {
+                                if val.get("subtype").and_then(|v| v.as_str()) == Some("init")
+                                    && let Some(sid) = val.get("session_id").and_then(|v| v.as_str())
+                                    && !sid.is_empty()
+                                    && sid != session_id
+                                {
+                                    session_id = sid.to_string();
+                                    let model = val
+                                        .get("model")
+                                        .and_then(|v| v.as_str())
+                                        .map(ToOwned::to_owned);
+                                    let _ = evt_tx
+                                        .send(DriverEvent::SessionInitialized {
+                                            persistence_ref: session_id.clone(),
+                                            model,
+                                        })
+                                        .await;
+                                }
+                            }
+                            "stream_event" => {
+                                // Only stream foreground root events on main timeline
+                                if val.get("parent_tool_use_id").is_some_and(|v| !v.is_null()) {
+                                    continue;
+                                }
+                                let Some(ev) = val.get("event") else { continue; };
+                                let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                match ev_type {
+                                    "message_start" => {
+                                        if let Some(mid) = ev.pointer("/message/id").and_then(|v| v.as_str()) {
+                                            active_msg_id = mid.to_string();
+                                            streamed_blocks.clear();
+                                        }
+                                    }
+                                    "content_block_start" => {
+                                        let idx = ev.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let btype = ev
+                                            .pointer("/content_block/type")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        streamed_blocks.insert(idx, (btype, String::new()));
+                                    }
+                                    "content_block_delta" => {
+                                        let idx = ev.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let dtype = ev.pointer("/delta/type").and_then(|v| v.as_str()).unwrap_or("");
+                                        if dtype == "text_delta" {
+                                            let chunk = ev.pointer("/delta/text").and_then(|v| v.as_str()).unwrap_or("");
+                                            if !chunk.is_empty() {
+                                                let entry = streamed_blocks
+                                                    .entry(idx)
+                                                    .or_insert_with(|| ("text".into(), String::new()));
+                                                entry.1.push_str(chunk);
+                                                emitted_text_in_turn = true;
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::AssistantText {
+                                                        item_id: format!("{active_msg_id}_{idx}"),
+                                                        text: entry.1.clone(),
+                                                        streaming: true,
+                                                    })
+                                                    .await;
+                                            }
+                                        } else if dtype == "thinking_delta" {
+                                            let chunk = ev
+                                                .pointer("/delta/thinking")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            if !chunk.is_empty() {
+                                                let entry = streamed_blocks
+                                                    .entry(idx)
+                                                    .or_insert_with(|| ("thinking".into(), String::new()));
+                                                entry.1.push_str(chunk);
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::ThinkingText {
+                                                        item_id: format!("{active_msg_id}_th_{idx}"),
+                                                        text: entry.1.clone(),
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    "content_block_stop" => {
+                                        let idx = ev.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        if let Some((btype, full_txt)) = streamed_blocks.get(&idx)
+                                            && btype == "text"
+                                            && !full_txt.is_empty()
+                                        {
+                                            let _ = evt_tx
+                                                .send(DriverEvent::AssistantText {
+                                                    item_id: format!("{active_msg_id}_{idx}"),
+                                                    text: full_txt.clone(),
+                                                    streaming: false,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            "assistant" => {
+                                if val.get("parent_tool_use_id").is_some_and(|v| !v.is_null()) {
+                                    continue;
+                                }
+                                let mid = val
+                                    .pointer("/message/id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("claude_msg");
+                                if let Some(blocks) = val.pointer("/message/content").and_then(|v| v.as_array()) {
+                                    for (i, b) in blocks.iter().enumerate() {
+                                        let btype = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                        if btype == "tool_use" {
+                                            let call_id = b
+                                                .get("id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("toolu")
+                                                .to_string();
+                                            let name = b
+                                                .get("name")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("Tool");
+                                            let input = &b["input"];
+                                            let detail = map_claude_tool_detail(name, input, None);
+                                            tool_cache.insert(call_id.clone(), detail.clone());
+                                            let _ = evt_tx
+                                                .send(DriverEvent::ToolCall {
+                                                    call_id,
+                                                    status: ToolCallStatus::Running,
+                                                    detail,
+                                                })
+                                                .await;
+                                        } else if btype == "text"
+                                            && streamed_blocks.is_empty()
+                                            && let Some(txt) = b.get("text").and_then(|v| v.as_str())
+                                            && !txt.is_empty()
+                                        {
+                                            emitted_text_in_turn = true;
+                                            let _ = evt_tx
+                                                .send(DriverEvent::AssistantText {
+                                                    item_id: format!("{mid}_{i}"),
+                                                    text: txt.to_string(),
+                                                    streaming: false,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            "user" => {
+                                if val.get("isReplay").and_then(|v| v.as_bool()) == Some(true) {
+                                    continue;
+                                }
+                                if let Some(blocks) = val.pointer("/message/content").and_then(|v| v.as_array()) {
+                                    for b in blocks {
+                                        if b.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+                                            && let Some(call_id) = b.get("tool_use_id").and_then(|v| v.as_str())
+                                        {
+                                            let is_err = b
+                                                .get("is_error")
+                                                .and_then(|v| v.as_bool())
+                                                .unwrap_or(false);
+                                            let out_text = extract_claude_tool_result_text(&b["content"]);
+                                            let detail = match tool_cache.remove(call_id) {
+                                                Some(ToolCallDetail::Shell { command, cwd, .. }) => {
+                                                    ToolCallDetail::Shell {
+                                                        command,
+                                                        cwd,
+                                                        exit_code: Some(if is_err { 1 } else { 0 }),
+                                                        output_preview: Some(out_text),
+                                                    }
+                                                }
+                                                Some(other) => other,
+                                                None => ToolCallDetail::Generic {
+                                                    tool_name: "tool".into(),
+                                                    arguments_json: out_text,
+                                                },
+                                            };
+                                            let _ = evt_tx
+                                                .send(DriverEvent::ToolCall {
+                                                    call_id: call_id.to_string(),
+                                                    status: if is_err {
+                                                        ToolCallStatus::Failed
+                                                    } else {
+                                                        ToolCallStatus::Completed
+                                                    },
+                                                    detail,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                            }
+                            "control_request" => {
+                                handle_claude_control_request(
+                                    &val,
+                                    &active_turn_id,
+                                    &mut pending_perms,
+                                    &evt_tx,
+                                )
+                                .await;
+                            }
+                            "result" => {
+                                active_turn_id = None;
+                                let is_err = val
+                                    .get("is_error")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let subtype = val
+                                    .get("subtype")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("success");
+
+                                if is_err || subtype != "success" {
+                                    let err_msg = val
+                                        .get("result")
+                                        .and_then(|v| v.as_str())
+                                        .map(ToOwned::to_owned)
+                                        .or_else(|| {
+                                            val.get("errors")
+                                                .and_then(|v| v.as_array())
+                                                .and_then(|a| a.first())
+                                                .and_then(|x| x.as_str())
+                                                .map(ToOwned::to_owned)
+                                        })
+                                        .unwrap_or_else(|| format!("Claude turn failed ({subtype})"));
+                                    let _ = evt_tx
+                                        .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                            message: err_msg,
+                                            recoverable: true,
+                                        }))
+                                        .await;
+                                } else {
+                                    if !emitted_text_in_turn
+                                        && let Some(res_txt) = val.get("result").and_then(|v| v.as_str())
+                                        && !res_txt.trim().is_empty()
+                                    {
+                                        let _ = evt_tx
+                                            .send(DriverEvent::AssistantText {
+                                                item_id: format!("slash_{}", Uuid::new_v4().simple()),
+                                                text: res_txt.to_string(),
+                                                streaming: false,
+                                            })
+                                            .await;
+                                    }
+                                    let _ = evt_tx
+                                        .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+                                        .await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    ShimFrame::Exited { code } => {
+                        let _ = evt_tx.send(DriverEvent::Exited { code }).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+async fn wait_claude_init_response(shim: &mut orbit_shim::ShimClient) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if rem.is_zero() {
+            return Err("Claude Code control_request initialize timed out".into());
+        }
+        match tokio::time::timeout(rem, shim.rx.recv()).await {
+            Ok(Some(ShimFrame::StdoutLine { line })) => {
+                let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if val.get("type").and_then(|v| v.as_str()) == Some("control_response")
+                    && val.pointer("/response/request_id").and_then(|v| v.as_str())
+                        == Some("init_1")
+                {
+                    return Ok(());
+                }
+            }
+            Ok(Some(ShimFrame::Exited { code })) => {
+                return Err(format!("claude exited early during init ({code:?})"));
+            }
+            Ok(Some(_)) => {}
+            _ => return Err("claude shim closed during init".into()),
+        }
+    }
+}
+
+fn claude_mode_flag(mode: &SessionMode) -> &'static str {
+    match mode {
+        SessionMode::Default => "default",
+        SessionMode::AcceptEdits => "acceptEdits",
+        SessionMode::Plan => "plan",
+        SessionMode::FullAccess => "bypassPermissions",
+        SessionMode::Custom(_) => "default",
+    }
+}
+
+async fn handle_claude_control_request(
+    val: &Value,
+    active_turn_id: &Option<String>,
+    pending_perms: &mut HashMap<String, PendingClaudePerm>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let Some(ctrl_req_id) = val.get("request_id").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let req = &val["request"];
+    if req.get("subtype").and_then(|v| v.as_str()) != Some("can_use_tool") {
+        return;
+    }
+
+    let tool_name = req
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Tool");
+    let tool_use_id = req
+        .get("tool_use_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let input = req.get("input").cloned().unwrap_or_else(|| json!({}));
+    let suggestions = req
+        .get("permission_suggestions")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+
+    if tool_name == "AskUserQuestion" {
+        let q_arr = input
+            .get("questions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut items = Vec::new();
+        let mut q_texts = Vec::new();
+        for (i, q) in q_arr.iter().enumerate() {
+            let qt = q
+                .get("question")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let opts = q
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|o| {
+                            o.get("label")
+                                .and_then(|l| l.as_str())
+                                .map(ToOwned::to_owned)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            q_texts.push(qt.clone());
+            items.push(QuestionItem {
+                id: format!("cq_{i}"),
+                header: q
+                    .get("header")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
+                question: qt,
+                options: opts,
+                is_multi_select: q
+                    .get("multiSelect")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+        let req_id = format!("clq_{}", Uuid::new_v4().simple());
+        pending_perms.insert(
+            req_id.clone(),
+            PendingClaudePerm {
+                control_request_id: ctrl_req_id.to_string(),
+                tool_use_id,
+                original_input: input,
+                permission_suggestions: suggestions,
+                is_question: true,
+                question_texts: q_texts,
+            },
+        );
+        let _ = evt_tx
+            .send(DriverEvent::StatusChanged(
+                AgentStatus::AwaitingPermission {
+                    turn_id: active_turn_id.clone().unwrap_or_default(),
+                    request_id: req_id.clone(),
+                },
+            ))
+            .await;
+        let _ = evt_tx
+            .send(DriverEvent::QuestionRequest {
+                request_id: req_id,
+                questions: items,
+            })
+            .await;
+        return;
+    }
+
+    let req_id = format!("clp_{}", Uuid::new_v4().simple());
+    let title = req
+        .get("title")
+        .or_else(|| req.get("description"))
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("Claude wants to use {tool_name}"));
+    let detail = map_claude_tool_detail(tool_name, &input, None);
+
+    pending_perms.insert(
+        req_id.clone(),
+        PendingClaudePerm {
+            control_request_id: ctrl_req_id.to_string(),
+            tool_use_id,
+            original_input: input,
+            permission_suggestions: suggestions,
+            is_question: false,
+            question_texts: Vec::new(),
+        },
+    );
+
+    let _ = evt_tx
+        .send(DriverEvent::StatusChanged(
+            AgentStatus::AwaitingPermission {
+                turn_id: active_turn_id.clone().unwrap_or_default(),
+                request_id: req_id.clone(),
+            },
+        ))
+        .await;
+    let _ = evt_tx
+        .send(DriverEvent::PermissionRequest {
+            request_id: req_id,
+            title,
+            detail,
+            allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
+        })
+        .await;
+}
+
+fn map_claude_tool_detail(
+    name: &str,
+    input: &Value,
+    output_preview: Option<String>,
+) -> ToolCallDetail {
+    match name {
+        "Bash" => ToolCallDetail::Shell {
+            command: input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            cwd: None,
+            exit_code: None,
+            output_preview,
+        },
+        "Read" => ToolCallDetail::FileRead {
+            path: input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            start_line: input
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+            end_line: input
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32),
+        },
+        "Edit" | "Write" | "MultiEdit" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let diff = match (
+                input.get("old_string").and_then(|v| v.as_str()),
+                input.get("new_string").and_then(|v| v.as_str()),
+            ) {
+                (Some(o), Some(n)) => Some(format!("--- old\n+++ new\n-{o}\n+{n}")),
+                _ => None,
+            };
+            ToolCallDetail::FileEdit {
+                path,
+                unified_diff: diff,
+            }
+        }
+        "Grep" | "Glob" => ToolCallDetail::Search {
+            query: input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            scope: input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned),
+        },
+        "Task" | "Agent" => ToolCallDetail::Subagent {
+            child_agent_id: None,
+            role: input
+                .get("description")
+                .or_else(|| input.get("subagent_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("subagent")
+                .to_string(),
+            prompt_preview: input
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(|s| truncate_claude(s, 240))
+                .unwrap_or_default(),
+        },
+        _ => ToolCallDetail::Generic {
+            tool_name: name.to_string(),
+            arguments_json: input.to_string(),
+        },
+    }
+}
+
+fn extract_claude_tool_result_text(v: &Value) -> String {
+    if let Some(s) = v.as_str() {
+        return truncate_claude(s, 800);
+    }
+    if let Some(arr) = v.as_array() {
+        let joined: String = arr
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return truncate_claude(&joined, 800);
+    }
+    String::new()
+}
+
+// --- Claude Code OAuth Quota Probe (`~/.claude/.credentials.json` + macOS Keychain) ---
+
+#[derive(Deserialize)]
+struct ClaudeCredentialsFile {
+    #[serde(rename = "claudeAiOauth")]
+    claude_ai_oauth: Option<ClaudeOAuthEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeOAuthEntry {
+    access_token: Option<String>,
+    subscription_type: Option<String>,
+    rate_limit_tier: Option<String>,
+}
+
+pub async fn probe_claude_quota() -> ProviderQuotaSnapshot {
+    let raw_creds = load_claude_credentials_json().await;
+    let Some(raw) = raw_creds else {
+        return ProviderQuotaSnapshot {
+            provider: ProviderKind::ClaudeCode,
+            account_label: None,
+            windows: Vec::new(),
+            credits_remaining: None,
+            error: Some("Claude OAuth credentials not found".into()),
+            updated_at: Utc::now(),
+        };
+    };
+
+    let Ok(parsed) = serde_json::from_str::<ClaudeCredentialsFile>(&raw) else {
+        return ProviderQuotaSnapshot {
+            provider: ProviderKind::ClaudeCode,
+            account_label: None,
+            windows: Vec::new(),
+            credits_remaining: None,
+            error: Some("invalid Claude credentials JSON".into()),
+            updated_at: Utc::now(),
+        };
+    };
+
+    let Some(oauth) = parsed.claude_ai_oauth else {
+        return ProviderQuotaSnapshot {
+            provider: ProviderKind::ClaudeCode,
+            account_label: None,
+            windows: Vec::new(),
+            credits_remaining: None,
+            error: Some("Claude configured via API key (no subscription window)".into()),
+            updated_at: Utc::now(),
+        };
+    };
+    let Some(token) = oauth.access_token else {
+        return ProviderQuotaSnapshot {
+            provider: ProviderKind::ClaudeCode,
+            account_label: None,
+            windows: Vec::new(),
+            credits_remaining: None,
+            error: Some("missing Claude accessToken".into()),
+            updated_at: Utc::now(),
+        };
+    };
+
+    let account_label = match (
+        oauth.subscription_type.as_deref(),
+        oauth.rate_limit_tier.as_deref(),
+    ) {
+        (Some(sub), Some(tier)) => {
+            let suffix = tier.split('_').next_back().unwrap_or("");
+            Some(
+                format!("Claude {} {}", sub.to_uppercase(), suffix)
+                    .trim()
+                    .to_string(),
+            )
+        }
+        (Some(sub), None) => Some(format!("Claude {}", sub.to_uppercase())),
+        _ => None,
+    };
+
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    else {
+        return ProviderQuotaSnapshot {
+            provider: ProviderKind::ClaudeCode,
+            account_label,
+            windows: Vec::new(),
+            credits_remaining: None,
+            error: Some("http client init failed".into()),
+            updated_at: Utc::now(),
+        };
+    };
+
+    let resp = client
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/json")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            if let Ok(val) = r.json::<Value>().await {
+                let mut windows = Vec::new();
+                for (key, title) in [
+                    ("five_hour", "Claude · 5-Hour Window"),
+                    ("seven_day", "Claude · Weekly Window"),
+                    ("seven_day_opus", "Claude · Weekly Opus"),
+                ] {
+                    if let Some(w) = val.get(key)
+                        && let Some(util) = w.get("utilization").and_then(|v| v.as_f64())
+                    {
+                        let resets_at = w
+                            .get("resets_at")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .map(|d| d.with_timezone(&Utc));
+                        windows.push(QuotaWindow {
+                            label: title.to_string(),
+                            used_percent: util as f32,
+                            resets_at,
+                        });
+                    }
+                }
+                ProviderQuotaSnapshot {
+                    provider: ProviderKind::ClaudeCode,
+                    account_label,
+                    windows,
+                    credits_remaining: None,
+                    error: None,
+                    updated_at: Utc::now(),
+                }
+            } else {
+                ProviderQuotaSnapshot {
+                    provider: ProviderKind::ClaudeCode,
+                    account_label,
+                    windows: Vec::new(),
+                    credits_remaining: None,
+                    error: Some("invalid usage JSON from Anthropic".into()),
+                    updated_at: Utc::now(),
+                }
+            }
+        }
+        Ok(r) => ProviderQuotaSnapshot {
+            provider: ProviderKind::ClaudeCode,
+            account_label,
+            windows: Vec::new(),
+            credits_remaining: None,
+            error: Some(format!("HTTP {}", r.status())),
+            updated_at: Utc::now(),
+        },
+        Err(e) => ProviderQuotaSnapshot {
+            provider: ProviderKind::ClaudeCode,
+            account_label,
+            windows: Vec::new(),
+            credits_remaining: None,
+            error: Some(e.to_string()),
+            updated_at: Utc::now(),
+        },
+    }
+}
+
+async fn load_claude_credentials_json() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = tokio::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-w",
+                "-s",
+                "Claude Code-credentials",
+            ])
+            .output()
+            .await
+            && out.status.success()
+        {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+
+    let cfg_dir = std::env::var("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".claude")
+        });
+    tokio::fs::read_to_string(cfg_dir.join(".credentials.json"))
+        .await
+        .ok()
+}
+
+fn truncate_claude(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push_str("...");
+        out
+    }
+}

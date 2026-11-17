@@ -1,0 +1,30 @@
+[package]
+name = "orbit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "orbit"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+orbit-protocol.workspace = true
+orbit-shim.workspace = true
+orbit-providers.workspace = true
+orbit-daemon.workspace = true
+orbit-relay.workspace = true
+orbit-client-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+orbit-crypto.workspace = true

@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.db
+*.db-shm
+*.db-wal
+*.sock
+*.pid
+.orbit-dev/
+.DS_Store
+.env
+app/.dart_tool/
+app/build/
+app/pubspec.lock

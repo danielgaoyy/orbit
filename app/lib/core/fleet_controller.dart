@@ -35,6 +35,7 @@ class HostRuntimeSession {
   final StringBuffer terminalBuffer = StringBuffer();
   String? activeTerminalId;
   int activeTerminalSlot = 1;
+  String? lastCreatedAgentId;
 
   bool get isEncryptedRelay => noiseChannelHandle != null;
 
@@ -442,6 +443,9 @@ class FleetController extends ChangeNotifier {
           session.agents[a.agentId] = a;
         }
       case 'agent_created':
+        final a = AgentSummary.fromJson(msg['agent'] as Map<String, dynamic>);
+        session.agents[a.agentId] = a;
+        session.lastCreatedAgentId = a.agentId;
       case 'agent_updated':
         final a = AgentSummary.fromJson(msg['agent'] as Map<String, dynamic>);
         session.agents[a.agentId] = a;

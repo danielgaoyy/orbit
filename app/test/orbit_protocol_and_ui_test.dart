@@ -156,4 +156,57 @@ Host mini
     expect(info.hasNewerVersion, isTrue);
     expect(info.macosDmgUrl, 'https://example.com/Orbit-macOS-AppleSilicon.dmg');
   });
+
+  testWidgets(
+      'Desktop split-pane workbench renders cleanly without overflow at 1360x840 and 880x600',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({
+      'orbit_saved_hosts': [
+        jsonEncode({
+          'host_id': 'host_workstation_1',
+          'hostname': 'workstation-pro',
+          'daemon_pubkey_b64': 'AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE',
+          'direct_endpoints': ['ws://127.0.0.1:1/ws'],
+          'relay_url': null,
+        }),
+      ],
+    });
+
+    for (final scale in [1.0, 1.5]) {
+      tester.platformDispatcher.textScaleFactorTestValue = scale;
+      for (final size in [
+        const Size(1360, 840),
+        const Size(880, 600),
+        const Size(390, 844),
+      ]) {
+        tester.view.physicalSize = size;
+        tester.view.devicePixelRatio = 1.0;
+
+        final controller = FleetController();
+        await controller.loadSavedHosts(autoDiscoverLocal: false);
+        await tester.pumpWidget(OrbitMobileApp(controller: controller));
+        await tester.pump(const Duration(seconds: 2));
+
+        expect(find.textContaining('workstation-pro'), findsWidgets);
+
+        if (size.width >= 880) {
+          expect(find.text('机器舰队'), findsOneWidget);
+          expect(find.text('编程会话'), findsOneWidget);
+          expect(find.text('Set Relay (SSH)'), findsOneWidget);
+
+          await tester.tap(find.text('Set Relay (SSH)'));
+          await tester.pumpAndSettle();
+          expect(find.textContaining('配置 E2EE 中继'), findsOneWidget);
+
+          Navigator.of(tester.element(find.textContaining('配置 E2EE 中继')))
+              .pop();
+          await tester.pumpAndSettle();
+        }
+      }
+    }
+
+    tester.platformDispatcher.clearTextScaleFactorTestValue();
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+  });
 }

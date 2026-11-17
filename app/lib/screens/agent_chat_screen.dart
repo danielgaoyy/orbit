@@ -9,11 +9,13 @@ class AgentChatScreen extends StatefulWidget {
     required this.controller,
     required this.hostId,
     required this.agentId,
+    this.embedded = false,
   });
 
   final FleetController controller;
   final String hostId;
   final String agentId;
+  final bool embedded;
 
   @override
   State<AgentChatScreen> createState() => _AgentChatScreenState();
@@ -28,6 +30,13 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
     _inputCtrl.dispose();
     _scrollCtrl.dispose();
     super.dispose();
+  }
+
+  void _submitPrompt() {
+    final txt = _inputCtrl.text.trim();
+    if (txt.isEmpty) return;
+    _inputCtrl.clear();
+    widget.controller.sendPrompt(widget.hostId, widget.agentId, txt);
   }
 
   @override
@@ -49,6 +58,133 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
             if (e.type == 'question_resolved')
               e.payload['request_id'] as String? ?? '',
         };
+
+        final bodyContent = Column(
+          children: [
+            if (widget.embedded && agent != null)
+              Container(
+                height: 46,
+                padding: const EdgeInsets.symmetric(horizontal: 18),
+                decoration: const BoxDecoration(
+                  color: Color(0xFF0E131E),
+                  border: Border(
+                    bottom: BorderSide(color: Color(0xFF1E293B)),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.auto_awesome_rounded,
+                      size: 16,
+                      color: Color(0xFF38BDF8),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '${agent.title}  ·  ${agent.provider.label}  ·  ${agent.cwd}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 12.5,
+                          color: Colors.white70,
+                        ),
+                      ),
+                    ),
+                    PopupMenuButton<SessionMode>(
+                      tooltip: '切换权限模式',
+                      onSelected: (m) => widget.controller
+                          .setSessionMode(widget.hostId, widget.agentId, m),
+                      itemBuilder: (_) => [
+                        for (final m in SessionMode.values)
+                          PopupMenuItem(
+                            value: m,
+                            child: Text(
+                              m == agent.mode ? '✓ ${m.label}' : m.label,
+                            ),
+                          ),
+                      ],
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.06),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.white12),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Icon(Icons.shield_outlined, size: 14),
+                            const SizedBox(width: 5),
+                            Text(
+                              agent.mode.label,
+                              style: const TextStyle(fontSize: 11.5),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (agent.isRunning) ...[
+                      const SizedBox(width: 8),
+                      TextButton.icon(
+                        onPressed: () => widget.controller
+                            .interruptAgent(widget.hostId, widget.agentId),
+                        icon: const Icon(
+                          Icons.stop_circle_rounded,
+                          size: 16,
+                          color: Colors.redAccent,
+                        ),
+                        label: const Text(
+                          '中断',
+                          style: TextStyle(color: Colors.redAccent, fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            Expanded(
+              child: events.isEmpty
+                  ? const Center(
+                      child: Text(
+                        'Waiting for timeline stream…',
+                        style: TextStyle(color: Colors.white54),
+                      ),
+                    )
+                  : ListView.builder(
+                      controller: _scrollCtrl,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 20,
+                        vertical: 16,
+                      ),
+                      itemCount: events.length,
+                      itemBuilder: (context, i) => Center(
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 860),
+                          child: _buildEventItem(
+                            context,
+                            events[i],
+                            resolvedPermIds,
+                            resolvedQuestionIds,
+                          ),
+                        ),
+                      ),
+                    ),
+            ),
+            Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 900),
+                child: _buildComposer(),
+              ),
+            ),
+          ],
+        );
+
+        if (widget.embedded) {
+          return bodyContent;
+        }
 
         return Scaffold(
           appBar: AppBar(
@@ -85,38 +221,16 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
               if (agent != null && agent.isRunning)
                 IconButton(
                   tooltip: 'Interrupt Active Turn',
-                  icon: const Icon(Icons.stop_circle_rounded,
-                      color: Colors.redAccent),
+                  icon: const Icon(
+                    Icons.stop_circle_rounded,
+                    color: Colors.redAccent,
+                  ),
                   onPressed: () => widget.controller
                       .interruptAgent(widget.hostId, widget.agentId),
                 ),
             ],
           ),
-          body: Column(
-            children: [
-              Expanded(
-                child: events.isEmpty
-                    ? const Center(
-                        child: Text(
-                          'Waiting for timeline stream…',
-                          style: TextStyle(color: Colors.white54),
-                        ),
-                      )
-                    : ListView.builder(
-                        controller: _scrollCtrl,
-                        padding: const EdgeInsets.all(14),
-                        itemCount: events.length,
-                        itemBuilder: (context, i) => _buildEventItem(
-                          context,
-                          events[i],
-                          resolvedPermIds,
-                          resolvedQuestionIds,
-                        ),
-                      ),
-              ),
-              _buildComposer(),
-            ],
-          ),
+          body: bodyContent,
         );
       },
     );
@@ -135,15 +249,15 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
           alignment: Alignment.centerRight,
           child: Container(
             margin: const EdgeInsets.symmetric(vertical: 6),
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            constraints: const BoxConstraints(maxWidth: 320),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+            constraints: const BoxConstraints(maxWidth: 620),
             decoration: BoxDecoration(
               color: const Color(0xFF1E3A5F),
               borderRadius: BorderRadius.circular(14),
             ),
-            child: Text(
+            child: SelectableText(
               (p['text'] as String?) ?? '',
-              style: const TextStyle(fontSize: 14),
+              style: const TextStyle(fontSize: 14, height: 1.4),
             ),
           ),
         );
@@ -153,8 +267,11 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
           margin: const EdgeInsets.symmetric(vertical: 4),
           child: ExpansionTile(
             dense: true,
-            leading: const Icon(Icons.psychology_rounded,
-                size: 18, color: Colors.white54),
+            leading: const Icon(
+              Icons.psychology_rounded,
+              size: 18,
+              color: Colors.white54,
+            ),
             title: const Text(
               'Reasoning Trace',
               style: TextStyle(fontSize: 12, color: Colors.white70),
@@ -162,12 +279,15 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
             children: [
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                child: Text(
-                  (p['text'] as String?) ?? '',
-                  style: const TextStyle(
-                    fontSize: 12,
-                    color: Colors.white60,
-                    fontFamily: 'monospace',
+                child: SizedBox(
+                  width: double.infinity,
+                  child: SelectableText(
+                    (p['text'] as String?) ?? '',
+                    style: const TextStyle(
+                      fontSize: 12,
+                      color: Colors.white60,
+                      fontFamily: 'monospace',
+                    ),
                   ),
                 ),
               ),
@@ -178,10 +298,11 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
       case 'assistant_message':
         final streaming = (p['streaming'] as bool?) ?? false;
         return Container(
+          width: double.infinity,
           margin: const EdgeInsets.symmetric(vertical: 6),
-          padding: const EdgeInsets.all(14),
+          padding: const EdgeInsets.all(15),
           decoration: BoxDecoration(
-            color: const Color(0xFF131822),
+            color: const Color(0xFF111622),
             borderRadius: BorderRadius.circular(14),
             border: Border.all(
               color: streaming
@@ -191,7 +312,7 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
           ),
           child: SelectableText(
             (p['text'] as String?) ?? '',
-            style: const TextStyle(fontSize: 14, height: 1.45),
+            style: const TextStyle(fontSize: 14, height: 1.5),
           ),
         );
 
@@ -257,10 +378,10 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
                     ),
                     child: Text(
                       subOutput,
-                      maxLines: 8,
+                      maxLines: 10,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
-                        fontSize: 11,
+                        fontSize: 11.5,
                         fontFamily: 'monospace',
                         color: Colors.white70,
                       ),
@@ -288,8 +409,11 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
             children: [
               Row(
                 children: [
-                  const Icon(Icons.gpp_maybe_rounded,
-                      color: Colors.amberAccent, size: 20),
+                  const Icon(
+                    Icons.gpp_maybe_rounded,
+                    color: Colors.amberAccent,
+                    size: 20,
+                  ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
@@ -372,7 +496,7 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
     return SafeArea(
       top: false,
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 14),
         child: Row(
           children: [
             Expanded(
@@ -380,28 +504,25 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
                 controller: _inputCtrl,
                 minLines: 1,
                 maxLines: 4,
+                textInputAction: TextInputAction.send,
+                onSubmitted: (_) => _submitPrompt(),
                 decoration: InputDecoration(
                   hintText: 'Message or steer active turn…',
                   filled: true,
-                  fillColor: const Color(0xFF131822),
+                  fillColor: const Color(0xFF111622),
                   contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                   border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(14),
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: Color(0xFF1E293B)),
                   ),
                 ),
               ),
             ),
-            const SizedBox(width: 8),
+            const SizedBox(width: 10),
             IconButton.filled(
               icon: const Icon(Icons.arrow_upward_rounded),
-              onPressed: () {
-                final txt = _inputCtrl.text.trim();
-                if (txt.isEmpty) return;
-                _inputCtrl.clear();
-                widget.controller
-                    .sendPrompt(widget.hostId, widget.agentId, txt);
-              },
+              onPressed: _submitPrompt,
             ),
           ],
         ),

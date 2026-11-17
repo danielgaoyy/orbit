@@ -22,20 +22,20 @@ static void my_application_activate(GApplication* application) {
 
   GtkWindow* window =
       GTK_WINDOW(gtk_application_window_new(GTK_APPLICATION(application)));
-  gtk_window_set_default_size(window, 1280, 720);
-
-  // If you want to use a header bar, uncomment the following lines.
-  // Header bars are commonly used in GNOME based desktop environments and
-  // allow additional widgets to be added to the title bar.
-  // See https://docs.gtk.org/gtk3/class.HeaderBar.html
-  // GtkHeaderBar* header_bar = GTK_HEADER_BAR(gtk_header_bar_new());
-  // gtk_widget_show(GTK_WIDGET(header_bar));
-  // gtk_header_bar_set_show_close_button(header_bar, TRUE);
-  // gtk_window_set_titlebar(window, GTK_WIDGET(header_bar));
+  gtk_window_set_default_size(window, 1360, 840);
 
   gtk_window_set_title(window, "Orbit");
 
+  // Default to Cairo/Skia compositor on Linux X11 unless explicitly overridden,
+  // avoiding GTK3 `gdk_cairo_draw_from_gl` fractional-scaling viewport clipping on NVIDIA 4K X11.
+  if (g_getenv("FLUTTER_LINUX_RENDERER") == nullptr) {
+    g_setenv("FLUTTER_LINUX_RENDERER", "software", FALSE);
+  }
+
   g_autoptr(FlDartProject) project = fl_dart_project_new();
+  if (g_strcmp0(g_getenv("FLUTTER_LINUX_RENDERER"), "software") == 0) {
+    fl_dart_project_set_enable_impeller(project, FALSE);
+  }
   fl_dart_project_set_dart_entrypoint_arguments(
       project, self->dart_entrypoint_arguments);
 

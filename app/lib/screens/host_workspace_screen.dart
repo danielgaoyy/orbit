@@ -205,6 +205,7 @@ class HostWorkspaceScreen extends StatelessWidget {
               ),
               const SizedBox(height: 12),
               DropdownButtonFormField<SessionMode>(
+                isExpanded: true,
                 initialValue: selectedMode,
                 decoration: const InputDecoration(
                   labelText: 'Permission Mode',

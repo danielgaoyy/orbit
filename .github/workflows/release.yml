@@ -63,6 +63,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -77,31 +78,10 @@ jobs:
       - name: Build Release Android APK
         working-directory: app
         run: |
-          mkdir -p ~/.gradle/init.d
-          cat << 'EOF' > ~/.gradle/init.d/gcs-maven-mirror.init.gradle
-          beforeSettings { settings ->
-              settings.buildscript.repositories {
-                  maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
-              }
-              settings.pluginManagement.repositories {
-                  maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
-              }
-          }
-          allprojects {
-              buildscript {
-                  repositories {
-                      maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
-                  }
-              }
-              repositories {
-                  maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
-              }
-          }
-          EOF
           flutter pub get
           flutter analyze
           flutter test
-          flutter build apk --release --target-platform android-arm64
+          flutter build apk --release --target-platform android-arm64 || (sleep 5 && flutter build apk --release --target-platform android-arm64)
       - uses: actions/upload-artifact@v4
         with:
           name: orbit-android-arm64-apk

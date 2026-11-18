@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../core/fleet_controller.dart';
 import '../core/models.dart';
 
+/// Zero-input Git Diff Review Drawer / Sheet automatically bound to the active conversation's `cwd`.
 class GitReviewScreen extends StatefulWidget {
   const GitReviewScreen({
     super.key,
@@ -22,20 +23,13 @@ class GitReviewScreen extends StatefulWidget {
 }
 
 class _GitReviewScreenState extends State<GitReviewScreen> {
-  late final TextEditingController _cwdCtrl =
-      TextEditingController(text: widget.initialCwd);
   String? _selectedPath;
 
   @override
   void initState() {
     super.initState();
     widget.controller.fetchGitStatus(widget.hostId, widget.initialCwd);
-  }
-
-  @override
-  void dispose() {
-    _cwdCtrl.dispose();
-    super.dispose();
+    widget.controller.fetchGitDiff(widget.hostId, widget.initialCwd);
   }
 
   @override
@@ -44,179 +38,169 @@ class _GitReviewScreenState extends State<GitReviewScreen> {
       listenable: widget.controller,
       builder: (context, _) {
         final session = widget.controller.sessionFor(widget.hostId);
-        final cwd = _cwdCtrl.text.trim();
-        final status = session?.gitStatuses[cwd];
-        final diffKey = '$cwd::${_selectedPath ?? "__all__"}';
+        final status = session?.gitStatuses[widget.initialCwd];
+        final files = status?.files ?? const <GitFileEntry>[];
+        if (_selectedPath == null && files.isNotEmpty) {
+          _selectedPath = files.first.path;
+          widget.controller.fetchGitDiff(
+            widget.hostId,
+            widget.initialCwd,
+            path: files.first.path,
+            staged: files.first.staged,
+          );
+        }
+
+        final diffKey = '${widget.initialCwd}::${_selectedPath ?? "__all__"}';
         final diffText = session?.gitDiffs[diffKey];
 
-        final content = LayoutBuilder(
-          builder: (context, constraints) {
-            final isWide = constraints.maxWidth >= 720;
-            return Column(
-              children: [
-                Container(
-                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
-                  decoration: const BoxDecoration(
-                    color: Color(0xFF0E131E),
-                    border: Border(
-                      bottom: BorderSide(color: Color(0xFF1E293B)),
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      if (status?.branch != null) ...[
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color:
-                                const Color(0xFF38BDF8).withValues(alpha: 0.12),
-                            borderRadius: BorderRadius.circular(8),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(
-                                Icons.call_split_rounded,
-                                size: 14,
-                                color: Color(0xFF38BDF8),
+        final content = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(
+              padding: const EdgeInsets.fromLTRB(18, 14, 12, 12),
+              decoration: BoxDecoration(
+                border: Border(
+                  bottom:
+                      BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+                ),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Text(
+                              '代码改动审阅',
+                              style: TextStyle(
+                                fontSize: 15,
+                                fontWeight: FontWeight.w600,
                               ),
-                              const SizedBox(width: 5),
-                              Text(
-                                status!.branch!,
-                                style: const TextStyle(
-                                  fontSize: 12,
-                                  fontFamily: 'monospace',
-                                  color: Color(0xFF38BDF8),
+                            ),
+                            if (status?.branch != null) ...[
+                              const SizedBox(width: 10),
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 7,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF38BDF8)
+                                      .withValues(alpha: 0.14),
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Text(
+                                  status!.branch!,
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    fontFamily: 'monospace',
+                                    color: Color(0xFF38BDF8),
+                                  ),
                                 ),
                               ),
                             ],
-                          ),
+                          ],
                         ),
-                        const SizedBox(width: 10),
-                      ],
-                      Expanded(
-                        child: TextField(
-                          controller: _cwdCtrl,
-                          onSubmitted: (v) => widget.controller
-                              .fetchGitStatus(widget.hostId, v.trim()),
+                        const SizedBox(height: 2),
+                        Text(
+                          widget.initialCwd,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
-                            fontSize: 13,
+                            fontSize: 11.5,
                             fontFamily: 'monospace',
-                          ),
-                          decoration: const InputDecoration(
-                            isDense: true,
-                            labelText: 'Git 仓库路径 (cwd)',
-                            border: OutlineInputBorder(),
+                            color: Colors.white38,
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 10),
-                      FilledButton.icon(
-                        onPressed: () => widget.controller
-                            .fetchGitStatus(widget.hostId, _cwdCtrl.text.trim()),
-                        icon: const Icon(Icons.refresh_rounded, size: 16),
-                        label: const Text('刷新状态'),
-                      ),
-                    ],
+                      ],
+                    ),
+                  ),
+                  IconButton(
+                    tooltip: '刷新改动',
+                    icon: const Icon(Icons.refresh_rounded, size: 18),
+                    onPressed: () {
+                      widget.controller
+                          .fetchGitStatus(widget.hostId, widget.initialCwd);
+                      if (_selectedPath != null) {
+                        widget.controller.fetchGitDiff(
+                          widget.hostId,
+                          widget.initialCwd,
+                          path: _selectedPath,
+                        );
+                      }
+                    },
+                  ),
+                  if (widget.embedded)
+                    IconButton(
+                      tooltip: '关闭',
+                      icon: const Icon(Icons.close_rounded, size: 19),
+                      onPressed: () => Navigator.of(context).maybePop(),
+                    ),
+                ],
+              ),
+            ),
+            if (files.isNotEmpty)
+              Container(
+                height: 44,
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+                decoration: BoxDecoration(
+                  border: Border(
+                    bottom:
+                        BorderSide(color: Colors.white.withValues(alpha: 0.06)),
                   ),
                 ),
-                Expanded(
-                  child: isWide
-                      ? Row(
-                          children: [
-                            SizedBox(
-                              width: 280,
-                              child: Container(
-                                decoration: const BoxDecoration(
-                                  border: Border(
-                                    right: BorderSide(color: Color(0xFF1E293B)),
-                                  ),
-                                ),
-                                child: _buildFileList(status, cwd),
-                              ),
-                            ),
-                            Expanded(child: _buildDiffPane(diffText)),
-                          ],
-                        )
-                      : Column(
-                          children: [
-                            SizedBox(
-                              height: 170,
-                              child: _buildFileList(status, cwd),
-                            ),
-                            const Divider(height: 1),
-                            Expanded(child: _buildDiffPane(diffText)),
-                          ],
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: files.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 6),
+                  itemBuilder: (_, i) {
+                    final f = files[i];
+                    final selected = f.path == _selectedPath;
+                    return Center(
+                      child: ChoiceChip(
+                        visualDensity: VisualDensity.compact,
+                        label: Text(
+                          f.path,
+                          style: const TextStyle(
+                            fontSize: 11.5,
+                            fontFamily: 'monospace',
+                          ),
                         ),
+                        selected: selected,
+                        onSelected: (_) {
+                          setState(() => _selectedPath = f.path);
+                          widget.controller.fetchGitDiff(
+                            widget.hostId,
+                            widget.initialCwd,
+                            path: f.path,
+                            staged: f.staged,
+                          );
+                        },
+                      ),
+                    );
+                  },
                 ),
-              ],
-            );
-          },
+              ),
+            Expanded(
+              child: files.isEmpty
+                  ? const Center(
+                      child: Text(
+                        '当前目录没有未提交改动',
+                        style: TextStyle(color: Colors.white54, fontSize: 13),
+                      ),
+                    )
+                  : _buildDiffPane(diffText),
+            ),
+          ],
         );
 
         if (widget.embedded) return content;
 
         return Scaffold(
-          appBar: AppBar(
-            title: Text(
-              status?.branch != null
-                  ? 'Git · ${status!.branch}'
-                  : 'Git Working Tree',
-            ),
-          ),
+          appBar: AppBar(title: const Text('代码改动审阅')),
           body: content,
-        );
-      },
-    );
-  }
-
-  Widget _buildFileList(GitStatusSnapshot? status, String cwd) {
-    if (status == null || status.files.isEmpty) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(16),
-          child: Text(
-            '工作区干净（或请输入有效的 Git 仓库目录）',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.white54, fontSize: 12.5),
-          ),
-        ),
-      );
-    }
-    return ListView.builder(
-      itemCount: status.files.length,
-      itemBuilder: (context, i) {
-        final f = status.files[i];
-        return ListTile(
-          dense: true,
-          selected: _selectedPath == f.path,
-          selectedTileColor: const Color(0xFF38BDF8).withValues(alpha: 0.12),
-          leading: Text(
-            f.status,
-            style: TextStyle(
-              fontFamily: 'monospace',
-              fontWeight: FontWeight.bold,
-              color: f.untracked ? Colors.greenAccent : Colors.amberAccent,
-            ),
-          ),
-          title: Text(
-            f.path,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 12.5, fontFamily: 'monospace'),
-          ),
-          onTap: () {
-            setState(() => _selectedPath = f.path);
-            widget.controller.fetchGitDiff(
-              widget.hostId,
-              cwd,
-              path: f.path,
-              staged: f.staged,
-            );
-          },
         );
       },
     );
@@ -226,8 +210,8 @@ class _GitReviewScreenState extends State<GitReviewScreen> {
     if (diffText == null || diffText.isEmpty) {
       return const Center(
         child: Text(
-          '点击左侧变更文件查看 Unified Diff',
-          style: TextStyle(color: Colors.white54, fontSize: 13),
+          '正在加载 Diff…',
+          style: TextStyle(color: Colors.white38, fontSize: 12.5),
         ),
       );
     }
@@ -237,11 +221,11 @@ class _GitReviewScreenState extends State<GitReviewScreen> {
         for (final line in diffText.split('\n'))
           Container(
             color: line.startsWith('+') && !line.startsWith('+++')
-                ? Colors.green.withValues(alpha: 0.16)
+                ? const Color(0xFF34D399).withValues(alpha: 0.14)
                 : line.startsWith('-') && !line.startsWith('---')
-                    ? Colors.red.withValues(alpha: 0.16)
+                    ? const Color(0xFFFB7185).withValues(alpha: 0.14)
                     : Colors.transparent,
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 1.5),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 2),
             child: SelectableText(
               line,
               style: TextStyle(
@@ -249,7 +233,7 @@ class _GitReviewScreenState extends State<GitReviewScreen> {
                 fontSize: 12,
                 color: line.startsWith('@@')
                     ? const Color(0xFF38BDF8)
-                    : Colors.white,
+                    : Colors.white.withValues(alpha: 0.88),
               ),
             ),
           ),

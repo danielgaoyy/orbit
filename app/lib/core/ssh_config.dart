@@ -324,4 +324,104 @@ class SshConfigService {
 
     return entry.relayWsUrl(relayPort);
   }
+
+  /// Zero-form 1-click SSH Host Connection:
+  /// Connects to `entry.alias`, installs/upgrades `orbit` if missing, starts `orbit daemon up`,
+  /// and returns the `orbit://pair/...` URI automatically without any manual terminal steps!
+  static Future<String> bootstrapDaemonAndFetchPairUri({
+    required SshHostEntry entry,
+    void Function(String step)? onStep,
+  }) async {
+    onStep?.call('正在通过 SSH 连接 ${entry.alias}…');
+
+    const remoteScript =
+        'set -eu; '
+        'export PATH="\$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:\$PATH"; '
+        'if ! command -v orbit >/dev/null 2>&1; then '
+        '  curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; '
+        'fi; '
+        'orbit daemon up >/dev/null 2>&1 || true; '
+        'orbit pair';
+
+    final sshBin = File('/usr/bin/ssh').existsSync() ? '/usr/bin/ssh' : 'ssh';
+    final result = await Process.run(
+      sshBin,
+      [
+        '-o',
+        'BatchMode=yes',
+        '-o',
+        'StrictHostKeyChecking=accept-new',
+        '-o',
+        'ConnectTimeout=12',
+        entry.alias,
+        remoteScript,
+      ],
+    );
+
+    final stdoutStr = (result.stdout ?? '').toString();
+    final stderrStr = (result.stderr ?? '').toString();
+    if (result.exitCode != 0) {
+      throw Exception(
+        stderrStr.trim().isNotEmpty
+            ? stderrStr.trim()
+            : 'SSH exited with code ${result.exitCode}',
+      );
+    }
+
+    for (final line in stdoutStr.split('\n')) {
+      final trimmed = line.trim();
+      if (trimmed.startsWith('orbit://pair/')) {
+        return trimmed;
+      }
+    }
+    throw Exception('未在 ${entry.alias} 获取到有效配对信息');
+  }
+
+  /// Open a background SSH local port-forward (`127.0.0.1:<freePort> -> 127.0.0.1:6868`)
+  /// so Desktop clients connect through existing SSH keys without opening firewall ports or configuring relays!
+  static Future<(Process, String)> startLocalSshTunnel(String sshAlias) async {
+    final probe = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final localPort = probe.port;
+    await probe.close();
+
+    final sshBin = File('/usr/bin/ssh').existsSync() ? '/usr/bin/ssh' : 'ssh';
+    final proc = await Process.start(
+      sshBin,
+      [
+        '-N',
+        '-o',
+        'BatchMode=yes',
+        '-o',
+        'StrictHostKeyChecking=accept-new',
+        '-o',
+        'ExitOnForwardFailure=yes',
+        '-o',
+        'ServerAliveInterval=15',
+        '-o',
+        'ServerAliveCountMax=3',
+        '-o',
+        'ConnectTimeout=10',
+        '-L',
+        '127.0.0.1:$localPort:127.0.0.1:6868',
+        sshAlias,
+      ],
+    );
+
+    // Wait up to 4.5s for the forwarded local port to accept TCP connections
+    for (var i = 0; i < 30; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      try {
+        final sock = await Socket.connect(
+          InternetAddress.loopbackIPv4,
+          localPort,
+          timeout: const Duration(milliseconds: 200),
+        );
+        sock.destroy();
+        return (proc, 'ws://127.0.0.1:$localPort/ws');
+      } catch (_) {}
+    }
+
+    proc.kill();
+    throw Exception('SSH 隧道建立超时 ($sshAlias)');
+  }
 }

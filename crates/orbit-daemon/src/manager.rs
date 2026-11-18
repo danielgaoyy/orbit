@@ -57,6 +57,16 @@ pub struct AgentOrchestrator {
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
 
+pub struct CreateAgentSpec {
+    pub cwd: String,
+    pub title: Option<String>,
+    pub provider: ProviderKind,
+    pub model: Option<String>,
+    pub mode: SessionMode,
+    pub initial_prompt: String,
+    pub worktree: bool,
+}
+
 impl AgentOrchestrator {
     pub async fn new(home_dir: PathBuf, store: Arc<OrbitStore>) -> Arc<Self> {
         let orbit_exe = resolve_orbit_exe();
@@ -136,13 +146,17 @@ impl AgentOrchestrator {
 
     pub async fn create_and_start_agent(
         self: &Arc<Self>,
-        cwd: String,
-        title: Option<String>,
-        provider: ProviderKind,
-        model: Option<String>,
-        mode: SessionMode,
-        initial_prompt: String,
+        spec: CreateAgentSpec,
     ) -> anyhow::Result<AgentSummary> {
+        let CreateAgentSpec {
+            cwd,
+            title,
+            provider,
+            model,
+            mode,
+            initial_prompt,
+            worktree,
+        } = spec;
         let executable = find_provider_executable(provider).ok_or_else(|| {
             anyhow::anyhow!(
                 "{} binary (`{}`) not found on host PATH",
@@ -151,7 +165,18 @@ impl AgentOrchestrator {
             )
         })?;
 
-        let ws = self.ensure_workspace(&cwd, None, None, None).await?;
+        let ws = if worktree {
+            let auto_branch = auto_worktree_branch(&initial_prompt);
+            match self
+                .ensure_workspace(&cwd, None, Some(auto_branch), None)
+                .await
+            {
+                Ok(isolated) => isolated,
+                Err(_) => self.ensure_workspace(&cwd, None, None, None).await?,
+            }
+        } else {
+            self.ensure_workspace(&cwd, None, None, None).await?
+        };
         let now = Utc::now();
         let agent_id = format!("ag_{}", Uuid::new_v4().simple());
         let computed_title = title.unwrap_or_else(|| summarize_prompt_title(&initial_prompt));
@@ -189,8 +214,16 @@ impl AgentOrchestrator {
         agent_id: &str,
         prompt: String,
     ) -> anyhow::Result<()> {
+        let needs_handoff = !self.live_agents.read().await.contains_key(agent_id)
+            && self.store.get_persistence_ref(agent_id)?.is_none();
+        let handoff_context = if needs_handoff {
+            self.build_handoff_context(agent_id)
+        } else {
+            None
+        };
         let cmd_tx = self.get_or_resume_driver(agent_id).await?;
-        self.dispatch_user_prompt(agent_id, &cmd_tx, prompt).await
+        self.dispatch_user_prompt_with_handoff(agent_id, &cmd_tx, prompt, handoff_context)
+            .await
     }
 
     async fn dispatch_user_prompt(
@@ -198,6 +231,17 @@ impl AgentOrchestrator {
         agent_id: &str,
         cmd_tx: &mpsc::Sender<DriverCommand>,
         prompt: String,
+    ) -> anyhow::Result<()> {
+        self.dispatch_user_prompt_with_handoff(agent_id, cmd_tx, prompt, None)
+            .await
+    }
+
+    async fn dispatch_user_prompt_with_handoff(
+        &self,
+        agent_id: &str,
+        cmd_tx: &mpsc::Sender<DriverCommand>,
+        prompt: String,
+        handoff_context: Option<String>,
     ) -> anyhow::Result<()> {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let ev = self.store.append_timeline_event(
@@ -211,11 +255,48 @@ impl AgentOrchestrator {
         )?;
         let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
 
+        let wire_prompt = match handoff_context {
+            Some(ctx) => format!("{ctx}\n\n[Latest User Request]\n{prompt}"),
+            None => prompt,
+        };
+
         cmd_tx
-            .send(DriverCommand::SendPrompt { turn_id, prompt })
+            .send(DriverCommand::SendPrompt {
+                turn_id,
+                prompt: wire_prompt,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("agent session channel closed"))?;
         Ok(())
+    }
+
+    fn build_handoff_context(&self, agent_id: &str) -> Option<String> {
+        let (events, _) = self.store.fetch_timeline_since(agent_id, 0, 80).ok()?;
+        let mut turns = Vec::new();
+        for ev in events {
+            match ev.payload {
+                TimelinePayload::UserPrompt { text, .. } => {
+                    turns.push(format!("User: {text}"));
+                }
+                TimelinePayload::AssistantMessage {
+                    text,
+                    streaming: false,
+                    ..
+                } => {
+                    let clipped: String = text.chars().take(600).collect();
+                    turns.push(format!("Assistant: {clipped}"));
+                }
+                _ => {}
+            }
+        }
+        if turns.is_empty() {
+            return None;
+        }
+        let start = turns.len().saturating_sub(6);
+        Some(format!(
+            "[Prior Conversation Context in this Workspace]\n{}",
+            turns[start..].join("\n\n")
+        ))
     }
 
     pub async fn interrupt_agent(&self, agent_id: &str) -> anyhow::Result<()> {
@@ -229,6 +310,43 @@ impl AgentOrchestrator {
         self.store.update_agent_mode(agent_id, &mode)?;
         if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
             let _ = tx.send(DriverCommand::SetMode { mode }).await;
+        }
+        if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
+    }
+
+    pub async fn switch_agent_provider(
+        &self,
+        agent_id: &str,
+        provider: ProviderKind,
+    ) -> anyhow::Result<()> {
+        let _ = find_provider_executable(provider).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} CLI (`{}`) is not installed on this host",
+                provider.display_name(),
+                provider.default_binary()
+            )
+        })?;
+
+        if let Some(tx) = self.live_agents.write().await.remove(agent_id) {
+            let _ = tx.send(DriverCommand::Shutdown).await;
+        }
+        self.store.switch_agent_provider(agent_id, provider)?;
+
+        if let Ok(ev) = self.store.append_timeline_event(
+            agent_id,
+            1,
+            None,
+            TimelinePayload::Notice {
+                level: "info".into(),
+                message: format!("已切换至 {} 接力当前对话", provider.display_name()),
+            },
+        ) {
+            let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
         }
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
             let _ = self
@@ -627,5 +745,29 @@ fn summarize_prompt_title(prompt: &str) -> String {
         let mut s: String = trimmed.chars().take(48).collect();
         s.push('…');
         s
+    }
+}
+
+fn auto_worktree_branch(prompt: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in prompt.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !slug.is_empty() && !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+        if slug.len() >= 20 {
+            break;
+        }
+    }
+    let clean = slug.trim_matches('-');
+    let short_id = &Uuid::new_v4().simple().to_string()[..4];
+    if clean.is_empty() {
+        format!("orbit/task-{short_id}")
+    } else {
+        format!("orbit/{clean}-{short_id}")
     }
 }

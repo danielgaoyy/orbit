@@ -2,13 +2,30 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 enum ProviderKind {
-  antigravity('antigravity', 'Antigravity'),
-  codex('codex', 'Codex'),
-  claudeCode('claude_code', 'Claude Code');
+  antigravity(
+    'antigravity',
+    'Antigravity',
+    'Antigravity',
+    '深度推理与多步编排',
+  ),
+  codex(
+    'codex',
+    'Codex',
+    'Codex',
+    '极速代码修改与测试闭环',
+  ),
+  claudeCode(
+    'claude_code',
+    'Claude Code',
+    'Claude',
+    '复杂架构重构与细致审查',
+  );
 
-  const ProviderKind(this.wire, this.label);
+  const ProviderKind(this.wire, this.label, this.shortLabel, this.subtitle);
   final String wire;
   final String label;
+  final String shortLabel;
+  final String subtitle;
 
   static ProviderKind fromWire(String? raw) {
     for (final p in ProviderKind.values) {
@@ -19,14 +36,43 @@ enum ProviderKind {
 }
 
 enum SessionMode {
-  defaultMode('default', 'Default'),
-  acceptEdits('accept_edits', 'Accept Edits'),
-  plan('plan', 'Plan'),
-  fullAccess('full_access', 'Full Access');
+  acceptEdits(
+    'accept_edits',
+    '自动改码',
+    '自动',
+    '默认推荐：自动读写项目代码，仅在外部或高危命令前请你点一下确认',
+  ),
+  plan(
+    'plan',
+    '先出方案',
+    '方案',
+    '只读分析代码并给出方案选择题，拍板前绝不改动任何文件',
+  ),
+  fullAccess(
+    'full_access',
+    '全自动推进',
+    '全自动',
+    '全程自主改码、跑测试并修复报错，适合挂在后台独立跑完长任务',
+  ),
+  defaultMode(
+    'default',
+    '谨慎确认',
+    '谨慎',
+    '每次文件修改与命令执行前均请求确认',
+  );
 
-  const SessionMode(this.wire, this.label);
+  const SessionMode(this.wire, this.label, this.shortLabel, this.description);
   final String wire;
   final String label;
+  final String shortLabel;
+  final String description;
+
+  /// Top 3 clean human choices shown in the inline composer menu.
+  static const List<SessionMode> primaryChoices = [
+    SessionMode.acceptEdits,
+    SessionMode.plan,
+    SessionMode.fullAccess,
+  ];
 
   static SessionMode fromWire(dynamic raw) {
     if (raw is String) {
@@ -34,7 +80,7 @@ enum SessionMode {
         if (m.wire == raw) return m;
       }
     }
-    return SessionMode.defaultMode;
+    return SessionMode.acceptEdits;
   }
 }
 
@@ -52,6 +98,7 @@ class HostProfile {
     required this.daemonPubkeyB64,
     required this.directEndpoints,
     this.relayUrl,
+    this.sshAlias,
     this.lastConnectionError,
     this.routeState = HostRouteState.disconnected,
     this.availableProviders = const [
@@ -66,9 +113,14 @@ class HostProfile {
   final String daemonPubkeyB64;
   final List<String> directEndpoints;
   String? relayUrl;
+  String? sshAlias;
   String? lastConnectionError;
   HostRouteState routeState;
   List<ProviderKind> availableProviders;
+
+  bool get isOnline =>
+      routeState == HostRouteState.onlineDirect ||
+      routeState == HostRouteState.onlineRelay;
 
   factory HostProfile.fromPairingJson(Map<String, dynamic> json) {
     return HostProfile(
@@ -79,6 +131,7 @@ class HostProfile {
           .map((e) => e.toString())
           .toList(),
       relayUrl: json['relay_url'] as String?,
+      sshAlias: json['ssh_alias'] as String?,
     );
   }
 
@@ -88,6 +141,7 @@ class HostProfile {
         'daemon_pubkey_b64': daemonPubkeyB64,
         'direct_endpoints': directEndpoints,
         'relay_url': relayUrl,
+        if (sshAlias != null) 'ssh_alias': sshAlias,
       };
 }
 
@@ -117,6 +171,66 @@ class WorkspaceSummary {
   }
 }
 
+class DiscoveredProjectItem {
+  DiscoveredProjectItem({
+    required this.path,
+    required this.name,
+    this.gitBranch,
+    this.isGitRepo = false,
+    this.lastModifiedUnix = 0,
+  });
+
+  final String path;
+  final String name;
+  final String? gitBranch;
+  final bool isGitRepo;
+  final int lastModifiedUnix;
+
+  factory DiscoveredProjectItem.fromJson(Map<String, dynamic> json) {
+    return DiscoveredProjectItem(
+      path: json['path'] as String,
+      name: (json['name'] as String?) ?? 'workspace',
+      gitBranch: json['git_branch'] as String?,
+      isGitRepo: (json['is_git_repo'] as bool?) ?? false,
+      lastModifiedUnix: (json['last_modified_unix'] as num?)?.toInt() ?? 0,
+    );
+  }
+}
+
+/// Cross-host selectable project option for the unified chat composer.
+class ProjectChoice {
+  const ProjectChoice({
+    required this.hostId,
+    required this.hostName,
+    required this.name,
+    required this.path,
+    this.gitBranch,
+    this.lastModifiedUnix = 0,
+  });
+
+  final String hostId;
+  final String hostName;
+  final String name;
+  final String path;
+  final String? gitBranch;
+  final int lastModifiedUnix;
+
+  String get key => '$hostId::$path';
+
+  String get displayPath {
+    final idx = path.indexOf('/workspace/');
+    if (idx > 0) return '~${path.substring(idx)}';
+    final parts = path.split('/');
+    if (parts.length > 3 && parts[1] == 'Users') {
+      return '~/${parts.sublist(3).join('/')}';
+    }
+    if (parts.length > 3 && parts[1] == 'home') {
+      return '~/${parts.sublist(3).join('/')}';
+    }
+    return path;
+  }
+}
+
 class AgentSummary {
   AgentSummary({
     required this.agentId,
@@ -128,21 +242,34 @@ class AgentSummary {
     required this.statusTag,
     this.errorMessage,
     this.latestSeq = 0,
+    this.updatedAtIso,
   });
 
   final String agentId;
   final String workspaceId;
   final String cwd;
   final String title;
-  final ProviderKind provider;
+  ProviderKind provider;
   SessionMode mode;
   String statusTag;
   String? errorMessage;
   int latestSeq;
+  final String? updatedAtIso;
 
   bool get isRunning =>
-      statusTag == 'running' || statusTag == 'autonomous_wakeup';
+      statusTag == 'running' ||
+      statusTag == 'autonomous_wakeup' ||
+      statusTag == 'initializing';
   bool get isAwaitingPermission => statusTag == 'awaiting_permission';
+
+  String get projectName {
+    final clean = cwd.replaceAll(RegExp(r'/+$'), '');
+    final idx = clean.lastIndexOf('/');
+    if (idx >= 0 && idx + 1 < clean.length) {
+      return clean.substring(idx + 1);
+    }
+    return clean.isEmpty ? 'workspace' : clean;
+  }
 
   factory AgentSummary.fromJson(Map<String, dynamic> json) {
     final statusObj = json['status'] as Map<String, dynamic>? ?? {};
@@ -156,8 +283,25 @@ class AgentSummary {
       statusTag: (statusObj['state'] as String?) ?? 'idle',
       errorMessage: statusObj['message'] as String?,
       latestSeq: (json['latest_seq'] as num?)?.toInt() ?? 0,
+      updatedAtIso: json['updated_at'] as String?,
     );
   }
+}
+
+class AgentWithHost {
+  const AgentWithHost({
+    required this.hostId,
+    required this.hostName,
+    required this.agent,
+    this.gitBranch,
+    this.isWorktree = false,
+  });
+
+  final String hostId;
+  final String hostName;
+  final AgentSummary agent;
+  final String? gitBranch;
+  final bool isWorktree;
 }
 
 class QuestionItem {
@@ -224,6 +368,8 @@ class QuotaWindow {
   final double usedPercent;
   final String? resetsAt;
 
+  double get remainingPercent => (100.0 - usedPercent).clamp(0.0, 100.0);
+
   factory QuotaWindow.fromJson(Map<String, dynamic> json) {
     return QuotaWindow(
       label: json['label'] as String,
@@ -247,6 +393,18 @@ class ProviderQuotaSnapshot {
   final List<QuotaWindow> windows;
   final double? creditsRemaining;
   final String? error;
+
+  /// Lowest remaining percentage across active rolling windows (null if unavailable).
+  int? get minRemainingPercent {
+    if (windows.isEmpty) return null;
+    var minRem = 100.0;
+    for (final w in windows) {
+      if (w.remainingPercent < minRem) {
+        minRem = w.remainingPercent;
+      }
+    }
+    return minRem.round();
+  }
 
   factory ProviderQuotaSnapshot.fromJson(Map<String, dynamic> json) {
     return ProviderQuotaSnapshot(

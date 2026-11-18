@@ -4,6 +4,7 @@
 //! supervises detached Shims, serves direct WebSocket clients, and optionally registers outbound to Relay
 //! with full `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
 
+pub mod discovery;
 pub mod git;
 pub mod manager;
 
@@ -618,6 +619,18 @@ async fn handle_wire_rpc(
         WireMessage::Ping { ts_ms } => Some(WireMessage::Pong { ts_ms }),
 
         // Workspaces & Git
+        WireMessage::DiscoverProjects { request_id } => {
+            let store = runtime.store.clone();
+            let projects = tokio::task::spawn_blocking(move || {
+                crate::discovery::discover_host_projects(&store)
+            })
+            .await
+            .unwrap_or_default();
+            Some(WireMessage::DiscoveredProjectsSnapshot {
+                request_id,
+                projects,
+            })
+        }
         WireMessage::ListWorkspaces { request_id } => match runtime.store.list_workspaces() {
             Ok(workspaces) => Some(WireMessage::WorkspacesSnapshot {
                 request_id,
@@ -677,10 +690,19 @@ async fn handle_wire_rpc(
             model,
             mode,
             initial_prompt,
+            worktree,
         } => {
             match runtime
                 .orchestrator
-                .create_and_start_agent(cwd, title, provider, model, mode, initial_prompt)
+                .create_and_start_agent(crate::manager::CreateAgentSpec {
+                    cwd,
+                    title,
+                    provider,
+                    model,
+                    mode,
+                    initial_prompt,
+                    worktree,
+                })
                 .await
             {
                 Ok(agent) => {
@@ -715,6 +737,18 @@ async fn handle_wire_rpc(
         } => match runtime.orchestrator.set_session_mode(&agent_id, mode).await {
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "set_mode_failed", e)),
+        },
+        WireMessage::SwitchAgentProvider {
+            request_id,
+            agent_id,
+            provider,
+        } => match runtime
+            .orchestrator
+            .switch_agent_provider(&agent_id, provider)
+            .await
+        {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "switch_provider_failed", e)),
         },
         WireMessage::ArchiveAgent {
             request_id,

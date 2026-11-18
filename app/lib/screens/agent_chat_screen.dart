@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../core/fleet_controller.dart';
 import '../core/models.dart';
+import '../widgets/orbit_chat_composer.dart';
 
 class AgentChatScreen extends StatefulWidget {
   const AgentChatScreen({
@@ -21,22 +22,54 @@ class AgentChatScreen extends StatefulWidget {
   State<AgentChatScreen> createState() => _AgentChatScreenState();
 }
 
+sealed class _RenderEntry {}
+
+class _SingleEventEntry extends _RenderEntry {
+  _SingleEventEntry(this.event);
+  final TimelineEvent event;
+}
+
+class _ToolGroupEntry extends _RenderEntry {
+  _ToolGroupEntry(this.events);
+  final List<TimelineEvent> events;
+}
+
 class _AgentChatScreenState extends State<AgentChatScreen> {
-  final _inputCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
+  int _lastEventCount = 0;
 
   @override
   void dispose() {
-    _inputCtrl.dispose();
     _scrollCtrl.dispose();
     super.dispose();
   }
 
-  void _submitPrompt() {
-    final txt = _inputCtrl.text.trim();
-    if (txt.isEmpty) return;
-    _inputCtrl.clear();
-    widget.controller.sendPrompt(widget.hostId, widget.agentId, txt);
+  List<_RenderEntry> _coalesceDisplayItems(List<TimelineEvent> raw) {
+    final result = <_RenderEntry>[];
+    var pendingTools = <TimelineEvent>[];
+
+    void flushTools() {
+      if (pendingTools.isNotEmpty) {
+        result.add(_ToolGroupEntry(List.of(pendingTools)));
+        pendingTools = <TimelineEvent>[];
+      }
+    }
+
+    for (final ev in raw) {
+      if (ev.type == 'tool_call') {
+        pendingTools.add(ev);
+        continue;
+      }
+      if (ev.type == 'status_changed' ||
+          ev.type == 'permission_resolved' ||
+          ev.type == 'question_resolved') {
+        continue;
+      }
+      flushTools();
+      result.add(_SingleEventEntry(ev));
+    }
+    flushTools();
+    return result;
   }
 
   @override
@@ -48,187 +81,102 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
         final agent = session?.agents[widget.agentId];
         final events = session?.timelines[widget.agentId] ?? const [];
 
+        if (events.length != _lastEventCount) {
+          _lastEventCount = events.length;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (_scrollCtrl.hasClients) {
+              _scrollCtrl.animateTo(
+                _scrollCtrl.position.maxScrollExtent,
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOut,
+              );
+            }
+          });
+        }
+
         final resolvedPermIds = <String>{
           for (final e in events)
             if (e.type == 'permission_resolved')
               e.payload['request_id'] as String? ?? '',
         };
-        final resolvedQuestionIds = <String>{
+        final resolvedQuestionMap = <String, List<dynamic>>{
           for (final e in events)
             if (e.type == 'question_resolved')
-              e.payload['request_id'] as String? ?? '',
+              (e.payload['request_id'] as String? ?? ''):
+                  (e.payload['answers'] as List<dynamic>? ?? const []),
         };
+
+        final displayItems = _coalesceDisplayItems(events);
 
         final bodyContent = Column(
           children: [
-            if (widget.embedded && agent != null)
-              Container(
-                height: 46,
-                padding: const EdgeInsets.symmetric(horizontal: 18),
-                decoration: const BoxDecoration(
-                  color: Color(0xFF0E131E),
-                  border: Border(
-                    bottom: BorderSide(color: Color(0xFF1E293B)),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(
-                      Icons.auto_awesome_rounded,
-                      size: 16,
-                      color: Color(0xFF38BDF8),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        '${agent.title}  ·  ${agent.provider.label}  ·  ${agent.cwd}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 12.5,
-                          color: Colors.white70,
-                        ),
-                      ),
-                    ),
-                    PopupMenuButton<SessionMode>(
-                      tooltip: '切换权限模式',
-                      onSelected: (m) => widget.controller
-                          .setSessionMode(widget.hostId, widget.agentId, m),
-                      itemBuilder: (_) => [
-                        for (final m in SessionMode.values)
-                          PopupMenuItem(
-                            value: m,
-                            child: Text(
-                              m == agent.mode ? '✓ ${m.label}' : m.label,
-                            ),
-                          ),
-                      ],
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 10,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.white.withValues(alpha: 0.06),
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.white12),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.shield_outlined, size: 14),
-                            const SizedBox(width: 5),
-                            Text(
-                              agent.mode.label,
-                              style: const TextStyle(fontSize: 11.5),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    if (agent.isRunning) ...[
-                      const SizedBox(width: 8),
-                      TextButton.icon(
-                        onPressed: () => widget.controller
-                            .interruptAgent(widget.hostId, widget.agentId),
-                        icon: const Icon(
-                          Icons.stop_circle_rounded,
-                          size: 16,
-                          color: Colors.redAccent,
-                        ),
-                        label: const Text(
-                          '中断',
-                          style: TextStyle(color: Colors.redAccent, fontSize: 12),
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
             Expanded(
-              child: events.isEmpty
-                  ? const Center(
+              child: displayItems.isEmpty
+                  ? Center(
                       child: Text(
-                        'Waiting for timeline stream…',
-                        style: TextStyle(color: Colors.white54),
+                        agent?.isRunning == true ? '正在思考与准备上下文…' : '等待对话消息…',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          color: Colors.white38,
+                        ),
                       ),
                     )
                   : ListView.builder(
                       controller: _scrollCtrl,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 20,
-                        vertical: 16,
-                      ),
-                      itemCount: events.length,
+                      padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+                      itemCount: displayItems.length,
                       itemBuilder: (context, i) => Center(
                         child: ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 860),
-                          child: _buildEventItem(
+                          constraints: const BoxConstraints(maxWidth: 740),
+                          child: _buildDisplayEntry(
                             context,
-                            events[i],
+                            displayItems[i],
                             resolvedPermIds,
-                            resolvedQuestionIds,
+                            resolvedQuestionMap,
                           ),
                         ),
                       ),
                     ),
             ),
-            Center(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 900),
-                child: _buildComposer(),
+            SafeArea(
+              top: false,
+              child: Center(
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 760),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 14),
+                    child: OrbitChatComposer(
+                      controller: widget.controller,
+                      isNewChat: false,
+                      isRunning: agent?.isRunning ?? false,
+                      activeHostId: widget.hostId,
+                      provider:
+                          agent?.provider ?? widget.controller.draftProvider,
+                      mode: agent?.mode ?? widget.controller.draftMode,
+                      onSelectProvider: (p) => widget.controller
+                          .switchAgentProvider(widget.hostId, widget.agentId, p),
+                      onSelectMode: (m) => widget.controller
+                          .setSessionMode(widget.hostId, widget.agentId, m),
+                      onSend: (txt) => widget.controller
+                          .sendPrompt(widget.hostId, widget.agentId, txt),
+                      onStop: () => widget.controller
+                          .interruptAgent(widget.hostId, widget.agentId),
+                    ),
+                  ),
+                ),
               ),
             ),
           ],
         );
 
-        if (widget.embedded) {
-          return bodyContent;
-        }
+        if (widget.embedded) return bodyContent;
 
         return Scaffold(
           appBar: AppBar(
-            title: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  agent?.title ?? widget.agentId,
-                  style: const TextStyle(fontSize: 15),
-                ),
-                Text(
-                  '${agent?.provider.label ?? ""} · ${agent?.statusTag ?? "idle"}',
-                  style: const TextStyle(fontSize: 11, color: Colors.white60),
-                ),
-              ],
+            title: Text(
+              agent?.title ?? widget.agentId,
+              style: const TextStyle(fontSize: 15),
             ),
-            actions: [
-              if (agent != null)
-                PopupMenuButton<SessionMode>(
-                  tooltip: 'Switch Permission Mode',
-                  icon: const Icon(Icons.shield_outlined),
-                  onSelected: (m) => widget.controller
-                      .setSessionMode(widget.hostId, widget.agentId, m),
-                  itemBuilder: (_) => [
-                    for (final m in SessionMode.values)
-                      PopupMenuItem(
-                        value: m,
-                        child: Text(
-                          m == agent.mode ? '✓ ${m.label}' : m.label,
-                        ),
-                      ),
-                  ],
-                ),
-              if (agent != null && agent.isRunning)
-                IconButton(
-                  tooltip: 'Interrupt Active Turn',
-                  icon: const Icon(
-                    Icons.stop_circle_rounded,
-                    color: Colors.redAccent,
-                  ),
-                  onPressed: () => widget.controller
-                      .interruptAgent(widget.hostId, widget.agentId),
-                ),
-            ],
           ),
           body: bodyContent,
         );
@@ -236,159 +184,75 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
     );
   }
 
-  Widget _buildEventItem(
+  Widget _buildDisplayEntry(
     BuildContext context,
-    TimelineEvent ev,
+    _RenderEntry entry,
     Set<String> resolvedPerms,
-    Set<String> resolvedQuestions,
+    Map<String, List<dynamic>> resolvedQuestions,
   ) {
+    if (entry is _ToolGroupEntry) {
+      return _ToolGroupTraceWidget(events: entry.events);
+    }
+
+    final ev = (entry as _SingleEventEntry).event;
     final p = ev.payload;
+
     switch (ev.type) {
       case 'user_prompt':
         return Align(
           alignment: Alignment.centerRight,
           child: Container(
-            margin: const EdgeInsets.symmetric(vertical: 6),
+            margin: const EdgeInsets.symmetric(vertical: 8),
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
-            constraints: const BoxConstraints(maxWidth: 620),
+            constraints: const BoxConstraints(maxWidth: 560),
             decoration: BoxDecoration(
-              color: const Color(0xFF1E3A5F),
-              borderRadius: BorderRadius.circular(14),
+              color: const Color(0xFF1C2230),
+              borderRadius: BorderRadius.circular(18),
             ),
             child: SelectableText(
               (p['text'] as String?) ?? '',
-              style: const TextStyle(fontSize: 14, height: 1.4),
+              style: const TextStyle(
+                fontSize: 14.5,
+                height: 1.48,
+                color: Color(0xFFF3F4F6),
+              ),
             ),
           ),
         );
 
       case 'assistant_thinking':
-        return Card(
-          margin: const EdgeInsets.symmetric(vertical: 4),
-          child: ExpansionTile(
-            dense: true,
-            leading: const Icon(
-              Icons.psychology_rounded,
-              size: 18,
-              color: Colors.white54,
-            ),
-            title: const Text(
-              'Reasoning Trace',
-              style: TextStyle(fontSize: 12, color: Colors.white70),
-            ),
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                child: SizedBox(
-                  width: double.infinity,
-                  child: SelectableText(
-                    (p['text'] as String?) ?? '',
-                    style: const TextStyle(
-                      fontSize: 12,
-                      color: Colors.white60,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        );
+        return _ThinkingTraceWidget(text: (p['text'] as String?) ?? '');
 
       case 'assistant_message':
-        final streaming = (p['streaming'] as bool?) ?? false;
-        return Container(
-          width: double.infinity,
-          margin: const EdgeInsets.symmetric(vertical: 6),
-          padding: const EdgeInsets.all(15),
-          decoration: BoxDecoration(
-            color: const Color(0xFF111622),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(
-              color: streaming
-                  ? const Color(0xFF38BDF8).withValues(alpha: 0.5)
-                  : const Color(0xFF1E293B),
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: SizedBox(
+            width: double.infinity,
+            child: SelectableText(
+              (p['text'] as String?) ?? '',
+              style: const TextStyle(
+                fontSize: 14.5,
+                height: 1.65,
+                color: Color(0xFFE6E9EF),
+              ),
             ),
-          ),
-          child: SelectableText(
-            (p['text'] as String?) ?? '',
-            style: const TextStyle(fontSize: 14, height: 1.5),
           ),
         );
 
-      case 'tool_call':
-        final status = (p['status'] as String?) ?? 'running';
-        final detail =
-            Map<String, dynamic>.from(p['detail'] as Map? ?? const {});
-        final kind = (detail['kind'] as String?) ?? 'generic';
-        final summary = switch (kind) {
-          'shell' => '\$ ${detail["command"] ?? ""}',
-          'file_edit' => 'Edit ${detail["path"] ?? ""}',
-          'file_read' => 'Read ${detail["path"] ?? ""}',
-          'search' => 'Search `${detail["query"] ?? ""}`',
-          'subagent' => 'Subagent (${detail["role"] ?? "worker"})',
-          _ => (detail['tool_name'] as String?) ?? 'tool',
-        };
-        final subOutput =
-            (detail['output_preview'] ?? detail['unified_diff']) as String?;
-
-        return Card(
-          margin: const EdgeInsets.symmetric(vertical: 4),
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Icon(
-                      status == 'completed'
-                          ? Icons.check_circle_outline
-                          : status == 'failed'
-                              ? Icons.error_outline
-                              : Icons.autorenew_rounded,
-                      size: 16,
-                      color: status == 'completed'
-                          ? Colors.greenAccent
-                          : status == 'failed'
-                              ? Colors.redAccent
-                              : const Color(0xFF38BDF8),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        summary,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontFamily: 'monospace',
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                if (subOutput != null && subOutput.trim().isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.black38,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      subOutput,
-                      maxLines: 10,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 11.5,
-                        fontFamily: 'monospace',
-                        color: Colors.white70,
-                      ),
-                    ),
-                  ),
-                ],
-              ],
+      case 'notice':
+        return Padding(
+          padding: const EdgeInsets.symmetric(vertical: 6),
+          child: Center(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.04),
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Text(
+                (p['message'] as String?) ?? '',
+                style: const TextStyle(fontSize: 11.5, color: Colors.white54),
+              ),
             ),
           ),
         );
@@ -396,13 +260,21 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
       case 'permission_request':
         final reqId = (p['request_id'] as String?) ?? '';
         final resolved = resolvedPerms.contains(reqId);
+        final detail =
+            Map<String, dynamic>.from(p['detail'] as Map? ?? const {});
+        final cmdPreview = detail['command']?.toString() ??
+            detail['path']?.toString() ??
+            detail['tool_name']?.toString();
+
         return Container(
-          margin: const EdgeInsets.symmetric(vertical: 8),
-          padding: const EdgeInsets.all(14),
+          margin: const EdgeInsets.symmetric(vertical: 10),
+          padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: const Color(0xFF282012),
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: Colors.amber.shade600),
+            color: const Color(0xFF191714),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: const Color(0xFFFBBF24).withValues(alpha: 0.30),
+            ),
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -411,47 +283,101 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
                 children: [
                   const Icon(
                     Icons.gpp_maybe_rounded,
-                    color: Colors.amberAccent,
-                    size: 20,
+                    color: Color(0xFFFBBF24),
+                    size: 18,
                   ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      (p['title'] as String?) ?? 'Permission Required',
-                      style: const TextStyle(fontWeight: FontWeight.bold),
+                      (p['title'] as String?) ?? '需要确认操作权限',
+                      style: const TextStyle(
+                        fontSize: 13.5,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                   ),
                 ],
               ),
+              if (cmdPreview != null && cmdPreview.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withValues(alpha: 0.38),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(
+                      color: Colors.white.withValues(alpha: 0.06),
+                    ),
+                  ),
+                  child: SelectableText(
+                    cmdPreview,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontFamily: 'monospace',
+                      color: Color(0xFFFDE68A),
+                    ),
+                  ),
+                ),
+              ],
               const SizedBox(height: 12),
               if (resolved)
-                const Text(
-                  'Decision submitted.',
-                  style: TextStyle(fontSize: 12, color: Colors.white60),
+                const Row(
+                  children: [
+                    Icon(
+                      Icons.check_circle_outline_rounded,
+                      size: 15,
+                      color: Color(0xFF34D399),
+                    ),
+                    SizedBox(width: 6),
+                    Text(
+                      '已提交确认结果',
+                      style: TextStyle(fontSize: 12, color: Colors.white54),
+                    ),
+                  ],
                 )
               else
                 Wrap(
                   spacing: 8,
+                  runSpacing: 8,
                   children: [
                     FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFFF3F4F6),
+                        foregroundColor: const Color(0xFF0B0D11),
+                        visualDensity: VisualDensity.compact,
+                      ),
                       onPressed: () => widget.controller.resolvePermission(
                         widget.hostId,
                         widget.agentId,
                         reqId,
                         'allow',
                       ),
-                      child: const Text('Allow Once'),
+                      child: const Text(
+                        '允许执行',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
                     ),
                     OutlinedButton(
+                      style: OutlinedButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        side: BorderSide(
+                          color: Colors.white.withValues(alpha: 0.14),
+                        ),
+                      ),
                       onPressed: () => widget.controller.resolvePermission(
                         widget.hostId,
                         widget.agentId,
                         reqId,
                         'allow_always',
                       ),
-                      child: const Text('Always Allow'),
+                      child: const Text('本对话不再询问'),
                     ),
                     TextButton(
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                      ),
                       onPressed: () => widget.controller.resolvePermission(
                         widget.hostId,
                         widget.agentId,
@@ -459,8 +385,8 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
                         'deny',
                       ),
                       child: const Text(
-                        'Deny',
-                        style: TextStyle(color: Colors.redAccent),
+                        '拒绝',
+                        style: TextStyle(color: Color(0xFFFB7185)),
                       ),
                     ),
                   ],
@@ -471,14 +397,14 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
 
       case 'question_request':
         final reqId = (p['request_id'] as String?) ?? '';
-        final resolved = resolvedQuestions.contains(reqId);
+        final resolvedAns = resolvedQuestions[reqId];
         final rawQs = (p['questions'] as List<dynamic>? ?? [])
             .map((q) => QuestionItem.fromJson(q as Map<String, dynamic>))
             .toList();
-        return _QuestionPromptCard(
+        return _QuestionChoiceCard(
           requestId: reqId,
           questions: rawQs,
-          resolved: resolved,
+          resolvedAnswers: resolvedAns,
           onSubmit: (answers) => widget.controller.answerQuestion(
             widget.hostId,
             widget.agentId,
@@ -491,78 +417,236 @@ class _AgentChatScreenState extends State<AgentChatScreen> {
         return const SizedBox.shrink();
     }
   }
+}
 
-  Widget _buildComposer() {
-    return SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 14),
-        child: Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _inputCtrl,
-                minLines: 1,
-                maxLines: 4,
-                textInputAction: TextInputAction.send,
-                onSubmitted: (_) => _submitPrompt(),
-                decoration: InputDecoration(
-                  hintText: 'Message or steer active turn…',
-                  filled: true,
-                  fillColor: const Color(0xFF111622),
-                  contentPadding:
-                      const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    borderSide: const BorderSide(color: Color(0xFF1E293B)),
+class _ThinkingTraceWidget extends StatefulWidget {
+  const _ThinkingTraceWidget({required this.text});
+  final String text;
+
+  @override
+  State<_ThinkingTraceWidget> createState() => _ThinkingTraceWidgetState();
+}
+
+class _ThinkingTraceWidgetState extends State<_ThinkingTraceWidget> {
+  bool _open = false;
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.text.trim().isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: () => setState(() => _open = !_open),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _open
+                        ? Icons.keyboard_arrow_down_rounded
+                        : Icons.keyboard_arrow_right_rounded,
+                    size: 16,
+                    color: Colors.white38,
                   ),
+                  const SizedBox(width: 4),
+                  const Text(
+                    '思考过程',
+                    style: TextStyle(fontSize: 12, color: Colors.white38),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_open)
+            Container(
+              margin: const EdgeInsets.only(left: 8, top: 4),
+              padding: const EdgeInsets.only(left: 12),
+              decoration: BoxDecoration(
+                border: Border(
+                  left: BorderSide(color: Colors.white.withValues(alpha: 0.10)),
+                ),
+              ),
+              child: SelectableText(
+                widget.text,
+                style: const TextStyle(
+                  fontSize: 12,
+                  height: 1.5,
+                  color: Colors.white54,
                 ),
               ),
             ),
-            const SizedBox(width: 10),
-            IconButton.filled(
-              icon: const Icon(Icons.arrow_upward_rounded),
-              onPressed: _submitPrompt,
-            ),
-          ],
-        ),
+        ],
       ),
     );
   }
 }
 
-class _QuestionPromptCard extends StatefulWidget {
-  const _QuestionPromptCard({
+class _ToolGroupTraceWidget extends StatefulWidget {
+  const _ToolGroupTraceWidget({required this.events});
+  final List<TimelineEvent> events;
+
+  @override
+  State<_ToolGroupTraceWidget> createState() => _ToolGroupTraceWidgetState();
+}
+
+class _ToolGroupTraceWidgetState extends State<_ToolGroupTraceWidget> {
+  bool _open = false;
+
+  String _summarizeOne(TimelineEvent ev) {
+    final p = ev.payload;
+    final detail = Map<String, dynamic>.from(p['detail'] as Map? ?? const {});
+    final kind = (detail['kind'] as String?) ?? 'generic';
+    return switch (kind) {
+      'shell' => '\$ ${detail["command"] ?? ""}',
+      'file_edit' => '修改 ${detail["path"] ?? ""}',
+      'file_read' => '读取 ${detail["path"] ?? ""}',
+      'search' => '检索 ${detail["query"] ?? ""}',
+      'subagent' => '子代理 (${detail["role"] ?? "worker"})',
+      _ => (detail['tool_name'] as String?) ?? '调用工具',
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final anyRunning =
+        widget.events.any((e) => (e.payload['status'] ?? '') == 'running');
+    final headerText = widget.events.length == 1
+        ? _summarizeOne(widget.events.first)
+        : anyRunning
+            ? '正在执行第 ${widget.events.length} 步工具操作…'
+            : '已查阅或修改 ${widget.events.length} 处代码与命令';
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: () => setState(() => _open = !_open),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (anyRunning)
+                    const Padding(
+                      padding: EdgeInsets.only(right: 6),
+                      child: SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.6,
+                          color: Color(0xFF38BDF8),
+                        ),
+                      ),
+                    )
+                  else
+                    Icon(
+                      _open
+                          ? Icons.keyboard_arrow_down_rounded
+                          : Icons.keyboard_arrow_right_rounded,
+                      size: 16,
+                      color: Colors.white38,
+                    ),
+                  const SizedBox(width: 4),
+                  Flexible(
+                    child: Text(
+                      headerText,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.white54,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_open)
+            Container(
+              margin: const EdgeInsets.only(left: 8, top: 4),
+              padding: const EdgeInsets.only(left: 12),
+              decoration: BoxDecoration(
+                border: Border(
+                  left: BorderSide(color: Colors.white.withValues(alpha: 0.10)),
+                ),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final ev in widget.events)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 2.5),
+                      child: Text(
+                        _summarizeOne(ev),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontFamily: 'monospace',
+                          color: Colors.white54,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Pure Multiple-Choice Question Card:
+/// - For single-question single-select: 1 tap on any option submits immediately!
+/// - Custom thoughts can simply be typed in the main chat box below (zero nested form boxes!).
+class _QuestionChoiceCard extends StatefulWidget {
+  const _QuestionChoiceCard({
     required this.requestId,
     required this.questions,
-    required this.resolved,
+    required this.resolvedAnswers,
     required this.onSubmit,
   });
 
   final String requestId;
   final List<QuestionItem> questions;
-  final bool resolved;
+  final List<dynamic>? resolvedAnswers;
   final ValueChanged<List<List<String>>> onSubmit;
 
   @override
-  State<_QuestionPromptCard> createState() => _QuestionPromptCardState();
+  State<_QuestionChoiceCard> createState() => _QuestionChoiceCardState();
 }
 
-class _QuestionPromptCardState extends State<_QuestionPromptCard> {
+class _QuestionChoiceCardState extends State<_QuestionChoiceCard> {
   late final List<Set<String>> _selected = [
     for (final q in widget.questions)
       if (q.options.isNotEmpty) {q.options.first} else <String>{},
   ];
 
+  bool get _isInstantSingleChoice =>
+      widget.questions.length == 1 && !widget.questions.first.isMultiSelect;
+
   @override
   Widget build(BuildContext context) {
+    final isResolved = widget.resolvedAnswers != null;
+
     return Container(
-      margin: const EdgeInsets.symmetric(vertical: 8),
-      padding: const EdgeInsets.all(14),
+      margin: const EdgeInsets.symmetric(vertical: 10),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF172033),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFF38BDF8)),
+        color: const Color(0xFF141923),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: const Color(0xFF38BDF8).withValues(alpha: 0.28),
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -570,51 +654,127 @@ class _QuestionPromptCardState extends State<_QuestionPromptCard> {
           for (var i = 0; i < widget.questions.length; i++) ...[
             Text(
               widget.questions[i].question,
-              style: const TextStyle(fontWeight: FontWeight.w600),
+              style: const TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+              ),
             ),
-            const SizedBox(height: 8),
-            Wrap(
-              spacing: 8,
-              runSpacing: 6,
-              children: [
-                for (final opt in widget.questions[i].options)
-                  FilterChip(
-                    label: Text(opt, style: const TextStyle(fontSize: 12)),
-                    selected: _selected[i].contains(opt),
-                    onSelected: widget.resolved
-                        ? null
-                        : (val) {
-                            setState(() {
-                              if (widget.questions[i].isMultiSelect) {
-                                if (val) {
-                                  _selected[i].add(opt);
-                                } else {
-                                  _selected[i].remove(opt);
-                                }
-                              } else {
-                                _selected[i]
-                                  ..clear()
-                                  ..add(opt);
-                              }
-                            });
-                          },
+            const SizedBox(height: 10),
+            if (!isResolved)
+              for (final opt in widget.questions[i].options)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 7),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(12),
+                    onTap: () {
+                      if (_isInstantSingleChoice) {
+                        widget.onSubmit([
+                          [opt],
+                        ]);
+                        return;
+                      }
+                      setState(() {
+                        if (widget.questions[i].isMultiSelect) {
+                          if (_selected[i].contains(opt)) {
+                            _selected[i].remove(opt);
+                          } else {
+                            _selected[i].add(opt);
+                          }
+                        } else {
+                          _selected[i]
+                            ..clear()
+                            ..add(opt);
+                        }
+                      });
+                    },
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 13,
+                        vertical: 11,
+                      ),
+                      decoration: BoxDecoration(
+                        color: (!_isInstantSingleChoice &&
+                                _selected[i].contains(opt))
+                            ? const Color(0xFF38BDF8).withValues(alpha: 0.16)
+                            : Colors.white.withValues(alpha: 0.035),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: (!_isInstantSingleChoice &&
+                                  _selected[i].contains(opt))
+                              ? const Color(0xFF38BDF8).withValues(alpha: 0.5)
+                              : Colors.white.withValues(alpha: 0.08),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              opt,
+                              style: const TextStyle(
+                                fontSize: 13,
+                                height: 1.35,
+                              ),
+                            ),
+                          ),
+                          if (!_isInstantSingleChoice &&
+                              _selected[i].contains(opt))
+                            const Icon(
+                              Icons.check_rounded,
+                              size: 17,
+                              color: Color(0xFF38BDF8),
+                            ),
+                        ],
+                      ),
+                    ),
                   ),
-              ],
-            ),
-            const SizedBox(height: 12),
+                ),
+            if (i < widget.questions.length - 1) const SizedBox(height: 8),
           ],
-          if (widget.resolved)
-            const Text(
-              'Answers submitted.',
-              style: TextStyle(fontSize: 12, color: Colors.white60),
+          if (isResolved)
+            Row(
+              children: [
+                const Icon(
+                  Icons.check_circle_outline_rounded,
+                  size: 15,
+                  color: Color(0xFF38BDF8),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    '已选择：${widget.resolvedAnswers!.expand((e) => e is List ? e : [e]).join(" · ")}',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      color: Color(0xFF7DD3FC),
+                    ),
+                  ),
+                ),
+              ],
             )
-          else
-            FilledButton.icon(
-              onPressed: () =>
-                  widget.onSubmit(_selected.map((s) => s.toList()).toList()),
-              icon: const Icon(Icons.check_rounded, size: 18),
-              label: const Text('Submit Answers'),
+          else ...[
+            if (!_isInstantSingleChoice) ...[
+              const SizedBox(height: 6),
+              FilledButton(
+                style: FilledButton.styleFrom(
+                  backgroundColor: const Color(0xFFF3F4F6),
+                  foregroundColor: const Color(0xFF0B0D11),
+                  visualDensity: VisualDensity.compact,
+                ),
+                onPressed: () => widget.onSubmit(
+                  _selected.map((s) => s.toList()).toList(),
+                ),
+                child: const Text(
+                  '确认选择',
+                  style: TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+            const SizedBox(height: 4),
+            const Text(
+              '点选任一选项即刻生效；若有其他想法，直接在下方对话框输入即可。',
+              style: TextStyle(fontSize: 11, color: Colors.white38),
             ),
+          ],
         ],
       ),
     );

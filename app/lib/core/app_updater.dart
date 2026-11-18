@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-const String kOrbitAppVersion = '0.1.4';
+const String kOrbitAppVersion = '0.2.0';
 const String kOrbitGithubRepo = 'danielgaoyy/orbit';
 
 class ReleaseUpdateInfo {

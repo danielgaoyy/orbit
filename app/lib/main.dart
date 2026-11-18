@@ -11,8 +11,9 @@ void main() {
 
 const List<String> kOrbitCjkFontFallback = [
   'PingFang SC',
-  'Noto Sans CJK SC',
+  'SF Pro Text',
   'Hiragino Sans GB',
+  'Noto Sans CJK SC',
   'Source Han Sans SC',
   'Microsoft YaHei',
   'sans-serif',
@@ -25,9 +26,9 @@ class OrbitMobileApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const obsidianBg = Color(0xFF0A0D14);
-    const cardSurface = Color(0xFF111622);
-    const orbitCyan = Color(0xFF38BDF8);
+    const canvasBg = Color(0xFF0B0D11);
+    const surfaceBg = Color(0xFF151922);
+    const orbitSky = Color(0xFF38BDF8);
 
     final baseDark = ThemeData(
       useMaterial3: true,
@@ -40,34 +41,38 @@ class OrbitMobileApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       darkTheme: baseDark.copyWith(
-        scaffoldBackgroundColor: obsidianBg,
+        scaffoldBackgroundColor: canvasBg,
         colorScheme: const ColorScheme.dark(
-          primary: orbitCyan,
-          secondary: Color(0xFF818CF8),
-          surface: cardSurface,
+          primary: orbitSky,
+          secondary: Color(0xFF34D399),
+          surface: surfaceBg,
         ),
         appBarTheme: const AppBarTheme(
-          backgroundColor: obsidianBg,
+          backgroundColor: canvasBg,
           surfaceTintColor: Colors.transparent,
           elevation: 0,
         ),
         dialogTheme: DialogThemeData(
-          backgroundColor: const Color(0xFF111622),
+          backgroundColor: surfaceBg,
+          surfaceTintColor: Colors.transparent,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0xFF1E293B)),
+            borderRadius: BorderRadius.circular(20),
+            side: BorderSide(color: Colors.white.withValues(alpha: 0.10)),
           ),
         ),
         bottomSheetTheme: const BottomSheetThemeData(
-          backgroundColor: Color(0xFF111622),
+          backgroundColor: surfaceBg,
           surfaceTintColor: Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+          ),
         ),
         cardTheme: CardThemeData(
-          color: cardSurface,
+          color: surfaceBg,
           elevation: 0,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-            side: const BorderSide(color: Color(0xFF1E293B)),
+            borderRadius: BorderRadius.circular(16),
+            side: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
           ),
         ),
       ),

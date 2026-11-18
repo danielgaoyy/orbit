@@ -30,8 +30,11 @@ void main() {
 
     final ffi = OrbitFfiBridge.instance;
     if (Platform.environment.containsKey('ORBIT_FFI_PATH')) {
-      expect(ffi.isNativeLoaded, isTrue,
-          reason: 'Native Rust liborbit_ffi.so must load cleanly via dart:ffi');
+      expect(
+        ffi.isNativeLoaded,
+        isTrue,
+        reason: 'Native Rust liborbit_ffi.so must load cleanly via dart:ffi',
+      );
     }
 
     final profile = ffi.parsePairingUri(uri);
@@ -40,14 +43,12 @@ void main() {
     expect(profile.relayUrl, 'wss://aws-devbox.example.com:7878');
 
     if (ffi.isNativeLoaded) {
-      // 1. Zstd roundtrip in native Rust
       final compressed = ffi.zstdCompressWire('{"op":"ping","ts_ms":12345}');
       expect(compressed, isNotNull);
       expect(compressed![0], 0x00);
       final decompressed = ffi.zstdDecompressWire(compressed.sublist(1));
       expect(decompressed, '{"op":"ping","ts_ms":12345}');
 
-      // 2. Noise_NK_25519_ChaChaPoly_SHA256 client handshake msg1 generation in native Rust
       final noiseInit =
           ffi.noiseClientInit('AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE');
       expect(noiseInit.handshakeHandle, greaterThan(0));
@@ -70,24 +71,18 @@ void main() {
     expect(resizeBytes[1], 2);
   });
 
-  testWidgets('FleetHomeScreen renders onboarding and Pair Machine modal',
+  testWidgets('FleetHomeScreen renders zero-form welcome choices cleanly',
       (tester) async {
     SharedPreferences.setMockInitialValues({});
     final controller = FleetController();
     await tester.pumpWidget(OrbitMobileApp(controller: controller));
     await tester.pumpAndSettle();
 
-    expect(find.text('Orbit Fleet'), findsOneWidget);
-    expect(find.text('Connect Your Multi-Host Fleet'), findsOneWidget);
-    expect(find.text('Pair Machine'), findsOneWidget);
-
-    await tester.tap(find.text('Pair Machine'));
-    await tester.pumpAndSettle();
-    expect(find.text('Pair Orbit Host'), findsOneWidget);
-    expect(find.text('Connect & Save Host'), findsOneWidget);
+    expect(find.text('选择一台开发机器开始对话'), findsOneWidget);
+    expect(find.text('从剪贴板一键读取配对码'), findsOneWidget);
   });
 
-  testWidgets('AgentChatScreen renders timeline & composer cleanly',
+  testWidgets('AgentChatScreen renders timeline & inline pill composer cleanly',
       (tester) async {
     SharedPreferences.setMockInitialValues({});
     final controller = FleetController();
@@ -101,8 +96,8 @@ void main() {
       ),
     );
     await tester.pump();
-    expect(find.text('Waiting for timeline stream…'), findsOneWidget);
-    expect(find.text('Message or steer active turn…'), findsOneWidget);
+    expect(find.text('等待对话消息…'), findsOneWidget);
+    expect(find.text('继续对话…'), findsOneWidget);
   });
 
   test('SshConfigService parses ~/.ssh/config hosts and skips git forges', () {
@@ -134,15 +129,15 @@ Host mini
   });
 
   test('AppUpdater compares semver and parses GitHub release metadata', () {
-    expect(AppUpdater.compareSemver('0.1.3', '0.1.2'), greaterThan(0));
-    expect(AppUpdater.compareSemver('v0.1.2', '0.1.2+3'), equals(0));
-    expect(AppUpdater.compareSemver('0.1.1', '0.1.2'), lessThan(0));
+    expect(AppUpdater.compareSemver('0.2.0', '0.1.4'), greaterThan(0));
+    expect(AppUpdater.compareSemver('v0.2.0', '0.2.0+6'), equals(0));
+    expect(AppUpdater.compareSemver('0.1.4', '0.2.0'), lessThan(0));
 
     final info = ReleaseUpdateInfo.fromGithubJson(
       {
-        'tag_name': 'v0.2.0',
-        'html_url': 'https://github.com/danielgaoyy/orbit/releases/tag/v0.2.0',
-        'body': 'One-click SSH relay + self-updater',
+        'tag_name': 'v0.2.1',
+        'html_url': 'https://github.com/danielgaoyy/orbit/releases/tag/v0.2.1',
+        'body': 'Minimal chat-first UI',
         'assets': [
           {
             'name': 'Orbit-macOS-AppleSilicon.dmg',
@@ -151,14 +146,17 @@ Host mini
           },
         ],
       },
-      currentVersion: '0.1.2',
+      currentVersion: '0.2.0',
     );
     expect(info.hasNewerVersion, isTrue);
-    expect(info.macosDmgUrl, 'https://example.com/Orbit-macOS-AppleSilicon.dmg');
+    expect(
+      info.macosDmgUrl,
+      'https://example.com/Orbit-macOS-AppleSilicon.dmg',
+    );
   });
 
   testWidgets(
-      'Desktop split-pane workbench renders cleanly without overflow at 1360x840 and 880x600',
+      'Zero-form chat-first UI renders without overflow across Desktop & Mobile viewports',
       (tester) async {
     SharedPreferences.setMockInitialValues({
       'orbit_saved_hosts': [
@@ -187,20 +185,12 @@ Host mini
         await tester.pumpWidget(OrbitMobileApp(controller: controller));
         await tester.pump(const Duration(seconds: 2));
 
-        expect(find.textContaining('workstation-pro'), findsWidgets);
+        expect(find.text('今天想推进哪块代码？'), findsOneWidget);
 
-        if (size.width >= 880) {
-          expect(find.text('机器舰队'), findsOneWidget);
-          expect(find.text('编程会话'), findsOneWidget);
-          expect(find.text('Set Relay (SSH)'), findsOneWidget);
-
-          await tester.tap(find.text('Set Relay (SSH)'));
-          await tester.pumpAndSettle();
-          expect(find.textContaining('配置 E2EE 中继'), findsOneWidget);
-
-          Navigator.of(tester.element(find.textContaining('配置 E2EE 中继')))
-              .pop();
-          await tester.pumpAndSettle();
+        if (size.width >= 800) {
+          expect(find.text('Orbit'), findsOneWidget);
+          expect(find.text('Antigravity'), findsOneWidget);
+          expect(find.text('自动改码'), findsOneWidget);
         }
       }
     }

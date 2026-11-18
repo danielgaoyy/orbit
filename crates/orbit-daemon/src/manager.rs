@@ -48,17 +48,9 @@ enum PtyAction {
     Kill,
 }
 
-pub struct AgentOrchestrator {
-    home_dir: PathBuf,
-    orbit_exe: PathBuf,
-    store: Arc<OrbitStore>,
-    live_agents: RwLock<HashMap<String, mpsc::Sender<DriverCommand>>>,
-    live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
-    pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
-}
-
 pub struct CreateAgentSpec {
     pub cwd: String,
+    pub extra_dirs: Vec<String>,
     pub title: Option<String>,
     pub provider: ProviderKind,
     pub model: Option<String>,
@@ -70,6 +62,16 @@ pub struct CreateAgentSpec {
     pub worktree: bool,
 }
 
+pub struct AgentOrchestrator {
+    home_dir: PathBuf,
+    orbit_exe: PathBuf,
+    store: Arc<OrbitStore>,
+    live_agents: RwLock<HashMap<String, mpsc::Sender<DriverCommand>>>,
+    agent_extra_dirs: RwLock<HashMap<String, Vec<PathBuf>>>,
+    live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
+    pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
+}
+
 impl AgentOrchestrator {
     pub async fn new(home_dir: PathBuf, store: Arc<OrbitStore>) -> Arc<Self> {
         let orbit_exe = resolve_orbit_exe();
@@ -79,6 +81,7 @@ impl AgentOrchestrator {
             orbit_exe,
             store,
             live_agents: RwLock::new(HashMap::new()),
+            agent_extra_dirs: RwLock::new(HashMap::new()),
             live_terminals: RwLock::new(HashMap::new()),
             broadcast_tx,
         });
@@ -153,6 +156,7 @@ impl AgentOrchestrator {
     ) -> anyhow::Result<AgentSummary> {
         let CreateAgentSpec {
             cwd,
+            extra_dirs,
             title,
             provider,
             model,
@@ -192,6 +196,18 @@ impl AgentOrchestrator {
         let agent_id = format!("ag_{}", Uuid::new_v4().simple());
         let computed_title = title.unwrap_or_else(|| summarize_prompt_title(&human_seed));
 
+        let extra_paths: Vec<PathBuf> = extra_dirs
+            .into_iter()
+            .filter(|s| !s.trim().is_empty() && s.trim() != ws.cwd)
+            .map(PathBuf::from)
+            .collect();
+        if !extra_paths.is_empty() {
+            self.agent_extra_dirs
+                .write()
+                .await
+                .insert(agent_id.clone(), extra_paths);
+        }
+
         let summary = AgentSummary {
             agent_id: agent_id.clone(),
             workspace_id: ws.workspace_id,
@@ -209,20 +225,65 @@ impl AgentOrchestrator {
         };
         self.store.upsert_agent(&summary, None)?;
 
-        let cmd_tx = self
-            .spawn_and_wire_driver(&summary, executable, None)
-            .await?;
-
-        if !initial_prompt.trim().is_empty() {
-            self.dispatch_user_prompt(
+        // Persist the initial user prompt IMMEDIATELY (`< 1ms`) so `AgentCreated` returns right away
+        // and the user sees their clean message + badges at 0ms without blocking the socket!
+        let initial_turn_id = if !initial_prompt.trim().is_empty() {
+            let tid = format!("turn_{}", Uuid::new_v4().simple());
+            let visible_text = initial_display_prompt.unwrap_or_else(|| initial_prompt.clone());
+            let ev = self.store.append_timeline_event(
                 &agent_id,
-                &cmd_tx,
-                initial_prompt,
-                initial_display_prompt,
-                initial_badges,
-            )
-            .await?;
-        }
+                1,
+                Some(&tid),
+                TimelinePayload::UserPrompt {
+                    message_id: format!("u_{}", Uuid::new_v4().simple()),
+                    text: visible_text,
+                    badges: initial_badges,
+                },
+            )?;
+            let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            Some(tid)
+        } else {
+            None
+        };
+
+        let mgr = self.clone();
+        let summary_bg = summary.clone();
+        let ag_id_bg = agent_id.clone();
+        tokio::spawn(async move {
+            match mgr
+                .spawn_and_wire_driver(&summary_bg, executable, None)
+                .await
+            {
+                Ok(cmd_tx) => {
+                    if let Some(turn_id) = initial_turn_id {
+                        let _ = cmd_tx
+                            .send(DriverCommand::SendPrompt {
+                                turn_id,
+                                prompt: initial_prompt,
+                            })
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    if let Ok(ev) = mgr.store.append_timeline_event(
+                        &ag_id_bg,
+                        1,
+                        None,
+                        TimelinePayload::StatusChanged {
+                            status: AgentStatus::Error {
+                                message: e.to_string(),
+                                recoverable: true,
+                            },
+                        },
+                    ) {
+                        let _ = mgr.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                    }
+                    if let Ok(Some(ag)) = mgr.store.get_agent(&ag_id_bg) {
+                        let _ = mgr.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
+                    }
+                }
+            }
+        });
 
         Ok(self.store.get_agent(&agent_id)?.unwrap_or(summary))
     }
@@ -250,10 +311,9 @@ impl AgentOrchestrator {
         } else {
             None
         };
-        let cmd_tx = self.get_or_resume_driver(agent_id).await?;
+        let _ = self.get_or_resume_driver(agent_id).await?;
         self.dispatch_user_prompt_with_handoff(
             agent_id,
-            &cmd_tx,
             prompt,
             display_prompt,
             badges,
@@ -262,34 +322,21 @@ impl AgentOrchestrator {
         .await
     }
 
-    async fn dispatch_user_prompt(
-        &self,
-        agent_id: &str,
-        cmd_tx: &mpsc::Sender<DriverCommand>,
-        prompt: String,
-        display_prompt: Option<String>,
-        badges: Vec<PromptBadge>,
-    ) -> anyhow::Result<()> {
-        self.dispatch_user_prompt_with_handoff(
-            agent_id,
-            cmd_tx,
-            prompt,
-            display_prompt,
-            badges,
-            None,
-        )
-        .await
-    }
-
     async fn dispatch_user_prompt_with_handoff(
         &self,
         agent_id: &str,
-        cmd_tx: &mpsc::Sender<DriverCommand>,
         prompt: String,
         display_prompt: Option<String>,
         badges: Vec<PromptBadge>,
         handoff_context: Option<String>,
     ) -> anyhow::Result<()> {
+        let cmd_tx = self
+            .live_agents
+            .read()
+            .await
+            .get(agent_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("agent session not active"))?;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let visible_text = display_prompt.unwrap_or_else(|| prompt.clone());
         let ev = self.store.append_timeline_event(
@@ -383,6 +430,28 @@ impl AgentOrchestrator {
             .update_agent_config(agent_id, model.as_deref(), effort)?;
         if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
             let _ = tx.send(DriverCommand::SetConfig { model, effort }).await;
+        }
+        if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
+    }
+
+    pub async fn set_agent_model(
+        &self,
+        agent_id: &str,
+        model: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.store.update_agent_model(agent_id, model.as_deref())?;
+        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+            let _ = tx
+                .send(DriverCommand::SetConfig {
+                    model,
+                    effort: None,
+                })
+                .await;
         }
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
             let _ = self
@@ -530,6 +599,14 @@ impl AgentOrchestrator {
             .join("shims")
             .join(format!("agent_{}.sock", summary.agent_id));
 
+        let extra_dirs = self
+            .agent_extra_dirs
+            .read()
+            .await
+            .get(&summary.agent_id)
+            .cloned()
+            .unwrap_or_default();
+
         let handle = spawn_provider_session(SessionLaunchConfig {
             agent_id: summary.agent_id.clone(),
             provider: summary.provider,
@@ -537,6 +614,7 @@ impl AgentOrchestrator {
             orbit_exe: self.orbit_exe.clone(),
             shim_socket,
             cwd: PathBuf::from(&summary.cwd),
+            extra_dirs,
             model: summary.model.clone(),
             effort: summary.effort,
             mode: summary.mode.clone(),

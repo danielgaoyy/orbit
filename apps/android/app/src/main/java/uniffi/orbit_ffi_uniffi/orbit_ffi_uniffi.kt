@@ -3759,10 +3759,10 @@ sealed class FfiOrbitException: kotlin.Exception() {
     
     class Core(
         
-        val `message`: kotlin.String
+        val `detail`: kotlin.String
         ) : FfiOrbitException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "detail=${ `detail` }"
     }
     
 
@@ -3796,7 +3796,7 @@ public object FfiConverterTypeFfiOrbitError : FfiConverterRustBuffer<FfiOrbitExc
             is FfiOrbitException.Core -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
-                + FfiConverterString.allocationSize(value.`message`)
+                + FfiConverterString.allocationSize(value.`detail`)
             )
         }
     }
@@ -3805,7 +3805,7 @@ public object FfiConverterTypeFfiOrbitError : FfiConverterRustBuffer<FfiOrbitExc
         when(value) {
             is FfiOrbitException.Core -> {
                 buf.putInt(1)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

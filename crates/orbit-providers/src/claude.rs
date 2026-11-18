@@ -52,6 +52,10 @@ pub async fn spawn_claude_session(
         args.push("--model".to_string());
         args.push(m.clone());
     }
+    for extra in &cfg.extra_dirs {
+        args.push("--add-dir".to_string());
+        args.push(extra.to_string_lossy().to_string());
+    }
 
     let mut env = HashMap::new();
     env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-ts".into());

@@ -1,16 +1,25 @@
+mod updater;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::updater::{
+    AppUpdateProgress, CURRENT_APP_VERSION, ReleaseUpdateInfo, check_latest_release,
+    perform_one_click_update,
+};
+
+use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
-    AgentTimelineDeltaView, AgentTimelineView, CoreEventSubscriber, CoreNotification,
-    CreateAgentRequest, FleetOverviewView, GitReviewView, HostCardView, HostDetailView,
-    OrbitAppCore,
+    AgentTimelineDeltaView, AgentTimelineView, ClientProjectView, CoreEventSubscriber,
+    CoreNotification, CreateAgentRequest, FleetOverviewView, GitReviewView, HostCardView,
+    HostDetailView, OrbitAppCore,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
     open_in_external_editor, provision_relay_over_ssh, resolve_user_home, stage_local_attachment,
+    upgrade_remote_daemon_over_ssh,
 };
 use orbit_protocol::{PromptBadge, ProviderKind, ReasoningEffort, SessionMode};
 use tauri::{State, ipc::Channel};
@@ -98,8 +107,51 @@ fn pair_host(
 }
 
 #[tauri::command]
+async fn pair_ssh_host(
+    state: State<'_, DesktopAppState>,
+    ssh_alias: String,
+    remote_port: Option<u16>,
+) -> Result<HostCardView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.pair_ssh_host_blocking(&ssh_alias, remote_port)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
 fn remove_host(state: State<'_, DesktopAppState>, host_id: String) -> Result<(), String> {
     state.core.remove_host(&host_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_host_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    custom_name: Option<String>,
+    route_mode: Option<HostRouteMode>,
+    ssh_alias: Option<String>,
+    remote_daemon_port: Option<u16>,
+    custom_direct_endpoint: Option<String>,
+    relay_url: Option<String>,
+    reconnect: Option<bool>,
+) -> Result<HostCardView, String> {
+    state
+        .core
+        .update_host_config(
+            &host_id,
+            custom_name,
+            route_mode,
+            ssh_alias,
+            remote_daemon_port,
+            custom_direct_endpoint,
+            relay_url,
+            reconnect.unwrap_or(true),
+        )
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -112,6 +164,64 @@ fn update_host_relay(
         .core
         .update_host_relay(&host_id, relay_url.as_deref())
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn upgrade_remote_daemon(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    ssh_alias: String,
+    remote_port: Option<u16>,
+) -> Result<String, String> {
+    let alias_copy = ssh_alias.clone();
+    let (ver, maybe_uri) = tauri::async_runtime::spawn_blocking(move || {
+        upgrade_remote_daemon_over_ssh(&ssh_alias, remote_port)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
+    if let Some(uri) = maybe_uri {
+        let _ = state.core.pair_host(&uri);
+        let _ = state.core.update_host_config(
+            &host_id,
+            None,
+            None,
+            Some(alias_copy),
+            None,
+            None,
+            None,
+            true,
+        );
+    } else {
+        state.core.connect_host_async(host_id);
+    }
+    Ok(ver)
+}
+
+#[tauri::command]
+fn upsert_project(
+    state: State<'_, DesktopAppState>,
+    project_id: Option<String>,
+    host_id: String,
+    name: String,
+    directories: Vec<String>,
+) -> Result<ClientProjectView, String> {
+    state
+        .core
+        .upsert_project(project_id.as_deref(), &host_id, &name, directories)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_project(state: State<'_, DesktopAppState>, project_id: String) -> Result<(), String> {
+    state
+        .core
+        .remove_project(&project_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_directory(state: State<'_, DesktopAppState>, host_id: String, path: Option<String>) {
+    state.core.list_directory(&host_id, path);
 }
 
 #[tauri::command]
@@ -149,6 +259,7 @@ fn create_agent(
     state: State<'_, DesktopAppState>,
     host_id: String,
     cwd: String,
+    extra_dirs: Option<Vec<String>>,
     provider: ProviderKind,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
@@ -157,10 +268,11 @@ fn create_agent(
     initial_display_prompt: Option<String>,
     initial_badges: Option<Vec<PromptBadge>>,
     worktree_branch: Option<String>,
-) {
+) -> String {
     state.core.create_agent_with_config(CreateAgentRequest {
         host_id: &host_id,
         cwd: &cwd,
+        extra_dirs: extra_dirs.unwrap_or_default(),
         provider,
         model,
         effort,
@@ -169,7 +281,7 @@ fn create_agent(
         initial_display_prompt,
         initial_badges: initial_badges.unwrap_or_default(),
         worktree_branch: worktree_branch.as_deref(),
-    });
+    })
 }
 
 #[tauri::command]
@@ -221,6 +333,16 @@ fn set_agent_config(
     state
         .core
         .set_agent_config(&host_id, &agent_id, model, effort);
+}
+
+#[tauri::command]
+fn set_agent_model(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    model: Option<String>,
+) {
+    state.core.set_agent_model(&host_id, &agent_id, model);
 }
 
 #[tauri::command]
@@ -412,6 +534,24 @@ async fn provision_ssh_relay(
     Ok(relay_url)
 }
 
+#[tauri::command]
+fn get_app_version() -> &'static str {
+    CURRENT_APP_VERSION
+}
+
+#[tauri::command]
+async fn check_app_update() -> Result<ReleaseUpdateInfo, String> {
+    check_latest_release().await
+}
+
+#[tauri::command]
+async fn perform_app_self_update(
+    release: ReleaseUpdateInfo,
+    on_progress: Channel<AppUpdateProgress>,
+) -> Result<(), String> {
+    perform_one_click_update(release, on_progress).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_path = default_desktop_db_path();
@@ -430,8 +570,14 @@ pub fn run() {
             get_agent_timeline_delta,
             get_git_review,
             pair_host,
+            pair_ssh_host,
             remove_host,
+            update_host_config,
             update_host_relay,
+            upgrade_remote_daemon,
+            upsert_project,
+            remove_project,
+            list_directory,
             connect_host,
             connect_all_hosts,
             refresh_host,
@@ -443,6 +589,7 @@ pub fn run() {
             interrupt_agent,
             set_session_mode,
             set_agent_config,
+            set_agent_model,
             switch_agent_provider,
             archive_agent,
             resolve_permission,
@@ -462,6 +609,9 @@ pub fn run() {
             get_workspace_files,
             stage_attachment,
             provision_ssh_relay,
+            get_app_version,
+            check_app_update,
+            perform_app_self_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Orbit Tauri desktop application");

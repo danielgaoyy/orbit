@@ -17,6 +17,7 @@ pub struct SessionLaunchConfig {
     pub orbit_exe: PathBuf,
     pub shim_socket: PathBuf,
     pub cwd: PathBuf,
+    pub extra_dirs: Vec<PathBuf>,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
     pub mode: SessionMode,

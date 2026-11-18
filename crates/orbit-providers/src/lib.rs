@@ -5,10 +5,11 @@ pub mod claude;
 pub mod codex;
 pub mod driver;
 
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use orbit_protocol::{ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot};
+use orbit_protocol::{ModelOption, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot};
 use serde::{Deserialize, Serialize};
 
 pub use driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
@@ -168,4 +169,29 @@ pub async fn probe_all_provider_models() -> Vec<ProviderModelCatalog> {
     );
 
     vec![claude_cat, codex_cat, agy_cat]
+}
+
+/// Project structured `ProviderModelCatalog` slices into legacy `ModelOption` maps for mobile FFI.
+pub fn catalogs_to_model_map(
+    catalogs: &[ProviderModelCatalog],
+) -> HashMap<ProviderKind, Vec<ModelOption>> {
+    let mut map = HashMap::new();
+    for cat in catalogs {
+        let items = cat
+            .models
+            .iter()
+            .map(|m| ModelOption {
+                id: m.id.clone(),
+                label: m.label.clone(),
+                description: if m.description.is_empty() {
+                    None
+                } else {
+                    Some(m.description.clone())
+                },
+                is_default: m.is_default,
+            })
+            .collect();
+        map.insert(cat.provider, items);
+    }
+    map
 }

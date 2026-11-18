@@ -1,11 +1,15 @@
 //! Desktop-specific client utilities shared by macOS and Linux (Tauri v2):
 //! - Zero-config local Orbit Daemon discovery (`~/.orbit/host-keypair.json` -> `127.0.0.1:6868`)
 //! - `~/.ssh/config` server auto-discovery (with `Include` expansion)
+//! - One-click SSH Host Bootstrap (`orbit daemon up` + `orbit pair`) & SSH Local Port-Forward Tunnel (`SshTunnelGuard`)
 //! - One-click SSH E2EE Relay provisioning (`orbit relay up --allow-pubkey ...`)
 
 use std::fs;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +20,48 @@ pub struct SshHostItem {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub display_target: String,
+}
+
+/// RAII guard for a dedicated background `ssh -N -L` tunnel process.
+///
+/// Uses `ControlMaster=no` + `ControlPath=none` + `ServerAliveInterval=10` so user `~/.ssh/config`
+/// multiplexing timeouts never drop Orbit's WebSocket stream, and kills/reaps the child cleanly on drop.
+pub struct SshTunnelGuard {
+    pub ws_url: String,
+    child: Mutex<Child>,
+}
+
+impl SshTunnelGuard {
+    pub fn has_exited(&self) -> bool {
+        if let Ok(mut guard) = self.child.lock() {
+            matches!(guard.try_wait(), Ok(Some(_)) | Err(_))
+        } else {
+            true
+        }
+    }
+
+    pub fn take_stderr_summary(&self) -> Option<String> {
+        use std::io::Read;
+        let mut guard = self.child.lock().ok()?;
+        let mut stderr = guard.stderr.take()?;
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        let trimmed = buf.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+}
+
+impl Drop for SshTunnelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.child.lock() {
+            let _ = guard.kill();
+            let _ = guard.wait();
+        }
+    }
 }
 
 /// Normalize user-entered Relay host/URL (`1.2.3.4`, `https://relay.example.com`, `ws://host:7878/`) into a clean `ws://` or `wss://` base URL.
@@ -62,7 +108,62 @@ pub fn resolve_user_home() -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
-/// Automatically discover a local Orbit Daemon on Desktop (macOS / Linux / Windows) if `~/.orbit/host-keypair.json` exists.
+fn resolve_ssh_binary() -> &'static str {
+    if Path::new("/usr/bin/ssh").is_file() {
+        "/usr/bin/ssh"
+    } else {
+        "ssh"
+    }
+}
+
+fn build_ssh_command() -> Command {
+    let mut cmd = Command::new(resolve_ssh_binary());
+    let mut path_parts = vec![
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+        "/usr/sbin".to_string(),
+        "/sbin".to_string(),
+    ];
+    if let Some(home) = resolve_user_home() {
+        path_parts.insert(0, home.join(".local/bin").to_string_lossy().to_string());
+    }
+    if let Ok(existing) = std::env::var("PATH") {
+        for p in existing.split(':') {
+            if !p.is_empty() && !path_parts.iter().any(|x| x == p) {
+                path_parts.push(p.to_string());
+            }
+        }
+    }
+    cmd.env("PATH", path_parts.join(":"));
+    cmd
+}
+
+/// Extract the WebSocket TCP port from direct endpoints (e.g. `ws://172.31.33.74:6869/ws` -> `Some(6869)`).
+pub fn extract_ws_port(endpoints: &[String]) -> Option<u16> {
+    for ep in endpoints {
+        let trimmed = ep.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("ws://")
+            .or_else(|| trimmed.strip_prefix("wss://"))
+        else {
+            continue;
+        };
+        let Some(authority) = rest.split('/').next() else {
+            continue;
+        };
+        if let Some((_, port_str)) = authority.rsplit_once(':')
+            && let Ok(port) = port_str.parse::<u16>()
+            && port > 0
+        {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Automatically discover and ensure the current user's isolated local Orbit Daemon on Desktop if `orbit` CLI is installed.
 pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     if !cfg!(any(
         target_os = "macos",
@@ -72,11 +173,6 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         return None;
     }
     let home = resolve_user_home()?;
-    let keypair_path = home.join(".orbit").join("host-keypair.json");
-    if !keypair_path.is_file() {
-        return None;
-    }
-
     let candidates = [
         home.join(".local/bin/orbit"),
         home.join(".cargo/bin/orbit"),
@@ -84,21 +180,37 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         PathBuf::from("/usr/local/bin/orbit"),
         PathBuf::from("/opt/homebrew/bin/orbit"),
     ];
-    if let Some(orbit_bin) = candidates.into_iter().find(|p| p.is_file())
-        && let Ok(out) = Command::new(orbit_bin).arg("pair").output()
-        && out.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Some(uri) = stdout
-            .lines()
-            .map(str::trim)
-            .find(|line| line.starts_with("orbit://pair/"))
+    if let Some(orbit_bin) = candidates.into_iter().find(|p| p.is_file()) {
+        let status_out = Command::new(&orbit_bin)
+            .args(["daemon", "status"])
+            .output()
+            .ok();
+        let already_running = status_out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
+            .unwrap_or(false);
+        if !already_running {
+            let _ = Command::new(&orbit_bin).args(["daemon", "up"]).output();
+        }
+        if let Ok(out) = Command::new(orbit_bin).arg("pair").output()
+            && out.status.success()
         {
-            return Some(uri.to_owned());
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(uri) = stdout
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("orbit://pair/"))
+            {
+                return Some(uri.to_owned());
+            }
         }
     }
 
     // Pure-Rust direct fallback when running from source without a globally installed `orbit` binary
+    let keypair_path = home.join(".orbit").join("host-keypair.json");
+    if !keypair_path.is_file() {
+        return None;
+    }
     let raw = fs::read_to_string(&keypair_path).ok()?;
     let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
     let host_id = kp.host_id().ok()?;
@@ -369,6 +481,173 @@ fn simple_glob(pat: &str, text: &str) -> bool {
     pat == text
 }
 
+/// Zero-form 1-click SSH Host Connection with Native Multi-User Isolation:
+/// Connects to `alias`, installs/upgrades `orbit` if missing or `< 0.2.3`,
+/// ensures this Unix user's own isolated `orbit daemon` is running on a conflict-free port,
+/// and returns `orbit://pair/...` encoding that user's exact `host_id` & port.
+pub fn bootstrap_ssh_host_and_pair(
+    alias: &str,
+    explicit_port: Option<u16>,
+) -> Result<String, String> {
+    let port_flag = explicit_port
+        .map(|p| format!(" --port {p}"))
+        .unwrap_or_default();
+    let remote_script = format!(
+        "set -eu; \
+         export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
+         NEED_INSTALL=0; \
+         if ! command -v orbit >/dev/null 2>&1; then NEED_INSTALL=1; \
+         elif orbit --version 2>&1 | grep -Eq 'GLIBC_|0\\.1\\.|0\\.2\\.[012]'; then NEED_INSTALL=1; fi; \
+         if [ \"$NEED_INSTALL\" = \"1\" ]; then \
+           curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
+           orbit daemon up{port_flag} >/dev/null 2>&1 || true; \
+         elif ! orbit daemon status 2>/dev/null | grep -q 'RUNNING'; then \
+           orbit daemon up{port_flag} >/dev/null 2>&1 || true; \
+         fi; \
+         orbit pair"
+    );
+
+    let out = build_ssh_command()
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=12",
+            alias,
+            &remote_script,
+        ])
+        .output()
+        .map_err(|e| format!("无法启动 SSH 进程: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("SSH 连接退出状态 {}", out.status)
+        } else {
+            detail.to_string()
+        });
+    }
+
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("orbit://pair/"))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("未能在 {alias} 获取到有效配对码"))
+}
+
+/// One-click remote Orbit Daemon upgrade & restart over SSH (preserving per-user port isolation).
+pub fn upgrade_remote_daemon_over_ssh(
+    alias: &str,
+    explicit_port: Option<u16>,
+) -> Result<(String, Option<String>), String> {
+    let port_flag = explicit_port
+        .map(|p| format!(" --port {p}"))
+        .unwrap_or_default();
+    let remote_script = format!(
+        "set -eu; \
+         export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
+         curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
+         orbit daemon up{port_flag} >/dev/null 2>&1; \
+         orbit --version; \
+         orbit pair"
+    );
+
+    let out = build_ssh_command()
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=15",
+            alias,
+            &remote_script,
+        ])
+        .output()
+        .map_err(|e| format!("无法启动 SSH 升级: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        return Err(if stderr.is_empty() {
+            format!("远端升级失败 ({})", out.status)
+        } else {
+            stderr
+        });
+    }
+    let version = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("orbit "))
+        .unwrap_or("orbit upgraded")
+        .to_string();
+    let pair_uri = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("orbit://pair/"))
+        .map(ToOwned::to_owned);
+    Ok((version, pair_uri))
+}
+
+/// Open a dedicated SSH local port-forward (`127.0.0.1:<free_port> -> 127.0.0.1:<remote_port>`)
+/// without raw TCP probe resets or `ControlMaster` multiplexing drops.
+pub fn spawn_ssh_local_tunnel(alias: &str, remote_port: u16) -> Result<SshTunnelGuard, String> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("本地端口分配失败: {e}"))?;
+    let local_port = listener
+        .local_addr()
+        .map_err(|e| format!("读取本地端口失败: {e}"))?
+        .port();
+    drop(listener);
+
+    let forward_spec = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
+    let mut child = build_ssh_command()
+        .args([
+            "-N",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "TCPKeepAlive=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-L",
+            &forward_spec,
+            alias,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法拉起 SSH 隧道进程: {e}"))?;
+
+    std::thread::sleep(Duration::from_millis(220));
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!("SSH 隧道立即退出 ({alias}: {status})"));
+    }
+
+    Ok(SshTunnelGuard {
+        ws_url: format!("ws://127.0.0.1:{local_port}/ws"),
+        child: Mutex::new(child),
+    })
+}
+
 /// Deploy/update Orbit on a remote SSH host and start `orbit relay up` locked to `allowed_pubkeys`.
 pub fn provision_relay_over_ssh(
     alias: &str,
@@ -393,19 +672,13 @@ pub fn provision_relay_over_ssh(
     let remote_script = format!(
         "set -eu; \
          export PATH=\"$HOME/.local/bin:/usr/local/bin:$PATH\"; \
-         if ! command -v orbit >/dev/null 2>&1 || ! orbit relay --help 2>&1 | grep -q 'allow'; then \
+         if ! command -v orbit >/dev/null 2>&1 || orbit --version 2>&1 | grep -q 'GLIBC_' || ! orbit relay --help 2>&1 | grep -q 'allow'; then \
            curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh; \
          fi; \
          orbit relay up --port {relay_port} {pubkey_flags}"
     );
 
-    let ssh_bin = if Path::new("/usr/bin/ssh").is_file() {
-        "/usr/bin/ssh"
-    } else {
-        "ssh"
-    };
-
-    let out = Command::new(ssh_bin)
+    let out = build_ssh_command()
         .args([
             "-o",
             "BatchMode=yes",
@@ -950,6 +1223,63 @@ mod tests {
         assert_eq!(
             build_remote_editor_uri(ExternalEditorKind::FileManager, "devbox", "/tmp"),
             None
+        );
+    }
+
+    #[test]
+    fn ws_port_extraction_handles_direct_endpoints() {
+        assert_eq!(
+            extract_ws_port(&["ws://172.31.33.74:6869/ws".to_string()]),
+            Some(6869)
+        );
+        assert_eq!(
+            extract_ws_port(&["wss://devbox.internal:7001/ws".to_string()]),
+            Some(7001)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn live_devbox_ssh_one_click_e2e() {
+        use crate::HostConnectionState;
+        use crate::app_core::OrbitAppCore;
+
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let card = core
+            .pair_ssh_host_blocking("devbox", None)
+            .expect("1-click SSH pair against devbox must succeed");
+        assert_eq!(card.display_name, "devbox");
+
+        for _ in 0..40 {
+            let overview = core.fleet_overview();
+            let detail = core.host_detail(&card.host_id).expect("host detail");
+            if detail.host.connection_state == HostConnectionState::OnlineDirect
+                && !detail.discovered_projects.is_empty()
+            {
+                println!(
+                    "CONNECTED via_ssh_tunnel={} ping={:?}ms projects={} discovered={} workspaces={} agents={} models={}",
+                    detail.host.via_ssh_tunnel,
+                    detail.host.last_ping_ms,
+                    overview.projects.len(),
+                    detail.discovered_projects.len(),
+                    detail.workspaces.len(),
+                    detail.agents.len(),
+                    detail.models_by_provider.len()
+                );
+                assert!(detail.host.via_ssh_tunnel);
+                assert!(
+                    detail
+                        .discovered_projects
+                        .iter()
+                        .any(|p| p.path.contains("mono_repo"))
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        panic!(
+            "devbox did not reach OnlineDirect with workspaces: {:?}",
+            core.host_detail(&card.host_id)
         );
     }
 }

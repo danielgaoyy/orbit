@@ -18,7 +18,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -32,7 +32,6 @@ orbit-providers = { path = "crates/orbit-providers" }
 orbit-daemon = { path = "crates/orbit-daemon" }
 orbit-relay = { path = "crates/orbit-relay" }
 orbit-client-core = { path = "crates/orbit-client-core" }
-orbit-ffi-uniffi = { path = "crates/orbit-ffi-uniffi" }
 
 # Async & Networking
 tokio = { version = "1.44", features = ["full"] }

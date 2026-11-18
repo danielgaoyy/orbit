@@ -224,7 +224,7 @@ async fn run_codex_actor(
                             }))
                             .await;
 
-                        let (pol, sandbox_policy) = codex_turn_policies(&mode);
+                        let (pol, sandbox_policy) = codex_turn_policies(&mode, &cfg.extra_dirs);
                         let req_id = next_id;
                         next_id += 1;
                         let mut params = json!({
@@ -450,7 +450,11 @@ fn codex_thread_mode_strings(mode: &SessionMode) -> (&'static str, &'static str)
     }
 }
 
-fn codex_turn_policies(mode: &SessionMode) -> (&'static str, Value) {
+fn codex_turn_policies(mode: &SessionMode, extra_dirs: &[PathBuf]) -> (&'static str, Value) {
+    let writable_roots: Vec<String> = extra_dirs
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     match mode {
         SessionMode::FullAccess => ("never", json!({ "type": "dangerFullAccess" })),
         SessionMode::Plan => ("on-request", json!({ "type": "readOnly" })),
@@ -459,7 +463,7 @@ fn codex_turn_policies(mode: &SessionMode) -> (&'static str, Value) {
             json!({
                 "type": "workspaceWrite",
                 "networkAccess": false,
-                "writableRoots": [],
+                "writableRoots": writable_roots,
                 "excludeSlashTmp": false,
                 "excludeTmpdirEnvVar": false
             }),

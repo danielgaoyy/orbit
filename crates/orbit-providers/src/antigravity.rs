@@ -32,6 +32,10 @@ pub async fn spawn_antigravity_session(
     }
     args.push("--add-dir".to_string());
     args.push(cfg.cwd.to_string_lossy().to_string());
+    for extra in &cfg.extra_dirs {
+        args.push("--add-dir".to_string());
+        args.push(extra.to_string_lossy().to_string());
+    }
 
     let mut env = HashMap::new();
     env.insert("NO_COLOR".into(), "1".into());

@@ -1,4 +1,4 @@
-//! SQLite (WAL mode) persistence engine for Orbit Daemon and Mobile Replica Cache.
+//! SQLite (WAL mode) persistence engine for Orbit Daemon and Multi-Host Client Replica Cache.
 //!
 //! Replaces Paseo's scattered JSON files with ACID event-sourced timelines and `< 1ms` cursor catch-up.
 
@@ -13,6 +13,21 @@ use orbit_protocol::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+/// Extra host configuration metadata persisted alongside `StoredHostProfile`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredHostMeta {
+    #[serde(default)]
+    pub custom_name: Option<String>,
+    #[serde(default)]
+    pub ssh_alias: Option<String>,
+    #[serde(default)]
+    pub route_mode: Option<String>,
+    #[serde(default)]
+    pub remote_daemon_port: Option<u16>,
+    #[serde(default)]
+    pub custom_direct_endpoint: Option<String>,
+}
+
 /// Persisted remote/local host profile stored in the client's local SQLite replica.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredHostProfile {
@@ -21,6 +36,18 @@ pub struct StoredHostProfile {
     pub daemon_pubkey_b64: String,
     pub direct_endpoints: Vec<String>,
     pub relay_url: Option<String>,
+    #[serde(default)]
+    pub meta: StoredHostMeta,
+}
+
+/// Persisted Paseo-style multi-directory Project (`1 primary cwd + 0..N extra_dirs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredClientProject {
+    pub project_id: String,
+    pub host_id: String,
+    pub name: String,
+    pub directories: Vec<String>,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -104,17 +131,51 @@ impl OrbitStore {
             );
 
             CREATE TABLE IF NOT EXISTS client_hosts (
-                host_id              TEXT PRIMARY KEY,
-                display_name         TEXT NOT NULL,
-                daemon_pubkey_b64    TEXT NOT NULL,
+                host_id               TEXT PRIMARY KEY,
+                display_name          TEXT NOT NULL,
+                daemon_pubkey_b64     TEXT NOT NULL,
                 direct_endpoints_json TEXT NOT NULL,
-                relay_url            TEXT,
-                updated_at           TEXT NOT NULL
+                relay_url             TEXT,
+                meta_json             TEXT,
+                updated_at            TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS client_projects (
+                project_id       TEXT PRIMARY KEY,
+                host_id          TEXT NOT NULL,
+                name             TEXT NOT NULL,
+                directories_json TEXT NOT NULL,
+                updated_at_ms    INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS client_replica_workspaces (
+                host_id      TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (host_id, workspace_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS client_replica_agents (
+                host_id      TEXT NOT NULL,
+                agent_id     TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (host_id, agent_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS client_replica_events (
+                agent_id     TEXT NOT NULL,
+                seq          INTEGER NOT NULL,
+                epoch        INTEGER NOT NULL,
+                turn_id      TEXT,
+                timestamp    TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (agent_id, seq)
             );
             ",
         )?;
-        // Non-destructive column migration for pre-existing databases
+        // Non-destructive forward-compatible column migrations for pre-existing databases
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN effort_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE client_hosts ADD COLUMN meta_json TEXT", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -278,6 +339,19 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn update_agent_model(
+        &self,
+        agent_id: &str,
+        model: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "UPDATE agents SET model = ?1, updated_at = ?2 WHERE agent_id = ?3",
+            params![model, Utc::now().to_rfc3339(), agent_id],
+        )?;
+        Ok(())
+    }
+
     pub fn switch_agent_provider(
         &self,
         agent_id: &str,
@@ -344,7 +418,8 @@ impl OrbitStore {
         Ok(rows)
     }
 
-    /// Atomically append a timeline event, assign a monotonic `seq`, and update the agent's `latest_seq`.
+    /// Atomically append a timeline event, supersede prior partial streaming chunks with the same
+    /// `item_id` / `call_id`, assign a monotonic `seq`, and update the agent's `latest_seq`.
     pub fn append_timeline_event(
         &self,
         agent_id: &str,
@@ -357,6 +432,14 @@ impl OrbitStore {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let payload_json = serde_json::to_string(&payload)?;
+
+        if let Some((json_key, id_val)) = coalesce_identity(&payload) {
+            let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
+            let _ = tx.execute(
+                "DELETE FROM timeline_events WHERE agent_id = ?1 AND payload_json LIKE ?2",
+                params![agent_id, pattern],
+            );
+        }
 
         tx.execute(
             "INSERT INTO timeline_events (epoch, agent_id, turn_id, timestamp, payload_json)
@@ -397,30 +480,174 @@ impl OrbitStore {
         let payload_json = serde_json::to_string(&ev.payload)?;
         let ts_str = ev.timestamp.to_rfc3339();
 
+        if let Some((json_key, id_val)) = coalesce_identity(&ev.payload) {
+            let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
+            let _ = tx.execute(
+                "DELETE FROM client_replica_events WHERE agent_id = ?1 AND payload_json LIKE ?2",
+                params![ev.agent_id, pattern],
+            );
+        }
+
         tx.execute(
-            "INSERT INTO timeline_events (seq, epoch, agent_id, turn_id, timestamp, payload_json)
+            "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(seq) DO UPDATE SET
+             ON CONFLICT(agent_id, seq) DO UPDATE SET
                 payload_json = excluded.payload_json",
             params![
+                ev.agent_id,
                 ev.seq as i64,
                 ev.epoch,
-                ev.agent_id,
                 ev.turn_id,
                 ts_str,
                 payload_json
             ],
         )?;
-
-        tx.execute(
-            "UPDATE agents SET latest_seq = MAX(latest_seq, ?1), updated_at = ?2 WHERE agent_id = ?3",
-            params![ev.seq as i64, ts_str, ev.agent_id],
-        )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Instant incremental catch-up query (`seq > since_seq`) for reconnects without full reloads.
+    pub fn fetch_replica_timeline(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TimelineEvent>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM client_replica_events
+             WHERE agent_id = ?1
+             ORDER BY seq ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![agent_id, limit as i64], |row| {
+            let seq = row.get::<_, i64>(0)? as u64;
+            let epoch = row.get::<_, u32>(1)?;
+            let ag_id: String = row.get(2)?;
+            let turn_id: Option<String> = row.get(3)?;
+            let ts_str: String = row.get(4)?;
+            let payload_str: String = row.get(5)?;
+            Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = r?;
+            if let Ok(payload) = serde_json::from_str::<TimelinePayload>(&payload_str) {
+                out.push(TimelineEvent {
+                    seq,
+                    epoch,
+                    agent_id: ag_id,
+                    turn_id,
+                    timestamp: parse_ts(&ts_str),
+                    payload,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_replica_workspaces(
+        &self,
+        host_id: &str,
+        workspaces: &[WorkspaceSummary],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        for ws in workspaces {
+            let json = serde_json::to_string(ws)?;
+            tx.execute(
+                "INSERT INTO client_replica_workspaces (host_id, workspace_id, payload_json)
+                 VALUES (?1, ?2, ?3)",
+                params![host_id, ws.workspace_id, json],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_replica_workspaces(
+        &self,
+        host_id: &str,
+    ) -> Result<Vec<WorkspaceSummary>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt =
+            conn.prepare("SELECT payload_json FROM client_replica_workspaces WHERE host_id = ?1")?;
+        let rows = stmt.query_map(params![host_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(ws) = serde_json::from_str::<WorkspaceSummary>(&r?) {
+                out.push(ws);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_replica_agents(
+        &self,
+        host_id: &str,
+        agents: &[AgentSummary],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM client_replica_agents WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        for ag in agents {
+            let json = serde_json::to_string(ag)?;
+            tx.execute(
+                "INSERT INTO client_replica_agents (host_id, agent_id, payload_json)
+                 VALUES (?1, ?2, ?3)",
+                params![host_id, ag.agent_id, json],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_single_replica_agent(
+        &self,
+        host_id: &str,
+        ag: &AgentSummary,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let json = serde_json::to_string(ag)?;
+        conn.execute(
+            "INSERT INTO client_replica_agents (host_id, agent_id, payload_json)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(host_id, agent_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![host_id, ag.agent_id, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_replica_agent(&self, host_id: &str, agent_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM client_replica_agents WHERE host_id = ?1 AND agent_id = ?2",
+            params![host_id, agent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_replica_agents(&self, host_id: &str) -> Result<Vec<AgentSummary>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt =
+            conn.prepare("SELECT payload_json FROM client_replica_agents WHERE host_id = ?1")?;
+        let rows = stmt.query_map(params![host_id], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            if let Ok(ag) = serde_json::from_str::<AgentSummary>(&r?) {
+                out.push(ag);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Instant incremental catch-up query (`seq > since_seq`) for Daemon timelines.
     pub fn fetch_timeline_since(
         &self,
         agent_id: &str,
@@ -533,15 +760,17 @@ impl OrbitStore {
     pub fn upsert_client_host(&self, host: &StoredHostProfile) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let endpoints_json = serde_json::to_string(&host.direct_endpoints)?;
+        let meta_json = serde_json::to_string(&host.meta)?;
         conn.execute(
             "INSERT INTO client_hosts (
-                host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, meta_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(host_id) DO UPDATE SET
                 display_name = excluded.display_name,
                 daemon_pubkey_b64 = excluded.daemon_pubkey_b64,
                 direct_endpoints_json = excluded.direct_endpoints_json,
                 relay_url = excluded.relay_url,
+                meta_json = excluded.meta_json,
                 updated_at = excluded.updated_at",
             params![
                 host.host_id,
@@ -549,6 +778,7 @@ impl OrbitStore {
                 host.daemon_pubkey_b64,
                 endpoints_json,
                 host.relay_url,
+                meta_json,
                 Utc::now().to_rfc3339(),
             ],
         )?;
@@ -558,19 +788,25 @@ impl OrbitStore {
     pub fn list_client_hosts(&self) -> Result<Vec<StoredHostProfile>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
-            "SELECT host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url
+            "SELECT host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, meta_json
              FROM client_hosts ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |row| {
             let endpoints_str: String = row.get(3)?;
+            let meta_opt: Option<String> = row.get(5)?;
             let direct_endpoints: Vec<String> =
                 serde_json::from_str(&endpoints_str).unwrap_or_default();
+            let meta: StoredHostMeta = meta_opt
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
             Ok(StoredHostProfile {
                 host_id: row.get(0)?,
                 display_name: row.get(1)?,
                 daemon_pubkey_b64: row.get(2)?,
                 direct_endpoints,
                 relay_url: row.get(4)?,
+                meta,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -582,7 +818,100 @@ impl OrbitStore {
             "DELETE FROM client_hosts WHERE host_id = ?1",
             params![host_id],
         )?;
+        conn.execute(
+            "DELETE FROM client_projects WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        conn.execute(
+            "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        conn.execute(
+            "DELETE FROM client_replica_agents WHERE host_id = ?1",
+            params![host_id],
+        )?;
         Ok(())
+    }
+
+    pub fn clear_host_replica(&self, host_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        conn.execute(
+            "DELETE FROM client_replica_agents WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_client_project(&self, proj: &StoredClientProject) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let dirs_json = serde_json::to_string(&proj.directories)?;
+        conn.execute(
+            "INSERT INTO client_projects (project_id, host_id, name, directories_json, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(project_id) DO UPDATE SET
+                host_id = excluded.host_id,
+                name = excluded.name,
+                directories_json = excluded.directories_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                proj.project_id,
+                proj.host_id,
+                proj.name,
+                dirs_json,
+                proj.updated_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_client_projects(&self) -> Result<Vec<StoredClientProject>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT project_id, host_id, name, directories_json, updated_at_ms
+             FROM client_projects ORDER BY updated_at_ms DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let dirs_str: String = row.get(3)?;
+            let directories: Vec<String> = serde_json::from_str(&dirs_str).unwrap_or_default();
+            Ok(StoredClientProject {
+                project_id: row.get(0)?,
+                host_id: row.get(1)?,
+                name: row.get(2)?,
+                directories,
+                updated_at_ms: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn delete_client_project(&self, project_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM client_projects WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        Ok(())
+    }
+}
+
+fn coalesce_identity(payload: &TimelinePayload) -> Option<(&'static str, &str)> {
+    match payload {
+        TimelinePayload::AssistantMessage { item_id, .. }
+        | TimelinePayload::AssistantThinking { item_id, .. }
+            if !item_id.is_empty() && !item_id.contains('"') && !item_id.contains('%') =>
+        {
+            Some(("item_id", item_id.as_str()))
+        }
+        TimelinePayload::ToolCall { call_id, .. }
+            if !call_id.is_empty() && !call_id.contains('"') && !call_id.contains('%') =>
+        {
+            Some(("call_id", call_id.as_str()))
+        }
+        _ => None,
     }
 }
 
@@ -630,7 +959,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sqlite_wal_timeline_cursor_catchup() {
+    fn sqlite_wal_timeline_cursor_catchup_and_coalescing() {
         let store = OrbitStore::open_in_memory().expect("open store");
         let now = Utc::now();
 
@@ -685,19 +1014,29 @@ mod tests {
                 Some("turn_1"),
                 TimelinePayload::AssistantMessage {
                     item_id: "a1".into(),
+                    text: "Ready".into(),
+                    streaming: true,
+                },
+            )
+            .expect("append e2");
+        let e3 = store
+            .append_timeline_event(
+                "ag_1",
+                1,
+                Some("turn_1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
                     text: "Ready in Rust!".into(),
                     streaming: false,
                 },
             )
-            .expect("append e2");
+            .expect("append e3");
 
-        assert!(e2.seq > e1.seq);
+        assert!(e3.seq > e2.seq && e2.seq > e1.seq);
 
-        let (delta, has_more) = store
-            .fetch_timeline_since("ag_1", e1.seq, 50)
-            .expect("catchup");
-        assert!(!has_more);
-        assert_eq!(delta.len(), 1);
-        assert_eq!(delta[0].seq, e2.seq);
+        let (all, _) = store.fetch_timeline_since("ag_1", 0, 50).expect("catchup");
+        // Partial streaming row e2 was superseded by e3!
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].seq, e3.seq);
     }
 }

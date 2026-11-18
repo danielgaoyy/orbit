@@ -22,9 +22,10 @@ use orbit_shim::{ShimSpawnSpec, run_shim};
 use uuid::Uuid;
 
 use crate::service::{
-    RelayProbeOutcome, ServiceRole, check_local_health, default_daemon_listen, detect_public_ipv4,
-    install_and_start_service, normalize_relay_url, preflight_probe_relay, self_upgrade_cli,
-    stop_service,
+    PortOwnership, RelayProbeOutcome, ServiceRole, check_local_health, default_daemon_listen,
+    detect_public_ipv4, find_live_daemon_port_for_host, install_and_start_service,
+    normalize_relay_url, preflight_probe_relay, probe_daemon_port, resolve_isolated_daemon_listen,
+    self_upgrade_cli, stop_service,
 };
 use crate::ssh_config::{discover_ssh_hosts, provision_relay_via_ssh};
 
@@ -95,7 +96,10 @@ enum DaemonAction {
     /// Show background `orbit daemon` status, bound port, and attached Relay URL.
     Status,
     /// Restart background `orbit daemon` cleanly (running `orbit shim` sessions survive uninterrupted).
-    Restart,
+    Restart {
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Stop and disable background `orbit daemon`.
     Down,
 }
@@ -161,6 +165,8 @@ enum Commands {
 
     /// Print a Multi-Host QR pairing URI (auto-detects LAN/Tailscale IPs & persisted Relay URL).
     Pair {
+        #[arg(long)]
+        port: Option<u16>,
         #[arg(long = "endpoint")]
         endpoints: Vec<String>,
         #[arg(long)]
@@ -264,8 +270,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Doctor => {
             let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
             let persisted = DaemonPersistedConfig::load(&home_dir);
-            let listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
-            let daemon_live = check_local_health(listen.port()).await;
+            let fallback_port = persisted
+                .listen_addr
+                .unwrap_or_else(default_daemon_listen)
+                .port();
+            let active_port =
+                find_live_daemon_port_for_host(&runtime.host_info.host_id, fallback_port).await;
+            let daemon_live = probe_daemon_port(active_port, &runtime.host_info.host_id).await
+                == PortOwnership::Mine;
 
             println!("=== Orbit Host Diagnostics ===");
             println!("Host ID      : {}", runtime.host_info.host_id);
@@ -283,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     "stopped (run `orbit daemon up`)"
                 },
-                listen.port()
+                active_port
             );
             match &persisted.relay_url {
                 Some(r) => println!("Relay Route  : {r} (Noise NK E2EE)"),
@@ -363,23 +375,30 @@ async fn main() -> anyhow::Result<()> {
             no_provision,
             clear,
         } => {
+            let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
+            let expected_host_id = runtime.host_info.host_id.clone();
+            let pubkey = runtime.keypair.public_key_b64.clone();
+            drop(runtime);
+
             let mut persisted = DaemonPersistedConfig::load(&home_dir);
-            let listen = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+            let preferred = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+            let listen = resolve_isolated_daemon_listen(preferred, &expected_host_id).await?;
             persisted.listen_addr = Some(listen);
 
             if clear {
                 persisted.relay_url = None;
                 persisted.save(&home_dir)?;
-                let mgr = install_and_start_service(ServiceRole::Daemon, &home_dir, listen.port())
-                    .await?;
+                let mgr = install_and_start_service(
+                    ServiceRole::Daemon,
+                    &home_dir,
+                    listen.port(),
+                    Some(&expected_host_id),
+                )
+                .await?;
                 println!("[✓] Detached Relay configuration and restarted daemon via {mgr}.");
-                print_pairing_summary(&home_dir, Vec::new(), None).await?;
+                print_pairing_summary(&home_dir, Some(listen.port()), Vec::new(), None).await?;
                 return Ok(());
             }
-
-            let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
-            let pubkey = runtime.keypair.public_key_b64.clone();
-            drop(runtime);
 
             let ssh_hosts = discover_ssh_hosts();
             let chosen_input = match relay_url {
@@ -481,17 +500,27 @@ async fn main() -> anyhow::Result<()> {
             persisted.relay_url = Some(normalized.clone());
             persisted.save(&home_dir)?;
 
-            let mgr =
-                install_and_start_service(ServiceRole::Daemon, &home_dir, listen.port()).await?;
+            let mgr = install_and_start_service(
+                ServiceRole::Daemon,
+                &home_dir,
+                listen.port(),
+                Some(&expected_host_id),
+            )
+            .await?;
             println!("[✓] Orbit Daemon active via {mgr} -> attached to {normalized}");
             println!(
                 "\nCopy & import this updated Pairing Code in Orbit App (Mac / iOS / Android):"
             );
-            print_pairing_summary(&home_dir, Vec::new(), Some(normalized)).await?;
+            print_pairing_summary(&home_dir, Some(listen.port()), Vec::new(), Some(normalized))
+                .await?;
         }
 
-        Commands::Pair { endpoints, relay } => {
-            print_pairing_summary(&home_dir, endpoints, relay).await?;
+        Commands::Pair {
+            port,
+            endpoints,
+            relay,
+        } => {
+            print_pairing_summary(&home_dir, port, endpoints, relay).await?;
         }
 
         Commands::Daemon {
@@ -517,22 +546,32 @@ async fn main() -> anyhow::Result<()> {
                 listen: sub_listen,
                 relay: sub_relay,
             }) => {
+                let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
+                let expected_host_id = runtime.host_info.host_id.clone();
+                drop(runtime);
+
                 let mut persisted = DaemonPersistedConfig::load(&home_dir);
-                let addr = if let Some(l) = sub_listen.or(listen) {
+                let preferred = if let Some(l) = sub_listen.or(listen) {
                     l
                 } else if let Some(p) = port {
                     SocketAddr::from(([0, 0, 0, 0], p))
                 } else {
                     persisted.listen_addr.unwrap_or_else(default_daemon_listen)
                 };
+                let addr = resolve_isolated_daemon_listen(preferred, &expected_host_id).await?;
                 persisted.listen_addr = Some(addr);
                 if let Some(r) = sub_relay.or(relay) {
                     persisted.relay_url = Some(normalize_relay_url(&r)?);
                 }
                 persisted.save(&home_dir)?;
 
-                let mgr =
-                    install_and_start_service(ServiceRole::Daemon, &home_dir, addr.port()).await?;
+                let mgr = install_and_start_service(
+                    ServiceRole::Daemon,
+                    &home_dir,
+                    addr.port(),
+                    Some(&expected_host_id),
+                )
+                .await?;
                 println!("[✓] Orbit Daemon running in background via {mgr}");
                 println!("    Listen : {addr}");
                 println!(
@@ -543,24 +582,55 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or("(none — LAN/Tailscale direct)")
                 );
                 println!("\nPairing Code for Orbit App:");
-                print_pairing_summary(&home_dir, Vec::new(), persisted.relay_url).await?;
+                print_pairing_summary(
+                    &home_dir,
+                    Some(addr.port()),
+                    Vec::new(),
+                    persisted.relay_url,
+                )
+                .await?;
             }
-            Some(DaemonAction::Restart) => {
-                let persisted = DaemonPersistedConfig::load(&home_dir);
-                let addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
-                let mgr =
-                    install_and_start_service(ServiceRole::Daemon, &home_dir, addr.port()).await?;
+            Some(DaemonAction::Restart { port }) => {
+                let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
+                let expected_host_id = runtime.host_info.host_id.clone();
+                drop(runtime);
+
+                let mut persisted = DaemonPersistedConfig::load(&home_dir);
+                let preferred = if let Some(p) = port {
+                    SocketAddr::from(([0, 0, 0, 0], p))
+                } else {
+                    persisted.listen_addr.unwrap_or_else(default_daemon_listen)
+                };
+                let addr = resolve_isolated_daemon_listen(preferred, &expected_host_id).await?;
+                persisted.listen_addr = Some(addr);
+                persisted.save(&home_dir)?;
+
+                let mgr = install_and_start_service(
+                    ServiceRole::Daemon,
+                    &home_dir,
+                    addr.port(),
+                    Some(&expected_host_id),
+                )
+                .await?;
                 println!("[✓] Orbit Daemon restarted via {mgr} (existing agent shims preserved).");
             }
             Some(DaemonAction::Status) => {
+                let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
                 let persisted = DaemonPersistedConfig::load(&home_dir);
-                let addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
-                let healthy = check_local_health(addr.port()).await;
+                let base_addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+                let live_port =
+                    find_live_daemon_port_for_host(&runtime.host_info.host_id, base_addr.port())
+                        .await;
+                let healthy = probe_daemon_port(live_port, &runtime.host_info.host_id).await
+                    == PortOwnership::Mine;
                 println!(
                     "Orbit Daemon : {}",
                     if healthy { "RUNNING" } else { "STOPPED" }
                 );
-                println!("Listen Addr  : {addr}");
+                println!(
+                    "Listen Addr  : {}",
+                    SocketAddr::new(base_addr.ip(), live_port)
+                );
                 println!(
                     "Relay URL    : {}",
                     persisted.relay_url.as_deref().unwrap_or("(not configured)")
@@ -618,7 +688,8 @@ async fn main() -> anyhow::Result<()> {
 
                 let bound_port = persisted.listen_addr.port();
                 let mgr =
-                    install_and_start_service(ServiceRole::Relay, &home_dir, bound_port).await?;
+                    install_and_start_service(ServiceRole::Relay, &home_dir, bound_port, None)
+                        .await?;
 
                 let advertised_url = match public_url {
                     Some(u) => normalize_relay_url(&u)?,
@@ -666,6 +737,7 @@ async fn main() -> anyhow::Result<()> {
                     ServiceRole::Relay,
                     &home_dir,
                     persisted.listen_addr.port(),
+                    None,
                 )
                 .await?;
                 println!(
@@ -743,6 +815,7 @@ async fn main() -> anyhow::Result<()> {
                     WireMessage::CreateAgent {
                         request_id: req_id,
                         cwd: target_cwd.to_string_lossy().to_string(),
+                        extra_dirs: Vec::new(),
                         title: None,
                         provider: provider.into(),
                         model,
@@ -850,14 +923,20 @@ async fn main() -> anyhow::Result<()> {
 
 async fn print_pairing_summary(
     home_dir: &std::path::Path,
+    port_override: Option<u16>,
     explicit_endpoints: Vec<String>,
     explicit_relay: Option<String>,
 ) -> anyhow::Result<()> {
+    let runtime = DaemonRuntime::bootstrap(home_dir).await?;
     let persisted = DaemonPersistedConfig::load(home_dir);
-    let port = persisted
+    let fallback_port = persisted
         .listen_addr
         .unwrap_or_else(default_daemon_listen)
         .port();
+    let port = match port_override {
+        Some(p) => p,
+        None => find_live_daemon_port_for_host(&runtime.host_info.host_id, fallback_port).await,
+    };
     let endpoints = if explicit_endpoints.is_empty() {
         discover_lan_ws_endpoints(port)
     } else {
@@ -868,7 +947,6 @@ async fn print_pairing_summary(
         None => persisted.relay_url,
     };
 
-    let runtime = DaemonRuntime::bootstrap(home_dir).await?;
     let offer = runtime.build_pairing_offer(endpoints.clone(), relay.clone());
     eprintln!(
         "Host `{}` ({}) | Direct: {} | Relay: {}",

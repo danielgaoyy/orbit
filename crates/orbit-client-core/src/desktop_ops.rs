@@ -39,6 +39,20 @@ impl SshTunnelGuard {
             true
         }
     }
+
+    pub fn take_stderr_summary(&self) -> Option<String> {
+        use std::io::Read;
+        let mut guard = self.child.lock().ok()?;
+        let mut stderr = guard.stderr.take()?;
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf);
+        let trimmed = buf.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
 }
 
 impl Drop for SshTunnelGuard {
@@ -100,6 +114,30 @@ fn resolve_ssh_binary() -> &'static str {
     } else {
         "ssh"
     }
+}
+
+fn build_ssh_command() -> Command {
+    let mut cmd = Command::new(resolve_ssh_binary());
+    let mut path_parts = vec![
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+        "/usr/sbin".to_string(),
+        "/sbin".to_string(),
+    ];
+    if let Some(home) = resolve_user_home() {
+        path_parts.insert(0, home.join(".local/bin").to_string_lossy().to_string());
+    }
+    if let Ok(existing) = std::env::var("PATH") {
+        for p in existing.split(':') {
+            if !p.is_empty() && !path_parts.iter().any(|x| x == p) {
+                path_parts.push(p.to_string());
+            }
+        }
+    }
+    cmd.env("PATH", path_parts.join(":"));
+    cmd
 }
 
 /// Automatically discover and ensure a local Orbit Daemon on Desktop (macOS / Linux / Windows) if `orbit` CLI is installed.
@@ -393,7 +431,7 @@ fn simple_glob(pat: &str, text: &str) -> bool {
 
 /// Zero-form 1-click SSH Host Connection:
 /// Connects to `alias`, installs/upgrades `orbit` if missing or incompatible (`GLIBC_` / `<= 0.2.0`),
-/// ensures `orbit daemon up` is running, and returns `orbit://pair/...`.
+/// ensures `orbit daemon up` is running on `remote_port`, and returns `orbit://pair/...`.
 pub fn bootstrap_ssh_host_and_pair(alias: &str, remote_port: u16) -> Result<String, String> {
     let remote_script = format!(
         "set -eu; \
@@ -403,14 +441,14 @@ pub fn bootstrap_ssh_host_and_pair(alias: &str, remote_port: u16) -> Result<Stri
          elif orbit --version 2>&1 | grep -Eq 'GLIBC_|0\\.1\\.|0\\.2\\.0'; then NEED_INSTALL=1; fi; \
          if [ \"$NEED_INSTALL\" = \"1\" ]; then \
            curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
-           orbit daemon restart --port {remote_port} >/dev/null 2>&1 || orbit daemon up --port {remote_port} >/dev/null 2>&1 || true; \
-         else \
+           orbit daemon up --port {remote_port} >/dev/null 2>&1 || true; \
+         elif ! curl -fsS --max-time 1 http://127.0.0.1:{remote_port}/healthz >/dev/null 2>&1; then \
            orbit daemon up --port {remote_port} >/dev/null 2>&1 || true; \
          fi; \
-         orbit pair --port {remote_port}"
+         orbit pair"
     );
 
-    let out = Command::new(resolve_ssh_binary())
+    let out = build_ssh_command()
         .args([
             "-o",
             "BatchMode=yes",
@@ -449,11 +487,11 @@ pub fn upgrade_remote_daemon_over_ssh(alias: &str, remote_port: u16) -> Result<S
         "set -eu; \
          export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
          curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
-         orbit daemon restart --port {remote_port} >/dev/null 2>&1 || orbit daemon up --port {remote_port} >/dev/null 2>&1; \
+         orbit daemon up --port {remote_port} >/dev/null 2>&1; \
          orbit --version"
     );
 
-    let out = Command::new(resolve_ssh_binary())
+    let out = build_ssh_command()
         .args([
             "-o",
             "BatchMode=yes",
@@ -495,7 +533,7 @@ pub fn spawn_ssh_local_tunnel(alias: &str, remote_port: u16) -> Result<SshTunnel
     drop(listener);
 
     let forward_spec = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
-    let mut child = Command::new(resolve_ssh_binary())
+    let mut child = build_ssh_command()
         .args([
             "-N",
             "-o",
@@ -567,7 +605,7 @@ pub fn provision_relay_over_ssh(
          orbit relay up --port {relay_port} {pubkey_flags}"
     );
 
-    let out = Command::new(resolve_ssh_binary())
+    let out = build_ssh_command()
         .args([
             "-o",
             "BatchMode=yes",
@@ -629,5 +667,50 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].alias, "devbox");
         assert_eq!(list[0].display_target, "ubuntu@10.20.30.40");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_devbox_ssh_one_click_e2e() {
+        use crate::HostConnectionState;
+        use crate::app_core::OrbitAppCore;
+
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let card = core
+            .pair_ssh_host_blocking("devbox", 6868)
+            .expect("1-click SSH pair against devbox must succeed");
+        assert_eq!(card.display_name, "devbox");
+
+        for _ in 0..40 {
+            let overview = core.fleet_overview();
+            let detail = core.host_detail(&card.host_id).expect("host detail");
+            if detail.host.connection_state == HostConnectionState::OnlineDirect
+                && !detail.discovered_projects.is_empty()
+            {
+                println!(
+                    "CONNECTED via_ssh_tunnel={} ping={:?}ms projects={} discovered={} workspaces={} agents={} models={}",
+                    detail.host.via_ssh_tunnel,
+                    detail.host.last_ping_ms,
+                    overview.projects.len(),
+                    detail.discovered_projects.len(),
+                    detail.workspaces.len(),
+                    detail.agents.len(),
+                    detail.models_by_provider.len()
+                );
+                assert!(detail.host.via_ssh_tunnel);
+                assert!(
+                    detail
+                        .discovered_projects
+                        .iter()
+                        .any(|p| p.path.contains("mono_repo"))
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        panic!(
+            "devbox did not reach OnlineDirect with workspaces: {:?}",
+            core.host_detail(&card.host_id)
+        );
     }
 }

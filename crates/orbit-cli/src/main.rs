@@ -95,7 +95,10 @@ enum DaemonAction {
     /// Show background `orbit daemon` status, bound port, and attached Relay URL.
     Status,
     /// Restart background `orbit daemon` cleanly (running `orbit shim` sessions survive uninterrupted).
-    Restart,
+    Restart {
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Stop and disable background `orbit daemon`.
     Down,
 }
@@ -161,6 +164,8 @@ enum Commands {
 
     /// Print a Multi-Host QR pairing URI (auto-detects LAN/Tailscale IPs & persisted Relay URL).
     Pair {
+        #[arg(long)]
+        port: Option<u16>,
         #[arg(long = "endpoint")]
         endpoints: Vec<String>,
         #[arg(long)]
@@ -373,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
                 let mgr = install_and_start_service(ServiceRole::Daemon, &home_dir, listen.port())
                     .await?;
                 println!("[✓] Detached Relay configuration and restarted daemon via {mgr}.");
-                print_pairing_summary(&home_dir, Vec::new(), None).await?;
+                print_pairing_summary(&home_dir, None, Vec::new(), None).await?;
                 return Ok(());
             }
 
@@ -487,11 +492,15 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "\nCopy & import this updated Pairing Code in Orbit App (Mac / iOS / Android):"
             );
-            print_pairing_summary(&home_dir, Vec::new(), Some(normalized)).await?;
+            print_pairing_summary(&home_dir, None, Vec::new(), Some(normalized)).await?;
         }
 
-        Commands::Pair { endpoints, relay } => {
-            print_pairing_summary(&home_dir, endpoints, relay).await?;
+        Commands::Pair {
+            port,
+            endpoints,
+            relay,
+        } => {
+            print_pairing_summary(&home_dir, port, endpoints, relay).await?;
         }
 
         Commands::Daemon {
@@ -543,11 +552,24 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or("(none — LAN/Tailscale direct)")
                 );
                 println!("\nPairing Code for Orbit App:");
-                print_pairing_summary(&home_dir, Vec::new(), persisted.relay_url).await?;
+                print_pairing_summary(
+                    &home_dir,
+                    Some(addr.port()),
+                    Vec::new(),
+                    persisted.relay_url,
+                )
+                .await?;
             }
-            Some(DaemonAction::Restart) => {
-                let persisted = DaemonPersistedConfig::load(&home_dir);
-                let addr = persisted.listen_addr.unwrap_or_else(default_daemon_listen);
+            Some(DaemonAction::Restart { port }) => {
+                let mut persisted = DaemonPersistedConfig::load(&home_dir);
+                let addr = if let Some(p) = port {
+                    let a = SocketAddr::from(([0, 0, 0, 0], p));
+                    persisted.listen_addr = Some(a);
+                    persisted.save(&home_dir)?;
+                    a
+                } else {
+                    persisted.listen_addr.unwrap_or_else(default_daemon_listen)
+                };
                 let mgr =
                     install_and_start_service(ServiceRole::Daemon, &home_dir, addr.port()).await?;
                 println!("[✓] Orbit Daemon restarted via {mgr} (existing agent shims preserved).");
@@ -846,14 +868,17 @@ async fn main() -> anyhow::Result<()> {
 
 async fn print_pairing_summary(
     home_dir: &std::path::Path,
+    port_override: Option<u16>,
     explicit_endpoints: Vec<String>,
     explicit_relay: Option<String>,
 ) -> anyhow::Result<()> {
     let persisted = DaemonPersistedConfig::load(home_dir);
-    let port = persisted
-        .listen_addr
-        .unwrap_or_else(default_daemon_listen)
-        .port();
+    let port = port_override.unwrap_or_else(|| {
+        persisted
+            .listen_addr
+            .unwrap_or_else(default_daemon_listen)
+            .port()
+    });
     let endpoints = if explicit_endpoints.is_empty() {
         discover_lan_ws_endpoints(port)
     } else {

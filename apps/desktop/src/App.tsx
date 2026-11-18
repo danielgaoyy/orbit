@@ -1103,17 +1103,28 @@ export default function App() {
         }
       }
 
-      const hasAnyForHost = Array.from(projMap.values()).some((p) => p.host_id === host.host_id);
-      if (!hasAnyForHost && detail.discovered_projects.length > 0) {
-        const best = detail.discovered_projects[0];
-        const id = `${host.host_id}::${best.path.replace(/\/+$/, "")}`;
-        projMap.set(id, {
-          project_id: id,
-          host_id: host.host_id,
-          name: best.name,
-          directories: [best.path],
-          updated_at_ms: best.last_modified_unix * 1000,
-        });
+      for (const dp of detail.discovered_projects.slice(0, 6)) {
+        const cleanDp = dp.path.replace(/\/+$/, "");
+        const parts = cleanDp.split("/");
+        const isBareHome =
+          (parts.length === 3 && (parts[1] === "home" || parts[1] === "Users")) ||
+          cleanDp === "~";
+        if (isBareHome && Array.from(projMap.values()).some((p) => p.host_id === host.host_id)) {
+          continue;
+        }
+        const exists = Array.from(projMap.values()).some(
+          (p) => p.host_id === host.host_id && matchesProjectCwd(p, cleanDp),
+        );
+        if (!exists) {
+          const id = `${host.host_id}::${cleanDp}`;
+          projMap.set(id, {
+            project_id: id,
+            host_id: host.host_id,
+            name: dp.name,
+            directories: [cleanDp],
+            updated_at_ms: dp.last_modified_unix * 1000,
+          });
+        }
       }
     }
 
@@ -1142,6 +1153,15 @@ export default function App() {
       }
       groups.push({ project: proj, host, threads });
     }
+
+    groups.sort((a, b) => {
+      const aParts = (a.project.directories[0] ?? "").replace(/\/+$/, "").split("/");
+      const bParts = (b.project.directories[0] ?? "").replace(/\/+$/, "").split("/");
+      const aHome = aParts.length <= 3 && (aParts[1] === "home" || aParts[1] === "Users") ? 1 : 0;
+      const bHome = bParts.length <= 3 && (bParts[1] === "home" || bParts[1] === "Users") ? 1 : 0;
+      if (aHome !== bHome) return aHome - bHome;
+      return b.project.updated_at_ms - a.project.updated_at_ms;
+    });
 
     return groups;
   }, [fleet, hostDetailsById]);

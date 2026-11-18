@@ -519,12 +519,15 @@ async fn try_connect_ssh_tunnel(
 
     let shared_guard = Arc::new(guard);
     let mut last_err = None;
-    for _ in 0..22 {
+    for _ in 0..45 {
         if shared_guard.has_exited() {
-            return Err(ClientCoreError::Handshake("SSH 隧道进程意外退出".into()));
+            let detail = shared_guard
+                .take_stderr_summary()
+                .unwrap_or_else(|| "SSH 隧道进程意外退出".into());
+            return Err(ClientCoreError::Handshake(detail));
         }
         match tokio::time::timeout(
-            Duration::from_millis(900),
+            Duration::from_millis(3000),
             connect_direct_with_host_id(
                 &profile.host_id,
                 &shared_guard.ws_url,

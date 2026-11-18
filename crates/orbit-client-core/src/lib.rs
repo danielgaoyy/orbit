@@ -1,10 +1,15 @@
-//! Embedded Multi-Host Rust Client Core for Flutter (iOS / Android) and `orbit` CLI.
+//! Embedded Multi-Host Rust Client Core for Tauri Desktop, iOS (SwiftUI), Android (Compose), HarmonyOS 7+ (ArkUI), and `orbit` CLI.
 //!
 //! Provides:
 //! - Concurrent Multi-Host fleet management (Devbox, Linux workstation, Mac mini)
 //! - Happy-Eyeballs smart routing: LAN/Tailscale direct WebSocket first, seamless fallback to Noise NK E2EE Relay
 //! - Zstd wire compression + zero-copy binary terminal framing
 //! - `0ms` instant-open local SQLite WAL replica cache with monotonic `since_seq` catch-up
+//! - Pure-Rust streaming Markdown AST, `syntect` syntax highlighting, Git diff model, and VT100 terminal grid
+
+pub mod app_core;
+pub mod desktop_ops;
+pub mod render;
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -1,76 +1,66 @@
 # Orbit
 
-**Orbit** 是一个用纯 Rust 编写的超轻量、极低延迟、原生支持多主机舰队（Multi-Host Fleet）的本地 AI Coding Agent 编排与移动远程控制面（iOS & Android）。
+**Orbit** 是一个基于纯 Rust 核心构建的超轻量、极低延迟、原生支持多主机舰队（Multi-Host Fleet）的本地 AI Coding Agent 编排与全平台远程控制面。
 
-无论你的 AI 编程会话运行在云端 **Devbox**、**Linux 工作站**，还是家里的 **Mac mini** 上，你都可以通过 **Flutter 120Hz 原生客户端**（内嵌 Rust `liborbit_ffi` 原生加密与 Zstd 压缩内核）或 `orbit` CLI 随时随地以毫秒级响应查看流式进展、审批工具权限、回答澄清提问、审查 Git Diff、操控原生终端以及监控各账号实时额度。
+无论你的 AI 编程会话运行在云端 **Devbox**、**Linux 工作站**，还是家里的 **Mac mini** 上，你都可以通过：
+- **桌面端（macOS / Linux / Windows）**：基于 **Tauri v2** + **React 19 / TypeScript / Tailwind CSS v4 / shadcn/ui / `@xterm/xterm` WebGL** 的轻量级原生桌面控制台（`apps/desktop`）；
+- **移动端第一方原生 UI**：
+  - **iOS (`16.4+`)**：纯原生 **Swift + SwiftUI** 客户端（`apps/ios`，经 UniFFI 嵌入 Rust 内核）；
+  - **Android (`minSdk 29` / `targetSdk 36`)**：纯原生 **Kotlin 2.1 + Jetpack Compose Material 3** 客户端（`apps/android`，经 UniFFI 嵌入 Rust 内核）；
+  - **HarmonyOS (`7.0.0(26)`，仅支持鸿蒙 7 及以上)**：纯原生 **ArkTS + ArkUI V2 (`@ComponentV2` / `@ObservedV2`)** 客户端（`apps/harmony`，经 `ohos-rs` 嵌入 Rust 内核）；
+- 或 **`orbit` 单文件 CLI**
 
----
-
-## 核心特性（Phase 1 完备交付）
-
-1. **单静态二进制四合一（`9.1 MB` Single Binary Everything）**：
-   同一个 `orbit` 可执行文件同时包含 `daemon`（守护进程）、`shim`（热升级不死宿主壳）、`relay`（零知识端到端加密中继）和 `cli`（命令行客户端）。Linux (`x86_64` / `aarch64`) 与 macOS (`Apple Silicon`) 零 Node.js / Python 依赖即拷即用。
-2. **三大王牌 CLI 原生纯 Rust 驱动**：
-   - **Antigravity (`agy`)**：原生对接 `agy acp --stdio` + `transcript_full.jsonl` 字节偏移增量流（支持双向权限、`ask_question` & `elicitation/create` 多选问答、跨回合后台自治唤醒防死锁、`/usage` + `/credits` 实时额度探测）。
-   - **Codex (`codex`)**：原生对接 `codex app-server` 双向 JSON-RPC 2.0 协议（内置 SQLite 启动并发锁、会话创建与恢复、中途插话 `turn/steer`、权限与问答审批、`~/.codex/auth.json` Wham 实时额度与 Credits 探测）。
-   - **Claude Code (`claude`)**：纯 Rust 实现双向 `stream-json` Control Protocol（脱离 Node SDK 包袱，完整支持 `can_use_tool` 权限审批、`AskUserQuestion`、中途 `interrupt`、以及 Linux `.credentials.json` / macOS Keychain 实时额度探测）。
-3. **Daemon 热升级零中断（Detached Shim Architecture）**：
-   所有 CLI 子进程与 `portable-pty` 伪终端均由独立的 `orbit shim` 守护进程组托管并通过 Unix Domain Socket (`$ORBIT_HOME/shims/*.sock`) 接入 `orbit daemon`。随时重启或升级 Daemon 二进制，正在运行的会话与 PTY 终端不断流、不丢失。
-4. **专为跨国/弱网与开源零成本设计的混合网络（BYOR + Multi-Host）**：
-   - **Happy-Eyeballs 多路径竞速**：局域网 / Tailscale 直连优先，外网自动无缝切换至私有中继，配合 Zstd 实时帧压缩，跨国传输流量降低 75%+。
-   - **私有零知识白名单中继**：`orbit relay --allow-pubkey <KEY>` 采用 `Noise_NK_25519_ChaChaPoly_SHA256` 端到端加密与公钥白名单硬拦截，陌生请求在 HTTP Upgrade 阶段直接 `403` 丢弃，绝不消耗你的服务器内存与昂贵流量。
+随时随地以毫秒级响应查看流式进展、审批工具权限、回答澄清提问、审查 Git Diff、操控原生远程终端以及监控各账号实时额度。
 
 ---
 
-## 快速上手（多机部署指南）
+## 核心特性
 
-### 1. 一键安装单二进制（Linux x64/ARM64 & macOS Apple Silicon）
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh
-
-# 一键体检本机身份公钥、后台守护状态与已安装的 agy / codex / claude
-orbit doctor
-
-# 一键并发查询三大 CLI 实时 5h / 周配额与剩余 Credits
-orbit quotas
-```
-
-### 2. 基于 `~/.ssh/config` 零登录一键部署并挂载私有中继（App & CLI 双端原生支持）
-
-- **在 macOS `Orbit.app` 客户端内**：点击机器卡片上的 **`Set Relay`**，App 会自动识别你本机 `~/.ssh/config` 中的所有远程服务器，点一下 **`一键部署并挂载`** 即可自动通过 SSH 在云端装好 `orbit`、写入公钥白名单、拉起常驻中继并建立 `Noise E2EE` 连接；右上角内置 **`一键在线更新`**，随时自动下载最新 Release 并平滑重启。
-- **在终端 CLI 内**：无需手动登录中继机，直接传 `~/.ssh/config` 里的主机别名即可全自动远程部署中继 + 本机挂载 + 输出配对码：
-
-```bash
-# 自动读取 ~/.ssh/config（如 devbox），一键通过 SSH 远程部署白名单中继、重启本机 Daemon 并打印配对码！
-orbit use-relay devbox
-
-# 或交互式从 ~/.ssh/config 列表中回车选择：
-orbit use-relay
-
-# 后续随时一键自更新本机 CLI / Daemon / Relay 到最新 GitHub Release：
-orbit upgrade
-```
-
-### 3. 局域网 / Tailscale 直连模式（无需中继）
-
-```bash
-orbit daemon up
-orbit pair
-```
-
-### 4. 命令行直接驱动三大 CLI
-
-```bash
-orbit run --provider agy "Refactor this module"
-orbit run --provider codex "Run cargo test and fix warnings"
-orbit run --provider claude "Explain ARCHITECTURE.md"
-orbit ls
-```
+1. **单静态二进制四合一（Single Binary Everything）**：
+   同一个 `orbit` 可执行文件同时包含 `daemon`（守护进程）、`shim`（热升级不死宿主壳）、`relay`（零知识端到端加密中继）和 `cli`（命令行客户端）。零 Node.js / Python 运行时依赖。
+2. **共享纯 Rust 客户端引擎（`orbit-client-core`）**：
+   多主机连接池、Happy-Eyeballs 智能路由、Noise NK 端到端加密、SQLite WAL 离线秒开缓存、流式 Markdown AST 解析（`pulldown-cmark`）、纯 Rust 语法高亮（`syntect`）、结构化 Git Diff（`similar`）以及 VT100 终端屏幕网格（`vt100`）全部在纯 Rust 内核统一完成。
+3. **三大王牌 CLI 原生纯 Rust 驱动**：
+   - **Antigravity (`agy`)**：原生对接 `agy acp --stdio` + `transcript_full.jsonl` 字节偏移增量流。
+   - **Codex (`codex`)**：原生对接 `codex app-server` 双向 JSON-RPC 2.0 协议。
+   - **Claude Code (`claude`)**：纯 Rust 实现双向 `stream-json` Control Protocol。
+4. **私有零知识白名单中继**：
+   `orbit relay --allow-pubkey <KEY>` 采用 `Noise_NK_25519_ChaChaPoly_SHA256` 端到端加密与公钥白名单硬拦截，配合 Zstd 实时帧压缩降低 75%+ 跨国流量。
 
 ---
 
-## 手机客户端（iOS & Android）构建
+## 快速构建指南
 
-- **Android APK**：参见 [`.github/workflows/release.yml`](.github/workflows/release.yml) 中的 `build-android-apk`（通过 `cargo-ndk` 编译 `liborbit_ffi.so` 后执行 `flutter build apk --release --target-platform android-arm64`）。
-- **iOS IPA**：无需本地配置 Xcode，推送到 GitHub 后 `build-ios-ipa` 工作流会自动在 `macos-latest` 构建机上交叉编译 `aarch64-apple-ios` 静态库并打包产出 `Orbit-iOS-unsigned.ipa`（支持 AltStore / SideStore / Sideloadly 或 Apple 开发者证书签名安装）。
+### 1. Rust 服务端与全量测试
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+### 2. 桌面端（macOS / Linux / Windows — Tauri v2 + shadcn/ui）
+```bash
+cd apps/desktop
+npm install
+npm run tauri dev     # 启动桌面开发窗口（自动发现本机 127.0.0.1:6868 Daemon）
+npm run tauri build   # 构建当前桌面平台的原生安装包 (.dmg / .deb / .msi)
+```
+
+### 3. iOS 原生端（SwiftUI，兼容 iOS 16.4+）
+```bash
+./apps/ios/scripts/build-rust-xcframework.sh
+cd apps/ios && xcodegen generate
+open OrbitMobile.xcodeproj
+```
+
+### 4. Android 原生端（Jetpack Compose Material 3，minSdk 29 / targetSdk 36）
+```bash
+./apps/android/scripts/build-rust-android.sh
+# 使用 Android Studio 打开 apps/android 或运行 gradle assembleRelease
+```
+
+### 5. HarmonyOS 7+ 原生端（ArkTS + ArkUI V2，compatibleSdkVersion 7.0.0(26)）
+```bash
+./apps/harmony/scripts/build-rust-ohos.sh
+# 使用 DevEco Studio (HarmonyOS 7 / API 26 SDK) 打开 apps/harmony 构建 HAP
+```

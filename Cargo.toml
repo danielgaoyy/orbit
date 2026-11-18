@@ -9,8 +9,12 @@ members = [
     "crates/orbit-daemon",
     "crates/orbit-relay",
     "crates/orbit-client-core",
-    "crates/orbit-ffi",
+    "crates/orbit-ffi-uniffi",
+    "crates/orbit-ffi-ohos",
     "crates/orbit-cli",
+]
+exclude = [
+    "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
@@ -28,6 +32,7 @@ orbit-providers = { path = "crates/orbit-providers" }
 orbit-daemon = { path = "crates/orbit-daemon" }
 orbit-relay = { path = "crates/orbit-relay" }
 orbit-client-core = { path = "crates/orbit-client-core" }
+orbit-ffi-uniffi = { path = "crates/orbit-ffi-uniffi" }
 
 # Async & Networking
 tokio = { version = "1.44", features = ["full"] }
@@ -48,6 +53,18 @@ sha2 = "0.10"
 
 # Storage (SQLite WAL)
 rusqlite = { version = "0.34", features = ["bundled"] }
+
+# Client Rendering Pipeline (Pure Rust Markdown, Highlighting, Diff, VT100 Grid)
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+similar = "3.2"
+vt100 = "0.18"
+
+# Cross-Language Native Bindings (iOS/Android UniFFI & HarmonyOS 7+ N-API)
+uniffi = "0.32"
+napi-ohos = { version = "1.2", default-features = false, features = ["napi8", "async"] }
+napi-derive-ohos = "1.2"
+napi-build-ohos = "1.1"
 
 # CLI, PTY & System
 clap = { version = "4.5", features = ["derive", "env"] }

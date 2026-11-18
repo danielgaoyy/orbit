@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "0.2.0",
+  "description": "Orbit HarmonyOS 7+ Entry Module",
+  "main": "",
+  "author": "Orbit",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "liborbit_ohos.so": "file:./src/main/cpp/types/liborbit_ohos"
+  }
+}

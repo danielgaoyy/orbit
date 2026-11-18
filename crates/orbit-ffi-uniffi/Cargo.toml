@@ -1,0 +1,22 @@
+[package]
+name = "orbit-ffi-uniffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "orbit_ffi_uniffi"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+# UniFFI's `setup_scaffolding!()` macro emits C-ABI `unsafe extern "C"` shims at the FFI boundary.
+[lints]
+
+[dependencies]
+orbit-client-core.workspace = true
+orbit-protocol.workspace = true
+thiserror.workspace = true
+uniffi = { workspace = true, features = ["cli"] }

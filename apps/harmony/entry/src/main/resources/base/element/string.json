@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Orbit Multi-Host AI Coding Agent Control Plane (HarmonyOS 7+)"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Orbit Native ArkUI V2 Control Plane"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Orbit"
+    }
+  ]
+}

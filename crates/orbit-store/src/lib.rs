@@ -11,6 +11,17 @@ use orbit_protocol::{
     TimelinePayload, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+
+/// Persisted remote/local host profile stored in the client's local SQLite replica.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredHostProfile {
+    pub host_id: String,
+    pub display_name: String,
+    pub daemon_pubkey_b64: String,
+    pub direct_endpoints: Vec<String>,
+    pub relay_url: Option<String>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -89,6 +100,15 @@ impl OrbitStore {
                 cols        INTEGER NOT NULL,
                 rows        INTEGER NOT NULL,
                 created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS client_hosts (
+                host_id              TEXT PRIMARY KEY,
+                display_name         TEXT NOT NULL,
+                daemon_pubkey_b64    TEXT NOT NULL,
+                direct_endpoints_json TEXT NOT NULL,
+                relay_url            TEXT,
+                updated_at           TEXT NOT NULL
             );
             ",
         )?;
@@ -476,6 +496,61 @@ impl OrbitStore {
         conn.execute(
             "DELETE FROM terminals WHERE terminal_id = ?1",
             params![terminal_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_client_host(&self, host: &StoredHostProfile) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let endpoints_json = serde_json::to_string(&host.direct_endpoints)?;
+        conn.execute(
+            "INSERT INTO client_hosts (
+                host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(host_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                daemon_pubkey_b64 = excluded.daemon_pubkey_b64,
+                direct_endpoints_json = excluded.direct_endpoints_json,
+                relay_url = excluded.relay_url,
+                updated_at = excluded.updated_at",
+            params![
+                host.host_id,
+                host.display_name,
+                host.daemon_pubkey_b64,
+                endpoints_json,
+                host.relay_url,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_client_hosts(&self) -> Result<Vec<StoredHostProfile>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT host_id, display_name, daemon_pubkey_b64, direct_endpoints_json, relay_url
+             FROM client_hosts ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let endpoints_str: String = row.get(3)?;
+            let direct_endpoints: Vec<String> =
+                serde_json::from_str(&endpoints_str).unwrap_or_default();
+            Ok(StoredHostProfile {
+                host_id: row.get(0)?,
+                display_name: row.get(1)?,
+                daemon_pubkey_b64: row.get(2)?,
+                direct_endpoints,
+                relay_url: row.get(4)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn delete_client_host(&self, host_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM client_hosts WHERE host_id = ?1",
+            params![host_id],
         )?;
         Ok(())
     }

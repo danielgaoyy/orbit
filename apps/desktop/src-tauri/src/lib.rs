@@ -2,12 +2,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
-    AgentTimelineView, CoreEventSubscriber, CoreNotification, FleetOverviewView, GitReviewView,
-    HostCardView, HostDetailView, OrbitAppCore,
+    AgentTimelineView, ClientProjectView, CoreEventSubscriber, CoreNotification, FleetOverviewView,
+    GitReviewView, HostCardView, HostDetailView, OrbitAppCore,
 };
 use orbit_client_core::desktop_ops::{
     SshHostItem, discover_user_ssh_hosts, provision_relay_over_ssh, resolve_user_home,
+    upgrade_remote_daemon_over_ssh,
 };
 use orbit_protocol::{ProviderKind, SessionMode};
 use tauri::{State, ipc::Channel};
@@ -83,8 +85,52 @@ fn pair_host(
 }
 
 #[tauri::command]
+async fn pair_ssh_host(
+    state: State<'_, DesktopAppState>,
+    ssh_alias: String,
+    remote_port: Option<u16>,
+) -> Result<HostCardView, String> {
+    let core = Arc::clone(&state.core);
+    let port = remote_port.unwrap_or(6868);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.pair_ssh_host_blocking(&ssh_alias, port)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
 fn remove_host(state: State<'_, DesktopAppState>, host_id: String) -> Result<(), String> {
     state.core.remove_host(&host_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_host_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    custom_name: Option<String>,
+    route_mode: Option<HostRouteMode>,
+    ssh_alias: Option<String>,
+    remote_daemon_port: Option<u16>,
+    custom_direct_endpoint: Option<String>,
+    relay_url: Option<String>,
+    reconnect: Option<bool>,
+) -> Result<HostCardView, String> {
+    state
+        .core
+        .update_host_config(
+            &host_id,
+            custom_name,
+            route_mode,
+            ssh_alias,
+            remote_daemon_port,
+            custom_direct_endpoint,
+            relay_url,
+            reconnect.unwrap_or(true),
+        )
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -97,6 +143,50 @@ fn update_host_relay(
         .core
         .update_host_relay(&host_id, relay_url.as_deref())
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn upgrade_remote_daemon(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    ssh_alias: String,
+    remote_port: Option<u16>,
+) -> Result<String, String> {
+    let port = remote_port.unwrap_or(6868);
+    let ver = tauri::async_runtime::spawn_blocking(move || {
+        upgrade_remote_daemon_over_ssh(&ssh_alias, port)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
+    state.core.connect_host_async(host_id);
+    Ok(ver)
+}
+
+#[tauri::command]
+fn upsert_project(
+    state: State<'_, DesktopAppState>,
+    project_id: Option<String>,
+    host_id: String,
+    name: String,
+    directories: Vec<String>,
+) -> Result<ClientProjectView, String> {
+    state
+        .core
+        .upsert_project(project_id.as_deref(), &host_id, &name, directories)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_project(state: State<'_, DesktopAppState>, project_id: String) -> Result<(), String> {
+    state
+        .core
+        .remove_project(&project_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_directory(state: State<'_, DesktopAppState>, host_id: String, path: Option<String>) {
+    state.core.list_directory(&host_id, path);
 }
 
 #[tauri::command]
@@ -120,23 +210,28 @@ fn refresh_quotas(state: State<'_, DesktopAppState>, host_id: String) {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn create_agent(
     state: State<'_, DesktopAppState>,
     host_id: String,
     cwd: String,
+    extra_dirs: Option<Vec<String>>,
     provider: ProviderKind,
+    model: Option<String>,
     mode: SessionMode,
     initial_prompt: String,
     worktree_branch: Option<String>,
-) {
-    state.core.create_agent(
+) -> String {
+    state.core.create_agent_ext(
         &host_id,
         &cwd,
+        extra_dirs.unwrap_or_default(),
         provider,
+        model,
         mode,
         &initial_prompt,
         worktree_branch.as_deref(),
-    );
+    )
 }
 
 #[tauri::command]
@@ -167,6 +262,28 @@ fn set_session_mode(
     mode: SessionMode,
 ) {
     state.core.set_session_mode(&host_id, &agent_id, mode);
+}
+
+#[tauri::command]
+fn set_agent_model(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    model: Option<String>,
+) {
+    state.core.set_agent_model(&host_id, &agent_id, model);
+}
+
+#[tauri::command]
+fn switch_agent_provider(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    provider: ProviderKind,
+) {
+    state
+        .core
+        .switch_agent_provider(&host_id, &agent_id, provider);
 }
 
 #[tauri::command]
@@ -290,8 +407,14 @@ pub fn run() {
             get_agent_timeline,
             get_git_review,
             pair_host,
+            pair_ssh_host,
             remove_host,
+            update_host_config,
             update_host_relay,
+            upgrade_remote_daemon,
+            upsert_project,
+            remove_project,
+            list_directory,
             connect_host,
             connect_all_hosts,
             refresh_host,
@@ -301,6 +424,8 @@ pub fn run() {
             send_prompt,
             interrupt_agent,
             set_session_mode,
+            set_agent_model,
+            switch_agent_provider,
             archive_agent,
             resolve_permission,
             answer_question,

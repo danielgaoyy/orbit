@@ -743,6 +743,7 @@ async fn main() -> anyhow::Result<()> {
                     WireMessage::CreateAgent {
                         request_id: req_id,
                         cwd: target_cwd.to_string_lossy().to_string(),
+                        extra_dirs: Vec::new(),
                         title: None,
                         provider: provider.into(),
                         model,

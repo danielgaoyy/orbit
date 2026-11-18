@@ -16,6 +16,7 @@ pub struct SessionLaunchConfig {
     pub orbit_exe: PathBuf,
     pub shim_socket: PathBuf,
     pub cwd: PathBuf,
+    pub extra_dirs: Vec<PathBuf>,
     pub model: Option<String>,
     pub mode: SessionMode,
     pub resume_session_id: Option<String>,
@@ -30,6 +31,9 @@ pub enum DriverCommand {
     Interrupt,
     SetMode {
         mode: SessionMode,
+    },
+    SetModel {
+        model: Option<String>,
     },
     ResolvePermission {
         request_id: String,

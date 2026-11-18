@@ -51,6 +51,10 @@ pub async fn spawn_claude_session(
         args.push("--model".to_string());
         args.push(m.clone());
     }
+    for extra in &cfg.extra_dirs {
+        args.push("--add-dir".to_string());
+        args.push(extra.to_string_lossy().to_string());
+    }
 
     let mut env = HashMap::new();
     env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-ts".into());
@@ -204,6 +208,21 @@ async fn run_claude_actor(
                             }
                         });
                         let _ = shim.write_stdin_line(req.to_string()).await;
+                    }
+                    DriverCommand::SetModel { model } => {
+                        if let Some(m) = model {
+                            let rid = format!("ctrl_{ctrl_seq}");
+                            ctrl_seq += 1;
+                            let req = json!({
+                                "request_id": rid,
+                                "type": "control_request",
+                                "request": {
+                                    "subtype": "set_model",
+                                    "model": m
+                                }
+                            });
+                            let _ = shim.write_stdin_line(req.to_string()).await;
+                        }
                     }
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(p) = pending_perms.remove(&request_id) {

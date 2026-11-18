@@ -4,29 +4,34 @@
 //! - Android (minSdk 29 / targetSdk 36): Kotlin + Jetpack Compose (via `orbit-ffi-uniffi`)
 //! - HarmonyOS 7+ (API 26): ArkTS + ArkUI V2 (via `orbit-ffi-ohos`)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
-    AgentStatus, AgentSummary, DiscoveredProject, GitStatusSnapshot, ProviderKind,
-    ProviderQuotaSnapshot, QuestionItem, SessionMode, TerminalBinaryFrame, TerminalSummary,
-    TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceSummary,
+    AgentStatus, AgentSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot, ModelOption,
+    ProviderKind, ProviderQuotaSnapshot, QuestionItem, SessionMode, TerminalBinaryFrame,
+    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
+    WorkspaceSummary,
 };
-use orbit_store::{OrbitStore, StoredHostProfile};
+use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::desktop_ops::{discover_local_daemon_pairing_uri, normalize_relay_input};
+use crate::desktop_ops::{
+    bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri, normalize_relay_input,
+};
 use crate::render::{
     DiffFileView, RichBlockView, TerminalGridEmulator, TerminalScreenView, parse_markdown_blocks,
     parse_unified_diff,
 };
 use crate::{
-    ClientCoreError, ClientInboundEvent, HostConnectionState, HostSessionHandle, SavedHostProfile,
-    connect_smart,
+    ClientCoreError, ClientInboundEvent, HostConnectionState, HostRouteMode, HostSessionHandle,
+    SavedHostProfile, connect_smart,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +67,35 @@ pub trait CoreEventSubscriber: Send + Sync {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientProjectView {
+    pub project_id: String,
+    pub host_id: String,
+    pub name: String,
+    pub directories: Vec<String>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryListingView {
+    pub current_path: String,
+    pub parent_path: Option<String>,
+    pub entries: Vec<DirectoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostCardView {
     pub host_id: String,
     pub display_name: String,
+    pub hostname: String,
+    pub custom_name: Option<String>,
+    pub ssh_alias: Option<String>,
+    pub route_mode: HostRouteMode,
+    pub remote_daemon_port: u16,
+    pub custom_direct_endpoint: Option<String>,
+    pub via_ssh_tunnel: bool,
+    pub last_ping_ms: Option<u32>,
+    pub daemon_version: Option<String>,
+    pub os_arch: Option<String>,
     pub daemon_pubkey_b64: String,
     pub direct_endpoints: Vec<String>,
     pub relay_url: Option<String>,
@@ -81,6 +112,7 @@ pub struct FleetOverviewView {
     pub revision: u64,
     pub total_pending_approvals: u32,
     pub hosts: Vec<HostCardView>,
+    pub projects: Vec<ClientProjectView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,8 +138,12 @@ pub struct HostDetailView {
     pub revision: u64,
     pub host: HostCardView,
     pub discovered_projects: Vec<DiscoveredProject>,
+    pub directory_listing: Option<DirectoryListingView>,
+    pub models_by_provider: HashMap<ProviderKind, Vec<ModelOption>>,
     pub workspaces: Vec<WorkspaceSummary>,
     pub agents: Vec<AgentCardView>,
+    pub last_created_agent_id: Option<String>,
+    pub replaced_optimistic_agents: HashMap<String, String>,
     pub quotas: Vec<ProviderQuotaSnapshot>,
     pub terminals: Vec<TerminalSummary>,
     pub active_terminal_id: Option<String>,
@@ -186,9 +222,21 @@ pub struct GitReviewView {
 struct HostMemoryState {
     profile: SavedHostProfile,
     last_error: Option<String>,
+    via_ssh_tunnel: bool,
+    last_ping_ms: Option<u32>,
+    daemon_version: Option<String>,
+    os_arch: Option<String>,
+    reconnect_attempt: u32,
+    connecting_in_flight: bool,
     available_providers: Vec<ProviderKind>,
     session: Option<HostSessionHandle>,
+    pending_outbox: Vec<WireMessage>,
+    optimistic_by_req_id: HashMap<Uuid, String>,
+    replaced_optimistic_agents: HashMap<String, String>,
+    last_created_agent_id: Option<String>,
     discovered_projects: Vec<DiscoveredProject>,
+    directory_listing: Option<DirectoryListingView>,
+    models_by_provider: HashMap<ProviderKind, Vec<ModelOption>>,
     workspaces: Vec<WorkspaceSummary>,
     agents: HashMap<String, AgentSummary>,
     timelines: HashMap<String, Vec<TimelineEvent>>,
@@ -207,13 +255,25 @@ impl HostMemoryState {
         Self {
             profile,
             last_error: None,
+            via_ssh_tunnel: false,
+            last_ping_ms: None,
+            daemon_version: None,
+            os_arch: None,
+            reconnect_attempt: 0,
+            connecting_in_flight: false,
             available_providers: vec![
                 ProviderKind::Antigravity,
                 ProviderKind::Codex,
                 ProviderKind::ClaudeCode,
             ],
             session: None,
+            pending_outbox: Vec::new(),
+            optimistic_by_req_id: HashMap::new(),
+            replaced_optimistic_agents: HashMap::new(),
+            last_created_agent_id: None,
             discovered_projects: Vec::new(),
+            directory_listing: None,
+            models_by_provider: default_client_models_map(),
             workspaces: Vec::new(),
             agents: HashMap::new(),
             timelines: HashMap::new(),
@@ -228,6 +288,23 @@ impl HostMemoryState {
         }
     }
 
+    fn to_stored_host(&self) -> StoredHostProfile {
+        StoredHostProfile {
+            host_id: self.profile.host_id.clone(),
+            display_name: self.profile.hostname.clone(),
+            daemon_pubkey_b64: self.profile.daemon_pubkey_b64.clone(),
+            direct_endpoints: self.profile.direct_endpoints.clone(),
+            relay_url: self.profile.relay_url.clone(),
+            meta: StoredHostMeta {
+                custom_name: self.profile.custom_name.clone(),
+                ssh_alias: self.profile.ssh_alias.clone(),
+                route_mode: Some(self.profile.route_mode.as_str().to_string()),
+                remote_daemon_port: Some(self.profile.remote_daemon_port),
+                custom_direct_endpoint: self.profile.custom_direct_endpoint.clone(),
+            },
+        }
+    }
+
     fn to_card(&self) -> HostCardView {
         let pending_approval_count = self
             .agents
@@ -236,7 +313,17 @@ impl HostMemoryState {
             .count() as u32;
         HostCardView {
             host_id: self.profile.host_id.clone(),
-            display_name: self.profile.display_name.clone(),
+            display_name: self.profile.effective_display_name(),
+            hostname: self.profile.hostname.clone(),
+            custom_name: self.profile.custom_name.clone(),
+            ssh_alias: self.profile.ssh_alias.clone(),
+            route_mode: self.profile.route_mode,
+            remote_daemon_port: self.profile.remote_daemon_port,
+            custom_direct_endpoint: self.profile.custom_direct_endpoint.clone(),
+            via_ssh_tunnel: self.via_ssh_tunnel,
+            last_ping_ms: self.last_ping_ms,
+            daemon_version: self.daemon_version.clone(),
+            os_arch: self.os_arch.clone(),
             daemon_pubkey_b64: self.profile.daemon_pubkey_b64.clone(),
             direct_endpoints: self.profile.direct_endpoints.clone(),
             relay_url: self.profile.relay_url.clone(),
@@ -255,6 +342,7 @@ pub struct OrbitAppCore {
     runtime: tokio::runtime::Runtime,
     store: Arc<OrbitStore>,
     hosts: Arc<RwLock<HashMap<String, HostMemoryState>>>,
+    projects: Arc<RwLock<HashMap<String, ClientProjectView>>>,
     subscribers: Arc<Mutex<Vec<Arc<dyn CoreEventSubscriber>>>>,
     revision: Arc<AtomicU64>,
 }
@@ -288,13 +376,27 @@ impl OrbitAppCore {
             for h in saved {
                 let profile = SavedHostProfile {
                     host_id: h.host_id.clone(),
-                    display_name: h.display_name,
+                    hostname: h.display_name,
+                    custom_name: h.meta.custom_name,
+                    ssh_alias: h.meta.ssh_alias,
+                    route_mode: HostRouteMode::from_opt_str(h.meta.route_mode.as_deref()),
+                    remote_daemon_port: h.meta.remote_daemon_port.unwrap_or(6868),
+                    custom_direct_endpoint: h.meta.custom_direct_endpoint,
                     daemon_pubkey_b64: h.daemon_pubkey_b64,
                     direct_endpoints: h.direct_endpoints,
                     relay_url: h.relay_url,
                     state: HostConnectionState::Disconnected,
                 };
-                initial_hosts.insert(h.host_id, HostMemoryState::new(profile));
+                let mut mem = HostMemoryState::new(profile);
+                if let Ok(ws_list) = store.list_replica_workspaces(&h.host_id) {
+                    mem.workspaces = ws_list;
+                }
+                if let Ok(ag_list) = store.list_replica_agents(&h.host_id) {
+                    for ag in ag_list {
+                        mem.agents.insert(ag.agent_id.clone(), ag);
+                    }
+                }
+                initial_hosts.insert(h.host_id, mem);
             }
         }
 
@@ -308,31 +410,44 @@ impl OrbitAppCore {
             if !endpoints.contains(&loopback) {
                 endpoints.insert(0, loopback);
             }
-            let stored = StoredHostProfile {
+            let mem = HostMemoryState::new(SavedHostProfile {
                 host_id: offer.host_id.clone(),
-                display_name: offer.hostname.clone(),
-                daemon_pubkey_b64: offer.daemon_pubkey_b64.clone(),
-                direct_endpoints: endpoints.clone(),
-                relay_url: offer.relay_url.clone(),
-            };
-            let _ = store.upsert_client_host(&stored);
-            initial_hosts.insert(
-                offer.host_id.clone(),
-                HostMemoryState::new(SavedHostProfile {
-                    host_id: offer.host_id,
-                    display_name: offer.hostname,
-                    daemon_pubkey_b64: offer.daemon_pubkey_b64,
-                    direct_endpoints: endpoints,
-                    relay_url: offer.relay_url,
-                    state: HostConnectionState::Disconnected,
-                }),
-            );
+                hostname: offer.hostname,
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: offer.daemon_pubkey_b64,
+                direct_endpoints: endpoints,
+                relay_url: offer.relay_url,
+                state: HostConnectionState::Disconnected,
+            });
+            let _ = store.upsert_client_host(&mem.to_stored_host());
+            initial_hosts.insert(offer.host_id, mem);
+        }
+
+        let mut initial_projects = HashMap::new();
+        if let Ok(saved_projs) = store.list_client_projects() {
+            for p in saved_projs {
+                initial_projects.insert(
+                    p.project_id.clone(),
+                    ClientProjectView {
+                        project_id: p.project_id,
+                        host_id: p.host_id,
+                        name: p.name,
+                        directories: p.directories,
+                        updated_at_ms: p.updated_at_ms,
+                    },
+                );
+            }
         }
 
         Ok(Arc::new(Self {
             runtime,
             store,
             hosts: Arc::new(RwLock::new(initial_hosts)),
+            projects: Arc::new(RwLock::new(initial_projects)),
             subscribers: Arc::new(Mutex::new(Vec::new())),
             revision: Arc::new(AtomicU64::new(1)),
         }))
@@ -359,20 +474,33 @@ impl OrbitAppCore {
 
     pub fn fleet_overview(&self) -> FleetOverviewView {
         let rev = self.revision.load(Ordering::SeqCst);
-        let Ok(guard) = self.hosts.read() else {
-            return FleetOverviewView {
-                revision: rev,
-                total_pending_approvals: 0,
-                hosts: Vec::new(),
-            };
-        };
-        let mut cards: Vec<HostCardView> = guard.values().map(HostMemoryState::to_card).collect();
-        cards.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+        let cards = self
+            .hosts
+            .read()
+            .map(|guard| {
+                let mut v: Vec<HostCardView> =
+                    guard.values().map(HostMemoryState::to_card).collect();
+                v.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+                v
+            })
+            .unwrap_or_default();
         let total_pending_approvals = cards.iter().map(|c| c.pending_approval_count).sum();
+
+        let projects = self
+            .projects
+            .read()
+            .map(|guard| {
+                let mut v: Vec<ClientProjectView> = guard.values().cloned().collect();
+                v.sort_by_key(|a| std::cmp::Reverse(a.updated_at_ms));
+                v
+            })
+            .unwrap_or_default();
+
         FleetOverviewView {
             revision: rev,
             total_pending_approvals,
             hosts: cards,
+            projects,
         }
     }
 
@@ -387,8 +515,12 @@ impl OrbitAppCore {
             revision: rev,
             host: state.to_card(),
             discovered_projects: state.discovered_projects.clone(),
+            directory_listing: state.directory_listing.clone(),
+            models_by_provider: state.models_by_provider.clone(),
             workspaces: state.workspaces.clone(),
             agents,
+            last_created_agent_id: state.last_created_agent_id.clone(),
+            replaced_optimistic_agents: state.replaced_optimistic_agents.clone(),
             quotas: state.quotas.clone(),
             terminals: state.terminals.clone(),
             active_terminal_id: state.active_terminal_id.clone(),
@@ -417,7 +549,8 @@ impl OrbitAppCore {
 
         // Hydrate from local SQLite replica on first open for 0ms offline-first rendering
         if !host_state.timelines.contains_key(agent_id)
-            && let Ok((cached, _)) = self.store.fetch_timeline_since(agent_id, 0, 500)
+            && !agent_id.starts_with("opt_")
+            && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 500)
             && !cached.is_empty()
         {
             host_state.timelines.insert(agent_id.to_string(), cached);
@@ -430,7 +563,6 @@ impl OrbitAppCore {
             .cloned()
             .unwrap_or_default();
 
-        // Collect resolved permission & question decisions so cards render their final state
         let mut resolved_perms: HashMap<String, String> = HashMap::new();
         let mut resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         for ev in &events {
@@ -601,38 +733,146 @@ impl OrbitAppCore {
         Some(state.terminal_emulator.snapshot())
     }
 
-    // --- Commands / Intents ---
+    // --- Paseo-Style Multi-Directory Project Management ---
+
+    pub fn upsert_project(
+        &self,
+        project_id: Option<&str>,
+        host_id: &str,
+        name: &str,
+        directories: Vec<String>,
+    ) -> Result<ClientProjectView, ClientCoreError> {
+        let clean_dirs: Vec<String> = directories
+            .into_iter()
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty())
+            .collect();
+        let primary = clean_dirs
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "~".to_string());
+        let id = project_id
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("{host_id}::{}", primary.trim_end_matches('/')));
+        let clean_name = if name.trim().is_empty() {
+            folder_basename(&primary)
+        } else {
+            name.trim().to_string()
+        };
+        let now_ms = unix_ms_now() as i64;
+
+        let stored = StoredClientProject {
+            project_id: id.clone(),
+            host_id: host_id.to_string(),
+            name: clean_name.clone(),
+            directories: if clean_dirs.is_empty() {
+                vec![primary]
+            } else {
+                clean_dirs
+            },
+            updated_at_ms: now_ms,
+        };
+        self.store.upsert_client_project(&stored)?;
+
+        let view = ClientProjectView {
+            project_id: stored.project_id,
+            host_id: stored.host_id,
+            name: stored.name,
+            directories: stored.directories,
+            updated_at_ms: stored.updated_at_ms,
+        };
+        if let Ok(mut guard) = self.projects.write() {
+            guard.insert(id, view.clone());
+        }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        Ok(view)
+    }
+
+    pub fn remove_project(&self, project_id: &str) -> Result<(), ClientCoreError> {
+        self.store.delete_client_project(project_id)?;
+        if let Ok(mut guard) = self.projects.write() {
+            guard.remove(project_id);
+        }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        Ok(())
+    }
+
+    pub fn list_directory(self: &Arc<Self>, host_id: &str, path: Option<String>) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ListDirectory {
+                request_id: Uuid::new_v4(),
+                path,
+            },
+        );
+    }
+
+    // --- Host Pairing, 1-Click SSH & Configuration ---
 
     pub fn pair_host(self: &Arc<Self>, pairing_uri: &str) -> Result<HostCardView, ClientCoreError> {
-        let offer = PairingOffer::from_qr_uri(pairing_uri)?;
-        let stored = StoredHostProfile {
-            host_id: offer.host_id.clone(),
-            display_name: offer.hostname.clone(),
-            daemon_pubkey_b64: offer.daemon_pubkey_b64.clone(),
-            direct_endpoints: offer.direct_endpoints.clone(),
-            relay_url: offer.relay_url.clone(),
-        };
-        self.store.upsert_client_host(&stored)?;
+        self.pair_host_internal(pairing_uri, None)
+    }
 
-        let profile = SavedHostProfile {
-            host_id: offer.host_id.clone(),
-            display_name: offer.hostname,
-            daemon_pubkey_b64: offer.daemon_pubkey_b64,
-            direct_endpoints: offer.direct_endpoints,
-            relay_url: offer.relay_url,
-            state: HostConnectionState::Disconnected,
-        };
-        let card = {
+    pub fn pair_ssh_host_blocking(
+        self: &Arc<Self>,
+        alias: &str,
+        remote_port: u16,
+    ) -> Result<HostCardView, ClientCoreError> {
+        let uri =
+            bootstrap_ssh_host_and_pair(alias, remote_port).map_err(ClientCoreError::Handshake)?;
+        self.pair_host_internal(&uri, Some((alias.to_string(), remote_port)))
+    }
+
+    fn pair_host_internal(
+        self: &Arc<Self>,
+        pairing_uri: &str,
+        ssh_info: Option<(String, u16)>,
+    ) -> Result<HostCardView, ClientCoreError> {
+        let offer = PairingOffer::from_qr_uri(pairing_uri)?;
+        let (card, stored) = {
             let mut guard = self
                 .hosts
                 .write()
                 .map_err(|_| ClientCoreError::LockPoisoned)?;
+            let prev = guard.get(&offer.host_id);
+            let custom_name = prev.and_then(|h| h.profile.custom_name.clone());
+            let ssh_alias = ssh_info
+                .as_ref()
+                .map(|(a, _)| a.clone())
+                .or_else(|| prev.and_then(|h| h.profile.ssh_alias.clone()));
+            let remote_port = ssh_info
+                .as_ref()
+                .map(|(_, p)| *p)
+                .or_else(|| prev.map(|h| h.profile.remote_daemon_port))
+                .unwrap_or(6868);
+            let route_mode = prev
+                .map(|h| h.profile.route_mode)
+                .unwrap_or(HostRouteMode::Auto);
+            let custom_direct_endpoint =
+                prev.and_then(|h| h.profile.custom_direct_endpoint.clone());
+
+            let profile = SavedHostProfile {
+                host_id: offer.host_id.clone(),
+                hostname: offer.hostname,
+                custom_name,
+                ssh_alias,
+                route_mode,
+                remote_daemon_port: remote_port,
+                custom_direct_endpoint,
+                daemon_pubkey_b64: offer.daemon_pubkey_b64,
+                direct_endpoints: offer.direct_endpoints,
+                relay_url: offer.relay_url,
+                state: HostConnectionState::Disconnected,
+            };
             let entry = guard
                 .entry(offer.host_id.clone())
                 .or_insert_with(|| HostMemoryState::new(profile.clone()));
             entry.profile = profile;
-            entry.to_card()
+            (entry.to_card(), entry.to_stored_host())
         };
+
+        self.store.upsert_client_host(&stored)?;
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.connect_host_async(offer.host_id);
         Ok(card)
@@ -647,8 +887,80 @@ impl OrbitAppCore {
                 .map_err(|_| ClientCoreError::LockPoisoned)?;
             guard.remove(host_id);
         }
+        if let Ok(mut projs) = self.projects.write() {
+            projs.retain(|_, p| p.host_id != host_id);
+        }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_host_config(
+        self: &Arc<Self>,
+        host_id: &str,
+        custom_name: Option<String>,
+        route_mode: Option<HostRouteMode>,
+        ssh_alias: Option<String>,
+        remote_daemon_port: Option<u16>,
+        custom_direct_endpoint: Option<String>,
+        raw_relay_url: Option<String>,
+        reconnect: bool,
+    ) -> Result<HostCardView, ClientCoreError> {
+        let (card, stored) = {
+            let mut guard = self
+                .hosts
+                .write()
+                .map_err(|_| ClientCoreError::LockPoisoned)?;
+            let h = guard.get_mut(host_id).ok_or(ClientCoreError::Unreachable)?;
+
+            if let Some(cn) = custom_name {
+                let t = cn.trim();
+                h.profile.custom_name = if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                };
+            }
+            if let Some(rm) = route_mode {
+                h.profile.route_mode = rm;
+            }
+            if let Some(sa) = ssh_alias {
+                let t = sa.trim();
+                h.profile.ssh_alias = if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                };
+            }
+            if let Some(port) = remote_daemon_port.filter(|p| *p > 0) {
+                h.profile.remote_daemon_port = port;
+            }
+            if let Some(ep) = custom_direct_endpoint {
+                let t = ep.trim();
+                h.profile.custom_direct_endpoint = if t.is_empty() {
+                    None
+                } else if t.starts_with("ws://") || t.starts_with("wss://") {
+                    Some(t.to_string())
+                } else {
+                    Some(format!("ws://{t}"))
+                };
+            }
+            if let Some(ref relay) = raw_relay_url {
+                h.profile.relay_url = normalize_relay_input(Some(relay));
+            }
+            (h.to_card(), h.to_stored_host())
+        };
+
+        self.store.upsert_client_host(&stored)?;
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+        if reconnect {
+            self.connect_host_async(host_id.to_string());
+        }
+        Ok(card)
     }
 
     pub fn update_host_relay(
@@ -656,29 +968,16 @@ impl OrbitAppCore {
         host_id: &str,
         raw_relay_url: Option<&str>,
     ) -> Result<(), ClientCoreError> {
-        let normalized = normalize_relay_input(raw_relay_url);
-        let mut stored_opt = None;
-        {
-            let mut guard = self
-                .hosts
-                .write()
-                .map_err(|_| ClientCoreError::LockPoisoned)?;
-            if let Some(h) = guard.get_mut(host_id) {
-                h.profile.relay_url = normalized;
-                stored_opt = Some(StoredHostProfile {
-                    host_id: h.profile.host_id.clone(),
-                    display_name: h.profile.display_name.clone(),
-                    daemon_pubkey_b64: h.profile.daemon_pubkey_b64.clone(),
-                    direct_endpoints: h.profile.direct_endpoints.clone(),
-                    relay_url: h.profile.relay_url.clone(),
-                });
-            }
-        }
-        if let Some(stored) = stored_opt {
-            self.store.upsert_client_host(&stored)?;
-            self.emit(|revision| CoreNotification::FleetChanged { revision });
-            self.connect_host_async(host_id.to_string());
-        }
+        let _ = self.update_host_config(
+            host_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(raw_relay_url.unwrap_or("").to_string()),
+            true,
+        )?;
         Ok(())
     }
 
@@ -708,7 +1007,13 @@ impl OrbitAppCore {
             let Some(h) = guard.get_mut(host_id) else {
                 return;
             };
-            h.profile.state = if h.profile.direct_endpoints.is_empty() {
+            if h.connecting_in_flight {
+                return;
+            }
+            h.connecting_in_flight = true;
+            h.profile.state = if matches!(h.profile.route_mode, HostRouteMode::RelayOnly)
+                || (h.profile.direct_endpoints.is_empty() && h.profile.ssh_alias.is_none())
+            {
                 HostConnectionState::ConnectingRelay
             } else {
                 HostConnectionState::ConnectingDirect
@@ -722,21 +1027,46 @@ impl OrbitAppCore {
         match connect_smart(&profile, Some(self.store.clone())).await {
             Ok(handle) => {
                 let mut rx = handle.subscribe();
-                {
+                let (queued_outbox, resub_timelines) = {
                     let Ok(mut guard) = self.hosts.write() else {
                         return;
                     };
-                    if let Some(h) = guard.get_mut(host_id) {
-                        h.profile.state = handle.mode;
-                        h.last_error = None;
-                        h.session = Some(handle.clone());
-                    }
-                }
-                self.emit(|revision| CoreNotification::FleetChanged { revision });
+                    let Some(h) = guard.get_mut(host_id) else {
+                        return;
+                    };
+                    h.connecting_in_flight = false;
+                    h.reconnect_attempt = 0;
+                    h.profile.state = handle.mode;
+                    h.via_ssh_tunnel = handle.via_ssh_tunnel;
+                    h.last_error = None;
+                    h.session = Some(handle.clone());
 
-                // Request initial snapshots & zero-config project discovery upon connecting
+                    let outbox = std::mem::take(&mut h.pending_outbox);
+                    let resubs: Vec<(String, u64)> = h
+                        .timelines
+                        .iter()
+                        .filter(|(aid, _)| !aid.starts_with("opt_"))
+                        .map(|(aid, evs)| {
+                            let max_seq = evs.iter().map(|e| e.seq).max().unwrap_or(0);
+                            (aid.clone(), max_seq)
+                        })
+                        .collect();
+                    (outbox, resubs)
+                };
+                self.emit(|revision| CoreNotification::FleetChanged { revision });
+                self.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: host_id.to_string(),
+                });
+
+                // Initial state refresh + live models + quotas
                 let _ = handle
                     .send_wire(WireMessage::DiscoverProjects {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListModels {
                         request_id: Uuid::new_v4(),
                     })
                     .await;
@@ -756,6 +1086,26 @@ impl OrbitAppCore {
                         request_id: Uuid::new_v4(),
                     })
                     .await;
+                let _ = handle
+                    .send_wire(WireMessage::RefreshQuotas {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+
+                for (agent_id, since_seq) in resub_timelines {
+                    let _ = handle
+                        .send_wire(WireMessage::SubscribeTimeline {
+                            request_id: Uuid::new_v4(),
+                            agent_id,
+                            since_seq,
+                        })
+                        .await;
+                }
+
+                // Flush any prompts / agent launches queued while reconnecting!
+                for queued_msg in queued_outbox {
+                    let _ = handle.send_wire(queued_msg).await;
+                }
 
                 let loop_core = Arc::clone(self);
                 let owned_host_id = host_id.to_string();
@@ -769,14 +1119,7 @@ impl OrbitAppCore {
                                 loop_core.handle_inbound_terminal(&owned_host_id, term);
                             }
                             ClientInboundEvent::Disconnected => {
-                                if let Ok(mut guard) = loop_core.hosts.write()
-                                    && let Some(h) = guard.get_mut(&owned_host_id)
-                                {
-                                    h.profile.state = HostConnectionState::Disconnected;
-                                    h.session = None;
-                                }
-                                loop_core
-                                    .emit(|revision| CoreNotification::FleetChanged { revision });
+                                loop_core.handle_unexpected_disconnect(&owned_host_id);
                                 break;
                             }
                         }
@@ -784,37 +1127,129 @@ impl OrbitAppCore {
                 });
             }
             Err(err) => {
+                let mut backoff_ms = None;
                 if let Ok(mut guard) = self.hosts.write()
                     && let Some(h) = guard.get_mut(host_id)
                 {
+                    h.connecting_in_flight = false;
                     h.profile.state = HostConnectionState::Disconnected;
+                    h.via_ssh_tunnel = false;
                     h.last_error = Some(err.to_string());
+                    h.reconnect_attempt = h.reconnect_attempt.saturating_add(1);
+                    backoff_ms = Some(match h.reconnect_attempt {
+                        1 => 2000,
+                        2 => 4000,
+                        3 => 7000,
+                        _ => 12000,
+                    });
                 }
                 self.emit(|revision| CoreNotification::FleetChanged { revision });
+                self.emit(|revision| CoreNotification::HostChanged {
+                    revision,
+                    host_id: host_id.to_string(),
+                });
+                if let Some(delay) = backoff_ms {
+                    self.schedule_reconnect(host_id.to_string(), delay);
+                }
             }
         }
     }
 
-    fn handle_inbound_wire(&self, host_id: &str, msg: WireMessage) {
+    fn handle_unexpected_disconnect(self: &Arc<Self>, host_id: &str) {
+        let mut should_reconnect = false;
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            // Non-destructive disconnect: keep ALL workspaces, agents & timelines intact!
+            h.profile.state = HostConnectionState::Disconnected;
+            h.via_ssh_tunnel = false;
+            h.session = None;
+            should_reconnect = true;
+        }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+        if should_reconnect {
+            self.schedule_reconnect(host_id.to_string(), 1500);
+        }
+    }
+
+    fn schedule_reconnect(self: &Arc<Self>, host_id: String, delay_ms: u64) {
+        let core = Arc::clone(self);
+        self.runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let still_disconnected = core
+                .hosts
+                .read()
+                .ok()
+                .and_then(|g| {
+                    g.get(&host_id).map(|h| {
+                        h.profile.state == HostConnectionState::Disconnected
+                            && !h.connecting_in_flight
+                    })
+                })
+                .unwrap_or(false);
+            if still_disconnected {
+                core.connect_host_task(&host_id).await;
+            }
+        });
+    }
+
+    fn handle_inbound_wire(self: &Arc<Self>, host_id: &str, msg: WireMessage) {
         let mut notify_fleet = false;
         let mut notify_host = false;
         let mut notify_timeline_agent: Option<String> = None;
         let mut notify_git_cwd: Option<String> = None;
+        let mut auto_subscribe_agent: Option<String> = None;
+        let mut host_to_persist: Option<StoredHostProfile> = None;
 
         if let Ok(mut guard) = self.hosts.write()
             && let Some(state) = guard.get_mut(host_id)
         {
             match msg {
                 WireMessage::Welcome { host } => {
-                    state.profile.display_name = host.hostname;
+                    state.profile.hostname = host.hostname;
+                    state.daemon_version = Some(host.daemon_version);
+                    state.os_arch = Some(format!("{} / {}", host.os, host.arch));
                     if !host.available_providers.is_empty() {
                         state.available_providers = host.available_providers;
                     }
+                    host_to_persist = Some(state.to_stored_host());
                     notify_fleet = true;
                     notify_host = true;
                 }
+                WireMessage::Pong { ts_ms } => {
+                    let now = unix_ms_now();
+                    if now >= ts_ms && (now - ts_ms) < 60_000 {
+                        state.last_ping_ms = Some((now - ts_ms) as u32);
+                        notify_fleet = true;
+                    }
+                }
                 WireMessage::DiscoveredProjectsSnapshot { projects, .. } => {
                     state.discovered_projects = projects;
+                    notify_host = true;
+                }
+                WireMessage::DirectoryEntriesResponse {
+                    current_path,
+                    parent_path,
+                    entries,
+                    ..
+                } => {
+                    state.directory_listing = Some(DirectoryListingView {
+                        current_path,
+                        parent_path,
+                        entries,
+                    });
+                    notify_host = true;
+                }
+                WireMessage::ModelsSnapshot { models, .. } => {
+                    for (prov, list) in models {
+                        if !list.is_empty() {
+                            state.models_by_provider.insert(prov, list);
+                        }
+                    }
                     notify_host = true;
                 }
                 WireMessage::WorkspacesSnapshot { workspaces, .. } => {
@@ -831,14 +1266,35 @@ impl OrbitAppCore {
                     notify_host = true;
                 }
                 WireMessage::AgentsSnapshot { agents, .. } => {
-                    state.agents.clear();
+                    // Keep any 0ms optimistic `opt_*` sessions while refreshing server-confirmed ones
+                    state.agents.retain(|k, _| k.starts_with("opt_"));
                     for a in agents {
                         state.agents.insert(a.agent_id.clone(), a);
                     }
                     notify_fleet = true;
                     notify_host = true;
                 }
-                WireMessage::AgentCreated { agent, .. } | WireMessage::AgentUpdated { agent } => {
+                WireMessage::AgentCreated { request_id, agent } => {
+                    let ag_id = agent.agent_id.clone();
+                    if let Some(opt_id) = state.optimistic_by_req_id.remove(&request_id) {
+                        state.agents.remove(&opt_id);
+                        if let Some(opt_tl) = state.timelines.remove(&opt_id)
+                            && !state.timelines.contains_key(&ag_id)
+                        {
+                            state.timelines.insert(ag_id.clone(), opt_tl);
+                        }
+                        state
+                            .replaced_optimistic_agents
+                            .insert(opt_id, ag_id.clone());
+                    }
+                    state.last_created_agent_id = Some(ag_id.clone());
+                    state.agents.insert(ag_id.clone(), agent);
+                    auto_subscribe_agent = Some(ag_id.clone());
+                    notify_fleet = true;
+                    notify_host = true;
+                    notify_timeline_agent = Some(ag_id);
+                }
+                WireMessage::AgentUpdated { agent } => {
                     let ag_id = agent.agent_id.clone();
                     state.agents.insert(ag_id.clone(), agent);
                     notify_fleet = true;
@@ -849,13 +1305,11 @@ impl OrbitAppCore {
                     agent_id, events, ..
                 } => {
                     let list = state.timelines.entry(agent_id.clone()).or_default();
-                    let existing: HashSet<u64> = list.iter().map(|e| e.seq).collect();
-                    for ev in events {
-                        if !existing.contains(&ev.seq) {
-                            coalesce_or_push_timeline(list, ev);
-                        }
+                    let mut ordered = events;
+                    ordered.sort_by_key(|e| e.seq);
+                    for ev in ordered {
+                        coalesce_or_push_timeline(list, ev);
                     }
-                    list.sort_by_key(|e| e.seq);
                     notify_timeline_agent = Some(agent_id);
                 }
                 WireMessage::TimelineLive { event } => {
@@ -904,12 +1358,49 @@ impl OrbitAppCore {
                     state.quotas = snapshots;
                     notify_host = true;
                 }
-                WireMessage::RpcError { code, message, .. } => {
+                WireMessage::RpcError {
+                    request_id,
+                    code,
+                    message,
+                } => {
                     state.last_error = Some(format!("[{code}] {message}"));
+                    if let Some(req_id) = request_id
+                        && let Some(opt_id) = state.optimistic_by_req_id.remove(&req_id)
+                    {
+                        if let Some(opt_ag) = state.agents.get_mut(&opt_id) {
+                            opt_ag.status = AgentStatus::Error {
+                                message: message.clone(),
+                                recoverable: true,
+                            };
+                        }
+                        state
+                            .timelines
+                            .entry(opt_id.clone())
+                            .or_default()
+                            .push(TimelineEvent {
+                                seq: 0,
+                                epoch: 1,
+                                agent_id: opt_id.clone(),
+                                turn_id: None,
+                                timestamp: Utc::now(),
+                                payload: TimelinePayload::Notice {
+                                    level: "error".into(),
+                                    message,
+                                },
+                            });
+                        notify_timeline_agent = Some(opt_id);
+                    }
                     notify_host = true;
                 }
                 _ => {}
             }
+        }
+
+        if let Some(stored) = host_to_persist {
+            let _ = self.store.upsert_client_host(&stored);
+        }
+        if let Some(new_agent_id) = auto_subscribe_agent {
+            self.open_agent_timeline(host_id, &new_agent_id);
         }
 
         if notify_fleet {
@@ -982,10 +1473,50 @@ impl OrbitAppCore {
         }
     }
 
+    /// Sends immediately if connected, or queues into `pending_outbox` and triggers background reconnect so user messages are NEVER dropped!
+    fn dispatch_wire_queued(self: &Arc<Self>, host_id: &str, msg: WireMessage) {
+        let mut live_handle = None;
+        let mut needs_reconnect = false;
+
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if let Some(ref handle) = h.session {
+                live_handle = Some(handle.clone());
+            } else {
+                h.pending_outbox.push(msg.clone());
+                needs_reconnect = !h.connecting_in_flight;
+            }
+        }
+
+        if let Some(handle) = live_handle {
+            let fallback_core = Arc::clone(self);
+            let owned_host = host_id.to_string();
+            self.runtime.spawn(async move {
+                if handle.send_wire(msg.clone()).await.is_err() {
+                    if let Ok(mut guard) = fallback_core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_outbox.push(msg);
+                    }
+                    fallback_core.connect_host_async(owned_host);
+                }
+            });
+        } else if needs_reconnect {
+            self.connect_host_async(host_id.to_string());
+        }
+    }
+
     pub fn refresh_host(&self, host_id: &str) {
         self.dispatch_wire(
             host_id,
             WireMessage::DiscoverProjects {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListModels {
                 request_id: Uuid::new_v4(),
             },
         );
@@ -1019,8 +1550,9 @@ impl OrbitAppCore {
         );
     }
 
+    /// Legacy FFI-compatible wrapper (`orbit-ffi-uniffi` & `orbit-ffi-ohos`).
     pub fn create_agent(
-        &self,
+        self: &Arc<Self>,
         host_id: &str,
         cwd: &str,
         provider: ProviderKind,
@@ -1028,10 +1560,35 @@ impl OrbitAppCore {
         initial_prompt: &str,
         worktree_branch: Option<&str>,
     ) {
+        let _ = self.create_agent_ext(
+            host_id,
+            cwd,
+            Vec::new(),
+            provider,
+            None,
+            mode,
+            initial_prompt,
+            worktree_branch,
+        );
+    }
+
+    /// Full Paseo-style multi-directory + model-selectable `0ms` optimistic session launcher.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_agent_ext(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        extra_dirs: Vec<String>,
+        provider: ProviderKind,
+        model: Option<String>,
+        mode: SessionMode,
+        initial_prompt: &str,
+        worktree_branch: Option<&str>,
+    ) -> String {
         let clean_branch = worktree_branch.map(str::trim).filter(|b| !b.is_empty());
         let use_auto_worktree = clean_branch == Some("auto");
         if let Some(branch) = clean_branch.filter(|b| *b != "auto") {
-            self.dispatch_wire(
+            self.dispatch_wire_queued(
                 host_id,
                 WireMessage::CreateWorkspace {
                     request_id: Uuid::new_v4(),
@@ -1042,22 +1599,91 @@ impl OrbitAppCore {
                 },
             );
         }
-        self.dispatch_wire(
+
+        let req_id = Uuid::new_v4();
+        let opt_id = format!("opt_{req_id}");
+        let now = Utc::now();
+        let first_line = initial_prompt.lines().next().unwrap_or("").trim();
+        let title: String = {
+            let chars: Vec<char> = first_line.chars().collect();
+            if chars.is_empty() {
+                "新工作区会话".to_string()
+            } else if chars.len() > 48 {
+                format!("{}…", chars[..48].iter().collect::<String>())
+            } else {
+                first_line.to_string()
+            }
+        };
+
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            let opt_agent = AgentSummary {
+                agent_id: opt_id.clone(),
+                workspace_id: format!("ws_{opt_id}"),
+                cwd: cwd.to_string(),
+                title,
+                provider,
+                model: model.clone(),
+                mode: mode.clone(),
+                status: AgentStatus::Initializing,
+                parent_agent_id: None,
+                latest_seq: 0,
+                created_at: now,
+                updated_at: now,
+            };
+            h.optimistic_by_req_id.insert(req_id, opt_id.clone());
+            h.last_created_agent_id = Some(opt_id.clone());
+            h.agents.insert(opt_id.clone(), opt_agent);
+            h.timelines.insert(
+                opt_id.clone(),
+                vec![TimelineEvent {
+                    seq: 0,
+                    epoch: 1,
+                    agent_id: opt_id.clone(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: format!("opt_msg_{req_id}"),
+                        text: initial_prompt.to_string(),
+                    },
+                }],
+            );
+        }
+
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+        self.emit(|revision| CoreNotification::TimelineChanged {
+            revision,
+            host_id: host_id.to_string(),
+            agent_id: opt_id.clone(),
+        });
+
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::CreateAgent {
-                request_id: Uuid::new_v4(),
+                request_id: req_id,
                 cwd: cwd.to_string(),
+                extra_dirs,
                 title: None,
                 provider,
-                model: None,
+                model,
                 mode,
                 initial_prompt: initial_prompt.to_string(),
                 worktree: use_auto_worktree,
             },
         );
+
+        opt_id
     }
 
     pub fn open_agent_timeline(&self, host_id: &str, agent_id: &str) {
+        if agent_id.starts_with("opt_") {
+            return;
+        }
         let since_seq = self
             .hosts
             .read()
@@ -1065,7 +1691,7 @@ impl OrbitAppCore {
             .and_then(|g| {
                 g.get(host_id)
                     .and_then(|h| h.timelines.get(agent_id))
-                    .and_then(|list| list.last().map(|e| e.seq))
+                    .and_then(|list| list.iter().map(|e| e.seq).max())
             })
             .unwrap_or(0);
         self.dispatch_wire(
@@ -1078,8 +1704,44 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn send_prompt(&self, host_id: &str, agent_id: &str, prompt: &str) {
-        self.dispatch_wire(
+    pub fn send_prompt(self: &Arc<Self>, host_id: &str, agent_id: &str, prompt: &str) {
+        let now = Utc::now();
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if let Some(ag) = h.agents.get_mut(agent_id) {
+                ag.status = AgentStatus::Running {
+                    turn_id: "pending".into(),
+                };
+                ag.updated_at = now;
+            }
+            h.timelines
+                .entry(agent_id.to_string())
+                .or_default()
+                .push(TimelineEvent {
+                    seq: 0,
+                    epoch: 1,
+                    agent_id: agent_id.to_string(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: format!("opt_{}", Uuid::new_v4()),
+                        text: prompt.to_string(),
+                    },
+                });
+        }
+
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+        self.emit(|revision| CoreNotification::TimelineChanged {
+            revision,
+            host_id: host_id.to_string(),
+            agent_id: agent_id.to_string(),
+        });
+
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::SendPrompt {
                 request_id: Uuid::new_v4(),
@@ -1099,56 +1761,118 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn set_session_mode(&self, host_id: &str, agent_id: &str, mode: SessionMode) {
+    pub fn set_session_mode(self: &Arc<Self>, host_id: &str, agent_id: &str, mode: SessionMode) {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
             && let Some(ag) = h.agents.get_mut(agent_id)
         {
             ag.mode = mode.clone();
         }
-        self.dispatch_wire(
-            host_id,
-            WireMessage::SetSessionMode {
-                request_id: Uuid::new_v4(),
-                agent_id: agent_id.to_string(),
-                mode,
-            },
-        );
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::SetSessionMode {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                    mode,
+                },
+            );
+        }
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
             host_id: host_id.to_string(),
         });
     }
 
-    pub fn switch_agent_provider(&self, host_id: &str, agent_id: &str, provider: ProviderKind) {
-        self.dispatch_wire(
-            host_id,
-            WireMessage::SwitchAgentProvider {
-                request_id: Uuid::new_v4(),
-                agent_id: agent_id.to_string(),
-                provider,
-            },
-        );
+    pub fn set_agent_model(self: &Arc<Self>, host_id: &str, agent_id: &str, model: Option<String>) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.model = model.clone();
+        }
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::SetAgentModel {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                    model,
+                },
+            );
+        }
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+        self.emit(|revision| CoreNotification::TimelineChanged {
+            revision,
+            host_id: host_id.to_string(),
+            agent_id: agent_id.to_string(),
+        });
     }
 
-    pub fn archive_agent(&self, host_id: &str, agent_id: &str) {
-        self.dispatch_wire(
-            host_id,
-            WireMessage::ArchiveAgent {
-                request_id: Uuid::new_v4(),
-                agent_id: agent_id.to_string(),
-            },
-        );
+    pub fn switch_agent_provider(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        provider: ProviderKind,
+    ) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.provider = provider;
+            ag.model = None;
+        }
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::SwitchAgentProvider {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                    provider,
+                },
+            );
+        }
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn archive_agent(self: &Arc<Self>, host_id: &str, agent_id: &str) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.agents.remove(agent_id);
+            h.timelines.remove(agent_id);
+        }
+        let _ = self.store.delete_replica_agent(host_id, agent_id);
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::ArchiveAgent {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                },
+            );
+        }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
     }
 
     pub fn resolve_permission(
-        &self,
+        self: &Arc<Self>,
         host_id: &str,
         agent_id: &str,
         permission_request_id: &str,
         decision: &str,
     ) {
-        self.dispatch_wire(
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::ResolvePermission {
                 request_id: Uuid::new_v4(),
@@ -1160,13 +1884,13 @@ impl OrbitAppCore {
     }
 
     pub fn answer_question(
-        &self,
+        self: &Arc<Self>,
         host_id: &str,
         agent_id: &str,
         question_request_id: &str,
         answers: Vec<Vec<String>>,
     ) {
-        self.dispatch_wire(
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::AnswerQuestion {
                 request_id: Uuid::new_v4(),
@@ -1266,33 +1990,117 @@ impl OrbitAppCore {
     }
 }
 
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn folder_basename(path: &str) -> String {
+    let clean = path.trim_end_matches('/');
+    if clean.is_empty() || clean == "~" {
+        return "主目录".to_string();
+    }
+    clean
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(clean)
+        .to_string()
+}
+
 fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, incoming: TimelineEvent) {
-    if let TimelinePayload::AssistantMessage { ref item_id, .. } = incoming.payload
-        && let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
-            matches!(
-                &prev_ev.payload,
-                TimelinePayload::AssistantMessage {
-                    item_id: existing_id,
-                    ..
-                } if existing_id == item_id
-            )
-        })
-    {
-        *prev = incoming;
-        return;
+    match &incoming.payload {
+        TimelinePayload::UserPrompt {
+            text: inc_text,
+            message_id: inc_mid,
+        } => {
+            if incoming.seq > 0 {
+                // Replace optimistic `seq == 0` UserPrompt with matching text
+                if let Some(opt_slot) = list.iter_mut().find(|ev| {
+                    ev.seq == 0
+                        && matches!(
+                            &ev.payload,
+                            TimelinePayload::UserPrompt { text, .. } if text.trim() == inc_text.trim()
+                        )
+                }) {
+                    *opt_slot = incoming;
+                    return;
+                }
+            }
+            if !inc_mid.is_empty()
+                && let Some(dup_slot) = list.iter_mut().find(|ev| {
+                    matches!(
+                        &ev.payload,
+                        TimelinePayload::UserPrompt { message_id, .. } if message_id == inc_mid
+                    )
+                })
+            {
+                *dup_slot = incoming;
+                return;
+            }
+        }
+        TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
+            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
+                matches!(
+                    &prev_ev.payload,
+                    TimelinePayload::AssistantMessage { item_id: existing_id, .. } if existing_id == item_id
+                )
+            }) {
+                *prev = incoming;
+                return;
+            }
+        }
+        TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
+            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
+                matches!(
+                    &prev_ev.payload,
+                    TimelinePayload::AssistantThinking { item_id: existing_id, .. } if existing_id == item_id
+                )
+            }) {
+                *prev = incoming;
+                return;
+            }
+        }
+        TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
+            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
+                matches!(
+                    &prev_ev.payload,
+                    TimelinePayload::ToolCall { call_id: existing_id, .. } if existing_id == call_id
+                )
+            }) {
+                *prev = incoming;
+                return;
+            }
+        }
+        _ => {}
+    }
+
+    if incoming.seq > 0 {
+        if let Some(same_seq) = list.iter_mut().find(|e| e.seq == incoming.seq) {
+            *same_seq = incoming;
+            return;
+        }
+        if let Some(first_opt_idx) = list.iter().position(|e| e.seq == 0) {
+            list.insert(first_opt_idx, incoming);
+            return;
+        }
     }
     list.push(incoming);
 }
 
 fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
     let (status_label, is_running, is_awaiting_permission) = match &a.status {
-        AgentStatus::Initializing => ("Initializing".to_string(), true, false),
-        AgentStatus::Idle => ("Idle".to_string(), false, false),
-        AgentStatus::Running { .. } => ("Running".to_string(), true, false),
-        AgentStatus::AutonomousWakeup { source, .. } => (format!("Wakeup ({source})"), true, false),
-        AgentStatus::AwaitingPermission { .. } => ("Needs Approval".to_string(), false, true),
-        AgentStatus::Error { .. } => ("Error".to_string(), false, false),
-        AgentStatus::Closed => ("Closed".to_string(), false, false),
+        AgentStatus::Initializing => ("启动中".to_string(), true, false),
+        AgentStatus::Idle => ("就绪".to_string(), false, false),
+        AgentStatus::Running { .. } => ("思考执行中".to_string(), true, false),
+        AgentStatus::AutonomousWakeup { source, .. } => {
+            (format!("后台唤醒 ({source})"), true, false)
+        }
+        AgentStatus::AwaitingPermission { .. } => ("等待确认".to_string(), false, true),
+        AgentStatus::Error { .. } => ("异常".to_string(), false, false),
+        AgentStatus::Closed => ("已结束".to_string(), false, false),
     };
     AgentCardView {
         agent_id: a.agent_id.clone(),
@@ -1315,18 +2123,128 @@ fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
 fn summarize_tool_detail(detail: &ToolCallDetail) -> (String, Vec<DiffFileView>) {
     match detail {
         ToolCallDetail::Shell { command, .. } => (format!("$ {command}"), Vec::new()),
-        ToolCallDetail::FileRead { path, .. } => (format!("Read {path}"), Vec::new()),
+        ToolCallDetail::FileRead { path, .. } => (format!("读取文件 {path}"), Vec::new()),
         ToolCallDetail::FileEdit { path, unified_diff } => {
             let diffs = unified_diff
                 .as_deref()
                 .map(parse_unified_diff)
                 .unwrap_or_default();
-            (format!("Edit {path}"), diffs)
+            (format!("编辑文件 {path}"), diffs)
         }
-        ToolCallDetail::Search { query, .. } => (format!("Search \"{query}\""), Vec::new()),
-        ToolCallDetail::Subagent { role, .. } => (format!("Subagent · {role}"), Vec::new()),
+        ToolCallDetail::Search { query, .. } => (format!("检索代码 \"{query}\""), Vec::new()),
+        ToolCallDetail::Subagent { role, .. } => (format!("子代理协作 · {role}"), Vec::new()),
         ToolCallDetail::Generic { tool_name, .. } => (tool_name.clone(), Vec::new()),
     }
+}
+
+fn default_client_models_map() -> HashMap<ProviderKind, Vec<ModelOption>> {
+    let mut m = HashMap::new();
+    m.insert(
+        ProviderKind::Antigravity,
+        vec![
+            ModelOption {
+                id: "gemini-4-carbon-high".into(),
+                label: "Gemini 4 Carbon (High)".into(),
+                description: Some("最新旗舰深度推理与多步编排模型".into()),
+                is_default: true,
+            },
+            ModelOption {
+                id: "gemini-4-carbon-medium".into(),
+                label: "Gemini 4 Carbon (Medium)".into(),
+                description: Some("速度与深度均衡主力".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "gemini-4-argon-high".into(),
+                label: "Gemini 4 Argon (High)".into(),
+                description: Some("高强度复杂代码推理".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "claude-opus-5-5-high".into(),
+                label: "Claude Opus 5.5 (High)".into(),
+                description: Some("Antigravity 内置 Opus 深度模式".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "claude-sonnet-5-5-high".into(),
+                label: "Claude Sonnet 5.5 (High)".into(),
+                description: Some("高响应速度编码模式".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "gemini-3.8-flash-high".into(),
+                label: "Gemini 3.8 Flash (High)".into(),
+                description: Some("极速轻量任务响应".into()),
+                is_default: false,
+            },
+        ],
+    );
+    m.insert(
+        ProviderKind::Codex,
+        vec![
+            ModelOption {
+                id: "gpt-6.1-sol".into(),
+                label: "GPT-6.1-Sol".into(),
+                description: Some("最新日常编码与重构主力模型".into()),
+                is_default: true,
+            },
+            ModelOption {
+                id: "gpt-6-astra".into(),
+                label: "GPT-6-Astra".into(),
+                description: Some("高复杂度架构与攻坚模型".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "gpt-6.1-terra".into(),
+                label: "GPT-6.1-Terra".into(),
+                description: Some("均衡稳定编码模型".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "gpt-5.4".into(),
+                label: "GPT-5.4".into(),
+                description: Some("通用高兼容 Codex 模型".into()),
+                is_default: false,
+            },
+        ],
+    );
+    m.insert(
+        ProviderKind::ClaudeCode,
+        vec![
+            ModelOption {
+                id: "claude-opus-5-5".into(),
+                label: "Opus 5.5".into(),
+                description: Some("最新旗舰深度架构与推理模型".into()),
+                is_default: true,
+            },
+            ModelOption {
+                id: "claude-sonnet-5-5".into(),
+                label: "Sonnet 5.5".into(),
+                description: Some("高速高质主力编码模型".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "claude-opus-4-6".into(),
+                label: "Opus 4.6".into(),
+                description: Some("经典稳定复杂工程模型".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "claude-sonnet-4-6".into(),
+                label: "Sonnet 4.6".into(),
+                description: Some("轻量快速日常开发".into()),
+                is_default: false,
+            },
+            ModelOption {
+                id: "claude-haiku-5-5".into(),
+                label: "Haiku 5.5".into(),
+                description: Some("瞬时响应问答与检索".into()),
+                is_default: false,
+            },
+        ],
+    );
+    m
 }
 
 #[cfg(test)]
@@ -1334,12 +2252,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_core_persists_paired_host_and_projects_overview() {
+    fn app_core_persists_paired_host_projects_rename_and_optimistic_outbox() {
         let core = OrbitAppCore::open_in_memory().expect("open core");
         let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
         let offer = PairingOffer {
             host_id: "host_devbox".into(),
-            hostname: "cloud-devbox".into(),
+            hostname: "ip-172-31-33-74.ap-southeast-1.compute.internal".into(),
             daemon_pubkey_b64: kp.public_key_b64,
             direct_endpoints: Vec::new(),
             relay_url: None,
@@ -1348,9 +2266,56 @@ mod tests {
         let uri = offer.to_qr_uri().expect("qr uri");
         let card = core.pair_host(&uri).expect("pair");
         assert_eq!(card.host_id, "host_devbox");
-        assert_eq!(card.display_name, "cloud-devbox");
+
+        // Configure SSH alias + rename -> overrides ugly EC2 hostname
+        let updated = core
+            .update_host_config(
+                "host_devbox",
+                Some("新加坡 DevBox".into()),
+                Some(HostRouteMode::SshTunnel),
+                Some("devbox".into()),
+                Some(6868),
+                None,
+                None,
+                false,
+            )
+            .expect("update config");
+        assert_eq!(updated.display_name, "新加坡 DevBox");
+        assert_eq!(updated.route_mode, HostRouteMode::SshTunnel);
+
+        // Multi-directory Project creation
+        let proj = core
+            .upsert_project(
+                None,
+                "host_devbox",
+                "mono_repo",
+                vec![
+                    "/home/ec2-user/go/src/mono_repo".into(),
+                    "/home/ec2-user/go/src/shared_proto".into(),
+                ],
+            )
+            .expect("upsert project");
+        assert_eq!(proj.directories.len(), 2);
+
+        // Optimistic 0ms create_agent while offline -> creates `opt_*` agent + queues in outbox!
+        let opt_id = core.create_agent_ext(
+            "host_devbox",
+            "/home/ec2-user/go/src/mono_repo",
+            vec!["/home/ec2-user/go/src/shared_proto".into()],
+            ProviderKind::Antigravity,
+            Some("claude-opus-5-5-high".into()),
+            SessionMode::AcceptEdits,
+            "帮我检查 mono_repo 编译状态",
+            None,
+        );
+        assert!(opt_id.starts_with("opt_"));
+
+        let tl = core.agent_timeline("host_devbox", &opt_id);
+        assert_eq!(tl.items.len(), 1);
+        assert!(tl.agent.expect("opt agent").is_running);
 
         let overview = core.fleet_overview();
         assert_eq!(overview.hosts.len(), 1);
+        assert_eq!(overview.projects.len(), 1);
     }
 }

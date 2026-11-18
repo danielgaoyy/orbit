@@ -30,6 +30,10 @@ pub async fn spawn_antigravity_session(
     }
     args.push("--add-dir".to_string());
     args.push(cfg.cwd.to_string_lossy().to_string());
+    for extra in &cfg.extra_dirs {
+        args.push("--add-dir".to_string());
+        args.push(extra.to_string_lossy().to_string());
+    }
 
     let mut env = HashMap::new();
     env.insert("NO_COLOR".into(), "1".into());
@@ -316,6 +320,23 @@ async fn run_agy_actor(
                                 "params": {
                                     "sessionId": session_id,
                                     "modeId": mode_str
+                                }
+                            })
+                            .to_string();
+                            let _ = shim.write_stdin_line(req).await;
+                        }
+                    }
+                    DriverCommand::SetModel { model: new_model } => {
+                        if let Some(m) = new_model {
+                            let id = next_rpc_id;
+                            next_rpc_id += 1;
+                            let req = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": "session/set_model",
+                                "params": {
+                                    "sessionId": session_id,
+                                    "modelId": m
                                 }
                             })
                             .to_string();

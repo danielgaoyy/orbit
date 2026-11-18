@@ -2,7 +2,7 @@
 //!
 //! Provides:
 //! - Concurrent Multi-Host fleet management (Devbox, Linux workstation, Mac mini)
-//! - Happy-Eyeballs smart routing: LAN/Tailscale direct WebSocket first, seamless fallback to Noise NK E2EE Relay
+//! - Happy-Eyeballs + Dedicated SSH Tunnel + Noise NK E2EE Relay smart routing with 10s Ping keepalive
 //! - Zstd wire compression + zero-copy binary terminal framing
 //! - `0ms` instant-open local SQLite WAL replica cache with monotonic `since_seq` catch-up
 //! - Pure-Rust streaming Markdown AST, `syntect` syntax highlighting, Git diff model, and VT100 terminal grid
@@ -14,7 +14,7 @@ pub mod render;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use orbit_crypto::{ClientHandshake, PairingOffer, SecureChannel, decode_key_32};
@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
+
+use crate::desktop_ops::{SshTunnelGuard, spawn_ssh_local_tunnel};
 
 /// Envelope discriminator inside an E2EE Noise tunnel:
 /// `0x00` = Zstd-compressed `WireMessage`, `0x01` = raw `TerminalBinaryFrame`.
@@ -44,14 +46,65 @@ pub enum HostConnectionState {
     OnlineRelay,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostRouteMode {
+    #[default]
+    Auto,
+    SshTunnel,
+    DirectOnly,
+    RelayOnly,
+}
+
+impl HostRouteMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SshTunnel => "ssh_tunnel",
+            Self::DirectOnly => "direct_only",
+            Self::RelayOnly => "relay_only",
+        }
+    }
+
+    pub fn from_opt_str(raw: Option<&str>) -> Self {
+        match raw {
+            Some("ssh_tunnel") => Self::SshTunnel,
+            Some("direct_only") => Self::DirectOnly,
+            Some("relay_only") => Self::RelayOnly,
+            _ => Self::Auto,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedHostProfile {
     pub host_id: String,
-    pub display_name: String,
+    pub hostname: String,
+    pub custom_name: Option<String>,
+    pub ssh_alias: Option<String>,
+    pub route_mode: HostRouteMode,
+    pub remote_daemon_port: u16,
+    pub custom_direct_endpoint: Option<String>,
     pub daemon_pubkey_b64: String,
     pub direct_endpoints: Vec<String>,
     pub relay_url: Option<String>,
     pub state: HostConnectionState,
+}
+
+impl SavedHostProfile {
+    pub fn effective_display_name(&self) -> String {
+        if let Some(ref cn) = self.custom_name
+            && !cn.trim().is_empty()
+        {
+            return cn.trim().to_string();
+        }
+        if let Some(ref alias) = self.ssh_alias
+            && !alias.trim().is_empty()
+        {
+            return alias.trim().to_string();
+        }
+        self.hostname.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +134,7 @@ pub enum ClientCoreError {
     Ws(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("connection handshake failed: {0}")]
     Handshake(String),
-    #[error("no reachable direct endpoint or relay configured")]
+    #[error("no reachable direct endpoint, SSH tunnel, or relay configured")]
     Unreachable,
     #[error("channel closed")]
     ChannelClosed,
@@ -95,12 +148,14 @@ impl From<tokio_tungstenite::tungstenite::Error> for ClientCoreError {
     }
 }
 
-/// Live bidirectional connection to one Orbit Host (either direct or Noise E2EE over Relay).
+/// Live bidirectional connection to one Orbit Host (Direct WS, SSH Tunnel WS, or Noise E2EE over Relay).
 #[derive(Clone)]
 pub struct HostSessionHandle {
     pub mode: HostConnectionState,
+    pub via_ssh_tunnel: bool,
     out_tx: mpsc::Sender<OutboundPayload>,
     events_tx: broadcast::Sender<ClientInboundEvent>,
+    _ssh_tunnel: Option<Arc<SshTunnelGuard>>,
 }
 
 impl HostSessionHandle {
@@ -162,10 +217,26 @@ impl HostSessionHandle {
     }
 }
 
-/// Connect directly to an Orbit Daemon WebSocket endpoint with Zstd compression.
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Connect directly to an Orbit Daemon WebSocket endpoint with Zstd compression & 10s Ping keepalive.
 pub async fn connect_direct(
     ws_url: &str,
     replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    connect_direct_with_host_id("", ws_url, replica, None).await
+}
+
+async fn connect_direct_with_host_id(
+    host_id: &str,
+    ws_url: &str,
+    replica: Option<Arc<OrbitStore>>,
+    ssh_tunnel: Option<Arc<SshTunnelGuard>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
     let (ws_stream, _) = connect_async(ws_url).await?;
     let (mut sink, mut stream) = ws_stream.split();
@@ -182,7 +253,33 @@ pub async fn connect_direct(
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundPayload>(256);
     let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(512);
 
+    // 10s WebSocket Ping keepalive so SSH tunnels & NAT routers never drop idle sessions
+    let ping_tx = out_tx.clone();
     tokio::spawn(async move {
+        let _ = ping_tx
+            .send(OutboundPayload::Wire(WireMessage::Ping {
+                ts_ms: unix_ms_now(),
+            }))
+            .await;
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if ping_tx
+                .send(OutboundPayload::Wire(WireMessage::Ping {
+                    ts_ms: unix_ms_now(),
+                }))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let tunnel_keep_writer = ssh_tunnel.clone();
+    tokio::spawn(async move {
+        let _hold = tunnel_keep_writer;
         while let Some(item) = out_rx.recv().await {
             let ws_msg = match item {
                 OutboundPayload::Wire(w) => match w.encode_zstd(3) {
@@ -203,19 +300,22 @@ pub async fn connect_direct(
     });
 
     let events_in = events_tx.clone();
+    let owned_host_id = host_id.to_string();
+    let tunnel_keep_reader = ssh_tunnel.clone();
     tokio::spawn(async move {
+        let _hold = tunnel_keep_reader;
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
                 Message::Text(txt) => {
                     if let Ok(wire) = serde_json::from_str::<WireMessage>(&txt) {
-                        sync_to_replica(replica.as_deref(), &wire);
+                        sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
                         let _ = events_in.send(ClientInboundEvent::Wire(wire));
                     }
                 }
                 Message::Binary(bin) if !bin.is_empty() => {
                     if bin[0] == DIRECT_BIN_ZSTD_WIRE {
                         if let Ok(wire) = WireMessage::decode_zstd(&bin[1..]) {
-                            sync_to_replica(replica.as_deref(), &wire);
+                            sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
                             let _ = events_in.send(ClientInboundEvent::Wire(wire));
                         }
                     } else if let Ok(term) = TerminalBinaryFrame::decode(&bin) {
@@ -231,13 +331,24 @@ pub async fn connect_direct(
 
     Ok(HostSessionHandle {
         mode: HostConnectionState::OnlineDirect,
+        via_ssh_tunnel: ssh_tunnel.is_some(),
         out_tx,
         events_tx,
+        _ssh_tunnel: ssh_tunnel,
     })
 }
 
 /// Connect through an untrusted/self-hosted Relay using `Noise_NK_25519_ChaChaPoly_SHA256` E2EE.
 pub async fn connect_via_relay(
+    relay_base_url: &str,
+    daemon_pubkey_b64: &str,
+    replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    connect_via_relay_with_host_id("", relay_base_url, daemon_pubkey_b64, replica).await
+}
+
+async fn connect_via_relay_with_host_id(
+    host_id: &str,
     relay_base_url: &str,
     daemon_pubkey_b64: &str,
     replica: Option<Arc<OrbitStore>>,
@@ -252,11 +363,9 @@ pub async fn connect_via_relay(
     let (ws_stream, _) = connect_async(&url).await?;
     let (mut sink, mut stream) = ws_stream.split();
 
-    // Noise NK Message 1: -> e, es
     let (hs, msg1) = ClientHandshake::new(&pubkey_bytes)?;
     sink.send(Message::Binary(msg1.into())).await?;
 
-    // Noise NK Message 2: <- e, ee
     let msg2 = tokio::time::timeout(Duration::from_secs(10), async {
         while let Some(Ok(frame)) = stream.next().await {
             if let Message::Binary(b) = frame {
@@ -272,11 +381,10 @@ pub async fn connect_via_relay(
     let write_chan: SecureChannel = hs.finalize(&msg2)?;
     let shared_chan = Arc::new(tokio::sync::Mutex::new(write_chan));
 
-    // Send encrypted Hello inside the established Noise tunnel
     {
         let hello = WireMessage::Hello {
             client_id: Uuid::new_v4().to_string(),
-            client_name: "orbit-mobile-e2ee".into(),
+            client_name: "orbit-e2ee".into(),
             protocol_version: PROTOCOL_VERSION,
             supports_zstd: true,
         };
@@ -290,6 +398,29 @@ pub async fn connect_via_relay(
 
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundPayload>(256);
     let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(512);
+
+    let ping_tx = out_tx.clone();
+    tokio::spawn(async move {
+        let _ = ping_tx
+            .send(OutboundPayload::Wire(WireMessage::Ping {
+                ts_ms: unix_ms_now(),
+            }))
+            .await;
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if ping_tx
+                .send(OutboundPayload::Wire(WireMessage::Ping {
+                    ts_ms: unix_ms_now(),
+                }))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 
     let chan_writer = shared_chan.clone();
     tokio::spawn(async move {
@@ -323,12 +454,12 @@ pub async fn connect_via_relay(
 
     let events_in = events_tx.clone();
     let chan_reader = shared_chan;
+    let owned_host_id = host_id.to_string();
     tokio::spawn(async move {
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
                 Message::Binary(ct) => {
                     let Ok(plain) = chan_reader.lock().await.open_record(&ct) else {
-                        // Tampered or replayed record: immediately drop channel!
                         break;
                     };
                     if plain.is_empty() {
@@ -337,7 +468,7 @@ pub async fn connect_via_relay(
                     match plain[0] {
                         E2EE_FRAME_WIRE => {
                             if let Ok(wire) = WireMessage::decode_zstd(&plain[1..]) {
-                                sync_to_replica(replica.as_deref(), &wire);
+                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
                                 let _ = events_in.send(ClientInboundEvent::Wire(wire));
                             }
                         }
@@ -358,41 +489,162 @@ pub async fn connect_via_relay(
 
     Ok(HostSessionHandle {
         mode: HostConnectionState::OnlineRelay,
+        via_ssh_tunnel: false,
         out_tx,
         events_tx,
+        _ssh_tunnel: None,
     })
 }
 
-/// Happy-Eyeballs smart connector: tries LAN/Tailscale direct endpoints with a fast 1.2s probe first,
-/// and seamlessly falls back to the private Noise E2EE Relay when away from home/office.
-pub async fn connect_smart(
+async fn try_connect_ssh_tunnel(
     profile: &SavedHostProfile,
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
-    for ep in &profile.direct_endpoints {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err(ClientCoreError::Unreachable);
+    }
+    let Some(alias) = profile.ssh_alias.clone().filter(|s| !s.trim().is_empty()) else {
+        return Err(ClientCoreError::Unreachable);
+    };
+    let port = if profile.remote_daemon_port == 0 {
+        6868
+    } else {
+        profile.remote_daemon_port
+    };
+
+    let guard = tokio::task::spawn_blocking(move || spawn_ssh_local_tunnel(&alias, port))
+        .await
+        .map_err(|e| ClientCoreError::Handshake(format!("SSH 线程启动异常: {e}")))?
+        .map_err(ClientCoreError::Handshake)?;
+
+    let shared_guard = Arc::new(guard);
+    let mut last_err = None;
+    for _ in 0..22 {
+        if shared_guard.has_exited() {
+            return Err(ClientCoreError::Handshake("SSH 隧道进程意外退出".into()));
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(900),
+            connect_direct_with_host_id(
+                &profile.host_id,
+                &shared_guard.ws_url,
+                replica.clone(),
+                Some(shared_guard.clone()),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(handle)) => return Ok(handle),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(220)).await;
+    }
+
+    Err(last_err.unwrap_or_else(|| ClientCoreError::Handshake("SSH 端口转发连接超时".into())))
+}
+
+async fn try_connect_direct_endpoints(
+    profile: &SavedHostProfile,
+    replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    let mut endpoints = Vec::new();
+    if let Some(ref custom) = profile.custom_direct_endpoint
+        && !custom.trim().is_empty()
+    {
+        endpoints.push(custom.trim().to_string());
+    }
+    endpoints.extend(profile.direct_endpoints.iter().cloned());
+
+    for ep in &endpoints {
         if let Ok(Ok(handle)) = tokio::time::timeout(
             Duration::from_millis(1200),
-            connect_direct(ep, replica.clone()),
+            connect_direct_with_host_id(&profile.host_id, ep, replica.clone(), None),
         )
         .await
         {
             return Ok(handle);
         }
     }
-
-    if let Some(ref relay_url) = profile.relay_url {
-        return connect_via_relay(relay_url, &profile.daemon_pubkey_b64, replica).await;
-    }
-
     Err(ClientCoreError::Unreachable)
 }
 
-fn sync_to_replica(store: Option<&OrbitStore>, msg: &WireMessage) {
+/// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`):
+/// - When an `ssh_alias` (`devbox`) is configured on Desktop in `Auto` mode, connects via dedicated SSH tunnel FIRST!
+/// - Otherwise probes Direct WS -> SSH Tunnel -> Noise E2EE Relay.
+pub async fn connect_smart(
+    profile: &SavedHostProfile,
+    replica: Option<Arc<OrbitStore>>,
+) -> Result<HostSessionHandle, ClientCoreError> {
+    let has_ssh = cfg!(any(target_os = "macos", target_os = "linux"))
+        && profile
+            .ssh_alias
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+
+    match profile.route_mode {
+        HostRouteMode::SshTunnel => try_connect_ssh_tunnel(profile, replica).await,
+        HostRouteMode::DirectOnly => try_connect_direct_endpoints(profile, replica).await,
+        HostRouteMode::RelayOnly => {
+            if let Some(ref relay_url) = profile.relay_url {
+                connect_via_relay_with_host_id(
+                    &profile.host_id,
+                    relay_url,
+                    &profile.daemon_pubkey_b64,
+                    replica,
+                )
+                .await
+            } else {
+                Err(ClientCoreError::Handshake("尚未配置 E2EE 中继地址".into()))
+            }
+        }
+        HostRouteMode::Auto => {
+            let mut last_ssh_err = None;
+            if has_ssh && profile.custom_direct_endpoint.is_none() {
+                match try_connect_ssh_tunnel(profile, replica.clone()).await {
+                    Ok(h) => return Ok(h),
+                    Err(e) => last_ssh_err = Some(e),
+                }
+                if let Ok(h) = try_connect_direct_endpoints(profile, replica.clone()).await {
+                    return Ok(h);
+                }
+            } else {
+                if let Ok(h) = try_connect_direct_endpoints(profile, replica.clone()).await {
+                    return Ok(h);
+                }
+                if has_ssh {
+                    match try_connect_ssh_tunnel(profile, replica.clone()).await {
+                        Ok(h) => return Ok(h),
+                        Err(e) => last_ssh_err = Some(e),
+                    }
+                }
+            }
+
+            if let Some(ref relay_url) = profile.relay_url {
+                return connect_via_relay_with_host_id(
+                    &profile.host_id,
+                    relay_url,
+                    &profile.daemon_pubkey_b64,
+                    replica,
+                )
+                .await;
+            }
+
+            Err(last_ssh_err.unwrap_or(ClientCoreError::Unreachable))
+        }
+    }
+}
+
+fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage) {
     let Some(store) = store else { return };
     match msg {
         WireMessage::WorkspacesSnapshot { workspaces, .. } => {
             for ws in workspaces {
                 let _ = store.upsert_workspace(ws);
+            }
+            if !host_id.is_empty() {
+                let _ = store.upsert_replica_workspaces(host_id, workspaces);
             }
         }
         WireMessage::WorkspaceCreated { workspace, .. } => {
@@ -402,9 +654,15 @@ fn sync_to_replica(store: Option<&OrbitStore>, msg: &WireMessage) {
             for ag in agents {
                 let _ = store.upsert_agent(ag, None);
             }
+            if !host_id.is_empty() {
+                let _ = store.upsert_replica_agents(host_id, agents);
+            }
         }
         WireMessage::AgentCreated { agent, .. } | WireMessage::AgentUpdated { agent } => {
             let _ = store.upsert_agent(agent, None);
+            if !host_id.is_empty() {
+                let _ = store.upsert_single_replica_agent(host_id, agent);
+            }
         }
         WireMessage::TimelineCatchup { events, .. } => {
             for ev in events {
@@ -418,7 +676,7 @@ fn sync_to_replica(store: Option<&OrbitStore>, msg: &WireMessage) {
     }
 }
 
-/// Fleet coordinator embedded inside the mobile app via `flutter_rust_bridge`.
+/// Fleet coordinator embedded inside standalone CLI/mobile consumers.
 pub struct MultiHostFleet {
     hosts: RwLock<HashMap<String, SavedHostProfile>>,
     sessions: RwLock<HashMap<String, HostSessionHandle>>,
@@ -442,12 +700,16 @@ impl MultiHostFleet {
         })
     }
 
-    /// Pair a new host (e.g. scanning QR from Devbox, Spark workstation, or Mac mini).
     pub fn import_pairing_uri(&self, uri: &str) -> Result<SavedHostProfile, ClientCoreError> {
         let offer = PairingOffer::from_qr_uri(uri)?;
         let profile = SavedHostProfile {
             host_id: offer.host_id.clone(),
-            display_name: offer.hostname,
+            hostname: offer.hostname,
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
             daemon_pubkey_b64: offer.daemon_pubkey_b64,
             direct_endpoints: offer.direct_endpoints,
             relay_url: offer.relay_url,
@@ -460,7 +722,6 @@ impl MultiHostFleet {
         Ok(profile)
     }
 
-    /// Establish a live connection to a saved host using Happy-Eyeballs routing.
     pub async fn connect_host(&self, host_id: &str) -> Result<HostSessionHandle, ClientCoreError> {
         let profile = {
             let guard = self

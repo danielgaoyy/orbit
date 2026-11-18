@@ -22,8 +22,8 @@ uniffi::setup_scaffolding!();
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiOrbitError {
-    #[error("{message}")]
-    Core { message: String },
+    #[error("{detail}")]
+    Core { detail: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -874,7 +874,7 @@ impl OrbitMobileCore {
     #[uniffi::constructor]
     pub fn open(db_path: String) -> Result<Arc<Self>, FfiOrbitError> {
         let inner = OrbitAppCore::open(&db_path, false).map_err(|e| FfiOrbitError::Core {
-            message: e.to_string(),
+            detail: e.to_string(),
         })?;
         Ok(Arc::new(Self { inner }))
     }
@@ -882,7 +882,7 @@ impl OrbitMobileCore {
     #[uniffi::constructor]
     pub fn open_in_memory() -> Result<Arc<Self>, FfiOrbitError> {
         let inner = OrbitAppCore::open_in_memory().map_err(|e| FfiOrbitError::Core {
-            message: e.to_string(),
+            detail: e.to_string(),
         })?;
         Ok(Arc::new(Self { inner }))
     }
@@ -919,7 +919,7 @@ impl OrbitMobileCore {
             .pair_host(&pairing_uri)
             .map(Into::into)
             .map_err(|e| FfiOrbitError::Core {
-                message: e.to_string(),
+                detail: e.to_string(),
             })
     }
 
@@ -927,7 +927,7 @@ impl OrbitMobileCore {
         self.inner
             .remove_host(&host_id)
             .map_err(|e| FfiOrbitError::Core {
-                message: e.to_string(),
+                detail: e.to_string(),
             })
     }
 
@@ -939,7 +939,7 @@ impl OrbitMobileCore {
         self.inner
             .update_host_relay(&host_id, relay_url.as_deref())
             .map_err(|e| FfiOrbitError::Core {
-                message: e.to_string(),
+                detail: e.to_string(),
             })
     }
 

@@ -15,9 +15,48 @@ export type HostConnectionState =
   | "online_direct"
   | "online_relay";
 
+export type HostRouteMode = "auto" | "ssh_tunnel" | "direct_only" | "relay_only";
+
+export interface ClientProjectView {
+  project_id: string;
+  host_id: string;
+  name: string;
+  directories: string[];
+  updated_at_ms: number;
+}
+
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+  is_git_repo: boolean;
+}
+
+export interface DirectoryListingView {
+  current_path: string;
+  parent_path: string | null;
+  entries: DirectoryEntry[];
+}
+
+export interface ModelOption {
+  id: string;
+  label: string;
+  description: string | null;
+  is_default: boolean;
+}
+
 export interface HostCardView {
   host_id: string;
   display_name: string;
+  hostname: string;
+  custom_name: string | null;
+  ssh_alias: string | null;
+  route_mode: HostRouteMode;
+  remote_daemon_port: number;
+  custom_direct_endpoint: string | null;
+  via_ssh_tunnel: boolean;
+  last_ping_ms: number | null;
+  daemon_version: string | null;
+  os_arch: string | null;
   daemon_pubkey_b64: string;
   direct_endpoints: string[];
   relay_url: string | null;
@@ -33,6 +72,7 @@ export interface FleetOverviewView {
   revision: number;
   total_pending_approvals: number;
   hosts: HostCardView[];
+  projects: ClientProjectView[];
 }
 
 export interface WorkspaceSummary {
@@ -96,8 +136,12 @@ export interface HostDetailView {
   revision: number;
   host: HostCardView;
   discovered_projects: DiscoveredProject[];
+  directory_listing: DirectoryListingView | null;
+  models_by_provider: Partial<Record<ProviderKind, ModelOption[]>>;
   workspaces: WorkspaceSummary[];
   agents: AgentCardView[];
+  last_created_agent_id: string | null;
+  replaced_optimistic_agents: Record<string, string>;
   quotas: ProviderQuotaSnapshot[];
   terminals: TerminalSummary[];
   active_terminal_id: string | null;
@@ -327,7 +371,7 @@ export const orbitIpc = {
 
   async getFleetOverview(): Promise<FleetOverviewView> {
     if (!isTauriRuntime()) {
-      return { revision: 0, total_pending_approvals: 0, hosts: [] };
+      return { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] };
     }
     return invoke("get_fleet_overview");
   },
@@ -360,9 +404,34 @@ export const orbitIpc = {
   },
 
   pairHost: (pairingUri: string) => invoke<HostCardView>("pair_host", { pairingUri }),
+  pairSshHost: (sshAlias: string, remotePort = 6868) =>
+    invoke<HostCardView>("pair_ssh_host", { sshAlias, remotePort }),
   removeHost: (hostId: string) => invoke<void>("remove_host", { hostId }),
+  updateHostConfig: (params: {
+    hostId: string;
+    customName?: string | null;
+    routeMode?: HostRouteMode;
+    sshAlias?: string | null;
+    remoteDaemonPort?: number;
+    customDirectEndpoint?: string | null;
+    relayUrl?: string | null;
+    reconnect?: boolean;
+  }) => invoke<HostCardView>("update_host_config", params),
   updateHostRelay: (hostId: string, relayUrl: string | null) =>
     invoke<void>("update_host_relay", { hostId, relayUrl }),
+  upgradeRemoteDaemon: (hostId: string, sshAlias: string, remotePort = 6868) =>
+    invoke<string>("upgrade_remote_daemon", { hostId, sshAlias, remotePort }),
+
+  upsertProject: (params: {
+    projectId?: string | null;
+    hostId: string;
+    name: string;
+    directories: string[];
+  }) => invoke<ClientProjectView>("upsert_project", params),
+  removeProject: (projectId: string) => invoke<void>("remove_project", { projectId }),
+  listDirectory: (hostId: string, path: string | null) =>
+    invoke<void>("list_directory", { hostId, path }),
+
   connectHost: (hostId: string) => invoke<void>("connect_host", { hostId }),
   refreshHost: (hostId: string) => invoke<void>("refresh_host", { hostId }),
   refreshQuotas: (hostId: string) => invoke<void>("refresh_quotas", { hostId }),
@@ -370,11 +439,13 @@ export const orbitIpc = {
   createAgent: (params: {
     hostId: string;
     cwd: string;
+    extraDirs?: string[];
     provider: ProviderKind;
+    model?: string | null;
     mode: SessionMode;
     initialPrompt: string;
     worktreeBranch: string | null;
-  }) => invoke<void>("create_agent", params),
+  }) => invoke<string>("create_agent", params),
 
   openAgentTimeline: (hostId: string, agentId: string) =>
     invoke<void>("open_agent_timeline", { hostId, agentId }),
@@ -387,6 +458,15 @@ export const orbitIpc = {
 
   setSessionMode: (hostId: string, agentId: string, mode: SessionMode) =>
     invoke<void>("set_session_mode", { hostId, agentId, mode }),
+
+  setAgentModel: (hostId: string, agentId: string, model: string | null) =>
+    invoke<void>("set_agent_model", { hostId, agentId, model }),
+
+  switchAgentProvider: (hostId: string, agentId: string, provider: ProviderKind) =>
+    invoke<void>("switch_agent_provider", { hostId, agentId, provider }),
+
+  archiveAgent: (hostId: string, agentId: string) =>
+    invoke<void>("archive_agent", { hostId, agentId }),
 
   resolvePermission: (
     hostId: string,

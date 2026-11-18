@@ -2836,7 +2836,7 @@ enum FfiOrbitError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError 
 
     
     
-    case Core(message: String
+    case Core(detail: String
     )
 
     
@@ -2868,7 +2868,7 @@ public struct FfiConverterTypeFfiOrbitError: FfiConverterRustBuffer {
 
         
         case 1: return .Core(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -2882,9 +2882,9 @@ public struct FfiConverterTypeFfiOrbitError: FfiConverterRustBuffer {
 
         
         
-        case let .Core(message):
+        case let .Core(detail):
             writeInt(&buf, Int32(1))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         }
     }

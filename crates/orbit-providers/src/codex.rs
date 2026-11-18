@@ -160,7 +160,7 @@ async fn run_codex_actor(
         .or(cfg.resume_session_id.as_deref())
         .unwrap_or("unknown")
         .to_string();
-    let resolved_model = thread_res
+    let mut resolved_model = thread_res
         .get("model")
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
@@ -220,7 +220,7 @@ async fn run_codex_actor(
                             }))
                             .await;
 
-                        let (pol, sandbox_policy) = codex_turn_policies(&mode);
+                        let (pol, sandbox_policy) = codex_turn_policies(&mode, &cfg.extra_dirs);
                         let req_id = next_id;
                         next_id += 1;
                         let mut params = json!({
@@ -271,6 +271,9 @@ async fn run_codex_actor(
                     }
                     DriverCommand::SetMode { mode: new_mode } => {
                         mode = new_mode;
+                    }
+                    DriverCommand::SetModel { model: new_model } => {
+                        resolved_model = new_model;
                     }
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(app) = pending_approvals.remove(&request_id) {
@@ -428,7 +431,11 @@ fn codex_thread_mode_strings(mode: &SessionMode) -> (&'static str, &'static str)
     }
 }
 
-fn codex_turn_policies(mode: &SessionMode) -> (&'static str, Value) {
+fn codex_turn_policies(mode: &SessionMode, extra_dirs: &[PathBuf]) -> (&'static str, Value) {
+    let writable_roots: Vec<String> = extra_dirs
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     match mode {
         SessionMode::FullAccess => ("never", json!({ "type": "dangerFullAccess" })),
         SessionMode::Plan => ("on-request", json!({ "type": "readOnly" })),
@@ -437,7 +444,7 @@ fn codex_turn_policies(mode: &SessionMode) -> (&'static str, Value) {
             json!({
                 "type": "workspaceWrite",
                 "networkAccess": false,
-                "writableRoots": [],
+                "writableRoots": writable_roots,
                 "excludeSlashTmp": false,
                 "excludeTmpdirEnvVar": false
             }),

@@ -1,11 +1,15 @@
 //! Desktop-specific client utilities shared by macOS and Linux (Tauri v2):
 //! - Zero-config local Orbit Daemon discovery (`~/.orbit/host-keypair.json` -> `127.0.0.1:6868`)
 //! - `~/.ssh/config` server auto-discovery (with `Include` expansion)
+//! - One-click SSH Host Bootstrap (`orbit daemon up` + `orbit pair`) & SSH Local Port-Forward Tunnel (`SshTunnelGuard`)
 //! - One-click SSH E2EE Relay provisioning (`orbit relay up --allow-pubkey ...`)
 
 use std::fs;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +20,34 @@ pub struct SshHostItem {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub display_target: String,
+}
+
+/// RAII guard for a dedicated background `ssh -N -L` tunnel process.
+///
+/// Uses `ControlMaster=no` + `ControlPath=none` + `ServerAliveInterval=10` so user `~/.ssh/config`
+/// multiplexing timeouts never drop Orbit's WebSocket stream, and kills/reaps the child cleanly on drop.
+pub struct SshTunnelGuard {
+    pub ws_url: String,
+    child: Mutex<Child>,
+}
+
+impl SshTunnelGuard {
+    pub fn has_exited(&self) -> bool {
+        if let Ok(mut guard) = self.child.lock() {
+            matches!(guard.try_wait(), Ok(Some(_)) | Err(_))
+        } else {
+            true
+        }
+    }
+}
+
+impl Drop for SshTunnelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.child.lock() {
+            let _ = guard.kill();
+            let _ = guard.wait();
+        }
+    }
 }
 
 /// Normalize user-entered Relay host/URL (`1.2.3.4`, `https://relay.example.com`, `ws://host:7878/`) into a clean `ws://` or `wss://` base URL.
@@ -62,7 +94,15 @@ pub fn resolve_user_home() -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
-/// Automatically discover a local Orbit Daemon on Desktop (macOS / Linux / Windows) if `~/.orbit/host-keypair.json` exists.
+fn resolve_ssh_binary() -> &'static str {
+    if Path::new("/usr/bin/ssh").is_file() {
+        "/usr/bin/ssh"
+    } else {
+        "ssh"
+    }
+}
+
+/// Automatically discover and ensure a local Orbit Daemon on Desktop (macOS / Linux / Windows) if `orbit` CLI is installed.
 pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     if !cfg!(any(
         target_os = "macos",
@@ -72,10 +112,6 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         return None;
     }
     let home = resolve_user_home()?;
-    if !home.join(".orbit").join("host-keypair.json").is_file() {
-        return None;
-    }
-
     let candidates = [
         home.join(".local/bin/orbit"),
         home.join(".cargo/bin/orbit"),
@@ -84,6 +120,12 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         PathBuf::from("/opt/homebrew/bin/orbit"),
     ];
     let orbit_bin = candidates.into_iter().find(|p| p.is_file())?;
+
+    if TcpStream::connect_timeout(&"127.0.0.1:6868".parse().ok()?, Duration::from_millis(250))
+        .is_err()
+    {
+        let _ = Command::new(&orbit_bin).args(["daemon", "up"]).output();
+    }
 
     let out = Command::new(orbit_bin).arg("pair").output().ok()?;
     if !out.status.success() {
@@ -349,6 +391,152 @@ fn simple_glob(pat: &str, text: &str) -> bool {
     pat == text
 }
 
+/// Zero-form 1-click SSH Host Connection:
+/// Connects to `alias`, installs/upgrades `orbit` if missing or incompatible (`GLIBC_` / `<= 0.2.0`),
+/// ensures `orbit daemon up` is running, and returns `orbit://pair/...`.
+pub fn bootstrap_ssh_host_and_pair(alias: &str, remote_port: u16) -> Result<String, String> {
+    let remote_script = format!(
+        "set -eu; \
+         export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
+         NEED_INSTALL=0; \
+         if ! command -v orbit >/dev/null 2>&1; then NEED_INSTALL=1; \
+         elif orbit --version 2>&1 | grep -Eq 'GLIBC_|0\\.1\\.|0\\.2\\.0'; then NEED_INSTALL=1; fi; \
+         if [ \"$NEED_INSTALL\" = \"1\" ]; then \
+           curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
+           orbit daemon restart --port {remote_port} >/dev/null 2>&1 || orbit daemon up --port {remote_port} >/dev/null 2>&1 || true; \
+         else \
+           orbit daemon up --port {remote_port} >/dev/null 2>&1 || true; \
+         fi; \
+         orbit pair --port {remote_port}"
+    );
+
+    let out = Command::new(resolve_ssh_binary())
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=12",
+            alias,
+            &remote_script,
+        ])
+        .output()
+        .map_err(|e| format!("无法启动 SSH 进程: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        let detail = stderr.trim();
+        return Err(if detail.is_empty() {
+            format!("SSH 连接退出状态 {}", out.status)
+        } else {
+            detail.to_string()
+        });
+    }
+
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("orbit://pair/"))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("未能在 {alias} 获取到有效配对码"))
+}
+
+/// One-click remote Orbit Daemon upgrade & restart over SSH.
+pub fn upgrade_remote_daemon_over_ssh(alias: &str, remote_port: u16) -> Result<String, String> {
+    let remote_script = format!(
+        "set -eu; \
+         export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
+         curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
+         orbit daemon restart --port {remote_port} >/dev/null 2>&1 || orbit daemon up --port {remote_port} >/dev/null 2>&1; \
+         orbit --version"
+    );
+
+    let out = Command::new(resolve_ssh_binary())
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=15",
+            alias,
+            &remote_script,
+        ])
+        .output()
+        .map_err(|e| format!("无法启动 SSH 升级: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !out.status.success() {
+        return Err(if stderr.is_empty() {
+            format!("远端升级失败 ({})", out.status)
+        } else {
+            stderr
+        });
+    }
+    Ok(if stdout.is_empty() {
+        "orbit upgraded".into()
+    } else {
+        stdout
+    })
+}
+
+/// Open a dedicated SSH local port-forward (`127.0.0.1:<free_port> -> 127.0.0.1:<remote_port>`)
+/// without raw TCP probe resets or `ControlMaster` multiplexing drops.
+pub fn spawn_ssh_local_tunnel(alias: &str, remote_port: u16) -> Result<SshTunnelGuard, String> {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("本地端口分配失败: {e}"))?;
+    let local_port = listener
+        .local_addr()
+        .map_err(|e| format!("读取本地端口失败: {e}"))?
+        .port();
+    drop(listener);
+
+    let forward_spec = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
+    let mut child = Command::new(resolve_ssh_binary())
+        .args([
+            "-N",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "TCPKeepAlive=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-L",
+            &forward_spec,
+            alias,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法拉起 SSH 隧道进程: {e}"))?;
+
+    std::thread::sleep(Duration::from_millis(220));
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!("SSH 隧道立即退出 ({alias}: {status})"));
+    }
+
+    Ok(SshTunnelGuard {
+        ws_url: format!("ws://127.0.0.1:{local_port}/ws"),
+        child: Mutex::new(child),
+    })
+}
+
 /// Deploy/update Orbit on a remote SSH host and start `orbit relay up` locked to `allowed_pubkeys`.
 pub fn provision_relay_over_ssh(
     alias: &str,
@@ -373,19 +561,13 @@ pub fn provision_relay_over_ssh(
     let remote_script = format!(
         "set -eu; \
          export PATH=\"$HOME/.local/bin:/usr/local/bin:$PATH\"; \
-         if ! command -v orbit >/dev/null 2>&1 || ! orbit relay --help 2>&1 | grep -q 'allow'; then \
+         if ! command -v orbit >/dev/null 2>&1 || orbit --version 2>&1 | grep -q 'GLIBC_' || ! orbit relay --help 2>&1 | grep -q 'allow'; then \
            curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh; \
          fi; \
          orbit relay up --port {relay_port} {pubkey_flags}"
     );
 
-    let ssh_bin = if Path::new("/usr/bin/ssh").is_file() {
-        "/usr/bin/ssh"
-    } else {
-        "ssh"
-    };
-
-    let out = Command::new(ssh_bin)
+    let out = Command::new(resolve_ssh_binary())
         .args([
             "-o",
             "BatchMode=yes",

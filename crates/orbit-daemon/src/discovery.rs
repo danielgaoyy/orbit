@@ -1,14 +1,14 @@
-//! Zero-configuration project & Git repository discovery on the host filesystem.
+//! Zero-configuration project & Git repository discovery + interactive remote directory browser.
 //!
-//! Eliminates manual `cwd` path typing ("fill-in-the-blank") in Orbit clients by automatically
-//! discovering active Git repositories and workspaces under common developer directories and
-//! Orbit's persisted session history.
+//! Supports both automatic discovery (including `~/workspace`, `~/go/src`, `~/.paseo/projects`,
+//! `~/.claude.json`, and Orbit's own workspace history) AND interactive remote/local folder browsing
+//! (`list_directory_entries`) so users can add any single or multi-directory Project with clicks!
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use orbit_protocol::DiscoveredProject;
+use orbit_protocol::{DirectoryEntry, DiscoveredProject};
 use orbit_store::OrbitStore;
 
 const CANDIDATE_WORKSPACE_ROOTS: &[&str] = &[
@@ -22,6 +22,10 @@ const CANDIDATE_WORKSPACE_ROOTS: &[&str] = &[
     "code",
     "repos",
     "github",
+    "go/src",
+    "artifacts",
+    "deliveries",
+    "opt",
 ];
 
 const IGNORED_DIR_NAMES: &[&str] = &[
@@ -32,13 +36,69 @@ const IGNORED_DIR_NAMES: &[&str] = &[
     "vendor",
     "Library",
     "Applications",
-    "Downloads",
     "Movies",
     "Music",
     "Pictures",
     "Public",
     "Trash",
 ];
+
+/// Browse subdirectories inside `requested_path` (defaults to `$HOME` when `None` or `"~"`).
+pub fn list_directory_entries(
+    requested_path: Option<&str>,
+) -> (String, Option<String>, Vec<DirectoryEntry>) {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+
+    let target = match requested_path.map(str::trim) {
+        None | Some("") | Some("~") => home.clone(),
+        Some(rel) if rel.starts_with("~/") => home.join(&rel[2..]),
+        Some(abs) => PathBuf::from(abs),
+    };
+
+    let canonical = if target.is_dir() {
+        std::fs::canonicalize(&target).unwrap_or(target)
+    } else {
+        std::fs::canonicalize(&home).unwrap_or(home)
+    };
+
+    let current_path = canonical.to_string_lossy().to_string();
+    let parent_path = canonical
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && *p != canonical.as_path())
+        .map(|p| p.to_string_lossy().to_string());
+
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&canonical) {
+        for item in rd.flatten() {
+            let path = item.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            if !path.is_dir() {
+                continue;
+            }
+            let is_git_repo = path.join(".git").exists();
+            entries.push(DirectoryEntry {
+                name: name.to_string(),
+                path: path.to_string_lossy().to_string(),
+                is_git_repo,
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        b.is_git_repo
+            .cmp(&a.is_git_repo)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    (current_path, parent_path, entries)
+}
 
 /// Discover selectable projects on the current host sorted by recent activity (`last_modified_unix` DESC).
 pub fn discover_host_projects(store: &OrbitStore) -> Vec<DiscoveredProject> {
@@ -67,18 +127,22 @@ pub fn discover_host_projects(store: &OrbitStore) -> Vec<DiscoveredProject> {
         }
     }
 
-    // 2. Scan common workspace roots under $HOME (1~2 levels deep, skipping heavy/system dirs)
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        // 2. Also import any projects configured in Paseo (`~/.paseo/projects/projects.json`) or Claude (`~/.claude.json`)
+        import_paseo_projects(&home, &mut by_path);
+        import_claude_projects(&home, &mut by_path);
+
+        // 3. Scan common workspace roots under $HOME (1~2 levels deep)
         for rel in CANDIDATE_WORKSPACE_ROOTS {
             let root = home.join(rel);
             if root.is_dir() {
                 scan_workspace_root(&root, 2, &mut by_path);
             }
         }
-        // Also check direct children of $HOME that are themselves Git repositories
+
+        // 4. Include direct non-hidden subdirectories of $HOME that are Git repos (excluding $HOME/.git itself)
         scan_direct_git_children(&home, &mut by_path);
 
-        // Ensure at least $HOME is available if the machine is completely fresh
         if by_path.is_empty() && home.is_dir() {
             insert_candidate(&mut by_path, &home, None, None);
         }
@@ -91,8 +155,48 @@ pub fn discover_host_projects(store: &OrbitStore) -> Vec<DiscoveredProject> {
             .then_with(|| b.is_git_repo.cmp(&a.is_git_repo))
             .then_with(|| a.name.cmp(&b.name))
     });
-    list.truncate(48);
+    list.truncate(60);
     list
+}
+
+fn import_paseo_projects(home: &Path, out: &mut HashMap<String, DiscoveredProject>) {
+    let path = home.join(".paseo/projects/projects.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) else {
+        return;
+    };
+    for item in arr {
+        if item.get("archivedAt").is_some_and(|v| !v.is_null()) {
+            continue;
+        }
+        if let Some(root_str) = item.get("rootPath").and_then(|v| v.as_str()) {
+            let p = PathBuf::from(root_str);
+            if p.is_dir() {
+                insert_candidate(out, &p, None, None);
+            }
+        }
+    }
+}
+
+fn import_claude_projects(home: &Path, out: &mut HashMap<String, DiscoveredProject>) {
+    let path = home.join(".claude.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(projects_obj) = val.get("projects").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for key in projects_obj.keys().take(30) {
+        let p = PathBuf::from(key);
+        if p.is_dir() && p != home {
+            insert_candidate(out, &p, None, None);
+        }
+    }
 }
 
 fn scan_direct_git_children(dir: &Path, out: &mut HashMap<String, DiscoveredProject>) {
@@ -139,8 +243,6 @@ fn scan_workspace_root(
         if path.join(".git").exists() {
             insert_candidate(out, &path, None, None);
         } else if remaining_depth > 1 {
-            // Also include immediate project folders inside ~/workspace even if not git-initialized yet,
-            // while still checking one level deeper for nested git repos (e.g. ~/workspace/org/repo).
             insert_candidate(out, &path, None, None);
             scan_direct_git_children(&path, out);
         }
@@ -244,19 +346,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_seeded_workspace_cleanly() {
+    fn discovers_seeded_workspace_and_lists_subdirs() {
         let store = OrbitStore::open_in_memory().expect("in-memory store");
         let tmp =
             std::env::temp_dir().join(format!("orbit_disc_test_{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(tmp.join(".git")).expect("mkdir .git");
-        std::fs::write(tmp.join(".git/HEAD"), "ref: refs/heads/feat/clean-ui\n")
-            .expect("write HEAD");
+        std::fs::create_dir_all(tmp.join("sub_repo/.git")).expect("mkdir .git");
+        std::fs::write(
+            tmp.join("sub_repo/.git/HEAD"),
+            "ref: refs/heads/feat/clean-ui\n",
+        )
+        .expect("write HEAD");
 
+        let sub_str = tmp.join("sub_repo").to_string_lossy().to_string();
         store
             .upsert_workspace(&orbit_protocol::WorkspaceSummary {
                 workspace_id: "ws_disc".into(),
                 title: "demo".into(),
-                cwd: tmp.to_string_lossy().to_string(),
+                cwd: sub_str,
                 git_branch: None,
                 is_worktree: false,
                 updated_at: chrono::Utc::now(),
@@ -269,6 +375,12 @@ mod tests {
                 .iter()
                 .any(|p| p.git_branch.as_deref() == Some("feat/clean-ui"))
         );
+
+        let (_, _, entries) = list_directory_entries(Some(&tmp.to_string_lossy()));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "sub_repo");
+        assert!(entries[0].is_git_repo);
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

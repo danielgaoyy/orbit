@@ -1,5 +1,7 @@
 //! Core wire types, state machines, timeline events, git/worktree models, and binary terminal framing.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -102,6 +104,23 @@ pub struct DiscoveredProject {
     pub git_branch: Option<String>,
     pub is_git_repo: bool,
     pub last_modified_unix: i64,
+}
+
+/// Directory entry for interactive remote/local folder browsing (`+ 添加工作目录`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub is_git_repo: bool,
+}
+
+/// Selectable LLM model option reported by an installed Provider CLI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelOption {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    pub is_default: bool,
 }
 
 /// Git file entry status for mobile working-tree review.
@@ -303,13 +322,30 @@ pub enum WireMessage {
         ts_ms: u64,
     },
 
-    // Workspaces & Git / Worktrees
+    // Workspaces, Directory Browser & Git / Worktrees
     DiscoverProjects {
         request_id: Uuid,
     },
     DiscoveredProjectsSnapshot {
         request_id: Uuid,
         projects: Vec<DiscoveredProject>,
+    },
+    ListDirectory {
+        request_id: Uuid,
+        path: Option<String>,
+    },
+    DirectoryEntriesResponse {
+        request_id: Uuid,
+        current_path: String,
+        parent_path: Option<String>,
+        entries: Vec<DirectoryEntry>,
+    },
+    ListModels {
+        request_id: Uuid,
+    },
+    ModelsSnapshot {
+        request_id: Uuid,
+        models: HashMap<ProviderKind, Vec<ModelOption>>,
     },
     ListWorkspaces {
         request_id: Uuid,
@@ -363,6 +399,8 @@ pub enum WireMessage {
     CreateAgent {
         request_id: Uuid,
         cwd: String,
+        #[serde(default)]
+        extra_dirs: Vec<String>,
         title: Option<String>,
         provider: ProviderKind,
         model: Option<String>,
@@ -391,6 +429,11 @@ pub enum WireMessage {
         request_id: Uuid,
         agent_id: String,
         mode: SessionMode,
+    },
+    SetAgentModel {
+        request_id: Uuid,
+        agent_id: String,
+        model: Option<String>,
     },
     SwitchAgentProvider {
         request_id: Uuid,
@@ -594,6 +637,7 @@ mod tests {
         let msg = WireMessage::CreateAgent {
             request_id: Uuid::new_v4(),
             cwd: "/workspace/orbit".into(),
+            extra_dirs: vec!["/workspace/shared".into()],
             title: Some("Build Orbit".into()),
             provider: ProviderKind::Antigravity,
             model: Some("gemini-pro".into()),

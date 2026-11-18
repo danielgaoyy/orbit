@@ -25,8 +25,12 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use orbit_crypto::{DaemonHandshake, HostIdentityKeypair, PairingOffer};
-use orbit_protocol::{HostInfo, PROTOCOL_VERSION, TerminalBinaryFrame, WireMessage};
-use orbit_providers::{discover_installed_providers, probe_all_provider_quotas};
+use orbit_protocol::{
+    HostInfo, ModelOption, PROTOCOL_VERSION, ProviderKind, TerminalBinaryFrame, WireMessage,
+};
+use orbit_providers::{
+    discover_installed_providers, probe_all_provider_models, probe_all_provider_quotas,
+};
 use orbit_store::OrbitStore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -137,6 +141,7 @@ pub struct DaemonRuntime {
     pub store: Arc<OrbitStore>,
     pub orchestrator: Arc<AgentOrchestrator>,
     pub home_dir: PathBuf,
+    pub models_cache: tokio::sync::RwLock<Option<HashMap<ProviderKind, Vec<ModelOption>>>>,
 }
 
 impl DaemonRuntime {
@@ -178,13 +183,23 @@ impl DaemonRuntime {
             available_providers,
         };
 
-        Ok(Arc::new(Self {
+        let rt = Arc::new(Self {
             host_info,
             keypair,
             store,
             orchestrator,
             home_dir: home_dir.to_path_buf(),
-        }))
+            models_cache: tokio::sync::RwLock::new(None),
+        });
+
+        // Pre-warm live provider models asynchronously so `ListModels` is instantaneous!
+        let rt_warm = rt.clone();
+        tokio::spawn(async move {
+            let probed = probe_all_provider_models().await;
+            *rt_warm.models_cache.write().await = Some(probed);
+        });
+
+        Ok(rt)
     }
 
     pub fn build_pairing_offer(
@@ -631,6 +646,33 @@ async fn handle_wire_rpc(
                 projects,
             })
         }
+        WireMessage::ListDirectory { request_id, path } => {
+            let (current_path, parent_path, entries) = tokio::task::spawn_blocking(move || {
+                crate::discovery::list_directory_entries(path.as_deref())
+            })
+            .await
+            .unwrap_or_else(|_| ("/".into(), None, Vec::new()));
+            Some(WireMessage::DirectoryEntriesResponse {
+                request_id,
+                current_path,
+                parent_path,
+                entries,
+            })
+        }
+        WireMessage::ListModels { request_id } => {
+            if let Some(cached) = runtime.models_cache.read().await.clone() {
+                return Some(WireMessage::ModelsSnapshot {
+                    request_id,
+                    models: cached,
+                });
+            }
+            let fresh = probe_all_provider_models().await;
+            *runtime.models_cache.write().await = Some(fresh.clone());
+            Some(WireMessage::ModelsSnapshot {
+                request_id,
+                models: fresh,
+            })
+        }
         WireMessage::ListWorkspaces { request_id } => match runtime.store.list_workspaces() {
             Ok(workspaces) => Some(WireMessage::WorkspacesSnapshot {
                 request_id,
@@ -685,6 +727,7 @@ async fn handle_wire_rpc(
         WireMessage::CreateAgent {
             request_id,
             cwd,
+            extra_dirs,
             title,
             provider,
             model,
@@ -696,6 +739,7 @@ async fn handle_wire_rpc(
                 .orchestrator
                 .create_and_start_agent(crate::manager::CreateAgentSpec {
                     cwd,
+                    extra_dirs,
                     title,
                     provider,
                     model,
@@ -737,6 +781,14 @@ async fn handle_wire_rpc(
         } => match runtime.orchestrator.set_session_mode(&agent_id, mode).await {
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "set_mode_failed", e)),
+        },
+        WireMessage::SetAgentModel {
+            request_id,
+            agent_id,
+            model,
+        } => match runtime.orchestrator.set_agent_model(&agent_id, model).await {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "set_model_failed", e)),
         },
         WireMessage::SwitchAgentProvider {
             request_id,

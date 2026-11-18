@@ -13,6 +13,17 @@ export default defineConfig({
     },
   },
   clearScreen: false,
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("@xterm/")) return "xterm";
+          if (id.includes("radix-ui") || id.includes("lucide-react")) return "ui-vendor";
+          if (id.includes("node_modules/react")) return "react-vendor";
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     strictPort: true,

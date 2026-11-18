@@ -13,11 +13,13 @@
     "windows": [
       {
         "label": "main",
-        "title": "Orbit — Multi-Host AI Coding Agent Control Plane",
-        "width": 1380,
-        "height": 860,
-        "minWidth": 980,
-        "minHeight": 640
+        "title": "Orbit",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 500,
+        "minHeight": 400,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

@@ -14,9 +14,9 @@ use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     AgentStatus, AgentSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot, ModelOption,
-    ProviderKind, ProviderQuotaSnapshot, QuestionItem, SessionMode, TerminalBinaryFrame,
-    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
-    WorkspaceSummary,
+    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot, QuestionItem,
+    ReasoningEffort, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
+    TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceSummary,
 };
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
 use serde::{Deserialize, Serialize};
@@ -125,13 +125,29 @@ pub struct AgentCardView {
     pub provider: ProviderKind,
     pub provider_label: String,
     pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
     pub mode: SessionMode,
     pub status: AgentStatus,
     pub status_label: String,
     pub is_running: bool,
     pub is_awaiting_permission: bool,
+    pub parent_agent_id: Option<String>,
     pub latest_seq: u64,
     pub updated_at_rfc3339: String,
+}
+
+pub struct CreateAgentRequest<'a> {
+    pub host_id: &'a str,
+    pub cwd: &'a str,
+    pub extra_dirs: Vec<String>,
+    pub provider: ProviderKind,
+    pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
+    pub mode: SessionMode,
+    pub initial_prompt: &'a str,
+    pub initial_display_prompt: Option<String>,
+    pub initial_badges: Vec<PromptBadge>,
+    pub worktree_branch: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +162,8 @@ pub struct HostDetailView {
     pub last_created_agent_id: Option<String>,
     pub replaced_optimistic_agents: HashMap<String, String>,
     pub quotas: Vec<ProviderQuotaSnapshot>,
+    #[serde(default)]
+    pub provider_catalogs: Vec<ProviderModelCatalog>,
     pub terminals: Vec<TerminalSummary>,
     pub active_terminal_id: Option<String>,
     pub active_terminal_slot: u8,
@@ -158,6 +176,8 @@ pub enum TimelineItemView {
         seq: u64,
         message_id: String,
         text: String,
+        #[serde(default)]
+        badges: Vec<PromptBadge>,
         blocks: Vec<RichBlockView>,
     },
     AssistantThinking {
@@ -209,6 +229,18 @@ pub struct AgentTimelineView {
     pub items: Vec<TimelineItemView>,
 }
 
+/// Incremental `O(delta)` timeline projection so streaming tokens never re-serialize historical blocks over IPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTimelineDeltaView {
+    pub revision: u64,
+    pub host_id: String,
+    pub agent: Option<AgentCardView>,
+    pub latest_seq: u64,
+    pub upserted_items: Vec<TimelineItemView>,
+    pub resolved_permissions: HashMap<String, String>,
+    pub resolved_questions: HashMap<String, Vec<Vec<String>>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitReviewView {
     pub revision: u64,
@@ -244,12 +276,14 @@ struct HostMemoryState {
     timelines: HashMap<String, Vec<TimelineEvent>>,
     markdown_cache: HashMap<(u64, usize, bool), Vec<RichBlockView>>,
     quotas: Vec<ProviderQuotaSnapshot>,
+    provider_catalogs: Vec<ProviderModelCatalog>,
     terminals: Vec<TerminalSummary>,
     active_terminal_id: Option<String>,
     active_terminal_slot: u8,
     terminal_emulator: TerminalGridEmulator,
     git_statuses: HashMap<String, GitStatusSnapshot>,
     git_diffs: HashMap<String, String>,
+    workspace_files: HashMap<String, Vec<String>>,
 }
 
 impl HostMemoryState {
@@ -282,12 +316,14 @@ impl HostMemoryState {
             timelines: HashMap::new(),
             markdown_cache: HashMap::new(),
             quotas: Vec::new(),
+            provider_catalogs: Vec::new(),
             terminals: Vec::new(),
             active_terminal_id: None,
             active_terminal_slot: 1,
             terminal_emulator: TerminalGridEmulator::new(100, 30),
             git_statuses: HashMap::new(),
             git_diffs: HashMap::new(),
+            workspace_files: HashMap::new(),
         }
     }
 
@@ -526,6 +562,7 @@ impl OrbitAppCore {
             last_created_agent_id: state.last_created_agent_id.clone(),
             replaced_optimistic_agents: state.replaced_optimistic_agents.clone(),
             quotas: state.quotas.clone(),
+            provider_catalogs: state.provider_catalogs.clone(),
             terminals: state.terminals.clone(),
             active_terminal_id: state.active_terminal_id.clone(),
             active_terminal_slot: state.active_terminal_slot,
@@ -533,21 +570,42 @@ impl OrbitAppCore {
     }
 
     pub fn agent_timeline(&self, host_id: &str, agent_id: &str) -> AgentTimelineView {
+        let delta = self.agent_timeline_delta(host_id, agent_id, 0);
+        AgentTimelineView {
+            revision: delta.revision,
+            host_id: delta.host_id,
+            agent: delta.agent,
+            items: delta.upserted_items,
+        }
+    }
+
+    pub fn agent_timeline_delta(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        since_seq: u64,
+    ) -> AgentTimelineDeltaView {
         let rev = self.revision.load(Ordering::SeqCst);
         let Ok(mut guard) = self.hosts.write() else {
-            return AgentTimelineView {
+            return AgentTimelineDeltaView {
                 revision: rev,
                 host_id: host_id.to_string(),
                 agent: None,
-                items: Vec::new(),
+                latest_seq: since_seq,
+                upserted_items: Vec::new(),
+                resolved_permissions: HashMap::new(),
+                resolved_questions: HashMap::new(),
             };
         };
         let Some(host_state) = guard.get_mut(host_id) else {
-            return AgentTimelineView {
+            return AgentTimelineDeltaView {
                 revision: rev,
                 host_id: host_id.to_string(),
                 agent: None,
-                items: Vec::new(),
+                latest_seq: since_seq,
+                upserted_items: Vec::new(),
+                resolved_permissions: HashMap::new(),
+                resolved_questions: HashMap::new(),
             };
         };
 
@@ -557,7 +615,11 @@ impl OrbitAppCore {
             && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 500)
             && !cached.is_empty()
         {
-            host_state.timelines.insert(agent_id.to_string(), cached);
+            let mut coalesced = Vec::with_capacity(cached.len());
+            for ev in cached {
+                coalesce_or_push_timeline(&mut coalesced, ev);
+            }
+            host_state.timelines.insert(agent_id.to_string(), coalesced);
         }
 
         let agent_card = host_state.agents.get(agent_id).map(agent_to_card_view);
@@ -567,45 +629,65 @@ impl OrbitAppCore {
             .cloned()
             .unwrap_or_default();
 
-        let mut resolved_perms: HashMap<String, String> = HashMap::new();
-        let mut resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        let mut all_resolved_perms: HashMap<String, String> = HashMap::new();
+        let mut all_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        let mut delta_resolved_perms: HashMap<String, String> = HashMap::new();
+        let mut delta_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+        let mut latest_seq = since_seq;
         for ev in &events {
+            if ev.seq > latest_seq {
+                latest_seq = ev.seq;
+            }
             match &ev.payload {
                 TimelinePayload::PermissionResolved {
                     request_id,
                     decision,
                 } => {
-                    resolved_perms.insert(request_id.clone(), decision.clone());
+                    all_resolved_perms.insert(request_id.clone(), decision.clone());
+                    if since_seq == 0 || ev.seq > since_seq {
+                        delta_resolved_perms.insert(request_id.clone(), decision.clone());
+                    }
                 }
                 TimelinePayload::QuestionResolved {
                     request_id,
                     answers,
                 } => {
-                    resolved_questions.insert(request_id.clone(), answers.clone());
+                    all_resolved_questions.insert(request_id.clone(), answers.clone());
+                    if since_seq == 0 || ev.seq > since_seq {
+                        delta_resolved_questions.insert(request_id.clone(), answers.clone());
+                    }
                 }
                 _ => {}
             }
         }
 
-        let mut items = Vec::with_capacity(events.len());
+        let mut upserted_items = Vec::new();
         for ev in &events {
+            if since_seq > 0 && ev.seq <= since_seq {
+                continue;
+            }
             match &ev.payload {
-                TimelinePayload::UserPrompt { message_id, text } => {
+                TimelinePayload::UserPrompt {
+                    message_id,
+                    text,
+                    badges,
+                } => {
                     let key = (ev.seq, text.len(), false);
                     let blocks = host_state
                         .markdown_cache
                         .entry(key)
                         .or_insert_with(|| parse_markdown_blocks(text, false))
                         .clone();
-                    items.push(TimelineItemView::UserPrompt {
+                    upserted_items.push(TimelineItemView::UserPrompt {
                         seq: ev.seq,
                         message_id: message_id.clone(),
                         text: text.clone(),
+                        badges: badges.clone(),
                         blocks,
                     });
                 }
                 TimelinePayload::AssistantThinking { item_id, text } => {
-                    items.push(TimelineItemView::AssistantThinking {
+                    upserted_items.push(TimelineItemView::AssistantThinking {
                         seq: ev.seq,
                         item_id: item_id.clone(),
                         text: text.clone(),
@@ -622,7 +704,7 @@ impl OrbitAppCore {
                         .entry(key)
                         .or_insert_with(|| parse_markdown_blocks(text, *streaming))
                         .clone();
-                    items.push(TimelineItemView::AssistantMessage {
+                    upserted_items.push(TimelineItemView::AssistantMessage {
                         seq: ev.seq,
                         item_id: item_id.clone(),
                         text: text.clone(),
@@ -636,7 +718,7 @@ impl OrbitAppCore {
                     detail,
                 } => {
                     let (summary_title, diff_files) = summarize_tool_detail(detail);
-                    items.push(TimelineItemView::ToolCall {
+                    upserted_items.push(TimelineItemView::ToolCall {
                         seq: ev.seq,
                         call_id: call_id.clone(),
                         status: *status,
@@ -651,28 +733,28 @@ impl OrbitAppCore {
                     detail,
                     allowed_decisions,
                 } => {
-                    items.push(TimelineItemView::PermissionRequest {
+                    upserted_items.push(TimelineItemView::PermissionRequest {
                         seq: ev.seq,
                         request_id: request_id.clone(),
                         title: title.clone(),
                         detail: detail.clone(),
                         allowed_decisions: allowed_decisions.clone(),
-                        resolved_decision: resolved_perms.get(request_id).cloned(),
+                        resolved_decision: all_resolved_perms.get(request_id).cloned(),
                     });
                 }
                 TimelinePayload::QuestionRequest {
                     request_id,
                     questions,
                 } => {
-                    items.push(TimelineItemView::QuestionRequest {
+                    upserted_items.push(TimelineItemView::QuestionRequest {
                         seq: ev.seq,
                         request_id: request_id.clone(),
                         questions: questions.clone(),
-                        resolved_answers: resolved_questions.get(request_id).cloned(),
+                        resolved_answers: all_resolved_questions.get(request_id).cloned(),
                     });
                 }
                 TimelinePayload::Notice { level, message } => {
-                    items.push(TimelineItemView::Notice {
+                    upserted_items.push(TimelineItemView::Notice {
                         seq: ev.seq,
                         level: level.clone(),
                         message: message.clone(),
@@ -684,11 +766,14 @@ impl OrbitAppCore {
             }
         }
 
-        AgentTimelineView {
+        AgentTimelineDeltaView {
             revision: rev,
             host_id: host_id.to_string(),
             agent: agent_card,
-            items,
+            latest_seq,
+            upserted_items,
+            resolved_permissions: delta_resolved_perms,
+            resolved_questions: delta_resolved_questions,
         }
     }
 
@@ -1097,6 +1182,12 @@ impl OrbitAppCore {
                     })
                     .await;
                 let _ = handle
+                    .send_wire(WireMessage::ListProviderModels {
+                        request_id: Uuid::new_v4(),
+                        force_refresh: false,
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::DiscoverProjects {
                         request_id: Uuid::new_v4(),
                     })
@@ -1279,6 +1370,7 @@ impl OrbitAppCore {
         let mut notify_timeline_agent: Option<String> = None;
         let mut notify_git_cwd: Option<String> = None;
         let mut auto_subscribe_agent: Option<String> = None;
+        let mut continue_catchup: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
 
         if let Ok(mut guard) = self.hosts.write()
@@ -1378,13 +1470,20 @@ impl OrbitAppCore {
                     notify_timeline_agent = Some(ag_id);
                 }
                 WireMessage::TimelineCatchup {
-                    agent_id, events, ..
+                    agent_id,
+                    events,
+                    has_more,
+                    ..
                 } => {
                     let list = state.timelines.entry(agent_id.clone()).or_default();
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
+                    let max_seq = ordered.last().map(|e| e.seq);
                     for ev in ordered {
                         coalesce_or_push_timeline(list, ev);
+                    }
+                    if has_more && let Some(next_since) = max_seq {
+                        continue_catchup = Some((agent_id.clone(), next_since));
                     }
                     notify_timeline_agent = Some(agent_id);
                 }
@@ -1416,6 +1515,10 @@ impl OrbitAppCore {
                     state.git_diffs.insert(key, unified_diff);
                     notify_git_cwd = Some(cwd);
                 }
+                WireMessage::WorkspaceFilesResponse { cwd, files, .. } => {
+                    state.workspace_files.insert(cwd.clone(), files);
+                    notify_git_cwd = Some(cwd);
+                }
                 WireMessage::TerminalsSnapshot { terminals, .. } => {
                     state.terminals = terminals;
                     notify_host = true;
@@ -1432,6 +1535,10 @@ impl OrbitAppCore {
                 }
                 WireMessage::QuotaReport { snapshots, .. } => {
                     state.quotas = snapshots;
+                    notify_host = true;
+                }
+                WireMessage::ProviderModelsSnapshot { catalogs, .. } => {
+                    state.provider_catalogs = catalogs;
                     notify_host = true;
                 }
                 WireMessage::RpcError {
@@ -1477,6 +1584,16 @@ impl OrbitAppCore {
         }
         if let Some(new_agent_id) = auto_subscribe_agent {
             self.open_agent_timeline(host_id, &new_agent_id);
+        }
+        if let Some((catchup_agent_id, since_seq)) = continue_catchup {
+            self.dispatch_wire(
+                host_id,
+                WireMessage::SubscribeTimeline {
+                    request_id: Uuid::new_v4(),
+                    agent_id: catchup_agent_id,
+                    since_seq,
+                },
+            );
         }
 
         if notify_fleet {
@@ -1615,6 +1732,23 @@ impl OrbitAppCore {
                 request_id: Uuid::new_v4(),
             },
         );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListProviderModels {
+                request_id: Uuid::new_v4(),
+                force_refresh: false,
+            },
+        );
+    }
+
+    pub fn refresh_provider_models(&self, host_id: &str, force_refresh: bool) {
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListProviderModels {
+                request_id: Uuid::new_v4(),
+                force_refresh,
+            },
+        );
     }
 
     pub fn refresh_quotas(&self, host_id: &str) {
@@ -1636,16 +1770,19 @@ impl OrbitAppCore {
         initial_prompt: &str,
         worktree_branch: Option<&str>,
     ) {
-        let _ = self.create_agent_ext(
+        let _ = self.create_agent_with_config(CreateAgentRequest {
             host_id,
             cwd,
-            Vec::new(),
+            extra_dirs: Vec::new(),
             provider,
-            None,
+            model: None,
+            effort: None,
             mode,
             initial_prompt,
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
             worktree_branch,
-        );
+        });
     }
 
     /// Full Paseo-style multi-directory + model-selectable `0ms` optimistic session launcher.
@@ -1661,14 +1798,30 @@ impl OrbitAppCore {
         initial_prompt: &str,
         worktree_branch: Option<&str>,
     ) -> String {
-        let clean_branch = worktree_branch.map(str::trim).filter(|b| !b.is_empty());
+        self.create_agent_with_config(CreateAgentRequest {
+            host_id,
+            cwd,
+            extra_dirs,
+            provider,
+            model,
+            effort: None,
+            mode,
+            initial_prompt,
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch,
+        })
+    }
+
+    pub fn create_agent_with_config(self: &Arc<Self>, req: CreateAgentRequest<'_>) -> String {
+        let clean_branch = req.worktree_branch.map(str::trim).filter(|b| !b.is_empty());
         let use_auto_worktree = clean_branch == Some("auto");
         if let Some(branch) = clean_branch.filter(|b| *b != "auto") {
             self.dispatch_wire_queued(
-                host_id,
+                req.host_id,
                 WireMessage::CreateWorkspace {
                     request_id: Uuid::new_v4(),
-                    source_cwd: cwd.to_string(),
+                    source_cwd: req.cwd.to_string(),
                     title: Some(branch.to_string()),
                     worktree_branch: Some(branch.to_string()),
                     base_ref: None,
@@ -1679,11 +1832,18 @@ impl OrbitAppCore {
         let req_id = Uuid::new_v4();
         let opt_id = format!("opt_{req_id}");
         let now = Utc::now();
-        let first_line = initial_prompt.lines().next().unwrap_or("").trim();
+        let clean_model = req.model.filter(|m| !m.trim().is_empty());
+        let visible_seed = req
+            .initial_display_prompt
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| req.initial_badges.first().map(|b| b.label.as_str()))
+            .unwrap_or(req.initial_prompt);
+        let first_line = visible_seed.lines().next().unwrap_or("").trim();
         let title: String = {
             let chars: Vec<char> = first_line.chars().collect();
             if chars.is_empty() {
-                "新工作区会话".to_string()
+                "New Session".to_string()
             } else if chars.len() > 48 {
                 format!("{}…", chars[..48].iter().collect::<String>())
             } else {
@@ -1692,16 +1852,17 @@ impl OrbitAppCore {
         };
 
         if let Ok(mut guard) = self.hosts.write()
-            && let Some(h) = guard.get_mut(host_id)
+            && let Some(h) = guard.get_mut(req.host_id)
         {
             let opt_agent = AgentSummary {
                 agent_id: opt_id.clone(),
                 workspace_id: format!("ws_{opt_id}"),
-                cwd: cwd.to_string(),
+                cwd: req.cwd.to_string(),
                 title,
-                provider,
-                model: model.clone(),
-                mode: mode.clone(),
+                provider: req.provider,
+                model: clean_model.clone(),
+                effort: req.effort,
+                mode: req.mode.clone(),
                 status: AgentStatus::Initializing,
                 parent_agent_id: None,
                 latest_seq: 0,
@@ -1711,6 +1872,10 @@ impl OrbitAppCore {
             h.optimistic_by_req_id.insert(req_id, opt_id.clone());
             h.last_created_agent_id = Some(opt_id.clone());
             h.agents.insert(opt_id.clone(), opt_agent);
+            let visible_text = req
+                .initial_display_prompt
+                .clone()
+                .unwrap_or_else(|| req.initial_prompt.to_string());
             h.timelines.insert(
                 opt_id.clone(),
                 vec![TimelineEvent {
@@ -1721,7 +1886,8 @@ impl OrbitAppCore {
                     timestamp: now,
                     payload: TimelinePayload::UserPrompt {
                         message_id: format!("opt_msg_{req_id}"),
-                        text: initial_prompt.to_string(),
+                        text: visible_text,
+                        badges: req.initial_badges.clone(),
                     },
                 }],
             );
@@ -1730,25 +1896,28 @@ impl OrbitAppCore {
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
-            host_id: host_id.to_string(),
+            host_id: req.host_id.to_string(),
         });
         self.emit(|revision| CoreNotification::TimelineChanged {
             revision,
-            host_id: host_id.to_string(),
+            host_id: req.host_id.to_string(),
             agent_id: opt_id.clone(),
         });
 
         self.dispatch_wire_queued(
-            host_id,
+            req.host_id,
             WireMessage::CreateAgent {
                 request_id: req_id,
-                cwd: cwd.to_string(),
-                extra_dirs,
+                cwd: req.cwd.to_string(),
+                extra_dirs: req.extra_dirs,
                 title: None,
-                provider,
-                model,
-                mode,
-                initial_prompt: initial_prompt.to_string(),
+                provider: req.provider,
+                model: clean_model,
+                effort: req.effort,
+                mode: req.mode,
+                initial_prompt: req.initial_prompt.to_string(),
+                initial_display_prompt: req.initial_display_prompt,
+                initial_badges: req.initial_badges,
                 worktree: use_auto_worktree,
             },
         );
@@ -1781,7 +1950,19 @@ impl OrbitAppCore {
     }
 
     pub fn send_prompt(self: &Arc<Self>, host_id: &str, agent_id: &str, prompt: &str) {
+        self.send_prompt_with_meta(host_id, agent_id, prompt, None, Vec::new());
+    }
+
+    pub fn send_prompt_with_meta(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        prompt: &str,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
+    ) {
         let now = Utc::now();
+        let visible_text = display_prompt.clone().unwrap_or_else(|| prompt.to_string());
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
@@ -1802,7 +1983,8 @@ impl OrbitAppCore {
                     timestamp: now,
                     payload: TimelinePayload::UserPrompt {
                         message_id: format!("opt_{}", Uuid::new_v4()),
-                        text: prompt.to_string(),
+                        text: visible_text,
+                        badges: badges.clone(),
                     },
                 });
         }
@@ -1823,6 +2005,8 @@ impl OrbitAppCore {
                 request_id: Uuid::new_v4(),
                 agent_id: agent_id.to_string(),
                 prompt: prompt.to_string(),
+                display_prompt,
+                badges,
             },
         );
     }
@@ -1860,20 +2044,29 @@ impl OrbitAppCore {
         });
     }
 
-    pub fn set_agent_model(self: &Arc<Self>, host_id: &str, agent_id: &str, model: Option<String>) {
+    pub fn set_agent_config(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+    ) {
+        let clean_model = model.filter(|m| !m.trim().is_empty());
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
             && let Some(ag) = h.agents.get_mut(agent_id)
         {
-            ag.model = model.clone();
+            ag.model = clean_model.clone();
+            ag.effort = effort;
         }
         if !agent_id.starts_with("opt_") {
             self.dispatch_wire_queued(
                 host_id,
-                WireMessage::SetAgentModel {
+                WireMessage::SetAgentConfig {
                     request_id: Uuid::new_v4(),
                     agent_id: agent_id.to_string(),
-                    model,
+                    model: clean_model,
+                    effort,
                 },
             );
         }
@@ -1881,10 +2074,29 @@ impl OrbitAppCore {
             revision,
             host_id: host_id.to_string(),
         });
-        self.emit(|revision| CoreNotification::TimelineChanged {
+    }
+
+    pub fn set_agent_model(self: &Arc<Self>, host_id: &str, agent_id: &str, model: Option<String>) {
+        let clean_model = model.filter(|m| !m.trim().is_empty());
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.model = clean_model.clone();
+        }
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::SetAgentModel {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                    model: clean_model,
+                },
+            );
+        }
+        self.emit(|revision| CoreNotification::HostChanged {
             revision,
             host_id: host_id.to_string(),
-            agent_id: agent_id.to_string(),
         });
     }
 
@@ -1894,12 +2106,25 @@ impl OrbitAppCore {
         agent_id: &str,
         provider: ProviderKind,
     ) {
+        self.switch_agent_provider_with_config(host_id, agent_id, provider, None, None);
+    }
+
+    pub fn switch_agent_provider_with_config(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        provider: ProviderKind,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+    ) {
+        let clean_model = model.filter(|m| !m.trim().is_empty());
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
             && let Some(ag) = h.agents.get_mut(agent_id)
         {
             ag.provider = provider;
-            ag.model = None;
+            ag.model = clean_model.clone();
+            ag.effort = effort;
         }
         if !agent_id.starts_with("opt_") {
             self.dispatch_wire_queued(
@@ -1908,6 +2133,8 @@ impl OrbitAppCore {
                     request_id: Uuid::new_v4(),
                     agent_id: agent_id.to_string(),
                     provider,
+                    model: clean_model,
+                    effort,
                 },
             );
         }
@@ -1999,6 +2226,27 @@ impl OrbitAppCore {
         );
     }
 
+    pub fn fetch_workspace_files(&self, host_id: &str, cwd: &str) {
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListWorkspaceFiles {
+                request_id: Uuid::new_v4(),
+                cwd: cwd.to_string(),
+            },
+        );
+    }
+
+    pub fn workspace_files(&self, host_id: &str, cwd: &str) -> Vec<String> {
+        let Ok(guard) = self.hosts.read() else {
+            return Vec::new();
+        };
+        guard
+            .get(host_id)
+            .and_then(|h| h.workspace_files.get(cwd))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn start_terminal(&self, host_id: &str, cwd: &str, cols: u16, rows: u16) {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
@@ -2029,12 +2277,47 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn send_terminal_input(&self, host_id: &str, input_bytes: Vec<u8>) {
-        let pair = self.hosts.read().ok().and_then(|g| {
-            g.get(host_id)
-                .and_then(|h| h.session.clone().map(|s| (h.active_terminal_slot, s)))
+    pub fn kill_terminal(&self, host_id: &str, terminal_id: &str) {
+        let _ = self.store.delete_terminal(terminal_id);
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.terminals.retain(|t| t.terminal_id != terminal_id);
+            if h.active_terminal_id.as_deref() == Some(terminal_id) {
+                h.active_terminal_id = h.terminals.first().map(|t| t.terminal_id.clone());
+            }
+        }
+        self.dispatch_wire(
+            host_id,
+            WireMessage::KillTerminal {
+                request_id: Uuid::new_v4(),
+                terminal_id: terminal_id.to_string(),
+            },
+        );
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
         });
-        if let Some((slot, handle)) = pair {
+    }
+
+    pub fn send_terminal_input(&self, host_id: &str, input_bytes: Vec<u8>) {
+        let slot = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|g| g.get(host_id).map(|h| h.active_terminal_slot));
+        if let Some(s) = slot {
+            self.send_terminal_input_slot(host_id, s, input_bytes);
+        }
+    }
+
+    pub fn send_terminal_input_slot(&self, host_id: &str, slot: u8, input_bytes: Vec<u8>) {
+        let handle_opt = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|g| g.get(host_id).and_then(|h| h.session.clone()));
+        if let Some(handle) = handle_opt {
             self.runtime.spawn(async move {
                 let _ = handle
                     .send_terminal(TerminalBinaryFrame::Input {
@@ -2047,16 +2330,27 @@ impl OrbitAppCore {
     }
 
     pub fn resize_terminal(&self, host_id: &str, cols: u16, rows: u16) {
-        let mut pair = None;
+        let slot = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|g| g.get(host_id).map(|h| h.active_terminal_slot));
+        if let Some(s) = slot {
+            self.resize_terminal_slot(host_id, s, cols, rows);
+        }
+    }
+
+    pub fn resize_terminal_slot(&self, host_id: &str, slot: u8, cols: u16, rows: u16) {
+        let mut handle_opt = None;
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
-            h.terminal_emulator.resize(cols, rows);
-            if let Some(ref s) = h.session {
-                pair = Some((h.active_terminal_slot, s.clone()));
+            if h.active_terminal_slot == slot {
+                h.terminal_emulator.resize(cols, rows);
             }
+            handle_opt = h.session.clone();
         }
-        if let Some((slot, handle)) = pair {
+        if let Some(handle) = handle_opt {
             self.runtime.spawn(async move {
                 let _ = handle
                     .send_terminal(TerminalBinaryFrame::Resize { slot, cols, rows })
@@ -2086,11 +2380,53 @@ fn folder_basename(path: &str) -> String {
         .to_string()
 }
 
-fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, incoming: TimelineEvent) {
-    match &incoming.payload {
+fn strip_segment_scope(id: &str) -> &str {
+    id.split_once("@s").map(|(base, _)| base).unwrap_or(id)
+}
+
+fn is_legacy_shared_item_id(raw_id: &str) -> bool {
+    matches!(
+        raw_id,
+        "agy_msg_default" | "agy_thought_default" | "codex_msg" | "codex_rsn" | "item"
+    )
+}
+
+fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: TimelineEvent) {
+    let active_end = list.iter().position(|e| e.seq == 0).unwrap_or(list.len());
+    let precedes_incoming =
+        |ev: &TimelineEvent| -> bool { ev.seq > 0 && (incoming.seq == 0 || ev.seq < incoming.seq) };
+
+    let turn_start_idx = list[..active_end]
+        .iter()
+        .rposition(|ev| {
+            precedes_incoming(ev) && matches!(ev.payload, TimelinePayload::UserPrompt { .. })
+        })
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let seg_start_idx = list[..active_end]
+        .iter()
+        .rposition(|ev| {
+            precedes_incoming(ev)
+                && matches!(
+                    ev.payload,
+                    TimelinePayload::UserPrompt { .. } | TimelinePayload::ToolCall { .. }
+                )
+        })
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let seg_boundary_seq = if seg_start_idx > 0 {
+        list[seg_start_idx - 1].seq
+    } else {
+        0
+    };
+
+    match &mut incoming.payload {
         TimelinePayload::UserPrompt {
             text: inc_text,
             message_id: inc_mid,
+            ..
         } => {
             if incoming.seq > 0 {
                 // Replace optimistic `seq == 0` UserPrompt with matching text
@@ -2118,34 +2454,82 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, incoming: TimelineEv
             }
         }
         TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
-            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
-                matches!(
-                    &prev_ev.payload,
-                    TimelinePayload::AssistantMessage { item_id: existing_id, .. } if existing_id == item_id
-                )
-            }) {
+            let raw_id = strip_segment_scope(item_id).to_string();
+            let collides_earlier = is_legacy_shared_item_id(&raw_id)
+                || list[..seg_start_idx].iter().any(|ev| {
+                    matches!(
+                        &ev.payload,
+                        TimelinePayload::AssistantMessage { item_id: eid, .. }
+                            if strip_segment_scope(eid) == raw_id
+                    )
+                });
+            let effective_id = if collides_earlier {
+                format!("{raw_id}@s{seg_boundary_seq}")
+            } else {
+                raw_id
+            };
+            *item_id = effective_id.clone();
+
+            if let Some(prev) = list[seg_start_idx..active_end]
+                .iter_mut()
+                .rev()
+                .find(|prev_ev| {
+                    matches!(
+                        &prev_ev.payload,
+                        TimelinePayload::AssistantMessage { item_id: existing_id, .. }
+                            if existing_id == &effective_id
+                    )
+                })
+            {
                 *prev = incoming;
                 return;
             }
         }
         TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
-            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
-                matches!(
-                    &prev_ev.payload,
-                    TimelinePayload::AssistantThinking { item_id: existing_id, .. } if existing_id == item_id
-                )
-            }) {
+            let raw_id = strip_segment_scope(item_id).to_string();
+            let collides_earlier = is_legacy_shared_item_id(&raw_id)
+                || list[..seg_start_idx].iter().any(|ev| {
+                    matches!(
+                        &ev.payload,
+                        TimelinePayload::AssistantThinking { item_id: eid, .. }
+                            if strip_segment_scope(eid) == raw_id
+                    )
+                });
+            let effective_id = if collides_earlier {
+                format!("{raw_id}@s{seg_boundary_seq}")
+            } else {
+                raw_id
+            };
+            *item_id = effective_id.clone();
+
+            if let Some(prev) = list[seg_start_idx..active_end]
+                .iter_mut()
+                .rev()
+                .find(|prev_ev| {
+                    matches!(
+                        &prev_ev.payload,
+                        TimelinePayload::AssistantThinking { item_id: existing_id, .. }
+                            if existing_id == &effective_id
+                    )
+                })
+            {
                 *prev = incoming;
                 return;
             }
         }
         TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
-            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
-                matches!(
-                    &prev_ev.payload,
-                    TimelinePayload::ToolCall { call_id: existing_id, .. } if existing_id == call_id
-                )
-            }) {
+            let target_call_id = call_id.clone();
+            if let Some(prev) = list[turn_start_idx..active_end]
+                .iter_mut()
+                .rev()
+                .find(|prev_ev| {
+                    matches!(
+                        &prev_ev.payload,
+                        TimelinePayload::ToolCall { call_id: existing_id, .. }
+                            if existing_id == &target_call_id
+                    )
+                })
+            {
                 *prev = incoming;
                 return;
             }
@@ -2186,11 +2570,13 @@ fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
         provider: a.provider,
         provider_label: a.provider.display_name().to_string(),
         model: a.model.clone(),
+        effort: a.effort,
         mode: a.mode.clone(),
         status: a.status.clone(),
         status_label,
         is_running,
         is_awaiting_permission,
+        parent_agent_id: a.parent_agent_id.clone(),
         latest_seq: a.latest_seq,
         updated_at_rfc3339: a.updated_at.to_rfc3339(),
     }
@@ -2393,5 +2779,218 @@ mod tests {
         let overview = core.fleet_overview();
         assert_eq!(overview.hosts.len(), 1);
         assert_eq!(overview.projects.len(), 1);
+    }
+
+    #[test]
+    fn timeline_delta_and_coalescing_work_incrementally() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = PairingOffer {
+            host_id: "host_1".into(),
+            hostname: "workstation".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        let uri = offer.to_qr_uri().expect("uri");
+        core.pair_host(&uri).expect("pair");
+
+        let now = chrono::Utc::now();
+        core.handle_inbound_wire(
+            "host_1",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 1,
+                    epoch: 1,
+                    agent_id: "ag_1".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: "m1".into(),
+                        text: "Optimize desktop UI".into(),
+                        badges: Vec::new(),
+                    },
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            "host_1",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 2,
+                    epoch: 1,
+                    agent_id: "ag_1".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::ToolCall {
+                        call_id: "tc_1".into(),
+                        status: ToolCallStatus::Running,
+                        detail: ToolCallDetail::FileRead {
+                            path: "src/App.tsx".into(),
+                            start_line: Some(1),
+                            end_line: Some(80),
+                        },
+                    },
+                },
+            },
+        );
+
+        let full = core.agent_timeline_delta("host_1", "ag_1", 0);
+        assert_eq!(full.latest_seq, 2);
+        assert_eq!(full.upserted_items.len(), 2);
+
+        // Emit completed status for the SAME `tc_1` call_id at seq 3: should coalesce in place and return 1 delta item!
+        core.handle_inbound_wire(
+            "host_1",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 3,
+                    epoch: 1,
+                    agent_id: "ag_1".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::ToolCall {
+                        call_id: "tc_1".into(),
+                        status: ToolCallStatus::Completed,
+                        detail: ToolCallDetail::FileRead {
+                            path: "src/App.tsx".into(),
+                            start_line: Some(1),
+                            end_line: Some(80),
+                        },
+                    },
+                },
+            },
+        );
+
+        let delta = core.agent_timeline_delta("host_1", "ag_1", 2);
+        assert_eq!(delta.latest_seq, 3);
+        assert_eq!(delta.upserted_items.len(), 1);
+        assert_eq!(core.agent_timeline("host_1", "ag_1").items.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_timeline_isolates_shared_item_ids_across_turns_and_tools() {
+        let now = chrono::Utc::now();
+        let mut list = Vec::new();
+
+        // Turn 1: "你好" -> Assistant reply with shared legacy `agy_msg_default`
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 1,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "你好".into(),
+                    badges: Vec::new(),
+                },
+            },
+        );
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 2,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_default".into(),
+                    text: "你好！".into(),
+                    streaming: true,
+                },
+            },
+        );
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 3,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_default".into(),
+                    text: "你好！请问有什么可以帮你的？".into(),
+                    streaming: false,
+                },
+            },
+        );
+
+        // Turn 2: "看看技术栈" -> ToolCall -> Assistant reply with the SAME `agy_msg_default`
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 4,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: "u2".into(),
+                    text: "看看技术栈".into(),
+                    badges: Vec::new(),
+                },
+            },
+        );
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 5,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::ToolCall {
+                    call_id: "tc_read".into(),
+                    status: ToolCallStatus::Completed,
+                    detail: ToolCallDetail::FileRead {
+                        path: "Cargo.toml".into(),
+                        start_line: None,
+                        end_line: None,
+                    },
+                },
+            },
+        );
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 6,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_default".into(),
+                    text: "Orbit 采用纯 Rust 核心。".into(),
+                    streaming: false,
+                },
+            },
+        );
+
+        assert_eq!(list.len(), 5);
+        match (&list[1].payload, &list[4].payload) {
+            (
+                TimelinePayload::AssistantMessage {
+                    item_id: id1,
+                    text: t1,
+                    ..
+                },
+                TimelinePayload::AssistantMessage {
+                    item_id: id2,
+                    text: t2,
+                    ..
+                },
+            ) => {
+                assert_eq!(t1, "你好！请问有什么可以帮你的？");
+                assert_eq!(t2, "Orbit 采用纯 Rust 核心。");
+                assert_ne!(id1, id2);
+            }
+            _ => panic!("unexpected timeline order: {list:?}"),
+        }
     }
 }

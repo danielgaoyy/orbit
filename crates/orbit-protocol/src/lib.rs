@@ -46,6 +46,84 @@ pub enum SessionMode {
     Custom(String),
 }
 
+/// Normalized reasoning effort / thinking budget across Codex, Claude Code, and Antigravity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    Medium,
+    High,
+    #[serde(alias = "extra_high")]
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl ReasoningEffort {
+    pub fn from_slug(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "disabled" => Some(Self::Off),
+            "low" | "minimal" => Some(Self::Low),
+            "medium" | "med" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "extra_high" | "extra-high" => Some(Self::Xhigh),
+            "max" => Some(Self::Max),
+            "ultra" | "ultracode" => Some(Self::Ultra),
+            _ => None,
+        }
+    }
+
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Xhigh => "Extra High",
+            Self::Max => "Max",
+            Self::Ultra => "Ultra",
+        }
+    }
+}
+
+/// Supported reasoning/thinking option for a specific provider model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingOptionSpec {
+    pub effort: ReasoningEffort,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// Discovered or manifest model entry for a provider (Paseo-style catalog model).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModelSpec {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub default_effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub thinking_options: Vec<ThinkingOptionSpec>,
+}
+
+/// Dynamic model & thinking catalog for a single provider on a specific Orbit host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModelCatalog {
+    pub provider: ProviderKind,
+    pub models: Vec<ProviderModelSpec>,
+    #[serde(default)]
+    pub configured_default_model: Option<String>,
+    #[serde(default)]
+    pub configured_default_effort: Option<ReasoningEffort>,
+}
+
 /// Strict algebraic lifecycle state machine for a managed agent session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -153,6 +231,8 @@ pub struct AgentSummary {
     pub title: String,
     pub provider: ProviderKind,
     pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
     pub mode: SessionMode,
     pub status: AgentStatus,
     pub parent_agent_id: Option<String>,
@@ -243,6 +323,13 @@ pub struct ProviderQuotaSnapshot {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Compact semantic chip attached to a user turn (e.g. `/plan`, `@file`, `Working Tree Diff`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptBadge {
+    pub kind: String,
+    pub label: String,
+}
+
 /// Monotonically sequenced timeline event stored in SQLite WAL and streamed to clients.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEvent {
@@ -260,6 +347,8 @@ pub enum TimelinePayload {
     UserPrompt {
         message_id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        badges: Vec<PromptBadge>,
     },
     AssistantThinking {
         item_id: String,
@@ -386,6 +475,15 @@ pub enum WireMessage {
         path: Option<String>,
         unified_diff: String,
     },
+    ListWorkspaceFiles {
+        request_id: Uuid,
+        cwd: String,
+    },
+    WorkspaceFilesResponse {
+        request_id: Uuid,
+        cwd: String,
+        files: Vec<String>,
+    },
 
     // Agents & Interactive Orchestration
     ListAgents {
@@ -404,8 +502,14 @@ pub enum WireMessage {
         title: Option<String>,
         provider: ProviderKind,
         model: Option<String>,
+        #[serde(default)]
+        effort: Option<ReasoningEffort>,
         mode: SessionMode,
         initial_prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_display_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        initial_badges: Vec<PromptBadge>,
         #[serde(default)]
         worktree: bool,
     },
@@ -420,6 +524,10 @@ pub enum WireMessage {
         request_id: Uuid,
         agent_id: String,
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        badges: Vec<PromptBadge>,
     },
     InterruptTurn {
         request_id: Uuid,
@@ -430,6 +538,12 @@ pub enum WireMessage {
         agent_id: String,
         mode: SessionMode,
     },
+    SetAgentConfig {
+        request_id: Uuid,
+        agent_id: String,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+    },
     SetAgentModel {
         request_id: Uuid,
         agent_id: String,
@@ -439,6 +553,10 @@ pub enum WireMessage {
         request_id: Uuid,
         agent_id: String,
         provider: ProviderKind,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<ReasoningEffort>,
     },
     ArchiveAgent {
         request_id: Uuid,
@@ -507,13 +625,22 @@ pub enum WireMessage {
         terminal_id: String,
     },
 
-    // Quotas
+    // Quotas & Provider Model Catalogs
     RefreshQuotas {
         request_id: Uuid,
     },
     QuotaReport {
         request_id: Option<Uuid>,
         snapshots: Vec<ProviderQuotaSnapshot>,
+    },
+    ListProviderModels {
+        request_id: Uuid,
+        #[serde(default)]
+        force_refresh: bool,
+    },
+    ProviderModelsSnapshot {
+        request_id: Uuid,
+        catalogs: Vec<ProviderModelCatalog>,
     },
 
     RpcError {
@@ -641,8 +768,11 @@ mod tests {
             title: Some("Build Orbit".into()),
             provider: ProviderKind::Antigravity,
             model: Some("gemini-pro".into()),
+            effort: Some(ReasoningEffort::High),
             mode: SessionMode::AcceptEdits,
             initial_prompt: "Build the Rust agent orchestrator!".repeat(20),
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
             worktree: false,
         };
         let raw_json = serde_json::to_vec(&msg).expect("serialize");

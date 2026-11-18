@@ -26,18 +26,19 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use orbit_crypto::{DaemonHandshake, HostIdentityKeypair, PairingOffer};
 use orbit_protocol::{
-    HostInfo, ModelOption, PROTOCOL_VERSION, ProviderKind, TerminalBinaryFrame, WireMessage,
+    HostInfo, PROTOCOL_VERSION, ProviderModelCatalog, TerminalBinaryFrame, WireMessage,
 };
 use orbit_providers::{
-    discover_installed_providers, probe_all_provider_models, probe_all_provider_quotas,
+    catalogs_to_model_map, discover_installed_providers, probe_all_provider_models,
+    probe_all_provider_quotas,
 };
 use orbit_store::OrbitStore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message as TungMsg};
 use tracing::{info, warn};
 
-use crate::git::{compute_git_diff, inspect_git_status};
+use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files};
 use crate::manager::{AgentOrchestrator, DaemonBroadcast, PtyBroadcast};
 
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
@@ -141,7 +142,8 @@ pub struct DaemonRuntime {
     pub store: Arc<OrbitStore>,
     pub orchestrator: Arc<AgentOrchestrator>,
     pub home_dir: PathBuf,
-    pub models_cache: tokio::sync::RwLock<Option<HashMap<ProviderKind, Vec<ModelOption>>>>,
+    provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
+    catalog_refresh_lock: AsyncMutex<()>,
 }
 
 impl DaemonRuntime {
@@ -189,17 +191,32 @@ impl DaemonRuntime {
             store,
             orchestrator,
             home_dir: home_dir.to_path_buf(),
-            models_cache: tokio::sync::RwLock::new(None),
+            provider_catalogs: RwLock::new(None),
+            catalog_refresh_lock: AsyncMutex::new(()),
         });
 
-        // Pre-warm live provider models asynchronously so `ListModels` is instantaneous!
         let rt_warm = rt.clone();
         tokio::spawn(async move {
-            let probed = probe_all_provider_models().await;
-            *rt_warm.models_cache.write().await = Some(probed);
+            let _ = rt_warm.get_or_probe_provider_catalogs(false).await;
         });
 
         Ok(rt)
+    }
+
+    pub async fn get_or_probe_provider_catalogs(
+        &self,
+        force_refresh: bool,
+    ) -> Vec<ProviderModelCatalog> {
+        if !force_refresh && let Some(cached) = self.provider_catalogs.read().await.clone() {
+            return cached;
+        }
+        let _guard = self.catalog_refresh_lock.lock().await;
+        if !force_refresh && let Some(cached) = self.provider_catalogs.read().await.clone() {
+            return cached;
+        }
+        let probed = probe_all_provider_models().await;
+        *self.provider_catalogs.write().await = Some(probed.clone());
+        probed
     }
 
     pub fn build_pairing_offer(
@@ -568,7 +585,7 @@ async fn run_client_session_loop(
 ) {
     let mut use_zstd = false;
     let mut subscribed_agents: HashSet<String> = HashSet::new();
-    let mut slot_to_terminal: HashMap<u8, String> = HashMap::new();
+    let mut slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)> = HashMap::new();
     let mut bcast_rx = runtime.orchestrator.broadcast_tx.subscribe();
 
     loop {
@@ -579,12 +596,12 @@ async fn run_client_session_loop(
                     SessionFrame::Terminal(tframe) => {
                         match tframe {
                             TerminalBinaryFrame::Input { slot, data } => {
-                                if let Some(tid) = slot_to_terminal.get(&slot) {
+                                if let Some((tid, _)) = slot_to_terminal.get(&slot) {
                                     runtime.orchestrator.write_terminal_input(tid, data).await;
                                 }
                             }
                             TerminalBinaryFrame::Resize { slot, cols, rows } => {
-                                if let Some(tid) = slot_to_terminal.get(&slot) {
+                                if let Some((tid, _)) = slot_to_terminal.get(&slot) {
                                     runtime.orchestrator.resize_terminal(tid, cols, rows).await;
                                 }
                             }
@@ -649,6 +666,10 @@ async fn run_client_session_loop(
             }
         }
     }
+
+    for (_, (_, abort_handle)) in slot_to_terminal.drain() {
+        abort_handle.abort();
+    }
 }
 
 async fn handle_wire_rpc(
@@ -656,7 +677,7 @@ async fn handle_wire_rpc(
     req: WireMessage,
     use_zstd: &mut bool,
     subscribed_agents: &mut HashSet<String>,
-    slot_to_terminal: &mut HashMap<u8, String>,
+    slot_to_terminal: &mut HashMap<u8, (String, tokio::task::AbortHandle)>,
     out_tx: &mpsc::Sender<SessionFrame>,
 ) -> Option<WireMessage> {
     match req {
@@ -695,17 +716,10 @@ async fn handle_wire_rpc(
             })
         }
         WireMessage::ListModels { request_id } => {
-            if let Some(cached) = runtime.models_cache.read().await.clone() {
-                return Some(WireMessage::ModelsSnapshot {
-                    request_id,
-                    models: cached,
-                });
-            }
-            let fresh = probe_all_provider_models().await;
-            *runtime.models_cache.write().await = Some(fresh.clone());
+            let catalogs = runtime.get_or_probe_provider_catalogs(false).await;
             Some(WireMessage::ModelsSnapshot {
                 request_id,
-                models: fresh,
+                models: catalogs_to_model_map(&catalogs),
             })
         }
         WireMessage::ListWorkspaces { request_id } => match runtime.store.list_workspaces() {
@@ -750,6 +764,14 @@ async fn handle_wire_rpc(
             }),
             Err(e) => Some(rpc_err(request_id, "git_diff_error", e)),
         },
+        WireMessage::ListWorkspaceFiles { request_id, cwd } => {
+            let files = list_workspace_files(Path::new(&cwd), 2500).await;
+            Some(WireMessage::WorkspaceFilesResponse {
+                request_id,
+                cwd,
+                files,
+            })
+        }
 
         // Agents
         WireMessage::ListAgents {
@@ -766,8 +788,11 @@ async fn handle_wire_rpc(
             title,
             provider,
             model,
+            effort,
             mode,
             initial_prompt,
+            initial_display_prompt,
+            initial_badges,
             worktree,
         } => {
             match runtime
@@ -778,8 +803,11 @@ async fn handle_wire_rpc(
                     title,
                     provider,
                     model,
+                    effort,
                     mode,
                     initial_prompt,
+                    initial_display_prompt,
+                    initial_badges,
                     worktree,
                 })
                 .await
@@ -795,9 +823,15 @@ async fn handle_wire_rpc(
             request_id,
             agent_id,
             prompt,
+            display_prompt,
+            badges,
         } => {
             subscribed_agents.insert(agent_id.clone());
-            match runtime.orchestrator.send_prompt(&agent_id, prompt).await {
+            match runtime
+                .orchestrator
+                .send_prompt_with_meta(&agent_id, prompt, display_prompt, badges)
+                .await
+            {
                 Ok(()) => Some(WireMessage::Ack { request_id }),
                 Err(e) => Some(rpc_err(request_id, "send_prompt_failed", e)),
             }
@@ -817,6 +851,19 @@ async fn handle_wire_rpc(
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "set_mode_failed", e)),
         },
+        WireMessage::SetAgentConfig {
+            request_id,
+            agent_id,
+            model,
+            effort,
+        } => match runtime
+            .orchestrator
+            .set_agent_config(&agent_id, model, effort)
+            .await
+        {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "set_config_failed", e)),
+        },
         WireMessage::SetAgentModel {
             request_id,
             agent_id,
@@ -829,9 +876,11 @@ async fn handle_wire_rpc(
             request_id,
             agent_id,
             provider,
+            model,
+            effort,
         } => match runtime
             .orchestrator
-            .switch_agent_provider(&agent_id, provider)
+            .switch_agent_provider(&agent_id, provider, model, effort)
             .await
         {
             Ok(()) => Some(WireMessage::Ack { request_id }),
@@ -881,7 +930,7 @@ async fn handle_wire_rpc(
             subscribed_agents.insert(agent_id.clone());
             match runtime
                 .store
-                .fetch_timeline_since(&agent_id, since_seq, 500)
+                .fetch_timeline_since(&agent_id, since_seq, 2000)
             {
                 Ok((events, has_more)) => Some(WireMessage::TimelineCatchup {
                     request_id,
@@ -913,7 +962,9 @@ async fn handle_wire_rpc(
             .await
         {
             Ok(terminal) => {
-                let slot = 1u8;
+                let slot = (1u8..=250u8)
+                    .find(|s| !slot_to_terminal.contains_key(s))
+                    .unwrap_or(1u8);
                 bind_terminal_stream_to_client(
                     runtime,
                     &terminal.terminal_id,
@@ -960,17 +1011,37 @@ async fn handle_wire_rpc(
         WireMessage::KillTerminal {
             request_id,
             terminal_id,
-        } => match runtime.orchestrator.kill_terminal(&terminal_id).await {
-            Ok(()) => Some(WireMessage::Ack { request_id }),
-            Err(e) => Some(rpc_err(request_id, "kill_terminal_failed", e)),
-        },
+        } => {
+            slot_to_terminal.retain(|_, (tid, handle)| {
+                if tid == &terminal_id {
+                    handle.abort();
+                    false
+                } else {
+                    true
+                }
+            });
+            match runtime.orchestrator.kill_terminal(&terminal_id).await {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Err(e) => Some(rpc_err(request_id, "kill_terminal_failed", e)),
+            }
+        }
 
-        // Quotas
+        // Quotas & Provider Model Catalogs
         WireMessage::RefreshQuotas { request_id } => {
             let snapshots = probe_all_provider_quotas().await;
             Some(WireMessage::QuotaReport {
                 request_id: Some(request_id),
                 snapshots,
+            })
+        }
+        WireMessage::ListProviderModels {
+            request_id,
+            force_refresh,
+        } => {
+            let catalogs = runtime.get_or_probe_provider_catalogs(force_refresh).await;
+            Some(WireMessage::ProviderModelsSnapshot {
+                request_id,
+                catalogs,
             })
         }
         _ => None,
@@ -981,14 +1052,16 @@ async fn bind_terminal_stream_to_client(
     runtime: &Arc<DaemonRuntime>,
     terminal_id: &str,
     slot: u8,
-    slot_to_terminal: &mut HashMap<u8, String>,
+    slot_to_terminal: &mut HashMap<u8, (String, tokio::task::AbortHandle)>,
     out_tx: &mpsc::Sender<SessionFrame>,
 ) -> Option<orbit_protocol::TerminalSummary> {
     let (summary, snap, mut rx) = runtime.orchestrator.attach_terminal(terminal_id).await?;
-    slot_to_terminal.insert(slot, terminal_id.to_string());
+    if let Some((_, prev_handle)) = slot_to_terminal.remove(&slot) {
+        prev_handle.abort();
+    }
 
     let tx_clone = out_tx.clone();
-    tokio::spawn(async move {
+    let join_handle = tokio::spawn(async move {
         if !snap.is_empty()
             && tx_clone
                 .send(SessionFrame::Terminal(TerminalBinaryFrame::Snapshot {
@@ -1030,6 +1103,7 @@ async fn bind_terminal_stream_to_client(
             }
         }
     });
+    slot_to_terminal.insert(slot, (terminal_id.to_string(), join_handle.abort_handle()));
 
     Some(summary)
 }

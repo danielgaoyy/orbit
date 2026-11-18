@@ -1,6 +1,14 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 export type ProviderKind = "antigravity" | "codex" | "claude_code";
+export type ReasoningEffort =
+  | "off"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max"
+  | "ultra";
 export type SessionMode =
   | "default"
   | "plan"
@@ -14,6 +22,19 @@ export type HostConnectionState =
   | "connecting_relay"
   | "online_direct"
   | "online_relay";
+
+export type ExternalEditorKind =
+  | "cursor"
+  | "zed"
+  | "vs_code"
+  | "terminal"
+  | "file_manager";
+
+export interface ExternalEditorInfo {
+  kind: ExternalEditorKind;
+  label: string;
+  installed: boolean;
+}
 
 export type HostRouteMode = "auto" | "ssh_tunnel" | "direct_only" | "relay_only";
 
@@ -90,7 +111,7 @@ export interface FleetOverviewView {
   revision: number;
   total_pending_approvals: number;
   hosts: HostCardView[];
-  projects: ClientProjectView[];
+  projects?: ClientProjectView[];
 }
 
 export interface WorkspaceSummary {
@@ -110,10 +131,12 @@ export interface AgentCardView {
   provider: ProviderKind;
   provider_label: string;
   model: string | null;
+  effort: ReasoningEffort | null;
   mode: SessionMode;
   status_label: string;
   is_running: boolean;
   is_awaiting_permission: boolean;
+  parent_agent_id: string | null;
   latest_seq: number;
   updated_at_rfc3339: string;
 }
@@ -150,6 +173,29 @@ export interface DiscoveredProject {
   last_modified_unix: number;
 }
 
+export interface ThinkingOptionSpec {
+  effort: ReasoningEffort;
+  label: string;
+  description?: string | null;
+  is_default?: boolean;
+}
+
+export interface ProviderModelSpec {
+  id: string;
+  label: string;
+  description: string;
+  is_default: boolean;
+  default_effort: ReasoningEffort | null;
+  thinking_options: ThinkingOptionSpec[];
+}
+
+export interface ProviderModelCatalog {
+  provider: ProviderKind;
+  models: ProviderModelSpec[];
+  configured_default_model: string | null;
+  configured_default_effort: ReasoningEffort | null;
+}
+
 export interface HostDetailView {
   revision: number;
   host: HostCardView;
@@ -161,6 +207,7 @@ export interface HostDetailView {
   last_created_agent_id: string | null;
   replaced_optimistic_agents: Record<string, string>;
   quotas: ProviderQuotaSnapshot[];
+  provider_catalogs?: ProviderModelCatalog[];
   terminals: TerminalSummary[];
   active_terminal_id: string | null;
   active_terminal_slot: number;
@@ -266,12 +313,18 @@ export interface QuestionItem {
   is_multi_select: boolean;
 }
 
+export interface PromptBadge {
+  kind: "slash" | "file" | "git_diff" | "terminal" | "image" | "quote" | "paste" | string;
+  label: string;
+}
+
 export type TimelineItemView =
   | {
       item_type: "user_prompt";
       seq: number;
       message_id: string;
       text: string;
+      badges?: PromptBadge[];
       blocks: RichBlockView[];
     }
   | {
@@ -327,6 +380,16 @@ export interface AgentTimelineView {
   items: TimelineItemView[];
 }
 
+export interface AgentTimelineDeltaView {
+  revision: number;
+  host_id: string;
+  agent: AgentCardView | null;
+  latest_seq: number;
+  upserted_items: TimelineItemView[];
+  resolved_permissions: Record<string, string>;
+  resolved_questions: Record<string, string[][]>;
+}
+
 export interface GitFileEntry {
   path: string;
   status: string;
@@ -362,6 +425,12 @@ export interface SshHostItem {
   display_target: string;
 }
 
+export interface StagedAttachmentInfo {
+  path: string;
+  filename: string;
+  size_bytes: number;
+}
+
 export type CoreNotification =
   | { kind: "fleet_changed"; revision: number }
   | { kind: "host_changed"; revision: number; host_id: string }
@@ -377,6 +446,30 @@ export type CoreNotification =
 
 export function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+export function isMacDesktop(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
+}
+
+export function timelineItemLogicalKey(item: TimelineItemView): string {
+  switch (item.item_type) {
+    case "user_prompt":
+      return `msg:${item.message_id}`;
+    case "assistant_thinking":
+      return `think:${item.item_id}`;
+    case "assistant_message":
+      return `asst:${item.item_id}`;
+    case "tool_call":
+      return `tool:${item.call_id}`;
+    case "permission_request":
+      return `perm:${item.request_id}`;
+    case "question_request":
+      return `quest:${item.request_id}`;
+    case "notice":
+      return `notice:${item.seq}`;
+  }
 }
 
 export const orbitIpc = {
@@ -406,6 +499,25 @@ export const orbitIpc = {
     return invoke("get_agent_timeline", { hostId, agentId });
   },
 
+  async getAgentTimelineDelta(
+    hostId: string,
+    agentId: string,
+    sinceSeq: number,
+  ): Promise<AgentTimelineDeltaView> {
+    if (!isTauriRuntime()) {
+      return {
+        revision: 0,
+        host_id: hostId,
+        agent: null,
+        latest_seq: sinceSeq,
+        upserted_items: [],
+        resolved_permissions: {},
+        resolved_questions: {},
+      };
+    }
+    return invoke("get_agent_timeline_delta", { hostId, agentId, sinceSeq });
+  },
+
   async getGitReview(hostId: string, cwd: string, path: string | null): Promise<GitReviewView> {
     if (!isTauriRuntime()) {
       return {
@@ -421,11 +533,18 @@ export const orbitIpc = {
     return invoke("get_git_review", { hostId, cwd, path });
   },
 
-  pairHost: (pairingUri: string) => invoke<HostCardView>("pair_host", { pairingUri }),
-  pairSshHost: (sshAlias: string, remotePort?: number | null) =>
-    invoke<HostCardView>("pair_ssh_host", { sshAlias, remotePort: remotePort ?? null }),
-  removeHost: (hostId: string) => invoke<void>("remove_host", { hostId }),
-  updateHostConfig: (params: {
+  pairHost: async (pairingUri: string): Promise<HostCardView> => {
+    return invoke<HostCardView>("pair_host", { pairingUri });
+  },
+
+  pairSshHost: async (sshAlias: string, remotePort?: number | null): Promise<HostCardView> => {
+    return invoke<HostCardView>("pair_ssh_host", {
+      sshAlias,
+      remotePort: remotePort ?? null,
+    });
+  },
+
+  updateHostConfig: async (params: {
     hostId: string;
     customName?: string | null;
     routeMode?: HostRouteMode;
@@ -434,114 +553,313 @@ export const orbitIpc = {
     customDirectEndpoint?: string | null;
     relayUrl?: string | null;
     reconnect?: boolean;
-  }) => invoke<HostCardView>("update_host_config", params),
-  updateHostRelay: (hostId: string, relayUrl: string | null) =>
-    invoke<void>("update_host_relay", { hostId, relayUrl }),
-  upgradeRemoteDaemon: (hostId: string, sshAlias: string, remotePort?: number | null) =>
-    invoke<string>("upgrade_remote_daemon", {
+  }): Promise<HostCardView> => {
+    return invoke<HostCardView>("update_host_config", params);
+  },
+
+  upgradeRemoteDaemon: async (
+    hostId: string,
+    sshAlias: string,
+    remotePort?: number | null,
+  ): Promise<string> => {
+    return invoke<string>("upgrade_remote_daemon", {
       hostId,
       sshAlias,
       remotePort: remotePort ?? null,
-    }),
+    });
+  },
 
-  upsertProject: (params: {
+  upsertProject: async (params: {
     projectId?: string | null;
     hostId: string;
     name: string;
     directories: string[];
-  }) => invoke<ClientProjectView>("upsert_project", params),
-  removeProject: (projectId: string) => invoke<void>("remove_project", { projectId }),
-  listDirectory: (hostId: string, path: string | null) =>
-    invoke<void>("list_directory", { hostId, path }),
+  }): Promise<ClientProjectView> => {
+    return invoke<ClientProjectView>("upsert_project", params);
+  },
 
-  connectHost: (hostId: string) => invoke<void>("connect_host", { hostId }),
-  refreshHost: (hostId: string) => invoke<void>("refresh_host", { hostId }),
-  refreshQuotas: (hostId: string) => invoke<void>("refresh_quotas", { hostId }),
+  removeProject: async (projectId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("remove_project", { projectId });
+  },
 
-  createAgent: (params: {
+  listDirectory: async (hostId: string, path: string | null): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("list_directory", { hostId, path });
+  },
+
+  removeHost: async (hostId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("remove_host", { hostId });
+  },
+
+  updateHostRelay: async (hostId: string, relayUrl: string | null): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_host_relay", { hostId, relayUrl });
+  },
+
+  connectHost: async (hostId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("connect_host", { hostId });
+  },
+
+  connectAllHosts: async (): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("connect_all_hosts");
+  },
+
+  refreshHost: async (hostId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("refresh_host", { hostId });
+  },
+
+  refreshQuotas: async (hostId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("refresh_quotas", { hostId });
+  },
+
+  refreshProviderModels: async (hostId: string, forceRefresh = false): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("refresh_provider_models", { hostId, forceRefresh });
+  },
+
+  createAgent: async (params: {
     hostId: string;
     cwd: string;
     extraDirs?: string[];
     provider: ProviderKind;
     model?: string | null;
+    effort?: ReasoningEffort | null;
     mode: SessionMode;
     initialPrompt: string;
+    initialDisplayPrompt?: string | null;
+    initialBadges?: PromptBadge[];
     worktreeBranch: string | null;
-  }) => invoke<string>("create_agent", params),
+  }): Promise<string> => {
+    if (!isTauriRuntime()) return "";
+    return invoke<string>("create_agent", {
+      ...params,
+      model: params.model ?? null,
+      effort: params.effort ?? null,
+      initialDisplayPrompt: params.initialDisplayPrompt ?? null,
+      initialBadges: params.initialBadges ?? [],
+    });
+  },
 
-  openAgentTimeline: (hostId: string, agentId: string) =>
-    invoke<void>("open_agent_timeline", { hostId, agentId }),
+  openAgentTimeline: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("open_agent_timeline", { hostId, agentId });
+  },
 
-  sendPrompt: (hostId: string, agentId: string, prompt: string) =>
-    invoke<void>("send_prompt", { hostId, agentId, prompt }),
+  sendPrompt: async (
+    hostId: string,
+    agentId: string,
+    prompt: string,
+    meta?: { displayPrompt?: string; badges?: PromptBadge[] },
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("send_prompt", {
+      hostId,
+      agentId,
+      prompt,
+      displayPrompt: meta?.displayPrompt ?? null,
+      badges: meta?.badges ?? [],
+    });
+  },
 
-  interruptAgent: (hostId: string, agentId: string) =>
-    invoke<void>("interrupt_agent", { hostId, agentId }),
+  interruptAgent: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("interrupt_agent", { hostId, agentId });
+  },
 
-  setSessionMode: (hostId: string, agentId: string, mode: SessionMode) =>
-    invoke<void>("set_session_mode", { hostId, agentId, mode }),
+  setSessionMode: async (
+    hostId: string,
+    agentId: string,
+    mode: SessionMode,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("set_session_mode", { hostId, agentId, mode });
+  },
 
-  setAgentModel: (hostId: string, agentId: string, model: string | null) =>
-    invoke<void>("set_agent_model", { hostId, agentId, model }),
+  setAgentConfig: async (
+    hostId: string,
+    agentId: string,
+    model: string | null,
+    effort: ReasoningEffort | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("set_agent_config", { hostId, agentId, model, effort });
+  },
 
-  switchAgentProvider: (hostId: string, agentId: string, provider: ProviderKind) =>
-    invoke<void>("switch_agent_provider", { hostId, agentId, provider }),
+  setAgentModel: async (
+    hostId: string,
+    agentId: string,
+    model: string | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("set_agent_model", { hostId, agentId, model });
+  },
 
-  archiveAgent: (hostId: string, agentId: string) =>
-    invoke<void>("archive_agent", { hostId, agentId }),
+  switchAgentProvider: async (
+    hostId: string,
+    agentId: string,
+    provider: ProviderKind,
+    model: string | null = null,
+    effort: ReasoningEffort | null = null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("switch_agent_provider", {
+      hostId,
+      agentId,
+      provider,
+      model,
+      effort,
+    });
+  },
 
-  resolvePermission: (
+  archiveAgent: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("archive_agent", { hostId, agentId });
+  },
+
+  resolvePermission: async (
     hostId: string,
     agentId: string,
     permissionRequestId: string,
     decision: string,
-  ) =>
-    invoke<void>("resolve_permission", {
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("resolve_permission", {
       hostId,
       agentId,
       permissionRequestId,
       decision,
-    }),
+    });
+  },
 
-  answerQuestion: (
+  answerQuestion: async (
     hostId: string,
     agentId: string,
     questionRequestId: string,
     answers: string[][],
-  ) =>
-    invoke<void>("answer_question", {
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("answer_question", {
       hostId,
       agentId,
       questionRequestId,
       answers,
-    }),
+    });
+  },
 
-  fetchGitStatus: (hostId: string, cwd: string) =>
-    invoke<void>("fetch_git_status", { hostId, cwd }),
+  fetchGitStatus: async (hostId: string, cwd: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("fetch_git_status", { hostId, cwd });
+  },
 
-  fetchGitDiff: (hostId: string, cwd: string, path: string | null, staged: boolean) =>
-    invoke<void>("fetch_git_diff", { hostId, cwd, path, staged }),
+  fetchGitDiff: async (
+    hostId: string,
+    cwd: string,
+    path: string | null,
+    staged: boolean,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("fetch_git_diff", { hostId, cwd, path, staged });
+  },
 
-  startTerminal: (hostId: string, cwd: string, cols: number, rows: number) =>
-    invoke<void>("start_terminal", { hostId, cwd, cols, rows }),
+  startTerminal: async (
+    hostId: string,
+    cwd: string,
+    cols: number,
+    rows: number,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("start_terminal", { hostId, cwd, cols, rows });
+  },
 
-  sendTerminalInput: (hostId: string, data: string) =>
-    invoke<void>("send_terminal_input", { hostId, data }),
+  attachTerminal: async (
+    hostId: string,
+    terminalId: string,
+    slot: number,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("attach_terminal", { hostId, terminalId, slot });
+  },
 
-  resizeTerminal: (hostId: string, cols: number, rows: number) =>
-    invoke<void>("resize_terminal", { hostId, cols, rows }),
+  killTerminal: async (hostId: string, terminalId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("kill_terminal", { hostId, terminalId });
+  },
+
+  sendTerminalInputSlot: async (
+    hostId: string,
+    slot: number,
+    data: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("send_terminal_input_slot", { hostId, slot, data });
+  },
+
+  resizeTerminalSlot: async (
+    hostId: string,
+    slot: number,
+    cols: number,
+    rows: number,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("resize_terminal_slot", { hostId, slot, cols, rows });
+  },
 
   listSshHosts: async (): Promise<SshHostItem[]> => {
     if (!isTauriRuntime()) return [];
     return invoke("list_ssh_hosts");
   },
 
-  provisionSshRelay: (params: {
+  listExternalEditors: async (): Promise<ExternalEditorInfo[]> => {
+    if (!isTauriRuntime()) {
+      return [
+        { kind: "cursor", label: "Cursor", installed: true },
+        { kind: "zed", label: "Zed", installed: true },
+        { kind: "vs_code", label: "VS Code", installed: true },
+        { kind: "terminal", label: "System Terminal", installed: true },
+        { kind: "file_manager", label: "Finder", installed: true },
+      ];
+    }
+    return invoke("list_external_editors");
+  },
+
+  openInEditor: async (
+    editor: ExternalEditorKind,
+    cwd: string,
+    sshTarget: string | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("open_in_editor", { editor, cwd, sshTarget });
+  },
+
+  getWorkspaceFiles: async (hostId: string, cwd: string): Promise<string[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<string[]>("get_workspace_files", { hostId, cwd });
+  },
+
+  stageAttachment: async (
+    filename: string,
+    bytes: number[],
+  ): Promise<StagedAttachmentInfo> => {
+    if (!isTauriRuntime()) {
+      return { path: `/tmp/${filename}`, filename, size_bytes: bytes.length };
+    }
+    return invoke<StagedAttachmentInfo>("stage_attachment", { filename, bytes });
+  },
+
+  provisionSshRelay: async (params: {
     targetHostId: string;
     sshAlias: string;
     fallbackHostname: string;
     relayPort: number;
-  }) => invoke<string>("provision_ssh_relay", params),
+  }): Promise<string> => {
+    return invoke<string>("provision_ssh_relay", params);
+  },
 
   getAppVersion: async (): Promise<string> => {
     if (!isTauriRuntime()) return "0.2.4";

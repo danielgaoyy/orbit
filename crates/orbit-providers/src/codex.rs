@@ -7,12 +7,15 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use orbit_protocol::{
-    AgentStatus, ProviderKind, ProviderQuotaSnapshot, QuestionItem, QuotaWindow, SessionMode,
-    ToolCallDetail, ToolCallStatus,
+    AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
+    QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, ToolCallDetail,
+    ToolCallStatus,
 };
 use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, spawn_detached_shim};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
 use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
@@ -165,6 +168,7 @@ async fn run_codex_actor(
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
         .or_else(|| cfg.model.clone());
+    let mut current_effort = cfg.effort;
 
     let _ = evt_tx
         .send(DriverEvent::SessionInitialized {
@@ -238,6 +242,20 @@ async fn run_codex_actor(
                         if let Some(ref m) = resolved_model {
                             params["model"] = Value::String(m.clone());
                         }
+                        if let Some(eff) = current_effort {
+                            let eff_str = match eff {
+                                ReasoningEffort::Off => Some("none"),
+                                ReasoningEffort::Low => Some("low"),
+                                ReasoningEffort::Medium => Some("medium"),
+                                ReasoningEffort::High => Some("high"),
+                                ReasoningEffort::Xhigh => Some("xhigh"),
+                                ReasoningEffort::Max => Some("max"),
+                                ReasoningEffort::Ultra => Some("ultra"),
+                            };
+                            if let Some(s) = eff_str {
+                                params["effort"] = Value::String(s.to_string());
+                            }
+                        }
                         if matches!(mode, SessionMode::Plan) {
                             params["collaborationMode"] = json!({
                                 "mode": "plan",
@@ -272,8 +290,9 @@ async fn run_codex_actor(
                     DriverCommand::SetMode { mode: new_mode } => {
                         mode = new_mode;
                     }
-                    DriverCommand::SetModel { model: new_model } => {
-                        resolved_model = new_model;
+                    DriverCommand::SetConfig { model, effort } => {
+                        resolved_model = model;
+                        current_effort = effort;
                     }
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(app) = pending_approvals.remove(&request_id) {
@@ -473,11 +492,16 @@ async fn handle_codex_notification(
             }
         }
         "item/agentMessage/delta" => {
+            let turn_scope = native_turn_id
+                .as_deref()
+                .or(client_turn_id.as_deref())
+                .unwrap_or("turn0");
             let item_id = params
                 .get("itemId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("codex_msg")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("codex_msg_{turn_scope}"));
             let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if !delta.is_empty() {
                 let buf = msg_accum.entry(item_id.clone()).or_default();
@@ -492,11 +516,16 @@ async fn handle_codex_notification(
             }
         }
         "item/reasoning/summaryTextDelta" => {
+            let turn_scope = native_turn_id
+                .as_deref()
+                .or(client_turn_id.as_deref())
+                .unwrap_or("turn0");
             let item_id = params
                 .get("itemId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("codex_rsn")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("codex_rsn_{turn_scope}"));
             let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if !delta.is_empty() {
                 let buf = thought_accum.entry(item_id.clone()).or_default();
@@ -514,11 +543,16 @@ async fn handle_codex_notification(
             let Some(item) = params.get("item") else {
                 return;
             };
+            let turn_scope = native_turn_id
+                .as_deref()
+                .or(client_turn_id.as_deref())
+                .unwrap_or("turn0");
             let item_id = item
                 .get("id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("item")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("codex_msg_{turn_scope}"));
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             match item_type {
@@ -1034,5 +1068,529 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
         let mut out: String = s.chars().take(max_chars).collect();
         out.push_str("...");
         out
+    }
+}
+
+// --- Paseo-Aligned Dynamic Model & Thinking Catalog Probing (`codex app-server` `model/list`) ---
+
+fn resolve_codex_home_dir() -> PathBuf {
+    std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".codex")
+        })
+}
+
+pub fn format_codex_display_name(raw_display: &str, raw_id: &str) -> String {
+    let base = if raw_display.trim().is_empty() {
+        raw_id.trim()
+    } else {
+        raw_display.trim()
+    };
+    let lower = base.to_ascii_lowercase();
+    if lower.starts_with("gpt-") && !lower.starts_with("gpt-oss") {
+        let rest = &base[4..];
+        let cleaned_rest = rest
+            .split('-')
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| {
+                let mut chars = seg.chars();
+                match chars.next() {
+                    Some(c) if c.is_ascii_alphabetic() => {
+                        format!("{}{}", c.to_ascii_uppercase(), chars.as_str())
+                    }
+                    _ => seg.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("GPT {cleaned_rest}");
+    }
+    base.to_string()
+}
+
+async fn read_codex_config_toml_defaults() -> (Option<String>, Option<ReasoningEffort>) {
+    let cfg_path = resolve_codex_home_dir().join("config.toml");
+    let Ok(raw) = tokio::fs::read_to_string(cfg_path).await else {
+        return (None, None);
+    };
+    let mut cfg_model = None;
+    let mut cfg_effort = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with('[') {
+            if trimmed.starts_with('[') && cfg_model.is_some() {
+                break;
+            }
+            continue;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            let key = k.trim();
+            let val = v
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
+            if key == "model" && !val.is_empty() && cfg_model.is_none() {
+                cfg_model = Some(val.to_string());
+            } else if (key == "model_reasoning_effort" || key == "reasoning_effort")
+                && cfg_effort.is_none()
+            {
+                cfg_effort = ReasoningEffort::from_slug(val);
+            }
+        }
+    }
+    (cfg_model, cfg_effort)
+}
+
+fn build_codex_thinking_options(
+    entries: &[(ReasoningEffort, Option<String>)],
+    resolved_default: Option<ReasoningEffort>,
+) -> Vec<ThinkingOptionSpec> {
+    let mut out = Vec::new();
+    for (eff, desc) in entries {
+        if out
+            .iter()
+            .any(|existing: &ThinkingOptionSpec| existing.effort == *eff)
+        {
+            continue;
+        }
+        out.push(ThinkingOptionSpec {
+            effort: *eff,
+            label: eff.display_label().to_string(),
+            description: desc.clone(),
+            is_default: Some(*eff) == resolved_default,
+        });
+    }
+    if let Some(def) = resolved_default
+        && !out.iter().any(|x| x.effort == def)
+    {
+        out.push(ThinkingOptionSpec {
+            effort: def,
+            label: def.display_label().to_string(),
+            description: None,
+            is_default: true,
+        });
+    }
+    out
+}
+
+pub async fn fallback_codex_models() -> ProviderModelCatalog {
+    let (cfg_model, cfg_effort) = read_codex_config_toml_defaults().await;
+
+    // 1. Try reading `~/.codex/models_cache.json` written by Codex CLI
+    let cache_path = resolve_codex_home_dir().join("models_cache.json");
+    if let Ok(raw) = tokio::fs::read_to_string(cache_path).await
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+        && let Some(arr) = val.get("models").and_then(|v| v.as_array())
+    {
+        let mut parsed_models = Vec::new();
+        for item in arr {
+            let visibility = item
+                .get("visibility")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list");
+            let hidden = item
+                .get("hidden")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if visibility == "hide" || hidden {
+                continue;
+            }
+            let Some(id) = item
+                .get("slug")
+                .or_else(|| item.get("id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                continue;
+            };
+            let display_raw = item
+                .get("display_name")
+                .or_else(|| item.get("displayName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(id);
+            let description = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let model_default_eff = item
+                .get("default_reasoning_level")
+                .or_else(|| item.get("defaultReasoningEffort"))
+                .and_then(|v| v.as_str())
+                .and_then(ReasoningEffort::from_slug);
+            let resolved_eff = cfg_effort.or(model_default_eff);
+
+            let mut effort_entries = Vec::new();
+            if let Some(levels) = item
+                .get("supported_reasoning_levels")
+                .or_else(|| item.get("supportedReasoningEfforts"))
+                .and_then(|v| v.as_array())
+            {
+                for lvl in levels {
+                    if let Some(slug) = lvl
+                        .get("effort")
+                        .or_else(|| lvl.get("reasoningEffort"))
+                        .and_then(|v| v.as_str())
+                        && let Some(eff) = ReasoningEffort::from_slug(slug)
+                    {
+                        let desc = lvl
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(ToOwned::to_owned);
+                        effort_entries.push((eff, desc));
+                    }
+                }
+            }
+
+            parsed_models.push(ProviderModelSpec {
+                id: id.to_string(),
+                label: format_codex_display_name(display_raw, id),
+                description,
+                is_default: false,
+                default_effort: resolved_eff,
+                thinking_options: build_codex_thinking_options(&effort_entries, resolved_eff),
+            });
+        }
+
+        if !parsed_models.is_empty() {
+            let has_cfg = cfg_model
+                .as_deref()
+                .is_some_and(|m| parsed_models.iter().any(|pm| pm.id == m));
+            for (idx, pm) in parsed_models.iter_mut().enumerate() {
+                pm.is_default = if has_cfg {
+                    cfg_model.as_deref() == Some(pm.id.as_str())
+                } else {
+                    idx == 0
+                };
+            }
+            return ProviderModelCatalog {
+                provider: ProviderKind::Codex,
+                models: parsed_models,
+                configured_default_model: cfg_model,
+                configured_default_effort: cfg_effort,
+            };
+        }
+    }
+
+    // 2. Built-in static catalog matching Codex 0.169+ when CLI is not installed on host
+    let full_efforts = vec![
+        (
+            ReasoningEffort::Low,
+            Some("Fast responses with lighter reasoning".to_string()),
+        ),
+        (
+            ReasoningEffort::Medium,
+            Some("Balances speed and reasoning depth".to_string()),
+        ),
+        (
+            ReasoningEffort::High,
+            Some("Greater reasoning depth for complex problems".to_string()),
+        ),
+        (
+            ReasoningEffort::Xhigh,
+            Some("Extra high reasoning depth".to_string()),
+        ),
+        (
+            ReasoningEffort::Max,
+            Some("Maximum reasoning depth for the hardest problems".to_string()),
+        ),
+        (
+            ReasoningEffort::Ultra,
+            Some("Maximum reasoning with automatic task delegation".to_string()),
+        ),
+    ];
+    let presets = [
+        (
+            "gpt-6.2-sol",
+            "GPT 6.2 Sol",
+            "Fast, go-to model for coding and everyday work.",
+            ReasoningEffort::Low,
+            true,
+        ),
+        (
+            "gpt-6.2-astra",
+            "GPT 6.2 Astra",
+            "Most capable model for complex coding and professional work.",
+            ReasoningEffort::Low,
+            false,
+        ),
+        (
+            "gpt-6.1-terra",
+            "GPT 6.1 Terra",
+            "Efficient model for visual understanding and computer use.",
+            ReasoningEffort::Low,
+            false,
+        ),
+        (
+            "gpt-6.1-sol",
+            "GPT 6.1 Sol",
+            "Previous generation model for coding and everyday work.",
+            ReasoningEffort::Low,
+            false,
+        ),
+        (
+            "gpt-6-astra",
+            "GPT 6 Astra",
+            "Previous generation model for complex coding and professional work.",
+            ReasoningEffort::Medium,
+            false,
+        ),
+        (
+            "gpt-6-sol",
+            "GPT 6 Sol",
+            "Legacy model for coding and everyday work.",
+            ReasoningEffort::Medium,
+            false,
+        ),
+        (
+            "gpt-6-luna",
+            "GPT 6 Luna",
+            "Fast and affordable model for easier tasks.",
+            ReasoningEffort::Medium,
+            false,
+        ),
+    ];
+
+    let has_cfg = cfg_model
+        .as_deref()
+        .is_some_and(|m| presets.iter().any(|(id, ..)| *id == m));
+    let models = presets
+        .into_iter()
+        .map(|(id, label, desc, def_eff, is_def)| {
+            let resolved_eff = cfg_effort.unwrap_or(def_eff);
+            ProviderModelSpec {
+                id: id.to_string(),
+                label: label.to_string(),
+                description: desc.to_string(),
+                is_default: if has_cfg {
+                    cfg_model.as_deref() == Some(id)
+                } else {
+                    is_def
+                },
+                default_effort: Some(resolved_eff),
+                thinking_options: build_codex_thinking_options(&full_efforts, Some(resolved_eff)),
+            }
+        })
+        .collect();
+
+    ProviderModelCatalog {
+        provider: ProviderKind::Codex,
+        models,
+        configured_default_model: cfg_model,
+        configured_default_effort: cfg_effort,
+    }
+}
+
+pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatalog {
+    let Some(exe) = executable else {
+        return fallback_codex_models().await;
+    };
+
+    let rpc_res = tokio::time::timeout(Duration::from_secs(6), async {
+        let _startup_guard = codex_startup_mutex().lock().await;
+        let mut child = Command::new(exe)
+            .arg("app-server")
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err("codex stdin unavailable".to_string());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return Err("codex stdout unavailable".to_string());
+        };
+        let mut lines = BufReader::new(stdout).lines();
+
+        let init_req = json!({
+            "id": 1u64,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "orbit_model_probe",
+                    "title": "Orbit Codex Catalog Probe",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": true
+                }
+            }
+        });
+        stdin
+            .write_all(format!("{init_req}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && v.get("id").and_then(|x| x.as_u64()) == Some(1)
+            {
+                break;
+            }
+        }
+        drop(_startup_guard);
+
+        let batch = format!(
+            "{}\n{}\n{}\n",
+            json!({ "method": "initialized", "params": {} }),
+            json!({ "id": 2u64, "method": "model/list", "params": { "includeHidden": false } }),
+            json!({ "id": 3u64, "method": "config/read", "params": {} }),
+        );
+        stdin
+            .write_all(batch.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+
+        let mut model_list_res: Option<Value> = None;
+        let mut config_read_res: Option<Value> = None;
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            match v.get("id").and_then(|x| x.as_u64()) {
+                Some(2) => model_list_res = v.get("result").cloned(),
+                Some(3) => config_read_res = v.get("result").cloned(),
+                _ => {}
+            }
+            if model_list_res.is_some() && config_read_res.is_some() {
+                break;
+            }
+        }
+
+        let _ = child.kill().await;
+        Ok::<(Option<Value>, Option<Value>), String>((model_list_res, config_read_res))
+    })
+    .await;
+
+    let Ok(Ok((Some(list_val), cfg_val))) = rpc_res else {
+        return fallback_codex_models().await;
+    };
+
+    let (toml_model, toml_effort) = read_codex_config_toml_defaults().await;
+    let cfg_obj = cfg_val.as_ref().and_then(|v| v.get("config"));
+    let configured_model = cfg_obj
+        .and_then(|c| c.get("model"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or(toml_model);
+    let configured_effort = cfg_obj
+        .and_then(|c| {
+            c.get("model_reasoning_effort")
+                .or_else(|| c.get("modelReasoningEffort"))
+        })
+        .and_then(|v| v.as_str())
+        .and_then(ReasoningEffort::from_slug)
+        .or(toml_effort);
+
+    let Some(data) = list_val.get("data").and_then(|v| v.as_array()) else {
+        return fallback_codex_models().await;
+    };
+
+    let has_cfg_model = configured_model.as_deref().is_some_and(|cm| {
+        data.iter()
+            .any(|item| item.get("id").and_then(|v| v.as_str()) == Some(cm))
+    });
+
+    let mut models = Vec::new();
+    for item in data {
+        if item
+            .get("hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(id) = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+        else {
+            continue;
+        };
+        let display_name = item
+            .get("displayName")
+            .and_then(|v| v.as_str())
+            .unwrap_or(id);
+        let description = item
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let item_is_default = item
+            .get("isDefault")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let model_def_effort = item
+            .get("defaultReasoningEffort")
+            .and_then(|v| v.as_str())
+            .and_then(ReasoningEffort::from_slug);
+        let resolved_default_effort = configured_effort.or(model_def_effort);
+
+        let mut effort_entries = Vec::new();
+        if let Some(arr) = item
+            .get("supportedReasoningEfforts")
+            .and_then(|v| v.as_array())
+        {
+            for entry in arr {
+                if let Some(slug) = entry.get("reasoningEffort").and_then(|v| v.as_str())
+                    && let Some(eff) = ReasoningEffort::from_slug(slug)
+                {
+                    let desc = entry
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned);
+                    effort_entries.push((eff, desc));
+                }
+            }
+        }
+
+        models.push(ProviderModelSpec {
+            id: id.to_string(),
+            label: format_codex_display_name(display_name, id),
+            description,
+            is_default: if has_cfg_model {
+                configured_model.as_deref() == Some(id)
+            } else {
+                item_is_default
+            },
+            default_effort: resolved_default_effort,
+            thinking_options: build_codex_thinking_options(
+                &effort_entries,
+                resolved_default_effort,
+            ),
+        });
+    }
+
+    if models.is_empty() {
+        return fallback_codex_models().await;
+    }
+
+    if !models.iter().any(|m| m.is_default)
+        && let Some(first) = models.first_mut()
+    {
+        first.is_default = true;
+    }
+
+    ProviderModelCatalog {
+        provider: ProviderKind::Codex,
+        models,
+        configured_default_model: configured_model,
+        configured_default_effort: configured_effort,
     }
 }

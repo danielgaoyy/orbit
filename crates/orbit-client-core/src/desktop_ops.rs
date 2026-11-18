@@ -180,30 +180,53 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         PathBuf::from("/usr/local/bin/orbit"),
         PathBuf::from("/opt/homebrew/bin/orbit"),
     ];
-    let orbit_bin = candidates.into_iter().find(|p| p.is_file())?;
-
-    let status_out = Command::new(&orbit_bin)
-        .args(["daemon", "status"])
-        .output()
-        .ok();
-    let already_running = status_out
-        .as_ref()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
-        .unwrap_or(false);
-    if !already_running {
-        let _ = Command::new(&orbit_bin).args(["daemon", "up"]).output();
+    if let Some(orbit_bin) = candidates.into_iter().find(|p| p.is_file()) {
+        let status_out = Command::new(&orbit_bin)
+            .args(["daemon", "status"])
+            .output()
+            .ok();
+        let already_running = status_out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
+            .unwrap_or(false);
+        if !already_running {
+            let _ = Command::new(&orbit_bin).args(["daemon", "up"]).output();
+        }
+        if let Ok(out) = Command::new(orbit_bin).arg("pair").output()
+            && out.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(uri) = stdout
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("orbit://pair/"))
+            {
+                return Some(uri.to_owned());
+            }
+        }
     }
 
-    let out = Command::new(orbit_bin).arg("pair").output().ok()?;
-    if !out.status.success() {
+    // Pure-Rust direct fallback when running from source without a globally installed `orbit` binary
+    let keypair_path = home.join(".orbit").join("host-keypair.json");
+    if !keypair_path.is_file() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("orbit://pair/"))
-        .map(ToOwned::to_owned)
+    let raw = fs::read_to_string(&keypair_path).ok()?;
+    let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
+    let host_id = kp.host_id().ok()?;
+    let hostname = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".to_string());
+    let offer = orbit_crypto::PairingOffer {
+        host_id,
+        hostname,
+        daemon_pubkey_b64: kp.public_key_b64,
+        direct_endpoints: vec!["ws://127.0.0.1:6868/ws".to_string()],
+        relay_url: None,
+        pairing_secret: "local".to_string(),
+    };
+    offer.to_qr_uri().ok()
 }
 
 /// Parse `~/.ssh/config` (and `Include` files up to depth 3) for concrete remote servers.
@@ -694,6 +717,474 @@ pub fn provision_relay_over_ssh(
     Ok(format!("ws://{fallback_hostname}:{relay_port}"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalEditorKind {
+    Cursor,
+    Zed,
+    VsCode,
+    Terminal,
+    FileManager,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalEditorInfo {
+    pub kind: ExternalEditorKind,
+    pub label: String,
+    pub installed: bool,
+}
+
+fn binary_exists_on_path(bin: &str) -> bool {
+    let Some(path_os) = std::env::var_os("PATH") else {
+        return false;
+    };
+    for dir in std::env::split_paths(&path_os) {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        for ext in ["exe", "cmd", "bat"] {
+            if dir.join(format!("{bin}.{ext}")).is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn macos_app_exists(app_bundle: &str) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    if Path::new("/Applications").join(app_bundle).exists() {
+        return true;
+    }
+    resolve_user_home()
+        .map(|h| h.join("Applications").join(app_bundle).exists())
+        .unwrap_or(false)
+}
+
+/// Discover installed local editors and system shell/file-manager targets for one-click ADE handoff (`⌘O`).
+pub fn detect_installed_editors() -> Vec<ExternalEditorInfo> {
+    let cursor_installed = binary_exists_on_path("cursor") || macos_app_exists("Cursor.app");
+    let zed_installed = binary_exists_on_path("zed") || macos_app_exists("Zed.app");
+    let vscode_installed =
+        binary_exists_on_path("code") || macos_app_exists("Visual Studio Code.app");
+
+    let file_manager_label = if cfg!(target_os = "macos") {
+        "Finder"
+    } else if cfg!(target_os = "windows") {
+        "Explorer"
+    } else {
+        "Files"
+    };
+
+    vec![
+        ExternalEditorInfo {
+            kind: ExternalEditorKind::Cursor,
+            label: "Cursor".into(),
+            installed: cursor_installed,
+        },
+        ExternalEditorInfo {
+            kind: ExternalEditorKind::Zed,
+            label: "Zed".into(),
+            installed: zed_installed,
+        },
+        ExternalEditorInfo {
+            kind: ExternalEditorKind::VsCode,
+            label: "VS Code".into(),
+            installed: vscode_installed,
+        },
+        ExternalEditorInfo {
+            kind: ExternalEditorKind::Terminal,
+            label: "System Terminal".into(),
+            installed: true,
+        },
+        ExternalEditorInfo {
+            kind: ExternalEditorKind::FileManager,
+            label: file_manager_label.into(),
+            installed: true,
+        },
+    ]
+}
+
+/// Build a remote SSH workspace URI (`vscode-remote://ssh-remote+...` or `ssh://...`) for remote Devbox handoff.
+pub fn build_remote_editor_uri(
+    editor: ExternalEditorKind,
+    ssh_target: &str,
+    cwd: &str,
+) -> Option<String> {
+    let clean_target = ssh_target.trim();
+    if clean_target.is_empty() {
+        return None;
+    }
+    let normalized_path = if cwd.starts_with('/') {
+        cwd.to_string()
+    } else if let Some(rest) = cwd.strip_prefix("~/") {
+        format!("/{rest}")
+    } else {
+        format!("/{cwd}")
+    };
+
+    match editor {
+        ExternalEditorKind::Cursor | ExternalEditorKind::VsCode => Some(format!(
+            "vscode-remote://ssh-remote+{clean_target}{normalized_path}"
+        )),
+        ExternalEditorKind::Zed => Some(format!("ssh://{clean_target}{normalized_path}")),
+        ExternalEditorKind::Terminal | ExternalEditorKind::FileManager => None,
+    }
+}
+
+fn expand_local_tilde(cwd: &str) -> PathBuf {
+    if cwd == "~"
+        && let Some(home) = resolve_user_home()
+    {
+        return home;
+    }
+    if let Some(rest) = cwd.strip_prefix("~/")
+        && let Some(home) = resolve_user_home()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(cwd)
+}
+
+/// Launch the requested external editor or OS tool at `cwd` (either locally or via SSH remote URI).
+pub fn open_in_external_editor(
+    editor: ExternalEditorKind,
+    cwd: &str,
+    remote_ssh_target: Option<&str>,
+) -> Result<(), String> {
+    let ssh_target = remote_ssh_target.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(remote) = ssh_target {
+        match editor {
+            ExternalEditorKind::Cursor => {
+                let uri = build_remote_editor_uri(editor, remote, cwd)
+                    .ok_or_else(|| "invalid remote SSH target".to_string())?;
+                if binary_exists_on_path("cursor") {
+                    Command::new("cursor")
+                        .args(["--folder-uri", &uri])
+                        .spawn()
+                        .map_err(|e| format!("failed to launch cursor: {e}"))?;
+                    return Ok(());
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    Command::new("open")
+                        .args(["-a", "Cursor", "--args", "--folder-uri", &uri])
+                        .spawn()
+                        .map_err(|e| format!("failed to open Cursor.app: {e}"))?;
+                    return Ok(());
+                }
+                #[cfg(not(target_os = "macos"))]
+                return Err("`cursor` CLI not found on PATH".into());
+            }
+            ExternalEditorKind::VsCode => {
+                let uri = build_remote_editor_uri(editor, remote, cwd)
+                    .ok_or_else(|| "invalid remote SSH target".to_string())?;
+                if binary_exists_on_path("code") {
+                    Command::new("code")
+                        .args(["--folder-uri", &uri])
+                        .spawn()
+                        .map_err(|e| format!("failed to launch code: {e}"))?;
+                    return Ok(());
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    Command::new("open")
+                        .args(["-a", "Visual Studio Code", "--args", "--folder-uri", &uri])
+                        .spawn()
+                        .map_err(|e| format!("failed to open Visual Studio Code.app: {e}"))?;
+                    return Ok(());
+                }
+                #[cfg(not(target_os = "macos"))]
+                return Err("`code` CLI not found on PATH".into());
+            }
+            ExternalEditorKind::Zed => {
+                let uri = build_remote_editor_uri(editor, remote, cwd)
+                    .ok_or_else(|| "invalid remote SSH target".to_string())?;
+                if binary_exists_on_path("zed") {
+                    Command::new("zed")
+                        .arg(&uri)
+                        .spawn()
+                        .map_err(|e| format!("failed to launch zed: {e}"))?;
+                    return Ok(());
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    Command::new("open")
+                        .args(["-a", "Zed", &uri])
+                        .spawn()
+                        .map_err(|e| format!("failed to open Zed.app: {e}"))?;
+                    return Ok(());
+                }
+                #[cfg(not(target_os = "macos"))]
+                return Err("`zed` CLI not found on PATH".into());
+            }
+            ExternalEditorKind::Terminal => {
+                #[cfg(target_os = "macos")]
+                {
+                    let escaped_target = remote.replace('\'', "");
+                    let script = format!(
+                        "tell application \"Terminal\" to do script \"ssh {escaped_target}\""
+                    );
+                    Command::new("osascript")
+                        .args([
+                            "-e",
+                            "tell application \"Terminal\" to activate",
+                            "-e",
+                            &script,
+                        ])
+                        .spawn()
+                        .map_err(|e| format!("failed to open Terminal: {e}"))?;
+                    return Ok(());
+                }
+                #[cfg(not(target_os = "macos"))]
+                return Err(
+                    "Use the built-in Orbit PTY drawer (`Ctrl+J`) for remote shell access".into(),
+                );
+            }
+            ExternalEditorKind::FileManager => {
+                return Err(
+                    "Finder / File Manager handoff is only available for local hosts".into(),
+                );
+            }
+        }
+    }
+
+    let local_path = expand_local_tilde(cwd);
+    match editor {
+        ExternalEditorKind::Cursor => {
+            if binary_exists_on_path("cursor") {
+                Command::new("cursor")
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to launch cursor: {e}"))?;
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Command::new("open")
+                    .args(["-a", "Cursor"])
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to open Cursor.app: {e}"))?;
+                Ok(())
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err("Cursor is not installed or not on PATH".into())
+        }
+        ExternalEditorKind::Zed => {
+            if binary_exists_on_path("zed") {
+                Command::new("zed")
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to launch zed: {e}"))?;
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Command::new("open")
+                    .args(["-a", "Zed"])
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to open Zed.app: {e}"))?;
+                Ok(())
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err("Zed is not installed or not on PATH".into())
+        }
+        ExternalEditorKind::VsCode => {
+            if binary_exists_on_path("code") {
+                Command::new("code")
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to launch code: {e}"))?;
+                return Ok(());
+            }
+            #[cfg(target_os = "macos")]
+            {
+                Command::new("open")
+                    .args(["-a", "Visual Studio Code"])
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to open Visual Studio Code.app: {e}"))?;
+                Ok(())
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err("VS Code (`code`) is not installed or not on PATH".into())
+        }
+        ExternalEditorKind::Terminal => {
+            #[cfg(target_os = "macos")]
+            {
+                for app in ["Ghostty", "iTerm", "Warp", "Terminal"] {
+                    if macos_app_exists(&format!("{app}.app")) || app == "Terminal" {
+                        Command::new("open")
+                            .args(["-a", app])
+                            .arg(&local_path)
+                            .spawn()
+                            .map_err(|e| format!("failed to open {app}: {e}"))?;
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            {
+                Command::new("x-terminal-emulator")
+                    .current_dir(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to launch terminal: {e}"))?;
+                Ok(())
+            }
+            #[cfg(target_os = "windows")]
+            {
+                Command::new("cmd")
+                    .args(["/C", "start", "cmd"])
+                    .current_dir(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to launch terminal: {e}"))?;
+                Ok(())
+            }
+        }
+        ExternalEditorKind::FileManager => {
+            #[cfg(target_os = "macos")]
+            {
+                Command::new("open")
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to open Finder: {e}"))?;
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            {
+                Command::new("xdg-open")
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to open file manager: {e}"))?;
+                Ok(())
+            }
+            #[cfg(target_os = "windows")]
+            {
+                Command::new("explorer")
+                    .arg(&local_path)
+                    .spawn()
+                    .map_err(|e| format!("failed to open Explorer: {e}"))?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedAttachmentInfo {
+    pub path: String,
+    pub filename: String,
+    pub size_bytes: usize,
+}
+
+/// Fast synchronous local repository file scan (`git ls-files` + shallow fallback) for instant `@` file mentions.
+pub fn list_local_workspace_files(cwd: &str, limit: usize) -> Option<Vec<String>> {
+    let dir = expand_local_tilde(cwd);
+    if !dir.is_dir() {
+        return None;
+    }
+    if let Ok(out) = Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .current_dir(&dir)
+        .output()
+        && out.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let list: Vec<String> = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(limit)
+            .map(ToOwned::to_owned)
+            .collect();
+        return Some(list);
+    }
+
+    let mut fallback = Vec::new();
+    walk_local_shallow(&dir, &dir, 0, limit, &mut fallback);
+    Some(fallback)
+}
+
+fn walk_local_shallow(root: &Path, dir: &Path, depth: usize, limit: usize, out: &mut Vec<String>) {
+    if depth > 3 || out.len() >= limit {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.')
+            || matches!(name, "node_modules" | "target" | "dist" | "build" | ".git")
+        {
+            continue;
+        }
+        if path.is_dir() {
+            walk_local_shallow(root, &path, depth + 1, limit, out);
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
+/// Stage clipboard-pasted screenshots (`⌘V`) or dropped files into `~/.orbit/attachments/` for CLI agent consumption.
+pub fn stage_local_attachment(
+    raw_filename: &str,
+    bytes: &[u8],
+) -> Result<StagedAttachmentInfo, String> {
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err("Attachment exceeds 25 MiB limit".into());
+    }
+    let base_dir = resolve_user_home()
+        .map(|h| h.join(".orbit").join("attachments"))
+        .unwrap_or_else(|| std::env::temp_dir().join("orbit-attachments"));
+    fs::create_dir_all(&base_dir)
+        .map_err(|e| format!("failed to create attachments directory: {e}"))?;
+
+    let safe_name: String = raw_filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean_name = if safe_name.trim_matches('_').is_empty() {
+        "pasted-image.png".to_string()
+    } else {
+        safe_name
+    };
+
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dest = base_dir.join(format!("{ts_ms}_{clean_name}"));
+    fs::write(&dest, bytes).map_err(|e| format!("failed to write staged attachment: {e}"))?;
+
+    Ok(StagedAttachmentInfo {
+        path: dest.to_string_lossy().to_string(),
+        filename: clean_name,
+        size_bytes: bytes.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,6 +1208,22 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].alias, "devbox");
         assert_eq!(list[0].display_target, "ubuntu@10.20.30.40");
+    }
+
+    #[test]
+    fn remote_editor_uri_formats_vscode_and_zed() {
+        assert_eq!(
+            build_remote_editor_uri(ExternalEditorKind::Cursor, "devbox", "/home/ubuntu/orbit"),
+            Some("vscode-remote://ssh-remote+devbox/home/ubuntu/orbit".into())
+        );
+        assert_eq!(
+            build_remote_editor_uri(ExternalEditorKind::Zed, "devbox", "/home/ubuntu/orbit"),
+            Some("ssh://devbox/home/ubuntu/orbit".into())
+        );
+        assert_eq!(
+            build_remote_editor_uri(ExternalEditorKind::FileManager, "devbox", "/tmp"),
+            None
+        );
     }
 
     #[test]

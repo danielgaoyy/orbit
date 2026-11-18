@@ -11,14 +11,17 @@ use crate::updater::{
 
 use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
-    AgentTimelineView, ClientProjectView, CoreEventSubscriber, CoreNotification, FleetOverviewView,
-    GitReviewView, HostCardView, HostDetailView, OrbitAppCore,
+    AgentTimelineDeltaView, AgentTimelineView, ClientProjectView, CoreEventSubscriber,
+    CoreNotification, CreateAgentRequest, FleetOverviewView, GitReviewView, HostCardView,
+    HostDetailView, OrbitAppCore,
 };
 use orbit_client_core::desktop_ops::{
-    SshHostItem, discover_user_ssh_hosts, provision_relay_over_ssh, resolve_user_home,
+    ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
+    detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
+    open_in_external_editor, provision_relay_over_ssh, resolve_user_home, stage_local_attachment,
     upgrade_remote_daemon_over_ssh,
 };
-use orbit_protocol::{ProviderKind, SessionMode};
+use orbit_protocol::{PromptBadge, ProviderKind, ReasoningEffort, SessionMode};
 use tauri::{State, ipc::Channel};
 
 struct DesktopAppState {
@@ -68,6 +71,18 @@ fn get_agent_timeline(
     agent_id: String,
 ) -> AgentTimelineView {
     state.core.agent_timeline(&host_id, &agent_id)
+}
+
+#[tauri::command]
+fn get_agent_timeline_delta(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    since_seq: u64,
+) -> AgentTimelineDeltaView {
+    state
+        .core
+        .agent_timeline_delta(&host_id, &agent_id, since_seq)
 }
 
 #[tauri::command]
@@ -230,6 +245,15 @@ fn refresh_quotas(state: State<'_, DesktopAppState>, host_id: String) {
 }
 
 #[tauri::command]
+fn refresh_provider_models(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    force_refresh: bool,
+) {
+    state.core.refresh_provider_models(&host_id, force_refresh);
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn create_agent(
     state: State<'_, DesktopAppState>,
@@ -238,20 +262,26 @@ fn create_agent(
     extra_dirs: Option<Vec<String>>,
     provider: ProviderKind,
     model: Option<String>,
+    effort: Option<ReasoningEffort>,
     mode: SessionMode,
     initial_prompt: String,
+    initial_display_prompt: Option<String>,
+    initial_badges: Option<Vec<PromptBadge>>,
     worktree_branch: Option<String>,
 ) -> String {
-    state.core.create_agent_ext(
-        &host_id,
-        &cwd,
-        extra_dirs.unwrap_or_default(),
+    state.core.create_agent_with_config(CreateAgentRequest {
+        host_id: &host_id,
+        cwd: &cwd,
+        extra_dirs: extra_dirs.unwrap_or_default(),
         provider,
         model,
+        effort,
         mode,
-        &initial_prompt,
-        worktree_branch.as_deref(),
-    )
+        initial_prompt: &initial_prompt,
+        initial_display_prompt,
+        initial_badges: initial_badges.unwrap_or_default(),
+        worktree_branch: worktree_branch.as_deref(),
+    })
 }
 
 #[tauri::command]
@@ -265,8 +295,16 @@ fn send_prompt(
     host_id: String,
     agent_id: String,
     prompt: String,
+    display_prompt: Option<String>,
+    badges: Option<Vec<PromptBadge>>,
 ) {
-    state.core.send_prompt(&host_id, &agent_id, &prompt);
+    state.core.send_prompt_with_meta(
+        &host_id,
+        &agent_id,
+        &prompt,
+        display_prompt,
+        badges.unwrap_or_default(),
+    );
 }
 
 #[tauri::command]
@@ -285,6 +323,19 @@ fn set_session_mode(
 }
 
 #[tauri::command]
+fn set_agent_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    model: Option<String>,
+    effort: Option<ReasoningEffort>,
+) {
+    state
+        .core
+        .set_agent_config(&host_id, &agent_id, model, effort);
+}
+
+#[tauri::command]
 fn set_agent_model(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -300,10 +351,12 @@ fn switch_agent_provider(
     host_id: String,
     agent_id: String,
     provider: ProviderKind,
+    model: Option<String>,
+    effort: Option<ReasoningEffort>,
 ) {
     state
         .core
-        .switch_agent_provider(&host_id, &agent_id, provider);
+        .switch_agent_provider_with_config(&host_id, &agent_id, provider, model, effort);
 }
 
 #[tauri::command]
@@ -367,8 +420,35 @@ fn start_terminal(
 }
 
 #[tauri::command]
+fn attach_terminal(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    terminal_id: String,
+    slot: u8,
+) {
+    state.core.attach_terminal(&host_id, &terminal_id, slot);
+}
+
+#[tauri::command]
+fn kill_terminal(state: State<'_, DesktopAppState>, host_id: String, terminal_id: String) {
+    state.core.kill_terminal(&host_id, &terminal_id);
+}
+
+#[tauri::command]
 fn send_terminal_input(state: State<'_, DesktopAppState>, host_id: String, data: String) {
     state.core.send_terminal_input(&host_id, data.into_bytes());
+}
+
+#[tauri::command]
+fn send_terminal_input_slot(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    slot: u8,
+    data: String,
+) {
+    state
+        .core
+        .send_terminal_input_slot(&host_id, slot, data.into_bytes());
 }
 
 #[tauri::command]
@@ -377,8 +457,52 @@ fn resize_terminal(state: State<'_, DesktopAppState>, host_id: String, cols: u16
 }
 
 #[tauri::command]
+fn resize_terminal_slot(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    slot: u8,
+    cols: u16,
+    rows: u16,
+) {
+    state.core.resize_terminal_slot(&host_id, slot, cols, rows);
+}
+
+#[tauri::command]
 fn list_ssh_hosts() -> Vec<SshHostItem> {
     discover_user_ssh_hosts()
+}
+
+#[tauri::command]
+fn list_external_editors() -> Vec<ExternalEditorInfo> {
+    detect_installed_editors()
+}
+
+#[tauri::command]
+fn open_in_editor(
+    editor: ExternalEditorKind,
+    cwd: String,
+    ssh_target: Option<String>,
+) -> Result<(), String> {
+    open_in_external_editor(editor, &cwd, ssh_target.as_deref())
+}
+
+#[tauri::command]
+fn get_workspace_files(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Vec<String> {
+    let cached = state.core.workspace_files(&host_id, &cwd);
+    if !cached.is_empty() {
+        return cached;
+    }
+    state.core.fetch_workspace_files(&host_id, &cwd);
+    list_local_workspace_files(&cwd, 2500).unwrap_or_default()
+}
+
+#[tauri::command]
+fn stage_attachment(filename: String, bytes: Vec<u8>) -> Result<StagedAttachmentInfo, String> {
+    stage_local_attachment(&filename, &bytes)
 }
 
 #[tauri::command]
@@ -443,6 +567,7 @@ pub fn run() {
             get_fleet_overview,
             get_host_detail,
             get_agent_timeline,
+            get_agent_timeline_delta,
             get_git_review,
             pair_host,
             pair_ssh_host,
@@ -457,11 +582,13 @@ pub fn run() {
             connect_all_hosts,
             refresh_host,
             refresh_quotas,
+            refresh_provider_models,
             create_agent,
             open_agent_timeline,
             send_prompt,
             interrupt_agent,
             set_session_mode,
+            set_agent_config,
             set_agent_model,
             switch_agent_provider,
             archive_agent,
@@ -470,9 +597,17 @@ pub fn run() {
             fetch_git_status,
             fetch_git_diff,
             start_terminal,
+            attach_terminal,
+            kill_terminal,
             send_terminal_input,
+            send_terminal_input_slot,
             resize_terminal,
+            resize_terminal_slot,
             list_ssh_hosts,
+            list_external_editors,
+            open_in_editor,
+            get_workspace_files,
+            stage_attachment,
             provision_ssh_relay,
             get_app_version,
             check_app_update,

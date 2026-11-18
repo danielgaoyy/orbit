@@ -1,43 +1,66 @@
 import { useEffect, useRef } from "react";
-import { Terminal } from "@xterm/xterm";
+import { type ITheme, Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { orbitIpc } from "@/lib/orbit-ipc";
+import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { cn } from "@/lib/utils";
 
-export interface XtermStreamChunk {
-  seq: number;
-  bytes: Uint8Array;
-}
+const DARK_XTERM_THEME: ITheme = {
+  background: "#0B0E14",
+  foreground: "#E2E8F0",
+  cursor: "#93C5FD",
+  selectionBackground: "rgba(147, 197, 253, 0.24)",
+};
+
+const LIGHT_XTERM_THEME: ITheme = {
+  background: "#F7F8FA",
+  foreground: "#1E293B",
+  cursor: "#2563EB",
+  selectionBackground: "rgba(37, 99, 235, 0.18)",
+  black: "#1E293B",
+  red: "#DC2626",
+  green: "#16A34A",
+  yellow: "#CA8A04",
+  blue: "#2563EB",
+  magenta: "#9333EA",
+  cyan: "#0891B2",
+  white: "#64748B",
+};
 
 export function XtermPane({
   hostId,
-  cwd,
-  chunks,
+  slot,
+  active,
+  visible,
 }: {
   hostId: string;
-  cwd: string;
-  chunks: XtermStreamChunk[];
+  slot: number;
+  active: boolean;
+  visible: boolean;
 }) {
+  const resolvedTheme = useOrbitSelector((s) => s.resolvedTheme);
+  const terminalFontSize = useOrbitSelector((s) => s.terminalFontSize);
+  const terminalCursorStyle = useOrbitSelector((s) => s.terminalCursorStyle);
+  const terminalScrollback = useOrbitSelector((s) => s.terminalScrollback);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
-  const lastSeqRef = useRef<number>(0);
+  const fitRef = useRef<FitAddon | null>(null);
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
+    const snap = orbitActions.getSnapshot();
+    const initialDark = snap.resolvedTheme === "dark";
     const term = new Terminal({
       cursorBlink: true,
-      cursorStyle: "block",
+      cursorStyle: snap.terminalCursorStyle,
       fontFamily: '"JetBrains Mono", "SF Mono", Menlo, Monaco, Consolas, monospace',
-      fontSize: 13,
-      lineHeight: 1.25,
-      theme: {
-        background: "#090D16",
-        foreground: "#E2E8F0",
-        cursor: "#60A5FA",
-        selectionBackground: "rgba(96, 165, 250, 0.28)",
-      },
+      fontSize: snap.terminalFontSize,
+      lineHeight: 1.28,
+      scrollback: snap.terminalScrollback,
+      theme: initialDark ? DARK_XTERM_THEME : LIGHT_XTERM_THEME,
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
@@ -47,23 +70,26 @@ export function XtermPane({
       const webglAddon = new WebglAddon();
       term.loadAddon(webglAddon);
     } catch {
-      // Graceful canvas fallback when WebGL2 context is unavailable (e.g. headless Linux VM)
+      // Fallback to standard canvas renderer when WebGL2 is unavailable
     }
 
-    fitAddon.fit();
     termRef.current = term;
-    lastSeqRef.current = 0;
+    fitRef.current = fitAddon;
 
-    void orbitIpc.startTerminal(hostId, cwd, term.cols || 100, term.rows || 30);
+    const unsubscribeStream = orbitActions.subscribeTerminalSlot(hostId, slot, (bytes) => {
+      term.write(bytes);
+    });
 
     const dataDisposable = term.onData((data) => {
-      void orbitIpc.sendTerminalInput(hostId, data);
+      void orbitIpc.sendTerminalInputSlot(hostId, slot, data);
     });
 
     const resizeObserver = new ResizeObserver(() => {
-      fitAddon.fit();
-      if (term.cols > 0 && term.rows > 0) {
-        void orbitIpc.resizeTerminal(hostId, term.cols, term.rows);
+      if (el.clientWidth > 0 && el.clientHeight > 0) {
+        fitAddon.fit();
+        if (term.cols > 0 && term.rows > 0) {
+          void orbitIpc.resizeTerminalSlot(hostId, slot, term.cols, term.rows);
+        }
       }
     });
     resizeObserver.observe(el);
@@ -71,25 +97,46 @@ export function XtermPane({
     return () => {
       resizeObserver.disconnect();
       dataDisposable.dispose();
+      unsubscribeStream();
       term.dispose();
       termRef.current = null;
+      fitRef.current = null;
     };
-  }, [hostId, cwd]);
+  }, [hostId, slot]);
 
+  // Dynamically update live xterm palette & typography when preferences change
   useEffect(() => {
     const term = termRef.current;
     if (!term) return;
-    for (const chunk of chunks) {
-      if (chunk.seq > lastSeqRef.current) {
-        term.write(chunk.bytes);
-        lastSeqRef.current = chunk.seq;
-      }
-    }
-  }, [chunks]);
+    term.options.theme = resolvedTheme === "dark" ? DARK_XTERM_THEME : LIGHT_XTERM_THEME;
+    term.options.fontSize = terminalFontSize;
+    term.options.cursorStyle = terminalCursorStyle;
+    term.options.scrollback = terminalScrollback;
+    fitRef.current?.fit();
+  }, [resolvedTheme, terminalFontSize, terminalCursorStyle, terminalScrollback]);
+
+  // Re-fit and focus when this persistent tab becomes visible/active
+  useEffect(() => {
+    if (!active || !visible) return;
+    const id = requestAnimationFrame(() => {
+      fitRef.current?.fit();
+      termRef.current?.focus();
+    });
+    return () => cancelAnimationFrame(id);
+  }, [active, visible]);
 
   return (
-    <div className="flex h-full flex-col overflow-hidden rounded-xl border border-white/10 bg-[#090D16] p-2">
-      <div ref={containerRef} className="h-full w-full flex-1 overflow-hidden" />
+    <div
+      onFocusCapture={() => orbitActions.setTerminalFocused(true)}
+      onBlurCapture={() => orbitActions.setTerminalFocused(false)}
+      className={cn(
+        "h-full w-full overflow-hidden bg-[#F7F8FA] px-2.5 py-1.5 dark:bg-[#0B0E14]",
+        !active && "hidden",
+      )}
+    >
+      <div ref={containerRef} className="h-full w-full overflow-hidden" />
     </div>
   );
 }
+
+export default XtermPane;

@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, AgentSummary, ProviderKind, SessionMode, TerminalSummary, TimelineEvent,
-    TimelinePayload, WorkspaceSummary,
+    AgentStatus, AgentSummary, ProviderKind, ReasoningEffort, SessionMode, TerminalSummary,
+    TimelineEvent, TimelinePayload, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,7 @@ impl OrbitStore {
                 title           TEXT NOT NULL,
                 provider_json   TEXT NOT NULL,
                 model           TEXT,
+                effort_json     TEXT,
                 mode_json       TEXT NOT NULL,
                 status_json     TEXT NOT NULL,
                 parent_agent_id TEXT,
@@ -172,8 +173,19 @@ impl OrbitStore {
             );
             ",
         )?;
-        // Seamless forward-compatible column migration for existing SQLite files
+        // Non-destructive forward-compatible column migrations for pre-existing databases
+        let _ = conn.execute("ALTER TABLE agents ADD COLUMN effort_json TEXT", []);
         let _ = conn.execute("ALTER TABLE client_hosts ADD COLUMN meta_json TEXT", []);
+        // Self-heal client replica caches that previously collapsed turns via shared default item_ids
+        let _ = conn.execute(
+            "DELETE FROM client_replica_events
+             WHERE agent_id IN (
+                 SELECT DISTINCT agent_id FROM client_replica_events
+                 WHERE payload_json LIKE '%\"agy_msg_default\"%'
+                    OR payload_json LIKE '%\"agy_thought_default\"%'
+             )",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -253,20 +265,26 @@ impl OrbitStore {
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let provider_json = serde_json::to_string(&agent.provider)?;
+        let effort_json = agent
+            .effort
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let mode_json = serde_json::to_string(&agent.mode)?;
         let status_json = serde_json::to_string(&agent.status)?;
 
         conn.execute(
             "
             INSERT INTO agents (
-                agent_id, workspace_id, cwd, title, provider_json, model,
+                agent_id, workspace_id, cwd, title, provider_json, model, effort_json,
                 mode_json, status_json, parent_agent_id, persistence_ref,
                 latest_seq, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(agent_id) DO UPDATE SET
                 title = excluded.title,
                 model = excluded.model,
+                effort_json = excluded.effort_json,
                 mode_json = excluded.mode_json,
                 status_json = excluded.status_json,
                 persistence_ref = COALESCE(excluded.persistence_ref, agents.persistence_ref),
@@ -280,6 +298,7 @@ impl OrbitStore {
                 agent.title,
                 provider_json,
                 agent.model,
+                effort_json,
                 mode_json,
                 status_json,
                 agent.parent_agent_id,
@@ -296,7 +315,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at
+                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json
              FROM agents WHERE agent_id = ?1",
             params![agent_id],
             map_agent_row,
@@ -311,6 +330,21 @@ impl OrbitStore {
         conn.execute(
             "UPDATE agents SET mode_json = ?1, updated_at = ?2 WHERE agent_id = ?3",
             params![mode_json, Utc::now().to_rfc3339(), agent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_agent_config(
+        &self,
+        agent_id: &str,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let effort_json = effort.as_ref().map(serde_json::to_string).transpose()?;
+        conn.execute(
+            "UPDATE agents SET model = ?1, effort_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
+            params![model, effort_json, Utc::now().to_rfc3339(), agent_id],
         )?;
         Ok(())
     }
@@ -332,17 +366,22 @@ impl OrbitStore {
         &self,
         agent_id: &str,
         provider: ProviderKind,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let provider_json = serde_json::to_string(&provider)?;
+        let effort_json = effort.as_ref().map(serde_json::to_string).transpose()?;
         let status_json = serde_json::to_string(&AgentStatus::Idle)?;
         conn.execute(
             "UPDATE agents
-             SET provider_json = ?1, model = NULL, persistence_ref = NULL,
-                 status_json = ?2, updated_at = ?3
-             WHERE agent_id = ?4",
+             SET provider_json = ?1, model = ?2, effort_json = ?3, persistence_ref = NULL,
+                 status_json = ?4, updated_at = ?5
+             WHERE agent_id = ?6",
             params![
                 provider_json,
+                model,
+                effort_json,
                 status_json,
                 Utc::now().to_rfc3339(),
                 agent_id
@@ -370,11 +409,11 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let sql = if workspace_id.is_some() {
             "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at
+                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json
              FROM agents WHERE workspace_id = ?1 ORDER BY updated_at DESC"
         } else {
             "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at
+                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json
              FROM agents ORDER BY updated_at DESC"
         };
 
@@ -405,10 +444,12 @@ impl OrbitStore {
         let payload_json = serde_json::to_string(&payload)?;
 
         if let Some((json_key, id_val)) = coalesce_identity(&payload) {
+            let boundary_seq =
+                query_coalesce_boundary_seq(&tx, "timeline_events", agent_id, &payload, None);
             let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
             let _ = tx.execute(
-                "DELETE FROM timeline_events WHERE agent_id = ?1 AND payload_json LIKE ?2",
-                params![agent_id, pattern],
+                "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND payload_json LIKE ?3",
+                params![agent_id, boundary_seq, pattern],
             );
         }
 
@@ -452,10 +493,18 @@ impl OrbitStore {
         let ts_str = ev.timestamp.to_rfc3339();
 
         if let Some((json_key, id_val)) = coalesce_identity(&ev.payload) {
+            let boundary_seq = query_coalesce_boundary_seq(
+                &tx,
+                "client_replica_events",
+                &ev.agent_id,
+                &ev.payload,
+                Some(ev.seq),
+            );
             let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
             let _ = tx.execute(
-                "DELETE FROM client_replica_events WHERE agent_id = ?1 AND payload_json LIKE ?2",
-                params![ev.agent_id, pattern],
+                "DELETE FROM client_replica_events
+                 WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND payload_json LIKE ?4",
+                params![ev.agent_id, boundary_seq, ev.seq as i64, pattern],
             );
         }
 
@@ -869,6 +918,51 @@ impl OrbitStore {
     }
 }
 
+fn query_coalesce_boundary_seq(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    agent_id: &str,
+    payload: &TimelinePayload,
+    upper_seq: Option<u64>,
+) -> i64 {
+    let stop_at_tool = matches!(
+        payload,
+        TimelinePayload::AssistantMessage { .. } | TimelinePayload::AssistantThinking { .. }
+    );
+    let sql = match (stop_at_tool, upper_seq.is_some()) {
+        (true, true) => format!(
+            "SELECT COALESCE(MAX(seq), 0) FROM {table}
+             WHERE agent_id = ?1 AND seq < ?2
+               AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
+                    OR payload_json LIKE '%\"type\":\"tool_call\"%')"
+        ),
+        (true, false) => format!(
+            "SELECT COALESCE(MAX(seq), 0) FROM {table}
+             WHERE agent_id = ?1
+               AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
+                    OR payload_json LIKE '%\"type\":\"tool_call\"%')"
+        ),
+        (false, true) => format!(
+            "SELECT COALESCE(MAX(seq), 0) FROM {table}
+             WHERE agent_id = ?1 AND seq < ?2
+               AND payload_json LIKE '%\"type\":\"user_prompt\"%'"
+        ),
+        (false, false) => format!(
+            "SELECT COALESCE(MAX(seq), 0) FROM {table}
+             WHERE agent_id = ?1
+               AND payload_json LIKE '%\"type\":\"user_prompt\"%'"
+        ),
+    };
+
+    if let Some(max_s) = upper_seq {
+        tx.query_row(&sql, params![agent_id, max_s as i64], |r| r.get(0))
+            .unwrap_or(0)
+    } else {
+        tx.query_row(&sql, params![agent_id], |r| r.get(0))
+            .unwrap_or(0)
+    }
+}
+
 fn coalesce_identity(payload: &TimelinePayload) -> Option<(&'static str, &str)> {
     match payload {
         TimelinePayload::AssistantMessage { item_id, .. }
@@ -892,9 +986,13 @@ fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
     let status_str: String = row.get(7)?;
     let created_str: String = row.get(10)?;
     let updated_str: String = row.get(11)?;
+    let effort_opt_str: Option<String> = row.get(12)?;
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
+    let effort: Option<ReasoningEffort> = effort_opt_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
     let mode: SessionMode = serde_json::from_str(&mode_str).unwrap_or(SessionMode::Default);
     let status: AgentStatus = serde_json::from_str(&status_str).unwrap_or(AgentStatus::Closed);
 
@@ -905,6 +1003,7 @@ fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
         title: row.get(3)?,
         provider,
         model: row.get(5)?,
+        effort,
         mode,
         status,
         parent_agent_id: row.get(8)?,
@@ -949,6 +1048,7 @@ mod tests {
                     title: "Build Daemon".into(),
                     provider: ProviderKind::Antigravity,
                     model: None,
+                    effort: Some(ReasoningEffort::High),
                     mode: SessionMode::AcceptEdits,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -968,6 +1068,7 @@ mod tests {
                 TimelinePayload::UserPrompt {
                     message_id: "m1".into(),
                     text: "Hello Orbit".into(),
+                    badges: Vec::new(),
                 },
             )
             .expect("append e1");

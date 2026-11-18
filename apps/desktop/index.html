@@ -1,11 +1,24 @@
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Orbit — Multi-Host AI Coding Agent Control Plane</title>
+    <title>Orbit</title>
+    <script>
+      (function () {
+        try {
+          var raw = localStorage.getItem("orbit.desktop.prefs.v3");
+          var pref = raw ? JSON.parse(raw).theme : "system";
+          var isDark =
+            pref === "dark" ||
+            ((!pref || pref === "system") &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (isDark) document.documentElement.classList.add("dark");
+        } catch (_) {}
+      })();
+    </script>
   </head>
-  <body class="bg-background text-foreground antialiased selection:bg-primary/25 overflow-hidden">
+  <body class="bg-background text-foreground antialiased selection:bg-primary/20 overflow-hidden">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

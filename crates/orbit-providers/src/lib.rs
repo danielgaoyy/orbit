@@ -8,11 +8,9 @@ pub mod driver;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use orbit_protocol::{ModelOption, ProviderKind, ProviderQuotaSnapshot};
+use orbit_protocol::{ModelOption, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub use driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 
@@ -141,313 +139,59 @@ pub async fn probe_all_provider_quotas() -> Vec<ProviderQuotaSnapshot> {
     [a, b, c].into_iter().flatten().collect()
 }
 
-/// Discover available LLM models across all three providers (combining live CLI probes with curated defaults).
-pub async fn probe_all_provider_models() -> HashMap<ProviderKind, Vec<ModelOption>> {
-    let agy_bin = find_provider_executable(ProviderKind::Antigravity);
-    let codex_bin = find_provider_executable(ProviderKind::Codex);
+/// Instant non-subprocess model catalogs (reads `~/.codex/models_cache.json` + Paseo manifests).
+pub async fn fallback_all_provider_models() -> Vec<ProviderModelCatalog> {
+    let codex = codex::fallback_codex_models().await;
+    let claude = claude::fallback_claude_models();
+    let agy = antigravity::fallback_antigravity_models();
+    vec![claude, codex, agy]
+}
 
-    let agy_fut = async move {
-        if let Some(bin) = agy_bin
-            && let Some(live) = probe_agy_models_live(&bin).await
-            && !live.is_empty()
-        {
-            return live;
+/// Concurrently probe live available models & per-model thinking options across all three providers.
+pub async fn probe_all_provider_models() -> Vec<ProviderModelCatalog> {
+    let installed = discover_installed_providers();
+    let mut agy_path = None;
+    let mut codex_path = None;
+    let mut claude_path = None;
+
+    for p in installed {
+        match p.kind {
+            ProviderKind::Antigravity => agy_path = Some(p.executable_path),
+            ProviderKind::Codex => codex_path = Some(p.executable_path),
+            ProviderKind::ClaudeCode => claude_path = Some(p.executable_path),
         }
-        default_antigravity_models()
-    };
+    }
 
-    let codex_fut = async move {
-        if let Some(bin) = codex_bin
-            && let Some(live) = probe_codex_models_live(&bin).await
-            && !live.is_empty()
-        {
-            return live;
-        }
-        default_codex_models()
-    };
+    let (claude_cat, codex_cat, agy_cat) = tokio::join!(
+        claude::probe_claude_models(claude_path.as_deref()),
+        codex::probe_codex_models(codex_path.as_deref()),
+        antigravity::probe_antigravity_models(agy_path.as_deref()),
+    );
 
-    let (agy_models, codex_models) = tokio::join!(agy_fut, codex_fut);
+    vec![claude_cat, codex_cat, agy_cat]
+}
+
+/// Project structured `ProviderModelCatalog` slices into legacy `ModelOption` maps for mobile FFI.
+pub fn catalogs_to_model_map(
+    catalogs: &[ProviderModelCatalog],
+) -> HashMap<ProviderKind, Vec<ModelOption>> {
     let mut map = HashMap::new();
-    map.insert(ProviderKind::Antigravity, agy_models);
-    map.insert(ProviderKind::Codex, codex_models);
-    map.insert(ProviderKind::ClaudeCode, default_claude_models());
+    for cat in catalogs {
+        let items = cat
+            .models
+            .iter()
+            .map(|m| ModelOption {
+                id: m.id.clone(),
+                label: m.label.clone(),
+                description: if m.description.is_empty() {
+                    None
+                } else {
+                    Some(m.description.clone())
+                },
+                is_default: m.is_default,
+            })
+            .collect();
+        map.insert(cat.provider, items);
+    }
     map
-}
-
-async fn probe_agy_models_live(bin: &Path) -> Option<Vec<ModelOption>> {
-    let mut child = tokio::process::Command::new(bin)
-        .args(["acp", "--stdio"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
-
-    let mut stdin = child.stdin.take()?;
-    let stdout = child.stdout.take()?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    let cwd = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let init_line = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": 1,
-            "clientCapabilities": {},
-            "clientInfo": { "name": "orbit-model-probe", "version": "0.2.1" }
-        }
-    })
-    .to_string();
-    stdin
-        .write_all(format!("{init_line}\n").as_bytes())
-        .await
-        .ok()?;
-    let _ = tokio::time::timeout(Duration::from_secs(4), reader.next_line())
-        .await
-        .ok()?
-        .ok()??;
-
-    let new_line = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "session/new",
-        "params": { "cwd": cwd, "mcpServers": [] }
-    })
-    .to_string();
-    stdin
-        .write_all(format!("{new_line}\n").as_bytes())
-        .await
-        .ok()?;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Ok(Ok(Some(line))) = tokio::time::timeout(rem, reader.next_line()).await else {
-            break;
-        };
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if val.get("id").and_then(|v| v.as_i64()) == Some(2) {
-            let current = val
-                .pointer("/result/models/currentModelId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let arr = val
-                .pointer("/result/models/availableModels")
-                .and_then(|v| v.as_array())?;
-            let mut out = Vec::new();
-            for item in arr {
-                let Some(id) = item.get("modelId").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let label = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(id)
-                    .to_string();
-                let desc = item
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned);
-                out.push(ModelOption {
-                    id: id.to_string(),
-                    label,
-                    description: desc,
-                    is_default: id == current,
-                });
-            }
-            return Some(out);
-        }
-    }
-    None
-}
-
-async fn probe_codex_models_live(bin: &Path) -> Option<Vec<ModelOption>> {
-    let mut child = tokio::process::Command::new(bin)
-        .arg("app-server")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
-
-    let mut stdin = child.stdin.take()?;
-    let stdout = child.stdout.take()?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    let init = serde_json::json!({
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "clientInfo": { "name": "orbit_probe", "title": "Orbit", "version": "0.2.1" },
-            "capabilities": { "experimentalApi": true }
-        }
-    })
-    .to_string();
-    stdin.write_all(format!("{init}\n").as_bytes()).await.ok()?;
-    let _ = tokio::time::timeout(Duration::from_secs(4), reader.next_line())
-        .await
-        .ok()?
-        .ok()??;
-
-    let initialized = serde_json::json!({ "method": "initialized", "params": {} }).to_string();
-    let list_req = serde_json::json!({ "id": 2, "method": "model/list", "params": {} }).to_string();
-    stdin
-        .write_all(format!("{initialized}\n{list_req}\n").as_bytes())
-        .await
-        .ok()?;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-    while tokio::time::Instant::now() < deadline {
-        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Ok(Ok(Some(line))) = tokio::time::timeout(rem, reader.next_line()).await else {
-            break;
-        };
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if val.get("id").and_then(|v| v.as_i64()) == Some(2) {
-            let arr = val.pointer("/result/data").and_then(|v| v.as_array())?;
-            let mut out = Vec::new();
-            for item in arr {
-                let Some(id) = item
-                    .get("id")
-                    .or_else(|| item.get("model"))
-                    .and_then(|v| v.as_str())
-                else {
-                    continue;
-                };
-                let label = item
-                    .get("displayName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(id)
-                    .to_string();
-                let desc = item
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned);
-                let is_def = item
-                    .get("isDefault")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                out.push(ModelOption {
-                    id: id.to_string(),
-                    label,
-                    description: desc,
-                    is_default: is_def,
-                });
-            }
-            return Some(out);
-        }
-    }
-    None
-}
-
-fn default_antigravity_models() -> Vec<ModelOption> {
-    vec![
-        ModelOption {
-            id: "gemini-4-carbon-high".into(),
-            label: "Gemini 4 Carbon (High)".into(),
-            description: Some("深度推理与架构设计旗舰".into()),
-            is_default: true,
-        },
-        ModelOption {
-            id: "gemini-4-carbon-medium".into(),
-            label: "Gemini 4 Carbon (Medium)".into(),
-            description: Some("速度与深度均衡主力".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "gemini-4-argon-high".into(),
-            label: "Gemini 4 Argon (High)".into(),
-            description: Some("高强度复杂代码推理".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "claude-opus-5-5-high".into(),
-            label: "Claude Opus 5.5 (High)".into(),
-            description: Some("Antigravity 内置 Opus 深度模式".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "claude-sonnet-5-5-high".into(),
-            label: "Claude Sonnet 5.5 (High)".into(),
-            description: Some("高响应速度编码模式".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "gemini-3.8-flash-high".into(),
-            label: "Gemini 3.8 Flash (High)".into(),
-            description: Some("极速轻量任务响应".into()),
-            is_default: false,
-        },
-    ]
-}
-
-fn default_codex_models() -> Vec<ModelOption> {
-    vec![
-        ModelOption {
-            id: "gpt-6.1-sol".into(),
-            label: "GPT-6.1-Sol".into(),
-            description: Some("最新日常编码与重构主力模型".into()),
-            is_default: true,
-        },
-        ModelOption {
-            id: "gpt-6-astra".into(),
-            label: "GPT-6-Astra".into(),
-            description: Some("高复杂度架构与攻坚模型".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "gpt-6.1-terra".into(),
-            label: "GPT-6.1-Terra".into(),
-            description: Some("均衡稳定编码模型".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "gpt-5.4".into(),
-            label: "GPT-5.4".into(),
-            description: Some("通用高兼容 Codex 模型".into()),
-            is_default: false,
-        },
-    ]
-}
-
-fn default_claude_models() -> Vec<ModelOption> {
-    vec![
-        ModelOption {
-            id: "claude-opus-5-5".into(),
-            label: "Opus 5.5".into(),
-            description: Some("最新旗舰深度架构与推理模型".into()),
-            is_default: true,
-        },
-        ModelOption {
-            id: "claude-sonnet-5-5".into(),
-            label: "Sonnet 5.5".into(),
-            description: Some("高速高质主力编码模型".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "claude-opus-4-6".into(),
-            label: "Opus 4.6".into(),
-            description: Some("经典稳定复杂工程模型".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "claude-sonnet-4-6".into(),
-            label: "Sonnet 4.6".into(),
-            description: Some("轻量快速日常开发".into()),
-            is_default: false,
-        },
-        ModelOption {
-            id: "claude-haiku-5-5".into(),
-            label: "Haiku 5.5".into(),
-            description: Some("瞬时响应问答与检索".into()),
-            is_default: false,
-        },
-    ]
 }

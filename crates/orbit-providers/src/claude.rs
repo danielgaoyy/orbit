@@ -2,13 +2,14 @@
 //! + `~/.claude/.credentials.json` / macOS Keychain OAuth Usage).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, ProviderKind, ProviderQuotaSnapshot, QuestionItem, QuotaWindow, SessionMode,
-    ToolCallDetail, ToolCallStatus,
+    AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
+    QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, ToolCallDetail,
+    ToolCallStatus,
 };
 use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, spawn_detached_shim};
 use serde::Deserialize;
@@ -64,6 +65,19 @@ pub async fn spawn_claude_session(
     );
     env.insert("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into());
     env.insert("NO_COLOR".into(), "1".into());
+    if let Some(eff) = cfg.effort {
+        let eff_str = match eff {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+            ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
+        };
+        if let Some(s) = eff_str {
+            env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), s.into());
+        }
+    }
 
     let spec = ShimSpawnSpec {
         shim_id: format!("claude_{}", cfg.agent_id),
@@ -209,7 +223,7 @@ async fn run_claude_actor(
                         });
                         let _ = shim.write_stdin_line(req.to_string()).await;
                     }
-                    DriverCommand::SetModel { model } => {
+                    DriverCommand::SetConfig { model, effort } => {
                         if let Some(m) = model {
                             let rid = format!("ctrl_{ctrl_seq}");
                             ctrl_seq += 1;
@@ -219,6 +233,27 @@ async fn run_claude_actor(
                                 "request": {
                                     "subtype": "set_model",
                                     "model": m
+                                }
+                            });
+                            let _ = shim.write_stdin_line(req.to_string()).await;
+                        }
+                        if let Some(eff) = effort {
+                            let max_tokens = match eff {
+                                ReasoningEffort::Off => 0,
+                                ReasoningEffort::Low => 4_000,
+                                ReasoningEffort::Medium => 10_000,
+                                ReasoningEffort::High => 16_000,
+                                ReasoningEffort::Xhigh => 24_000,
+                                ReasoningEffort::Max | ReasoningEffort::Ultra => 31_999,
+                            };
+                            let rid = format!("ctrl_{ctrl_seq}");
+                            ctrl_seq += 1;
+                            let req = json!({
+                                "request_id": rid,
+                                "type": "control_request",
+                                "request": {
+                                    "subtype": "set_max_thinking_tokens",
+                                    "max_thinking_tokens": max_tokens
                                 }
                             });
                             let _ = shim.write_stdin_line(req.to_string()).await;
@@ -1063,4 +1098,227 @@ fn truncate_claude(s: &str, max_chars: usize) -> String {
         out.push_str("...");
         out
     }
+}
+
+// --- Paseo-Aligned Claude Code First-Party Model Manifest (`model-manifest.ts`) ---
+
+struct ClaudeManifestRow {
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    min_version: Option<(u32, u32, u32)>,
+    default_priority: u8,
+    default_effort: Option<ReasoningEffort>,
+    efforts: &'static [ReasoningEffort],
+}
+
+const EFFORTS_XHIGH_WITH_OFF: &[ReasoningEffort] = &[
+    ReasoningEffort::Off,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+    ReasoningEffort::Max,
+];
+
+const EFFORTS_XHIGH: &[ReasoningEffort] = &[
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+    ReasoningEffort::Max,
+];
+
+const EFFORTS_STANDARD_WITH_OFF: &[ReasoningEffort] = &[
+    ReasoningEffort::Off,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Max,
+];
+
+const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
+    ClaudeManifestRow {
+        id: "claude-opus-5-5",
+        label: "Opus 5.5",
+        description: "Opus 5.5 · Latest release",
+        min_version: Some((2, 1, 280)),
+        default_priority: 3,
+        default_effort: Some(ReasoningEffort::Medium),
+        efforts: EFFORTS_XHIGH,
+    },
+    ClaudeManifestRow {
+        id: "claude-fable-5-2",
+        label: "Fable 5.2",
+        description: "Fable 5.2 · Most powerful model",
+        min_version: Some((2, 1, 321)),
+        default_priority: 0,
+        default_effort: Some(ReasoningEffort::Medium),
+        efforts: EFFORTS_XHIGH,
+    },
+    ClaudeManifestRow {
+        id: "claude-sonnet-5-5",
+        label: "Sonnet 5.5",
+        description: "Sonnet 5.5 · Best for everyday tasks",
+        min_version: Some((2, 1, 284)),
+        default_priority: 0,
+        default_effort: Some(ReasoningEffort::Medium),
+        efforts: EFFORTS_XHIGH,
+    },
+    ClaudeManifestRow {
+        id: "claude-haiku-5-5",
+        label: "Haiku 5.5",
+        description: "Haiku 5.5 · Fastest for quick answers",
+        min_version: Some((2, 1, 293)),
+        default_priority: 0,
+        default_effort: Some(ReasoningEffort::Medium),
+        efforts: EFFORTS_XHIGH_WITH_OFF,
+    },
+    ClaudeManifestRow {
+        id: "claude-opus-5",
+        label: "Opus 5",
+        description: "Opus 5 · Previous release",
+        min_version: Some((2, 1, 219)),
+        default_priority: 2,
+        default_effort: Some(ReasoningEffort::High),
+        efforts: EFFORTS_XHIGH_WITH_OFF,
+    },
+    ClaudeManifestRow {
+        id: "claude-fable-5-1",
+        label: "Fable 5.1",
+        description: "Fable 5.1 · Previous release",
+        min_version: None,
+        default_priority: 0,
+        default_effort: Some(ReasoningEffort::High),
+        efforts: EFFORTS_XHIGH,
+    },
+    ClaudeManifestRow {
+        id: "claude-sonnet-5",
+        label: "Sonnet 5",
+        description: "Sonnet 5 · Previous release",
+        min_version: None,
+        default_priority: 0,
+        default_effort: Some(ReasoningEffort::High),
+        efforts: EFFORTS_XHIGH_WITH_OFF,
+    },
+    ClaudeManifestRow {
+        id: "claude-opus-4-8",
+        label: "Opus 4.8",
+        description: "Opus 4.8 · Previous release",
+        min_version: None,
+        default_priority: 1,
+        default_effort: Some(ReasoningEffort::High),
+        efforts: EFFORTS_XHIGH_WITH_OFF,
+    },
+    ClaudeManifestRow {
+        id: "claude-opus-4-6",
+        label: "Opus 4.6",
+        description: "Opus 4.6 · Most capable for complex work",
+        min_version: None,
+        default_priority: 0,
+        default_effort: Some(ReasoningEffort::High),
+        efforts: EFFORTS_STANDARD_WITH_OFF,
+    },
+    ClaudeManifestRow {
+        id: "claude-sonnet-4-6",
+        label: "Sonnet 4.6",
+        description: "Sonnet 4.6 · Best for everyday tasks",
+        min_version: None,
+        default_priority: 0,
+        default_effort: Some(ReasoningEffort::High),
+        efforts: EFFORTS_STANDARD_WITH_OFF,
+    },
+    ClaudeManifestRow {
+        id: "claude-haiku-4-5",
+        label: "Haiku 4.5",
+        description: "Haiku 4.5 · Previous release",
+        min_version: None,
+        default_priority: 0,
+        default_effort: None,
+        efforts: &[],
+    },
+];
+
+fn parse_semver_prefix(raw: &str) -> Option<(u32, u32, u32)> {
+    for tok in raw.split_whitespace() {
+        let cleaned = tok.trim_start_matches('v');
+        let mut parts = cleaned.split(['.', '-']);
+        if let (Some(a), Some(b), Some(c)) = (parts.next(), parts.next(), parts.next())
+            && let (Ok(maj), Ok(min), Ok(pat)) =
+                (a.parse::<u32>(), b.parse::<u32>(), c.parse::<u32>())
+        {
+            return Some((maj, min, pat));
+        }
+    }
+    None
+}
+
+fn build_claude_catalog_for_version(version: Option<(u32, u32, u32)>) -> ProviderModelCatalog {
+    let eligible: Vec<&ClaudeManifestRow> = CLAUDE_MANIFEST
+        .iter()
+        .filter(|row| match (row.min_version, version) {
+            (Some(min_v), Some(cur_v)) => cur_v >= min_v,
+            _ => true,
+        })
+        .collect();
+
+    let best_default_id = eligible
+        .iter()
+        .max_by_key(|row| row.default_priority)
+        .map(|row| row.id);
+
+    let models = eligible
+        .into_iter()
+        .map(|row| {
+            let thinking_options = row
+                .efforts
+                .iter()
+                .map(|eff| ThinkingOptionSpec {
+                    effort: *eff,
+                    label: eff.display_label().to_string(),
+                    description: None,
+                    is_default: Some(*eff) == row.default_effort,
+                })
+                .collect();
+
+            ProviderModelSpec {
+                id: row.id.to_string(),
+                label: row.label.to_string(),
+                description: row.description.to_string(),
+                is_default: Some(row.id) == best_default_id,
+                default_effort: row.default_effort,
+                thinking_options,
+            }
+        })
+        .collect();
+
+    ProviderModelCatalog {
+        provider: ProviderKind::ClaudeCode,
+        models,
+        configured_default_model: best_default_id.map(ToOwned::to_owned),
+        configured_default_effort: Some(ReasoningEffort::Medium),
+    }
+}
+
+pub fn fallback_claude_models() -> ProviderModelCatalog {
+    build_claude_catalog_for_version(None)
+}
+
+pub async fn probe_claude_models(executable: Option<&Path>) -> ProviderModelCatalog {
+    let Some(exe) = executable else {
+        return fallback_claude_models();
+    };
+    let ver = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::process::Command::new(exe)
+            .arg("--version")
+            .env("NO_COLOR", "1")
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .and_then(|out| parse_semver_prefix(&String::from_utf8_lossy(&out.stdout)));
+
+    build_claude_catalog_for_version(ver)
 }

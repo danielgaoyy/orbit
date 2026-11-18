@@ -53,6 +53,7 @@ import { XtermPane, type XtermStreamChunk } from "@/components/xterm-pane";
 import {
   type AgentCardView,
   type AgentTimelineView,
+  type AppUpdateProgress,
   type ClientProjectView,
   type CoreNotification,
   type FleetOverviewView,
@@ -63,6 +64,7 @@ import {
   type ModelOption,
   type ProviderKind,
   type QuestionItem,
+  type ReleaseUpdateInfo,
   type SessionMode,
   type SshHostItem,
   type TimelineItemView,
@@ -993,6 +995,15 @@ export default function App() {
   const [cfgStatusMsg, setCfgStatusMsg] = useState<string | null>(null);
   const [cfgBusy, setCfgBusy] = useState(false);
 
+  // Built-in 1-Click In-App Self-Updater State
+  const [appVersion, setAppVersion] = useState("0.2.4");
+  const [updateInfo, setUpdateInfo] = useState<ReleaseUpdateInfo | null>(null);
+  const [updateModalOpen, setUpdateModalOpen] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updatingApp, setUpdatingApp] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<AppUpdateProgress | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const selectedHostIdRef = useRef<string | null>(null);
   const selectedAgentIdRef = useRef<string | null>(null);
@@ -1025,6 +1036,63 @@ export default function App() {
       void reloadHost(h.host_id);
     }
   }, [reloadHost]);
+
+  const checkUpdateSilently = useCallback(async () => {
+    try {
+      const info = await orbitIpc.checkAppUpdate();
+      setUpdateInfo(info);
+      if (info.current_version) {
+        setAppVersion(info.current_version);
+      }
+    } catch {
+      // Ignore transient offline errors during background polling
+    }
+  }, []);
+
+  const openAppUpdateModal = useCallback(async () => {
+    setUpdateModalOpen(true);
+    setUpdateError(null);
+    setCheckingUpdate(true);
+    try {
+      const info = await orbitIpc.checkAppUpdate();
+      setUpdateInfo(info);
+      if (info.current_version) {
+        setAppVersion(info.current_version);
+      }
+    } catch (e) {
+      setUpdateError(String(e));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }, []);
+
+  const handleTriggerSelfUpdate = useCallback(async () => {
+    if (!updateInfo) return;
+    setUpdatingApp(true);
+    setUpdateError(null);
+    setUpdateProgress({
+      progress: 0.02,
+      status: `正在准备下载 ${updateInfo.tag_name}…`,
+      done: false,
+    });
+    try {
+      await orbitIpc.performAppSelfUpdate(updateInfo, (ev) => {
+        setUpdateProgress(ev);
+      });
+    } catch (e) {
+      setUpdateError(String(e));
+      setUpdatingApp(false);
+    }
+  }, [updateInfo]);
+
+  useEffect(() => {
+    void orbitIpc.getAppVersion().then(setAppVersion).catch(() => {});
+    void checkUpdateSilently();
+    const timer = window.setInterval(() => {
+      void checkUpdateSilently();
+    }, 15 * 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, [checkUpdateSilently]);
 
   useEffect(() => {
     void reloadFleet();
@@ -1413,15 +1481,40 @@ export default function App() {
           PASEO-STYLE LEFT SIDEBAR (`Project -> Workspace` Hierarchy)
       ===================================================================== */}
       <aside className="flex w-72 shrink-0 flex-col border-r border-white/8 bg-[#0F1219]">
-        {/* Brand + "+ 新对话" */}
+        {/* Brand + Version Update Button + "+ 新对话" */}
         <div className="flex items-center justify-between px-3.5 pt-3.5 pb-2.5">
-          <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex min-w-0 items-center gap-2">
             <img
               src="/orbit-logo.png"
               alt="Orbit"
               className="size-7 shrink-0 rounded-lg ring-1 ring-white/15"
             />
             <span className="truncate text-sm font-bold tracking-tight">Orbit</span>
+            <button
+              type="button"
+              title={
+                updateInfo?.has_newer_version
+                  ? `发现新版本 ${updateInfo.tag_name} · 点此一键自动更新`
+                  : `当前版本 v${appVersion} · 点此检查更新`
+              }
+              onClick={() => void openAppUpdateModal()}
+              className={cn(
+                "flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors",
+                updateInfo?.has_newer_version
+                  ? "bg-sky-500/20 text-sky-300 ring-1 ring-sky-400/40 hover:bg-sky-500/30"
+                  : "bg-white/[0.05] text-zinc-400 hover:bg-white/[0.1] hover:text-zinc-200",
+              )}
+            >
+              <ArrowUpFromLine className="size-3" />
+              <span>
+                {updateInfo?.has_newer_version
+                  ? `更新 ${updateInfo.tag_name}`
+                  : `v${appVersion}`}
+              </span>
+              {updateInfo?.has_newer_version && (
+                <span className="size-1.5 rounded-full bg-sky-400" />
+              )}
+            </button>
           </div>
           <Button
             size="xs"
@@ -1628,8 +1721,23 @@ export default function App() {
           )}
         </div>
 
-        {/* Machine Status & Tuning Footer */}
-        <div className="border-t border-white/8 p-2.5">
+        {/* 1-Click Update Notification Strip + Machine Status Footer */}
+        <div className="space-y-1.5 border-t border-white/8 p-2.5">
+          {updateInfo?.has_newer_version && (
+            <button
+              type="button"
+              onClick={() => void openAppUpdateModal()}
+              className="flex w-full cursor-pointer items-center justify-between rounded-xl border border-sky-500/35 bg-sky-500/12 px-3 py-2 text-xs text-sky-200 transition-colors hover:bg-sky-500/20"
+            >
+              <span className="flex min-w-0 items-center gap-2 font-medium">
+                <ArrowUpFromLine className="size-3.5 shrink-0 text-sky-400" />
+                <span className="truncate">发现新版本 {updateInfo.tag_name}</span>
+              </span>
+              <span className="shrink-0 rounded-full bg-sky-500/25 px-2 py-0.5 text-[10.5px] font-semibold text-sky-200">
+                一键更新
+              </span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() => {
@@ -2704,6 +2812,122 @@ export default function App() {
               </div>
             </>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* =====================================================================
+          MODAL 7: 1-CLICK IN-APP SELF-UPDATER (macOS .dmg / Linux .deb)
+      ===================================================================== */}
+      <Dialog
+        open={updateModalOpen}
+        onOpenChange={(o) => {
+          if (!updatingApp) setUpdateModalOpen(o);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ArrowUpFromLine className="size-4 text-sky-400" />
+              Orbit 客户端版本与一键更新
+            </DialogTitle>
+            <DialogDescription>
+              无需手动下载安装包或敲命令，自动拉取最新 Release、替换应用、清理签名属性并重启
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3.5 text-xs">
+            <div className="flex items-center justify-between rounded-xl border border-white/10 bg-[#141822] px-3.5 py-2.5">
+              <div>
+                <div className="text-zinc-400">当前运行版本</div>
+                <div className="mt-0.5 font-mono text-sm font-semibold">v{appVersion}</div>
+              </div>
+              <div className="text-right">
+                <div className="text-zinc-400">GitHub 最新版本</div>
+                <div className="mt-0.5 font-mono text-sm font-semibold text-sky-300">
+                  {checkingUpdate
+                    ? "检查中…"
+                    : updateInfo
+                      ? updateInfo.tag_name
+                      : "未获取"}
+                </div>
+              </div>
+            </div>
+
+            {updateInfo?.notes && (
+              <div className="max-h-36 overflow-y-auto rounded-xl border border-white/8 bg-black/30 p-3 font-mono text-[11px] whitespace-pre-wrap text-zinc-300">
+                {updateInfo.notes}
+              </div>
+            )}
+
+            {updatingApp && updateProgress && (
+              <div className="space-y-2 rounded-xl border border-sky-500/30 bg-sky-500/10 p-3">
+                <div className="flex items-center justify-between text-[11px] text-sky-200">
+                  <span className="flex items-center gap-1.5">
+                    <Loader2 className="size-3.5 animate-spin text-sky-400" />
+                    {updateProgress.status}
+                  </span>
+                  <span className="font-mono">
+                    {Math.round(updateProgress.progress * 100)}%
+                  </span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                  <div
+                    className="h-full rounded-full bg-sky-400 transition-all duration-200"
+                    style={{ width: `${Math.round(updateProgress.progress * 100)}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {updateError && (
+              <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-rose-300">
+                更新异常: {updateError}
+              </div>
+            )}
+
+            <div className="flex items-center justify-between pt-1">
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={checkingUpdate || updatingApp}
+                onClick={() => void openAppUpdateModal()}
+              >
+                <RefreshCw className={cn("size-3.5", checkingUpdate && "animate-spin")} />
+                重新检查
+              </Button>
+
+              {updateInfo?.has_newer_version ? (
+                <Button
+                  size="sm"
+                  disabled={updatingApp || checkingUpdate}
+                  onClick={() => void handleTriggerSelfUpdate()}
+                >
+                  {updatingApp ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <ArrowUpFromLine className="size-3.5" />
+                  )}
+                  一键更新至 {updateInfo.tag_name} 并重启
+                </Button>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <span className="flex items-center gap-1 text-emerald-400">
+                    <CheckCircle2 className="size-3.5" /> 已是最新版本
+                  </span>
+                  {updateInfo && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={updatingApp || checkingUpdate}
+                      onClick={() => void handleTriggerSelfUpdate()}
+                    >
+                      重装当前版
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
         </DialogContent>
       </Dialog>
     </div>

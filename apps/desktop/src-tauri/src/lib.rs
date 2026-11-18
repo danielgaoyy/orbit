@@ -1,6 +1,13 @@
+mod updater;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use crate::updater::{
+    AppUpdateProgress, CURRENT_APP_VERSION, ReleaseUpdateInfo, check_latest_release,
+    perform_one_click_update,
+};
 
 use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
@@ -403,6 +410,24 @@ async fn provision_ssh_relay(
     Ok(relay_url)
 }
 
+#[tauri::command]
+fn get_app_version() -> &'static str {
+    CURRENT_APP_VERSION
+}
+
+#[tauri::command]
+async fn check_app_update() -> Result<ReleaseUpdateInfo, String> {
+    check_latest_release().await
+}
+
+#[tauri::command]
+async fn perform_app_self_update(
+    release: ReleaseUpdateInfo,
+    on_progress: Channel<AppUpdateProgress>,
+) -> Result<(), String> {
+    perform_one_click_update(release, on_progress).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_path = default_desktop_db_path();
@@ -449,6 +474,9 @@ pub fn run() {
             resize_terminal,
             list_ssh_hosts,
             provision_ssh_relay,
+            get_app_version,
+            check_app_update,
+            perform_app_self_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Orbit Tauri desktop application");

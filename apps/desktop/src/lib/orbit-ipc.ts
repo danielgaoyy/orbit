@@ -17,6 +17,24 @@ export type HostConnectionState =
 
 export type HostRouteMode = "auto" | "ssh_tunnel" | "direct_only" | "relay_only";
 
+export interface ReleaseUpdateInfo {
+  current_version: string;
+  tag_name: string;
+  latest_version: string;
+  html_url: string;
+  notes: string;
+  has_newer_version: boolean;
+  macos_dmg_url: string | null;
+  linux_arm64_deb_url: string | null;
+  linux_x64_deb_url: string | null;
+}
+
+export interface AppUpdateProgress {
+  progress: number;
+  status: string;
+  done: boolean;
+}
+
 export interface ClientProjectView {
   project_id: string;
   host_id: string;
@@ -404,8 +422,8 @@ export const orbitIpc = {
   },
 
   pairHost: (pairingUri: string) => invoke<HostCardView>("pair_host", { pairingUri }),
-  pairSshHost: (sshAlias: string, remotePort = 6868) =>
-    invoke<HostCardView>("pair_ssh_host", { sshAlias, remotePort }),
+  pairSshHost: (sshAlias: string, remotePort?: number | null) =>
+    invoke<HostCardView>("pair_ssh_host", { sshAlias, remotePort: remotePort ?? null }),
   removeHost: (hostId: string) => invoke<void>("remove_host", { hostId }),
   updateHostConfig: (params: {
     hostId: string;
@@ -419,8 +437,12 @@ export const orbitIpc = {
   }) => invoke<HostCardView>("update_host_config", params),
   updateHostRelay: (hostId: string, relayUrl: string | null) =>
     invoke<void>("update_host_relay", { hostId, relayUrl }),
-  upgradeRemoteDaemon: (hostId: string, sshAlias: string, remotePort = 6868) =>
-    invoke<string>("upgrade_remote_daemon", { hostId, sshAlias, remotePort }),
+  upgradeRemoteDaemon: (hostId: string, sshAlias: string, remotePort?: number | null) =>
+    invoke<string>("upgrade_remote_daemon", {
+      hostId,
+      sshAlias,
+      remotePort: remotePort ?? null,
+    }),
 
   upsertProject: (params: {
     projectId?: string | null;
@@ -520,4 +542,25 @@ export const orbitIpc = {
     fallbackHostname: string;
     relayPort: number;
   }) => invoke<string>("provision_ssh_relay", params),
+
+  getAppVersion: async (): Promise<string> => {
+    if (!isTauriRuntime()) return "0.2.4";
+    return invoke<string>("get_app_version");
+  },
+
+  checkAppUpdate: async (): Promise<ReleaseUpdateInfo> => {
+    return invoke<ReleaseUpdateInfo>("check_app_update");
+  },
+
+  performAppSelfUpdate: async (
+    release: ReleaseUpdateInfo,
+    onProgress: (ev: AppUpdateProgress) => void,
+  ): Promise<void> => {
+    const ch = new Channel<AppUpdateProgress>();
+    ch.onmessage = onProgress;
+    return invoke<void>("perform_app_self_update", {
+      release,
+      onProgress: ch,
+    });
+  },
 };

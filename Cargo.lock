@@ -1504,7 +1504,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "orbit-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-client-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-crypto"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-daemon"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-ffi-ohos"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "napi-build-ohos",
  "napi-derive-ohos",
@@ -1596,7 +1596,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-ffi-uniffi"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "orbit-client-core",
  "orbit-protocol",
@@ -1606,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-protocol"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "serde",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-providers"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "orbit-protocol",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-relay"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "axum",
@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-shim"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "base64 0.22.1",
  "portable-pty",
@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-store"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "orbit-protocol",

@@ -193,6 +193,64 @@ pub async fn create_isolated_worktree(
     Ok(target_dir)
 }
 
+/// Fast repository file listing (`git ls-files`) for `@` context mention autocomplete across local & remote hosts.
+pub async fn list_workspace_files(cwd: &Path, limit: usize) -> Vec<String> {
+    if let Ok(out) = Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .current_dir(cwd)
+        .output()
+        .await
+        && out.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(limit)
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+
+    let mut out = Vec::new();
+    collect_shallow_files_sync(cwd, cwd, 0, limit, &mut out);
+    out
+}
+
+fn collect_shallow_files_sync(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    limit: usize,
+    out: &mut Vec<String>,
+) {
+    if depth > 3 || out.len() >= limit {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.')
+            || matches!(name, "node_modules" | "target" | "dist" | "build" | ".git")
+        {
+            continue;
+        }
+        if path.is_dir() {
+            collect_shallow_files_sync(root, &path, depth + 1, limit, out);
+        } else if let Ok(rel) = path.strip_prefix(root) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
 fn empty_non_git(cwd: String) -> GitStatusSnapshot {
     GitStatusSnapshot {
         cwd,

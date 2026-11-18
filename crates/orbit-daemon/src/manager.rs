@@ -7,8 +7,8 @@ use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_protocol::{
-    AgentStatus, AgentSummary, ProviderKind, QuestionItem, SessionMode, TerminalSummary,
-    TimelineEvent, TimelinePayload, WorkspaceSummary,
+    AgentStatus, AgentSummary, PromptBadge, ProviderKind, QuestionItem, ReasoningEffort,
+    SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, WorkspaceSummary,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, SessionLaunchConfig, find_provider_executable,
@@ -62,8 +62,11 @@ pub struct CreateAgentSpec {
     pub title: Option<String>,
     pub provider: ProviderKind,
     pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
     pub mode: SessionMode,
     pub initial_prompt: String,
+    pub initial_display_prompt: Option<String>,
+    pub initial_badges: Vec<PromptBadge>,
     pub worktree: bool,
 }
 
@@ -153,8 +156,11 @@ impl AgentOrchestrator {
             title,
             provider,
             model,
+            effort,
             mode,
             initial_prompt,
+            initial_display_prompt,
+            initial_badges,
             worktree,
         } = spec;
         let executable = find_provider_executable(provider).ok_or_else(|| {
@@ -165,8 +171,13 @@ impl AgentOrchestrator {
             )
         })?;
 
+        let human_seed = derive_human_seed(
+            initial_display_prompt.as_deref(),
+            &initial_badges,
+            &initial_prompt,
+        );
         let ws = if worktree {
-            let auto_branch = auto_worktree_branch(&initial_prompt);
+            let auto_branch = auto_worktree_branch(&human_seed);
             match self
                 .ensure_workspace(&cwd, None, Some(auto_branch), None)
                 .await
@@ -179,7 +190,7 @@ impl AgentOrchestrator {
         };
         let now = Utc::now();
         let agent_id = format!("ag_{}", Uuid::new_v4().simple());
-        let computed_title = title.unwrap_or_else(|| summarize_prompt_title(&initial_prompt));
+        let computed_title = title.unwrap_or_else(|| summarize_prompt_title(&human_seed));
 
         let summary = AgentSummary {
             agent_id: agent_id.clone(),
@@ -188,6 +199,7 @@ impl AgentOrchestrator {
             title: computed_title,
             provider,
             model: model.clone(),
+            effort,
             mode: mode.clone(),
             status: AgentStatus::Initializing,
             parent_agent_id: None,
@@ -202,8 +214,14 @@ impl AgentOrchestrator {
             .await?;
 
         if !initial_prompt.trim().is_empty() {
-            self.dispatch_user_prompt(&agent_id, &cmd_tx, initial_prompt)
-                .await?;
+            self.dispatch_user_prompt(
+                &agent_id,
+                &cmd_tx,
+                initial_prompt,
+                initial_display_prompt,
+                initial_badges,
+            )
+            .await?;
         }
 
         Ok(self.store.get_agent(&agent_id)?.unwrap_or(summary))
@@ -214,6 +232,17 @@ impl AgentOrchestrator {
         agent_id: &str,
         prompt: String,
     ) -> anyhow::Result<()> {
+        self.send_prompt_with_meta(agent_id, prompt, None, Vec::new())
+            .await
+    }
+
+    pub async fn send_prompt_with_meta(
+        self: &Arc<Self>,
+        agent_id: &str,
+        prompt: String,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
+    ) -> anyhow::Result<()> {
         let needs_handoff = !self.live_agents.read().await.contains_key(agent_id)
             && self.store.get_persistence_ref(agent_id)?.is_none();
         let handoff_context = if needs_handoff {
@@ -222,8 +251,15 @@ impl AgentOrchestrator {
             None
         };
         let cmd_tx = self.get_or_resume_driver(agent_id).await?;
-        self.dispatch_user_prompt_with_handoff(agent_id, &cmd_tx, prompt, handoff_context)
-            .await
+        self.dispatch_user_prompt_with_handoff(
+            agent_id,
+            &cmd_tx,
+            prompt,
+            display_prompt,
+            badges,
+            handoff_context,
+        )
+        .await
     }
 
     async fn dispatch_user_prompt(
@@ -231,9 +267,18 @@ impl AgentOrchestrator {
         agent_id: &str,
         cmd_tx: &mpsc::Sender<DriverCommand>,
         prompt: String,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
     ) -> anyhow::Result<()> {
-        self.dispatch_user_prompt_with_handoff(agent_id, cmd_tx, prompt, None)
-            .await
+        self.dispatch_user_prompt_with_handoff(
+            agent_id,
+            cmd_tx,
+            prompt,
+            display_prompt,
+            badges,
+            None,
+        )
+        .await
     }
 
     async fn dispatch_user_prompt_with_handoff(
@@ -241,16 +286,20 @@ impl AgentOrchestrator {
         agent_id: &str,
         cmd_tx: &mpsc::Sender<DriverCommand>,
         prompt: String,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
         handoff_context: Option<String>,
     ) -> anyhow::Result<()> {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
+        let visible_text = display_prompt.unwrap_or_else(|| prompt.clone());
         let ev = self.store.append_timeline_event(
             agent_id,
             1,
             Some(&turn_id),
             TimelinePayload::UserPrompt {
                 message_id: format!("u_{}", Uuid::new_v4().simple()),
-                text: prompt.clone(),
+                text: visible_text,
+                badges,
             },
         )?;
         let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
@@ -275,8 +324,13 @@ impl AgentOrchestrator {
         let mut turns = Vec::new();
         for ev in events {
             match ev.payload {
-                TimelinePayload::UserPrompt { text, .. } => {
-                    turns.push(format!("User: {text}"));
+                TimelinePayload::UserPrompt { text, badges, .. } => {
+                    if !text.trim().is_empty() {
+                        turns.push(format!("User: {text}"));
+                    } else if !badges.is_empty() {
+                        let summary: Vec<&str> = badges.iter().map(|b| b.label.as_str()).collect();
+                        turns.push(format!("User: {}", summary.join(" ")));
+                    }
                 }
                 TimelinePayload::AssistantMessage {
                     text,
@@ -319,10 +373,31 @@ impl AgentOrchestrator {
         Ok(())
     }
 
+    pub async fn set_agent_config(
+        &self,
+        agent_id: &str,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+    ) -> anyhow::Result<()> {
+        self.store
+            .update_agent_config(agent_id, model.as_deref(), effort)?;
+        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+            let _ = tx.send(DriverCommand::SetConfig { model, effort }).await;
+        }
+        if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
+    }
+
     pub async fn switch_agent_provider(
         &self,
         agent_id: &str,
         provider: ProviderKind,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
     ) -> anyhow::Result<()> {
         let _ = find_provider_executable(provider).ok_or_else(|| {
             anyhow::anyhow!(
@@ -335,7 +410,8 @@ impl AgentOrchestrator {
         if let Some(tx) = self.live_agents.write().await.remove(agent_id) {
             let _ = tx.send(DriverCommand::Shutdown).await;
         }
-        self.store.switch_agent_provider(agent_id, provider)?;
+        self.store
+            .switch_agent_provider(agent_id, provider, model.as_deref(), effort)?;
 
         if let Ok(ev) = self.store.append_timeline_event(
             agent_id,
@@ -462,6 +538,7 @@ impl AgentOrchestrator {
             shim_socket,
             cwd: PathBuf::from(&summary.cwd),
             model: summary.model.clone(),
+            effort: summary.effort,
             mode: summary.mode.clone(),
             resume_session_id,
         })
@@ -731,6 +808,31 @@ fn resolve_orbit_exe() -> PathBuf {
         return cur;
     }
     PathBuf::from("orbit")
+}
+
+fn derive_human_seed(
+    display_prompt: Option<&str>,
+    badges: &[PromptBadge],
+    fallback_wire: &str,
+) -> String {
+    if let Some(dp) = display_prompt {
+        let trimmed = dp.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(slash) = badges.iter().find(|b| b.kind == "slash") {
+        return match slash.label.as_str() {
+            "/review" => "Code review".to_string(),
+            "/plan" => "Implementation plan".to_string(),
+            "/compact" => "Compact context".to_string(),
+            other => other.to_string(),
+        };
+    }
+    if let Some(first) = badges.first() {
+        return first.label.clone();
+    }
+    fallback_wire.to_string()
 }
 
 fn summarize_prompt_title(prompt: &str) -> String {

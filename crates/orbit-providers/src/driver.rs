@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use orbit_protocol::{
-    AgentStatus, ProviderKind, QuestionItem, SessionMode, ToolCallDetail, ToolCallStatus,
+    AgentStatus, ProviderKind, QuestionItem, ReasoningEffort, SessionMode, ToolCallDetail,
+    ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -17,6 +18,7 @@ pub struct SessionLaunchConfig {
     pub shim_socket: PathBuf,
     pub cwd: PathBuf,
     pub model: Option<String>,
+    pub effort: Option<ReasoningEffort>,
     pub mode: SessionMode,
     pub resume_session_id: Option<String>,
 }
@@ -30,6 +32,10 @@ pub enum DriverCommand {
     Interrupt,
     SetMode {
         mode: SessionMode,
+    },
+    SetConfig {
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
     },
     ResolvePermission {
         request_id: String,

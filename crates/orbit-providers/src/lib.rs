@@ -8,7 +8,7 @@ pub mod driver;
 use std::env;
 use std::path::{Path, PathBuf};
 
-use orbit_protocol::{ProviderKind, ProviderQuotaSnapshot};
+use orbit_protocol::{ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot};
 use serde::{Deserialize, Serialize};
 
 pub use driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
@@ -136,4 +136,36 @@ pub async fn probe_all_provider_quotas() -> Vec<ProviderQuotaSnapshot> {
 
     let (a, b, c) = tokio::join!(agy_fut, codex_fut, claude_fut);
     [a, b, c].into_iter().flatten().collect()
+}
+
+/// Instant non-subprocess model catalogs (reads `~/.codex/models_cache.json` + Paseo manifests).
+pub async fn fallback_all_provider_models() -> Vec<ProviderModelCatalog> {
+    let codex = codex::fallback_codex_models().await;
+    let claude = claude::fallback_claude_models();
+    let agy = antigravity::fallback_antigravity_models();
+    vec![claude, codex, agy]
+}
+
+/// Concurrently probe live available models & per-model thinking options across all three providers.
+pub async fn probe_all_provider_models() -> Vec<ProviderModelCatalog> {
+    let installed = discover_installed_providers();
+    let mut agy_path = None;
+    let mut codex_path = None;
+    let mut claude_path = None;
+
+    for p in installed {
+        match p.kind {
+            ProviderKind::Antigravity => agy_path = Some(p.executable_path),
+            ProviderKind::Codex => codex_path = Some(p.executable_path),
+            ProviderKind::ClaudeCode => claude_path = Some(p.executable_path),
+        }
+    }
+
+    let (claude_cat, codex_cat, agy_cat) = tokio::join!(
+        claude::probe_claude_models(claude_path.as_deref()),
+        codex::probe_codex_models(codex_path.as_deref()),
+        antigravity::probe_antigravity_models(agy_path.as_deref()),
+    );
+
+    vec![claude_cat, codex_cat, agy_cat]
 }

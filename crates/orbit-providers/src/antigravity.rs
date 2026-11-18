@@ -7,12 +7,14 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, ProviderKind, ProviderQuotaSnapshot, QuestionItem, QuotaWindow, SessionMode,
-    ToolCallDetail, ToolCallStatus,
+    AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
+    QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, ToolCallDetail,
+    ToolCallStatus,
 };
 use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, spawn_detached_shim};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
@@ -33,6 +35,19 @@ pub async fn spawn_antigravity_session(
 
     let mut env = HashMap::new();
     env.insert("NO_COLOR".into(), "1".into());
+    if let Some(eff) = cfg.effort {
+        let eff_str = match eff {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+            ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
+        };
+        if let Some(s) = eff_str {
+            env.insert("AGY_EFFORT".into(), s.into());
+        }
+    }
 
     let spec = ShimSpawnSpec {
         shim_id: format!("agy_{}", cfg.agent_id),
@@ -182,29 +197,72 @@ async fn run_agy_actor(
         .unwrap_or("unknown")
         .to_string();
 
-    let mut current_model = sess_val
+    let available_model_ids: HashSet<String> = sess_val
+        .pointer("/models/availableModels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("modelId").and_then(|s| s.as_str()))
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let canonical_base_ids: HashSet<String> = sess_val
+        .get("configOptions")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("model"))
+        })
+        .and_then(|opt| opt.get("options"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("value").and_then(|s| s.as_str()))
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let raw_initial_model = sess_val
         .pointer("/models/currentModelId")
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
         .or_else(|| cfg.model.clone());
 
-    // Optional `session/set_model`
-    if let Some(ref wanted_model) = cfg.model
-        && let Ok(rx) = send_acp_req(
+    let mut active_effort = cfg.effort;
+    let mut current_base_model = raw_initial_model
+        .as_deref()
+        .map(|m| normalize_agy_base_model_id(m, &canonical_base_ids))
+        .or_else(|| cfg.model.clone());
+
+    // Optional `session/set_model` when explicit model or effort was requested
+    if (cfg.model.is_some() || cfg.effort.is_some())
+        && let Some(ref base_m) = cfg.model.as_ref().or(current_base_model.as_ref()).cloned()
+    {
+        let wire_model_id = resolve_agy_wire_model_id(
+            base_m,
+            active_effort,
+            &available_model_ids,
+            &canonical_base_ids,
+        );
+        if let Ok(rx) = send_acp_req(
             &shim,
             &mut next_rpc_id,
             &mut pending_rpcs,
             "session/set_model",
             json!({
                 "sessionId": session_id,
-                "modelId": wanted_model
+                "modelId": wire_model_id
             }),
         )
         .await
-        && let Ok(v) = wait_rpc_during_boot(&mut shim, &mut pending_rpcs, rx).await
-        && let Some(m) = v.pointer("/models/currentModelId").and_then(|x| x.as_str())
-    {
-        current_model = Some(m.to_string());
+            && let Ok(v) = wait_rpc_during_boot(&mut shim, &mut pending_rpcs, rx).await
+            && let Some(m) = v.pointer("/models/currentModelId").and_then(|x| x.as_str())
+        {
+            current_base_model = Some(normalize_agy_base_model_id(m, &canonical_base_ids));
+        }
     }
 
     // Optional `session/set_mode` for `accept-edits` (ignore -32601)
@@ -227,7 +285,7 @@ async fn run_agy_actor(
     let _ = evt_tx
         .send(DriverEvent::SessionInitialized {
             persistence_ref: session_id.clone(),
-            model: current_model,
+            model: current_base_model.clone(),
         })
         .await;
     let _ = evt_tx
@@ -316,6 +374,36 @@ async fn run_agy_actor(
                                 "params": {
                                     "sessionId": session_id,
                                     "modeId": mode_str
+                                }
+                            })
+                            .to_string();
+                            let _ = shim.write_stdin_line(req).await;
+                        }
+                    }
+                    DriverCommand::SetConfig { model, effort } => {
+                        if let Some(m) = model {
+                            current_base_model =
+                                Some(normalize_agy_base_model_id(&m, &canonical_base_ids));
+                        }
+                        if effort.is_some() {
+                            active_effort = effort;
+                        }
+                        if let Some(ref base_m) = current_base_model {
+                            let wire_model_id = resolve_agy_wire_model_id(
+                                base_m,
+                                active_effort,
+                                &available_model_ids,
+                                &canonical_base_ids,
+                            );
+                            let id = next_rpc_id;
+                            next_rpc_id += 1;
+                            let req = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "method": "session/set_model",
+                                "params": {
+                                    "sessionId": session_id,
+                                    "modelId": wire_model_id
                                 }
                             })
                             .to_string();
@@ -1466,5 +1554,416 @@ fn truncate_preview(s: &str, max_chars: usize) -> String {
         let mut out: String = s.chars().take(max_chars).collect();
         out.push_str("...");
         out
+    }
+}
+
+// --- Antigravity ACP Model & Thinking Catalog Probing (`agy acp --stdio` `session/new`) ---
+
+fn strip_trailing_effort_suffix(model_id: &str) -> (&str, Option<ReasoningEffort>) {
+    for (suffix, eff) in [
+        ("-xhigh", ReasoningEffort::Xhigh),
+        ("-ultra", ReasoningEffort::Ultra),
+        ("-medium", ReasoningEffort::Medium),
+        ("-high", ReasoningEffort::High),
+        ("-low", ReasoningEffort::Low),
+        ("-max", ReasoningEffort::Max),
+    ] {
+        if let Some(base) = model_id.strip_suffix(suffix) {
+            return (base, Some(eff));
+        }
+    }
+    (model_id, None)
+}
+
+fn normalize_agy_base_model_id(raw_id: &str, canonical_bases: &HashSet<String>) -> String {
+    if canonical_bases.contains(raw_id) {
+        return raw_id.to_string();
+    }
+    let (stripped, _) = strip_trailing_effort_suffix(raw_id);
+    if canonical_bases.is_empty() || canonical_bases.contains(stripped) {
+        return stripped.to_string();
+    }
+    raw_id.to_string()
+}
+
+fn resolve_agy_wire_model_id(
+    wanted_model: &str,
+    effort: Option<ReasoningEffort>,
+    available_ids: &HashSet<String>,
+    canonical_bases: &HashSet<String>,
+) -> String {
+    if available_ids.is_empty() {
+        return wanted_model.to_string();
+    }
+    let base = normalize_agy_base_model_id(wanted_model, canonical_bases);
+    if let Some(eff) = effort {
+        let candidate_suffixes: &[&str] = match eff {
+            ReasoningEffort::Off | ReasoningEffort::Low => &["low", "medium"],
+            ReasoningEffort::Medium => &["medium", "high", "low"],
+            ReasoningEffort::High => &["high", "medium"],
+            ReasoningEffort::Xhigh | ReasoningEffort::Max | ReasoningEffort::Ultra => {
+                &["xhigh", "max", "high", "medium"]
+            }
+        };
+        for suf in candidate_suffixes {
+            let candidate = format!("{base}-{suf}");
+            if available_ids.contains(&candidate) {
+                return candidate;
+            }
+        }
+    }
+    if available_ids.contains(wanted_model) {
+        return wanted_model.to_string();
+    }
+    for fallback_suf in ["medium", "high", "low"] {
+        let candidate = format!("{base}-{fallback_suf}");
+        if available_ids.contains(&candidate) {
+            return candidate;
+        }
+    }
+    wanted_model.to_string()
+}
+
+struct AgyFallbackRow<'a> {
+    id: &'static str,
+    label: &'static str,
+    desc: &'static str,
+    is_default: bool,
+    default_effort: Option<ReasoningEffort>,
+    efforts: &'a [ReasoningEffort],
+}
+
+pub fn fallback_antigravity_models() -> ProviderModelCatalog {
+    let std_efforts = [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+    ];
+    let xhigh_efforts = [
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Xhigh,
+    ];
+
+    let rows = [
+        AgyFallbackRow {
+            id: "gemini-4-carbon",
+            label: "Gemini 4 Carbon",
+            desc: "Flagship reasoning & multi-file software engineering",
+            is_default: true,
+            default_effort: Some(ReasoningEffort::Medium),
+            efforts: &std_efforts,
+        },
+        AgyFallbackRow {
+            id: "gemini-4-argon",
+            label: "Gemini 4 Argon",
+            desc: "Balanced coding, architecture & tool orchestration",
+            is_default: false,
+            default_effort: Some(ReasoningEffort::Medium),
+            efforts: &std_efforts,
+        },
+        AgyFallbackRow {
+            id: "gemini-4-hydrogen",
+            label: "Gemini 4 Hydrogen",
+            desc: "Extended deep reasoning with Extra High budget",
+            is_default: false,
+            default_effort: Some(ReasoningEffort::High),
+            efforts: &xhigh_efforts,
+        },
+        AgyFallbackRow {
+            id: "gemini-pro-orchestrator",
+            label: "Orchestrator (Carbon)",
+            desc: "Multi-agent coordinator powered by Carbon",
+            is_default: false,
+            default_effort: None,
+            efforts: &[],
+        },
+        AgyFallbackRow {
+            id: "gemini-pro-orchestrator-argon",
+            label: "Orchestrator (Argon)",
+            desc: "Multi-agent coordinator powered by Argon",
+            is_default: false,
+            default_effort: None,
+            efforts: &[],
+        },
+        AgyFallbackRow {
+            id: "gemini-3.8-flash",
+            label: "Gemini 3.8 Flash",
+            desc: "High-speed interactive coding & rapid iteration",
+            is_default: false,
+            default_effort: Some(ReasoningEffort::Medium),
+            efforts: &std_efforts,
+        },
+        AgyFallbackRow {
+            id: "claude-opus-5-5",
+            label: "Claude Opus 5.5",
+            desc: "Anthropic flagship model on Antigravity",
+            is_default: false,
+            default_effort: Some(ReasoningEffort::Medium),
+            efforts: &std_efforts,
+        },
+        AgyFallbackRow {
+            id: "claude-sonnet-5-5",
+            label: "Claude Sonnet 5.5",
+            desc: "Fast everyday coding & refactoring",
+            is_default: false,
+            default_effort: Some(ReasoningEffort::Medium),
+            efforts: &std_efforts,
+        },
+    ];
+
+    let models = rows
+        .iter()
+        .map(|row| ProviderModelSpec {
+            id: row.id.to_string(),
+            label: row.label.to_string(),
+            description: row.desc.to_string(),
+            is_default: row.is_default,
+            default_effort: row.default_effort,
+            thinking_options: row
+                .efforts
+                .iter()
+                .map(|e| ThinkingOptionSpec {
+                    effort: *e,
+                    label: e.display_label().to_string(),
+                    description: None,
+                    is_default: Some(*e) == row.default_effort,
+                })
+                .collect(),
+        })
+        .collect();
+
+    ProviderModelCatalog {
+        provider: ProviderKind::Antigravity,
+        models,
+        configured_default_model: Some("gemini-4-carbon".to_string()),
+        configured_default_effort: Some(ReasoningEffort::Medium),
+    }
+}
+
+pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderModelCatalog {
+    let Some(exe) = executable else {
+        return fallback_antigravity_models();
+    };
+
+    let probe_cwd = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let rpc_res = tokio::time::timeout(Duration::from_secs(6), async {
+        let mut child = Command::new(exe)
+            .args(["acp", "--stdio"])
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err("agy stdin unavailable".to_string());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return Err("agy stdout unavailable".to_string());
+        };
+        let mut lines = BufReader::new(stdout).lines();
+
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {
+                    "name": "orbit_model_probe",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }
+        });
+        stdin
+            .write_all(format!("{init_req}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && v.get("id").and_then(|x| x.as_i64()) == Some(1)
+            {
+                break;
+            }
+        }
+
+        let new_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": {
+                "cwd": probe_cwd.to_string_lossy(),
+                "mcpServers": []
+            }
+        });
+        stdin
+            .write_all(format!("{new_req}\n").as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
+        stdin.flush().await.map_err(|e| e.to_string())?;
+
+        let mut sess_result: Option<Value> = None;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(v) = serde_json::from_str::<Value>(&line)
+                && v.get("id").and_then(|x| x.as_i64()) == Some(2)
+            {
+                sess_result = v.get("result").cloned();
+                break;
+            }
+        }
+
+        // Best-effort close temporary probe session cleanly before terminating
+        if let Some(sid) = sess_result
+            .as_ref()
+            .and_then(|r| r.get("sessionId"))
+            .and_then(|v| v.as_str())
+        {
+            let close_req = json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/close",
+                "params": { "sessionId": sid }
+            });
+            let _ = stdin.write_all(format!("{close_req}\n").as_bytes()).await;
+            let _ = stdin.flush().await;
+        }
+
+        let _ = child.kill().await;
+        Ok::<Option<Value>, String>(sess_result)
+    })
+    .await;
+
+    let Ok(Ok(Some(res_val))) = rpc_res else {
+        return fallback_antigravity_models();
+    };
+
+    let available_ids: Vec<String> = res_val
+        .pointer("/models/availableModels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("modelId").and_then(|x| x.as_str()))
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let config_options = res_val
+        .get("configOptions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let model_opt = config_options
+        .iter()
+        .find(|o| o.get("id").and_then(|x| x.as_str()) == Some("model"));
+    let thought_opt = config_options
+        .iter()
+        .find(|o| o.get("id").and_then(|x| x.as_str()) == Some("thought_level"));
+
+    let default_model_id = model_opt
+        .and_then(|o| o.get("currentValue"))
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned);
+    let default_effort = thought_opt
+        .and_then(|o| o.get("currentValue"))
+        .and_then(|v| v.as_str())
+        .and_then(ReasoningEffort::from_slug)
+        .or(Some(ReasoningEffort::Medium));
+
+    let mut models = Vec::new();
+    if let Some(opts) = model_opt
+        .and_then(|o| o.get("options"))
+        .and_then(|v| v.as_array())
+    {
+        for opt in opts {
+            let Some(base_id) = opt
+                .get("value")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+            else {
+                continue;
+            };
+            let label = opt
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(base_id)
+                .to_string();
+            let description = opt
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Discover exact supported efforts for this base model from `availableModels`
+            let mut supported_efforts = Vec::new();
+            for (suf, eff) in [
+                ("low", ReasoningEffort::Low),
+                ("medium", ReasoningEffort::Medium),
+                ("high", ReasoningEffort::High),
+                ("xhigh", ReasoningEffort::Xhigh),
+                ("max", ReasoningEffort::Max),
+            ] {
+                let candidate = format!("{base_id}-{suf}");
+                if available_ids.iter().any(|aid| aid == &candidate) {
+                    supported_efforts.push(eff);
+                }
+            }
+
+            let model_def_eff = if supported_efforts.is_empty() {
+                None
+            } else if let Some(de) = default_effort
+                && supported_efforts.contains(&de)
+            {
+                Some(de)
+            } else {
+                supported_efforts.first().copied()
+            };
+
+            let thinking_options = supported_efforts
+                .into_iter()
+                .map(|eff| ThinkingOptionSpec {
+                    effort: eff,
+                    label: eff.display_label().to_string(),
+                    description: None,
+                    is_default: Some(eff) == model_def_eff,
+                })
+                .collect();
+
+            models.push(ProviderModelSpec {
+                id: base_id.to_string(),
+                label,
+                description,
+                is_default: default_model_id.as_deref() == Some(base_id),
+                default_effort: model_def_eff,
+                thinking_options,
+            });
+        }
+    }
+
+    if models.is_empty() {
+        return fallback_antigravity_models();
+    }
+    if !models.iter().any(|m| m.is_default)
+        && let Some(first) = models.first_mut()
+    {
+        first.is_default = true;
+    }
+
+    ProviderModelCatalog {
+        provider: ProviderKind::Antigravity,
+        models,
+        configured_default_model: default_model_id,
+        configured_default_effort: default_effort,
     }
 }

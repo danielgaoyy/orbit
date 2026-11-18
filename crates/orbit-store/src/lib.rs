@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, AgentSummary, ProviderKind, SessionMode, TerminalSummary, TimelineEvent,
-    TimelinePayload, WorkspaceSummary,
+    AgentStatus, AgentSummary, ProviderKind, ReasoningEffort, SessionMode, TerminalSummary,
+    TimelineEvent, TimelinePayload, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,7 @@ impl OrbitStore {
                 title           TEXT NOT NULL,
                 provider_json   TEXT NOT NULL,
                 model           TEXT,
+                effort_json     TEXT,
                 mode_json       TEXT NOT NULL,
                 status_json     TEXT NOT NULL,
                 parent_agent_id TEXT,
@@ -112,6 +113,8 @@ impl OrbitStore {
             );
             ",
         )?;
+        // Non-destructive column migration for pre-existing databases
+        let _ = conn.execute("ALTER TABLE agents ADD COLUMN effort_json TEXT", []);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -191,20 +194,26 @@ impl OrbitStore {
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let provider_json = serde_json::to_string(&agent.provider)?;
+        let effort_json = agent
+            .effort
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let mode_json = serde_json::to_string(&agent.mode)?;
         let status_json = serde_json::to_string(&agent.status)?;
 
         conn.execute(
             "
             INSERT INTO agents (
-                agent_id, workspace_id, cwd, title, provider_json, model,
+                agent_id, workspace_id, cwd, title, provider_json, model, effort_json,
                 mode_json, status_json, parent_agent_id, persistence_ref,
                 latest_seq, created_at, updated_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(agent_id) DO UPDATE SET
                 title = excluded.title,
                 model = excluded.model,
+                effort_json = excluded.effort_json,
                 mode_json = excluded.mode_json,
                 status_json = excluded.status_json,
                 persistence_ref = COALESCE(excluded.persistence_ref, agents.persistence_ref),
@@ -218,6 +227,7 @@ impl OrbitStore {
                 agent.title,
                 provider_json,
                 agent.model,
+                effort_json,
                 mode_json,
                 status_json,
                 agent.parent_agent_id,
@@ -234,7 +244,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at
+                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json
              FROM agents WHERE agent_id = ?1",
             params![agent_id],
             map_agent_row,
@@ -253,21 +263,41 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn update_agent_config(
+        &self,
+        agent_id: &str,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let effort_json = effort.as_ref().map(serde_json::to_string).transpose()?;
+        conn.execute(
+            "UPDATE agents SET model = ?1, effort_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
+            params![model, effort_json, Utc::now().to_rfc3339(), agent_id],
+        )?;
+        Ok(())
+    }
+
     pub fn switch_agent_provider(
         &self,
         agent_id: &str,
         provider: ProviderKind,
+        model: Option<&str>,
+        effort: Option<ReasoningEffort>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let provider_json = serde_json::to_string(&provider)?;
+        let effort_json = effort.as_ref().map(serde_json::to_string).transpose()?;
         let status_json = serde_json::to_string(&AgentStatus::Idle)?;
         conn.execute(
             "UPDATE agents
-             SET provider_json = ?1, model = NULL, persistence_ref = NULL,
-                 status_json = ?2, updated_at = ?3
-             WHERE agent_id = ?4",
+             SET provider_json = ?1, model = ?2, effort_json = ?3, persistence_ref = NULL,
+                 status_json = ?4, updated_at = ?5
+             WHERE agent_id = ?6",
             params![
                 provider_json,
+                model,
+                effort_json,
                 status_json,
                 Utc::now().to_rfc3339(),
                 agent_id
@@ -295,11 +325,11 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let sql = if workspace_id.is_some() {
             "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at
+                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json
              FROM agents WHERE workspace_id = ?1 ORDER BY updated_at DESC"
         } else {
             "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at
+                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json
              FROM agents ORDER BY updated_at DESC"
         };
 
@@ -562,9 +592,13 @@ fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
     let status_str: String = row.get(7)?;
     let created_str: String = row.get(10)?;
     let updated_str: String = row.get(11)?;
+    let effort_opt_str: Option<String> = row.get(12)?;
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
+    let effort: Option<ReasoningEffort> = effort_opt_str
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
     let mode: SessionMode = serde_json::from_str(&mode_str).unwrap_or(SessionMode::Default);
     let status: AgentStatus = serde_json::from_str(&status_str).unwrap_or(AgentStatus::Closed);
 
@@ -575,6 +609,7 @@ fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
         title: row.get(3)?,
         provider,
         model: row.get(5)?,
+        effort,
         mode,
         status,
         parent_agent_id: row.get(8)?,
@@ -619,6 +654,7 @@ mod tests {
                     title: "Build Daemon".into(),
                     provider: ProviderKind::Antigravity,
                     model: None,
+                    effort: Some(ReasoningEffort::High),
                     mode: SessionMode::AcceptEdits,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -638,6 +674,7 @@ mod tests {
                 TimelinePayload::UserPrompt {
                     message_id: "m1".into(),
                     text: "Hello Orbit".into(),
+                    badges: Vec::new(),
                 },
             )
             .expect("append e1");

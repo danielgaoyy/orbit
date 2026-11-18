@@ -662,6 +662,7 @@ impl From<TimelineItemView> for FfiTimelineItem {
                 message_id,
                 text,
                 blocks,
+                ..
             } => Self::UserPrompt {
                 seq,
                 message_id,

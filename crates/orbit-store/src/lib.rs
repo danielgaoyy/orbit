@@ -253,6 +253,29 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn switch_agent_provider(
+        &self,
+        agent_id: &str,
+        provider: ProviderKind,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let provider_json = serde_json::to_string(&provider)?;
+        let status_json = serde_json::to_string(&AgentStatus::Idle)?;
+        conn.execute(
+            "UPDATE agents
+             SET provider_json = ?1, model = NULL, persistence_ref = NULL,
+                 status_json = ?2, updated_at = ?3
+             WHERE agent_id = ?4",
+            params![
+                provider_json,
+                status_json,
+                Utc::now().to_rfc3339(),
+                agent_id
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_persistence_ref(&self, agent_id: &str, pref: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute(

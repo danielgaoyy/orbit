@@ -84,9 +84,18 @@ export interface TerminalSummary {
   created_at: string;
 }
 
+export interface DiscoveredProject {
+  path: string;
+  name: string;
+  git_branch: string | null;
+  is_git_repo: boolean;
+  last_modified_unix: number;
+}
+
 export interface HostDetailView {
   revision: number;
   host: HostCardView;
+  discovered_projects: DiscoveredProject[];
   workspaces: WorkspaceSummary[];
   agents: AgentCardView[];
   quotas: ProviderQuotaSnapshot[];

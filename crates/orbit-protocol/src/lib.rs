@@ -94,6 +94,16 @@ pub struct WorkspaceSummary {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Auto-discovered local project / Git repository choice for zero-typing UI selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredProject {
+    pub path: String,
+    pub name: String,
+    pub git_branch: Option<String>,
+    pub is_git_repo: bool,
+    pub last_modified_unix: i64,
+}
+
 /// Git file entry status for mobile working-tree review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitFileEntry {
@@ -294,6 +304,13 @@ pub enum WireMessage {
     },
 
     // Workspaces & Git / Worktrees
+    DiscoverProjects {
+        request_id: Uuid,
+    },
+    DiscoveredProjectsSnapshot {
+        request_id: Uuid,
+        projects: Vec<DiscoveredProject>,
+    },
     ListWorkspaces {
         request_id: Uuid,
     },
@@ -351,6 +368,8 @@ pub enum WireMessage {
         model: Option<String>,
         mode: SessionMode,
         initial_prompt: String,
+        #[serde(default)]
+        worktree: bool,
     },
     AgentCreated {
         request_id: Uuid,
@@ -372,6 +391,11 @@ pub enum WireMessage {
         request_id: Uuid,
         agent_id: String,
         mode: SessionMode,
+    },
+    SwitchAgentProvider {
+        request_id: Uuid,
+        agent_id: String,
+        provider: ProviderKind,
     },
     ArchiveAgent {
         request_id: Uuid,
@@ -575,6 +599,7 @@ mod tests {
             model: Some("gemini-pro".into()),
             mode: SessionMode::AcceptEdits,
             initial_prompt: "Build the Rust agent orchestrator!".repeat(20),
+            worktree: false,
         };
         let raw_json = serde_json::to_vec(&msg).expect("serialize");
         let compressed = msg.encode_zstd(3).expect("compress");

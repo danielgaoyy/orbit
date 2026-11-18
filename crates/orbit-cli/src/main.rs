@@ -204,6 +204,9 @@ enum Commands {
         model: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
+        /// Automatically run inside an isolated git worktree branch.
+        #[arg(long)]
+        worktree: bool,
         #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
         server: String,
         /// Initial prompt to send to the agent.
@@ -724,6 +727,7 @@ async fn main() -> anyhow::Result<()> {
             mode,
             model,
             cwd,
+            worktree,
             server,
             prompt,
         } => {
@@ -744,6 +748,7 @@ async fn main() -> anyhow::Result<()> {
                         model,
                         mode: mode.into(),
                         initial_prompt: prompt,
+                        worktree,
                     },
                     Duration::from_secs(35),
                     |w| {

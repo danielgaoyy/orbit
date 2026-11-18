@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
-    AgentStatus, AgentSummary, GitStatusSnapshot, ProviderKind, ProviderQuotaSnapshot,
-    QuestionItem, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
-    TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceSummary,
+    AgentStatus, AgentSummary, DiscoveredProject, GitStatusSnapshot, ProviderKind,
+    ProviderQuotaSnapshot, QuestionItem, SessionMode, TerminalBinaryFrame, TerminalSummary,
+    TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceSummary,
 };
 use orbit_store::{OrbitStore, StoredHostProfile};
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,7 @@ pub struct AgentCardView {
 pub struct HostDetailView {
     pub revision: u64,
     pub host: HostCardView,
+    pub discovered_projects: Vec<DiscoveredProject>,
     pub workspaces: Vec<WorkspaceSummary>,
     pub agents: Vec<AgentCardView>,
     pub quotas: Vec<ProviderQuotaSnapshot>,
@@ -187,6 +188,7 @@ struct HostMemoryState {
     last_error: Option<String>,
     available_providers: Vec<ProviderKind>,
     session: Option<HostSessionHandle>,
+    discovered_projects: Vec<DiscoveredProject>,
     workspaces: Vec<WorkspaceSummary>,
     agents: HashMap<String, AgentSummary>,
     timelines: HashMap<String, Vec<TimelineEvent>>,
@@ -211,6 +213,7 @@ impl HostMemoryState {
                 ProviderKind::ClaudeCode,
             ],
             session: None,
+            discovered_projects: Vec::new(),
             workspaces: Vec::new(),
             agents: HashMap::new(),
             timelines: HashMap::new(),
@@ -383,6 +386,7 @@ impl OrbitAppCore {
         Some(HostDetailView {
             revision: rev,
             host: state.to_card(),
+            discovered_projects: state.discovered_projects.clone(),
             workspaces: state.workspaces.clone(),
             agents,
             quotas: state.quotas.clone(),
@@ -730,7 +734,12 @@ impl OrbitAppCore {
                 }
                 self.emit(|revision| CoreNotification::FleetChanged { revision });
 
-                // Request initial snapshots immediately upon connecting
+                // Request initial snapshots & zero-config project discovery upon connecting
+                let _ = handle
+                    .send_wire(WireMessage::DiscoverProjects {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
                 let _ = handle
                     .send_wire(WireMessage::ListWorkspaces {
                         request_id: Uuid::new_v4(),
@@ -802,6 +811,10 @@ impl OrbitAppCore {
                         state.available_providers = host.available_providers;
                     }
                     notify_fleet = true;
+                    notify_host = true;
+                }
+                WireMessage::DiscoveredProjectsSnapshot { projects, .. } => {
+                    state.discovered_projects = projects;
                     notify_host = true;
                 }
                 WireMessage::WorkspacesSnapshot { workspaces, .. } => {
@@ -972,6 +985,12 @@ impl OrbitAppCore {
     pub fn refresh_host(&self, host_id: &str) {
         self.dispatch_wire(
             host_id,
+            WireMessage::DiscoverProjects {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
             WireMessage::ListWorkspaces {
                 request_id: Uuid::new_v4(),
             },
@@ -1009,7 +1028,9 @@ impl OrbitAppCore {
         initial_prompt: &str,
         worktree_branch: Option<&str>,
     ) {
-        if let Some(branch) = worktree_branch.map(str::trim).filter(|b| !b.is_empty()) {
+        let clean_branch = worktree_branch.map(str::trim).filter(|b| !b.is_empty());
+        let use_auto_worktree = clean_branch == Some("auto");
+        if let Some(branch) = clean_branch.filter(|b| *b != "auto") {
             self.dispatch_wire(
                 host_id,
                 WireMessage::CreateWorkspace {
@@ -1031,6 +1052,7 @@ impl OrbitAppCore {
                 model: None,
                 mode,
                 initial_prompt: initial_prompt.to_string(),
+                worktree: use_auto_worktree,
             },
         );
     }
@@ -1096,6 +1118,17 @@ impl OrbitAppCore {
             revision,
             host_id: host_id.to_string(),
         });
+    }
+
+    pub fn switch_agent_provider(&self, host_id: &str, agent_id: &str, provider: ProviderKind) {
+        self.dispatch_wire(
+            host_id,
+            WireMessage::SwitchAgentProvider {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+                provider,
+            },
+        );
     }
 
     pub fn archive_agent(&self, host_id: &str, agent_id: &str) {

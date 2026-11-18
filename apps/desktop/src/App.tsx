@@ -971,6 +971,21 @@ export default function App() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
+            {hostDetail && hostDetail.discovered_projects.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+                {hostDetail.discovered_projects.map((proj) => (
+                  <Button
+                    key={proj.path}
+                    size="xs"
+                    variant={newCwd === proj.path ? "default" : "outline"}
+                    onClick={() => setNewCwd(proj.path)}
+                    title={proj.path}
+                  >
+                    {proj.name}
+                  </Button>
+                ))}
+              </div>
+            )}
             <Input
               placeholder="Workspace path (e.g. /home/dev/project)"
               value={newCwd}

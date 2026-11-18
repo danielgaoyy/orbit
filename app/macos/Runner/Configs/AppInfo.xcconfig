@@ -1,4 +1,0 @@
-// Application-level settings for the Runner target.
-PRODUCT_NAME = Orbit
-PRODUCT_BUNDLE_IDENTIFIER = dev.orbit.app
-PRODUCT_COPYRIGHT = Copyright © 2026 Orbit Contributors. All rights reserved.

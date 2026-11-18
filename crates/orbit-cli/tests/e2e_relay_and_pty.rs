@@ -13,7 +13,13 @@ use uuid::Uuid;
 
 #[tokio::test]
 async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
-    let temp_home = std::env::temp_dir().join(format!("orbit_e2e_{}", Uuid::new_v4().simple()));
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home = base_tmp.join(format!("orb_e2e_{short_id}"));
     std::fs::create_dir_all(&temp_home).expect("mkdir");
 
     // 1. Bootstrap Daemon first to know its static X25519 public key for Relay allowlisting

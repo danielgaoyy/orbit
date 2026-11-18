@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::desktop_ops::{
-    bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri, normalize_relay_input,
+    bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri, extract_ws_port,
+    normalize_relay_input,
 };
 use crate::render::{
     DiffFileView, RichBlockView, TerminalGridEmulator, TerminalScreenView, parse_markdown_blocks,
@@ -227,6 +228,7 @@ struct HostMemoryState {
     daemon_version: Option<String>,
     os_arch: Option<String>,
     reconnect_attempt: u32,
+    ssh_heal_attempted: bool,
     connecting_in_flight: bool,
     available_providers: Vec<ProviderKind>,
     session: Option<HostSessionHandle>,
@@ -260,6 +262,7 @@ impl HostMemoryState {
             daemon_version: None,
             os_arch: None,
             reconnect_attempt: 0,
+            ssh_heal_attempted: false,
             connecting_in_flight: false,
             available_providers: vec![
                 ProviderKind::Antigravity,
@@ -405,8 +408,9 @@ impl OrbitAppCore {
             && let Ok(offer) = PairingOffer::from_qr_uri(&uri)
             && !initial_hosts.contains_key(&offer.host_id)
         {
+            let local_port = extract_ws_port(&offer.direct_endpoints).unwrap_or(6868);
             let mut endpoints = offer.direct_endpoints;
-            let loopback = "ws://127.0.0.1:6868/ws".to_string();
+            let loopback = format!("ws://127.0.0.1:{local_port}/ws");
             if !endpoints.contains(&loopback) {
                 endpoints.insert(0, loopback);
             }
@@ -416,7 +420,7 @@ impl OrbitAppCore {
                 custom_name: None,
                 ssh_alias: None,
                 route_mode: HostRouteMode::Auto,
-                remote_daemon_port: 6868,
+                remote_daemon_port: local_port,
                 custom_direct_endpoint: None,
                 daemon_pubkey_b64: offer.daemon_pubkey_b64,
                 direct_endpoints: endpoints,
@@ -817,7 +821,7 @@ impl OrbitAppCore {
     pub fn pair_ssh_host_blocking(
         self: &Arc<Self>,
         alias: &str,
-        remote_port: u16,
+        remote_port: Option<u16>,
     ) -> Result<HostCardView, ClientCoreError> {
         let uri =
             bootstrap_ssh_host_and_pair(alias, remote_port).map_err(ClientCoreError::Handshake)?;
@@ -827,9 +831,10 @@ impl OrbitAppCore {
     fn pair_host_internal(
         self: &Arc<Self>,
         pairing_uri: &str,
-        ssh_info: Option<(String, u16)>,
+        ssh_info: Option<(String, Option<u16>)>,
     ) -> Result<HostCardView, ClientCoreError> {
         let offer = PairingOffer::from_qr_uri(pairing_uri)?;
+        let detected_port = extract_ws_port(&offer.direct_endpoints);
         let (card, stored) = {
             let mut guard = self
                 .hosts
@@ -843,7 +848,8 @@ impl OrbitAppCore {
                 .or_else(|| prev.and_then(|h| h.profile.ssh_alias.clone()));
             let remote_port = ssh_info
                 .as_ref()
-                .map(|(_, p)| *p)
+                .and_then(|(_, p)| *p)
+                .or(detected_port)
                 .or_else(|| prev.map(|h| h.profile.remote_daemon_port))
                 .unwrap_or(6868);
             let route_mode = prev
@@ -869,6 +875,7 @@ impl OrbitAppCore {
                 .entry(offer.host_id.clone())
                 .or_insert_with(|| HostMemoryState::new(profile.clone()));
             entry.profile = profile;
+            entry.ssh_heal_attempted = false;
             (entry.to_card(), entry.to_stored_host())
         };
 
@@ -948,6 +955,7 @@ impl OrbitAppCore {
             if let Some(ref relay) = raw_relay_url {
                 h.profile.relay_url = normalize_relay_input(Some(relay));
             }
+            h.ssh_heal_attempted = false;
             (h.to_card(), h.to_stored_host())
         };
 
@@ -1027,6 +1035,7 @@ impl OrbitAppCore {
         match connect_smart(&profile, Some(self.store.clone())).await {
             Ok(handle) => {
                 let mut rx = handle.subscribe();
+                let welcome_host = handle.welcome_host.clone();
                 let (queued_outbox, resub_timelines) = {
                     let Ok(mut guard) = self.hosts.write() else {
                         return;
@@ -1036,6 +1045,7 @@ impl OrbitAppCore {
                     };
                     h.connecting_in_flight = false;
                     h.reconnect_attempt = 0;
+                    h.ssh_heal_attempted = false;
                     h.profile.state = handle.mode;
                     h.via_ssh_tunnel = handle.via_ssh_tunnel;
                     h.last_error = None;
@@ -1053,23 +1063,18 @@ impl OrbitAppCore {
                         .collect();
                     (outbox, resubs)
                 };
-                self.emit(|revision| CoreNotification::FleetChanged { revision });
-                self.emit(|revision| CoreNotification::HostChanged {
-                    revision,
-                    host_id: host_id.to_string(),
-                });
+                if let Some(host_info) = welcome_host {
+                    self.handle_inbound_wire(host_id, WireMessage::Welcome { host: host_info });
+                } else {
+                    self.emit(|revision| CoreNotification::FleetChanged { revision });
+                    self.emit(|revision| CoreNotification::HostChanged {
+                        revision,
+                        host_id: host_id.to_string(),
+                    });
+                }
 
-                // Initial state refresh + live models + quotas
-                let _ = handle
-                    .send_wire(WireMessage::DiscoverProjects {
-                        request_id: Uuid::new_v4(),
-                    })
-                    .await;
-                let _ = handle
-                    .send_wire(WireMessage::ListModels {
-                        request_id: Uuid::new_v4(),
-                    })
-                    .await;
+                // Fast SQLite state (`< 2ms`) FIRST so sidebar sessions appear immediately,
+                // followed by filesystem project discovery & background quota probes!
                 let _ = handle
                     .send_wire(WireMessage::ListWorkspaces {
                         request_id: Uuid::new_v4(),
@@ -1082,7 +1087,17 @@ impl OrbitAppCore {
                     })
                     .await;
                 let _ = handle
+                    .send_wire(WireMessage::ListModels {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListTerminals {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::DiscoverProjects {
                         request_id: Uuid::new_v4(),
                     })
                     .await;
@@ -1127,6 +1142,13 @@ impl OrbitAppCore {
                 });
             }
             Err(err) => {
+                let is_identity_mismatch =
+                    matches!(err, ClientCoreError::HostIdentityMismatch { .. });
+                if is_identity_mismatch {
+                    let _ = self.store.clear_host_replica(host_id);
+                }
+
+                let mut ssh_self_heal_alias: Option<String> = None;
                 let mut backoff_ms = None;
                 if let Ok(mut guard) = self.hosts.write()
                     && let Some(h) = guard.get_mut(host_id)
@@ -1136,19 +1158,73 @@ impl OrbitAppCore {
                     h.via_ssh_tunnel = false;
                     h.last_error = Some(err.to_string());
                     h.reconnect_attempt = h.reconnect_attempt.saturating_add(1);
-                    backoff_ms = Some(match h.reconnect_attempt {
-                        1 => 2000,
-                        2 => 4000,
-                        3 => 7000,
-                        _ => 12000,
-                    });
+
+                    if is_identity_mismatch {
+                        h.workspaces.clear();
+                        h.agents.clear();
+                        h.discovered_projects.clear();
+                        h.timelines.clear();
+                    }
+
+                    if !h.ssh_heal_attempted
+                        && let Some(ref alias) = h.profile.ssh_alias
+                        && !alias.trim().is_empty()
+                        && (is_identity_mismatch || h.reconnect_attempt == 1)
+                    {
+                        h.ssh_heal_attempted = true;
+                        ssh_self_heal_alias = Some(alias.trim().to_string());
+                    } else {
+                        backoff_ms = Some(match h.reconnect_attempt {
+                            1 => 2000,
+                            2 => 4000,
+                            3 => 7000,
+                            _ => 12000,
+                        });
+                    }
                 }
                 self.emit(|revision| CoreNotification::FleetChanged { revision });
                 self.emit(|revision| CoreNotification::HostChanged {
                     revision,
                     host_id: host_id.to_string(),
                 });
-                if let Some(delay) = backoff_ms {
+
+                // Zero-touch Multi-User SSH Self-Healing:
+                // Automatically upgrades remote CLI/Daemon, isolates onto a conflict-free per-user port,
+                // updates local port & endpoint metadata, and reconnects immediately!
+                if let Some(alias) = ssh_self_heal_alias {
+                    let heal_core = Arc::clone(self);
+                    let owned_id = host_id.to_string();
+                    tokio::spawn(async move {
+                        let healed = tokio::task::spawn_blocking(move || {
+                            bootstrap_ssh_host_and_pair(&alias, None)
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+
+                        if let Some(uri) = healed
+                            && let Ok(offer) = PairingOffer::from_qr_uri(&uri)
+                            && offer.host_id == owned_id
+                        {
+                            let new_port = extract_ws_port(&offer.direct_endpoints).unwrap_or(6868);
+                            let mut maybe_stored = None;
+                            if let Ok(mut guard) = heal_core.hosts.write()
+                                && let Some(h) = guard.get_mut(&owned_id)
+                            {
+                                h.profile.remote_daemon_port = new_port;
+                                h.profile.direct_endpoints = offer.direct_endpoints;
+                                h.profile.daemon_pubkey_b64 = offer.daemon_pubkey_b64;
+                                maybe_stored = Some(h.to_stored_host());
+                            }
+                            if let Some(stored) = maybe_stored {
+                                let _ = heal_core.store.upsert_client_host(&stored);
+                            }
+                            heal_core.connect_host_async(owned_id);
+                        } else {
+                            heal_core.schedule_reconnect(owned_id, 3000);
+                        }
+                    });
+                } else if let Some(delay) = backoff_ms {
                     self.schedule_reconnect(host_id.to_string(), delay);
                 }
             }

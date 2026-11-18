@@ -5,7 +5,7 @@
 //! - One-click SSH E2EE Relay provisioning (`orbit relay up --allow-pubkey ...`)
 
 use std::fs;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -140,7 +140,30 @@ fn build_ssh_command() -> Command {
     cmd
 }
 
-/// Automatically discover and ensure a local Orbit Daemon on Desktop (macOS / Linux / Windows) if `orbit` CLI is installed.
+/// Extract the WebSocket TCP port from direct endpoints (e.g. `ws://172.31.33.74:6869/ws` -> `Some(6869)`).
+pub fn extract_ws_port(endpoints: &[String]) -> Option<u16> {
+    for ep in endpoints {
+        let trimmed = ep.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("ws://")
+            .or_else(|| trimmed.strip_prefix("wss://"))
+        else {
+            continue;
+        };
+        let Some(authority) = rest.split('/').next() else {
+            continue;
+        };
+        if let Some((_, port_str)) = authority.rsplit_once(':')
+            && let Ok(port) = port_str.parse::<u16>()
+            && port > 0
+        {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Automatically discover and ensure the current user's isolated local Orbit Daemon on Desktop if `orbit` CLI is installed.
 pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     if !cfg!(any(
         target_os = "macos",
@@ -159,9 +182,15 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     ];
     let orbit_bin = candidates.into_iter().find(|p| p.is_file())?;
 
-    if TcpStream::connect_timeout(&"127.0.0.1:6868".parse().ok()?, Duration::from_millis(250))
-        .is_err()
-    {
+    let status_out = Command::new(&orbit_bin)
+        .args(["daemon", "status"])
+        .output()
+        .ok();
+    let already_running = status_out
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("RUNNING"))
+        .unwrap_or(false);
+    if !already_running {
         let _ = Command::new(&orbit_bin).args(["daemon", "up"]).output();
     }
 
@@ -429,21 +458,28 @@ fn simple_glob(pat: &str, text: &str) -> bool {
     pat == text
 }
 
-/// Zero-form 1-click SSH Host Connection:
-/// Connects to `alias`, installs/upgrades `orbit` if missing or incompatible (`GLIBC_` / `<= 0.2.0`),
-/// ensures `orbit daemon up` is running on `remote_port`, and returns `orbit://pair/...`.
-pub fn bootstrap_ssh_host_and_pair(alias: &str, remote_port: u16) -> Result<String, String> {
+/// Zero-form 1-click SSH Host Connection with Native Multi-User Isolation:
+/// Connects to `alias`, installs/upgrades `orbit` if missing or `< 0.2.3`,
+/// ensures this Unix user's own isolated `orbit daemon` is running on a conflict-free port,
+/// and returns `orbit://pair/...` encoding that user's exact `host_id` & port.
+pub fn bootstrap_ssh_host_and_pair(
+    alias: &str,
+    explicit_port: Option<u16>,
+) -> Result<String, String> {
+    let port_flag = explicit_port
+        .map(|p| format!(" --port {p}"))
+        .unwrap_or_default();
     let remote_script = format!(
         "set -eu; \
          export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
          NEED_INSTALL=0; \
          if ! command -v orbit >/dev/null 2>&1; then NEED_INSTALL=1; \
-         elif orbit --version 2>&1 | grep -Eq 'GLIBC_|0\\.1\\.|0\\.2\\.0'; then NEED_INSTALL=1; fi; \
+         elif orbit --version 2>&1 | grep -Eq 'GLIBC_|0\\.1\\.|0\\.2\\.[012]'; then NEED_INSTALL=1; fi; \
          if [ \"$NEED_INSTALL\" = \"1\" ]; then \
            curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
-           orbit daemon up --port {remote_port} >/dev/null 2>&1 || true; \
-         elif ! curl -fsS --max-time 1 http://127.0.0.1:{remote_port}/healthz >/dev/null 2>&1; then \
-           orbit daemon up --port {remote_port} >/dev/null 2>&1 || true; \
+           orbit daemon up{port_flag} >/dev/null 2>&1 || true; \
+         elif ! orbit daemon status 2>/dev/null | grep -q 'RUNNING'; then \
+           orbit daemon up{port_flag} >/dev/null 2>&1 || true; \
          fi; \
          orbit pair"
     );
@@ -481,14 +517,21 @@ pub fn bootstrap_ssh_host_and_pair(alias: &str, remote_port: u16) -> Result<Stri
         .ok_or_else(|| format!("未能在 {alias} 获取到有效配对码"))
 }
 
-/// One-click remote Orbit Daemon upgrade & restart over SSH.
-pub fn upgrade_remote_daemon_over_ssh(alias: &str, remote_port: u16) -> Result<String, String> {
+/// One-click remote Orbit Daemon upgrade & restart over SSH (preserving per-user port isolation).
+pub fn upgrade_remote_daemon_over_ssh(
+    alias: &str,
+    explicit_port: Option<u16>,
+) -> Result<(String, Option<String>), String> {
+    let port_flag = explicit_port
+        .map(|p| format!(" --port {p}"))
+        .unwrap_or_default();
     let remote_script = format!(
         "set -eu; \
          export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
          curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
-         orbit daemon up --port {remote_port} >/dev/null 2>&1; \
-         orbit --version"
+         orbit daemon up{port_flag} >/dev/null 2>&1; \
+         orbit --version; \
+         orbit pair"
     );
 
     let out = build_ssh_command()
@@ -505,7 +548,7 @@ pub fn upgrade_remote_daemon_over_ssh(alias: &str, remote_port: u16) -> Result<S
         .output()
         .map_err(|e| format!("无法启动 SSH 升级: {e}"))?;
 
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if !out.status.success() {
         return Err(if stderr.is_empty() {
@@ -514,11 +557,18 @@ pub fn upgrade_remote_daemon_over_ssh(alias: &str, remote_port: u16) -> Result<S
             stderr
         });
     }
-    Ok(if stdout.is_empty() {
-        "orbit upgraded".into()
-    } else {
-        stdout
-    })
+    let version = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("orbit "))
+        .unwrap_or("orbit upgraded")
+        .to_string();
+    let pair_uri = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("orbit://pair/"))
+        .map(ToOwned::to_owned);
+    Ok((version, pair_uri))
 }
 
 /// Open a dedicated SSH local port-forward (`127.0.0.1:<free_port> -> 127.0.0.1:<remote_port>`)
@@ -670,6 +720,18 @@ mod tests {
     }
 
     #[test]
+    fn ws_port_extraction_handles_direct_endpoints() {
+        assert_eq!(
+            extract_ws_port(&["ws://172.31.33.74:6869/ws".to_string()]),
+            Some(6869)
+        );
+        assert_eq!(
+            extract_ws_port(&["wss://devbox.internal:7001/ws".to_string()]),
+            Some(7001)
+        );
+    }
+
+    #[test]
     #[ignore]
     fn live_devbox_ssh_one_click_e2e() {
         use crate::HostConnectionState;
@@ -677,7 +739,7 @@ mod tests {
 
         let core = OrbitAppCore::open_in_memory().expect("open core");
         let card = core
-            .pair_ssh_host_blocking("devbox", 6868)
+            .pair_ssh_host_blocking("devbox", None)
             .expect("1-click SSH pair against devbox must succeed");
         assert_eq!(card.display_name, "devbox");
 

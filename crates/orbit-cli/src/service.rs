@@ -1,10 +1,12 @@
 use std::fs::{self, File};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use tokio_tungstenite::tungstenite::Error as WsError;
+use futures_util::{SinkExt, StreamExt};
+use orbit_protocol::{PROTOCOL_VERSION, WireMessage};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message as TungMsg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceRole {
@@ -159,7 +161,14 @@ pub async fn detect_public_ipv4() -> Option<String> {
     None
 }
 
-/// Check whether local HTTP `/healthz` responds `200 OK` on the given port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortOwnership {
+    Mine,
+    Free,
+    OccupiedByOther,
+}
+
+/// Check whether local HTTP `/healthz` responds `200 OK` on the given port (used for Relay).
 pub async fn check_local_health(port: u16) -> bool {
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_millis(400))
@@ -171,15 +180,172 @@ pub async fn check_local_health(port: u16) -> bool {
     matches!(client.get(url).send().await, Ok(r) if r.status().is_success())
 }
 
-pub async fn wait_until_healthy(port: u16, timeout: Duration) -> bool {
+/// Verify whether `127.0.0.1:{port}` is free, owned by `expected_host_id` (`Mine`), or held by another user/process (`OccupiedByOther`).
+/// Works seamlessly across both `0.2.3+` JSON `/healthz` and `<= 0.2.2` legacy WebSocket `Welcome` handshakes.
+pub async fn probe_daemon_port(port: u16, expected_host_id: &str) -> PortOwnership {
+    if let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_millis(350))
+        .build()
+    {
+        let url = format!("http://127.0.0.1:{port}/healthz");
+        if let Ok(resp) = client.get(url).send().await
+            && resp.status().is_success()
+            && let Ok(body) = resp.text().await
+        {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(hid) = json.get("host_id").and_then(|v| v.as_str())
+            {
+                return if hid == expected_host_id {
+                    PortOwnership::Mine
+                } else {
+                    PortOwnership::OccupiedByOther
+                };
+            }
+            // Legacy <= 0.2.2 daemon returning plain `"ok"`: verify `host_id` via local WS `Welcome`
+            return match probe_ws_welcome_host_id(port).await {
+                Some(hid) if hid == expected_host_id => PortOwnership::Mine,
+                _ => PortOwnership::OccupiedByOther,
+            };
+        }
+    }
+
+    if TcpListener::bind(("0.0.0.0", port)).is_ok()
+        && TcpListener::bind(("127.0.0.1", port)).is_ok()
+    {
+        PortOwnership::Free
+    } else {
+        PortOwnership::OccupiedByOther
+    }
+}
+
+async fn probe_ws_welcome_host_id(port: u16) -> Option<String> {
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_millis(450),
+        tokio_tungstenite::connect_async(&url),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let (mut sink, mut stream) = ws.split();
+    let hello = WireMessage::Hello {
+        client_id: "health-probe".into(),
+        client_name: "orbit-cli-probe".into(),
+        protocol_version: PROTOCOL_VERSION,
+        supports_zstd: false,
+    };
+    let txt = serde_json::to_string(&hello).ok()?;
+    sink.send(TungMsg::Text(txt.into())).await.ok()?;
+
+    let msg = tokio::time::timeout(Duration::from_millis(450), stream.next())
+        .await
+        .ok()??
+        .ok()?;
+    match msg {
+        TungMsg::Text(t) => match serde_json::from_str::<WireMessage>(&t).ok()? {
+            WireMessage::Welcome { host } => Some(host.host_id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Automatically select an isolated, conflict-free port for `expected_host_id` on multi-user shared servers.
+/// - Reuses an already-running daemon owned by `expected_host_id` (`Mine`) if present!
+/// - Keeps `preferred` (e.g. `6868`) if free or already `Mine`.
+/// - Automatically allocates `6869..=6999` if `preferred` is occupied by another Linux user's daemon!
+pub async fn resolve_isolated_daemon_listen(
+    preferred: SocketAddr,
+    expected_host_id: &str,
+) -> anyhow::Result<SocketAddr> {
+    match probe_daemon_port(preferred.port(), expected_host_id).await {
+        PortOwnership::Mine | PortOwnership::Free => return Ok(preferred),
+        PortOwnership::OccupiedByOther => {}
+    }
+
+    // Pass 1: Check if this user already has a live daemon on one of the isolated ports (`6868..=6999`)
+    for candidate in 6868u16..=6999 {
+        if candidate == preferred.port() {
+            continue;
+        }
+        // Fast TCP check before HTTP probe so scanning 130 ports takes < 3ms!
+        if std::net::TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], candidate)),
+            Duration::from_millis(15),
+        )
+        .is_ok()
+            && probe_daemon_port(candidate, expected_host_id).await == PortOwnership::Mine
+        {
+            return Ok(SocketAddr::new(preferred.ip(), candidate));
+        }
+    }
+
+    // Pass 2: Pick the first completely free port in `6868..=6999`
+    for candidate in 6868u16..=6999 {
+        if candidate == preferred.port() {
+            continue;
+        }
+        if TcpListener::bind((preferred.ip(), candidate)).is_ok()
+            && TcpListener::bind(("127.0.0.1", candidate)).is_ok()
+        {
+            return Ok(SocketAddr::new(preferred.ip(), candidate));
+        }
+    }
+
+    anyhow::bail!("no free isolated daemon port available in 6868..=6999")
+}
+
+/// Find the live port currently serving `expected_host_id`, falling back to `fallback_port`.
+pub async fn find_live_daemon_port_for_host(expected_host_id: &str, fallback_port: u16) -> u16 {
+    if probe_daemon_port(fallback_port, expected_host_id).await == PortOwnership::Mine {
+        return fallback_port;
+    }
+    for candidate in 6868u16..=6999 {
+        if candidate == fallback_port {
+            continue;
+        }
+        if std::net::TcpStream::connect_timeout(
+            &SocketAddr::from(([127, 0, 0, 1], candidate)),
+            Duration::from_millis(15),
+        )
+        .is_ok()
+            && probe_daemon_port(candidate, expected_host_id).await == PortOwnership::Mine
+        {
+            return candidate;
+        }
+    }
+    fallback_port
+}
+
+pub async fn wait_until_healthy_for_host(
+    port: u16,
+    expected_host_id: Option<&str>,
+    timeout: Duration,
+) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
-        if check_local_health(port).await {
+        let ok = match expected_host_id {
+            Some(hid) => probe_daemon_port(port, hid).await == PortOwnership::Mine,
+            None => check_local_health(port).await,
+        };
+        if ok {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    check_local_health(port).await
+    match expected_host_id {
+        Some(hid) => probe_daemon_port(port, hid).await == PortOwnership::Mine,
+        None => check_local_health(port).await,
+    }
+}
+
+fn is_default_orbit_home(home_dir: &Path) -> bool {
+    let Some(h) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let default_dir = PathBuf::from(h).join(".orbit");
+    fs::canonicalize(home_dir).unwrap_or_else(|_| home_dir.to_path_buf())
+        == fs::canonicalize(&default_dir).unwrap_or(default_dir)
 }
 
 /// Install & start (or restart) a persistent background service for `daemon` or `relay`.
@@ -187,16 +353,18 @@ pub async fn install_and_start_service(
     role: ServiceRole,
     home_dir: &Path,
     expected_port: u16,
+    expected_host_id: Option<&str>,
 ) -> anyhow::Result<String> {
     fs::create_dir_all(home_dir.join("logs"))?;
     let exe = resolve_self_exe()?;
     let service_path_env = build_service_path_env();
+    let use_os_supervisor = is_default_orbit_home(home_dir);
 
-    let manager_label = if cfg!(target_os = "linux") && has_user_systemd() {
+    let manager_label = if use_os_supervisor && cfg!(target_os = "linux") && has_user_systemd() {
         ensure_linux_user_linger_best_effort();
         install_systemd_user_service(role, &exe, home_dir, &service_path_env)?;
         format!("systemd --user ({}.service)", role.unit_name())
-    } else if cfg!(target_os = "macos") && has_launchctl() {
+    } else if use_os_supervisor && cfg!(target_os = "macos") && has_launchctl() {
         install_macos_launch_agent(role, &exe, home_dir, &service_path_env)?;
         format!("launchd ({})", role.launchd_label())
     } else {
@@ -204,9 +372,9 @@ pub async fn install_and_start_service(
         format!("background daemon ({})", role.pid_file(home_dir).display())
     };
 
-    if !wait_until_healthy(expected_port, Duration::from_secs(3)).await {
+    if !wait_until_healthy_for_host(expected_port, expected_host_id, Duration::from_secs(4)).await {
         anyhow::bail!(
-            "{} did not pass health check on 127.0.0.1:{expected_port} (check logs in {})",
+            "{} did not pass identity health check on 127.0.0.1:{expected_port} (check logs in {})",
             role.unit_name(),
             role.log_file(home_dir).display()
         );
@@ -217,13 +385,15 @@ pub async fn install_and_start_service(
 
 /// Stop a background `daemon` or `relay` service if running.
 pub fn stop_service(role: ServiceRole, home_dir: &Path) -> anyhow::Result<()> {
-    if cfg!(target_os = "linux") && has_user_systemd() {
+    let use_os_supervisor = is_default_orbit_home(home_dir);
+    if use_os_supervisor && cfg!(target_os = "linux") && has_user_systemd() {
         let unit = format!("{}.service", role.unit_name());
         let _ = Command::new("systemctl")
             .args(["--user", "disable", "--now", &unit])
             .status();
     }
-    if cfg!(target_os = "macos")
+    if use_os_supervisor
+        && cfg!(target_os = "macos")
         && has_launchctl()
         && let Some(plist) = macos_plist_path(role)
         && plist.exists()
@@ -579,20 +749,30 @@ pub async fn self_upgrade_cli(home_dir: &Path, force: bool) -> anyhow::Result<()
     );
 
     // Automatically restart active background daemon / relay if running on this host!
-    let d_cfg = orbit_daemon::DaemonPersistedConfig::load(home_dir);
-    let d_port = d_cfg
-        .listen_addr
-        .unwrap_or_else(default_daemon_listen)
-        .port();
-    if check_local_health(d_port).await {
-        let mgr = install_and_start_service(ServiceRole::Daemon, home_dir, d_port).await?;
-        println!("[✓] Hot-restarted local Orbit Daemon ({mgr}) — active agent shims preserved.");
+    if let Ok(rt) = orbit_daemon::DaemonRuntime::bootstrap(home_dir).await {
+        let hid = rt.host_info.host_id.clone();
+        drop(rt);
+        let d_cfg = orbit_daemon::DaemonPersistedConfig::load(home_dir);
+        let d_port = d_cfg
+            .listen_addr
+            .unwrap_or_else(default_daemon_listen)
+            .port();
+        let live_port = find_live_daemon_port_for_host(&hid, d_port).await;
+        if probe_daemon_port(live_port, &hid).await == PortOwnership::Mine {
+            let mgr =
+                install_and_start_service(ServiceRole::Daemon, home_dir, live_port, Some(&hid))
+                    .await?;
+            println!(
+                "[✓] Hot-restarted local Orbit Daemon ({mgr}) — active agent shims preserved."
+            );
+        }
     }
 
     let r_cfg = orbit_relay::RelayPersistedConfig::load(home_dir);
     if check_local_health(r_cfg.listen_addr.port()).await {
-        let mgr = install_and_start_service(ServiceRole::Relay, home_dir, r_cfg.listen_addr.port())
-            .await?;
+        let mgr =
+            install_and_start_service(ServiceRole::Relay, home_dir, r_cfg.listen_addr.port(), None)
+                .await?;
         println!("[✓] Restarted local Orbit Relay ({mgr}).");
     }
 

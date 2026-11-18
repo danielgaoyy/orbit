@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use orbit_crypto::{ClientHandshake, PairingOffer, SecureChannel, decode_key_32};
-use orbit_protocol::{PROTOCOL_VERSION, TerminalBinaryFrame, WireMessage};
+use orbit_protocol::{HostInfo, PROTOCOL_VERSION, TerminalBinaryFrame, WireMessage};
 use orbit_store::{OrbitStore, StoreError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -134,6 +134,8 @@ pub enum ClientCoreError {
     Ws(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("connection handshake failed: {0}")]
     Handshake(String),
+    #[error("host identity mismatch (expected {expected}, got {actual})")]
+    HostIdentityMismatch { expected: String, actual: String },
     #[error("no reachable direct endpoint, SSH tunnel, or relay configured")]
     Unreachable,
     #[error("channel closed")]
@@ -153,6 +155,7 @@ impl From<tokio_tungstenite::tungstenite::Error> for ClientCoreError {
 pub struct HostSessionHandle {
     pub mode: HostConnectionState,
     pub via_ssh_tunnel: bool,
+    pub welcome_host: Option<HostInfo>,
     out_tx: mpsc::Sender<OutboundPayload>,
     events_tx: broadcast::Sender<ClientInboundEvent>,
     _ssh_tunnel: Option<Arc<SshTunnelGuard>>,
@@ -250,6 +253,53 @@ async fn connect_direct_with_host_id(
     let hello_json = serde_json::to_string(&hello).map_err(orbit_protocol::ProtocolError::from)?;
     sink.send(Message::Text(hello_json.into())).await?;
 
+    // Verify `WireMessage::Welcome` BEFORE syncing any state so two users sharing a machine
+    // can NEVER cross-connect or contaminate each other's local session replica!
+    let mut welcome_host: Option<HostInfo> = None;
+    let welcome_deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+    while welcome_host.is_none() {
+        let remaining = welcome_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ClientCoreError::Handshake(
+                "timed out waiting for daemon Welcome".into(),
+            ));
+        }
+        let next_msg = tokio::time::timeout(remaining, stream.next())
+            .await
+            .map_err(|_| {
+                ClientCoreError::Handshake("timed out waiting for daemon Welcome".into())
+            })?;
+        match next_msg {
+            Some(Ok(Message::Text(txt))) => {
+                if let Ok(WireMessage::Welcome { host }) = serde_json::from_str::<WireMessage>(&txt)
+                {
+                    welcome_host = Some(host);
+                }
+            }
+            Some(Ok(Message::Binary(bin))) if !bin.is_empty() && bin[0] == DIRECT_BIN_ZSTD_WIRE => {
+                if let Ok(WireMessage::Welcome { host }) = WireMessage::decode_zstd(&bin[1..]) {
+                    welcome_host = Some(host);
+                }
+            }
+            Some(Ok(Message::Close(_))) | None => {
+                return Err(ClientCoreError::ChannelClosed);
+            }
+            Some(Err(e)) => return Err(e.into()),
+            _ => {}
+        }
+    }
+
+    if let Some(ref host_info) = welcome_host
+        && !host_id.is_empty()
+        && host_info.host_id != host_id
+    {
+        let _ = sink.close().await;
+        return Err(ClientCoreError::HostIdentityMismatch {
+            expected: host_id.to_string(),
+            actual: host_info.host_id.clone(),
+        });
+    }
+
     let (out_tx, mut out_rx) = mpsc::channel::<OutboundPayload>(256);
     let (events_tx, _) = broadcast::channel::<ClientInboundEvent>(512);
 
@@ -332,6 +382,7 @@ async fn connect_direct_with_host_id(
     Ok(HostSessionHandle {
         mode: HostConnectionState::OnlineDirect,
         via_ssh_tunnel: ssh_tunnel.is_some(),
+        welcome_host,
         out_tx,
         events_tx,
         _ssh_tunnel: ssh_tunnel,
@@ -490,6 +541,7 @@ async fn connect_via_relay_with_host_id(
     Ok(HostSessionHandle {
         mode: HostConnectionState::OnlineRelay,
         via_ssh_tunnel: false,
+        welcome_host: None,
         out_tx,
         events_tx,
         _ssh_tunnel: None,
@@ -538,6 +590,7 @@ async fn try_connect_ssh_tunnel(
         .await
         {
             Ok(Ok(handle)) => return Ok(handle),
+            Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. })) => return Err(e),
             Ok(Err(e)) => last_err = Some(e),
             Err(_) => {}
         }
@@ -559,17 +612,20 @@ async fn try_connect_direct_endpoints(
     }
     endpoints.extend(profile.direct_endpoints.iter().cloned());
 
+    let mut mismatch_err = None;
     for ep in &endpoints {
-        if let Ok(Ok(handle)) = tokio::time::timeout(
+        match tokio::time::timeout(
             Duration::from_millis(1200),
             connect_direct_with_host_id(&profile.host_id, ep, replica.clone(), None),
         )
         .await
         {
-            return Ok(handle);
+            Ok(Ok(handle)) => return Ok(handle),
+            Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. })) => mismatch_err = Some(e),
+            _ => {}
         }
     }
-    Err(ClientCoreError::Unreachable)
+    Err(mismatch_err.unwrap_or(ClientCoreError::Unreachable))
 }
 
 /// Smart connector supporting `HostRouteMode` (`Auto`, `SshTunnel`, `DirectOnly`, `RelayOnly`):

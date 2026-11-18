@@ -1320,9 +1320,9 @@ export default function App() {
 
   const handleConnectSshOneClick = async (entry: SshHostItem) => {
     setSshConnectingAlias(entry.alias);
-    setMachineFeedback(`正在通过 SSH 自动部署并接入 ${entry.alias}…`);
+    setMachineFeedback(`正在通过 SSH 自动部署并接入 ${entry.alias}（自动多用户环境隔离）…`);
     try {
-      const card = await orbitIpc.pairSshHost(entry.alias, 6868);
+      const card = await orbitIpc.pairSshHost(entry.alias);
       setSelectedHostId(card.host_id);
       setMachineFeedback(`已成功接入 ${card.display_name}`);
       await reloadFleet();
@@ -1353,7 +1353,7 @@ export default function App() {
         customName: cfgName,
         routeMode: cfgRouteMode,
         sshAlias: cfgSshAlias,
-        remoteDaemonPort: Number(cfgRemotePort) || 6868,
+        remoteDaemonPort: Number(cfgRemotePort) || undefined,
         customDirectEndpoint: cfgDirectEp,
         relayUrl: cfgRelayUrl,
         reconnect: true,
@@ -1378,7 +1378,6 @@ export default function App() {
       const ver = await orbitIpc.upgradeRemoteDaemon(
         editingHost.host_id,
         cfgSshAlias.trim(),
-        Number(cfgRemotePort) || 6868,
       );
       setCfgStatusMsg(`升级并重启成功 (${ver})`);
       await reloadFleet();

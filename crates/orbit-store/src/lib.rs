@@ -804,6 +804,19 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn clear_host_replica(&self, host_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        conn.execute(
+            "DELETE FROM client_replica_agents WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_client_project(&self, proj: &StoredClientProject) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let dirs_json = serde_json::to_string(&proj.directories)?;

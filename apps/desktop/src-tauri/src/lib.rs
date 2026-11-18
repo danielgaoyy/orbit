@@ -91,9 +91,8 @@ async fn pair_ssh_host(
     remote_port: Option<u16>,
 ) -> Result<HostCardView, String> {
     let core = Arc::clone(&state.core);
-    let port = remote_port.unwrap_or(6868);
     tauri::async_runtime::spawn_blocking(move || {
-        core.pair_ssh_host_blocking(&ssh_alias, port)
+        core.pair_ssh_host_blocking(&ssh_alias, remote_port)
             .map_err(|e| e.to_string())
     })
     .await
@@ -152,13 +151,27 @@ async fn upgrade_remote_daemon(
     ssh_alias: String,
     remote_port: Option<u16>,
 ) -> Result<String, String> {
-    let port = remote_port.unwrap_or(6868);
-    let ver = tauri::async_runtime::spawn_blocking(move || {
-        upgrade_remote_daemon_over_ssh(&ssh_alias, port)
+    let alias_copy = ssh_alias.clone();
+    let (ver, maybe_uri) = tauri::async_runtime::spawn_blocking(move || {
+        upgrade_remote_daemon_over_ssh(&ssh_alias, remote_port)
     })
     .await
     .map_err(|e| format!("task join error: {e}"))??;
-    state.core.connect_host_async(host_id);
+    if let Some(uri) = maybe_uri {
+        let _ = state.core.pair_host(&uri);
+        let _ = state.core.update_host_config(
+            &host_id,
+            None,
+            None,
+            Some(alias_copy),
+            None,
+            None,
+            None,
+            true,
+        );
+    } else {
+        state.core.connect_host_async(host_id);
+    }
     Ok(ver)
 }
 

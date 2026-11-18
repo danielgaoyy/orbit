@@ -219,10 +219,37 @@ impl DaemonRuntime {
 }
 
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
-    let persisted = DaemonPersistedConfig::load(&config.home_dir);
-    let effective_relay = config.relay_url.or(persisted.relay_url);
+    let mut persisted = DaemonPersistedConfig::load(&config.home_dir);
+    let effective_relay = config.relay_url.or_else(|| persisted.relay_url.clone());
     let runtime = DaemonRuntime::bootstrap(&config.home_dir).await?;
-    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+    let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && config.listen_addr.port() != 0 => {
+            let mut fallback_listener = None;
+            for candidate_port in 6868u16..=6999 {
+                if candidate_port == config.listen_addr.port() {
+                    continue;
+                }
+                let addr = SocketAddr::new(config.listen_addr.ip(), candidate_port);
+                if let Ok(l) = tokio::net::TcpListener::bind(addr).await {
+                    warn!(
+                        requested = %config.listen_addr,
+                        rebound = %addr,
+                        "Requested port already in use by another user/process; automatically isolated onto free port"
+                    );
+                    persisted.listen_addr = Some(addr);
+                    let _ = persisted.save(&config.home_dir);
+                    fallback_listener = Some(l);
+                    break;
+                }
+            }
+            match fallback_listener {
+                Some(l) => l,
+                None => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
     let bound_addr = listener.local_addr()?;
 
     let direct_eps = if bound_addr.ip().is_unspecified() {
@@ -252,7 +279,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     }
 
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz_handler))
         .route("/ws", get(ws_handler))
         .with_state(runtime);
 
@@ -278,7 +305,7 @@ pub async fn spawn_embedded_daemon(
 
     let rt_http = runtime.clone();
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz_handler))
         .route("/ws", get(ws_handler))
         .with_state(rt_http);
 
@@ -287,6 +314,14 @@ pub async fn spawn_embedded_daemon(
     });
 
     Ok((addr, runtime))
+}
+
+async fn healthz_handler(State(runtime): State<Arc<DaemonRuntime>>) -> impl IntoResponse {
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "host_id": runtime.host_info.host_id,
+        "version": runtime.host_info.daemon_version,
+    }))
 }
 
 // --- Outbound Relay Control & Noise NK E2EE Tunnel Spawner ---

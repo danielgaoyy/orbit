@@ -930,7 +930,7 @@ async fn handle_wire_rpc(
             subscribed_agents.insert(agent_id.clone());
             match runtime
                 .store
-                .fetch_timeline_since(&agent_id, since_seq, 500)
+                .fetch_timeline_since(&agent_id, since_seq, 2000)
             {
                 Ok((events, has_more)) => Some(WireMessage::TimelineCatchup {
                     request_id,

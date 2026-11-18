@@ -16,14 +16,17 @@ import {
   FileCode2,
   FileDiff,
   FileImage,
+  FilePlus2,
   FileSearch,
   FileSymlink,
   FileText,
   FoldVertical,
   GitCompareArrows,
+  Globe,
   HelpCircle,
   Layers,
   ListTodo,
+  MessageSquareText,
   Quote,
   Scissors,
   Search,
@@ -46,7 +49,12 @@ import { modSymbol } from "@/lib/keybindings";
 import {
   type StageTurn,
   type TurnFileDiffSummary,
+  type WorkSummaryResult,
+  classifySearchTool,
+  describeToolStep,
+  extractThinkingHeadline,
   formatDurationCompact,
+  formatThoughtSummaryLabel,
   processTimelineForStage,
   stripWorkspacePrefix,
 } from "@/lib/timeline-coalesce";
@@ -57,6 +65,8 @@ import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 const USER_PROMPT_PREVIEW_MAX_PX = 240;
+const LIVE_STEP_AUTO_COLLAPSE_THRESHOLD = 5;
+const LIVE_STEP_VISIBLE_TAIL_COUNT = 3;
 
 interface TurnTimingRecord {
   startedAtMs: number;
@@ -78,11 +88,50 @@ function formatClockTime(ms: number): string {
   }
 }
 
-/** Inline compact diff preview used when expanding an `Edit` step inside a turn. */
+function formatJsonPreview(rawJson: string): string {
+  const trimmed = rawJson.trim();
+  if (!trimmed) return "";
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return trimmed;
+  }
+}
+
+function parseUnifiedDiffFallback(unifiedDiff: string): DiffLineView[] {
+  const out: DiffLineView[] = [];
+  for (const raw of unifiedDiff.split(/\r?\n/)) {
+    if (
+      raw.startsWith("diff --git") ||
+      raw.startsWith("index ") ||
+      raw.startsWith("--- ") ||
+      raw.startsWith("+++ ")
+    ) {
+      continue;
+    }
+    if (raw.startsWith("@@")) {
+      out.push({ kind: "hunk_header", old_line: null, new_line: null, content: raw });
+    } else if (raw.startsWith("+")) {
+      out.push({ kind: "added", old_line: null, new_line: null, content: raw.slice(1) });
+    } else if (raw.startsWith("-")) {
+      out.push({ kind: "removed", old_line: null, new_line: null, content: raw.slice(1) });
+    } else {
+      out.push({
+        kind: "context",
+        old_line: null,
+        new_line: null,
+        content: raw.startsWith(" ") ? raw.slice(1) : raw,
+      });
+    }
+  }
+  return out;
+}
+
+/** Inline compact diff preview used when expanding an `Edited` / `Created` step inside a turn. */
 function InlineStepDiffPreview({ lines }: { lines: DiffLineView[] }) {
   const capped = lines.slice(0, 80);
   return (
-    <div className="selectable-text max-h-56 overflow-auto overscroll-contain rounded-lg border border-black/[0.07] bg-zinc-50/90 py-1.5 font-mono text-[12px] leading-[1.55] dark:border-white/[0.08] dark:bg-[#131418]">
+    <div className="selectable-text border-border bg-muted/45 dark:bg-muted/25 max-h-56 overflow-auto overscroll-contain rounded-lg border py-1.5 font-mono text-[12px] leading-[1.55]">
       {capped.map((ln, idx) => {
         if (ln.kind === "meta") return null;
         return (
@@ -95,7 +144,7 @@ function InlineStepDiffPreview({ lines }: { lines: DiffLineView[] }) {
               ln.kind === "removed" &&
                 "bg-rose-500/[0.10] text-rose-900 dark:bg-rose-500/[0.14] dark:text-rose-200",
               ln.kind === "hunk_header" && "text-muted-foreground/75 py-0.5 text-[11px]",
-              ln.kind === "context" && "text-zinc-700 dark:text-zinc-300",
+              ln.kind === "context" && "text-foreground/80",
             )}
           >
             <span className="w-4 shrink-0 opacity-55 select-none">
@@ -114,37 +163,70 @@ function InlineStepDiffPreview({ lines }: { lines: DiffLineView[] }) {
   );
 }
 
+function resolveToolStepIcon(
+  item: Extract<TimelineItemView, { item_type: "tool_call" }>,
+  descriptorKind: ReturnType<typeof describeToolStep>["kind"],
+): LucideIcon {
+  switch (descriptorKind) {
+    case "file_read":
+      return FileText;
+    case "file_create":
+      return FilePlus2;
+    case "file_edit":
+      return FileCode2;
+    case "search": {
+      if (item.detail.kind === "search") {
+        const sub = classifySearchTool(item.detail.query, item.summary_title);
+        if (sub === "web") return Globe;
+        if (sub === "glob") return FileSearch;
+      }
+      return Search;
+    }
+    case "shell":
+      return TerminalIcon;
+    case "subagent":
+      return Layers;
+    case "generic":
+      return Wrench;
+  }
+}
+
 /**
- * Claude.app-inspired borderless step row:
- * - Zero box/border clutter at rest; `0px–2px` tight vertical grouping.
+ * Borderless step row for reasoning, intermediate notes, permissions, and tool calls:
+ * - Zero box/border clutter at rest; tight vertical grouping.
  * - Semantic muted icon swaps cleanly in-place to `ChevronRight` on hover/expand.
- * - Running step sweeps a calm linear-gradient text shimmer instead of noisy spinners.
+ * - Active thinking/tool step sweeps a calm linear-gradient text shimmer.
  */
-const ClaudeStepRow = memo(function ClaudeStepRow({
+const StepItemRow = memo(function StepItemRow({
   item,
   cwd,
   holdViewport,
+  isActivelyThinking = false,
+  thoughtDurationMs = null,
+  autoExpandError = false,
 }: {
   item: TimelineItemView;
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
+  isActivelyThinking?: boolean;
+  thoughtDurationMs?: number | null;
+  autoExpandError?: boolean;
 }) {
   const defaultOpen =
-    item.item_type === "tool_call" && (item.status === "failed" || item.status === "denied");
+    autoExpandError &&
+    item.item_type === "tool_call" &&
+    (item.status === "failed" || item.status === "denied");
   const [expanded, setExpanded] = useState(defaultOpen);
   const [hovered, setHovered] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   if (item.item_type === "assistant_thinking") {
-    const firstLine =
-      item.text
-        .trim()
-        .split("\n")
-        .find((l) => l.trim().length > 0)
-        ?.replace(/^#+\s*/, "")
-        .slice(0, 76) ?? "";
+    const headline = extractThinkingHeadline(item.text, isActivelyThinking);
     const canExpand = item.text.trim().length > 0;
     const showChevron = canExpand && (hovered || expanded);
+    const thoughtLabel = isActivelyThinking
+      ? "Thinking"
+      : formatThoughtSummaryLabel(thoughtDurationMs, 1);
 
     return (
       <div>
@@ -158,9 +240,9 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
             if (!canExpand) return;
             holdViewport(triggerRef.current, () => setExpanded((v) => !v));
           }}
-          className="group/step hover:bg-foreground/[0.035] -ml-1.5 flex w-full max-w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13px] transition-colors disabled:cursor-default"
+          className="group/step hover:bg-accent/55 -ml-1.5 flex w-full max-w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13px] transition-colors disabled:cursor-default"
         >
-          <span className="text-foreground/48 flex size-4 shrink-0 items-center justify-center">
+          <span className="text-muted-foreground group-hover/step:text-foreground/80 flex size-4 shrink-0 items-center justify-center">
             {showChevron ? (
               <ChevronRight
                 className={cn(
@@ -172,14 +254,30 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
               <Sparkles className="size-3.5 stroke-[1.75]" />
             )}
           </span>
-          <span className="text-foreground/68 shrink-0 font-normal">Thought</span>
-          {!expanded && firstLine && (
-            <span className="text-foreground/42 truncate text-[12.5px]">{firstLine}</span>
+          <span
+            className={cn(
+              "shrink-0 font-normal",
+              isActivelyThinking
+                ? "agent-text-shimmer"
+                : "text-foreground/72 group-hover/step:text-foreground",
+            )}
+          >
+            {thoughtLabel}
+          </span>
+          {!expanded && headline && (
+            <span
+              className={cn(
+                "truncate text-[12.5px]",
+                isActivelyThinking ? "agent-text-shimmer" : "text-muted-foreground/80",
+              )}
+            >
+              {headline}
+            </span>
           )}
         </button>
 
         {expanded && (
-          <pre className="selectable-text text-muted-foreground my-1 ml-4 max-h-56 overflow-y-auto overscroll-contain border-l border-black/[0.08] pl-3 font-mono text-[12px] leading-relaxed whitespace-pre-wrap dark:border-white/[0.09]">
+          <pre className="selectable-text text-muted-foreground border-border my-1 ml-4 max-h-56 overflow-y-auto overscroll-contain border-l pl-3 font-mono text-[12px] leading-relaxed whitespace-pre-wrap">
             {item.text}
           </pre>
         )}
@@ -188,19 +286,75 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
   }
 
   if (item.item_type === "assistant_message") {
+    const trimmed = item.text.trim();
+    if (!trimmed) return null;
+    const singleLinePreview = trimmed.replace(/\s+/g, " ");
+    const isCompactSingleLine = !trimmed.includes("\n") && singleLinePreview.length <= 120;
+
+    if (isCompactSingleLine) {
+      return (
+        <div className="text-muted-foreground flex items-start gap-2 py-1 text-[13px] leading-[1.5]">
+          <span className="text-muted-foreground/75 mt-[2px] flex size-4 shrink-0 items-center justify-center">
+            <MessageSquareText className="size-3.5 stroke-[1.75]" />
+          </span>
+          <span className="selectable-text text-foreground/78">{trimmed}</span>
+        </div>
+      );
+    }
+
+    const showChevron = hovered || expanded;
     return (
-      <div className="text-foreground/78 py-1 pl-0.5 text-[13.5px]">
-        <MarkdownBlocksView blocks={item.blocks} streaming={item.streaming} />
+      <div>
+        <button
+          ref={triggerRef}
+          type="button"
+          onMouseEnter={() => setHovered(true)}
+          onMouseLeave={() => setHovered(false)}
+          onClick={() => holdViewport(triggerRef.current, () => setExpanded((v) => !v))}
+          className="group/note hover:bg-accent/55 -ml-1.5 flex w-full max-w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13px] transition-colors"
+        >
+          <span className="text-muted-foreground group-hover/note:text-foreground/80 flex size-4 shrink-0 items-center justify-center">
+            {showChevron ? (
+              <ChevronRight
+                className={cn(
+                  "size-3.5 stroke-[1.9] transition-transform duration-150",
+                  expanded && "rotate-90",
+                )}
+              />
+            ) : (
+              <MessageSquareText className="size-3.5 stroke-[1.75]" />
+            )}
+          </span>
+          <span className="text-foreground/72 group-hover/note:text-foreground truncate">
+            {singleLinePreview}
+          </span>
+        </button>
+
+        {expanded && (
+          <div className="border-border my-1 ml-4 border-l pl-3 text-[13.5px]">
+            <MarkdownBlocksView blocks={item.blocks} streaming={item.streaming} />
+          </div>
+        )}
       </div>
     );
   }
 
   if (item.item_type === "permission_request") {
+    const denied = /deny|reject|decline/i.test(item.resolved_decision ?? "");
     return (
-      <div className="text-foreground/55 flex items-center gap-2 py-0.5 text-[12.5px]">
-        <Check className="size-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+      <div className="text-muted-foreground flex items-center gap-2 py-0.5 text-[12.5px]">
+        <span className="flex size-4 shrink-0 items-center justify-center">
+          {denied ? (
+            <AlertTriangle className="size-3.5 text-rose-500" />
+          ) : (
+            <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+          )}
+        </span>
         <span className="truncate">
-          {item.title} · <span className="text-foreground/72">{item.resolved_decision}</span>
+          {item.title} ·{" "}
+          <span className="text-foreground/75">
+            {(item.resolved_decision ?? "resolved").replace(/_/g, " ")}
+          </span>
         </span>
       </div>
     );
@@ -208,8 +362,10 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
 
   if (item.item_type === "question_request") {
     return (
-      <div className="text-foreground/55 flex items-center gap-2 py-0.5 text-[12.5px]">
-        <Check className="size-3.5 shrink-0 text-sky-600 dark:text-sky-400" />
+      <div className="text-muted-foreground flex items-center gap-2 py-0.5 text-[12.5px]">
+        <span className="flex size-4 shrink-0 items-center justify-center">
+          <Check className="size-3.5 text-sky-600 dark:text-sky-400" />
+        </span>
         <span className="truncate">
           Answered {item.questions.length} clarifying{" "}
           {item.questions.length === 1 ? "question" : "questions"}
@@ -222,72 +378,24 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
     return null;
   }
 
-  const isRunning = item.status === "running";
-  const isError = item.status === "failed" || item.status === "denied";
+  const desc = describeToolStep(item, cwd);
+  const isError = desc.isFailed || desc.isDenied;
+  const IconComp = resolveToolStepIcon(item, desc.kind);
 
-  let verb = "Tool";
-  let targetSummary = item.summary_title;
-  let openPath: string | null = null;
-  let IconComp = Wrench;
-
-  switch (item.detail.kind) {
-    case "file_read": {
-      IconComp = FileText;
-      verb = isRunning ? "Reading" : "Read";
-      const rel = stripWorkspacePrefix(item.detail.path, cwd);
-      const range =
-        item.detail.start_line && item.detail.end_line
-          ? `:${item.detail.start_line}-${item.detail.end_line}`
-          : "";
-      targetSummary = `${rel}${range}`;
-      openPath = item.detail.path;
-      break;
-    }
-    case "file_edit": {
-      IconComp = FileCode2;
-      verb = isRunning ? "Editing" : "Edited";
-      targetSummary = stripWorkspacePrefix(item.detail.path, cwd);
-      openPath = item.detail.path;
-      break;
-    }
-    case "search": {
-      IconComp = Search;
-      verb = isRunning ? "Searching" : "Searched";
-      targetSummary = item.detail.query;
-      break;
-    }
-    case "shell": {
-      IconComp = TerminalIcon;
-      verb = isRunning ? "Running" : "Ran";
-      targetSummary = item.detail.command;
-      break;
-    }
-    case "subagent": {
-      IconComp = Layers;
-      verb = isRunning ? "Delegating" : "Delegated";
-      targetSummary = item.detail.role || item.detail.prompt_preview;
-      break;
-    }
-    case "generic": {
-      IconComp = Wrench;
-      verb = item.detail.tool_name || "Tool";
-      targetSummary = item.summary_title !== verb ? item.summary_title : "";
-      break;
-    }
-  }
-
-  const additions = item.diff_files.reduce((acc, f) => acc + f.additions, 0);
-  const deletions = item.diff_files.reduce((acc, f) => acc + f.deletions, 0);
-  const firstDiffLines = item.diff_files[0]?.lines ?? [];
+  const diffLines =
+    item.diff_files[0]?.lines && item.diff_files[0].lines.length > 0
+      ? item.diff_files[0].lines
+      : item.detail.kind === "file_edit" && item.detail.unified_diff
+        ? parseUnifiedDiffFallback(item.detail.unified_diff)
+        : [];
 
   const hasExpandableDetail =
-    (item.detail.kind === "shell" &&
-      Boolean(item.detail.command || item.detail.output_preview)) ||
-    (item.detail.kind === "file_edit" && firstDiffLines.length > 0) ||
-    (item.detail.kind === "subagent" && Boolean(item.detail.prompt_preview)) ||
-    (item.detail.kind === "generic" && Boolean(item.detail.arguments_json));
-
+    desc.hasExpandableDetail &&
+    (item.detail.kind !== "file_edit" || diffLines.length > 0);
   const showChevron = hasExpandableDetail && (hovered || expanded);
+  const openFilePath = desc.openPath;
+  const canOpenFileInDiff =
+    Boolean(openFilePath) && (desc.kind === "file_edit" || desc.kind === "file_create");
 
   return (
     <div>
@@ -296,7 +404,7 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
         onMouseLeave={() => setHovered(false)}
         className={cn(
           "group/tool -ml-1.5 flex items-center justify-between gap-2 rounded-md px-1.5 py-1 text-[13px] transition-colors",
-          hasExpandableDetail && "hover:bg-foreground/[0.035]",
+          (hasExpandableDetail || canOpenFileInDiff) && "hover:bg-accent/55",
         )}
       >
         <button
@@ -315,7 +423,9 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
           <span
             className={cn(
               "flex size-4 shrink-0 items-center justify-center",
-              isError ? "text-rose-500" : "text-foreground/48 group-hover/tool:text-foreground/80",
+              isError
+                ? "text-rose-500"
+                : "text-muted-foreground group-hover/tool:text-foreground/80",
             )}
           >
             {showChevron ? (
@@ -337,56 +447,73 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
               "shrink-0 font-normal",
               isError
                 ? "text-rose-600 dark:text-rose-400"
-                : isRunning
+                : desc.isRunning
                   ? "agent-text-shimmer"
-                  : "text-foreground/74 group-hover/tool:text-foreground",
+                  : "text-foreground/75 group-hover/tool:text-foreground",
             )}
           >
-            {verb}
+            {desc.verb}
           </span>
 
-          {targetSummary && (
+          {desc.target && (
             <span
+              onClick={
+                canOpenFileInDiff && !hasExpandableDetail && openFilePath
+                  ? (e) => {
+                      e.stopPropagation();
+                      orbitActions.openInspectorForFile(openFilePath, "session_turns");
+                    }
+                  : undefined
+              }
               className={cn(
                 "truncate font-mono text-[12px]",
-                isRunning
+                desc.isRunning
                   ? "agent-text-shimmer"
-                  : "text-foreground/46 group-hover/tool:text-foreground/68",
+                  : "text-muted-foreground group-hover/tool:text-foreground/70",
+                canOpenFileInDiff && !hasExpandableDetail && "cursor-pointer hover:underline",
               )}
             >
-              {targetSummary}
+              {desc.target}
+            </span>
+          )}
+
+          {desc.secondaryMeta && (
+            <span className="text-muted-foreground/70 shrink-0 font-mono text-[11.5px]">
+              {desc.secondaryMeta}
             </span>
           )}
         </button>
 
         <div className="tabular-nums flex shrink-0 items-center gap-2 font-mono text-[11.5px]">
-          {(additions > 0 || deletions > 0) && (
+          {(desc.additions > 0 || desc.deletions > 0) && (
             <span className="flex items-center gap-1.5">
-              {additions > 0 && (
-                <span className="text-emerald-600 dark:text-emerald-400">+{additions}</span>
+              {desc.additions > 0 && (
+                <span className="text-emerald-600 dark:text-emerald-400">
+                  +{desc.additions}
+                </span>
               )}
-              {deletions > 0 && (
-                <span className="text-rose-600 dark:text-rose-400">-{deletions}</span>
+              {desc.deletions > 0 && (
+                <span className="text-rose-600 dark:text-rose-400">-{desc.deletions}</span>
               )}
             </span>
           )}
 
-          {item.detail.kind === "shell" &&
-            !isRunning &&
-            item.detail.exit_code !== null &&
-            item.detail.exit_code !== 0 && (
-              <span className="text-rose-500">exit {item.detail.exit_code}</span>
+          {desc.kind === "shell" &&
+            !desc.isRunning &&
+            desc.exitCode !== null &&
+            desc.exitCode !== 0 && (
+              <span className="text-rose-500">exit {desc.exitCode}</span>
             )}
 
-          {openPath && item.detail.kind === "file_edit" && (
+          {canOpenFileInDiff && openFilePath && (
             <button
               type="button"
               title="Open in Diff Review"
               onClick={(e) => {
                 e.stopPropagation();
-                orbitActions.openInspectorForFile(openPath, "session_turns");
+                orbitActions.openInspectorForFile(openFilePath, "session_turns");
               }}
-              className="text-foreground/45 hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
+              className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
             >
               <FileSymlink className="size-3.5" />
             </button>
@@ -401,29 +528,33 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
               className={cn(
                 "selectable-text max-h-56 overflow-auto overscroll-contain rounded-lg border px-3 py-2 font-mono text-[12px] leading-relaxed whitespace-pre-wrap",
                 isError
-                  ? "border-rose-500/30 bg-rose-500/[0.04] text-zinc-800 dark:text-zinc-200"
-                  : "border-black/[0.07] bg-zinc-50/90 text-zinc-800 dark:border-white/[0.08] dark:bg-[#131418] dark:text-zinc-300",
+                  ? "border-rose-500/30 bg-rose-500/[0.04] text-foreground/90"
+                  : "border-border bg-muted/45 dark:bg-muted/25 text-foreground/88",
               )}
             >
               <span className="text-muted-foreground select-none">$ </span>
               {item.detail.command}
-              {item.detail.output_preview ? `\n\n${item.detail.output_preview}` : ""}
+              {item.detail.output_preview
+                ? `\n\n${item.detail.output_preview}`
+                : !desc.isRunning
+                  ? "\n\n(no output)"
+                  : ""}
             </pre>
           )}
 
-          {item.detail.kind === "file_edit" && firstDiffLines.length > 0 && (
-            <InlineStepDiffPreview lines={firstDiffLines} />
+          {item.detail.kind === "file_edit" && diffLines.length > 0 && (
+            <InlineStepDiffPreview lines={diffLines} />
           )}
 
           {item.detail.kind === "subagent" && item.detail.prompt_preview && (
-            <pre className="selectable-text text-muted-foreground max-h-44 overflow-auto overscroll-contain rounded-lg border border-black/[0.07] bg-zinc-50/80 px-3 py-2 font-mono text-[12px] whitespace-pre-wrap dark:border-white/[0.08] dark:bg-[#131418]">
+            <pre className="selectable-text text-muted-foreground border-border bg-muted/45 dark:bg-muted/25 max-h-44 overflow-auto overscroll-contain rounded-lg border px-3 py-2 font-mono text-[12px] whitespace-pre-wrap">
               {item.detail.prompt_preview}
             </pre>
           )}
 
           {item.detail.kind === "generic" && item.detail.arguments_json && (
-            <pre className="selectable-text text-muted-foreground max-h-44 overflow-auto overscroll-contain rounded-lg border border-black/[0.07] bg-zinc-50/80 px-3 py-2 font-mono text-[12px] whitespace-pre-wrap dark:border-white/[0.08] dark:bg-[#131418]">
-              {item.detail.arguments_json}
+            <pre className="selectable-text text-muted-foreground border-border bg-muted/45 dark:bg-muted/25 max-h-44 overflow-auto overscroll-contain rounded-lg border px-3 py-2 font-mono text-[12px] whitespace-pre-wrap">
+              {formatJsonPreview(item.detail.arguments_json)}
             </pre>
           )}
         </div>
@@ -432,35 +563,226 @@ const ClaudeStepRow = memo(function ClaudeStepRow({
   );
 });
 
-/** Vertical step connector rail in the spirit of Claude.app's activity log. */
-const ClaudeStepTimeline = memo(function ClaudeStepTimeline({
+/** Vertical step connector rail for expanded or actively streaming steps. */
+const StepTimelineRail = memo(function StepTimelineRail({
   items,
   cwd,
   holdViewport,
   indented = false,
+  isLiveActive = false,
+  autoCollapseEarlierLiveSteps = false,
+  autoExpandErrors = false,
+  agentId,
+  thinkingTimings,
 }: {
   items: TimelineItemView[];
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
   indented?: boolean;
+  isLiveActive?: boolean;
+  autoCollapseEarlierLiveSteps?: boolean;
+  autoExpandErrors?: boolean;
+  agentId: string;
+  thinkingTimings: Record<string, TurnTimingRecord>;
 }) {
+  const [showAllLiveSteps, setShowAllLiveSteps] = useState(false);
+  const collapseBtnRef = useRef<HTMLButtonElement | null>(null);
+
   if (items.length === 0) return null;
+
+  const canRollUpEarlier =
+    isLiveActive &&
+    autoCollapseEarlierLiveSteps &&
+    items.length >= LIVE_STEP_AUTO_COLLAPSE_THRESHOLD;
+  const hiddenCount = canRollUpEarlier
+    ? Math.max(0, items.length - LIVE_STEP_VISIBLE_TAIL_COUNT)
+    : 0;
+  const visibleItems =
+    canRollUpEarlier && !showAllLiveSteps
+      ? items.slice(items.length - LIVE_STEP_VISIBLE_TAIL_COUNT)
+      : items;
+
+  const lastSeq = items[items.length - 1]?.seq;
+
   return (
     <div
       className={cn(
         "space-y-0.5",
-        indented &&
-          "mt-1 ml-[7px] border-l border-black/[0.085] pl-3.5 dark:border-white/[0.095]",
+        indented && "border-border mt-1 ml-[7px] border-l pl-3.5",
       )}
     >
-      {items.map((sub, i) => (
-        <ClaudeStepRow
-          key={`${sub.item_type}-${sub.seq}-${i}`}
-          item={sub}
+      {canRollUpEarlier && hiddenCount > 0 && (
+        <button
+          ref={collapseBtnRef}
+          type="button"
+          aria-expanded={showAllLiveSteps}
+          onClick={() =>
+            holdViewport(collapseBtnRef.current, () => setShowAllLiveSteps((v) => !v))
+          }
+          className="text-muted-foreground hover:text-foreground hover:bg-accent/55 -ml-1.5 inline-flex cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-1 text-[12.5px] transition-colors"
+        >
+          <ChevronRight
+            className={cn(
+              "size-3.5 stroke-[1.85] transition-transform duration-150",
+              showAllLiveSteps && "rotate-90",
+            )}
+          />
+          <span>
+            {showAllLiveSteps
+              ? "Hide steps"
+              : `${hiddenCount} ${hiddenCount === 1 ? "step" : "steps"}`}
+          </span>
+        </button>
+      )}
+
+      {visibleItems.map((sub, i) => {
+        const isLastInLiveGroup = isLiveActive && sub.seq === lastSeq;
+        const thinkingKey =
+          sub.item_type === "assistant_thinking"
+            ? `${agentId}::think::${sub.item_id || sub.seq}`
+            : null;
+        const thoughtDurationMs = thinkingKey
+          ? (thinkingTimings[thinkingKey]?.durationMs ?? null)
+          : null;
+
+        return (
+          <StepItemRow
+            key={`${sub.item_type}-${sub.seq}-${i}`}
+            item={sub}
+            cwd={cwd}
+            holdViewport={holdViewport}
+            isActivelyThinking={
+              sub.item_type === "assistant_thinking" && isLastInLiveGroup
+            }
+            thoughtDurationMs={thoughtDurationMs}
+            autoExpandError={autoExpandErrors}
+          />
+        );
+      })}
+    </div>
+  );
+});
+
+/**
+ * Collapsible Step Group Disclosure:
+ * Renders settled work batches as a single concise 1-line summary button
+ * (`Edited 2 files, ran a command`, `Read omni-composer.tsx`, `Thought for 6s`),
+ * expanding on click to reveal the indented vertical step timeline.
+ */
+const CollapsibleStepGroup = memo(function CollapsibleStepGroup({
+  items,
+  summaryLabel,
+  summaryCounts,
+  labelIncludesFailure,
+  shouldFold,
+  isLiveActive,
+  autoCollapseLiveOverflow,
+  showInlineDiffStat = false,
+  cwd,
+  agentId,
+  thinkingTimings,
+  holdViewport,
+}: {
+  items: TimelineItemView[];
+  summaryLabel: string;
+  summaryCounts: WorkSummaryResult["counts"];
+  labelIncludesFailure: boolean;
+  shouldFold: boolean;
+  isLiveActive: boolean;
+  autoCollapseLiveOverflow: boolean;
+  showInlineDiffStat?: boolean;
+  cwd: string;
+  agentId: string;
+  thinkingTimings: Record<string, TurnTimingRecord>;
+  holdViewport: ViewportAnchorHoldFn;
+}) {
+  const [manualExpanded, setManualExpanded] = useState(false);
+  const foldBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  if (items.length === 0) return null;
+
+  if (!shouldFold) {
+    return (
+      <StepTimelineRail
+        items={items}
+        cwd={cwd}
+        holdViewport={holdViewport}
+        indented={items.length > 1}
+        isLiveActive={isLiveActive}
+        autoCollapseEarlierLiveSteps={autoCollapseLiveOverflow}
+        autoExpandErrors={!isLiveActive && summaryCounts.unrecoveredFailureCount > 0}
+        agentId={agentId}
+        thinkingTimings={thinkingTimings}
+      />
+    );
+  }
+
+  const showFailureBadge =
+    summaryCounts.unrecoveredFailureCount > 0 && !labelIncludesFailure;
+  const showDiffNumbers =
+    showInlineDiffStat && (summaryCounts.additions > 0 || summaryCounts.deletions > 0);
+
+  return (
+    <div>
+      <button
+        ref={foldBtnRef}
+        type="button"
+        aria-expanded={manualExpanded}
+        onClick={() =>
+          holdViewport(foldBtnRef.current, () => setManualExpanded((v) => !v))
+        }
+        className="group/fold text-muted-foreground hover:text-foreground hover:bg-accent/55 -ml-1.5 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[13.5px] font-normal transition-colors"
+      >
+        <span
+          className={cn(
+            "truncate",
+            labelIncludesFailure && "text-rose-600 dark:text-rose-400",
+          )}
+        >
+          {summaryLabel}
+        </span>
+
+        {showFailureBadge && (
+          <span className="shrink-0 text-[12.5px] text-rose-600 dark:text-rose-400">
+            · {summaryCounts.unrecoveredFailureCount} failed
+          </span>
+        )}
+
+        {showDiffNumbers && (
+          <span className="tabular-nums flex shrink-0 items-center gap-1 font-mono text-[11.5px]">
+            {summaryCounts.additions > 0 && (
+              <span className="text-emerald-600 dark:text-emerald-400">
+                +{summaryCounts.additions}
+              </span>
+            )}
+            {summaryCounts.deletions > 0 && (
+              <span className="text-rose-600 dark:text-rose-400">
+                -{summaryCounts.deletions}
+              </span>
+            )}
+          </span>
+        )}
+
+        <ChevronRight
+          className={cn(
+            "size-3.5 shrink-0 opacity-70 transition-transform duration-150 group-hover/fold:opacity-100",
+            manualExpanded && "rotate-90",
+          )}
+        />
+      </button>
+
+      {manualExpanded && (
+        <StepTimelineRail
+          items={items}
           cwd={cwd}
           holdViewport={holdViewport}
+          indented
+          isLiveActive={false}
+          autoExpandErrors={summaryCounts.failedCount > 0 || summaryCounts.deniedCount > 0}
+          agentId={agentId}
+          thinkingTimings={thinkingTimings}
         />
-      ))}
+      )}
     </div>
   );
 });
@@ -519,7 +841,6 @@ function extractUserPromptPresentation(
   const inferredBadges: PromptBadge[] = [];
   let sanitized = false;
 
-  // Strip legacy attached image lines
   working = working.replace(/^Attached image file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
     sanitized = true;
     const name = rawPath.split("/").pop() || rawPath;
@@ -527,7 +848,6 @@ function extractUserPromptPresentation(
     return "";
   });
 
-  // Strip legacy referenced workspace files line
   working = working.replace(/^Referenced workspace files:\s*(.+)$/gm, (_, listStr: string) => {
     sanitized = true;
     const matches = Array.from(listStr.matchAll(/`@?([^`]+)`/g));
@@ -538,7 +858,6 @@ function extractUserPromptPresentation(
     return "";
   });
 
-  // Strip legacy inlined diff / terminal / quote blocks
   working = working.replace(
     /^>\s*(Working Tree Diff|Staged Diff):\n```diff\n[\s\S]*?\n```\s*$/gm,
     (_, label: string) => {
@@ -596,10 +915,10 @@ function extractUserPromptPresentation(
 }
 
 /**
- * Claude.app-style User Prompt Bubble:
- * - Soft warm-tinted capsule aligned flush right with Composer's right border.
- * - Renders semantic context & slash workflow chips (`/plan`, `/review`, `@file`, `Diff`) cleanly
- *   without exposing hidden system scaffolding or raw diff dumps.
+ * Orbit Native User Prompt Bubble:
+ * - Crisp cool-neutral Orbit surface (`bg-secondary` + `border-border`) aligned flush right.
+ * - Renders semantic context & slash workflow tokens (`/plan`, `/review`, `@file`, `Diff`)
+ *   without exposing hidden wire scaffolding.
  * - Capped at `240px` height with smooth bottom EdgeFade + `Show more / Show less`.
  * - Quiet hover `[Copy]` action without layout shift.
  */
@@ -648,7 +967,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
 
   return (
     <div className="group/user flex flex-col items-end pt-2">
-      <div className="relative max-w-[82%] rounded-[20px] border border-black/[0.055] bg-[#F4F3EE] px-4 py-2.5 dark:border-white/[0.075] dark:bg-[#2A2B30]">
+      <div className="prompt-bubble-surface text-foreground relative max-w-[82%] rounded-[22px] px-5 py-3">
         <div
           ref={bodyRef}
           style={
@@ -666,9 +985,9 @@ const UserPromptBubble = memo(function UserPromptBubble({
                 return (
                   <span
                     key={`${badge.kind}-${badge.label}-${idx}`}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-black/[0.08] bg-black/[0.035] px-2 py-0.5 text-[12px] text-foreground/85 dark:border-white/[0.11] dark:bg-white/[0.06]"
+                    className="text-foreground/85 inline-flex items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] dark:border-white/[0.10] dark:bg-white/[0.055]"
                   >
-                    <BadgeIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
+                    <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
                     <span className={cn("leading-normal font-medium", isMono && "font-mono")}>
                       {badge.label}
                     </span>
@@ -679,7 +998,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
           )}
 
           {slashBadge && SlashIcon ? (
-            <p className="selectable-text text-foreground text-[14px] leading-[1.6] whitespace-pre-wrap">
+            <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
               <span className="mr-1.5 inline-flex items-center gap-1.5 align-baseline">
                 <SlashIcon className="text-muted-foreground relative top-[2px] size-[14px] shrink-0 stroke-[1.75]" />
                 <span className="text-foreground font-medium">{slashLabel}</span>
@@ -689,7 +1008,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
           ) : (
             cleanText.length > 0 &&
             (sanitizedLegacy ? (
-              <p className="selectable-text text-foreground text-[14px] leading-[1.6] whitespace-pre-wrap">
+              <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
                 {cleanText}
               </p>
             ) : (
@@ -700,7 +1019,11 @@ const UserPromptBubble = memo(function UserPromptBubble({
           {!expanded && overflowing && (
             <div
               aria-hidden="true"
-              className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-[#F4F3EE] to-transparent dark:from-[#2A2B30]"
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-12"
+              style={{
+                background:
+                  "linear-gradient(to top, var(--surface-elevated) 0%, transparent 100%)",
+              }}
             />
           )}
         </div>
@@ -712,7 +1035,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
             onClick={() =>
               holdViewport(toggleBtnRef.current, () => setExpanded((v) => !v), "bottom")
             }
-            className="text-foreground/55 hover:text-foreground mt-1 inline-flex cursor-pointer items-center text-[12px] font-medium transition-colors"
+            className="text-muted-foreground hover:text-foreground mt-1 inline-flex cursor-pointer items-center text-[12px] font-medium transition-colors"
           >
             {expanded ? "Show less" : "Show more"}
           </button>
@@ -724,7 +1047,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
           type="button"
           title="Copy prompt"
           onClick={() => void handleCopy()}
-          className="text-foreground/42 hover:text-foreground inline-flex cursor-pointer items-center gap-1 rounded px-1 py-0.5 text-[11.5px] transition-colors"
+          className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1 rounded px-1 py-0.5 text-[11.5px] transition-colors"
         >
           {copied ? (
             <Check className="size-3 text-emerald-600 dark:text-emerald-400" />
@@ -760,10 +1083,10 @@ const TurnChangesBar = memo(function TurnChangesBar({
       <button
         type="button"
         onClick={() => orbitActions.openInspectorForFile(primaryPath, "session_turns")}
-        className="hover:bg-accent/65 bg-elevated/60 inline-flex max-w-full cursor-pointer items-center gap-2.5 rounded-full border border-black/[0.075] px-3 py-1 text-[12.5px] transition-colors dark:border-white/[0.085]"
+        className="border-border bg-elevated hover:bg-accent/65 inline-flex max-w-full cursor-pointer items-center gap-2.5 rounded-full border px-3 py-1 text-[12.5px] transition-colors"
       >
-        <FileCode2 className="text-foreground/60 size-3.5 shrink-0 stroke-[1.75]" />
-        <span className="text-foreground/85 truncate font-medium">{label}</span>
+        <FileCode2 className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
+        <span className="text-foreground/88 truncate font-medium">{label}</span>
         {(totalAdd > 0 || totalDel > 0) && (
           <span className="tabular-nums flex shrink-0 items-center gap-1.5 font-mono text-[11.5px]">
             {totalAdd > 0 && (
@@ -772,7 +1095,7 @@ const TurnChangesBar = memo(function TurnChangesBar({
             {totalDel > 0 && <span className="text-rose-600 dark:text-rose-400">-{totalDel}</span>}
           </span>
         )}
-        <span className="text-foreground/48 shrink-0 text-[12px]">Review ▸</span>
+        <span className="text-muted-foreground shrink-0 text-[12px]">Review ▸</span>
       </button>
     </div>
   );
@@ -793,8 +1116,8 @@ const LiveTurnElapsed = memo(function LiveTurnElapsed({ startedAtMs }: { started
   const formatted = `${mins}:${String(secs).padStart(2, "0")}`;
 
   return (
-    <span className="text-foreground/48 tabular-nums flex items-center gap-2 text-[12px]">
-      <span className="bg-foreground/45 size-1.5 animate-pulse rounded-full" />
+    <span className="text-muted-foreground tabular-nums flex items-center gap-2 text-[12px]">
+      <span className="bg-muted-foreground/70 size-1.5 animate-pulse rounded-full" />
       <span>{formatted}</span>
     </span>
   );
@@ -845,7 +1168,7 @@ const TurnFooter = memo(function TurnFooter({
               type="button"
               title="Copy response"
               onClick={() => void handleCopy()}
-              className="text-foreground/42 hover:text-foreground -ml-1 inline-flex size-6 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
+              className="text-muted-foreground hover:text-foreground hover:bg-accent/65 -ml-1 inline-flex size-6 cursor-pointer items-center justify-center rounded-md transition-colors"
             >
               {copied ? (
                 <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -859,7 +1182,7 @@ const TurnFooter = memo(function TurnFooter({
             <span
               onMouseEnter={() => setHoverTime(true)}
               onMouseLeave={() => setHoverTime(false)}
-              className="text-foreground/42 tabular-nums text-[12px] select-none"
+              className="text-muted-foreground tabular-nums text-[12px] select-none"
             >
               {hoverTime && completedClock ? completedClock : durationText}
             </span>
@@ -872,7 +1195,7 @@ const TurnFooter = memo(function TurnFooter({
 
 const CompactionDivider = memo(function CompactionDivider({ label }: { label?: string }) {
   return (
-    <div className="text-foreground/45 flex items-center gap-3 px-[10px] py-3 text-[12px]">
+    <div className="text-muted-foreground flex items-center gap-3 px-[10px] py-3 text-[12px]">
       <div className="border-border flex-1 border-t" />
       <span className="inline-flex items-center gap-1.5">
         <Scissors className="size-3 opacity-75" />
@@ -883,19 +1206,40 @@ const CompactionDivider = memo(function CompactionDivider({ label }: { label?: s
   );
 });
 
+function computeTotalThinkingDurationMs(
+  items: TimelineItemView[],
+  agentId: string,
+  thinkingTimings: Record<string, TurnTimingRecord>,
+): number | null {
+  let total = 0;
+  let foundAny = false;
+  for (const it of items) {
+    if (it.item_type !== "assistant_thinking") continue;
+    const rec = thinkingTimings[`${agentId}::think::${it.item_id || it.seq}`];
+    if (rec?.durationMs !== null && rec?.durationMs !== undefined) {
+      total += rec.durationMs;
+      foundAny = true;
+    }
+  }
+  return foundAny ? total : null;
+}
+
 /**
- * Renders a complete Claude.app-style Conversation Turn:
- * - Active turn: live vertical step timeline + streaming prose + `24px` live timer footer.
- * - Completed turn: auto-folds intermediate steps behind a quiet 1-line summary header
- *   (`Worked for 18s · Edited 2 files, ran 1 command ›`), keeping only the final synthesis
- *   response, aggregated file-changes pill, and `24px` action footer on stage.
+ * Renders a complete Conversation Turn:
+ * - Pre-reply steps fold automatically into a 1-line summary header (`Edited 2 files, ran a command ›`)
+ *   the moment `terminalReply` begins, preventing any layout jump when streaming completes.
+ * - During multi-phase runs (`[Steps 1] -> [Note] -> [Steps 2]`), settled earlier `step_group` batches
+ *   auto-fold immediately while the trailing active `step_group` streams live at the bottom.
+ * - Unrecovered tool failures without a final reply stay expanded so error output is immediately visible.
  */
 const TurnStageSection = memo(function TurnStageSection({
   turn,
   isTurnActive,
   autoFoldCompleted,
   cwd,
+  agentId,
   timing,
+  thinkingTimings,
   holdViewport,
   registerTurnEl,
 }: {
@@ -903,13 +1247,12 @@ const TurnStageSection = memo(function TurnStageSection({
   isTurnActive: boolean;
   autoFoldCompleted: boolean;
   cwd: string;
+  agentId: string;
   timing?: TurnTimingRecord;
+  thinkingTimings: Record<string, TurnTimingRecord>;
   holdViewport: ViewportAnchorHoldFn;
   registerTurnEl: (seq: number, el: HTMLDivElement | null) => void;
 }) {
-  const [manualExpanded, setManualExpanded] = useState(false);
-  const foldBtnRef = useRef<HTMLButtonElement | null>(null);
-
   const setRef = useCallback(
     (el: HTMLDivElement | null) => {
       registerTurnEl(turn.anchorSeq, el);
@@ -925,23 +1268,28 @@ const TurnStageSection = memo(function TurnStageSection({
     );
   }
 
-  const canFoldCompletedWork =
-    autoFoldCompleted &&
-    !isTurnActive &&
-    !turn.hasError &&
-    turn.terminalReply !== null &&
-    turn.foldedSteps.length > 0;
+  // Fold pre-reply work as soon as `terminalReply` starts (all prior steps are already done)
+  const canFoldPreReplyWork =
+    autoFoldCompleted && turn.terminalReply !== null && turn.foldedSteps.length > 0;
 
-  const durationPrefix =
-    timing?.durationMs && timing.durationMs >= 1000
-      ? `Worked for ${formatDurationCompact(timing.durationMs)}`
-      : null;
-
-  const foldHeaderText = durationPrefix
-    ? turn.workCounts.totalSteps > 0
-      ? `${durationPrefix} · ${turn.workSummaryLabel}`
-      : durationPrefix
-    : turn.workSummaryLabel;
+  const preReplySummaryLabel = useMemo(() => {
+    if (turn.workCounts.actionSteps === 0 && turn.workCounts.thoughtCount > 0) {
+      const thoughtMs = computeTotalThinkingDurationMs(
+        turn.foldedSteps,
+        agentId,
+        thinkingTimings,
+      );
+      return formatThoughtSummaryLabel(thoughtMs, turn.workCounts.thoughtCount);
+    }
+    return turn.workSummaryLabel;
+  }, [
+    agentId,
+    thinkingTimings,
+    turn.foldedSteps,
+    turn.workCounts.actionSteps,
+    turn.workCounts.thoughtCount,
+    turn.workSummaryLabel,
+  ]);
 
   return (
     <div ref={setRef} className="space-y-3">
@@ -951,40 +1299,26 @@ const TurnStageSection = memo(function TurnStageSection({
 
       {(turn.liveSegments.length > 0 || isTurnActive) && (
         <div className="px-[10px]">
-          {canFoldCompletedWork ? (
+          {canFoldPreReplyWork ? (
             <div className="space-y-2">
-              <div>
-                <button
-                  ref={foldBtnRef}
-                  type="button"
-                  onClick={() =>
-                    holdViewport(foldBtnRef.current, () => setManualExpanded((v) => !v))
-                  }
-                  className="text-foreground/50 hover:text-foreground hover:bg-foreground/[0.035] -ml-1.5 inline-flex max-w-full cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-[13.5px] font-normal transition-colors"
-                >
-                  <span className="truncate">{foldHeaderText}</span>
-                  <ChevronRight
-                    className={cn(
-                      "size-3.5 shrink-0 opacity-75 transition-transform duration-150",
-                      manualExpanded && "rotate-90",
-                    )}
-                  />
-                </button>
-
-                {manualExpanded && (
-                  <ClaudeStepTimeline
-                    items={turn.foldedSteps}
-                    cwd={cwd}
-                    holdViewport={holdViewport}
-                    indented
-                  />
-                )}
-              </div>
+              <CollapsibleStepGroup
+                items={turn.foldedSteps}
+                summaryLabel={preReplySummaryLabel}
+                summaryCounts={turn.workCounts}
+                labelIncludesFailure={turn.workSummaryIncludesFailure}
+                shouldFold
+                isLiveActive={false}
+                autoCollapseLiveOverflow={autoFoldCompleted}
+                cwd={cwd}
+                agentId={agentId}
+                thinkingTimings={thinkingTimings}
+                holdViewport={holdViewport}
+              />
 
               {turn.notices.map((n) => (
                 <div
                   key={`notice-${n.seq}`}
-                  className="text-muted-foreground bg-muted/55 flex items-center gap-2 rounded-xl px-3.5 py-2 text-[13px]"
+                  className="text-muted-foreground border-border bg-muted/50 flex items-center gap-2 rounded-xl border px-3.5 py-2 text-[13px]"
                 >
                   <AlertTriangle className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
                   <span>{n.message}</span>
@@ -1000,28 +1334,61 @@ const TurnStageSection = memo(function TurnStageSection({
                 </div>
               )}
 
-              <TurnChangesBar diffs={turn.turnDiffs} cwd={cwd} />
+              {!isTurnActive && <TurnChangesBar diffs={turn.turnDiffs} cwd={cwd} />}
 
               <TurnFooter
-                isTurnActive={false}
+                isTurnActive={isTurnActive}
                 timing={timing}
-                replyText={turn.terminalReply?.text ?? null}
+                replyText={!isTurnActive ? (turn.terminalReply?.text ?? null) : null}
               />
             </div>
           ) : (
             <div className="space-y-2">
-              {turn.liveSegments.map((seg) => {
+              {turn.liveSegments.map((seg, segIdx) => {
                 switch (seg.kind) {
-                  case "step_group":
+                  case "step_group": {
+                    const isTrailingSeg = segIdx === turn.liveSegments.length - 1;
+                    const isSegLiveActive =
+                      isTurnActive && isTrailingSeg && !seg.hasFollowingContent;
+                    const segSettled = !isSegLiveActive && !seg.hasRunningStep;
+                    // Keep an unrecovered trailing error open when there is no final reply after it
+                    const keepOpenForTrailingFailure =
+                      !seg.hasFollowingContent &&
+                      seg.summary.counts.unrecoveredFailureCount > 0;
+                    const shouldFoldSeg =
+                      autoFoldCompleted && segSettled && !keepOpenForTrailingFailure;
+
+                    const segLabel =
+                      seg.summary.counts.actionSteps === 0 &&
+                      seg.summary.counts.thoughtCount > 0
+                        ? formatThoughtSummaryLabel(
+                            computeTotalThinkingDurationMs(
+                              seg.items,
+                              agentId,
+                              thinkingTimings,
+                            ),
+                            seg.summary.counts.thoughtCount,
+                          )
+                        : seg.summary.label;
+
                     return (
-                      <ClaudeStepTimeline
+                      <CollapsibleStepGroup
                         key={seg.key}
                         items={seg.items}
+                        summaryLabel={segLabel}
+                        summaryCounts={seg.summary.counts}
+                        labelIncludesFailure={seg.summary.labelIncludesFailure}
+                        shouldFold={shouldFoldSeg}
+                        isLiveActive={isSegLiveActive}
+                        autoCollapseLiveOverflow={autoFoldCompleted}
+                        showInlineDiffStat={isTurnActive}
                         cwd={cwd}
+                        agentId={agentId}
+                        thinkingTimings={thinkingTimings}
                         holdViewport={holdViewport}
-                        indented={seg.items.length > 1}
                       />
                     );
+                  }
                   case "assistant_message":
                     return (
                       <div key={seg.key} className="py-0.5">
@@ -1037,7 +1404,7 @@ const TurnStageSection = memo(function TurnStageSection({
                     return (
                       <div
                         key={seg.key}
-                        className="text-muted-foreground bg-muted/55 flex items-center gap-2 rounded-xl px-3.5 py-2 text-[13px]"
+                        className="text-muted-foreground border-border bg-muted/50 flex items-center gap-2 rounded-xl border px-3.5 py-2 text-[13px]"
                       >
                         <AlertTriangle className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
                         <span>{seg.item.message}</span>
@@ -1051,7 +1418,7 @@ const TurnStageSection = memo(function TurnStageSection({
               <TurnFooter
                 isTurnActive={isTurnActive}
                 timing={timing}
-                replyText={turn.terminalReply?.text ?? null}
+                replyText={!isTurnActive ? (turn.terminalReply?.text ?? null) : null}
               />
             </div>
           )}
@@ -1062,8 +1429,8 @@ const TurnStageSection = memo(function TurnStageSection({
 });
 
 /**
- * Peripheral left-margin Turn Outline Rail (Paseo-inspired):
- * Appears only on wide viewports (`>= 960px` stage width) when `>= 2` user prompts exist,
+ * Peripheral left-margin Turn Outline Rail:
+ * Appears only on wide viewports (`>= 940px` stage width) when `>= 2` user prompts exist,
  * allowing zero-clutter jump-to-turn navigation in long sessions.
  */
 const ChatOutlineRail = memo(function ChatOutlineRail({
@@ -1119,7 +1486,7 @@ const ChatOutlineRail = memo(function ChatOutlineRail({
             </button>
 
             {hoveredIdx === idx && (
-              <div className="bg-popover text-popover-foreground floating-surface pointer-events-none absolute top-1/2 left-8 z-30 w-56 -translate-y-1/2 rounded-xl border border-black/[0.08] px-3 py-2 text-[12px] leading-snug dark:border-white/[0.10]">
+              <div className="bg-popover text-popover-foreground border-border floating-surface pointer-events-none absolute top-1/2 left-8 z-30 w-56 -translate-y-1/2 rounded-xl border px-3 py-2 text-[12px] leading-snug">
                 <div className="line-clamp-2 break-words">{p.preview}</div>
               </div>
             )}
@@ -1344,8 +1711,11 @@ export function StreamStage() {
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef<boolean>(true);
+  const programmaticScrollRef = useRef<boolean>(false);
+  const programmaticScrollTimerRef = useRef<number | null>(null);
   const turnElementMapRef = useRef<Map<number, HTMLDivElement>>(new Map());
   const turnTimingsRef = useRef<Record<string, TurnTimingRecord>>({});
+  const thinkingTimingsRef = useRef<Record<string, TurnTimingRecord>>({});
 
   const [isOccludingText, setIsOccludingText] = useState(false);
   const [showJumpLatest, setShowJumpLatest] = useState(false);
@@ -1372,31 +1742,68 @@ export function StreamStage() {
     latestTurn && (isAgentRunning || latestTurn.hasActiveItem),
   );
 
-  // Record live turn start & completion durations for the active session
+  // Record live turn & per-thinking-block start/completion durations for the active session
   useEffect(() => {
     if (!selectedAgentId || !latestTurn) return;
+    let changed = false;
+    const now = Date.now();
+
     const timingKey = `${selectedAgentId}::${latestTurn.key}`;
     const existing = turnTimingsRef.current[timingKey];
 
     if (isLatestTurnActive) {
       if (!existing || existing.completedAtMs !== null) {
         turnTimingsRef.current[timingKey] = {
-          startedAtMs: Date.now(),
+          startedAtMs: now,
           completedAtMs: null,
           durationMs: null,
         };
-        setTimingTick((n) => n + 1);
+        changed = true;
       }
     } else if (existing && existing.completedAtMs === null) {
-      const now = Date.now();
       turnTimingsRef.current[timingKey] = {
         ...existing,
         completedAtMs: now,
         durationMs: Math.max(0, now - existing.startedAtMs),
       };
+      changed = true;
+    }
+
+    const rawItems = cachedTimeline?.items ?? [];
+    const lastRawItem = rawItems[rawItems.length - 1] ?? null;
+
+    for (const item of rawItems) {
+      if (item.item_type !== "assistant_thinking") continue;
+      if (item.seq < latestTurn.anchorSeq) continue;
+
+      const thinkKey = `${selectedAgentId}::think::${item.item_id || item.seq}`;
+      const isCurrentlyThinking =
+        isLatestTurnActive && lastRawItem?.seq === item.seq;
+      const prevThink = thinkingTimingsRef.current[thinkKey];
+
+      if (isCurrentlyThinking) {
+        if (!prevThink) {
+          thinkingTimingsRef.current[thinkKey] = {
+            startedAtMs: now,
+            completedAtMs: null,
+            durationMs: null,
+          };
+          changed = true;
+        }
+      } else if (prevThink && prevThink.completedAtMs === null) {
+        thinkingTimingsRef.current[thinkKey] = {
+          ...prevThink,
+          completedAtMs: now,
+          durationMs: Math.max(0, now - prevThink.startedAtMs),
+        };
+        changed = true;
+      }
+    }
+
+    if (changed) {
       setTimingTick((n) => n + 1);
     }
-  }, [selectedAgentId, latestTurn, isLatestTurnActive]);
+  }, [selectedAgentId, latestTurn, isLatestTurnActive, cachedTimeline?.items]);
 
   // Measure stage width so peripheral ChatOutlineRail hides cleanly on narrow windows
   useEffect(() => {
@@ -1426,14 +1833,36 @@ export function StreamStage() {
     [stage.turns],
   );
 
+  useEffect(() => {
+    return () => {
+      if (programmaticScrollTimerRef.current !== null) {
+        window.clearTimeout(programmaticScrollTimerRef.current);
+      }
+    };
+  }, []);
+
   const syncScrollMetrics = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    const nearBottom = distanceFromBottom < 48;
-    stickToBottomRef.current = nearBottom;
-    setIsOccludingText(distanceFromBottom > 4 && stage.turns.length > 0);
-    setShowJumpLatest(!nearBottom && stage.turns.length > 0);
+
+    if (programmaticScrollRef.current) {
+      if (distanceFromBottom < 8) {
+        programmaticScrollRef.current = false;
+        if (programmaticScrollTimerRef.current !== null) {
+          window.clearTimeout(programmaticScrollTimerRef.current);
+          programmaticScrollTimerRef.current = null;
+        }
+      }
+      stickToBottomRef.current = true;
+      setIsOccludingText(false);
+      setShowJumpLatest(false);
+    } else {
+      const nearBottom = distanceFromBottom < 48;
+      stickToBottomRef.current = nearBottom;
+      setIsOccludingText(distanceFromBottom > 4 && stage.turns.length > 0);
+      setShowJumpLatest(!nearBottom && stage.turns.length > 0);
+    }
 
     // Update active turn in peripheral outline rail
     if (outlinePrompts.length >= 2) {
@@ -1452,9 +1881,20 @@ export function StreamStage() {
   const scrollToLatest = () => {
     const el = scrollRef.current;
     if (!el) return;
+    programmaticScrollRef.current = true;
     stickToBottomRef.current = true;
     setIsOccludingText(false);
     setShowJumpLatest(false);
+
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+    }
+    programmaticScrollTimerRef.current = window.setTimeout(() => {
+      programmaticScrollRef.current = false;
+      programmaticScrollTimerRef.current = null;
+      syncScrollMetrics();
+    }, 800);
+
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   };
 
@@ -1577,6 +2017,15 @@ export function StreamStage() {
       <div
         ref={scrollRef}
         onScroll={syncScrollMetrics}
+        onWheel={(e) => {
+          if (e.deltaY < 0 && programmaticScrollRef.current) {
+            programmaticScrollRef.current = false;
+            if (programmaticScrollTimerRef.current !== null) {
+              window.clearTimeout(programmaticScrollTimerRef.current);
+              programmaticScrollTimerRef.current = null;
+            }
+          }
+        }}
         className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable] pt-5 pr-[18px] pb-3 pl-[24px]"
       >
         <div className="mx-auto w-full max-w-[768px] space-y-6">
@@ -1591,7 +2040,9 @@ export function StreamStage() {
                 isTurnActive={turnActive}
                 autoFoldCompleted={coalesceExploration}
                 cwd={selectedCwd || currentAgent?.cwd || ""}
+                agentId={selectedAgentId}
                 timing={timing}
+                thinkingTimings={thinkingTimingsRef.current}
                 holdViewport={holdViewport}
                 registerTurnEl={registerTurnEl}
               />
@@ -1614,16 +2065,21 @@ export function StreamStage() {
                 "linear-gradient(to top, var(--surface-canvas) 0%, color-mix(in oklab, var(--surface-canvas) 66%, transparent) 48%, transparent 100%)",
             }}
           />
-          {showJumpLatest && (
-            <button
-              type="button"
-              aria-label="Scroll to latest"
-              onClick={scrollToLatest}
-              className="bg-elevated text-foreground/75 hover:text-foreground pointer-events-auto absolute bottom-2 left-[calc(50%+6px)] inline-flex size-8.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border border-black/[0.10] shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-colors hover:border-black/[0.16] dark:border-white/[0.12] dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]"
-            >
-              <ArrowDown className="size-4 stroke-[1.9]" />
-            </button>
-          )}
+          <button
+            type="button"
+            aria-label="Scroll to latest"
+            aria-hidden={!showJumpLatest}
+            tabIndex={showJumpLatest ? 0 : -1}
+            onClick={scrollToLatest}
+            className={cn(
+              "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute bottom-2 left-[calc(50%+6px)] inline-flex size-8.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-all duration-150 ease-out dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
+              showJumpLatest
+                ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
+                : "pointer-events-none translate-y-1 scale-95 opacity-0",
+            )}
+          >
+            <ArrowDown className="size-4 stroke-[1.9]" />
+          </button>
         </div>
 
         <StickyApprovalDock

@@ -452,7 +452,29 @@ function mergeTimelineDelta(
   for (const incoming of delta.upserted_items) {
     const key = timelineItemLogicalKey(incoming);
     const existingIdx = indexByKey.get(key);
-    if (existingIdx !== undefined) {
+    let canUpdateInPlace = existingIdx !== undefined;
+
+    if (
+      canUpdateInPlace &&
+      existingIdx !== undefined &&
+      incoming.item_type !== "user_prompt" &&
+      incoming.seq > 0
+    ) {
+      // Never allow an assistant/tool update to overwrite an item belonging to an earlier turn
+      for (let j = existingIdx + 1; j < baseItems.length; j += 1) {
+        const between = baseItems[j];
+        if (
+          between.item_type === "user_prompt" &&
+          between.seq > 0 &&
+          between.seq < incoming.seq
+        ) {
+          canUpdateInPlace = false;
+          break;
+        }
+      }
+    }
+
+    if (canUpdateInPlace && existingIdx !== undefined) {
       baseItems[existingIdx] = incoming;
     } else {
       indexByKey.set(key, baseItems.length);

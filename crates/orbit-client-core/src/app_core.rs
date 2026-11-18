@@ -1370,6 +1370,7 @@ impl OrbitAppCore {
         let mut notify_timeline_agent: Option<String> = None;
         let mut notify_git_cwd: Option<String> = None;
         let mut auto_subscribe_agent: Option<String> = None;
+        let mut continue_catchup: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
 
         if let Ok(mut guard) = self.hosts.write()
@@ -1469,13 +1470,20 @@ impl OrbitAppCore {
                     notify_timeline_agent = Some(ag_id);
                 }
                 WireMessage::TimelineCatchup {
-                    agent_id, events, ..
+                    agent_id,
+                    events,
+                    has_more,
+                    ..
                 } => {
                     let list = state.timelines.entry(agent_id.clone()).or_default();
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
+                    let max_seq = ordered.last().map(|e| e.seq);
                     for ev in ordered {
                         coalesce_or_push_timeline(list, ev);
+                    }
+                    if has_more && let Some(next_since) = max_seq {
+                        continue_catchup = Some((agent_id.clone(), next_since));
                     }
                     notify_timeline_agent = Some(agent_id);
                 }
@@ -1576,6 +1584,16 @@ impl OrbitAppCore {
         }
         if let Some(new_agent_id) = auto_subscribe_agent {
             self.open_agent_timeline(host_id, &new_agent_id);
+        }
+        if let Some((catchup_agent_id, since_seq)) = continue_catchup {
+            self.dispatch_wire(
+                host_id,
+                WireMessage::SubscribeTimeline {
+                    request_id: Uuid::new_v4(),
+                    agent_id: catchup_agent_id,
+                    since_seq,
+                },
+            );
         }
 
         if notify_fleet {
@@ -2362,8 +2380,49 @@ fn folder_basename(path: &str) -> String {
         .to_string()
 }
 
-fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, incoming: TimelineEvent) {
-    match &incoming.payload {
+fn strip_segment_scope(id: &str) -> &str {
+    id.split_once("@s").map(|(base, _)| base).unwrap_or(id)
+}
+
+fn is_legacy_shared_item_id(raw_id: &str) -> bool {
+    matches!(
+        raw_id,
+        "agy_msg_default" | "agy_thought_default" | "codex_msg" | "codex_rsn" | "item"
+    )
+}
+
+fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: TimelineEvent) {
+    let active_end = list.iter().position(|e| e.seq == 0).unwrap_or(list.len());
+    let precedes_incoming =
+        |ev: &TimelineEvent| -> bool { ev.seq > 0 && (incoming.seq == 0 || ev.seq < incoming.seq) };
+
+    let turn_start_idx = list[..active_end]
+        .iter()
+        .rposition(|ev| {
+            precedes_incoming(ev) && matches!(ev.payload, TimelinePayload::UserPrompt { .. })
+        })
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let seg_start_idx = list[..active_end]
+        .iter()
+        .rposition(|ev| {
+            precedes_incoming(ev)
+                && matches!(
+                    ev.payload,
+                    TimelinePayload::UserPrompt { .. } | TimelinePayload::ToolCall { .. }
+                )
+        })
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let seg_boundary_seq = if seg_start_idx > 0 {
+        list[seg_start_idx - 1].seq
+    } else {
+        0
+    };
+
+    match &mut incoming.payload {
         TimelinePayload::UserPrompt {
             text: inc_text,
             message_id: inc_mid,
@@ -2395,34 +2454,82 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, incoming: TimelineEv
             }
         }
         TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
-            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
-                matches!(
-                    &prev_ev.payload,
-                    TimelinePayload::AssistantMessage { item_id: existing_id, .. } if existing_id == item_id
-                )
-            }) {
+            let raw_id = strip_segment_scope(item_id).to_string();
+            let collides_earlier = is_legacy_shared_item_id(&raw_id)
+                || list[..seg_start_idx].iter().any(|ev| {
+                    matches!(
+                        &ev.payload,
+                        TimelinePayload::AssistantMessage { item_id: eid, .. }
+                            if strip_segment_scope(eid) == raw_id
+                    )
+                });
+            let effective_id = if collides_earlier {
+                format!("{raw_id}@s{seg_boundary_seq}")
+            } else {
+                raw_id
+            };
+            *item_id = effective_id.clone();
+
+            if let Some(prev) = list[seg_start_idx..active_end]
+                .iter_mut()
+                .rev()
+                .find(|prev_ev| {
+                    matches!(
+                        &prev_ev.payload,
+                        TimelinePayload::AssistantMessage { item_id: existing_id, .. }
+                            if existing_id == &effective_id
+                    )
+                })
+            {
                 *prev = incoming;
                 return;
             }
         }
         TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
-            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
-                matches!(
-                    &prev_ev.payload,
-                    TimelinePayload::AssistantThinking { item_id: existing_id, .. } if existing_id == item_id
-                )
-            }) {
+            let raw_id = strip_segment_scope(item_id).to_string();
+            let collides_earlier = is_legacy_shared_item_id(&raw_id)
+                || list[..seg_start_idx].iter().any(|ev| {
+                    matches!(
+                        &ev.payload,
+                        TimelinePayload::AssistantThinking { item_id: eid, .. }
+                            if strip_segment_scope(eid) == raw_id
+                    )
+                });
+            let effective_id = if collides_earlier {
+                format!("{raw_id}@s{seg_boundary_seq}")
+            } else {
+                raw_id
+            };
+            *item_id = effective_id.clone();
+
+            if let Some(prev) = list[seg_start_idx..active_end]
+                .iter_mut()
+                .rev()
+                .find(|prev_ev| {
+                    matches!(
+                        &prev_ev.payload,
+                        TimelinePayload::AssistantThinking { item_id: existing_id, .. }
+                            if existing_id == &effective_id
+                    )
+                })
+            {
                 *prev = incoming;
                 return;
             }
         }
         TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
-            if let Some(prev) = list.iter_mut().rev().find(|prev_ev| {
-                matches!(
-                    &prev_ev.payload,
-                    TimelinePayload::ToolCall { call_id: existing_id, .. } if existing_id == call_id
-                )
-            }) {
+            let target_call_id = call_id.clone();
+            if let Some(prev) = list[turn_start_idx..active_end]
+                .iter_mut()
+                .rev()
+                .find(|prev_ev| {
+                    matches!(
+                        &prev_ev.payload,
+                        TimelinePayload::ToolCall { call_id: existing_id, .. }
+                            if existing_id == &target_call_id
+                    )
+                })
+            {
                 *prev = incoming;
                 return;
             }
@@ -2760,5 +2867,130 @@ mod tests {
         assert_eq!(delta.latest_seq, 3);
         assert_eq!(delta.upserted_items.len(), 1);
         assert_eq!(core.agent_timeline("host_1", "ag_1").items.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_timeline_isolates_shared_item_ids_across_turns_and_tools() {
+        let now = chrono::Utc::now();
+        let mut list = Vec::new();
+
+        // Turn 1: "你好" -> Assistant reply with shared legacy `agy_msg_default`
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 1,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "你好".into(),
+                    badges: Vec::new(),
+                },
+            },
+        );
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 2,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_default".into(),
+                    text: "你好！".into(),
+                    streaming: true,
+                },
+            },
+        );
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 3,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_default".into(),
+                    text: "你好！请问有什么可以帮你的？".into(),
+                    streaming: false,
+                },
+            },
+        );
+
+        // Turn 2: "看看技术栈" -> ToolCall -> Assistant reply with the SAME `agy_msg_default`
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 4,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: "u2".into(),
+                    text: "看看技术栈".into(),
+                    badges: Vec::new(),
+                },
+            },
+        );
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 5,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::ToolCall {
+                    call_id: "tc_read".into(),
+                    status: ToolCallStatus::Completed,
+                    detail: ToolCallDetail::FileRead {
+                        path: "Cargo.toml".into(),
+                        start_line: None,
+                        end_line: None,
+                    },
+                },
+            },
+        );
+        coalesce_or_push_timeline(
+            &mut list,
+            TimelineEvent {
+                seq: 6,
+                epoch: 1,
+                agent_id: "ag_1".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_default".into(),
+                    text: "Orbit 采用纯 Rust 核心。".into(),
+                    streaming: false,
+                },
+            },
+        );
+
+        assert_eq!(list.len(), 5);
+        match (&list[1].payload, &list[4].payload) {
+            (
+                TimelinePayload::AssistantMessage {
+                    item_id: id1,
+                    text: t1,
+                    ..
+                },
+                TimelinePayload::AssistantMessage {
+                    item_id: id2,
+                    text: t2,
+                    ..
+                },
+            ) => {
+                assert_eq!(t1, "你好！请问有什么可以帮你的？");
+                assert_eq!(t2, "Orbit 采用纯 Rust 核心。");
+                assert_ne!(id1, id2);
+            }
+            _ => panic!("unexpected timeline order: {list:?}"),
+        }
     }
 }

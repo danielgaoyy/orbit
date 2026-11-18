@@ -492,11 +492,16 @@ async fn handle_codex_notification(
             }
         }
         "item/agentMessage/delta" => {
+            let turn_scope = native_turn_id
+                .as_deref()
+                .or(client_turn_id.as_deref())
+                .unwrap_or("turn0");
             let item_id = params
                 .get("itemId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("codex_msg")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("codex_msg_{turn_scope}"));
             let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if !delta.is_empty() {
                 let buf = msg_accum.entry(item_id.clone()).or_default();
@@ -511,11 +516,16 @@ async fn handle_codex_notification(
             }
         }
         "item/reasoning/summaryTextDelta" => {
+            let turn_scope = native_turn_id
+                .as_deref()
+                .or(client_turn_id.as_deref())
+                .unwrap_or("turn0");
             let item_id = params
                 .get("itemId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("codex_rsn")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("codex_rsn_{turn_scope}"));
             let delta = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
             if !delta.is_empty() {
                 let buf = thought_accum.entry(item_id.clone()).or_default();
@@ -533,11 +543,16 @@ async fn handle_codex_notification(
             let Some(item) = params.get("item") else {
                 return;
             };
+            let turn_scope = native_turn_id
+                .as_deref()
+                .or(client_turn_id.as_deref())
+                .unwrap_or("turn0");
             let item_id = item
                 .get("id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("item")
-                .to_string();
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("codex_msg_{turn_scope}"));
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
             match item_type {

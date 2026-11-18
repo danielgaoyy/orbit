@@ -88,6 +88,16 @@ struct PendingElicitation {
     field_keys: Vec<(String, bool)>, // (key, is_multi_select)
 }
 
+#[derive(Default)]
+struct AgyStreamSegmentState {
+    turn_tag: String,
+    step_seq: u64,
+    active_msg_id: Option<String>,
+    active_thought_id: Option<String>,
+    msg_accum: HashMap<String, String>,
+    thought_accum: HashMap<String, String>,
+}
+
 async fn run_agy_actor(
     cfg: SessionLaunchConfig,
     mut shim: orbit_shim::ShimClient,
@@ -300,8 +310,7 @@ async fn run_agy_actor(
     let mut mode = cfg.mode.clone();
     let mut active_turn_id: Option<String> = None;
     let mut active_prompt_rpc_key: Option<String> = None;
-    let mut msg_accum: HashMap<String, String> = HashMap::new();
-    let mut thought_accum: HashMap<String, String> = HashMap::new();
+    let mut seg_state = AgyStreamSegmentState::default();
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingPerm> = HashMap::new();
     let mut pending_elicits: HashMap<String, PendingElicitation> = HashMap::new();
@@ -320,8 +329,10 @@ async fn run_agy_actor(
                 match cmd {
                     DriverCommand::SendPrompt { turn_id, prompt } => {
                         active_turn_id = Some(turn_id.clone());
-                        msg_accum.clear();
-                        thought_accum.clear();
+                        seg_state = AgyStreamSegmentState {
+                            turn_tag: turn_id.clone(),
+                            ..AgyStreamSegmentState::default()
+                        };
                         let is_slash = prompt.trim_start().starts_with('/');
                         if is_slash {
                             suppress_catchup_until_user_chunk = false;
@@ -532,8 +543,10 @@ async fn run_agy_actor(
                                 let key = rid.as_key();
                                 if active_prompt_rpc_key.as_deref() == Some(key.as_str()) {
                                     active_prompt_rpc_key = None;
+                                    seg_state.active_msg_id = None;
+                                    seg_state.active_thought_id = None;
                                     // Finalize any streaming message buffers
-                                    for (mid, text) in msg_accum.drain() {
+                                    for (mid, text) in seg_state.msg_accum.drain() {
                                         let _ = evt_tx
                                             .send(DriverEvent::AssistantText {
                                                 item_id: mid,
@@ -570,8 +583,7 @@ async fn run_agy_actor(
                                     update,
                                     &mut suppress_catchup_until_user_chunk,
                                     &synthesized_wakeup_tools,
-                                    &mut msg_accum,
-                                    &mut thought_accum,
+                                    &mut seg_state,
                                     &mut tool_cache,
                                     &evt_tx,
                                 )
@@ -732,8 +744,7 @@ async fn handle_acp_session_update(
     update: &Value,
     suppress_catchup: &mut bool,
     synthesized_wakeup_tools: &HashSet<String>,
-    msg_accum: &mut HashMap<String, String>,
-    thought_accum: &mut HashMap<String, String>,
+    seg_state: &mut AgyStreamSegmentState,
     tool_cache: &mut HashMap<String, ToolCallDetail>,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) {
@@ -749,6 +760,12 @@ async fn handle_acp_session_update(
         return;
     }
 
+    let turn_tag = if seg_state.turn_tag.is_empty() {
+        "init".to_string()
+    } else {
+        seg_state.turn_tag.clone()
+    };
+
     match kind {
         "agent_message_chunk" => {
             let chunk = update
@@ -758,12 +775,22 @@ async fn handle_acp_session_update(
             if chunk.is_empty() {
                 return;
             }
-            let mid = update
+            seg_state.active_thought_id = None;
+            let mid = if let Some(explicit) = update
                 .get("messageId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("agy_msg_default")
-                .to_string();
-            let entry = msg_accum.entry(mid.clone()).or_default();
+                .filter(|s| !s.is_empty())
+            {
+                format!("{turn_tag}_{explicit}")
+            } else if let Some(ref cur) = seg_state.active_msg_id {
+                cur.clone()
+            } else {
+                seg_state.step_seq += 1;
+                let id = format!("agy_msg_{turn_tag}_{}", seg_state.step_seq);
+                seg_state.active_msg_id = Some(id.clone());
+                id
+            };
+            let entry = seg_state.msg_accum.entry(mid.clone()).or_default();
             entry.push_str(chunk);
             let _ = evt_tx
                 .send(DriverEvent::AssistantText {
@@ -781,12 +808,32 @@ async fn handle_acp_session_update(
             if chunk.is_empty() {
                 return;
             }
-            let tid = update
+            if let Some(prev_mid) = seg_state.active_msg_id.take()
+                && let Some(prev_text) = seg_state.msg_accum.remove(&prev_mid)
+            {
+                let _ = evt_tx
+                    .send(DriverEvent::AssistantText {
+                        item_id: prev_mid,
+                        text: prev_text,
+                        streaming: false,
+                    })
+                    .await;
+            }
+            let tid = if let Some(explicit) = update
                 .get("messageId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("agy_thought_default")
-                .to_string();
-            let entry = thought_accum.entry(tid.clone()).or_default();
+                .filter(|s| !s.is_empty())
+            {
+                format!("{turn_tag}_th_{explicit}")
+            } else if let Some(ref cur) = seg_state.active_thought_id {
+                cur.clone()
+            } else {
+                seg_state.step_seq += 1;
+                let id = format!("agy_th_{turn_tag}_{}", seg_state.step_seq);
+                seg_state.active_thought_id = Some(id.clone());
+                id
+            };
+            let entry = seg_state.thought_accum.entry(tid.clone()).or_default();
             entry.push_str(chunk);
             let _ = evt_tx
                 .send(DriverEvent::ThinkingText {
@@ -801,6 +848,18 @@ async fn handle_acp_session_update(
             };
             if synthesized_wakeup_tools.contains(call_id) {
                 return;
+            }
+            seg_state.active_thought_id = None;
+            if let Some(prev_mid) = seg_state.active_msg_id.take()
+                && let Some(prev_text) = seg_state.msg_accum.remove(&prev_mid)
+            {
+                let _ = evt_tx
+                    .send(DriverEvent::AssistantText {
+                        item_id: prev_mid,
+                        text: prev_text,
+                        streaming: false,
+                    })
+                    .await;
             }
             let status = match update.get("status").and_then(|v| v.as_str()) {
                 Some("completed") => ToolCallStatus::Completed,

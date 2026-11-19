@@ -165,7 +165,7 @@ jobs:
           fi
 
           npm ci
-          npx tauri build --target aarch64-apple-darwin --bundles dmg "${TAURI_EXTRA_ARGS[@]}"
+          npx tauri build --target aarch64-apple-darwin --bundles app,dmg "${TAURI_EXTRA_ARGS[@]}"
           cp src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg Orbit-macOS-AppleSilicon.dmg
       - name: Verify Signature & Notarize macOS DMG
         working-directory: apps/desktop

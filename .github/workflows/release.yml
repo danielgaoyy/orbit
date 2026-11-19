@@ -1,4 +1,4 @@
-name: Build & Release Orbit (CLI + Tauri Desktop + Native iOS/Android)
+name: Build & Release Orbit (CLI + Tauri Desktop + Native iOS/Android/HarmonyOS)
 
 on:
   push:
@@ -318,6 +318,124 @@ jobs:
           name: Orbit-iOS-sideload.ipa
           path: apps/ios/Orbit-iOS-sideload.ipa
 
+  build-harmony-hap:
+    name: Build Native HarmonyOS HAP (ArkUI V2 + N-API, API 26)
+    needs: rust-quality-and-e2e
+    runs-on: ubuntu-latest
+    outputs:
+      signed: ${{ steps.harmony-signing.outputs.signed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install HarmonyOS Headless Graphics Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libgles2 libglx0 libglib2.0-0 \
+            libx11-6 libxext6 libxrender1 libxrandr2 libxfixes3 libxi6 libxcursor1 \
+            libxcomposite1 libxdamage1 libxtst6 libxkbcommon0 \
+            libgbm1 libdrm2 fontconfig fonts-dejavu-core jq
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Setup HarmonyOS Command Line Tools (API 26)
+        uses: ErBWs/setup-ohos@v2
+        with:
+          version: "26.0.0.821"
+          cache: true
+      - name: Configure HarmonyOS SDK & Package Registries
+        run: |
+          echo "DEVECO_SDK_HOME=$HOS_SDK_HOME" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$HOS_SDK_HOME/default/openharmony" >> "$GITHUB_ENV"
+          echo "@ohos:registry=https://repo.harmonyos.com/npm/" >> "$HOME/.npmrc"
+          ohpm config set registry https://repo.harmonyos.com/ohpm/
+          hvigorw --version || true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-ohos,x86_64-unknown-linux-ohos
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Rust N-API Libraries (arm64-v8a + x86_64)
+        run: ./apps/harmony/scripts/build-rust-ohos.sh
+      - name: Probe HarmonyOS Signing Secrets
+        id: harmony-signing
+        env:
+          SIGN_CERT: ${{ secrets.HARMONY_SIGNING_CERT }}
+          SIGN_PROFILE: ${{ secrets.HARMONY_SIGNING_PROFILE }}
+          SIGN_KEYSTORE: ${{ secrets.HARMONY_SIGNING_KEYSTORE }}
+          SIGN_ALIAS: ${{ secrets.HARMONY_SIGNING_KEY_ALIAS }}
+          SIGN_KEY_PWD: ${{ secrets.HARMONY_SIGNING_KEY_PASSWORD }}
+          SIGN_STORE_PWD: ${{ secrets.HARMONY_SIGNING_STORE_PASSWORD }}
+        run: |
+          if [ -n "$SIGN_CERT" ] && [ -n "$SIGN_PROFILE" ] && [ -n "$SIGN_KEYSTORE" ] && \
+             [ -n "$SIGN_ALIAS" ] && [ -n "$SIGN_KEY_PWD" ] && [ -n "$SIGN_STORE_PWD" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HarmonyOS signing secrets are not configured; building an unsigned HAP. Configure HARMONY_SIGNING_* secrets (see deploy/HARMONY_SIGNING.md) for signed releases."
+          fi
+      - name: Prepare Clean CI Signing Config
+        run: python3 apps/harmony/scripts/strip-signing.py apps/harmony/build-profile.json5
+      - name: Install ohpm Dependencies & Build Release HAP
+        working-directory: apps/harmony
+        run: |
+          ohpm install --all
+          hvigorw assembleHap --mode module -p product=default -p module=entry@default -p buildMode=release --no-daemon --stacktrace
+      - name: Package & Optionally Sign Orbit-HarmonyOS.hap
+        working-directory: apps/harmony
+        env:
+          SHOULD_SIGN: ${{ steps.harmony-signing.outputs.signed }}
+          SIGN_CERT_B64: ${{ secrets.HARMONY_SIGNING_CERT }}
+          SIGN_PROFILE_B64: ${{ secrets.HARMONY_SIGNING_PROFILE }}
+          SIGN_KEYSTORE_B64: ${{ secrets.HARMONY_SIGNING_KEYSTORE }}
+          SIGN_KEY_ALIAS: ${{ secrets.HARMONY_SIGNING_KEY_ALIAS }}
+          SIGN_KEY_PWD: ${{ secrets.HARMONY_SIGNING_KEY_PASSWORD }}
+          SIGN_STORE_PWD: ${{ secrets.HARMONY_SIGNING_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          UNSIGNED_HAP="$(find entry/build -type f -name '*-unsigned.hap' -path '*/outputs/*' | head -n 1 || true)"
+          if [ -z "$UNSIGNED_HAP" ]; then
+            UNSIGNED_HAP="$(find entry/build -type f -name '*.hap' -path '*/outputs/*' | head -n 1 || true)"
+          fi
+          if [ -z "$UNSIGNED_HAP" ] || [ ! -f "$UNSIGNED_HAP" ]; then
+            echo "::error::Failed to locate built HAP under apps/harmony/entry/build/"
+            find entry/build -maxdepth 5 -type f || true
+            exit 1
+          fi
+          echo "Found assembled HAP: $UNSIGNED_HAP ($(wc -c < "$UNSIGNED_HAP") bytes)"
+
+          if [ "$SHOULD_SIGN" = "true" ]; then
+            SIGN_DIR="$RUNNER_TEMP/harmony-sign"
+            mkdir -p "$SIGN_DIR"
+            chmod 700 "$SIGN_DIR"
+            umask 077
+            printf '%s' "$SIGN_CERT_B64" | base64 -d > "$SIGN_DIR/app.cer"
+            printf '%s' "$SIGN_PROFILE_B64" | base64 -d > "$SIGN_DIR/app.p7b"
+            printf '%s' "$SIGN_KEYSTORE_B64" | base64 -d > "$SIGN_DIR/app.p12"
+
+            SIGN_TOOL="$HOS_SDK_HOME/default/openharmony/toolchains/lib/hap-sign-tool.jar"
+            java -jar "$SIGN_TOOL" sign-app \
+              -mode localSign \
+              -signAlg SHA256withECDSA \
+              -keyAlias "$SIGN_KEY_ALIAS" \
+              -inFile "$UNSIGNED_HAP" \
+              -outFile "Orbit-HarmonyOS.hap" \
+              -keystoreFile "$SIGN_DIR/app.p12" \
+              -keystorePwd "$SIGN_STORE_PWD" \
+              -keyPwd "$SIGN_KEY_PWD" \
+              -appCertFile "$SIGN_DIR/app.cer" \
+              -profileFile "$SIGN_DIR/app.p7b" \
+              -signCode 1
+          else
+            cp -f "$UNSIGNED_HAP" "Orbit-HarmonyOS.hap"
+          fi
+      - name: Cleanup Temporary HarmonyOS Signing Materials
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/harmony-sign"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Orbit-HarmonyOS.hap
+          path: apps/harmony/Orbit-HarmonyOS.hap
+
   publish-github-release:
     name: Publish GitHub Release Assets
     if: startsWith(github.ref, 'refs/tags/v')
@@ -327,6 +445,7 @@ jobs:
       - build-linux-desktop
       - build-android-apk
       - build-ios-ipa
+      - build-harmony-hap
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -346,21 +465,26 @@ jobs:
         id: release-notes
         env:
           NOTARIZED: ${{ needs.build-macos-desktop.outputs.notarized }}
+          HARMONY_SIGNED: ${{ needs.build-harmony-hap.outputs.signed }}
         run: |
-          if [ "$NOTARIZED" != "true" ]; then
-            {
-              echo "body<<ORBIT_RELEASE_BODY_EOF"
+          {
+            echo "body<<ORBIT_RELEASE_BODY_EOF"
+            if [ "$NOTARIZED" != "true" ]; then
               cat <<'NOTE'
           > **macOS First Launch Note**: This build is ad-hoc signed without Apple Notarization. On first launch, go to **System Settings → Privacy & Security** and click **Open Anyway**. On macOS Sequoia (15+) or newer, if the *Open Anyway* button does not appear, run:
           > ```bash
           > xattr -dr com.apple.quarantine /Applications/Orbit.app
           > ```
+
           NOTE
-              echo "ORBIT_RELEASE_BODY_EOF"
-            } >> "$GITHUB_OUTPUT"
-          else
-            echo "body=" >> "$GITHUB_OUTPUT"
-          fi
+            fi
+            if [ "$HARMONY_SIGNED" != "true" ]; then
+              cat <<'HNOTE'
+          > **HarmonyOS Sideload Note**: `Orbit-HarmonyOS.hap` is unsigned because HarmonyOS release signing secrets are not configured. Sign it with your DevEco Studio / AppGallery Connect certificate (see [`deploy/HARMONY_SIGNING.md`](deploy/HARMONY_SIGNING.md)) or build directly via DevEco Studio before installing via `hdc install`.
+          HNOTE
+            fi
+            echo "ORBIT_RELEASE_BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -375,4 +499,5 @@ jobs:
             release-dist/orbit-cli-linux-x64
             release-dist/Orbit-Android-arm64.apk
             release-dist/Orbit-iOS-sideload.ipa
+            release-dist/Orbit-HarmonyOS.hap
             release-dist/SHA256SUMS.txt

@@ -164,8 +164,8 @@ export function GeneralSection() {
           </SettingRow>
 
           <SettingRow
-            title="Auto-collapse completed steps"
-            description="Fold intermediate tool calls and thoughts once a reply arrives."
+            title="Collapse thinking and tool calls"
+            description="Fold all thinking and tool calls into a single live summary row; click anytime to expand all."
           >
             <ToggleSwitch
               checked={coalesceExploration}

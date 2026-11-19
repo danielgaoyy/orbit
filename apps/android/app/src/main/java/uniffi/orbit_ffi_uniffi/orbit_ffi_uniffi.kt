@@ -787,6 +787,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_session_mode(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_stage_attachment(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_start_terminal(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_subscribe(
@@ -928,6 +930,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_set_session_mode(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`mode`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_stage_attachment(`ptr`: Long,`hostId`: RustBuffer.ByValue,`filename`: RustBuffer.ByValue,`mimeType`: RustBuffer.ByValue,`bytes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_start_terminal(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`cols`: Short,`rows`: Short,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_subscribe(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1208,6 +1212,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_session_mode() and 0xFFFF) != 39379) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_stage_attachment() and 0xFFFF) != 5186) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_start_terminal() and 0xFFFF) != 39661) {
@@ -2212,6 +2219,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `setSessionMode`(`hostId`: kotlin.String, `agentId`: kotlin.String, `mode`: FfiSessionMode)
     
+    fun `stageAttachment`(`hostId`: kotlin.String, `filename`: kotlin.String, `mimeType`: kotlin.String?, `bytes`: kotlin.ByteArray): FfiStagedAttachment
+    
     fun `startTerminal`(`hostId`: kotlin.String, `cwd`: kotlin.String, `cols`: kotlin.UShort, `rows`: kotlin.UShort)
     
     fun `subscribe`(`listener`: MobileCoreListener)
@@ -2903,6 +2912,24 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
 }
     }
     
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `stageAttachment`(`hostId`: kotlin.String, `filename`: kotlin.String, `mimeType`: kotlin.String?, `bytes`: kotlin.ByteArray): FfiStagedAttachment {
+            return FfiConverterTypeFfiStagedAttachment.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_stage_attachment(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`filename`),
+        FfiConverterOptionalString.lower(`mimeType`),
+        FfiConverterByteArray.lower(`bytes`),_status)
+}
+    }
+    )
+    }
     
 
     override fun `startTerminal`(`hostId`: kotlin.String, `cwd`: kotlin.String, `cols`: kotlin.UShort, `rows`: kotlin.UShort)
@@ -4676,6 +4703,49 @@ public object FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer<FfiStageTurn>
             FfiConverterBoolean.write(value.`hasActiveItem`, buf)
             FfiConverterOptionalLong.write(value.`startedAtMs`, buf)
             FfiConverterOptionalLong.write(value.`completedAtMs`, buf)
+    }
+}
+
+
+
+data class FfiStagedAttachment (
+    var `path`: kotlin.String
+    , 
+    var `filename`: kotlin.String
+    , 
+    var `sizeBytes`: kotlin.ULong
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiStagedAttachment: FfiConverterRustBuffer<FfiStagedAttachment> {
+    override fun read(buf: ByteBuffer): FfiStagedAttachment {
+        return FfiStagedAttachment(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiStagedAttachment) = (
+            FfiConverterString.allocationSize(value.`path`) +
+            FfiConverterString.allocationSize(value.`filename`) +
+            FfiConverterULong.allocationSize(value.`sizeBytes`)
+    )
+
+    override fun write(value: FfiStagedAttachment, buf: ByteBuffer) {
+            FfiConverterString.write(value.`path`, buf)
+            FfiConverterString.write(value.`filename`, buf)
+            FfiConverterULong.write(value.`sizeBytes`, buf)
     }
 }
 

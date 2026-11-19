@@ -965,6 +965,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func setSessionMode(hostId: String, agentId: String, mode: FfiSessionMode) 
     
+    func stageAttachment(hostId: String, filename: String, mimeType: String?, bytes: Data) throws  -> FfiStagedAttachment
+    
     func startTerminal(hostId: String, cwd: String, cols: UInt16, rows: UInt16) 
     
     func subscribe(listener: MobileCoreListener) 
@@ -1474,6 +1476,19 @@ open func setSessionMode(hostId: String, agentId: String, mode: FfiSessionMode) 
         FfiConverterTypeFfiSessionMode_lower(mode),uniffiCallStatus
     )
 }
+}
+    
+open func stageAttachment(hostId: String, filename: String, mimeType: String?, bytes: Data)throws  -> FfiStagedAttachment  {
+    return try  FfiConverterTypeFfiStagedAttachment_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_stage_attachment(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(filename),
+        FfiConverterOptionString.lower(mimeType),
+        FfiConverterData.lower(bytes),uniffiCallStatus
+    )
+})
 }
     
 open func startTerminal(hostId: String, cwd: String, cols: UInt16, rows: UInt16)  {try! rustCall() {
@@ -3460,6 +3475,64 @@ public func FfiConverterTypeFfiStageTurn_lift(_ buf: RustBuffer) throws -> FfiSt
 #endif
 public func FfiConverterTypeFfiStageTurn_lower(_ value: FfiStageTurn) -> RustBuffer {
     return FfiConverterTypeFfiStageTurn.lower(value)
+}
+
+
+public struct FfiStagedAttachment: Equatable, Hashable {
+    public var path: String
+    public var filename: String
+    public var sizeBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(path: String, filename: String, sizeBytes: UInt64) {
+        self.path = path
+        self.filename = filename
+        self.sizeBytes = sizeBytes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiStagedAttachment: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiStagedAttachment: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiStagedAttachment {
+        return
+            try FfiStagedAttachment(
+                path: FfiConverterString.read(from: &buf), 
+                filename: FfiConverterString.read(from: &buf), 
+                sizeBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiStagedAttachment, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterString.write(value.filename, into: &buf)
+        FfiConverterUInt64.write(value.sizeBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiStagedAttachment_lift(_ buf: RustBuffer) throws -> FfiStagedAttachment {
+    return try FfiConverterTypeFfiStagedAttachment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiStagedAttachment_lower(_ value: FfiStagedAttachment) -> RustBuffer {
+    return FfiConverterTypeFfiStagedAttachment.lower(value)
 }
 
 
@@ -7224,6 +7297,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_set_session_mode() != 39379) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_stage_attachment() != 5186) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_start_terminal() != 39661) {

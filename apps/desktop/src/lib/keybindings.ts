@@ -1,6 +1,11 @@
 import { useEffect, useRef } from "react";
 import { isMacDesktop, orbitIpc } from "@/lib/orbit-ipc";
-import { findFirstPendingPermission } from "@/lib/timeline-coalesce";
+import {
+  findFirstPendingPermission,
+  getFocusedDecisionTarget,
+  isAlwaysDecision,
+  isDenyDecision,
+} from "@/lib/timeline-coalesce";
 import { orbitActions } from "@/state/orbit-store";
 
 export function modSymbol(): string {
@@ -126,43 +131,70 @@ export function useGlobalErgonomicKeybindings(): void {
         }
       }
 
-      // 10. Quick Permission Approval Chords (`⌘Y` Allow, `⌘⇧Y` Always Allow, `⌘Backspace` Deny)
-      if (mod && snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession) {
-        const tl = snap.timelines[`${snap.selectedHostId}::${snap.selectedAgentId}`];
-        if (tl) {
-          const firstPerm = findFirstPendingPermission(tl.items);
-          if (firstPerm) {
-            if (!e.shiftKey && keyLower === "y") {
-              e.preventDefault();
-              void orbitIpc.resolvePermission(
-                snap.selectedHostId,
-                snap.selectedAgentId,
-                firstPerm.request_id,
-                "allow",
-              );
-              return;
-            }
-            if (e.shiftKey && keyLower === "y") {
-              e.preventDefault();
-              const alwaysChoice =
-                firstPerm.allowed_decisions.find((d) => d.includes("always")) ?? "allow_always";
-              void orbitIpc.resolvePermission(
-                snap.selectedHostId,
-                snap.selectedAgentId,
-                firstPerm.request_id,
-                alwaysChoice,
-              );
-              return;
-            }
-            if (e.key === "Backspace") {
-              e.preventDefault();
-              void orbitIpc.resolvePermission(
-                snap.selectedHostId,
-                snap.selectedAgentId,
-                firstPerm.request_id,
-                "deny",
-              );
-              return;
+      // 10. Quick Permission Approval Chords (`⌘Y` Allow, `⌘⇧Y` Always Allow, `⌘⌫` Deny)
+      if (mod && !e.altKey && !e.repeat && snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession) {
+        const focused = getFocusedDecisionTarget();
+        if (focused?.kind !== "question") {
+          const tl = snap.timelines[`${snap.selectedHostId}::${snap.selectedAgentId}`];
+          if (tl) {
+            const focusedPerm =
+              focused?.kind === "permission"
+                ? tl.items.find(
+                    (it): it is Extract<(typeof tl.items)[number], { item_type: "permission_request" }> =>
+                      it.item_type === "permission_request" &&
+                      !it.resolved_decision &&
+                      it.request_id === focused.requestId,
+                  ) ?? null
+                : null;
+            const targetPerm = focusedPerm ?? findFirstPendingPermission(tl.items);
+            if (targetPerm) {
+              const decisions =
+                targetPerm.allowed_decisions.length > 0
+                  ? targetPerm.allowed_decisions
+                  : ["allow", "allow_always", "deny"];
+              const allowChoice =
+                decisions.find((d) => !isDenyDecision(d) && !isAlwaysDecision(d)) ?? null;
+              const alwaysChoice = decisions.find((d) => isAlwaysDecision(d)) ?? null;
+              const denyChoice = decisions.find((d) => isDenyDecision(d)) ?? null;
+
+              if (!e.shiftKey && keyLower === "y" && allowChoice) {
+                e.preventDefault();
+                void orbitIpc.resolvePermission(
+                  snap.selectedHostId,
+                  snap.selectedAgentId,
+                  targetPerm.request_id,
+                  allowChoice,
+                );
+                return;
+              }
+              if (e.shiftKey && keyLower === "y" && alwaysChoice) {
+                e.preventDefault();
+                void orbitIpc.resolvePermission(
+                  snap.selectedHostId,
+                  snap.selectedAgentId,
+                  targetPerm.request_id,
+                  alwaysChoice,
+                );
+                return;
+              }
+              if (!e.shiftKey && e.key === "Backspace" && denyChoice) {
+                const activeEl = document.activeElement as HTMLElement | null;
+                const activeTag = activeEl?.tagName;
+                const isEditable =
+                  activeTag === "INPUT" ||
+                  activeTag === "TEXTAREA" ||
+                  Boolean(activeEl?.isContentEditable);
+                if (!isEditable) {
+                  e.preventDefault();
+                  void orbitIpc.resolvePermission(
+                    snap.selectedHostId,
+                    snap.selectedAgentId,
+                    targetPerm.request_id,
+                    denyChoice,
+                  );
+                  return;
+                }
+              }
             }
           }
         }
@@ -181,7 +213,7 @@ export function useGlobalErgonomicKeybindings(): void {
           if (snap.selectedHostId && snap.selectedAgentId) {
             const detail = snap.hostDetails[snap.selectedHostId];
             const ag = detail?.agents.find((a) => a.agent_id === snap.selectedAgentId);
-            if (ag?.is_running) {
+            if (ag?.is_running || ag?.is_awaiting_permission) {
               e.preventDefault();
               void orbitIpc.interruptAgent(snap.selectedHostId, snap.selectedAgentId);
               orbitActions.showToast("Interrupted active turn");

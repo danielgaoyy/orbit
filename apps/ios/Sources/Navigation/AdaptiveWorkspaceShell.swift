@@ -10,7 +10,7 @@ struct AdaptiveWorkspaceShell: View {
     @GestureState private var drawerDragTranslation: CGFloat = 0
 
     private var appearanceMode: OrbitAppearanceMode {
-        OrbitAppearanceMode(rawValue: appearanceRaw) ?? .system
+        OrbitAppearanceMode.fromStorage(appearanceRaw)
     }
 
     var body: some View {
@@ -24,7 +24,7 @@ struct AdaptiveWorkspaceShell: View {
                 if isSplitLayout {
                     regularSplitShell(canShowInlineInspector: canShowInlineInspector)
                 } else {
-                    compactDrawerShell
+                    compactDrawerShell(availableWidth: width)
                 }
 
                 toastAndErrorOverlay
@@ -92,76 +92,83 @@ struct AdaptiveWorkspaceShell: View {
 
     // MARK: - iPhone Full-Screen Stage + Interactive Left-Edge Drawer
 
-    private var compactDrawerProgress: CGFloat {
-        let width = OrbitSpacing.drawerWidth
-        let base: CGFloat = store.isDrawerOpen ? width : 0
-        let current = min(width, max(0, base + drawerDragTranslation))
-        return current / width
+    private func compactDrawerWidth(for availableWidth: CGFloat) -> CGFloat {
+        min(336, max(280, floor(availableWidth * 0.82)))
     }
 
-    private var compactDrawerOffset: CGFloat {
-        let width = OrbitSpacing.drawerWidth
-        return -width * (1.0 - compactDrawerProgress)
+    private func compactDrawerProgress(drawerWidth: CGFloat) -> CGFloat {
+        let base: CGFloat = store.isDrawerOpen ? drawerWidth : 0
+        let current = min(drawerWidth, max(0, base + drawerDragTranslation))
+        return current / drawerWidth
     }
 
-    private var compactDrawerShell: some View {
-        ZStack(alignment: .leading) {
+    private func compactDrawerOffset(drawerWidth: CGFloat) -> CGFloat {
+        -drawerWidth * (1.0 - compactDrawerProgress(drawerWidth: drawerWidth))
+    }
+
+    private func compactDrawerShell(availableWidth: CGFloat) -> some View {
+        let drawerWidth = compactDrawerWidth(for: availableWidth)
+        let progress = compactDrawerProgress(drawerWidth: drawerWidth)
+        let drawerOffset = compactDrawerOffset(drawerWidth: drawerWidth)
+        let stageOffset = drawerWidth * progress
+
+        return ZStack(alignment: .leading) {
             WorkspaceStagePane(
                 store: store,
                 showSidebarButton: true,
                 canShowInlineInspector: false,
                 onToggleSidebar: {
                     store.hapticLight()
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.90)) {
                         store.isDrawerOpen.toggle()
                     }
                 }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(palette.canvas)
+            .background(palette.canvas.ignoresSafeArea())
+            .overlay {
+                if progress > 0.001 {
+                    Color.black
+                        .opacity((palette.isDark ? 0.44 : 0.22) * Double(progress))
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.28, dampingFraction: 0.90)) {
+                                store.isDrawerOpen = false
+                            }
+                        }
+                        .gesture(drawerCloseGesture)
+                }
+            }
+            .offset(x: stageOffset)
 
             // Interactive left-edge swipe strip when drawer is closed
             if !store.isDrawerOpen {
                 Color.clear
-                    .frame(width: 20)
+                    .frame(width: 24)
                     .contentShape(Rectangle())
                     .gesture(edgeOpenGesture)
             }
 
-            // Dimmed Scrim + Fleet Drawer Overlay
-            if compactDrawerProgress > 0.001 {
-                Color.black
-                    .opacity(0.36 * Double(compactDrawerProgress))
-                    .ignoresSafeArea()
-                    .onTapGesture {
-                        withAnimation(.spring(response: 0.26, dampingFraction: 0.88)) {
-                            store.isDrawerOpen = false
-                        }
-                    }
-                    .gesture(drawerCloseGesture)
-
-                compactDrawerPanel
-                    .offset(x: compactDrawerOffset)
+            // Full-Height Edge-to-Edge Push-Over Drawer
+            if progress > 0.001 {
+                compactDrawerPanel(drawerWidth: drawerWidth)
+                    .offset(x: drawerOffset)
                     .gesture(drawerCloseGesture)
             }
         }
     }
 
-    @ViewBuilder
-    private var compactDrawerPanel: some View {
-        if #available(iOS 26.0, *) {
+    private func compactDrawerPanel(drawerWidth: CGFloat) -> some View {
+        HStack(spacing: 0) {
             FleetDrawerView(store: store, isCompactOverlay: true)
-                .frame(width: OrbitSpacing.drawerWidth)
-                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
-                .padding(.leading, OrbitSpacing.sm)
-                .padding(.vertical, OrbitSpacing.xs)
-        } else {
-            HStack(spacing: 0) {
-                FleetDrawerView(store: store, isCompactOverlay: true)
-                    .frame(width: OrbitSpacing.drawerWidth)
-                OrbitHairline(axis: .vertical)
-            }
+                .frame(width: drawerWidth)
+                .frame(maxHeight: .infinity)
+                .background(palette.drawer.ignoresSafeArea())
+
+            Rectangle()
+                .fill(palette.hairline)
+                .frame(width: 0.5)
+                .ignoresSafeArea()
         }
     }
 
@@ -209,10 +216,6 @@ struct AdaptiveWorkspaceShell: View {
             GitDiffSheet(store: store)
         case .pty:
             NativePtySheet(store: store)
-        case .modelPicker:
-            ModelPickerSheet(store: store)
-        case .contextPicker:
-            ContextPickerSheet(store: store)
         case .qrPair:
             QrPairSheet(store: store)
         case .directoryBrowser:
@@ -285,6 +288,221 @@ struct AdaptiveWorkspaceShell: View {
     }
 }
 
+// MARK: - Shared Workspace Header Context, Title Trigger & Overflow Menu
+
+@MainActor
+private struct WorkspaceHeaderContext {
+    let store: OrbitIosStore
+    let canShowInlineInspector: Bool
+
+    var primaryTitle: String {
+        if store.hosts.isEmpty {
+            return "Orbit"
+        }
+        if let agent = store.activeAgent {
+            let trimmed = agent.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return "New Conversation"
+    }
+
+    var isDraftTitle: Bool {
+        !store.hosts.isEmpty && store.activeAgent == nil
+    }
+
+    var isMultiHost: Bool {
+        store.hosts.count > 1
+    }
+
+    func isConnectionHealthy(for host: FfiHostCard) -> Bool {
+        switch host.connectionState {
+        case .onlineDirect, .onlineRelay:
+            return true
+        case .connectingDirect, .connectingRelay, .disconnected:
+            return false
+        }
+    }
+
+    func subtitleText(for host: FfiHostCard) -> String {
+        let repo = OrbitFormatters.shortPath(store.activeCwd)
+        let rawHost = host.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hostName = rawHost.isEmpty ? host.hostId : rawHost
+        let branch = store.activeGitBranch?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !isConnectionHealthy(for: host) {
+            let status = OrbitFormatters.compactTopBarConnectionLabel(for: host)
+            let target = isMultiHost ? hostName : repo
+            return "\(status) · \(target)"
+        }
+        if isMultiHost {
+            return "\(hostName) / \(repo)"
+        }
+        if let branch = branch, !branch.isEmpty {
+            return "\(repo) · \(branch)"
+        }
+        return repo
+    }
+
+    var terminalCount: Int {
+        store.currentHostDetail?.terminals.count ?? 0
+    }
+
+    var diffSubtitle: String? {
+        let totals = store.diffTotals
+        guard totals.fileCount > 0 else {
+            return nil
+        }
+        let unit = totals.fileCount == 1 ? "file" : "files"
+        return "\(totals.fileCount) \(unit)"
+    }
+}
+
+private struct WorkspaceHeaderTitleTrigger: View {
+    @ObservedObject var store: OrbitIosStore
+    let canShowInlineInspector: Bool
+
+    @Environment(\.orbitPalette) private var palette
+
+    private var ctx: WorkspaceHeaderContext {
+        WorkspaceHeaderContext(store: store, canShowInlineInspector: canShowInlineInspector)
+    }
+
+    var body: some View {
+        if let host = store.activeHost {
+            Menu {
+                Button {
+                    store.hapticLight()
+                    store.openDirectoryBrowser()
+                } label: {
+                    Label("Open Folder", systemImage: "folder")
+                }
+
+                Button {
+                    store.copyPathToClipboard(store.activeCwd)
+                } label: {
+                    Label("Copy Path", systemImage: "square.on.square")
+                }
+            } label: {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(ctx.primaryTitle)
+                        .font(OrbitTypography.subhead(.semibold))
+                        .foregroundStyle(ctx.isDraftTitle ? palette.fgPrimary.opacity(0.76) : palette.fgPrimary)
+                        .lineLimit(1)
+
+                    HStack(spacing: OrbitSpacing.xs) {
+                        Circle()
+                            .fill(palette.connectionColor(host.connectionState))
+                            .frame(width: 6, height: 6)
+
+                        Text(ctx.subtitleText(for: host))
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgSecondary)
+                            .lineLimit(1)
+
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                }
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .tint(palette.fgPrimary)
+            .accessibilityLabel("\(ctx.primaryTitle), \(ctx.subtitleText(for: host))")
+        } else {
+            Button {
+                store.activeSheet = .qrPair
+            } label: {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Orbit")
+                        .font(OrbitTypography.subhead(.semibold))
+                        .foregroundStyle(palette.fgPrimary)
+                        .lineLimit(1)
+
+                    Text("No Host Paired")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                        .lineLimit(1)
+                }
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Pair Host")
+        }
+    }
+}
+
+@MainActor
+@ViewBuilder
+private func workspaceHeaderMoreMenuItems(
+    store: OrbitIosStore,
+    canShowInlineInspector: Bool,
+    ctx: WorkspaceHeaderContext
+) -> some View {
+    Section {
+        Button {
+            store.hapticLight()
+            if canShowInlineInspector {
+                store.refreshGitReview()
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                    store.isPadDiffInspectorVisible.toggle()
+                }
+            } else {
+                store.openGitDiff()
+            }
+        } label: {
+            Text(canShowInlineInspector && store.isPadDiffInspectorVisible ? "Hide Diff Review" : "Diff Review")
+            if let diffSubtitle = ctx.diffSubtitle {
+                Text(diffSubtitle)
+            }
+            Image(systemName: "arrow.left.arrow.right")
+        }
+
+        if canShowInlineInspector && store.isPadDiffInspectorVisible {
+            Button {
+                store.hapticLight()
+                store.refreshGitReview()
+                store.activeSheet = .gitDiff
+            } label: {
+                Label("Full Diff", systemImage: "arrow.up.left.and.arrow.down.right")
+            }
+        }
+
+        Button {
+            store.hapticLight()
+            store.activeSheet = .pty
+        } label: {
+            Text("Terminal")
+            if ctx.terminalCount > 0 {
+                Text("\(ctx.terminalCount) active")
+            }
+            Image(systemName: "terminal")
+        }
+    }
+
+    if let agent = store.activeAgent {
+        Section {
+            Button(role: .destructive) {
+                store.hapticLight()
+                store.archiveSession(agent.agentId)
+            } label: {
+                Label {
+                    Text("Archive")
+                } icon: {
+                    Image(systemName: "archivebox")
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(Color(uiColor: .systemRed), Color(uiColor: .systemRed))
+                }
+            }
+            .tint(nil)
+        }
+    }
+}
+
 // MARK: - Workspace Stage Pane (iOS 26+ Native Floating Liquid Glass NavigationStack + Pre-26 Fallback)
 
 private struct WorkspaceStagePane: View {
@@ -295,26 +513,14 @@ private struct WorkspaceStagePane: View {
 
     @Environment(\.orbitPalette) private var palette
 
-    private var sessionTitle: String {
-        if let agent = store.activeAgent {
-            let trimmed = agent.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? "New Session" : trimmed
-        }
-        return "New Session"
-    }
-
-    private var connectionState: FfiConnectionState {
-        store.activeHost?.connectionState ?? .disconnected
-    }
-
-    private var hasTerminals: Bool {
-        !(store.currentHostDetail?.terminals.isEmpty ?? true)
-    }
-
     var body: some View {
         if #available(iOS 26.0, *) {
+            let ctx = WorkspaceHeaderContext(
+                store: store,
+                canShowInlineInspector: canShowInlineInspector
+            )
             NavigationStack {
-                StreamStageView(store: store)
+                applyNavigationHeader(StreamStageView(store: store), ctx: ctx)
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         if showSidebarButton {
@@ -335,99 +541,7 @@ private struct WorkspaceStagePane: View {
                             }
                         }
 
-                        ToolbarItem(placement: .title) {
-                            Button {
-                                if store.activeHost == nil {
-                                    store.activeSheet = .qrPair
-                                } else {
-                                    store.openDirectoryBrowser()
-                                }
-                            } label: {
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(sessionTitle)
-                                        .font(OrbitTypography.subhead(.semibold))
-                                        .foregroundStyle(palette.fgPrimary)
-                                        .lineLimit(1)
-
-                                    HStack(spacing: OrbitSpacing.xs) {
-                                        Circle()
-                                            .fill(palette.connectionColor(connectionState))
-                                            .frame(width: 6, height: 6)
-
-                                        if let host = store.activeHost {
-                                            Text(OrbitFormatters.compactTopBarConnectionLabel(for: host))
-                                                .font(OrbitTypography.meta(.regular))
-                                                .foregroundStyle(palette.fgSecondary)
-                                                .lineLimit(1)
-                                                .fixedSize(horizontal: true, vertical: false)
-
-                                            Text("·")
-                                                .font(OrbitTypography.meta(.regular))
-                                                .foregroundStyle(palette.fgMuted)
-
-                                            Text(OrbitFormatters.shortPath(store.activeCwd))
-                                                .font(OrbitTypography.code(.regular))
-                                                .foregroundStyle(palette.fgSecondary)
-                                                .lineLimit(1)
-                                        } else {
-                                            Text("No Host Paired")
-                                                .font(OrbitTypography.meta(.regular))
-                                                .foregroundStyle(palette.fgMuted)
-                                        }
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Workspace Directory: \(OrbitFormatters.shortPath(store.activeCwd))")
-                        }
-
-                        if store.hosts.isEmpty {
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button {
-                                    store.hapticLight()
-                                    store.activeSheet = .settings
-                                } label: {
-                                    Image(systemName: "slider.horizontal.3")
-                                        .foregroundStyle(palette.fgPrimary)
-                                }
-                                .accessibilityLabel("Settings")
-                            }
-                        } else {
-                            ToolbarItemGroup(placement: .topBarTrailing) {
-                                glassDiffToolbarButton
-
-                                Button {
-                                    store.hapticLight()
-                                    if store.selectedHostId == nil {
-                                        store.activeSheet = .qrPair
-                                    } else {
-                                        store.activeSheet = .pty
-                                    }
-                                } label: {
-                                    Image(systemName: "terminal")
-                                        .foregroundStyle(palette.fgPrimary)
-                                        .overlay(alignment: .topTrailing) {
-                                            if hasTerminals {
-                                                Circle()
-                                                    .fill(palette.direct)
-                                                    .frame(width: 6, height: 6)
-                                                    .offset(x: 3, y: -2)
-                                            }
-                                        }
-                                }
-                                .accessibilityLabel("Open Terminal")
-
-                                Button {
-                                    store.startNewSessionDraft()
-                                } label: {
-                                    Image(systemName: "plus")
-                                        .foregroundStyle(palette.fgPrimary)
-                                }
-                                .accessibilityLabel("New Session")
-                            }
-                        }
+                        trailingToolbarContent(ctx: ctx)
                     }
             }
         } else {
@@ -444,52 +558,129 @@ private struct WorkspaceStagePane: View {
         }
     }
 
-    @ViewBuilder
-    private var glassDiffToolbarButton: some View {
-        let totals = store.diffTotals
-        Button {
-            store.hapticLight()
-            guard store.selectedHostId != nil else {
-                store.activeSheet = .qrPair
-                return
-            }
-            if canShowInlineInspector {
-                store.refreshGitReview()
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                    store.isPadDiffInspectorVisible.toggle()
+    @available(iOS 26.0, *)
+    @ToolbarContentBuilder
+    private func trailingToolbarContent(ctx: WorkspaceHeaderContext) -> some ToolbarContent {
+        if #available(iOS 27.0, *) {
+            if store.hosts.isEmpty {
+                ToolbarItem(placement: .topBarPinnedTrailing) {
+                    Button {
+                        store.hapticLight()
+                        store.activeSheet = .settings
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
                 }
             } else {
-                store.openGitDiff()
-            }
-        } label: {
-            if totals.additions > 0 || totals.deletions > 0 {
-                HStack(spacing: OrbitSpacing.xs) {
-                    Text("+\(totals.additions)")
-                        .font(OrbitTypography.meta(.semibold))
-                        .foregroundStyle(palette.added)
-                    Text("-\(totals.deletions)")
-                        .font(OrbitTypography.meta(.semibold))
-                        .foregroundStyle(palette.removed)
-                }
-                .fixedSize(horizontal: true, vertical: false)
-            } else {
-                Image(systemName: "arrow.triangle.branch")
-                    .foregroundStyle(
-                        canShowInlineInspector && store.isPadDiffInspectorVisible
-                            ? palette.primary
-                            : palette.fgPrimary
+                ToolbarOverflowMenu {
+                    workspaceHeaderMoreMenuItems(
+                        store: store,
+                        canShowInlineInspector: canShowInlineInspector,
+                        ctx: ctx
                     )
+                }
+
+                if store.activeAgent != nil {
+                    ToolbarItem(placement: .topBarPinnedTrailing) {
+                        Button {
+                            store.hapticLight()
+                            store.startNewSessionDraft()
+                        } label: {
+                            Label("New Conversation", systemImage: "square.and.pencil")
+                        }
+                    }
+                }
+            }
+        } else {
+            if store.hosts.isEmpty {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        store.hapticLight()
+                        store.activeSheet = .settings
+                    } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                }
+            } else if store.activeAgent != nil {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Menu {
+                        workspaceHeaderMoreMenuItems(
+                            store: store,
+                            canShowInlineInspector: canShowInlineInspector,
+                            ctx: ctx
+                        )
+                    } label: {
+                        Label("More Actions", systemImage: "ellipsis")
+                    }
+
+                    Button {
+                        store.hapticLight()
+                        store.startNewSessionDraft()
+                    } label: {
+                        Label("New Conversation", systemImage: "square.and.pencil")
+                    }
+                }
+            } else {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        workspaceHeaderMoreMenuItems(
+                            store: store,
+                            canShowInlineInspector: canShowInlineInspector,
+                            ctx: ctx
+                        )
+                    } label: {
+                        Label("More Actions", systemImage: "ellipsis")
+                    }
+                }
             }
         }
-        .contextMenu {
-            Button {
-                store.refreshGitReview()
-                store.activeSheet = .gitDiff
-            } label: {
-                Label("Open Full Diff Sheet", systemImage: "arrow.up.left.and.arrow.down.right")
-            }
+    }
+
+    @available(iOS 26.0, *)
+    @ViewBuilder
+    private func applyNavigationHeader<Content: View>(
+        _ content: Content,
+        ctx: WorkspaceHeaderContext
+    ) -> some View {
+        if ctx.isDraftTitle {
+            content
+                .navigationTitle("")
+                .navigationSubtitle(Text(""))
+        } else {
+            content
+                .navigationTitle(ctx.primaryTitle)
+                .navigationSubtitle(nativeSubtitleText(ctx: ctx))
+                .toolbarTitleMenu {
+                    if store.activeHost != nil {
+                        Button {
+                            store.hapticLight()
+                            store.openDirectoryBrowser()
+                        } label: {
+                            Label("Open Folder", systemImage: "folder")
+                        }
+
+                        Button {
+                            store.copyPathToClipboard(store.activeCwd)
+                        } label: {
+                            Label("Copy Path", systemImage: "square.on.square")
+                        }
+                    } else {
+                        Button {
+                            store.activeSheet = .qrPair
+                        } label: {
+                            Label("Pair Host", systemImage: "qrcode.viewfinder")
+                        }
+                    }
+                }
         }
-        .accessibilityLabel("Git Diff")
+    }
+
+    @available(iOS 26.0, *)
+    private func nativeSubtitleText(ctx: WorkspaceHeaderContext) -> Text {
+        if let host = store.activeHost {
+            return Text(ctx.subtitleText(for: host))
+        }
+        return Text("No Host Paired")
     }
 }
 
@@ -503,23 +694,11 @@ struct WorkspaceTopBar: View {
 
     @Environment(\.orbitPalette) private var palette
 
-    private var sessionTitle: String {
-        if let agent = store.activeAgent {
-            let trimmed = agent.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? "New Session" : trimmed
-        }
-        return "New Session"
-    }
-
-    private var connectionState: FfiConnectionState {
-        store.activeHost?.connectionState ?? .disconnected
-    }
-
-    private var hasTerminals: Bool {
-        !(store.currentHostDetail?.terminals.isEmpty ?? true)
-    }
-
     var body: some View {
+        let ctx = WorkspaceHeaderContext(
+            store: store,
+            canShowInlineInspector: canShowInlineInspector
+        )
         HStack(spacing: OrbitSpacing.xs) {
             if showSidebarButton {
                 Button(action: onToggleSidebar) {
@@ -545,52 +724,13 @@ struct WorkspaceTopBar: View {
                 .padding(.leading, -OrbitSpacing.sm)
             }
 
-            // Session Title + Connection Dot
-            Button {
-                if store.activeHost == nil {
-                    store.activeSheet = .qrPair
-                } else {
-                    store.openDirectoryBrowser()
-                }
-            } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(sessionTitle)
-                        .font(OrbitTypography.subhead(.semibold))
-                        .foregroundStyle(palette.fgPrimary)
-                        .lineLimit(1)
-
-                    HStack(spacing: OrbitSpacing.xs) {
-                        Circle()
-                            .fill(palette.connectionColor(connectionState))
-                            .frame(width: 6, height: 6)
-
-                        if let host = store.activeHost {
-                            Text(OrbitFormatters.compactTopBarConnectionLabel(for: host))
-                                .font(OrbitTypography.meta(.regular))
-                                .foregroundStyle(palette.fgSecondary)
-                                .lineLimit(1)
-                                .fixedSize(horizontal: true, vertical: false)
-
-                            Text("·")
-                                .font(OrbitTypography.meta(.regular))
-                                .foregroundStyle(palette.fgMuted)
-
-                            Text(OrbitFormatters.shortPath(store.activeCwd))
-                                .font(OrbitTypography.code(.regular))
-                                .foregroundStyle(palette.fgSecondary)
-                                .lineLimit(1)
-                        } else {
-                            Text("No Host Paired")
-                                .font(OrbitTypography.meta(.regular))
-                                .foregroundStyle(palette.fgMuted)
-                        }
-                    }
-                }
+            if !ctx.isDraftTitle {
+                WorkspaceHeaderTitleTrigger(
+                    store: store,
+                    canShowInlineInspector: canShowInlineInspector
+                )
                 .frame(minHeight: OrbitSpacing.hitTarget, alignment: .leading)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Workspace Directory: \(OrbitFormatters.shortPath(store.activeCwd))")
 
             Spacer(minLength: OrbitSpacing.xs)
 
@@ -599,7 +739,7 @@ struct WorkspaceTopBar: View {
                     store.hapticLight()
                     store.activeSheet = .settings
                 } label: {
-                    Image(systemName: "slider.horizontal.3")
+                    Image(systemName: "gearshape")
                         .font(OrbitTypography.icon)
                         .foregroundStyle(palette.fgSecondary)
                         .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
@@ -609,106 +749,42 @@ struct WorkspaceTopBar: View {
                 .accessibilityLabel("Settings")
                 .padding(.trailing, -OrbitSpacing.sm)
             } else {
-                // Contextual Right Actions: Diff Pill, Native PTY, New Session
-                diffActionButton
-
-                Button {
-                    store.hapticLight()
-                    if store.selectedHostId == nil {
-                        store.activeSheet = .qrPair
-                    } else {
-                        store.activeSheet = .pty
-                    }
+                Menu {
+                    workspaceHeaderMoreMenuItems(
+                        store: store,
+                        canShowInlineInspector: canShowInlineInspector,
+                        ctx: ctx
+                    )
                 } label: {
-                    ZStack(alignment: .topTrailing) {
-                        Image(systemName: "terminal")
-                            .font(OrbitTypography.icon)
-                            .foregroundStyle(palette.fgSecondary)
-                            .padding(OrbitSpacing.xs)
-
-                        if hasTerminals {
-                            Circle()
-                                .fill(palette.direct)
-                                .frame(width: 6, height: 6)
-                                .offset(x: 1, y: 1)
-                        }
-                    }
-                    .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Open Terminal")
-
-                Button {
-                    store.startNewSessionDraft()
-                } label: {
-                    Image(systemName: "plus")
+                    Image(systemName: "ellipsis")
                         .font(OrbitTypography.icon)
                         .foregroundStyle(palette.fgPrimary)
                         .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("New Session")
-                .padding(.trailing, -OrbitSpacing.sm)
+                .tint(palette.fgPrimary)
+                .accessibilityLabel("More Actions")
+                .padding(.trailing, store.activeAgent == nil ? -OrbitSpacing.sm : 0)
+
+                if store.activeAgent != nil {
+                    Button {
+                        store.hapticLight()
+                        store.startNewSessionDraft()
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                            .font(OrbitTypography.icon)
+                            .foregroundStyle(palette.fgPrimary)
+                            .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("New Conversation")
+                    .padding(.trailing, -OrbitSpacing.sm)
+                }
             }
         }
         .padding(.horizontal, OrbitSpacing.lg)
         .frame(height: OrbitSpacing.hitTarget)
         .background(palette.canvas)
-    }
-
-    @ViewBuilder
-    private var diffActionButton: some View {
-        let totals = store.diffTotals
-        Button {
-            store.hapticLight()
-            guard store.selectedHostId != nil else {
-                store.activeSheet = .qrPair
-                return
-            }
-            if canShowInlineInspector {
-                store.refreshGitReview()
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                    store.isPadDiffInspectorVisible.toggle()
-                }
-            } else {
-                store.openGitDiff()
-            }
-        } label: {
-            Group {
-                if totals.additions > 0 || totals.deletions > 0 {
-                    HStack(spacing: OrbitSpacing.xs) {
-                        Text("+\(totals.additions)")
-                            .font(OrbitTypography.meta(.medium))
-                            .foregroundStyle(palette.added)
-                        Text("-\(totals.deletions)")
-                            .font(OrbitTypography.meta(.medium))
-                            .foregroundStyle(palette.removed)
-                    }
-                    .padding(.horizontal, OrbitSpacing.sm)
-                    .padding(.vertical, OrbitSpacing.xs)
-                    .background(palette.subtleFill)
-                    .clipShape(Capsule())
-                    .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
-                } else {
-                    Image(systemName: "arrow.triangle.branch")
-                        .font(OrbitTypography.icon)
-                        .foregroundStyle(canShowInlineInspector && store.isPadDiffInspectorVisible ? palette.primary : palette.fgSecondary)
-                }
-            }
-            .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button {
-                store.refreshGitReview()
-                store.activeSheet = .gitDiff
-            } label: {
-                Label("Open Full Diff Sheet", systemImage: "arrow.up.left.and.arrow.down.right")
-            }
-        }
-        .accessibilityLabel("Git Diff")
     }
 }

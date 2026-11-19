@@ -326,6 +326,7 @@ private struct QuestionDecisionCard: View {
                     )
                 }
             }
+            .padding(.horizontal, OrbitSpacing.md)
 
             if requiresScrolling {
                 ScrollView(.vertical, showsIndicators: true) {
@@ -350,8 +351,9 @@ private struct QuestionDecisionCard: View {
             }
             .buttonStyle(.plain)
             .disabled(!canSubmit)
+            .padding(.horizontal, OrbitSpacing.md)
         }
-        .padding(OrbitSpacing.md)
+        .padding(.vertical, OrbitSpacing.md)
         .orbitGlassSurface(
             in: RoundedRectangle(cornerRadius: 18, style: .continuous),
             tint: palette.primary.opacity(0.06),
@@ -371,6 +373,7 @@ private struct QuestionDecisionCard: View {
                 questionBlock(q)
             }
         }
+        .padding(.horizontal, OrbitSpacing.md)
     }
 
     private func questionBlock(_ q: FfiQuestionItem) -> some View {

@@ -37,6 +37,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const hiddenProjectKeys = useOrbitSelector((s) => s.hiddenProjectKeys);
   const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
 
   const heroProjects = useMemo(() => {
@@ -44,6 +45,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
       fleet.hosts,
       fleet.projects ?? [],
       hostDetails,
+      hiddenProjectKeys,
     );
     const items = unified.map((u) => ({
       id: u.id,
@@ -85,7 +87,15 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
     }
 
     return items;
-  }, [fleet.hosts, fleet.projects, hostDetails, selectedHostId, selectedCwd, hostDetail]);
+  }, [
+    fleet.hosts,
+    fleet.projects,
+    hostDetails,
+    hiddenProjectKeys,
+    selectedHostId,
+    selectedCwd,
+    hostDetail,
+  ]);
 
   const activeHeroProject = useMemo(() => {
     if (!selectedHostId) return null;

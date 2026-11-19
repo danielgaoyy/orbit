@@ -1,5 +1,8 @@
 package dev.orbit.android.ui.shell
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandHorizontally
@@ -28,14 +31,17 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.MenuOpen
-import androidx.compose.material.icons.automirrored.outlined.ViewSidebar
-import androidx.compose.material.icons.outlined.Add
-import androidx.compose.material.icons.outlined.Difference
-import androidx.compose.material.icons.outlined.Menu
+import androidx.compose.material.icons.automirrored.outlined.CompareArrows
+import androidx.compose.material.icons.outlined.Archive
+import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.MoreHoriz
+import androidx.compose.material.icons.outlined.OpenInFull
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalDrawerSheet
@@ -54,9 +60,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.orbit.android.store.OrbitAndroidStore
@@ -71,6 +76,9 @@ import dev.orbit.android.ui.sheets.PairQrSheet
 import dev.orbit.android.ui.sheets.PtyTerminalSheet
 import dev.orbit.android.ui.sheets.SettingsSheet
 import dev.orbit.android.ui.stage.StreamStageScreen
+import dev.orbit.android.ui.theme.OrbitComposeIcon
+import dev.orbit.android.ui.theme.OrbitCopyIcon
+import dev.orbit.android.ui.theme.OrbitSidebarIcon
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 import kotlinx.coroutines.delay
@@ -85,6 +93,7 @@ private val SIDE_BY_SIDE_DIFF_STAGE_THRESHOLD = 780.dp
 
 private enum class ActiveModalSheet {
     NONE,
+    FULL_DIFF,
     TERMINAL,
     MODEL_SELECTOR,
     CONTEXT_MENTION,
@@ -101,6 +110,7 @@ fun AdaptiveOrbitShell(
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
 
@@ -223,11 +233,15 @@ fun AdaptiveOrbitShell(
             FleetDrawerContent(
                 ui = ui,
                 onSearchQueryChange = { store.updateDrawerSearchQuery(it) },
+                onSetProjectSort = { store.setSidebarProjectSort(it) },
+                onSetThreadFilter = { store.setSidebarThreadFilter(it) },
+                onToggleProjectCollapsed = { store.toggleProjectCollapsed(it) },
+                onTogglePinThread = { hId, aId -> store.togglePinThread(hId, aId) },
                 onSelectHost = { hostId ->
                     store.selectHost(hostId)
                     if (!hasPermanentDrawer) scope.launch { drawerState.close() }
                 },
-                onRefreshHost = { store.refreshSelectedHost() },
+                onConnectLocalDaemon = { store.discoverLocalDaemon() },
                 onSelectProjectDir = { dir ->
                     store.selectWorkspaceCwd(dir)
                     if (!hasPermanentDrawer) scope.launch { drawerState.close() }
@@ -279,29 +293,39 @@ fun AdaptiveOrbitShell(
                 OrbitStageTopBar(
                     ui = ui,
                     isWideViewport = hasPermanentDrawer,
+                    isInlineDiffOpen = supportsThreePane && ui.isDiffInspectorOpen,
                     onOpenDrawer = { scope.launch { drawerState.open() } },
                     onTogglePermanentDrawer = { store.togglePermanentDrawerCollapsed() },
-                    onTitleClick = {
-                        if (ui.hosts.isNotEmpty() && ui.selectedHostId != null) {
-                            activeSheet = ActiveModalSheet.DIRECTORY_BROWSER
-                        }
+                    onOpenDirectoryBrowser = { activeSheet = ActiveModalSheet.DIRECTORY_BROWSER },
+                    onCopyPath = { path ->
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        cm?.setPrimaryClip(ClipData.newPlainText("workspace_path", path))
+                        store.showToast("Copied path")
                     },
-                    onToggleDiff = {
-                        store.toggleDiffInspector()
+                    onOpenPairSheet = { activeSheet = ActiveModalSheet.PAIR_QR },
+                    onToggleDiff = { store.toggleDiffInspector() },
+                    onOpenFullDiff = {
+                        store.loadGitReview()
+                        activeSheet = ActiveModalSheet.FULL_DIFF
                     },
                     onOpenTerminal = { activeSheet = ActiveModalSheet.TERMINAL },
                     onNewSession = { store.startNewSession() },
+                    onArchiveSession = { agentId -> store.archiveAgent(agentId) },
                     onOpenSettings = { activeSheet = ActiveModalSheet.SETTINGS },
                 )
-                HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+                val showTopBarDivider = ui.hosts.isEmpty() || (!ui.isNewSessionMode && ui.activeAgent != null)
+                if (showTopBarDivider) {
+                    HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+                }
                 StreamStageScreen(
                     ui = ui,
                     store = store,
                     onOpenContextPicker = { activeSheet = ActiveModalSheet.CONTEXT_MENTION },
                     onOpenModelSelector = { activeSheet = ActiveModalSheet.MODEL_SELECTOR },
                     onOpenDiffForFile = openDiffHandler,
-                    onOpenDirectoryBrowser = { activeSheet = ActiveModalSheet.DIRECTORY_BROWSER },
                     onOpenPairSheet = { activeSheet = ActiveModalSheet.PAIR_QR },
+                    onOpenTerminal = { activeSheet = ActiveModalSheet.TERMINAL },
+                    onOpenSettings = { activeSheet = ActiveModalSheet.SETTINGS },
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -356,7 +380,8 @@ fun AdaptiveOrbitShell(
                 drawerState = drawerState,
                 drawerContent = {
                     ModalDrawerSheet(
-                        modifier = Modifier.width(304.dp),
+                        modifier = Modifier.width(320.dp),
+                        drawerShape = RoundedCornerShape(topEnd = 16.dp, bottomEnd = 16.dp),
                         drawerContainerColor = colors.drawer,
                         drawerContentColor = colors.fgPrimary,
                     ) {
@@ -435,6 +460,26 @@ fun AdaptiveOrbitShell(
         when (activeSheet) {
             ActiveModalSheet.NONE -> Unit
 
+            ActiveModalSheet.FULL_DIFF -> {
+                GitDiffBottomSheet(
+                    cwd = ui.activeCwd,
+                    gitReview = ui.gitReview,
+                    sessionTurnDiffs = ui.agentStage?.sessionTurnDiffs.orEmpty(),
+                    stagedMode = ui.gitStagedMode,
+                    selectedPath = ui.gitSelectedPath,
+                    isRefreshing = ui.isRefreshingGitDiff,
+                    onRefresh = { store.loadGitReview() },
+                    onPullRefresh = { store.refreshGitDiff() },
+                    onSetStagedMode = { store.setGitStagedMode(it) },
+                    onSelectPath = { store.selectGitFileFilter(it) },
+                    onQuoteLine = { path, lineLabel, content ->
+                        store.addQuotedDiffLine(path, lineLabel, content)
+                        activeSheet = ActiveModalSheet.NONE
+                    },
+                    onDismiss = { activeSheet = ActiveModalSheet.NONE },
+                )
+            }
+
             ActiveModalSheet.TERMINAL -> {
                 PtyTerminalSheet(
                     cwd = ui.activeCwd,
@@ -462,6 +507,9 @@ fun AdaptiveOrbitShell(
                     currentModel = ui.composer.model,
                     currentEffort = ui.composer.effort,
                     hostDetail = ui.hostDetail,
+                    isNewSession = ui.isNewSessionMode || ui.selectedAgentId == null,
+                    onSwitchProvider = { store.switchDraftProvider(it) },
+                    onSelectEffort = { store.selectEffort(it) },
                     onSelect = { prov, mod, eff ->
                         store.selectProviderModelAndEffort(prov, mod, eff)
                     },
@@ -506,12 +554,20 @@ fun AdaptiveOrbitShell(
             }
 
             ActiveModalSheet.DIRECTORY_BROWSER -> {
+                val hostPinned = remember(ui.projects, ui.selectedHostId) {
+                    ui.projects.filter { it.hostId == ui.selectedHostId }
+                }
                 DirectoryBrowserSheet(
                     initialPath = ui.activeCwd,
+                    hostDisplayName = ui.selectedHost?.displayName,
+                    isMultiHost = ui.hosts.size > 1,
                     listing = ui.hostDetail?.directoryListing,
+                    pinnedProjects = hostPinned,
+                    discoveredProjects = ui.hostDetail?.discoveredProjects.orEmpty(),
                     onBrowsePath = { store.browseDirectory(it) },
                     onSelectDirectory = { store.selectWorkspaceCwd(it) },
                     onPinProject = { name, dir -> store.pinProject(name, dir) },
+                    onUnpinProject = { projId -> store.removeProject(projId) },
                     onDismiss = { activeSheet = ActiveModalSheet.NONE },
                 )
             }
@@ -519,17 +575,21 @@ fun AdaptiveOrbitShell(
             ActiveModalSheet.SETTINGS -> {
                 SettingsSheet(
                     appearanceMode = ui.appearanceMode,
-                    selectedHost = ui.selectedHost,
+                    hosts = ui.hosts,
+                    selectedHostId = ui.selectedHostId,
                     quotas = ui.hostDetail?.quotas.orEmpty(),
                     onSelectAppearance = { store.setAppearanceMode(it) },
-                    onReconnectHost = { store.reconnectSelectedHost() },
+                    onSelectHost = { store.selectHost(it) },
+                    onOpenPairHost = { activeSheet = ActiveModalSheet.PAIR_QR },
+                    onReconnectHost = { hostId -> store.reconnectHost(hostId) },
                     onSaveHostConfig = { hostId, customName, routeMode, directEp, relay ->
+                        val target = ui.hosts.firstOrNull { it.hostId == hostId }
                         store.updateHostConfiguration(
                             hostId = hostId,
                             customName = customName,
                             routeMode = routeMode,
-                            sshAlias = ui.selectedHost?.sshAlias,
-                            remoteDaemonPort = ui.selectedHost?.remoteDaemonPort,
+                            sshAlias = target?.sshAlias,
+                            remoteDaemonPort = target?.remoteDaemonPort,
                             customDirectEndpoint = directEp,
                             relayUrl = relay,
                             reconnect = true,
@@ -537,6 +597,7 @@ fun AdaptiveOrbitShell(
                     },
                     onRemoveHost = { store.removeHost(it) },
                     onRefreshQuotas = { store.refreshQuotasAndModels(forceModels = false) },
+                    onShowToast = { store.showToast(it) },
                     onDismiss = { activeSheet = ActiveModalSheet.NONE },
                 )
             }
@@ -544,16 +605,35 @@ fun AdaptiveOrbitShell(
     }
 }
 
+private fun resolveHeaderGitBranch(ui: OrbitUiState): String? {
+    ui.gitReview?.branch?.takeIf { it.isNotBlank() }?.let { return it.trim() }
+    val detail = ui.hostDetail ?: return null
+    detail.discoveredProjects
+        .firstOrNull { OrbitFormatters.pathsEquivalent(it.path, ui.activeCwd) }
+        ?.gitBranch?.takeIf { it.isNotBlank() }
+        ?.let { return it.trim() }
+    detail.workspaces
+        .firstOrNull { OrbitFormatters.pathsEquivalent(it.cwd, ui.activeCwd) }
+        ?.gitBranch?.takeIf { it.isNotBlank() }
+        ?.let { return it.trim() }
+    return null
+}
+
 @Composable
 private fun OrbitStageTopBar(
     ui: OrbitUiState,
     isWideViewport: Boolean,
+    isInlineDiffOpen: Boolean,
     onOpenDrawer: () -> Unit,
     onTogglePermanentDrawer: () -> Unit,
-    onTitleClick: () -> Unit,
+    onOpenDirectoryBrowser: () -> Unit,
+    onCopyPath: (String) -> Unit,
+    onOpenPairSheet: () -> Unit,
     onToggleDiff: () -> Unit,
+    onOpenFullDiff: () -> Unit,
     onOpenTerminal: () -> Unit,
     onNewSession: () -> Unit,
+    onArchiveSession: (String) -> Unit,
     onOpenSettings: () -> Unit,
 ) {
     val colors = OrbitTheme.colors
@@ -562,6 +642,10 @@ private fun OrbitStageTopBar(
 
     val hasHosts = ui.hosts.isNotEmpty()
     val host = if (hasHosts) ui.selectedHost else null
+    val activeAgent = if (host != null && !ui.isNewSessionMode) ui.activeAgent else null
+    val isDraftTitle = host != null && activeAgent == null
+    val isMultiHost = ui.hosts.size > 1
+
     val statusDotColor = when (host?.connectionState) {
         FfiConnectionState.ONLINE_DIRECT -> colors.directAdded
         FfiConnectionState.ONLINE_RELAY -> colors.relay
@@ -571,23 +655,43 @@ private fun OrbitStageTopBar(
 
     val primaryTitle = when {
         host == null -> "Orbit"
-        ui.isNewSessionMode || ui.activeAgent == null -> "New Session"
-        else -> ui.activeAgent?.title?.ifBlank { "New Session" } ?: "New Session"
+        activeAgent != null && activeAgent.title.isNotBlank() -> activeAgent.title.trim()
+        else -> "New Conversation"
     }
 
-    // Compact top-bar-only connection route ("Direct" / "SSH" / "Relay" / "Connecting" / "Offline")
-    val subtitle: String? = if (host == null) {
+    val subtitleText: String? = if (host == null) {
         null
     } else {
-        val compactRoute = OrbitFormatters.topBarConnectionLabel(host.connectionState, host.viaSshTunnel)
-        "$compactRoute · ${OrbitFormatters.shortPath(ui.activeCwd)}"
+        val repo = OrbitFormatters.shortPath(ui.activeCwd)
+        val hostName = host.displayName.trim().ifEmpty { host.hostId }
+        val branch = resolveHeaderGitBranch(ui)
+        val isConnectionHealthy = host.connectionState == FfiConnectionState.ONLINE_DIRECT ||
+            host.connectionState == FfiConnectionState.ONLINE_RELAY
+        when {
+            !isConnectionHealthy -> {
+                val status = OrbitFormatters.topBarConnectionLabel(host.connectionState, host.viaSshTunnel)
+                val target = if (isMultiHost) hostName else repo
+                "$status · $target"
+            }
+            isMultiHost -> "$hostName / $repo"
+            !branch.isNullOrBlank() -> "$repo · $branch"
+            else -> repo
+        }
     }
 
     val diffFiles = ui.gitReview?.diffFiles?.takeIf { it.isNotEmpty() }
         ?: ui.agentStage?.sessionTurnDiffs.orEmpty()
-    val totalAdditions = remember(diffFiles) { diffFiles.sumOf { it.additions.toLong() } }
-    val totalDeletions = remember(diffFiles) { diffFiles.sumOf { it.deletions.toLong() } }
-    val hasActiveTerminals = ui.hostDetail?.terminals?.isNotEmpty() == true
+    val diffFileCount = diffFiles.size
+    val diffSubtitle = if (diffFileCount > 0) {
+        "$diffFileCount ${if (diffFileCount == 1) "file" else "files"}"
+    } else {
+        null
+    }
+    val terminalCount = ui.hostDetail?.terminals?.size ?: 0
+    val terminalSubtitle = if (terminalCount > 0) "$terminalCount active" else null
+
+    var titleMenuExpanded by remember { mutableStateOf(false) }
+    var moreMenuExpanded by remember { mutableStateOf(false) }
 
     Row(
         modifier = Modifier
@@ -595,104 +699,174 @@ private fun OrbitStageTopBar(
             .background(colors.canvas)
             .statusBarsPadding()
             .height(OrbitSpacing.topBarHeight)
-            .padding(horizontal = OrbitSpacing.xs),
+            .padding(horizontal = OrbitSpacing.lg),
         verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
     ) {
-        // 1. Compact Menu Trigger (< 700.dp) OR Collapsible Sidebar Zen Toggle (>= 700.dp)
-        if (!isWideViewport) {
-            Box(
-                modifier = Modifier
-                    .size(OrbitSpacing.touchTarget)
-                    .clip(CircleShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onOpenDrawer()
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Menu,
-                    contentDescription = "Open fleet drawer",
-                    tint = colors.fgPrimary,
-                    modifier = Modifier.size(OrbitSpacing.iconMd),
+        // 1. Leading Sidebar Toggle Circle (aligned with Desktop & iOS sidebar.left)
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clip(CircleShape)
+                .background(colors.subtleFill, CircleShape)
+                .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
+                .clickable {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    if (!isWideViewport) onOpenDrawer() else onTogglePermanentDrawer()
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            val showCollapsedTint = isWideViewport && ui.isPermanentDrawerCollapsed
+            Icon(
+                imageVector = OrbitSidebarIcon,
+                contentDescription = if (!isWideViewport) {
+                    "Open fleet drawer"
+                } else if (ui.isPermanentDrawerCollapsed) {
+                    "Expand fleet sidebar"
+                } else {
+                    "Collapse fleet sidebar"
+                },
+                tint = if (showCollapsedTint) colors.fgSecondary else colors.fgPrimary,
+                modifier = Modifier.size(OrbitSpacing.iconMd),
+            )
+            val showApprovalBadge = ui.totalPendingApprovals > 0u &&
+                (!isWideViewport || ui.isPermanentDrawerCollapsed)
+            if (showApprovalBadge) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 8.dp, end = 8.dp)
+                        .size(6.dp)
+                        .background(colors.warning, CircleShape)
                 )
-                if (ui.totalPendingApprovals > 0u) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = OrbitSpacing.md, end = OrbitSpacing.md)
-                            .size(6.dp)
-                            .background(colors.warning, CircleShape)
-                    )
-                }
-            }
-        } else {
-            Box(
-                modifier = Modifier
-                    .size(OrbitSpacing.touchTarget)
-                    .clip(CircleShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onTogglePermanentDrawer()
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = if (ui.isPermanentDrawerCollapsed) {
-                        Icons.AutoMirrored.Outlined.ViewSidebar
-                    } else {
-                        Icons.AutoMirrored.Outlined.MenuOpen
-                    },
-                    contentDescription = if (ui.isPermanentDrawerCollapsed) {
-                        "Expand fleet sidebar"
-                    } else {
-                        "Collapse fleet sidebar"
-                    },
-                    tint = colors.fgSecondary,
-                    modifier = Modifier.size(OrbitSpacing.iconMd),
-                )
-                if (ui.isPermanentDrawerCollapsed && ui.totalPendingApprovals > 0u) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = OrbitSpacing.md, end = OrbitSpacing.md)
-                            .size(6.dp)
-                            .background(colors.warning, CircleShape)
-                    )
-                }
             }
         }
 
-        // 2. Session Title + Zero-Truncation "● Direct · repo" Subtitle
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .clip(RoundedCornerShape(OrbitSpacing.sm))
-                .clickable(enabled = host != null) { onTitleClick() }
-                .padding(horizontal = OrbitSpacing.xs, vertical = OrbitSpacing.xs / 2),
-            verticalArrangement = Arrangement.Center,
-        ) {
-            Text(
-                text = primaryTitle,
-                style = typography.subheadSemiBold,
-                color = colors.fgPrimary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (subtitle != null) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+        // 2. Center Title + Smart Subtitle (hidden on Minimalist Zen New-Session Canvas to avoid duplicating Launchpad pills)
+        Box(modifier = Modifier.weight(1f)) {
+            if (host != null && !isDraftTitle) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(OrbitSpacing.sm))
+                        .clickable {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            titleMenuExpanded = true
+                        }
+                        .padding(horizontal = OrbitSpacing.xs, vertical = 2.dp),
+                    verticalArrangement = Arrangement.Center,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(6.dp)
-                            .background(statusDotColor, CircleShape)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        Text(
+                            text = primaryTitle,
+                            style = typography.subheadSemiBold,
+                            color = colors.fgPrimary.copy(alpha = if (isDraftTitle) 0.76f else 1f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        Icon(
+                            imageVector = Icons.Outlined.KeyboardArrowDown,
+                            contentDescription = null,
+                            tint = colors.fgMuted,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .background(statusDotColor, CircleShape)
+                        )
+                        Text(
+                            text = subtitleText.orEmpty(),
+                            style = typography.meta,
+                            color = colors.fgSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+
+                DropdownMenu(
+                    expanded = titleMenuExpanded,
+                    onDismissRequest = { titleMenuExpanded = false },
+                    containerColor = colors.elevated,
+                ) {
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = "Open Folder",
+                                style = typography.subheadMedium,
+                                color = colors.fgPrimary,
+                            )
+                        },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Outlined.Folder,
+                                contentDescription = null,
+                                tint = colors.fgPrimary,
+                                modifier = Modifier.size(OrbitSpacing.iconSm),
+                            )
+                        },
+                        onClick = {
+                            titleMenuExpanded = false
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onOpenDirectoryBrowser()
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = "Copy Path",
+                                style = typography.subheadMedium,
+                                color = colors.fgPrimary,
+                            )
+                        },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = OrbitCopyIcon,
+                                contentDescription = null,
+                                tint = colors.fgPrimary,
+                                modifier = Modifier.size(OrbitSpacing.iconSm),
+                            )
+                        },
+                        onClick = {
+                            titleMenuExpanded = false
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onCopyPath(ui.activeCwd)
+                        },
+                    )
+                }
+            } else if (host == null) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(OrbitSpacing.sm))
+                        .clickable {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onOpenPairSheet()
+                        }
+                        .padding(horizontal = OrbitSpacing.xs, vertical = 2.dp),
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Text(
+                        text = "Orbit",
+                        style = typography.subheadSemiBold,
+                        color = colors.fgPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = subtitle,
+                        text = "No Host Paired",
                         style = typography.meta,
-                        color = colors.fgSecondary,
+                        color = colors.fgMuted,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
@@ -700,113 +874,188 @@ private fun OrbitStageTopBar(
             }
         }
 
+        // 3. Trailing Controls: [ •••   ✎ ] when active, [ ••• ] on draft, [ ⚙ ] when unpaired
         if (host != null) {
-            // 3. `+add -del` Diff Pill (>= 44.dp touch target + explicit TalkBack label)
-            val pillShape = RoundedCornerShape(OrbitSpacing.sm)
-            val diffSemanticsDesc = if (totalAdditions > 0L || totalDeletions > 0L) {
-                "Inspect git diff, $totalAdditions additions and $totalDeletions deletions"
-            } else {
-                "Inspect git diff"
-            }
-            Box(
+            val capsuleShape = RoundedCornerShape(20.dp)
+            Row(
                 modifier = Modifier
-                    .height(OrbitSpacing.touchTarget)
-                    .widthIn(min = 44.dp)
-                    .clip(pillShape)
-                    .semantics { contentDescription = diffSemanticsDesc }
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onToggleDiff()
-                    }
-                    .padding(horizontal = OrbitSpacing.sm),
-                contentAlignment = Alignment.Center,
+                    .height(40.dp)
+                    .clip(capsuleShape)
+                    .background(colors.subtleFill, capsuleShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, capsuleShape),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (totalAdditions > 0L || totalDeletions > 0L) {
-                    Row(
-                        modifier = Modifier
-                            .background(colors.subtleFill, pillShape)
-                            .border(OrbitSpacing.hairline, colors.hairline, pillShape)
-                            .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "+$totalAdditions",
-                            style = typography.metaMedium,
-                            color = colors.directAdded,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                        Text(
-                            text = "-$totalDeletions",
-                            style = typography.metaMedium,
-                            color = colors.dangerRemoved,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                    }
-                } else {
-                    Icon(
-                        imageVector = Icons.Outlined.Difference,
-                        contentDescription = "Inspect git diff",
-                        tint = colors.fgSecondary,
-                        modifier = Modifier.size(OrbitSpacing.iconMd),
-                    )
-                }
-            }
-
-            // 4. `>_` PTY Terminal Button (48dp touch target)
-            Box(
-                modifier = Modifier
-                    .size(OrbitSpacing.touchTarget)
-                    .clip(CircleShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onOpenTerminal()
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Terminal,
-                    contentDescription = "Open interactive terminal",
-                    tint = colors.fgSecondary,
-                    modifier = Modifier.size(OrbitSpacing.iconMd),
-                )
-                if (hasActiveTerminals) {
+                Box {
                     Box(
                         modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 12.dp, end = 12.dp)
-                            .size(6.dp)
-                            .background(colors.directAdded, CircleShape)
-                    )
+                            .width(40.dp)
+                            .fillMaxHeight()
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                moreMenuExpanded = true
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.MoreHoriz,
+                            contentDescription = "More actions",
+                            tint = colors.fgPrimary,
+                            modifier = Modifier.size(OrbitSpacing.iconMd),
+                        )
+                    }
+
+                    DropdownMenu(
+                        expanded = moreMenuExpanded,
+                        onDismissRequest = { moreMenuExpanded = false },
+                        containerColor = colors.elevated,
+                    ) {
+                        DropdownMenuItem(
+                            text = {
+                                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                    Text(
+                                        text = if (isInlineDiffOpen) "Hide Diff Review" else "Diff Review",
+                                        style = typography.subheadMedium,
+                                        color = colors.fgPrimary,
+                                    )
+                                    if (diffSubtitle != null) {
+                                        Text(
+                                            text = diffSubtitle,
+                                            style = typography.meta,
+                                            color = colors.fgMuted,
+                                        )
+                                    }
+                                }
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Outlined.CompareArrows,
+                                    contentDescription = null,
+                                    tint = colors.fgPrimary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            },
+                            onClick = {
+                                moreMenuExpanded = false
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onToggleDiff()
+                            },
+                        )
+
+                        if (isInlineDiffOpen) {
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "Full Diff",
+                                        style = typography.subheadMedium,
+                                        color = colors.fgPrimary,
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Outlined.OpenInFull,
+                                        contentDescription = null,
+                                        tint = colors.fgPrimary,
+                                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                                    )
+                                },
+                                onClick = {
+                                    moreMenuExpanded = false
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onOpenFullDiff()
+                                },
+                            )
+                        }
+
+                        DropdownMenuItem(
+                            text = {
+                                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                                    Text(
+                                        text = "Terminal",
+                                        style = typography.subheadMedium,
+                                        color = colors.fgPrimary,
+                                    )
+                                    if (terminalSubtitle != null) {
+                                        Text(
+                                            text = terminalSubtitle,
+                                            style = typography.meta,
+                                            color = colors.fgMuted,
+                                        )
+                                    }
+                                }
+                            },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Outlined.Terminal,
+                                    contentDescription = null,
+                                    tint = colors.fgPrimary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            },
+                            onClick = {
+                                moreMenuExpanded = false
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onOpenTerminal()
+                            },
+                        )
+
+                        if (activeAgent != null) {
+                            HorizontalDivider(
+                                thickness = OrbitSpacing.hairline,
+                                color = colors.hairline,
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        text = "Archive",
+                                        style = typography.subheadMedium,
+                                        color = colors.dangerRemoved,
+                                    )
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Archive,
+                                        contentDescription = null,
+                                        tint = colors.dangerRemoved,
+                                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                                    )
+                                },
+                                onClick = {
+                                    moreMenuExpanded = false
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onArchiveSession(activeAgent.agentId)
+                                },
+                            )
+                        }
+                    }
+                }
+
+                if (activeAgent != null) {
+                    Box(
+                        modifier = Modifier
+                            .width(40.dp)
+                            .fillMaxHeight()
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onNewSession()
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = OrbitComposeIcon,
+                            contentDescription = "New Conversation",
+                            tint = colors.fgPrimary,
+                            modifier = Modifier.size(OrbitSpacing.iconMd),
+                        )
+                    }
                 }
             }
-
-            // 5. `+` New Session Icon Button (48dp touch target)
-            Box(
-                modifier = Modifier
-                    .size(OrbitSpacing.touchTarget)
-                    .clip(CircleShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onNewSession()
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Add,
-                    contentDescription = "New Session",
-                    tint = colors.fgPrimary,
-                    modifier = Modifier.size(OrbitSpacing.iconMd),
-                )
-            }
         } else {
-            // Unpaired Chrome: only a quiet Settings icon button on the right
             Box(
                 modifier = Modifier
-                    .size(OrbitSpacing.touchTarget)
+                    .size(40.dp)
                     .clip(CircleShape)
+                    .background(colors.subtleFill, CircleShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
                     .clickable {
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onOpenSettings()
@@ -816,7 +1065,7 @@ private fun OrbitStageTopBar(
                 Icon(
                     imageVector = Icons.Outlined.Settings,
                     contentDescription = "Settings",
-                    tint = colors.fgSecondary,
+                    tint = colors.fgPrimary,
                     modifier = Modifier.size(OrbitSpacing.iconMd),
                 )
             }

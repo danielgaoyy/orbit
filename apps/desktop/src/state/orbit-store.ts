@@ -4,7 +4,13 @@ import {
   resolveActiveModelSpec,
   resolveSupportedEffortForModel,
 } from "@/lib/model-catalog";
-import { isLocalHostCard } from "@/lib/projects";
+import {
+  type UnifiedProjectEntry,
+  buildUnifiedProjects,
+  isLocalHostCard,
+  matchesProjectDirectory,
+  projectPathScopeKey,
+} from "@/lib/projects";
 import {
   type AgentCardView,
   type AgentTimelineDeltaView,
@@ -180,6 +186,7 @@ export interface OrbitUiState {
   sidebarWidth: number;
   collapsedHostIds: Record<string, boolean>;
   collapsedProjectIds: Record<string, boolean>;
+  hiddenProjectKeys: Record<string, boolean>;
   pinnedThreadKeys: string[];
   threadCustomTitles: Record<string, string>;
   archivedThreads: Record<string, ArchivedThreadEntry>;
@@ -235,6 +242,7 @@ interface PersistedPrefs {
   terminalScrollback?: number;
   sidebarOpen?: boolean;
   sidebarWidth?: number;
+  hiddenProjectKeys?: Record<string, boolean>;
   pinnedThreadKeys?: string[];
   threadCustomTitles?: Record<string, string>;
   archivedThreads?: Record<string, ArchivedThreadEntry>;
@@ -287,6 +295,7 @@ function writePrefsNow(snap: OrbitUiState): void {
       terminalScrollback: snap.terminalScrollback,
       sidebarOpen: snap.sidebarDesktopOpenPref,
       sidebarWidth: snap.sidebarWidth,
+      hiddenProjectKeys: snap.hiddenProjectKeys,
       pinnedThreadKeys: snap.pinnedThreadKeys,
       threadCustomTitles: snap.threadCustomTitles,
       archivedThreads: snap.archivedThreads,
@@ -448,6 +457,7 @@ let state: OrbitUiState = {
       : 256,
   collapsedHostIds: {},
   collapsedProjectIds: {},
+  hiddenProjectKeys: initialPrefs.hiddenProjectKeys ?? {},
   pinnedThreadKeys: initialPrefs.pinnedThreadKeys ?? [],
   threadCustomTitles: initialPrefs.threadCustomTitles ?? {},
   archivedThreads: initialPrefs.archivedThreads ?? {},
@@ -781,6 +791,23 @@ async function drainPromptQueueIfIdle(hostId: string, detail: HostDetailView): P
       });
     }
   }
+}
+
+function omitRecordKeys<T>(
+  record: Record<string, T>,
+  keysToRemove: ReadonlySet<string>,
+): Record<string, T> {
+  if (keysToRemove.size === 0) return record;
+  let mutated = false;
+  const next: Record<string, T> = {};
+  for (const [k, v] of Object.entries(record)) {
+    if (keysToRemove.has(k)) {
+      mutated = true;
+    } else {
+      next[k] = v;
+    }
+  }
+  return mutated ? next : record;
 }
 
 function resolveSettingsSectionTarget(
@@ -2194,7 +2221,7 @@ export const orbitActions = {
     const detail = state.hostDetails[hostId];
     const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
 
-    if (activeAgent?.is_running) {
+    if (activeAgent?.is_running || activeAgent?.is_awaiting_permission) {
       if (steerImmediately) {
         await orbitIpc.interruptAgent(hostId, agentId);
         await orbitIpc.sendPrompt(hostId, agentId, assembledWirePrompt, {
@@ -2620,14 +2647,22 @@ export const orbitActions = {
         name: (name ?? basenameFromPath(cleanPath)) || cleanPath,
         directories: [cleanPath],
       });
-      setState((s) => ({
-        ...s,
-        remoteFolderPickerHostId: null,
-        collapsedProjectIds: {
-          ...s.collapsedProjectIds,
-          [created.project_id]: false,
-        },
-      }));
+      const keysToUnhide = new Set<string>([projectPathScopeKey(hostId, cleanPath)]);
+      if (created.directories[0]) {
+        keysToUnhide.add(projectPathScopeKey(hostId, created.directories[0]));
+      }
+      setState(
+        (s) => ({
+          ...s,
+          remoteFolderPickerHostId: null,
+          hiddenProjectKeys: omitRecordKeys(s.hiddenProjectKeys, keysToUnhide),
+          collapsedProjectIds: {
+            ...s.collapsedProjectIds,
+            [created.project_id]: false,
+          },
+        }),
+        true,
+      );
       await orbitActions.reloadFleetOnly();
       orbitActions.startNewThreadDraft(hostId, created.directories[0] ?? cleanPath);
     } catch (err) {
@@ -2681,6 +2716,148 @@ export const orbitActions = {
       await orbitActions.reloadFleetOnly();
     } catch (err) {
       notifyToast(`Failed to remove project: ${String(err)}`);
+    }
+  },
+
+  async deleteProject(project: UnifiedProjectEntry): Promise<void> {
+    const hostId = project.host.host_id;
+    try {
+      const running = project.conversations.filter(
+        ({ agent }) => agent.is_running || agent.is_awaiting_permission,
+      );
+      if (running.length > 0) {
+        await Promise.allSettled(
+          running.map(({ agent }) => orbitIpc.interruptAgent(hostId, agent.agent_id)),
+        );
+      }
+
+      if (project.conversations.length > 0) {
+        await Promise.allSettled(
+          project.conversations.map(({ agent }) => orbitIpc.archiveAgent(hostId, agent.agent_id)),
+        );
+      }
+
+      const removedPinnedIds = new Set<string>();
+      if (project.pinnedProject?.project_id) {
+        removedPinnedIds.add(project.pinnedProject.project_id);
+      }
+      for (const pinned of state.fleet.projects ?? []) {
+        if (
+          pinned.host_id === hostId &&
+          pinned.directories.some((dir) => matchesProjectDirectory(project.directories, dir))
+        ) {
+          removedPinnedIds.add(pinned.project_id);
+        }
+      }
+      if (removedPinnedIds.size > 0) {
+        await Promise.all(
+          Array.from(removedPinnedIds).map((pid) => orbitIpc.removeProject(pid)),
+        );
+      }
+
+      const deletedAgentIds = new Set(project.conversations.map((c) => c.agent.agent_id));
+      const deletedThreadKeys = new Set(
+        project.conversations.map((c) => threadScopeKey(hostId, c.agent.agent_id)),
+      );
+
+      setState((s) => {
+        const nextHidden = { ...s.hiddenProjectKeys };
+        nextHidden[projectPathScopeKey(hostId, project.primaryCwd)] = true;
+        for (const dir of project.directories) {
+          nextHidden[projectPathScopeKey(hostId, dir)] = true;
+        }
+
+        const nextCollapsed = { ...s.collapsedProjectIds };
+        delete nextCollapsed[project.id];
+
+        const wasSelectedAgent =
+          !s.isDraftNewSession &&
+          s.selectedHostId === hostId &&
+          s.selectedAgentId !== null &&
+          deletedAgentIds.has(s.selectedAgentId);
+        const wasSelectedProjectCwd =
+          s.selectedHostId === hostId &&
+          matchesProjectDirectory(project.directories, s.selectedWorkspaceCwd);
+
+        let nextHostId = s.selectedHostId;
+        let nextAgentId = s.selectedAgentId;
+        let nextCwd = s.selectedWorkspaceCwd;
+        let nextDraft = s.isDraftNewSession;
+
+        if (wasSelectedAgent || wasSelectedProjectCwd) {
+          const remainingPinned = (s.fleet.projects ?? []).filter(
+            (p) => !removedPinnedIds.has(p.project_id),
+          );
+          const hostDetail = s.hostDetails[hostId];
+          const remainingHostDetails = hostDetail
+            ? {
+                ...s.hostDetails,
+                [hostId]: {
+                  ...hostDetail,
+                  agents: hostDetail.agents.filter((a) => !deletedAgentIds.has(a.agent_id)),
+                },
+              }
+            : s.hostDetails;
+          const remainingProjects = buildUnifiedProjects(
+            s.fleet.hosts,
+            remainingPinned,
+            remainingHostDetails,
+            nextHidden,
+          );
+          const nextProject =
+            remainingProjects.find(
+              (p) =>
+                p.id !== project.id &&
+                !(
+                  p.host.host_id === hostId &&
+                  matchesProjectDirectory(project.directories, p.primaryCwd)
+                ),
+            ) ?? null;
+
+          if (nextProject) {
+            nextHostId = nextProject.host.host_id;
+            nextCwd = nextProject.primaryCwd;
+            nextAgentId = null;
+            nextDraft = true;
+          } else {
+            nextAgentId = null;
+            nextCwd = "";
+            nextDraft = true;
+          }
+        }
+
+        return {
+          ...s,
+          selectedHostId: nextHostId,
+          selectedAgentId: nextAgentId,
+          selectedWorkspaceCwd: nextCwd,
+          isDraftNewSession: nextDraft,
+          hiddenProjectKeys: nextHidden,
+          collapsedProjectIds: nextCollapsed,
+          pinnedThreadKeys:
+            deletedThreadKeys.size > 0
+              ? s.pinnedThreadKeys.filter((k) => !deletedThreadKeys.has(k))
+              : s.pinnedThreadKeys,
+          archivedThreads: omitRecordKeys(s.archivedThreads, deletedThreadKeys),
+          threadCustomTitles: omitRecordKeys(s.threadCustomTitles, deletedThreadKeys),
+          seenAgentSeqs: omitRecordKeys(s.seenAgentSeqs, deletedThreadKeys),
+          timelines: omitRecordKeys(s.timelines, deletedThreadKeys),
+          composerDrafts: omitRecordKeys(s.composerDrafts, deletedThreadKeys),
+          slashDirectives: omitRecordKeys(s.slashDirectives, deletedThreadKeys),
+          inlineMentions: omitRecordKeys(s.inlineMentions, deletedThreadKeys),
+          contextItems: omitRecordKeys(s.contextItems, deletedThreadKeys),
+          pastedAttachments: omitRecordKeys(s.pastedAttachments, deletedThreadKeys),
+          diffQuotes: omitRecordKeys(s.diffQuotes, deletedThreadKeys),
+          queuedPrompts: omitRecordKeys(s.queuedPrompts, deletedThreadKeys),
+        };
+      }, true);
+
+      await orbitActions.reloadFleetOnly();
+      await orbitActions.reloadHostDetail(hostId, false);
+      notifyToast("Project deleted");
+    } catch (err) {
+      notifyToast(`Failed to delete project: ${String(err)}`);
+      throw err;
     }
   },
 

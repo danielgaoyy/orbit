@@ -1,4 +1,9 @@
 import {
+  CapsuleSegmentButtonV2,
+  LengthMetrics,
+  SegmentButtonV2Items
+} from '@kit.ArkUI';
+import {
   HostCardDto,
   ProviderQuotaDto,
   QuotaWindowDto,
@@ -14,108 +19,109 @@ import {
   orbitButtonSubhead,
   orbitInputMono,
   orbitInputSubhead,
+  orbitSegmentSelectedBg,
+  orbitSegmentSelectedFg,
   orbitTextMeta,
   orbitTextMono,
-  orbitTextSubhead,
-  orbitTextTitle
+  orbitTextSubhead
 } from '../../theme/OrbitTokens';
+import {
+  OrbitSectionHeader,
+  dismissHarmonyKeyboard,
+  resolveHostStatusColor
+} from '../common/OrbitCommonControls';
+import { OrbitProviderBrandIcon } from '../composer/ModelPickerSheet';
 
-interface ThemeOptionItem {
-  id: string;
-  label: string;
-  subtitle: string;
-}
-
-const THEME_ROW_TOP: ThemeOptionItem[] = [
-  { id: 'system', label: 'System', subtitle: 'Match system' },
-  { id: 'light', label: 'Light', subtitle: 'Daylight paper' }
-];
-
-const THEME_ROW_BOTTOM: ThemeOptionItem[] = [
-  { id: 'dark', label: 'Graphite', subtitle: 'Quiet graphite' },
-  { id: 'oled', label: 'OLED', subtitle: 'True pitch black' }
-];
-
+const APPEARANCE_MODES: string[] = ['system', 'light', 'dark'];
 const ROUTE_MODES: string[] = ['auto', 'direct_only', 'ssh_tunnel', 'relay_only'];
 
 @ComponentV2
 export struct HostSettingsSheet {
-  @Local pairingUriDraft: string = '';
+  @Local pairUriInput: string = '';
+  @Local inspectedHostId: string = '';
   @Local customNameDraft: string = '';
   @Local routeModeDraft: string = 'auto';
   @Local sshAliasDraft: string = '';
   @Local portDraft: string = '6868';
   @Local directEndpointDraft: string = '';
   @Local relayUrlDraft: string = '';
-  @Local hydratedHostId: string = '';
+  @Local appearanceItems: SegmentButtonV2Items = new SegmentButtonV2Items([
+    { text: 'System' },
+    { text: 'Light' },
+    { text: 'Dark' }
+  ]);
+  @Local routeModeItems: SegmentButtonV2Items = new SegmentButtonV2Items([
+    { text: formatRouteModeLabel('auto') },
+    { text: formatRouteModeLabel('direct_only') },
+    { text: formatRouteModeLabel('relay_only') }
+  ]);
 
+  private navPathStack: NavPathStack = new NavPathStack();
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
-  private activeHostCard(): HostCardDto | null {
-    const detail = this.store.currentHostDetail;
-    if (detail !== null) {
-      return detail.host;
+  @Computed
+  get appearanceIndex(): number {
+    const mode = this.store.themeMode;
+    if (mode === 'light') {
+      return 1;
     }
+    if (mode === 'dark' || mode === 'graphite' || mode === 'oled') {
+      return 2;
+    }
+    return 0;
+  }
+
+  @Computed
+  get routeModeIndex(): number {
+    const idx = ROUTE_MODES.indexOf(this.routeModeDraft);
+    return idx >= 0 ? idx : 0;
+  }
+
+  @Computed
+  get quotas(): ProviderQuotaDto[] {
+    const detail = this.store.currentHostDetail;
+    return detail !== null ? detail.quotas : [];
+  }
+
+  @Computed
+  get inspectedHost(): HostCardDto | null {
     for (let i = 0; i < this.store.hosts.length; i++) {
-      if (this.store.hosts[i].host_id === this.store.selectedHostId) {
+      if (this.store.hosts[i].host_id === this.inspectedHostId) {
         return this.store.hosts[i];
       }
     }
     return null;
   }
 
-  private ensureDraftHydrated(): void {
-    const h = this.activeHostCard();
-    if (h !== null && h.host_id !== this.hydratedHostId) {
-      this.hydratedHostId = h.host_id;
-      this.customNameDraft = h.custom_name ?? '';
-      this.routeModeDraft = h.route_mode;
-      this.sshAliasDraft = h.ssh_alias ?? '';
-      this.portDraft = h.remote_daemon_port.toString();
-      this.directEndpointDraft = h.custom_direct_endpoint ?? '';
-      this.relayUrlDraft = h.relay_url ?? '';
-    }
+  private pushHostDetail(host: HostCardDto): void {
+    this.inspectedHostId = host.host_id;
+    this.customNameDraft = host.display_name;
+    this.routeModeDraft = host.route_mode;
+    this.sshAliasDraft = host.ssh_alias ?? '';
+    this.portDraft = `${host.remote_daemon_port}`;
+    this.directEndpointDraft = host.custom_direct_endpoint ?? '';
+    this.relayUrlDraft = host.relay_url ?? '';
+    this.navPathStack.pushPathByName('host_detail', null);
+    this.store.triggerHaptic(6);
   }
 
-  private quotas(): ProviderQuotaDto[] {
-    const detail = this.store.currentHostDetail;
-    return detail !== null ? detail.quotas : [];
+  private hostSummarySubtitle(host: HostCardDto): string {
+    const state = formatConnectionStateLabel(host.connection_state, host.via_ssh_tunnel);
+    return host.last_ping_ms !== null ? `${state} · ${host.last_ping_ms} ms` : state;
   }
 
-  private hostDotColor(host: HostCardDto): string {
-    if (host.connection_state === 'online_direct') {
-      return this.store.palette.statusDirect;
-    }
-    if (host.connection_state === 'online_relay') {
-      return this.store.palette.statusRelay;
-    }
-    if (
-      host.connection_state === 'connecting_direct' ||
-      host.connection_state === 'connecting_relay'
-    ) {
-      return this.store.palette.accentPrimary;
-    }
-    if (host.last_error !== null && host.last_error.length > 0) {
-      return this.store.palette.statusDanger;
-    }
-    return this.store.palette.fgMuted;
-  }
-
-  private hostDiagnosticsSubtitle(host: HostCardDto): string {
-    const parts: string[] = [formatConnectionStateLabel(host.connection_state, host.via_ssh_tunnel)];
-    if (host.last_ping_ms !== null) {
-      parts.push(`${host.last_ping_ms}ms`);
-    }
+  private daemonSummary(host: HostCardDto): string {
+    const parts: string[] = [];
     if (host.daemon_version !== null && host.daemon_version.length > 0) {
-      parts.push(`v${host.daemon_version}`);
+      parts.push(host.daemon_version.startsWith('v') ? host.daemon_version : `v${host.daemon_version}`);
     }
     if (host.os_arch !== null && host.os_arch.length > 0) {
       parts.push(host.os_arch);
     }
-    return parts.join(' · ');
+    return parts.length > 0 ? parts.join(' · ') : '—';
   }
 
-  private quotaSemanticColor(usedPercent: number): string {
+  private quotaSemanticColor(usedPercent: number): ResourceColor {
     if (usedPercent > 90) {
       return this.store.palette.statusDanger;
     }
@@ -125,398 +131,697 @@ export struct HostSettingsSheet {
     return this.store.palette.statusDirect;
   }
 
+  private confirmRemoveHost(host: HostCardDto): void {
+    this.getUIContext().showAlertDialog({
+      title: `Remove ${host.display_name}?`,
+      message: 'Running remote agent sessions on this host will not be terminated.',
+      autoCancel: true,
+      primaryButton: {
+        value: 'Cancel',
+        fontColor: this.store.palette.fgSecondary,
+        action: () => {
+          // Dismissed
+        }
+      },
+      secondaryButton: {
+        value: 'Remove',
+        fontColor: this.store.palette.statusDanger,
+        action: () => {
+          const removingLast = this.store.hosts.length <= 1;
+          this.store.removeHost(host.host_id);
+          this.inspectedHostId = '';
+          this.navPathStack.pop();
+          if (removingLast) {
+            this.store.showHostSettingsSheet = false;
+          }
+        }
+      }
+    });
+  }
+
   aboutToAppear(): void {
-    this.ensureDraftHydrated();
+    if (this.store.selectedHostId.length > 0) {
+      this.store.refreshActiveQuotas();
+    }
   }
 
   @Builder
-  private renderThemeCard(opt: ThemeOptionItem) {
-    Column({ space: 2 }) {
-      Row() {
-        Text(opt.label)
-          .attributeModifier(
-            orbitTextSubhead(
-              this.store.themeMode === opt.id
-                ? this.store.palette.accentPrimary
-                : this.store.palette.fgPrimary,
-              FontWeight.Bold
-            )
-          )
-        Blank()
-        if (this.store.themeMode === opt.id) {
-          Text('✓')
-            .attributeModifier(orbitTextSubhead(this.store.palette.accentPrimary, FontWeight.Bold))
+  private renderQuotasHeader() {
+    Row() {
+      Text('Usage & Quotas')
+        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+        .maxLines(1)
+      Blank()
+      Button({ type: ButtonType.Normal, stateEffect: true }) {
+        Row({ space: 4 }) {
+          SymbolGlyph($r('sys.symbol.arrow_clockwise'))
+            .fontSize(13)
+            .fontColor([this.store.palette.accentPrimary])
+          Text('Refresh')
+            .attributeModifier(orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Medium))
         }
       }
-      .width('100%')
-
-      Text(opt.subtitle)
-        .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
-        .maxLines(1)
+      .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+      .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_XS })
+      .backgroundColor(Color.Transparent)
+      .onClick(() => {
+        this.store.refreshActiveQuotas();
+        this.store.triggerHaptic(6);
+      })
     }
-    .alignItems(HorizontalAlign.Start)
-    .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-    .padding(OrbitTokens.SPACE_MD)
-    .layoutWeight(1)
-    .backgroundColor(
-      this.store.themeMode === opt.id
-        ? this.store.palette.accentPrimarySoft
-        : this.store.palette.elevated
-    )
-    .borderRadius(OrbitTokens.CARD_RADIUS)
-    .border({
-      width: OrbitTokens.HAIRLINE,
-      color: this.store.themeMode === opt.id
-        ? this.store.palette.accentPrimary
-        : this.store.palette.hairline
+    .width('100%')
+    .padding({
+      left: OrbitTokens.SPACE_XS,
+      right: 0,
+      top: 14,
+      bottom: 2
     })
-    .onClick(() => {
-      this.store.setThemeMode(opt.id);
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  private renderRootSettings() {
+    List({ space: 0 }) {
+      // 1. Appearance (Native HarmonyOS 7 CapsuleSegmentButtonV2)
+      ListItem() {
+        OrbitSectionHeader({ title: 'Appearance', isFirst: true })
+      }
+
+      ListItem() {
+        CapsuleSegmentButtonV2({
+          items: this.appearanceItems,
+          selectedIndex: this.appearanceIndex,
+          onItemClicked: (idx: number) => {
+            if (idx >= 0 && idx < APPEARANCE_MODES.length) {
+              this.store.setThemeMode(APPEARANCE_MODES[idx]);
+            }
+          },
+          itemSelectedBackgroundColor: orbitSegmentSelectedBg(this.store.palette),
+          itemSelectedFontColor: orbitSegmentSelectedFg(this.store.palette),
+          itemMaxFontScale: 1.45,
+          itemMinHeight: LengthMetrics.vp(38)
+        })
+          .width('100%')
+      }
+
+      // 2. Hosts Fleet
+      ListItem() {
+        OrbitSectionHeader({ title: 'Hosts' })
+      }
+
+      ListItemGroup() {
+        if (this.store.hosts.length === 0) {
+          ListItem() {
+            Row() {
+              Text('No hosts paired yet')
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted))
+            }
+            .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+            .alignItems(VerticalAlign.Center)
+          }
+        } else {
+          ForEach(
+            this.store.hosts,
+            (host: HostCardDto) => {
+              ListItem() {
+                Button({ type: ButtonType.Normal, stateEffect: true }) {
+                  Row({ space: 10 }) {
+                    Row() {
+                      Row()
+                        .width(8)
+                        .height(8)
+                        .borderRadius(4)
+                        .backgroundColor(resolveHostStatusColor(host, this.store))
+                    }
+                    .width(20)
+                    .justifyContent(FlexAlign.Center)
+
+                    Column({ space: 2 }) {
+                      Row({ space: 6 }) {
+                        Text(host.display_name)
+                          .attributeModifier(
+                            orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium)
+                          )
+                          .maxLines(1)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
+                          .flexShrink(1)
+
+                        if (host.host_id === this.store.selectedHostId && this.store.hosts.length > 1) {
+                          Text('Active')
+                            .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+                            .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                            .borderRadius(OrbitTokens.RADIUS_SM)
+                            .backgroundColor(this.store.palette.subtleSurface)
+                        }
+                      }
+                      .alignItems(VerticalAlign.Center)
+
+                      Text(this.hostSummarySubtitle(host))
+                        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    }
+                    .alignItems(HorizontalAlign.Start)
+                    .layoutWeight(1)
+
+                    SymbolGlyph($r('sys.symbol.chevron_right'))
+                      .fontSize(13)
+                      .fontColor([this.store.palette.fgMuted])
+                  }
+                  .width('100%')
+                  .alignItems(VerticalAlign.Center)
+                }
+                .width('100%')
+                .constraintSize({ minHeight: 56 })
+                .padding({
+                  left: OrbitTokens.SPACE_LG,
+                  right: OrbitTokens.SPACE_LG,
+                  top: 8,
+                  bottom: 8
+                })
+                .backgroundColor(Color.Transparent)
+                .onClick(() => {
+                  this.pushHostDetail(host);
+                })
+              }
+            },
+            (host: HostCardDto) => `host_row_${host.host_id}`
+          )
+        }
+
+        ListItem() {
+          Button({ type: ButtonType.Normal, stateEffect: true }) {
+            Row({ space: 10 }) {
+              Row() {
+                SymbolGlyph($r('sys.symbol.qrcode'))
+                  .fontSize(16)
+                  .fontColor([this.store.palette.accentPrimary])
+              }
+              .width(20)
+              .justifyContent(FlexAlign.Center)
+
+              Text('Pair New Host')
+                .attributeModifier(
+                  orbitTextSubhead(this.store.palette.accentPrimary, FontWeight.Medium)
+                )
+                .layoutWeight(1)
+                .textAlign(TextAlign.Start)
+
+              SymbolGlyph($r('sys.symbol.chevron_right'))
+                .fontSize(13)
+                .fontColor([this.store.palette.fgMuted])
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+          }
+          .width('100%')
+          .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          .backgroundColor(Color.Transparent)
+          .onClick(() => {
+            this.navPathStack.pushPathByName('pair_host', null);
+            this.store.triggerHaptic(6);
+          })
+        }
+      }
+      .backgroundColor(this.store.palette.listCard)
+      .borderRadius(OrbitTokens.RADIUS_LG)
+      .clip(true)
+      .divider({
+        strokeWidth: OrbitTokens.HAIRLINE,
+        color: this.store.palette.hairline,
+        startMargin: 46,
+        endMargin: OrbitTokens.SPACE_LG
+      })
+
+      // 3. Usage & Quotas
+      if (this.store.selectedHostId.length > 0) {
+        ListItem() {
+          this.renderQuotasHeader()
+        }
+
+        ListItemGroup() {
+          if (this.quotas.length === 0) {
+            ListItem() {
+              Row() {
+                Text('No active rate-limit windows reported yet.')
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted))
+              }
+              .width('100%')
+              .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+              .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+              .alignItems(VerticalAlign.Center)
+            }
+          } else {
+            ForEach(
+              this.quotas,
+              (q: ProviderQuotaDto) => {
+                ListItem() {
+                  Column({ space: OrbitTokens.SPACE_SM }) {
+                    Row({ space: OrbitTokens.SPACE_SM }) {
+                      OrbitProviderBrandIcon({ provider: q.provider, iconSize: 16 })
+                      Text(formatProviderLabel(q.provider))
+                        .attributeModifier(
+                          orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium)
+                        )
+                      if (q.account_label !== null && q.account_label.length > 0) {
+                        Text(q.account_label)
+                          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                          .maxLines(1)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
+                          .flexShrink(1)
+                      }
+                      Blank()
+                      if (q.credits_remaining !== null) {
+                        Text(`$${q.credits_remaining.toFixed(2)}`)
+                          .attributeModifier(
+                            orbitTextMono(this.store.palette.statusDirect, FontWeight.Medium)
+                          )
+                      }
+                    }
+                    .width('100%')
+                    .alignItems(VerticalAlign.Center)
+
+                    if (q.error !== null && q.error.length > 0) {
+                      Text(q.error)
+                        .attributeModifier(orbitTextMeta(this.store.palette.statusWarning))
+                        .width('100%')
+                    }
+
+                    if (q.windows.length === 0 && (q.error === null || q.error.length === 0)) {
+                      Text('No active rate-limit windows')
+                        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                        .width('100%')
+                    } else {
+                      ForEach(
+                        q.windows,
+                        (win: QuotaWindowDto) => {
+                          Column({ space: 5 }) {
+                            Row({ space: OrbitTokens.SPACE_SM }) {
+                              Text(win.label)
+                                .attributeModifier(
+                                  orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium)
+                                )
+                                .layoutWeight(1)
+                                .maxLines(1)
+                                .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+                              if (formatQuotaResetCountdown(win.resets_at).length > 0) {
+                                Text(formatQuotaResetCountdown(win.resets_at))
+                                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                                  .maxLines(1)
+                              }
+
+                              Text(`${Math.round(win.used_percent)}%`)
+                                .attributeModifier(
+                                  orbitTextMono(
+                                    this.quotaSemanticColor(win.used_percent),
+                                    FontWeight.Medium
+                                  )
+                                )
+                            }
+                            .width('100%')
+                            .alignItems(VerticalAlign.Center)
+
+                            Progress({
+                              value: Math.min(100, Math.max(0, Math.round(win.used_percent))),
+                              total: 100,
+                              type: ProgressType.Linear
+                            })
+                              .width('100%')
+                              .color(this.quotaSemanticColor(win.used_percent))
+                              .backgroundColor(this.store.palette.subtleSurface)
+                              .style({ strokeWidth: 4, enableSmoothEffect: true })
+                          }
+                          .width('100%')
+                        },
+                        (win: QuotaWindowDto) => win.label
+                      )
+                    }
+                  }
+                  .width('100%')
+                  .padding(OrbitTokens.SPACE_LG)
+                }
+              },
+              (q: ProviderQuotaDto) => q.provider
+            )
+          }
+        }
+        .backgroundColor(this.store.palette.listCard)
+        .borderRadius(OrbitTokens.RADIUS_LG)
+        .clip(true)
+        .divider({
+          strokeWidth: OrbitTokens.HAIRLINE,
+          color: this.store.palette.hairline,
+          startMargin: OrbitTokens.SPACE_LG,
+          endMargin: OrbitTokens.SPACE_LG
+        })
+      }
+
+      // 4. About
+      ListItem() {
+        OrbitSectionHeader({ title: 'About' })
+      }
+
+      ListItemGroup() {
+        ListItem() {
+          Row() {
+            Text('Encryption')
+              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+            Blank()
+            Text('Noise NK · E2EE')
+              .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+          }
+          .width('100%')
+          .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          .alignItems(VerticalAlign.Center)
+        }
+
+        ListItem() {
+          Row() {
+            Text('Platform')
+              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+            Blank()
+            Text('HarmonyOS 7 · ArkUI V2')
+              .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+          }
+          .width('100%')
+          .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+          .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+          .alignItems(VerticalAlign.Center)
+        }
+      }
+      .backgroundColor(this.store.palette.listCard)
+      .borderRadius(OrbitTokens.RADIUS_LG)
+      .clip(true)
+      .divider({
+        strokeWidth: OrbitTokens.HAIRLINE,
+        color: this.store.palette.hairline,
+        startMargin: OrbitTokens.SPACE_LG,
+        endMargin: OrbitTokens.SPACE_LG
+      })
+    }
+    .width('100%')
+    .height('100%')
+    .padding({
+      left: OrbitTokens.SPACE_LG,
+      right: OrbitTokens.SPACE_LG,
+      top: OrbitTokens.SPACE_XS,
+      bottom: Math.max(OrbitTokens.SPACE_XL, this.store.safeBottomVp)
+    })
+    .scrollBar(BarState.Auto)
+    .edgeEffect(EdgeEffect.Spring)
+    .onScrollStart(() => {
+      dismissHarmonyKeyboard(this.getUIContext());
     })
   }
 
-  build() {
-    Column({ space: OrbitTokens.SPACE_LG }) {
-      Row() {
-        Text('Settings')
-          .attributeModifier(orbitTextTitle(this.store.palette.fgPrimary, FontWeight.Bold))
-        Blank()
-        Button('Done')
-          .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
-          .height(OrbitTokens.HIT_MIN)
-          .onClick(() => {
-            this.store.showHostSettingsSheet = false;
-          })
-      }
-      .width('100%')
+  @Builder
+  private renderHostDetailDestination(host: HostCardDto) {
+    NavDestination() {
+      List({ space: 0 }) {
+        // 1. Diagnostics Group
+        ListItem() {
+          OrbitSectionHeader({ title: 'Diagnostics', isFirst: true })
+        }
 
-      Scroll() {
-        Column({ space: OrbitTokens.SPACE_XL }) {
-          if (this.store.clipboardPairingUri.length > 0) {
+        ListItemGroup() {
+          ListItem() {
             Row({ space: OrbitTokens.SPACE_SM }) {
-              Column({ space: 2 }) {
-                Text('Pair from Clipboard')
-                  .attributeModifier(
-                    orbitTextSubhead(this.store.palette.accentPrimary, FontWeight.Bold)
-                  )
-                Text(this.store.clipboardPairingUri)
-                  .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-              }
-              .alignItems(HorizontalAlign.Start)
-              .layoutWeight(1)
+              Row()
+                .width(8)
+                .height(8)
+                .borderRadius(4)
+                .backgroundColor(resolveHostStatusColor(host, this.store))
 
-              Button('Pair')
+              Text(formatConnectionStateLabel(host.connection_state, host.via_ssh_tunnel))
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+                .layoutWeight(1)
+
+              Button('Reconnect', { type: ButtonType.Capsule, stateEffect: true })
                 .attributeModifier(
-                  orbitButtonSubhead(
-                    this.store.palette.onAccent,
-                    this.store.palette.accentPrimaryFill
-                  )
+                  orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.subtleSurface)
                 )
-                .height(OrbitTokens.HIT_MIN)
-                .borderRadius(OrbitTokens.PILL_RADIUS)
+                .height(OrbitTokens.HIT_COMPACT)
+                .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
                 .onClick(() => {
-                  this.store.pairFromClipboard();
+                  this.store.reconnectHost(host.host_id);
                 })
-
-              Stack({ alignContent: Alignment.Center }) {
-                Text('×')
-                  .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted, FontWeight.Bold))
-              }
-              .width(OrbitTokens.HIT_MIN)
-              .height(OrbitTokens.HIT_MIN)
-              .accessibilityText('Dismiss clipboard pairing banner')
-              .onClick(() => {
-                this.store.dismissClipboardPairingBanner();
-              })
             }
             .width('100%')
-            .padding({
-              left: OrbitTokens.SPACE_MD,
-              right: OrbitTokens.SPACE_XS,
-              top: OrbitTokens.SPACE_SM,
-              bottom: OrbitTokens.SPACE_SM
-            })
-            .backgroundColor(this.store.palette.accentPrimarySoft)
-            .borderRadius(OrbitTokens.CARD_RADIUS)
-            .border({
-              width: OrbitTokens.HAIRLINE,
-              color: this.store.palette.accentPrimary
-            })
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_MD })
             .alignItems(VerticalAlign.Center)
           }
 
-          Column({ space: OrbitTokens.SPACE_SM }) {
-            Text('APPEARANCE')
-              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-
-            Row({ space: OrbitTokens.SPACE_SM }) {
-              ForEach(
-                THEME_ROW_TOP,
-                (opt: ThemeOptionItem) => {
-                  this.renderThemeCard(opt)
-                },
-                (opt: ThemeOptionItem) => opt.id
-              )
+          ListItem() {
+            Row() {
+              Text('Latency')
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+              Blank()
+              Text(host.last_ping_ms !== null ? `${host.last_ping_ms} ms` : '—')
+                .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
             }
             .width('100%')
-
-            Row({ space: OrbitTokens.SPACE_SM }) {
-              ForEach(
-                THEME_ROW_BOTTOM,
-                (opt: ThemeOptionItem) => {
-                  this.renderThemeCard(opt)
-                },
-                (opt: ThemeOptionItem) => opt.id
-              )
-            }
-            .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+            .alignItems(VerticalAlign.Center)
           }
-          .alignItems(HorizontalAlign.Start)
-          .width('100%')
 
-          Column({ space: OrbitTokens.SPACE_SM }) {
-            Text('PAIR HOST')
-              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
+          ListItem() {
+            Row() {
+              Text('Daemon')
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+              Blank()
+              Text(this.daemonSummary(host))
+                .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+            .alignItems(VerticalAlign.Center)
+          }
 
-            Button('Scan QR Code')
-              .attributeModifier(
-                orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
-              )
+          ListItem() {
+            Button({ type: ButtonType.Normal, stateEffect: true }) {
+              Row({ space: 6 }) {
+                Text('Public Key')
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
+                Blank()
+                Text(`${host.daemon_pubkey_b64.substring(0, 16)}…`)
+                  .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+                  .maxLines(1)
+                SymbolGlyph($r('sys.symbol.square_and_square'))
+                  .fontSize(14)
+                  .fontColor([this.store.palette.iconSecondary])
+              }
               .width('100%')
-              .height(OrbitTokens.HIT_MIN)
-              .borderRadius(OrbitTokens.CARD_RADIUS)
-              .onClick(() => {
-                this.store.scanQrAndPair(this.getUIContext().getHostContext());
-              })
-
-            Row({ space: OrbitTokens.SPACE_SM }) {
-              TextInput({
-                placeholder: 'orbit://pair/...',
-                text: this.pairingUriDraft
-              })
-                .attributeModifier(
-                  orbitInputMono(
-                    this.store.palette.fgPrimary,
-                    this.store.palette.fgMuted,
-                    this.store.palette.code
-                  )
-                )
-                .height(OrbitTokens.HIT_MIN)
-                .borderRadius(OrbitTokens.CARD_RADIUS)
-                .border({
-                  width: OrbitTokens.HAIRLINE,
-                  color: this.store.palette.hairline
-                })
-                .layoutWeight(1)
-                .onChange((val: string) => {
-                  this.pairingUriDraft = val;
-                })
-
-              PasteButton({
-                icon: PasteIconStyle.LINES,
-                text: PasteDescription.PASTE,
-                buttonType: ButtonType.Capsule
-              })
-                .height(OrbitTokens.HIT_MIN)
-                .borderRadius(OrbitTokens.CARD_RADIUS)
-                .backgroundColor(this.store.palette.accentPrimarySoft)
-                .fontColor(this.store.palette.accentPrimary)
-                .iconColor(this.store.palette.accentPrimary)
-                .onClick((_event: ClickEvent, result: PasteButtonOnClickResult) => {
-                  if (result === PasteButtonOnClickResult.SUCCESS) {
-                    this.store.pasteAuthorizedPairingUri((val: string) => {
-                      this.pairingUriDraft = val;
-                    });
-                  }
-                })
-
-              Button('Pair Host')
-                .attributeModifier(
-                  orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
-                )
-                .height(OrbitTokens.HIT_MIN)
-                .borderRadius(OrbitTokens.CARD_RADIUS)
-                .onClick(() => {
-                  this.store.pairHost(this.pairingUriDraft);
-                  this.pairingUriDraft = '';
-                })
+              .alignItems(VerticalAlign.Center)
             }
             .width('100%')
+            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+            .backgroundColor(Color.Transparent)
+            .onClick(() => {
+              this.store.copyToClipboard(host.daemon_pubkey_b64, 'Copied public key');
+            })
           }
-          .alignItems(HorizontalAlign.Start)
-          .width('100%')
 
-          if (this.activeHostCard() !== null) {
-            Column({ space: OrbitTokens.SPACE_SM }) {
-              Text(`HOST DIAGNOSTICS & ROUTING`)
-                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-
-              // Active Host Diagnostics Row with One-Tap "Reconnect" Action
-              Column({ space: OrbitTokens.SPACE_XS }) {
-                Row({ space: OrbitTokens.SPACE_SM }) {
-                  Row()
-                    .width(OrbitTokens.DOT_SIZE)
-                    .height(OrbitTokens.DOT_SIZE)
-                    .borderRadius(3)
-                    .backgroundColor(this.hostDotColor(this.activeHostCard()!))
-
-                  Column({ space: 2 }) {
-                    Text(this.activeHostCard()?.display_name ?? '')
-                      .attributeModifier(
-                        orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold)
-                      )
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    Text(this.hostDiagnosticsSubtitle(this.activeHostCard()!))
-                      .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  }
-                  .alignItems(HorizontalAlign.Start)
-                  .layoutWeight(1)
-
-                  Button('Reconnect')
-                    .attributeModifier(
-                      orbitButtonMeta(
-                        this.store.palette.accentPrimary,
-                        this.store.palette.accentPrimarySoft
-                      )
-                    )
-                    .height(32)
-                    .borderRadius(OrbitTokens.PILL_RADIUS)
-                    .onClick(() => {
-                      const host = this.activeHostCard();
-                      if (host !== null) {
-                        this.store.reconnectHost(host.host_id);
-                      }
-                    })
-                }
+          if (host.last_error !== null && host.last_error.length > 0) {
+            ListItem() {
+              Text(host.last_error)
+                .attributeModifier(orbitTextMono(this.store.palette.statusDanger))
+                .copyOption(CopyOptions.LocalDevice)
                 .width('100%')
-                .alignItems(VerticalAlign.Center)
+                .padding({
+                  left: OrbitTokens.SPACE_LG,
+                  right: OrbitTokens.SPACE_LG,
+                  top: OrbitTokens.SPACE_SM,
+                  bottom: OrbitTokens.SPACE_SM
+                })
+            }
+          }
 
-                if (
-                  this.activeHostCard()?.last_error !== null &&
-                  (this.activeHostCard()?.last_error ?? '').length > 0
-                ) {
-                  Text(this.activeHostCard()?.last_error ?? '')
-                    .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
-                    .maxLines(2)
-                    .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    .width('100%')
+          if (host.host_id !== this.store.selectedHostId) {
+            ListItem() {
+              Button('Switch to This Host', { type: ButtonType.Normal, stateEffect: true })
+                .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
+                .width('100%')
+                .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+                .onClick(() => {
+                  this.store.selectHost(host.host_id);
+                  this.navPathStack.pop();
+                  this.store.triggerHaptic(8);
+                })
+            }
+          }
+        }
+        .backgroundColor(this.store.palette.listCard)
+        .borderRadius(OrbitTokens.RADIUS_LG)
+        .clip(true)
+        .divider({
+          strokeWidth: OrbitTokens.HAIRLINE,
+          color: this.store.palette.hairline,
+          startMargin: OrbitTokens.SPACE_LG,
+          endMargin: OrbitTokens.SPACE_LG
+        })
+
+        // 2. Connection Group (Native CapsuleSegmentButtonV2 Route Mode)
+        ListItem() {
+          OrbitSectionHeader({ title: 'Connection' })
+        }
+
+        ListItemGroup() {
+          ListItem() {
+            Column({ space: OrbitTokens.SPACE_SM }) {
+              Text('Route Mode')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+
+              CapsuleSegmentButtonV2({
+                items: this.routeModeItems,
+                selectedIndex: this.routeModeIndex,
+                onItemClicked: (idx: number) => {
+                  if (idx >= 0 && idx < ROUTE_MODES.length) {
+                    this.routeModeDraft = ROUTE_MODES[idx];
+                    this.store.triggerHaptic(6);
+                  }
+                },
+                itemFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
+                itemSelectedFontSize: LengthMetrics.fp(OrbitTokens.FONT_META),
+                itemSelectedBackgroundColor: orbitSegmentSelectedBg(this.store.palette),
+                itemSelectedFontColor: orbitSegmentSelectedFg(this.store.palette),
+                itemMaxFontScale: 1.3,
+                itemMinHeight: LengthMetrics.vp(36),
+                itemPadding: {
+                  top: LengthMetrics.vp(4),
+                  bottom: LengthMetrics.vp(4),
+                  start: LengthMetrics.vp(4),
+                  end: LengthMetrics.vp(4)
                 }
-              }
-              .width('100%')
-              .padding(OrbitTokens.SPACE_MD)
-              .backgroundColor(this.store.palette.elevated)
-              .borderRadius(OrbitTokens.CARD_RADIUS)
-              .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+              })
+                .width('100%')
+            }
+            .alignItems(HorizontalAlign.Start)
+            .width('100%')
+            .padding(OrbitTokens.SPACE_LG)
+          }
 
-              Flex({ wrap: FlexWrap.Wrap }) {
-                ForEach(
-                  ROUTE_MODES,
-                  (rm: string) => {
-                    Button(formatRouteModeLabel(rm))
-                      .attributeModifier(
-                        orbitButtonSubhead(
-                          this.routeModeDraft === rm
-                            ? this.store.palette.onAccent
-                            : this.store.palette.fgPrimary,
-                          this.routeModeDraft === rm
-                            ? this.store.palette.accentPrimaryFill
-                            : this.store.palette.subtleSurface
-                        )
-                      )
-                      .height(OrbitTokens.HIT_MIN)
-                      .borderRadius(OrbitTokens.PILL_RADIUS)
-                      .margin({ right: OrbitTokens.SPACE_SM, bottom: OrbitTokens.SPACE_SM })
-                      .onClick(() => {
-                        this.routeModeDraft = rm;
-                      })
-                  },
-                  (rm: string) => rm
-                )
-              }
-
+          ListItem() {
+            Column({ space: 4 }) {
+              Text('Display Name')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
               TextInput({
-                placeholder: 'Custom display name (optional)',
+                placeholder: host.hostname,
                 text: this.customNameDraft
               })
                 .attributeModifier(
                   orbitInputSubhead(
                     this.store.palette.fgPrimary,
                     this.store.palette.fgMuted,
-                    this.store.palette.elevated
+                    Color.Transparent
                   )
                 )
-                .height(OrbitTokens.HIT_MIN)
-                .borderRadius(OrbitTokens.CARD_RADIUS)
-                .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                .height(36)
+                .padding(0)
                 .width('100%')
                 .onChange((v: string) => {
                   this.customNameDraft = v;
                 })
+            }
+            .alignItems(HorizontalAlign.Start)
+            .width('100%')
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 10 })
+          }
 
+          ListItem() {
+            Column({ space: 4 }) {
+              Text('Direct Endpoint')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
               TextInput({
-                placeholder: 'Custom Direct Endpoint (ws://ip:6868/ws)',
+                placeholder: host.direct_endpoints.length > 0 ? host.direct_endpoints[0] : 'ws://192.168.1.x:6868/ws',
                 text: this.directEndpointDraft
               })
                 .attributeModifier(
                   orbitInputMono(
                     this.store.palette.fgPrimary,
                     this.store.palette.fgMuted,
-                    this.store.palette.code
+                    Color.Transparent
                   )
                 )
-                .height(OrbitTokens.HIT_MIN)
-                .borderRadius(OrbitTokens.CARD_RADIUS)
-                .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                .height(36)
+                .padding(0)
                 .width('100%')
                 .onChange((v: string) => {
                   this.directEndpointDraft = v;
                 })
+            }
+            .alignItems(HorizontalAlign.Start)
+            .width('100%')
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 10 })
+          }
 
+          ListItem() {
+            Column({ space: 4 }) {
+              Text('Relay URL')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
               TextInput({
-                placeholder: 'Noise E2EE Relay URL (wss://relay.example.com)',
+                placeholder: 'wss://relay.orbit.dev',
                 text: this.relayUrlDraft
               })
                 .attributeModifier(
                   orbitInputMono(
                     this.store.palette.fgPrimary,
                     this.store.palette.fgMuted,
-                    this.store.palette.code
+                    Color.Transparent
                   )
                 )
-                .height(OrbitTokens.HIT_MIN)
-                .borderRadius(OrbitTokens.CARD_RADIUS)
-                .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                .height(36)
+                .padding(0)
                 .width('100%')
                 .onChange((v: string) => {
                   this.relayUrlDraft = v;
                 })
+            }
+            .alignItems(HorizontalAlign.Start)
+            .width('100%')
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 10 })
+          }
 
-              if (this.routeModeDraft === 'ssh_tunnel') {
-                Row({ space: OrbitTokens.SPACE_SM }) {
+          if (this.routeModeDraft === 'ssh_tunnel') {
+            ListItem() {
+              Row({ space: OrbitTokens.SPACE_MD }) {
+                Column({ space: 4 }) {
+                  Text('SSH Alias')
+                    .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
                   TextInput({
-                    placeholder: 'SSH host alias',
+                    placeholder: 'devbox',
                     text: this.sshAliasDraft
                   })
                     .attributeModifier(
                       orbitInputMono(
                         this.store.palette.fgPrimary,
                         this.store.palette.fgMuted,
-                        this.store.palette.code
+                        Color.Transparent
                       )
                     )
-                    .height(OrbitTokens.HIT_MIN)
-                    .borderRadius(OrbitTokens.CARD_RADIUS)
-                    .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
-                    .layoutWeight(2)
+                    .height(36)
+                    .padding(0)
+                    .width('100%')
                     .onChange((v: string) => {
                       this.sshAliasDraft = v;
                     })
+                }
+                .alignItems(HorizontalAlign.Start)
+                .layoutWeight(2)
 
+                Column({ space: 4 }) {
+                  Text('Port')
+                    .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
                   TextInput({
                     placeholder: '6868',
                     text: this.portDraft
@@ -525,190 +830,226 @@ export struct HostSettingsSheet {
                       orbitInputMono(
                         this.store.palette.fgPrimary,
                         this.store.palette.fgMuted,
-                        this.store.palette.code
+                        Color.Transparent
                       )
                     )
-                    .height(OrbitTokens.HIT_MIN)
-                    .borderRadius(OrbitTokens.CARD_RADIUS)
-                    .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
-                    .layoutWeight(1)
+                    .height(36)
+                    .padding(0)
+                    .width('100%')
                     .onChange((v: string) => {
                       this.portDraft = v;
                     })
                 }
-                .width('100%')
-              }
-
-              Row({ space: OrbitTokens.SPACE_SM }) {
-                Button('Save & Reconnect')
-                  .attributeModifier(
-                    orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
-                  )
-                  .height(OrbitTokens.HIT_MIN)
-                  .borderRadius(OrbitTokens.CARD_RADIUS)
-                  .layoutWeight(1)
-                  .onClick(() => {
-                    const host = this.activeHostCard();
-                    if (host !== null) {
-                      const portNum = parseInt(this.portDraft, 10);
-                      this.store.updateHostConfig(
-                        host.host_id,
-                        this.customNameDraft,
-                        this.routeModeDraft,
-                        this.sshAliasDraft,
-                        Number.isNaN(portNum) ? 6868 : portNum,
-                        this.directEndpointDraft,
-                        this.relayUrlDraft
-                      );
-                    }
-                  })
-
-                Button('Remove Host')
-                  .attributeModifier(
-                    orbitButtonSubhead(
-                      this.store.palette.statusDanger,
-                      this.store.palette.statusDangerSoft
-                    )
-                  )
-                  .height(OrbitTokens.HIT_MIN)
-                  .borderRadius(OrbitTokens.CARD_RADIUS)
-                  .onClick(() => {
-                    const host = this.activeHostCard();
-                    if (host !== null) {
-                      this.store.removeHost(host.host_id);
-                    }
-                  })
+                .alignItems(HorizontalAlign.Start)
+                .layoutWeight(1)
               }
               .width('100%')
+              .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 10 })
             }
-            .alignItems(HorizontalAlign.Start)
-            .width('100%')
           }
+        }
+        .backgroundColor(this.store.palette.listCard)
+        .borderRadius(OrbitTokens.RADIUS_LG)
+        .clip(true)
+        .divider({
+          strokeWidth: OrbitTokens.HAIRLINE,
+          color: this.store.palette.hairline,
+          startMargin: OrbitTokens.SPACE_LG,
+          endMargin: OrbitTokens.SPACE_LG
+        })
 
+        // Save & Reconnect Primary Action
+        ListItem() {
+          Button('Save & Reconnect')
+            .attributeModifier(
+              orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+            )
+            .width('100%')
+            .height(OrbitTokens.HIT_MIN)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .onClick(() => {
+              dismissHarmonyKeyboard(this.getUIContext());
+              const portNum = parseInt(this.portDraft, 10);
+              this.store.updateHostConfig(
+                host.host_id,
+                this.customNameDraft,
+                this.routeModeDraft,
+                this.sshAliasDraft,
+                Number.isNaN(portNum) ? 6868 : portNum,
+                this.directEndpointDraft,
+                this.relayUrlDraft
+              );
+            })
+        }
+        .margin({ top: OrbitTokens.SPACE_LG })
+
+        // 3. Danger Zone (Native Button)
+        ListItem() {
+          Button('Remove Host', { type: ButtonType.Normal, stateEffect: true })
+            .attributeModifier(orbitButtonSubhead(this.store.palette.statusDanger, this.store.palette.listCard))
+            .width('100%')
+            .height(OrbitTokens.HIT_MIN)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .onClick(() => {
+              dismissHarmonyKeyboard(this.getUIContext());
+              this.confirmRemoveHost(host);
+            })
+        }
+        .margin({ top: OrbitTokens.SPACE_MD })
+      }
+      .width('100%')
+      .height('100%')
+      .padding({
+        left: OrbitTokens.SPACE_LG,
+        right: OrbitTokens.SPACE_LG,
+        top: OrbitTokens.SPACE_XS,
+        bottom: this.store.keyboardHeightVp > 0
+          ? OrbitTokens.SPACE_MD
+          : Math.max(OrbitTokens.SPACE_XL, this.store.safeBottomVp)
+      })
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
+      .onScrollStart(() => {
+        dismissHarmonyKeyboard(this.getUIContext());
+      })
+    }
+    .title(host.display_name)
+    .backgroundColor(this.store.palette.drawer)
+  }
+
+  @Builder
+  private renderPairHostDestination() {
+    NavDestination() {
+      List({ space: OrbitTokens.SPACE_LG }) {
+        ListItem() {
+          Button('Scan QR Code')
+            .attributeModifier(
+              orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+            )
+            .width('100%')
+            .height(OrbitTokens.HIT_MIN)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .onClick(() => {
+              this.store.scanQrAndPair(this.getUIContext().getHostContext());
+            })
+        }
+
+        ListItem() {
           Column({ space: OrbitTokens.SPACE_SM }) {
-            Row() {
-              Text('ACCOUNT QUOTAS')
-                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-              Blank()
-              Button('Refresh')
+            Text('Pairing URI')
+              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              TextInput({
+                placeholder: 'orbit://pair/...',
+                text: this.pairUriInput
+              })
                 .attributeModifier(
-                  orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.subtleSurface)
+                  orbitInputMono(
+                    this.store.palette.fgPrimary,
+                    this.store.palette.fgMuted,
+                    Color.Transparent
+                  )
                 )
-                .height(32)
-                .borderRadius(OrbitTokens.PILL_RADIUS)
-                .onClick(() => {
-                  this.store.refreshActiveQuotas();
+                .height(OrbitTokens.HIT_COMPACT)
+                .padding(0)
+                .layoutWeight(1)
+                .onChange((val: string) => {
+                  this.pairUriInput = val;
+                })
+                .onSubmit(() => {
+                  if (this.pairUriInput.trim().length > 0) {
+                    this.store.pairHost(this.pairUriInput);
+                    this.pairUriInput = '';
+                    this.navPathStack.pop();
+                  }
+                })
+
+              PasteButton({
+                icon: PasteIconStyle.LINES,
+                text: PasteDescription.PASTE,
+                buttonType: ButtonType.Capsule
+              })
+                .height(OrbitTokens.HIT_COMPACT)
+                .backgroundColor(this.store.palette.subtleSurface)
+                .fontColor(this.store.palette.fgPrimary)
+                .iconColor(this.store.palette.iconPrimary)
+                .onClick((_event: ClickEvent, result: PasteButtonOnClickResult) => {
+                  if (result === PasteButtonOnClickResult.SUCCESS) {
+                    this.store.pasteAuthorizedPairingUri((filled: string) => {
+                      this.pairUriInput = filled;
+                    });
+                  }
                 })
             }
             .width('100%')
-
-            if (this.quotas().length === 0) {
-              Text('No quota snapshots reported by connected providers yet.')
-                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-            } else {
-              ForEach(
-                this.quotas(),
-                (q: ProviderQuotaDto) => {
-                  Column({ space: OrbitTokens.SPACE_SM }) {
-                    Row() {
-                      Text(formatProviderLabel(q.provider))
-                        .attributeModifier(
-                          orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold)
-                        )
-                      Blank()
-                      if (q.account_label !== null && q.account_label.length > 0) {
-                        Text(q.account_label)
-                          .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
-                      }
-                    }
-                    .width('100%')
-
-                    if (q.error !== null && q.error.length > 0) {
-                      Text(q.error)
-                        .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
-                        .width('100%')
-                    }
-
-                    ForEach(
-                      q.windows,
-                      (win: QuotaWindowDto) => {
-                        Column({ space: OrbitTokens.SPACE_XS }) {
-                          Row({ space: OrbitTokens.SPACE_SM }) {
-                            Text(win.label)
-                              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
-                              .layoutWeight(1)
-                              .maxLines(1)
-                              .textOverflow({ overflow: TextOverflow.Ellipsis })
-
-                            if (formatQuotaResetCountdown(win.resets_at).length > 0) {
-                              Text(formatQuotaResetCountdown(win.resets_at))
-                                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-                                .maxLines(1)
-                            }
-
-                            Text(`${Math.round(win.used_percent)}%`)
-                              .attributeModifier(
-                                orbitTextMono(
-                                  this.quotaSemanticColor(win.used_percent),
-                                  FontWeight.Medium
-                                )
-                              )
-                          }
-                          .width('100%')
-                          .alignItems(VerticalAlign.Center)
-
-                          // 4vp-tall semantic progress bar (<70% statusDirect, 70-90% statusWarning, >90% statusDanger)
-                          Stack({ alignContent: Alignment.Start }) {
-                            Row()
-                              .width('100%')
-                              .height(OrbitTokens.SPACE_XS)
-                              .backgroundColor(this.store.palette.subtleSurface)
-                              .borderRadius(2)
-                            Row()
-                              .width(`${Math.min(100, Math.max(0, Math.round(win.used_percent)))}%`)
-                              .height(OrbitTokens.SPACE_XS)
-                              .backgroundColor(this.quotaSemanticColor(win.used_percent))
-                              .borderRadius(2)
-                          }
-                          .width('100%')
-                        }
-                        .width('100%')
-                      },
-                      (win: QuotaWindowDto) => win.label
-                    )
-
-                    if (q.credits_remaining !== null) {
-                      Text(`Credits remaining: ${q.credits_remaining.toFixed(2)}`)
-                        .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
-                    }
-                  }
-                  .width('100%')
-                  .padding(OrbitTokens.SPACE_MD)
-                  .backgroundColor(this.store.palette.elevated)
-                  .borderRadius(OrbitTokens.CARD_RADIUS)
-                  .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
-                },
-                (q: ProviderQuotaDto) => q.provider
-              )
-            }
+            .alignItems(VerticalAlign.Center)
           }
           .alignItems(HorizontalAlign.Start)
           .width('100%')
+          .padding(OrbitTokens.SPACE_LG)
+          .backgroundColor(this.store.palette.listCard)
+          .borderRadius(OrbitTokens.RADIUS_LG)
         }
-        .width('100%')
-        .padding({ bottom: OrbitTokens.SPACE_XL })
+
+        ListItem() {
+          Button('Pair Host')
+            .attributeModifier(
+              orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.listCard)
+            )
+            .width('100%')
+            .height(OrbitTokens.HIT_MIN)
+            .borderRadius(OrbitTokens.RADIUS_LG)
+            .enabled(this.pairUriInput.trim().length > 0)
+            .opacity(this.pairUriInput.trim().length > 0 ? 1.0 : 0.45)
+            .onClick(() => {
+              dismissHarmonyKeyboard(this.getUIContext());
+              this.store.pairHost(this.pairUriInput);
+              this.pairUriInput = '';
+              this.navPathStack.pop();
+            })
+        }
       }
-      .layoutWeight(1)
+      .width('100%')
+      .height('100%')
+      .padding({
+        left: OrbitTokens.SPACE_LG,
+        right: OrbitTokens.SPACE_LG,
+        top: OrbitTokens.SPACE_MD,
+        bottom: this.store.keyboardHeightVp > 0
+          ? OrbitTokens.SPACE_MD
+          : Math.max(OrbitTokens.SPACE_XL, this.store.safeBottomVp)
+      })
       .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.Spring)
+      .onScrollStart(() => {
+        dismissHarmonyKeyboard(this.getUIContext());
+      })
     }
+    .title('Pair Host')
+    .backgroundColor(this.store.palette.drawer)
+  }
+
+  @Builder
+  private buildNavDestination(name: string, _param: Object | null) {
+    if (name === 'host_detail' && this.inspectedHost !== null) {
+      this.renderHostDetailDestination(this.inspectedHost)
+    } else if (name === 'pair_host') {
+      this.renderPairHostDestination()
+    }
+  }
+
+  build() {
+    Navigation(this.navPathStack) {
+      this.renderRootSettings()
+    }
+    .title('Settings')
+    .titleMode(NavigationTitleMode.Mini)
+    .hideBackButton(true)
+    .mode(NavigationMode.Stack)
+    .navDestination(this.buildNavDestination)
     .width('100%')
     .height('100%')
-    .padding({
-      left: OrbitTokens.SPACE_LG,
-      right: OrbitTokens.SPACE_LG,
-      top: OrbitTokens.SPACE_LG,
-      bottom: Math.max(OrbitTokens.SPACE_LG, this.store.safeBottomVp)
-    })
-    .backgroundColor(this.store.palette.canvas)
+    .backgroundColor(this.store.palette.drawer)
   }
 }

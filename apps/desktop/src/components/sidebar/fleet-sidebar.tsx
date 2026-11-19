@@ -34,6 +34,7 @@ import { SidebarConversationRow } from "@/components/sidebar/sidebar-conversatio
 import {
   type ActiveConversationMenuState,
   type ActiveProjectMenuState,
+  DeleteProjectDialog,
   type MenuAnchorBox,
   SharedConversationMenu,
   SharedProjectMenu,
@@ -81,12 +82,15 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const seenAgentSeqs = useOrbitSelector((s) => s.seenAgentSeqs);
   const sidebarProjectSort = useOrbitSelector((s) => s.sidebarProjectSort);
   const sidebarThreadFilter = useOrbitSelector((s) => s.sidebarThreadFilter);
+  const hiddenProjectKeys = useOrbitSelector((s) => s.hiddenProjectKeys);
 
   const [expandedMoreProjects, setExpandedMoreProjects] = useState<Record<string, boolean>>({});
   const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [convMenu, setConvMenu] = useState<ActiveConversationMenuState | null>(null);
   const [projMenu, setProjMenu] = useState<ActiveProjectMenuState | null>(null);
+  const [deleteProjectTarget, setDeleteProjectTarget] =
+    useState<UnifiedProjectEntry | null>(null);
 
   const nowMs = useSidebarRelativeClock(sidebarOpen);
   const isMac = isMacDesktop();
@@ -124,8 +128,14 @@ export const FleetSidebar = memo(function FleetSidebar() {
   }, []);
 
   const rawProjects = useMemo(
-    () => buildUnifiedProjects(fleet.hosts, fleet.projects ?? [], hostDetails),
-    [fleet.hosts, fleet.projects, hostDetails],
+    () =>
+      buildUnifiedProjects(
+        fleet.hosts,
+        fleet.projects ?? [],
+        hostDetails,
+        hiddenProjectKeys,
+      ),
+    [fleet.hosts, fleet.projects, hostDetails, hiddenProjectKeys],
   );
 
   const pinnedSet = useMemo(() => new Set(pinnedThreadKeys), [pinnedThreadKeys]);
@@ -879,7 +889,17 @@ export const FleetSidebar = memo(function FleetSidebar() {
         onClose={handleCloseConvMenu}
         onStartRename={handleStartRename}
       />
-      <SharedProjectMenu target={projMenu} isMac={isMac} onClose={handleCloseProjMenu} />
+      <SharedProjectMenu
+        target={projMenu}
+        isMac={isMac}
+        onClose={handleCloseProjMenu}
+        onRequestDelete={setDeleteProjectTarget}
+      />
+      <DeleteProjectDialog
+        project={deleteProjectTarget}
+        archivedThreads={archivedThreads}
+        onClose={() => setDeleteProjectTarget(null)}
+      />
     </aside>
   );
 });

@@ -8,6 +8,9 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,15 +26,21 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AccountTree
+import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.Computer
+import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -54,18 +63,30 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import dev.orbit.android.store.OrbitAndroidStore
 import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.store.OrbitUiState
 import dev.orbit.android.ui.composer.OmniComposer
+import dev.orbit.android.ui.theme.OrbitCompactDropdownMenu
+import dev.orbit.android.ui.theme.OrbitMenuOptionRow
+import dev.orbit.android.ui.theme.OrbitMenuScrollContainer
+import dev.orbit.android.ui.theme.OrbitMenuSectionHeader
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 import kotlinx.coroutines.launch
+import uniffi.orbit_ffi_uniffi.FfiConnectionState
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -75,8 +96,9 @@ fun StreamStageScreen(
     onOpenContextPicker: () -> Unit,
     onOpenModelSelector: () -> Unit,
     onOpenDiffForFile: (String?) -> Unit,
-    onOpenDirectoryBrowser: () -> Unit,
     onOpenPairSheet: () -> Unit,
+    onOpenTerminal: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
@@ -93,6 +115,15 @@ fun StreamStageScreen(
             turns.any { it.hasActiveItem }
     )
     val listState = rememberLazyListState()
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    LaunchedEffect(listState.isScrollInProgress) {
+        if (listState.isScrollInProgress) {
+            focusManager.clearFocus()
+            keyboardController?.hide()
+        }
+    }
 
     val canScrollForward by remember {
         derivedStateOf { listState.canScrollForward }
@@ -188,6 +219,16 @@ fun StreamStageScreen(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
+                .pointerInput(Unit) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                        val up = waitForUpOrCancellation(pass = PointerEventPass.Initial)
+                        if (up != null) {
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
+                        }
+                    }
+                }
                 .onSizeChanged { size ->
                     stageViewportHeightPx = size.height
                 },
@@ -222,16 +263,11 @@ fun StreamStageScreen(
                                 .verticalScroll(rememberScrollState()),
                             contentAlignment = Alignment.Center,
                         ) {
-                            NewSessionHero(
-                                hostName = ui.selectedHost?.displayName ?: "Remote Host",
-                                activeCwd = ui.activeCwd,
-                                gitBranch = ui.gitReview?.branch,
-                                changedCount = ui.gitReview?.changedFiles?.size ?: 0,
-                                onBrowseDirectory = onOpenDirectoryBrowser,
-                                onStarterPrompt = { text, slash ->
-                                    if (slash != null) store.setSlashCommand(slash)
-                                    store.updateComposerText(text)
-                                },
+                            NewSessionZenCanvas(
+                                ui = ui,
+                                onSelectProject = { path -> store.selectWorkspaceCwd(path) },
+                                onSelectHost = { hostId -> store.selectHost(hostId) },
+                                onSetDraftUseWorktree = { useWt -> store.setDraftUseWorktree(useWt) },
                             )
                         }
                     } else {
@@ -245,12 +281,16 @@ fun StreamStageScreen(
                             // STRICT 24dp vertical spacing between conversation turns
                             verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
                         ) {
-                            items(
+                            itemsIndexed(
                                 items = turns,
-                                key = { it.key },
-                            ) { turn ->
+                                key = { _, it -> it.key },
+                            ) { index, turn ->
+                                val isTurnActive = turn.hasActiveItem ||
+                                    (isActiveAgentRunning && index == turns.lastIndex)
                                 TurnItem(
                                     turn = turn,
+                                    isTurnActive = isTurnActive,
+                                    activeCwd = ui.activeCwd,
                                     describeStep = { store.describeStep(it) },
                                     onOpenDiffFile = { filePath -> onOpenDiffForFile(filePath) },
                                     onQuoteDiffLine = { path, lineLabel, content ->
@@ -271,7 +311,7 @@ fun StreamStageScreen(
                 }
             }
 
-            // Floating 32.dp-tall `↓ Streaming` / `↓ Latest` capsule centered 8.dp above OmniComposer
+            // Native 36.dp circular scroll-to-bottom button above OmniComposer (standard fade, no bounce)
             androidx.compose.animation.AnimatedVisibility(
                 visible = turns.isNotEmpty() && canScrollForward,
                 enter = fadeIn(),
@@ -280,20 +320,15 @@ fun StreamStageScreen(
                     .align(Alignment.BottomCenter)
                     .padding(bottom = OrbitSpacing.sm),
             ) {
-                val pillShape = RoundedCornerShape(OrbitSpacing.lg)
-                val borderTint = if (isActiveAgentRunning) {
-                    colors.primary.copy(alpha = 0.6f)
-                } else {
-                    colors.hairline
-                }
                 Surface(
-                    shape = pillShape,
+                    shape = CircleShape,
                     color = colors.elevated,
-                    shadowElevation = OrbitSpacing.xs,
+                    tonalElevation = 1.dp,
+                    shadowElevation = 2.dp,
                     modifier = Modifier
-                        .height(OrbitSpacing.xxl)
-                        .border(OrbitSpacing.hairline, borderTint, pillShape)
-                        .clip(pillShape)
+                        .size(36.dp)
+                        .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
+                        .clip(CircleShape)
                         .clickable {
                             haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             scope.launch {
@@ -303,21 +338,21 @@ fun StreamStageScreen(
                             }
                         },
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = OrbitSpacing.md),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                    ) {
-                        if (isActiveAgentRunning) {
-                            BreathingDot(color = colors.primary)
-                        }
-                        Text(
-                            text = if (isActiveAgentRunning) "↓ Streaming" else "↓ Latest",
-                            style = typography.metaSemiBold,
-                            color = if (isActiveAgentRunning) colors.primary else colors.fgPrimary,
-                            maxLines = 1,
-                            softWrap = false,
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Outlined.ArrowDownward,
+                            contentDescription = "Scroll to bottom",
+                            tint = colors.fgPrimary,
+                            modifier = Modifier.size(18.dp),
                         )
+                        if (isActiveAgentRunning) {
+                            BreathingDot(
+                                color = colors.primary,
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(6.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -369,6 +404,19 @@ fun StreamStageScreen(
                 onEditQueuedPrompt = { store.editQueuedPrompt(it) },
                 onSendQueuedPromptNow = { store.sendQueuedPromptNow(it) },
                 onRemoveQueuedPrompt = { store.removeQueuedPrompt(it) },
+                onAttachImageBytes = { name, mime, bytes -> store.attachImageBytes(name, mime, bytes) },
+                onAttachFileBytes = { name, mime, bytes -> store.attachFileBytes(name, mime, bytes) },
+                onRemoveStagedAttachment = { store.removeStagedAttachment(it) },
+                onRegisterInlineMention = { token, kind, path, staged, label ->
+                    store.registerInlineMention(token, kind, path, staged, label)
+                },
+                onExecuteSlashCommand = { cmd ->
+                    store.executeSlashCommand(
+                        cmd = cmd,
+                        onOpenTerminal = onOpenTerminal,
+                        onOpenSettings = onOpenSettings,
+                    )
+                },
             )
         }
     }
@@ -417,13 +465,13 @@ private fun UnpairedWelcomeHero(
             Icon(
                 imageVector = Icons.Outlined.QrCodeScanner,
                 contentDescription = null,
-                tint = Color.White,
+                tint = colors.onPrimary,
                 modifier = Modifier.size(OrbitSpacing.iconMd),
             )
             Text(
                 text = "Pair Host",
                 style = typography.bodySemiBold,
-                color = Color.White,
+                color = colors.onPrimary,
             )
         }
         if (localDaemonAvailable) {
@@ -449,105 +497,342 @@ private fun UnpairedWelcomeHero(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun NewSessionHero(
-    hostName: String,
-    activeCwd: String,
-    gitBranch: String?,
-    changedCount: Int,
-    onBrowseDirectory: () -> Unit,
-    onStarterPrompt: (text: String, slash: String?) -> Unit,
+private fun NewSessionZenCanvas(
+    ui: OrbitUiState,
+    onSelectProject: (String) -> Unit,
+    onSelectHost: (String) -> Unit,
+    onSetDraftUseWorktree: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val pillShape = RoundedCornerShape(OrbitSpacing.md)
+    val haptics = LocalHapticFeedback.current
+
+    val projects = remember(ui.selectedHostId, ui.projects, ui.hostDetail, ui.activeCwd, ui.gitReview) {
+        ui.launchpadProjects
+    }
+    val activeProjectLabel = remember(projects, ui.activeCwd) {
+        projects.firstOrNull { OrbitFormatters.pathsEquivalent(it.path, ui.activeCwd) }?.name
+            ?: OrbitFormatters.shortPath(ui.activeCwd)
+    }
+    val activeHost = ui.selectedHost
+    val isHostOnline = activeHost?.connectionState == FfiConnectionState.ONLINE_DIRECT ||
+        activeHost?.connectionState == FfiConnectionState.ONLINE_RELAY
+    val activeBranch = ui.activeGitBranch
+    val isDraftSession = ui.isNewSessionMode || ui.selectedAgentId == null
+
+    var projectMenuExpanded by remember { mutableStateOf(false) }
+    var hostMenuExpanded by remember { mutableStateOf(false) }
+    var environmentMenuExpanded by remember { mutableStateOf(false) }
+
+    fun connectionDotColor(state: FfiConnectionState): Color = when (state) {
+        FfiConnectionState.ONLINE_DIRECT -> colors.directAdded
+        FfiConnectionState.ONLINE_RELAY -> colors.relay
+        FfiConnectionState.CONNECTING_DIRECT, FfiConnectionState.CONNECTING_RELAY -> colors.warning
+        FfiConnectionState.DISCONNECTED -> colors.dangerRemoved
+    }
 
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(horizontal = OrbitSpacing.xl),
-        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
+            .padding(horizontal = OrbitSpacing.lg)
+            .padding(bottom = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = "New Session",
-            style = typography.title,
+            text = "What would you like to build?",
+            style = typography.title.copy(
+                fontSize = 23.sp,
+                fontWeight = FontWeight.Medium,
+                letterSpacing = (-0.35).sp,
+            ),
             color = colors.fgPrimary,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
         )
 
-        // Tappable CWD & Git Summary Pill
-        Row(
-            modifier = Modifier
-                .clip(pillShape)
-                .background(colors.subtleFill, pillShape)
-                .border(OrbitSpacing.hairline, colors.hairline, pillShape)
-                .clickable { onBrowseDirectory() }
-                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-        ) {
-            Icon(
-                imageVector = Icons.Outlined.FolderOpen,
-                contentDescription = "Choose directory",
-                tint = colors.fgSecondary,
-                modifier = Modifier.size(OrbitSpacing.iconSm),
-            )
-            Text(
-                text = "$hostName · ${OrbitFormatters.shortPath(activeCwd)}",
-                style = typography.codeMedium,
-                color = colors.fgPrimary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            if (!gitBranch.isNullOrBlank()) {
-                Text(
-                    text = "($gitBranch)",
-                    style = typography.meta,
-                    color = colors.fgSecondary,
-                )
-            }
-        }
+        Spacer(modifier = Modifier.height(14.dp))
 
-        val gitSummary = if (changedCount == 0) {
-            "Working tree clean"
-        } else {
-            "$changedCount modified ${if (changedCount == 1) "file" else "files"} in working tree"
-        }
-        Text(
-            text = gitSummary,
-            style = typography.meta,
-            color = colors.fgMuted,
-        )
-
-        Spacer(modifier = Modifier.height(OrbitSpacing.xs))
-
+        // Compact Contextual Readiness Pills: [Project ▾] [Host ▾] [Local / Worktree ▾]
         FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm, Alignment.CenterHorizontally),
             verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
         ) {
-            val starters = listOf(
-                Triple("Plan feature", "Outline a clean implementation plan for ", "/plan"),
-                Triple("Review diff", "Audit uncommitted working tree changes for bugs", "/review"),
-                Triple("Run tests", "Run the project test suite and summarize any failures", null),
-            )
-            starters.forEach { (label, prompt, slash) ->
-                val chipShape = RoundedCornerShape(OrbitSpacing.md)
-                Box(
-                    modifier = Modifier
-                        .heightIn(min = 40.dp)
-                        .clip(chipShape)
-                        .background(colors.subtleFill, chipShape)
-                        .border(OrbitSpacing.hairline, colors.hairline, chipShape)
-                        .clickable { onStarterPrompt(prompt, slash) }
-                        .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
-                    contentAlignment = Alignment.Center,
+            // 1. Project Picker Pill
+            Box {
+                LaunchpadPillTrigger(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        projectMenuExpanded = true
+                    },
                 ) {
-                    Text(
-                        text = label,
-                        style = typography.subheadMedium,
-                        color = colors.fgSecondary,
+                    Icon(
+                        imageVector = Icons.Outlined.Folder,
+                        contentDescription = null,
+                        tint = colors.fgSecondary,
+                        modifier = Modifier.size(14.dp),
                     )
+                    Text(
+                        text = activeProjectLabel,
+                        style = typography.subheadMedium,
+                        color = colors.fgPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 160.dp),
+                    )
+                    Icon(
+                        imageVector = Icons.Outlined.KeyboardArrowDown,
+                        contentDescription = null,
+                        tint = colors.fgMuted,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+
+                OrbitCompactDropdownMenu(
+                    expanded = projectMenuExpanded,
+                    onDismissRequest = { projectMenuExpanded = false },
+                    width = 252.dp,
+                ) {
+                    OrbitMenuSectionHeader(title = "Projects")
+                    OrbitMenuScrollContainer(maxHeight = 240.dp) {
+                        if (projects.isEmpty()) {
+                            Text(
+                                text = "No projects",
+                                style = typography.meta,
+                                color = colors.fgMuted,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                            )
+                        } else {
+                            projects.forEach { proj ->
+                                val isSelected = OrbitFormatters.pathsEquivalent(proj.path, ui.activeCwd)
+                                OrbitMenuOptionRow(
+                                    title = proj.name,
+                                    icon = Icons.Outlined.Folder,
+                                    selected = isSelected,
+                                    onClick = {
+                                        projectMenuExpanded = false
+                                        onSelectProject(proj.path)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Host Picker Pill (multi-host only)
+            if (ui.hosts.size > 1 && activeHost != null) {
+                Box {
+                    LaunchpadPillTrigger(
+                        onClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            hostMenuExpanded = true
+                        },
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(connectionDotColor(activeHost.connectionState)),
+                        )
+                        Text(
+                            text = activeHost.displayName,
+                            style = typography.subheadMedium,
+                            color = colors.fgPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.widthIn(max = 140.dp),
+                        )
+                        Icon(
+                            imageVector = Icons.Outlined.KeyboardArrowDown,
+                            contentDescription = null,
+                            tint = colors.fgMuted,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+
+                    OrbitCompactDropdownMenu(
+                        expanded = hostMenuExpanded,
+                        onDismissRequest = { hostMenuExpanded = false },
+                        width = 264.dp,
+                    ) {
+                        OrbitMenuSectionHeader(title = "Hosts")
+                        OrbitMenuScrollContainer(maxHeight = 220.dp) {
+                            ui.hosts.forEach { host ->
+                                val isSelected = host.hostId == ui.selectedHostId
+                                val hostSub = buildString {
+                                    append(OrbitFormatters.topBarConnectionLabel(host.connectionState, host.viaSshTunnel))
+                                    host.lastPingMs?.let { append(" · ${it}ms") }
+                                }
+                                OrbitMenuOptionRow(
+                                    title = host.displayName,
+                                    subtitle = hostSub,
+                                    selected = isSelected,
+                                    leading = {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(7.dp)
+                                                .clip(CircleShape)
+                                                .background(connectionDotColor(host.connectionState)),
+                                        )
+                                    },
+                                    trailingBadge = if (host.pendingApprovalCount > 0u) {
+                                        {
+                                            Box(
+                                                modifier = Modifier
+                                                    .clip(CircleShape)
+                                                    .background(colors.warning.copy(alpha = 0.16f))
+                                                    .padding(horizontal = 6.dp, vertical = 1.dp),
+                                            ) {
+                                                Text(
+                                                    text = host.pendingApprovalCount.toString(),
+                                                    style = typography.metaSemiBold,
+                                                    color = colors.warning,
+                                                )
+                                            }
+                                        }
+                                    } else {
+                                        null
+                                    },
+                                    onClick = {
+                                        hostMenuExpanded = false
+                                        onSelectHost(host.hostId)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Execution Environment Pill (Local / Worktree)
+            if (isDraftSession) {
+                Box {
+                    LaunchpadPillTrigger(
+                        onClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            environmentMenuExpanded = true
+                        },
+                    ) {
+                        Icon(
+                            imageVector = if (ui.draftUseWorktree) {
+                                Icons.Outlined.AccountTree
+                            } else {
+                                Icons.Outlined.Computer
+                            },
+                            contentDescription = null,
+                            tint = colors.fgSecondary,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Text(
+                            text = if (ui.draftUseWorktree) "Worktree" else "Local",
+                            style = typography.subheadMedium,
+                            color = colors.fgPrimary,
+                            maxLines = 1,
+                        )
+                        Icon(
+                            imageVector = Icons.Outlined.KeyboardArrowDown,
+                            contentDescription = null,
+                            tint = colors.fgMuted,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+
+                    OrbitCompactDropdownMenu(
+                        expanded = environmentMenuExpanded,
+                        onDismissRequest = { environmentMenuExpanded = false },
+                        width = 288.dp,
+                    ) {
+                        OrbitMenuSectionHeader(
+                            title = "Execution",
+                            trailing = activeBranch,
+                        )
+                        OrbitMenuOptionRow(
+                            title = "Local",
+                            subtitle = "Work directly in project folder",
+                            icon = Icons.Outlined.Computer,
+                            selected = !ui.draftUseWorktree,
+                            onClick = {
+                                environmentMenuExpanded = false
+                                onSetDraftUseWorktree(false)
+                            },
+                        )
+                        OrbitMenuOptionRow(
+                            title = "Worktree",
+                            subtitle = "Isolated Git worktree for parallel tasks",
+                            icon = Icons.Outlined.AccountTree,
+                            selected = ui.draftUseWorktree,
+                            onClick = {
+                                environmentMenuExpanded = false
+                                onSetDraftUseWorktree(true)
+                            },
+                        )
+                    }
                 }
             }
         }
+
+        // Quiet single-line Git branch or host connection caption
+        if (activeHost != null && !isHostOnline) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(connectionDotColor(activeHost.connectionState)),
+                )
+                Text(
+                    text = "${OrbitFormatters.topBarConnectionLabel(activeHost.connectionState, activeHost.viaSshTunnel)} · ${activeHost.displayName}",
+                    style = typography.meta,
+                    color = colors.fgMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        } else if (!activeBranch.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.AccountTree,
+                    contentDescription = null,
+                    tint = colors.fgMuted,
+                    modifier = Modifier.size(12.dp),
+                )
+                Text(
+                    text = if (ui.draftUseWorktree) "Worktree from $activeBranch" else activeBranch,
+                    style = typography.meta,
+                    color = colors.fgMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LaunchpadPillTrigger(
+    onClick: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    val colors = OrbitTheme.colors
+    Row(
+        modifier = Modifier
+            .height(34.dp)
+            .clip(CircleShape)
+            .background(colors.subtleFill, CircleShape)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp),
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        content()
     }
 }

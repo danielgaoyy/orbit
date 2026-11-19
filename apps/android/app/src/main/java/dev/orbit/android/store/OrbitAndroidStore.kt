@@ -66,11 +66,158 @@ data class QuotedDiffSnippet(
 }
 
 @Immutable
+data class StagedAttachmentItem(
+    val id: String = UUID.randomUUID().toString(),
+    val path: String,
+    val filename: String,
+    val sizeBytes: Long,
+    val isImage: Boolean,
+    val previewBytes: ByteArray? = null,
+) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is StagedAttachmentItem) return false
+        return id == other.id &&
+            path == other.path &&
+            filename == other.filename &&
+            sizeBytes == other.sizeBytes &&
+            isImage == other.isImage
+    }
+
+    override fun hashCode(): Int {
+        var result = id.hashCode()
+        result = 31 * result + path.hashCode()
+        result = 31 * result + filename.hashCode()
+        result = 31 * result + sizeBytes.hashCode()
+        result = 31 * result + isImage.hashCode()
+        return result
+    }
+}
+
+@Immutable
+data class InlineMentionRegistration(
+    val token: String,
+    val kind: String,
+    val path: String? = null,
+    val staged: Boolean = false,
+    val label: String = "",
+)
+
+enum class OrbitSlashCommandId {
+    PLAN,
+    REVIEW,
+    DIFF,
+    COMPACT,
+    SUPERVISED,
+    AUTO,
+    FULL,
+    TERMINAL,
+    NEW_SESSION,
+    SETTINGS,
+}
+
+@Immutable
+data class OrbitSlashCommand(
+    val id: OrbitSlashCommandId,
+    val command: String,
+    val label: String,
+    val description: String,
+    val keywords: List<String>,
+) {
+    companion object {
+        val all: List<OrbitSlashCommand> = listOf(
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.PLAN,
+                command = "/plan",
+                label = "Draft Implementation Plan",
+                description = "Prompt the agent to design a step-by-step plan before editing",
+                keywords = listOf("plan", "design", "architect", "checklist"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.REVIEW,
+                command = "/review",
+                label = "Code Review Working Tree",
+                description = "Attach uncommitted git diff and prepare an engineering review",
+                keywords = listOf("review", "audit", "critique", "git"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.DIFF,
+                command = "/diff",
+                label = "Toggle Diff Inspector",
+                description = "Open or close the side-by-side Git & Turn Diff panel",
+                keywords = listOf("diff", "inspector", "changes"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.COMPACT,
+                command = "/compact",
+                label = "Compact Context",
+                description = "Ask active agent to summarize and compact conversation history",
+                keywords = listOf("compact", "summarize", "context", "memory"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.SUPERVISED,
+                command = "/ask",
+                label = "Always Ask Permissions",
+                description = "Require approval before file edits and shell commands",
+                keywords = listOf("ask", "supervised", "default", "safe", "permission"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.AUTO,
+                command = "/edits",
+                label = "Accept Edits Permissions",
+                description = "Auto-approve file edits, ask before shell commands",
+                keywords = listOf("edits", "auto", "edit", "accept", "permission"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.FULL,
+                command = "/full",
+                label = "Full Access Permissions",
+                description = "Edit files and run commands without approval prompts",
+                keywords = listOf("full", "autonomous", "bypass", "unrestricted", "permission"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.TERMINAL,
+                command = "/terminal",
+                label = "Toggle PTY Terminal",
+                description = "Show or hide the persistent multi-slot terminal dock",
+                keywords = listOf("terminal", "pty", "shell", "console"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.NEW_SESSION,
+                command = "/new",
+                label = "New Agent Session",
+                description = "Start a fresh isolated session in the stage",
+                keywords = listOf("new", "thread", "session", "clear"),
+            ),
+            OrbitSlashCommand(
+                id = OrbitSlashCommandId.SETTINGS,
+                command = "/settings",
+                label = "Settings",
+                description = "Configure hosts, engines, worktrees, and keybindings",
+                keywords = listOf("settings", "preferences", "config"),
+            ),
+        )
+
+        fun filter(query: String): List<OrbitSlashCommand> {
+            val q = query.trim().lowercase()
+            if (q.isEmpty()) return all
+            return all.filter { c ->
+                c.command.removePrefix("/").lowercase().contains(q) ||
+                    c.label.lowercase().contains(q) ||
+                    c.keywords.any { it.contains(q) }
+            }
+        }
+    }
+}
+
+@Immutable
 data class QueuedPromptItem(
     val id: String = UUID.randomUUID().toString(),
     val text: String,
     val previewText: String,
     val mentionedFiles: List<String> = emptyList(),
+    val stagedAttachments: List<StagedAttachmentItem> = emptyList(),
+    val inlineMentions: List<InlineMentionRegistration> = emptyList(),
     val includeGitDiff: Boolean = false,
     val includeStagedDiff: Boolean = false,
     val includeTerminal: Boolean = false,
@@ -86,6 +233,9 @@ data class ComposerDraftState(
     val effort: FfiReasoningEffort? = null,
     val mode: FfiSessionMode = FfiSessionMode.AcceptEdits,
     val mentionedFiles: List<String> = emptyList(),
+    val stagedAttachments: List<StagedAttachmentItem> = emptyList(),
+    val inlineMentions: List<InlineMentionRegistration> = emptyList(),
+    val isStagingAttachment: Boolean = false,
     val includeGitDiff: Boolean = false,
     val includeStagedDiff: Boolean = false,
     val includeTerminal: Boolean = false,
@@ -96,6 +246,7 @@ data class ComposerDraftState(
 ) {
     val hasContextAttachments: Boolean
         get() = mentionedFiles.isNotEmpty() ||
+            stagedAttachments.isNotEmpty() ||
             includeGitDiff ||
             includeStagedDiff ||
             includeTerminal ||
@@ -105,6 +256,24 @@ data class ComposerDraftState(
     val canSend: Boolean
         get() = text.isNotBlank() || hasContextAttachments
 }
+
+enum class OrbitSidebarProjectSort(val label: String) {
+    RECENT("Recent"),
+    NAME("Name"),
+}
+
+enum class OrbitSidebarThreadFilter(val label: String) {
+    ALL("All Conversations"),
+    ACTIVE_AND_UNREAD("Active & Unread"),
+}
+
+@Immutable
+data class OrbitLaunchpadProject(
+    val id: String,
+    val name: String,
+    val path: String,
+    val branch: String? = null,
+)
 
 @Immutable
 data class OrbitUiState(
@@ -117,6 +286,7 @@ data class OrbitUiState(
     val hostDetail: FfiHostDetail? = null,
     val selectedAgentId: String? = null,
     val isNewSessionMode: Boolean = false,
+    val draftUseWorktree: Boolean = false,
     val agentStage: FfiAgentStage? = null,
     val activeCwd: String = "~",
     val workspaceFiles: List<String> = emptyList(),
@@ -132,6 +302,11 @@ data class OrbitUiState(
     val composer: ComposerDraftState = ComposerDraftState(),
     val queuedPromptsByAgent: Map<String, List<QueuedPromptItem>> = emptyMap(),
     val drawerSearchQuery: String = "",
+    val sidebarProjectSort: OrbitSidebarProjectSort = OrbitSidebarProjectSort.RECENT,
+    val sidebarThreadFilter: OrbitSidebarThreadFilter = OrbitSidebarThreadFilter.ALL,
+    val collapsedProjectIds: Set<String> = emptySet(),
+    val pinnedThreadKeys: Set<String> = emptySet(),
+    val seenSeqByThreadKey: Map<String, ULong> = emptyMap(),
     val harnessRequestId: Long = 0L,
     val harnessSheetTarget: String? = null,
     val pendingPtyCommand: String? = null,
@@ -157,6 +332,145 @@ data class OrbitUiState(
             val aId = selectedAgentId?.takeIf { !isNewSessionMode } ?: return emptyList()
             return queuedPromptsByAgent["$hId::$aId"].orEmpty()
         }
+
+    val isActiveAgentRunning: Boolean
+        get() = !isNewSessionMode && (
+            agentStage?.agent?.isRunning == true ||
+                agentStage?.turns?.any { it.hasActiveItem } == true
+            )
+
+    val otherHostsPendingApprovals: UInt
+        get() = hosts
+            .filter { it.hostId != selectedHostId }
+            .sumOf { it.pendingApprovalCount }
+
+    val activeGitBranch: String?
+        get() {
+            gitReview?.branch?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+            val detail = hostDetail ?: return null
+            detail.discoveredProjects
+                .firstOrNull { OrbitFormatters.pathsEquivalent(it.path, activeCwd) }
+                ?.gitBranch?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { return it }
+            detail.workspaces
+                .firstOrNull { OrbitFormatters.pathsEquivalent(it.cwd, activeCwd) }
+                ?.gitBranch?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { return it }
+            return null
+        }
+
+    val launchpadProjects: List<OrbitLaunchpadProject>
+        get() {
+            val hid = selectedHostId ?: return emptyList()
+            val detail = hostDetail
+            val results = mutableListOf<OrbitLaunchpadProject>()
+
+            fun isBareHomePath(path: String): Boolean {
+                val trimmed = path.trim().trimEnd('/')
+                if (trimmed.isEmpty() || trimmed == "~" || trimmed == "/root") return true
+                val parts = trimmed.split('/').filter { it.isNotEmpty() }
+                return parts.size == 2 && (parts[0] == "Users" || parts[0] == "home")
+            }
+
+            fun resolvedBranch(path: String): String? {
+                if (OrbitFormatters.pathsEquivalent(path, activeCwd)) {
+                    gitReview?.branch?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+                }
+                detail?.discoveredProjects
+                    ?.firstOrNull { OrbitFormatters.pathsEquivalent(it.path, path) }
+                    ?.gitBranch?.trim()?.takeIf { it.isNotEmpty() }
+                    ?.let { return it }
+                detail?.workspaces
+                    ?.firstOrNull { OrbitFormatters.pathsEquivalent(it.cwd, path) }
+                    ?.gitBranch?.trim()?.takeIf { it.isNotEmpty() }
+                    ?.let { return it }
+                return null
+            }
+
+            fun appendIfUnique(id: String, name: String, path: String, branch: String?) {
+                val clean = path.trim()
+                if (clean.isEmpty()) return
+                if (results.any { OrbitFormatters.pathsEquivalent(it.path, clean) }) return
+                val resolvedName = name.trim().ifEmpty { OrbitFormatters.shortPath(clean) }
+                results += OrbitLaunchpadProject(
+                    id = id,
+                    name = resolvedName,
+                    path = clean,
+                    branch = branch?.trim()?.takeIf { it.isNotEmpty() } ?: resolvedBranch(clean),
+                )
+            }
+
+            projects.filter { it.hostId == hid }.forEach { proj ->
+                proj.directories.firstOrNull()?.let { primary ->
+                    appendIfUnique(
+                        id = proj.projectId,
+                        name = proj.name,
+                        path = primary,
+                        branch = null,
+                    )
+                }
+            }
+
+            detail?.workspaces.orEmpty().forEach { ws ->
+                if (!ws.isWorktree && !isBareHomePath(ws.cwd)) {
+                    appendIfUnique(
+                        id = "$hid::ws::${ws.workspaceId}",
+                        name = ws.title.ifBlank { OrbitFormatters.shortPath(ws.cwd) },
+                        path = ws.cwd,
+                        branch = ws.gitBranch,
+                    )
+                }
+            }
+
+            detail?.discoveredProjects.orEmpty().forEach { dp ->
+                if (!isBareHomePath(dp.path) && !dp.path.contains("/worktrees/")) {
+                    appendIfUnique(
+                        id = "$hid::dp::${dp.path}",
+                        name = dp.name,
+                        path = dp.path,
+                        branch = dp.gitBranch,
+                    )
+                }
+            }
+
+            if (activeCwd.isNotBlank() && !isBareHomePath(activeCwd)) {
+                appendIfUnique(
+                    id = "$hid::active::$activeCwd",
+                    name = OrbitFormatters.shortPath(activeCwd),
+                    path = activeCwd,
+                    branch = activeGitBranch,
+                )
+            }
+
+            if (results.isEmpty()) {
+                detail?.discoveredProjects?.firstOrNull()?.let { firstDp ->
+                    appendIfUnique(
+                        id = "$hid::dp::${firstDp.path}",
+                        name = firstDp.name,
+                        path = firstDp.path,
+                        branch = firstDp.gitBranch,
+                    )
+                }
+            }
+
+            return results
+        }
+
+    fun threadKey(hostId: String, agentId: String): String = "$hostId::$agentId"
+
+    fun isThreadPinned(hostId: String, agentId: String): Boolean =
+        pinnedThreadKeys.contains(threadKey(hostId, agentId))
+
+    fun isThreadUnread(hostId: String, agent: FfiAgentCard): Boolean {
+        if (selectedHostId == hostId && !isNewSessionMode && selectedAgentId == agent.agentId) {
+            return false
+        }
+        if (agent.isRunning || agent.isAwaitingPermission) {
+            return false
+        }
+        val seen = seenSeqByThreadKey[threadKey(hostId, agent.agentId)] ?: return false
+        return agent.latestSeq > seen
+    }
 }
 
 object OrbitFormatters {
@@ -174,10 +488,15 @@ object OrbitFormatters {
 
     fun sessionModeLabel(mode: FfiSessionMode): String = when (mode) {
         FfiSessionMode.Default -> "Always Ask"
-        FfiSessionMode.Plan -> "Plan"
+        FfiSessionMode.Plan -> "Always Ask"
         FfiSessionMode.AcceptEdits -> "Accept Edits"
         FfiSessionMode.FullAccess -> "Full Access"
         is FfiSessionMode.Custom -> mode.name
+    }
+
+    fun normalizeSessionMode(mode: FfiSessionMode): FfiSessionMode = when (mode) {
+        FfiSessionMode.Plan -> FfiSessionMode.Default
+        else -> mode
     }
 
     fun routeModeLabel(mode: FfiHostRouteMode): String = when (mode) {
@@ -207,6 +526,18 @@ object OrbitFormatters {
         if (trimmed.isEmpty() || trimmed == "~") return "~"
         val idx = trimmed.lastIndexOf('/')
         return if (idx >= 0 && idx < trimmed.length - 1) trimmed.substring(idx + 1) else trimmed
+    }
+
+    fun compactPath(path: String): String {
+        val trimmed = path.trim()
+        if (trimmed.isEmpty() || trimmed == "~") return "~"
+        val clean = if (trimmed.length > 1) trimmed.trimEnd('/') else trimmed
+        val parts = clean.split('/').filter { it.isNotEmpty() }
+        if (clean.startsWith("/") && parts.size >= 2 && (parts[0] == "Users" || parts[0] == "home")) {
+            val rest = parts.drop(2)
+            return if (rest.isEmpty()) "~" else "~/" + rest.joinToString("/")
+        }
+        return clean
     }
 
     fun pathsEquivalent(first: String, second: String): Boolean {
@@ -251,12 +582,58 @@ object OrbitFormatters {
         desired: FfiReasoningEffort?,
         catalogDefault: FfiReasoningEffort?,
     ): FfiReasoningEffort? = resolveSupportedEffortForModel(spec, desired, catalogDefault)
+
+    fun relativeTimeLabel(unixSecs: Long): String {
+        if (unixSecs <= 0L) return ""
+        val nowSecs = System.currentTimeMillis() / 1000L
+        val delta = (nowSecs - unixSecs).coerceAtLeast(0L)
+        return when {
+            delta < 60L -> "just now"
+            delta < 3_600L -> "${delta / 60L}m ago"
+            delta < 86_400L -> "${delta / 3_600L}h ago"
+            else -> "${delta / 86_400L}d ago"
+        }
+    }
+
+    fun stripWorkspacePrefix(path: String, cwd: String): String {
+        val cleanPath = path.trim()
+        val cleanCwd = cwd.trim().trimEnd('/')
+        if (cleanPath.isEmpty() || cleanCwd.isEmpty() || cleanCwd == "~") return cleanPath
+        return when {
+            cleanPath == cleanCwd -> "."
+            cleanPath.startsWith("$cleanCwd/") -> cleanPath.removePrefix("$cleanCwd/")
+            else -> cleanPath
+        }
+    }
+
+    fun parseRfc3339EpochMs(rfc3339: String): Long? {
+        val trimmed = rfc3339.trim()
+        if (trimmed.isEmpty()) return null
+        return runCatching { java.time.Instant.parse(trimmed).toEpochMilli() }.getOrNull()
+            ?: runCatching { java.time.OffsetDateTime.parse(trimmed).toInstant().toEpochMilli() }.getOrNull()
+    }
+
+    fun compactRelativeTime(rfc3339: String): String {
+        val epochMs = parseRfc3339EpochMs(rfc3339) ?: return ""
+        val deltaSecs = ((System.currentTimeMillis() - epochMs) / 1000L).coerceAtLeast(0L)
+        return when {
+            deltaSecs < 60L -> "now"
+            deltaSecs < 3600L -> "${deltaSecs / 60L}m"
+            deltaSecs < 86_400L -> "${deltaSecs / 3600L}h"
+            deltaSecs < 604_800L -> "${deltaSecs / 86_400L}d"
+            else -> "${deltaSecs / 604_800L}w"
+        }
+    }
 }
 
 class OrbitAndroidStore(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val runningAgentKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private val drainingAgentKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val draftSelectionsByProvider: MutableMap<FfiProviderKind, Pair<String?, FfiReasoningEffort?>> =
+        ConcurrentHashMap()
+    @Volatile
+    private var hasUserCustomizedDraftModel: Boolean = false
     private val coreReady = CompletableDeferred<OrbitMobileCore?>()
     @Volatile
     private var pendingSelectLatestSession: Boolean = false
@@ -265,7 +642,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         OrbitUiState(
             appearanceMode = OrbitAppearanceMode.fromStorage(prefs.getString(KEY_APPEARANCE, null)),
             isPermanentDrawerCollapsed = prefs.getBoolean(KEY_DRAWER_COLLAPSED, false),
+            draftUseWorktree = prefs.getBoolean(KEY_DRAFT_USE_WORKTREE, false),
             activeCwd = prefs.getString(KEY_LAST_CWD, "~") ?: "~",
+            pinnedThreadKeys = prefs.getStringSet(KEY_PINNED_THREAD_KEYS, emptySet())?.toSet().orEmpty(),
         )
     )
     val state: StateFlow<OrbitUiState> = _state.asStateFlow()
@@ -409,8 +788,47 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         _state.update { it.copy(isPermanentDrawerCollapsed = collapsed) }
     }
 
+    fun setDraftUseWorktree(useWorktree: Boolean) {
+        prefs.edit().putBoolean(KEY_DRAFT_USE_WORKTREE, useWorktree).apply()
+        _state.update { it.copy(draftUseWorktree = useWorktree) }
+    }
+
     fun updateDrawerSearchQuery(query: String) {
         _state.update { it.copy(drawerSearchQuery = query) }
+    }
+
+    fun setSidebarProjectSort(sort: OrbitSidebarProjectSort) {
+        _state.update { it.copy(sidebarProjectSort = sort) }
+    }
+
+    fun setSidebarThreadFilter(filter: OrbitSidebarThreadFilter) {
+        _state.update { it.copy(sidebarThreadFilter = filter) }
+    }
+
+    fun toggleProjectCollapsed(projectId: String) {
+        _state.update { prev ->
+            val next = if (prev.collapsedProjectIds.contains(projectId)) {
+                prev.collapsedProjectIds - projectId
+            } else {
+                prev.collapsedProjectIds + projectId
+            }
+            prev.copy(collapsedProjectIds = next)
+        }
+    }
+
+    fun togglePinThread(hostId: String, agentId: String) {
+        val key = "$hostId::$agentId"
+        var updated: Set<String> = emptySet()
+        _state.update { prev ->
+            val next = if (prev.pinnedThreadKeys.contains(key)) {
+                prev.pinnedThreadKeys - key
+            } else {
+                prev.pinnedThreadKeys + key
+            }
+            updated = next
+            prev.copy(pinnedThreadKeys = next)
+        }
+        prefs.edit().putStringSet(KEY_PINNED_THREAD_KEYS, updated).apply()
     }
 
     fun consumeHarnessSheetTarget() {
@@ -437,15 +855,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         // cannot inject PTY commands or UI state into the exported MainActivity in release builds.
         if (!BuildConfig.DEBUG) return
 
-        // 2. Immediate zero-flash theme (`--es orbit_theme <system|light|dark|graphite|oled>`)
+        // 2. Immediate zero-flash theme (`--es orbit_theme <system|light|dark>`)
         intent.getStringExtra(EXTRA_THEME)?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }?.let { rawTheme ->
-            val mode = when (rawTheme) {
-                "light" -> OrbitAppearanceMode.LIGHT
-                "dark", "graphite" -> OrbitAppearanceMode.DARK
-                "oled", "black" -> OrbitAppearanceMode.OLED
-                else -> OrbitAppearanceMode.SYSTEM
-            }
-            setAppearanceMode(mode)
+            setAppearanceMode(OrbitAppearanceMode.fromStorage(rawTheme))
         }
 
         // 3. Auto-select latest session (`--ez orbit_select_latest true`)
@@ -603,6 +1015,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     private fun reloadHostDetailInternal(hostId: String) {
         val detail = runCatching { core?.hostDetail(hostId) }.getOrNull() ?: return
         var autoOpenedLatestAgentId: String? = null
+        var updatedPinnedToPersist: Set<String>? = null
         _state.update { prev ->
             // Remap optimistic agent IDs once daemon confirms real session ID
             val remappedAgentId = prev.selectedAgentId?.let { currentId ->
@@ -635,18 +1048,39 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 ?: prev.composer.provider
 
             val catalog = OrbitFormatters.catalogFor(detail, preferredProvider)
-            val resolvedModel = matchedAgent?.model ?: prev.composer.model ?: catalog.configuredDefaultModel
-            val modelSpec = catalog.models.firstOrNull { it.id == resolvedModel } ?: catalog.models.firstOrNull { it.isDefault }
-            val resolvedEffort = matchedAgent?.effort ?: OrbitFormatters.resolveEffort(
-                spec = modelSpec,
-                desired = prev.composer.effort,
-                catalogDefault = catalog.configuredDefaultEffort,
+            val savedSelection = draftSelectionsByProvider[preferredProvider]
+            val (defaultDraftModel, defaultDraftEffort) = syncDefaultModelAndEffort(
+                detail = detail,
+                provider = preferredProvider,
+                desiredModel = if (hasUserCustomizedDraftModel && prev.composer.provider == preferredProvider) {
+                    prev.composer.model
+                } else {
+                    savedSelection?.first
+                },
+                desiredEffort = if (hasUserCustomizedDraftModel && prev.composer.provider == preferredProvider) {
+                    prev.composer.effort
+                } else {
+                    savedSelection?.second
+                },
             )
-            val resolvedMode = matchedAgent?.mode ?: prev.composer.mode
+            val resolvedModel = matchedAgent?.model ?: defaultDraftModel
+            val modelSpec = catalog.models.firstOrNull { it.id == resolvedModel }
+                ?: catalog.models.firstOrNull { it.isDefault }
+                ?: catalog.models.firstOrNull()
+            val resolvedEffort = matchedAgent?.let { ag ->
+                OrbitFormatters.resolveEffort(
+                    spec = modelSpec,
+                    desired = ag.effort,
+                    catalogDefault = catalog.configuredDefaultEffort,
+                )
+            } ?: defaultDraftEffort
+            val resolvedMode = OrbitFormatters.normalizeSessionMode(matchedAgent?.mode ?: prev.composer.mode)
 
             val files = runCatching { core?.workspaceFiles(hostId, nextCwd) }.getOrNull() ?: prev.workspaceFiles
 
             var migratedQueues = prev.queuedPromptsByAgent
+            var migratedPinned = prev.pinnedThreadKeys
+            val migratedSeen = prev.seenSeqByThreadKey.toMutableMap()
             detail.replacedOptimisticAgents.forEach { (optimisticId, confirmedId) ->
                 val oldKey = agentQueueKey(hostId, optimisticId)
                 val newKey = agentQueueKey(hostId, confirmedId)
@@ -655,8 +1089,26 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     migratedQueues = (migratedQueues - oldKey) +
                         (newKey to (migratedQueues[newKey].orEmpty() + pending))
                 }
+                if (oldKey != newKey && migratedPinned.contains(oldKey)) {
+                    migratedPinned = (migratedPinned - oldKey) + newKey
+                    updatedPinnedToPersist = migratedPinned
+                }
+                if (oldKey != newKey) {
+                    val prevSeen = migratedSeen.remove(oldKey)
+                    if (prevSeen != null) {
+                        migratedSeen[newKey] = maxOf(migratedSeen[newKey] ?: 0uL, prevSeen)
+                    }
+                }
                 if (runningAgentKeys.remove(oldKey)) {
                     runningAgentKeys.add(newKey)
+                }
+            }
+            detail.agents.forEach { ag ->
+                val key = agentQueueKey(hostId, ag.agentId)
+                if (!nextNewSessionMode && ag.agentId == nextSelectedAgentId) {
+                    migratedSeen[key] = maxOf(migratedSeen[key] ?: 0uL, ag.latestSeq)
+                } else if (!migratedSeen.containsKey(key)) {
+                    migratedSeen[key] = ag.latestSeq
                 }
             }
 
@@ -667,6 +1119,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 activeCwd = nextCwd,
                 workspaceFiles = files,
                 queuedPromptsByAgent = migratedQueues,
+                pinnedThreadKeys = migratedPinned,
+                seenSeqByThreadKey = migratedSeen,
                 composer = prev.composer.copy(
                     provider = preferredProvider,
                     model = resolvedModel,
@@ -674,6 +1128,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     mode = resolvedMode,
                 ),
             )
+        }
+        updatedPinnedToPersist?.let {
+            prefs.edit().putStringSet(KEY_PINNED_THREAD_KEYS, it).apply()
         }
 
         autoOpenedLatestAgentId?.let { latestId ->
@@ -707,14 +1164,26 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     provider = ag.provider,
                     model = ag.model ?: prev.composer.model,
                     effort = ag.effort ?: prev.composer.effort,
-                    mode = ag.mode,
+                    mode = OrbitFormatters.normalizeSessionMode(ag.mode),
                 )
             } else {
                 prev.composer
             }
+            val nextSeen = if (ag != null && !prev.isNewSessionMode && prev.selectedHostId == hostId && prev.selectedAgentId == agentId) {
+                val key = agentQueueKey(hostId, agentId)
+                val prevSeen = prev.seenSeqByThreadKey[key] ?: 0uL
+                if (ag.latestSeq > prevSeen) {
+                    prev.seenSeqByThreadKey + (key to ag.latestSeq)
+                } else {
+                    prev.seenSeqByThreadKey
+                }
+            } else {
+                prev.seenSeqByThreadKey
+            }
             prev.copy(
                 agentStage = stage,
                 activeCwd = ag?.cwd ?: prev.activeCwd,
+                seenSeqByThreadKey = nextSeen,
                 composer = nextComposer,
             )
         }
@@ -772,17 +1241,24 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun reconnectSelectedHost() {
-        val hostId = _state.value.selectedHostId ?: return
-        postToast("Reconnecting host…")
+    fun reconnectHost(hostId: String) {
+        val name = _state.value.hosts.firstOrNull { it.hostId == hostId }?.displayName ?: "host"
+        postToast("Reconnecting to $name…")
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { core?.connectHost(hostId) }
             runCatching { core?.refreshHost(hostId) }
             runCatching { core?.refreshProviderModels(hostId, false) }
             runCatching { core?.refreshQuotas(hostId) }
             reloadFleetInternal()
-            reloadHostDetailInternal(hostId)
+            if (_state.value.selectedHostId == hostId) {
+                reloadHostDetailInternal(hostId)
+            }
         }
+    }
+
+    fun reconnectSelectedHost() {
+        val hostId = _state.value.selectedHostId ?: return
+        reconnectHost(hostId)
     }
 
     fun refreshStageAndHost() {
@@ -931,28 +1407,27 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         val nextCwd = cwd?.trim()?.takeIf { it.isNotBlank() } ?: _state.value.activeCwd
         prefs.edit().putString(KEY_LAST_CWD, nextCwd).apply()
         _state.update { prev ->
-            val nextComposer = if (provider != null) {
-                val catalog = OrbitFormatters.catalogFor(prev.hostDetail, provider)
-                val nextModel = if (prev.composer.provider == provider) {
-                    prev.composer.model ?: catalog.configuredDefaultModel
+            val targetProvider = provider ?: prev.composer.provider
+            val saved = draftSelectionsByProvider[targetProvider]
+            val (nextModel, nextEffort) = syncDefaultModelAndEffort(
+                detail = prev.hostDetail,
+                provider = targetProvider,
+                desiredModel = if (hasUserCustomizedDraftModel && prev.composer.provider == targetProvider) {
+                    prev.composer.model
                 } else {
-                    catalog.configuredDefaultModel ?: catalog.models.firstOrNull { it.isDefault }?.id
-                }
-                val spec = catalog.models.firstOrNull { it.id == nextModel }
-                    ?: catalog.models.firstOrNull { it.isDefault }
-                val nextEffort = OrbitFormatters.resolveEffort(
-                    spec = spec,
-                    desired = prev.composer.effort,
-                    catalogDefault = catalog.configuredDefaultEffort,
-                )
-                prev.composer.copy(
-                    provider = provider,
-                    model = nextModel,
-                    effort = nextEffort,
-                )
-            } else {
-                prev.composer
-            }
+                    saved?.first
+                },
+                desiredEffort = if (hasUserCustomizedDraftModel && prev.composer.provider == targetProvider) {
+                    prev.composer.effort
+                } else {
+                    saved?.second
+                },
+            )
+            val nextComposer = prev.composer.copy(
+                provider = targetProvider,
+                model = nextModel,
+                effort = nextEffort,
+            )
             prev.copy(
                 selectedAgentId = null,
                 isNewSessionMode = true,
@@ -1010,10 +1485,14 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
     fun selectAgent(agentId: String) {
         val hostId = _state.value.selectedHostId ?: return
-        _state.update {
-            it.copy(
+        _state.update { prev ->
+            val key = agentQueueKey(hostId, agentId)
+            val matchedSeq = prev.hostDetail?.agents?.firstOrNull { it.agentId == agentId }?.latestSeq ?: 0uL
+            val nextSeen = maxOf(prev.seenSeqByThreadKey[key] ?: 0uL, matchedSeq)
+            prev.copy(
                 selectedAgentId = agentId,
                 isNewSessionMode = false,
+                seenSeqByThreadKey = prev.seenSeqByThreadKey + (key to nextSeen),
                 lastError = null,
             )
         }
@@ -1102,6 +1581,51 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         _state.update { it.copy(composer = it.composer.copy(text = text)) }
     }
 
+    private fun syncDefaultModelAndEffort(
+        detail: FfiHostDetail?,
+        provider: FfiProviderKind,
+        desiredModel: String? = null,
+        desiredEffort: FfiReasoningEffort? = null,
+    ): Pair<String?, FfiReasoningEffort?> {
+        val catalog = OrbitFormatters.catalogFor(detail, provider)
+        val resolvedModel = desiredModel?.takeIf { id ->
+            catalog.models.isEmpty() || catalog.models.any { it.id == id }
+        }
+            ?: catalog.configuredDefaultModel
+            ?: catalog.models.firstOrNull { it.isDefault }?.id
+            ?: catalog.models.firstOrNull()?.id
+        val spec = catalog.models.firstOrNull { it.id == resolvedModel }
+            ?: catalog.models.firstOrNull { it.isDefault }
+            ?: catalog.models.firstOrNull()
+        val resolvedEffort = OrbitFormatters.resolveEffort(
+            spec = spec,
+            desired = desiredEffort,
+            catalogDefault = catalog.configuredDefaultEffort,
+        )
+        return resolvedModel to resolvedEffort
+    }
+
+    fun switchDraftProvider(provider: FfiProviderKind) {
+        val prev = _state.value
+        draftSelectionsByProvider[prev.composer.provider] =
+            prev.composer.model to prev.composer.effort
+        hasUserCustomizedDraftModel = true
+        val saved = draftSelectionsByProvider[provider]
+        val (nextModel, nextEffort) = syncDefaultModelAndEffort(
+            detail = prev.hostDetail,
+            provider = provider,
+            desiredModel = saved?.first,
+            desiredEffort = saved?.second,
+        )
+        draftSelectionsByProvider[provider] = nextModel to nextEffort
+        selectProviderModelAndEffort(provider, nextModel, nextEffort)
+    }
+
+    fun selectEffort(effort: FfiReasoningEffort) {
+        val cur = _state.value
+        selectProviderModelAndEffort(cur.composer.provider, cur.composer.model, effort)
+    }
+
     fun selectProviderModelAndEffort(
         provider: FfiProviderKind,
         model: String?,
@@ -1109,8 +1633,14 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     ) {
         val prev = _state.value
         val catalog = OrbitFormatters.catalogFor(prev.hostDetail, provider)
-        val spec = catalog.models.firstOrNull { it.id == model } ?: catalog.models.firstOrNull { it.isDefault }
+        val spec = catalog.models.firstOrNull { it.id == model }
+            ?: catalog.models.firstOrNull { it.isDefault }
+            ?: catalog.models.firstOrNull()
         val resolvedEffort = OrbitFormatters.resolveEffort(spec, effort, catalog.configuredDefaultEffort)
+        if (prev.isNewSessionMode || prev.selectedAgentId == null) {
+            hasUserCustomizedDraftModel = true
+            draftSelectionsByProvider[provider] = model to resolvedEffort
+        }
 
         _state.update {
             it.copy(
@@ -1138,14 +1668,187 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     }
 
     fun selectSessionMode(mode: FfiSessionMode) {
+        val normalized = OrbitFormatters.normalizeSessionMode(mode)
         val prev = _state.value
-        _state.update { it.copy(composer = it.composer.copy(mode = mode)) }
+        _state.update { it.copy(composer = it.composer.copy(mode = normalized)) }
         val hostId = prev.selectedHostId ?: return
         val agentId = prev.selectedAgentId ?: return
         if (prev.isNewSessionMode) return
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { core?.setSessionMode(hostId, agentId, mode) }
+            runCatching { core?.setSessionMode(hostId, agentId, normalized) }
             reloadStageInternal(hostId, agentId)
+        }
+    }
+
+    fun attachImageBytes(filename: String, mimeType: String?, bytes: ByteArray) {
+        stageAttachmentBytes(
+            filename = filename,
+            mimeType = mimeType ?: "image/png",
+            bytes = bytes,
+            isImage = true,
+        )
+    }
+
+    fun attachFileBytes(filename: String, mimeType: String?, bytes: ByteArray) {
+        stageAttachmentBytes(
+            filename = filename,
+            mimeType = mimeType,
+            bytes = bytes,
+            isImage = false,
+        )
+    }
+
+    private fun stageAttachmentBytes(
+        filename: String,
+        mimeType: String?,
+        bytes: ByteArray,
+        isImage: Boolean,
+    ) {
+        val hostId = _state.value.selectedHostId ?: run {
+            postToast("Select a host first to attach files")
+            return
+        }
+        val safeName = filename.trim().ifEmpty { if (isImage) "image.png" else "attachment.bin" }
+        _state.update { it.copy(composer = it.composer.copy(isStagingAttachment = true)) }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val staged = core?.stageAttachment(hostId, safeName, mimeType, bytes)
+                    ?: throw IllegalStateException("Core is not ready")
+                val item = StagedAttachmentItem(
+                    path = staged.path,
+                    filename = staged.filename.ifBlank { safeName },
+                    sizeBytes = staged.sizeBytes.toLong(),
+                    isImage = isImage,
+                    previewBytes = if (isImage) bytes else null,
+                )
+                _state.update { prev ->
+                    prev.copy(
+                        composer = prev.composer.copy(
+                            stagedAttachments = prev.composer.stagedAttachments + item,
+                            isStagingAttachment = false,
+                        )
+                    )
+                }
+            } catch (t: Throwable) {
+                _state.update { it.copy(composer = it.composer.copy(isStagingAttachment = false)) }
+                postToast(extractErrorMessage(t, "Failed to stage attachment"))
+            }
+        }
+    }
+
+    fun removeStagedAttachment(id: String) {
+        _state.update { prev ->
+            prev.copy(
+                composer = prev.composer.copy(
+                    stagedAttachments = prev.composer.stagedAttachments.filterNot { it.id == id }
+                )
+            )
+        }
+    }
+
+    fun registerInlineMention(
+        token: String,
+        kind: String,
+        path: String? = null,
+        staged: Boolean = false,
+        label: String = "",
+    ) {
+        if (token.isBlank()) return
+        val reg = InlineMentionRegistration(
+            token = token,
+            kind = kind,
+            path = path,
+            staged = staged,
+            label = label,
+        )
+        _state.update { prev ->
+            val filtered = prev.composer.inlineMentions.filterNot { it.token == token }
+            prev.copy(
+                composer = prev.composer.copy(inlineMentions = filtered + reg)
+            )
+        }
+        if (kind == "terminal") {
+            val cur = _state.value
+            val hostId = cur.selectedHostId ?: return
+            viewModelScope.launch(Dispatchers.IO) {
+                val scr = runCatching { core?.terminalScreen(hostId) }.getOrNull()
+                if (scr != null) {
+                    _state.update { it.copy(terminalScreen = scr) }
+                }
+            }
+        }
+    }
+
+    fun executeSlashCommand(
+        cmd: OrbitSlashCommand,
+        onOpenTerminal: () -> Unit = {},
+        onOpenSettings: () -> Unit = {},
+    ) {
+        when (cmd.id) {
+            OrbitSlashCommandId.PLAN -> setSlashCommand("/plan")
+            OrbitSlashCommandId.REVIEW -> setSlashCommand("/review")
+            OrbitSlashCommandId.DIFF -> toggleDiffInspector()
+            OrbitSlashCommandId.COMPACT -> submitSlashCompact("")
+            OrbitSlashCommandId.SUPERVISED -> {
+                selectSessionMode(FfiSessionMode.Default)
+                postToast("Permissions: Always Ask")
+            }
+            OrbitSlashCommandId.AUTO -> {
+                selectSessionMode(FfiSessionMode.AcceptEdits)
+                postToast("Permissions: Accept Edits")
+            }
+            OrbitSlashCommandId.FULL -> {
+                selectSessionMode(FfiSessionMode.FullAccess)
+                postToast("Permissions: Full Access")
+            }
+            OrbitSlashCommandId.TERMINAL -> onOpenTerminal()
+            OrbitSlashCommandId.NEW_SESSION -> startNewSession()
+            OrbitSlashCommandId.SETTINGS -> onOpenSettings()
+        }
+    }
+
+    fun applyQuickWorkflow(slash: String) {
+        when (slash.trim().lowercase()) {
+            "/compact" -> submitSlashCompact("")
+            "/plan" -> setSlashCommand("/plan")
+            "/review" -> setSlashCommand("/review")
+            else -> setSlashCommand(slash)
+        }
+    }
+
+    fun submitSlashCompact(extraFocus: String = "") {
+        val cur = _state.value
+        val hostId = cur.selectedHostId ?: return
+        val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: run {
+            postToast("Start an active session first to compact context")
+            return
+        }
+        val provider = cur.activeAgent?.provider ?: cur.composer.provider
+        val cleanFocus = extraFocus.trim()
+        val badges = listOf(FfiPromptBadge(kind = "slash", label = "/compact"))
+        val wirePrompt = if (provider == FfiProviderKind.CLAUDE_CODE || provider == FfiProviderKind.ANTIGRAVITY) {
+            if (cleanFocus.isNotEmpty()) "/compact $cleanFocus" else "/compact"
+        } else {
+            if (cleanFocus.isNotEmpty()) {
+                "${buildHiddenWorkflowInstruction("compact")}\n\n<USER_REQUEST>\n$cleanFocus\n</USER_REQUEST>"
+            } else {
+                buildHiddenWorkflowInstruction("compact")
+            }
+        }
+        runningAgentKeys.add(agentQueueKey(hostId, agentId))
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                core?.sendPromptWithMeta(
+                    hostId = hostId,
+                    agentId = agentId,
+                    prompt = wirePrompt,
+                    displayPrompt = cleanFocus,
+                    badges = badges,
+                )
+                reloadStageInternal(hostId, agentId)
+            } catch (t: Throwable) {
+                _state.update { it.copy(lastError = extractErrorMessage(t, "Failed to compact context")) }
+            }
         }
     }
 
@@ -1293,6 +1996,44 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
     private fun agentQueueKey(hostId: String, agentId: String): String = "$hostId::$agentId"
 
+    private fun parseLeadingSlashDirective(rawText: String): Pair<String?, String> {
+        val trimmed = rawText.trim()
+        val match = Regex("""^/(plan|review|compact)(?:\s+([\s\S]*))?$""", RegexOption.IGNORE_CASE)
+            .matchEntire(trimmed)
+            ?: return null to trimmed
+        val directive = match.groupValues[1].lowercase()
+        val rest = match.groupValues[2].trim()
+        return "/$directive" to rest
+    }
+
+    private fun buildHiddenWorkflowInstruction(directive: String): String =
+        when (directive.lowercase().removePrefix("/")) {
+            "plan" -> listOf(
+                "<WORKFLOW_INSTRUCTION command=\"/plan\">",
+                "You are invoked with the /plan workflow.",
+                "First inspect and verify the relevant codebase files, architecture, and constraints.",
+                "Clarify any critical ambiguities if needed, then present a concise, structured, step-by-step implementation plan.",
+                "Do NOT modify files or run mutating commands until the user approves the plan.",
+                "</WORKFLOW_INSTRUCTION>",
+            ).joinToString("\n")
+            "review" -> listOf(
+                "<WORKFLOW_INSTRUCTION command=\"/review\">",
+                "You are invoked with the /review workflow.",
+                "Perform a thorough engineering code review of the attached changes.",
+                "Focus on correctness bugs, regressions, edge cases, concurrency/state hazards, security, and adherence to project conventions.",
+                "Cite exact file paths and line numbers, prioritize findings by severity, and do NOT modify files unless asked.",
+                "</WORKFLOW_INSTRUCTION>",
+            ).joinToString("\n")
+            else -> listOf(
+                "<WORKFLOW_INSTRUCTION command=\"/compact\">",
+                "Summarize and compact our conversation context into a concise, high-signal checkpoint:",
+                "1. Core goal & user preferences",
+                "2. Key architectural decisions & completed changes (with file paths)",
+                "3. Open issues & immediate next steps",
+                "</WORKFLOW_INSTRUCTION>",
+            ).joinToString("\n")
+        }
+
     private fun buildPromptPayload(
         hostId: String,
         activeCwd: String,
@@ -1301,79 +2042,129 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         terminalScreen: FfiTerminalScreen?,
         text: String,
         mentionedFiles: List<String>,
+        stagedAttachments: List<StagedAttachmentItem>,
+        inlineMentions: List<InlineMentionRegistration>,
         includeGitDiff: Boolean,
         includeStagedDiff: Boolean,
         includeTerminal: Boolean,
         activeSlashCommand: String?,
         quotedSnippets: List<QuotedDiffSnippet>,
     ): Triple<String, String, List<FfiPromptBadge>> {
+        val rawTrimmed = text.trim()
+        val (inlineSlash, parsedRest) = if (activeSlashCommand == null) {
+            parseLeadingSlashDirective(rawTrimmed)
+        } else {
+            null to rawTrimmed
+        }
+        val effectiveSlash = activeSlashCommand ?: inlineSlash
+        val cleanUserText = parsedRest
+
+        val mergedFiles = mentionedFiles.toMutableList()
+        var mergedWorkingDiff = includeGitDiff
+        var mergedStagedDiff = includeStagedDiff
+        var mergedTerminal = includeTerminal
+
+        inlineMentions.forEach { mention ->
+            if (!cleanUserText.contains(mention.token)) return@forEach
+            when (mention.kind) {
+                "file" -> mention.path?.let { p -> if (p !in mergedFiles) mergedFiles += p }
+                "git_diff" -> if (mention.staged) mergedStagedDiff = true else mergedWorkingDiff = true
+                "terminal" -> mergedTerminal = true
+            }
+        }
+
+        val autoReviewWorkingDiff = effectiveSlash.equals("/review", ignoreCase = true) &&
+            !mergedWorkingDiff &&
+            !mergedStagedDiff
+        if (autoReviewWorkingDiff) {
+            mergedWorkingDiff = true
+        }
+
         val badges = mutableListOf<FfiPromptBadge>()
-        activeSlashCommand?.let { cmd ->
+        effectiveSlash?.let { cmd ->
             badges += FfiPromptBadge(kind = "slash", label = cmd)
         }
-        mentionedFiles.forEach { path ->
-            badges += FfiPromptBadge(kind = "file", label = "@${OrbitFormatters.shortPath(path)}")
+        stagedAttachments.forEach { att ->
+            badges += FfiPromptBadge(
+                kind = if (att.isImage) "image" else "file",
+                label = att.filename,
+            )
         }
-        if (includeGitDiff) {
-            badges += FfiPromptBadge(kind = "git", label = "@diff")
+        mergedFiles.forEach { path ->
+            val shortName = OrbitFormatters.shortPath(path)
+            if (!cleanUserText.contains("@$shortName")) {
+                badges += FfiPromptBadge(kind = "file", label = "@$shortName")
+            }
         }
-        if (includeStagedDiff) {
-            badges += FfiPromptBadge(kind = "git", label = "@staged")
+        if (mergedWorkingDiff &&
+            !autoReviewWorkingDiff &&
+            !cleanUserText.contains("@working-diff")
+        ) {
+            badges += FfiPromptBadge(kind = "git_diff", label = "Working Tree Diff")
         }
-        if (includeTerminal) {
-            badges += FfiPromptBadge(kind = "terminal", label = "@terminal")
+        if (mergedStagedDiff && !cleanUserText.contains("@staged-diff")) {
+            badges += FfiPromptBadge(kind = "git_diff", label = "Staged Diff")
+        }
+        if (mergedTerminal && !cleanUserText.contains("@terminal")) {
+            badges += FfiPromptBadge(kind = "terminal", label = "Terminal")
         }
         quotedSnippets.forEach { q ->
             badges += FfiPromptBadge(kind = "quote", label = q.badgeLabel)
         }
 
-        val displayPrompt = buildString {
-            activeSlashCommand?.let { cmd ->
-                append(cmd)
-                if (text.isNotBlank()) append(" ")
-            }
-            append(text.trim())
-        }.ifBlank {
-            badges.joinToString(" ") { it.label }
-        }
+        val displayPrompt = cleanUserText.ifBlank { "" }
+
+        val imageAttachments = stagedAttachments.filter { it.isImage }
+        val fileAttachments = stagedAttachments.filterNot { it.isImage }
 
         val fullPrompt = buildString {
-            if (mentionedFiles.isNotEmpty()) {
-                appendLine("Referenced workspace files:")
-                mentionedFiles.forEach { p -> appendLine("- $p") }
+            effectiveSlash?.let { cmd ->
+                appendLine(buildHiddenWorkflowInstruction(cmd))
                 appendLine()
             }
-            if (includeGitDiff) {
+            if (imageAttachments.isNotEmpty()) {
+                imageAttachments.forEach { img ->
+                    appendLine("Attached image file: `${img.path}`")
+                }
+                appendLine()
+            }
+            val combinedFileRefs = mergedFiles + fileAttachments.map { it.path }
+            if (combinedFileRefs.isNotEmpty()) {
+                append("Referenced workspace files: ")
+                appendLine(combinedFileRefs.joinToString(", ") { "`@$it`" })
+                appendLine()
+            }
+            if (mergedWorkingDiff) {
                 val diffText = if (!gitStagedMode) gitReview?.rawDiff?.takeIf { it.isNotBlank() } else null
                 if (diffText != null) {
-                    appendLine("Uncommitted git diff context:")
+                    appendLine("Working Tree Diff:")
                     appendLine("```diff")
-                    appendLine(diffText.take(8_000))
+                    appendLine(diffText.take(14_000))
                     appendLine("```")
                     appendLine()
                 } else {
-                    appendLine("[Include uncommitted git working tree changes in $activeCwd]")
+                    appendLine("Context: Inspect working tree git changes in $activeCwd.")
                     appendLine()
                 }
             }
-            if (includeStagedDiff) {
+            if (mergedStagedDiff) {
                 val stagedPaths = gitReview?.changedFiles.orEmpty().filter { it.staged }.map { it.path }
                 val stagedPatch = if (gitStagedMode) gitReview?.rawDiff?.takeIf { it.isNotBlank() } else null
                 if (stagedPatch != null) {
-                    appendLine("Staged git diff context:")
+                    appendLine("Staged Diff:")
                     appendLine("```diff")
-                    appendLine(stagedPatch.take(8_000))
+                    appendLine(stagedPatch.take(14_000))
                     appendLine("```")
                     appendLine()
                 } else {
-                    appendLine("[Include staged git index changes (git diff --cached) in $activeCwd]")
+                    appendLine("Context: Inspect staged git changes in $activeCwd.")
                     if (stagedPaths.isNotEmpty()) {
                         stagedPaths.forEach { sp -> appendLine("- $sp") }
                     }
                     appendLine()
                 }
             }
-            if (includeTerminal) {
+            if (mergedTerminal) {
                 val scr = terminalScreen ?: runCatching { core?.terminalScreen(hostId) }.getOrNull()
                 val termLines = scr?.rowsData.orEmpty()
                     .map { row -> row.spans.joinToString("") { it.text }.trimEnd() }
@@ -1393,9 +2184,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 val diffSnippets = quotedSnippets.filterNot { it.isAssistantExcerpt }
                 val replyExcerpts = quotedSnippets.filter { it.isAssistantExcerpt }
                 if (diffSnippets.isNotEmpty()) {
-                    appendLine("Quoted diff lines:")
                     diffSnippets.forEach { q ->
-                        appendLine("`${q.path}:${q.lineLabel}`:")
+                        appendLine("Reference `${q.path}:${q.lineLabel}`:")
                         appendLine("```")
                         appendLine(q.content)
                         appendLine("```")
@@ -1412,7 +2202,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                     }
                 }
             }
-            append(displayPrompt)
+            if (cleanUserText.isNotEmpty()) {
+                append(cleanUserText)
+            }
         }.trim()
 
         return Triple(displayPrompt, fullPrompt, badges)
@@ -1421,14 +2213,34 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
     fun enqueueComposerPrompt() {
         val cur = _state.value
         val hostId = cur.selectedHostId ?: return
+        val draft = cur.composer
+        if (!draft.canSend) return
+
+        val (inlineSlash, cleanRest) = if (draft.activeSlashCommand == null) {
+            parseLeadingSlashDirective(draft.text)
+        } else {
+            null to draft.text.trim()
+        }
+        val effectiveSlash = draft.activeSlashCommand ?: inlineSlash
+        if (effectiveSlash == "/compact") {
+            _state.update { prev ->
+                prev.copy(
+                    composer = prev.composer.copy(
+                        text = "",
+                        activeSlashCommand = null,
+                    )
+                )
+            }
+            submitSlashCompact(cleanRest)
+            return
+        }
+
         val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: run {
             submitComposerPrompt()
             return
         }
-        val draft = cur.composer
-        if (!draft.canSend) return
 
-        val (displayPrompt, _, _) = buildPromptPayload(
+        val (displayPrompt, _, badges) = buildPromptPayload(
             hostId = hostId,
             activeCwd = cur.activeCwd,
             gitReview = cur.gitReview,
@@ -1436,6 +2248,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             terminalScreen = cur.terminalScreen,
             text = draft.text,
             mentionedFiles = draft.mentionedFiles,
+            stagedAttachments = draft.stagedAttachments,
+            inlineMentions = draft.inlineMentions,
             includeGitDiff = draft.includeGitDiff,
             includeStagedDiff = draft.includeStagedDiff,
             includeTerminal = draft.includeTerminal,
@@ -1445,8 +2259,11 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
         val item = QueuedPromptItem(
             text = draft.text,
-            previewText = displayPrompt.lineSequence().firstOrNull()?.trim().orEmpty().ifBlank { displayPrompt },
+            previewText = displayPrompt.lineSequence().firstOrNull()?.trim().orEmpty()
+                .ifBlank { badges.joinToString(" ") { it.label } },
             mentionedFiles = draft.mentionedFiles,
+            stagedAttachments = draft.stagedAttachments,
+            inlineMentions = draft.inlineMentions,
             includeGitDiff = draft.includeGitDiff,
             includeStagedDiff = draft.includeStagedDiff,
             includeTerminal = draft.includeTerminal,
@@ -1464,6 +2281,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 composer = prev.composer.copy(
                     text = "",
                     mentionedFiles = emptyList(),
+                    stagedAttachments = emptyList(),
+                    inlineMentions = emptyList(),
                     includeGitDiff = false,
                     includeStagedDiff = false,
                     includeTerminal = false,
@@ -1509,6 +2328,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 composer = prev.composer.copy(
                     text = target.text,
                     mentionedFiles = target.mentionedFiles,
+                    stagedAttachments = target.stagedAttachments,
+                    inlineMentions = target.inlineMentions,
                     includeGitDiff = target.includeGitDiff,
                     includeStagedDiff = target.includeStagedDiff,
                     includeTerminal = target.includeTerminal,
@@ -1579,6 +2400,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             terminalScreen = cur.terminalScreen,
             text = item.text,
             mentionedFiles = item.mentionedFiles,
+            stagedAttachments = item.stagedAttachments,
+            inlineMentions = item.inlineMentions,
             includeGitDiff = item.includeGitDiff,
             includeStagedDiff = item.includeStagedDiff,
             includeTerminal = item.includeTerminal,
@@ -1608,6 +2431,25 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         val draft = cur.composer
         if (!draft.canSend) return
 
+        val (inlineSlash, cleanRest) = if (draft.activeSlashCommand == null) {
+            parseLeadingSlashDirective(draft.text)
+        } else {
+            null to draft.text.trim()
+        }
+        val effectiveSlash = draft.activeSlashCommand ?: inlineSlash
+        if (effectiveSlash == "/compact") {
+            _state.update { prev ->
+                prev.copy(
+                    composer = prev.composer.copy(
+                        text = "",
+                        activeSlashCommand = null,
+                    )
+                )
+            }
+            submitSlashCompact(cleanRest)
+            return
+        }
+
         val (displayPrompt, fullPrompt, badges) = buildPromptPayload(
             hostId = hostId,
             activeCwd = cur.activeCwd,
@@ -1616,6 +2458,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             terminalScreen = cur.terminalScreen,
             text = draft.text,
             mentionedFiles = draft.mentionedFiles,
+            stagedAttachments = draft.stagedAttachments,
+            inlineMentions = draft.inlineMentions,
             includeGitDiff = draft.includeGitDiff,
             includeStagedDiff = draft.includeStagedDiff,
             includeTerminal = draft.includeTerminal,
@@ -1629,6 +2473,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 composer = prev.composer.copy(
                     text = "",
                     mentionedFiles = emptyList(),
+                    stagedAttachments = emptyList(),
+                    inlineMentions = emptyList(),
                     includeGitDiff = false,
                     includeStagedDiff = false,
                     includeTerminal = false,
@@ -1653,7 +2499,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         initialPrompt = fullPrompt,
                         initialDisplayPrompt = displayPrompt,
                         initialBadges = badges,
-                        worktreeBranch = draft.worktreeBranch,
+                        worktreeBranch = draft.worktreeBranch?.takeIf { it.isNotBlank() }
+                            ?: if (cur.draftUseWorktree) "auto" else null,
                     )
                     if (!createdId.isNullOrBlank()) {
                         runningAgentKeys.add(agentQueueKey(hostId, createdId))
@@ -1919,6 +2766,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         private const val KEY_DRAWER_COLLAPSED = "permanent_drawer_collapsed"
         private const val KEY_LAST_HOST_ID = "last_host_id"
         private const val KEY_LAST_CWD = "last_cwd"
+        private const val KEY_PINNED_THREAD_KEYS = "pinned_thread_keys"
+        private const val KEY_DRAFT_USE_WORKTREE = "draft_use_worktree"
 
         const val EXTRA_PAIR_URI = "orbit_pair_uri"
         const val EXTRA_SELECT_LATEST = "orbit_select_latest"

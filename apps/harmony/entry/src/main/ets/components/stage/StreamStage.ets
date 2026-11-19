@@ -1,40 +1,29 @@
-import { StageTurnDto, basenameOfPath } from '../../model/OrbitTypes';
+import { SymbolGlyphModifier } from '@kit.ArkUI';
+import {
+  HostCardDto,
+  LaunchpadProjectDto,
+  StageTurnDto,
+  basenameOfPath,
+  cwdPathsEquivalent,
+  formatCompactTopBarConnectionLabel
+} from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
   orbitButtonSubhead,
   orbitInputMono,
+  orbitSurface,
   orbitTextBody,
   orbitTextMeta,
-  orbitTextMono,
   orbitTextSubhead,
   orbitTextTitle
 } from '../../theme/OrbitTokens';
+import {
+  dismissHarmonyKeyboard,
+  resolveHostStatusColor,
+  resolveSelectedHost
+} from '../common/OrbitCommonControls';
 import { StageTurnView } from './StageTurnView';
-
-interface StarterPromptChip {
-  id: string;
-  label: string;
-  prompt: string;
-}
-
-const STARTER_PROMPTS: StarterPromptChip[] = [
-  {
-    id: 'arch',
-    label: 'Map codebase architecture',
-    prompt: 'Summarize the crate/module architecture and key entrypoints in this workspace.'
-  },
-  {
-    id: 'review',
-    label: 'Review working tree changes',
-    prompt: 'Inspect uncommitted git changes, check for edge cases, and suggest improvements.'
-  },
-  {
-    id: 'tests',
-    label: 'Run tests & fix failures',
-    prompt: 'Run the test suite, diagnose any failing tests or warnings, and fix them cleanly.'
-  }
-];
 
 @ComponentV2
 export struct StreamStage {
@@ -43,10 +32,51 @@ export struct StreamStage {
   @Local atBottomEdge: boolean = true;
   @Local manualPairUri: string = '';
   @Local isRefreshing: boolean = false;
-  @Local store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
+  @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
   private listScroller: Scroller = new Scroller();
   private isAutoAnchoringResize: boolean = false;
+  private refreshTimerId: number = -1;
+  private resizeTimerId: number = -1;
+
+  aboutToDisappear(): void {
+    if (this.refreshTimerId !== -1) {
+      clearTimeout(this.refreshTimerId);
+      this.refreshTimerId = -1;
+    }
+    if (this.resizeTimerId !== -1) {
+      clearTimeout(this.resizeTimerId);
+      this.resizeTimerId = -1;
+    }
+  }
+
+  @Computed
+  get activeHostCard(): HostCardDto | null {
+    const resolved = resolveSelectedHost(this.store);
+    if (resolved !== null) {
+      return resolved;
+    }
+    return this.store.hosts.length > 0 ? this.store.hosts[0] : null;
+  }
+
+  @Computed
+  get launchpadProjects(): LaunchpadProjectDto[] {
+    return this.store.launchpadProjects();
+  }
+
+  @Computed
+  get activeProjectLabel(): string {
+    const projects = this.launchpadProjects;
+    for (let i = 0; i < projects.length; i++) {
+      if (cwdPathsEquivalent(projects[i].path, this.store.activeCwd)) {
+        return projects[i].name;
+      }
+    }
+    if (this.store.activeCwd.trim().length > 0 && this.store.activeCwd !== '~') {
+      return basenameOfPath(this.store.activeCwd);
+    }
+    return '~';
+  }
 
   private showJumpToLatest(): boolean {
     const totalItems = this.store.stageTurns.length;
@@ -62,8 +92,12 @@ export struct StreamStage {
   private handlePullRefresh(): void {
     this.isRefreshing = true;
     this.store.pullRefreshStage();
-    setTimeout(() => {
+    if (this.refreshTimerId !== -1) {
+      clearTimeout(this.refreshTimerId);
+    }
+    this.refreshTimerId = setTimeout(() => {
       this.isRefreshing = false;
+      this.refreshTimerId = -1;
     }, 450);
   }
 
@@ -83,17 +117,20 @@ export struct StreamStage {
     this.atBottomEdge = true;
   }
 
-  private activeHostName(): string {
-    const detail = this.store.currentHostDetail;
-    if (detail !== null) {
-      return detail.host.display_name;
+  private isHostOnline(host: HostCardDto): boolean {
+    return host.connection_state === 'online_direct' || host.connection_state === 'online_relay';
+  }
+
+  private hostSubtitle(host: HostCardDto): string {
+    const route = formatCompactTopBarConnectionLabel(host.connection_state, host.via_ssh_tunnel);
+    if (host.last_ping_ms !== null && host.last_ping_ms !== undefined) {
+      return `${route} · ${host.last_ping_ms}ms`;
     }
-    for (let i = 0; i < this.store.hosts.length; i++) {
-      if (this.store.hosts[i].host_id === this.store.selectedHostId) {
-        return this.store.hosts[i].display_name;
-      }
-    }
-    return 'No Host Connected';
+    return route;
+  }
+
+  private isDraftSession(): boolean {
+    return this.store.isNewSessionDraft || this.store.selectedAgentId.length === 0;
   }
 
   @Builder
@@ -114,49 +151,13 @@ export struct StreamStage {
       .width('100%')
 
       Column({ space: OrbitTokens.SPACE_MD }) {
-        if (this.store.clipboardPairingUri.length > 0) {
-          Row({ space: OrbitTokens.SPACE_SM }) {
-            Column({ space: 2 }) {
-              Text('Pair from Clipboard')
-                .attributeModifier(
-                  orbitTextSubhead(this.store.palette.accentPrimary, FontWeight.Bold)
-                )
-              Text(this.store.clipboardPairingUri)
-                .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-            }
-            .alignItems(HorizontalAlign.Start)
-            .layoutWeight(1)
-
-            Button('Pair')
-              .attributeModifier(
-                orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
-              )
-              .height(OrbitTokens.HIT_MIN)
-              .borderRadius(OrbitTokens.PILL_RADIUS)
-              .onClick(() => {
-                this.store.pairFromClipboard();
-              })
-          }
-          .width('100%')
-          .padding(OrbitTokens.SPACE_MD)
-          .backgroundColor(this.store.palette.accentPrimarySoft)
-          .borderRadius(OrbitTokens.CARD_RADIUS)
-          .border({
-            width: OrbitTokens.HAIRLINE,
-            color: this.store.palette.accentPrimary
-          })
-          .alignItems(VerticalAlign.Center)
-        }
-
         Button('Scan QR Code')
           .attributeModifier(
             orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
           )
           .width('100%')
           .height(OrbitTokens.HIT_MIN)
-          .borderRadius(OrbitTokens.CARD_RADIUS)
+          .borderRadius(OrbitTokens.RADIUS_MD)
           .onClick(() => {
             this.store.scanQrAndPair(this.getUIContext().getHostContext());
           })
@@ -171,7 +172,7 @@ export struct StreamStage {
               )
             )
             .height(OrbitTokens.HIT_MIN)
-            .borderRadius(OrbitTokens.CARD_RADIUS)
+            .borderRadius(OrbitTokens.RADIUS_MD)
             .border({
               width: OrbitTokens.HAIRLINE,
               color: this.store.palette.hairline
@@ -186,8 +187,9 @@ export struct StreamStage {
               orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
             )
             .height(OrbitTokens.HIT_MIN)
-            .borderRadius(OrbitTokens.CARD_RADIUS)
+            .borderRadius(OrbitTokens.RADIUS_MD)
             .onClick(() => {
+              dismissHarmonyKeyboard(this.getUIContext());
               if (this.manualPairUri.trim().length > 0) {
                 this.store.pairHost(this.manualPairUri.trim());
                 this.manualPairUri = '';
@@ -219,86 +221,261 @@ export struct StreamStage {
       Blank()
     }
     .width('100%')
-    .layoutWeight(1)
+    .height('100%')
     .padding({ left: OrbitTokens.SPACE_XL, right: OrbitTokens.SPACE_XL })
     .alignItems(HorizontalAlign.Center)
   }
 
   @Builder
-  private renderNewSessionWelcome() {
-    Column({ space: OrbitTokens.SPACE_LG }) {
-      Blank()
-
-      Column({ space: OrbitTokens.SPACE_SM }) {
-        Text('New Session')
-          .attributeModifier(orbitTextTitle(this.store.palette.fgPrimary, FontWeight.Bold))
-
-        Row({ space: OrbitTokens.SPACE_SM }) {
-          Text(this.activeHostName())
-            .attributeModifier(orbitTextSubhead(this.store.palette.fgSecondary, FontWeight.Medium))
-          Text('·')
-            .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted))
-          Text(basenameOfPath(this.store.activeCwd))
-            .attributeModifier(orbitTextMono(this.store.palette.accentPrimary, FontWeight.Medium))
-        }
-        .height(OrbitTokens.HIT_MIN)
-        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-        .backgroundColor(this.store.palette.subtleSurface)
-        .borderRadius(OrbitTokens.CARD_RADIUS)
-        .border({
-          width: OrbitTokens.HAIRLINE,
-          color: this.store.palette.hairline
-        })
-        .onClick(() => {
-          this.store.sidebarOpen = true;
-          this.store.browseDirectory(this.store.activeCwd === '~' ? null : this.store.activeCwd);
-        })
-      }
-      .alignItems(HorizontalAlign.Center)
-      .width('100%')
-
-      Column({ space: OrbitTokens.SPACE_SM }) {
+  private renderProjectPickerMenu() {
+    Menu() {
+      MenuItemGroup({ header: 'Projects' }) {
         ForEach(
-          STARTER_PROMPTS,
-          (chip: StarterPromptChip) => {
-            Row({ space: OrbitTokens.SPACE_SM }) {
-              Text(chip.label)
-                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal))
-                .layoutWeight(1)
-              Text('↗')
-                .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted))
-            }
-            .width('100%')
-            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
-            .backgroundColor(this.store.palette.elevated)
-            .borderRadius(OrbitTokens.CARD_RADIUS)
-            .border({
-              width: OrbitTokens.HAIRLINE,
-              color: this.store.palette.hairline
+          this.launchpadProjects,
+          (proj: LaunchpadProjectDto) => {
+            MenuItem({
+              symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder'))
+                .fontColor([this.store.palette.iconPrimary]),
+              content: proj.name,
+              labelInfo: proj.branch.length > 0 ? proj.branch : undefined,
+              symbolEndIcon: cwdPathsEquivalent(proj.path, this.store.activeCwd)
+                ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+                : undefined
             })
-            .onClick(() => {
-              this.store.composerText = chip.prompt;
-              this.store.triggerHaptic(8);
-            })
+              .labelFontColor(this.store.palette.fgMuted)
+              .onClick(() => {
+                this.store.setActiveCwd(proj.path);
+              })
           },
-          (chip: StarterPromptChip) => chip.id
+          (proj: LaunchpadProjectDto) => proj.id
         )
       }
-      .constraintSize({ maxWidth: 520 })
+
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder_badge_plus'))
+            .fontColor([this.store.palette.accentPrimary]),
+          content: 'Browse Directories…'
+        })
+          .contentFontColor(this.store.palette.accentPrimary)
+          .onClick(() => {
+            this.store.browseDirectory(
+              this.store.activeCwd === '~' ? null : this.store.activeCwd
+            );
+          })
+      }
+    }
+  }
+
+  @Builder
+  private renderHostPickerMenu() {
+    Menu() {
+      MenuItemGroup({ header: 'Hosts' }) {
+        ForEach(
+          this.store.hosts,
+          (host: HostCardDto) => {
+            MenuItem({
+              symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.dot_circle'))
+                .fontColor([resolveHostStatusColor(host, this.store)]),
+              content: host.display_name,
+              labelInfo: this.hostSubtitle(host),
+              symbolEndIcon: host.host_id === this.store.selectedHostId
+                ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+                : undefined
+            })
+              .labelFontColor(this.store.palette.fgMuted)
+              .onClick(() => {
+                this.store.selectHost(host.host_id);
+                this.store.triggerHaptic(8);
+              })
+          },
+          (host: HostCardDto) => `stage_host_${host.host_id}`
+        )
+      }
+    }
+  }
+
+  @Builder
+  private renderExecutionModeMenu() {
+    Menu() {
+      MenuItemGroup({ header: 'Execution Environment' }) {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.pc'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Local',
+          labelInfo: 'Current directory',
+          symbolEndIcon: !this.store.draftUseWorktree
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .labelFontColor(this.store.palette.fgMuted)
+          .onClick(() => {
+            this.store.setDraftUseWorktree(false);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_triangle_divide'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Worktree',
+          labelInfo: 'Isolated git worktree',
+          symbolEndIcon: this.store.draftUseWorktree
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .labelFontColor(this.store.palette.fgMuted)
+          .onClick(() => {
+            this.store.setDraftUseWorktree(true);
+          })
+      }
+    }
+  }
+
+  @Builder
+  private renderNewSessionWelcome() {
+    Column({ space: 0 }) {
+      Blank()
+
+      Text('What would you like to build?')
+        .attributeModifier(orbitTextTitle(this.store.palette.fgPrimary, FontWeight.Bold))
+        .textAlign(TextAlign.Center)
+        .maxLines(2)
+        .width('100%')
+
+      // Contextual Readiness Pills: Native HarmonyOS 7 Capsule Buttons + Native Menus
+      Flex({
+        wrap: FlexWrap.Wrap,
+        justifyContent: FlexAlign.Center,
+        alignItems: ItemAlign.Center
+      }) {
+        Button({ type: ButtonType.Capsule, stateEffect: true }) {
+          Row({ space: 6 }) {
+            SymbolGlyph($r('sys.symbol.folder'))
+              .fontSize(14)
+              .fontColor([this.store.palette.iconSecondary])
+            Text(this.activeProjectLabel)
+              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .constraintSize({ maxWidth: 160 })
+            SymbolGlyph($r('sys.symbol.chevron_down'))
+              .fontSize(11)
+              .fontColor([this.store.palette.fgMuted])
+          }
+          .alignItems(VerticalAlign.Center)
+        }
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding({ left: 14, right: 12 })
+        .margin({ left: 4, right: 4, top: 4, bottom: 4 })
+        .backgroundColor(this.store.palette.subtleSurface)
+        .accessibilityText(`Project: ${this.activeProjectLabel}`)
+        .bindMenu(this.renderProjectPickerMenu())
+
+        if (this.store.hosts.length > 1 && this.activeHostCard !== null) {
+          Button({ type: ButtonType.Capsule, stateEffect: true }) {
+            Row({ space: 6 }) {
+              Row()
+                .width(7)
+                .height(7)
+                .borderRadius(3.5)
+                .backgroundColor(resolveHostStatusColor(this.activeHostCard, this.store))
+              Text(this.activeHostCard.display_name)
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .constraintSize({ maxWidth: 140 })
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(11)
+                .fontColor([this.store.palette.fgMuted])
+            }
+            .alignItems(VerticalAlign.Center)
+          }
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding({ left: 14, right: 12 })
+          .margin({ left: 4, right: 4, top: 4, bottom: 4 })
+          .backgroundColor(this.store.palette.subtleSurface)
+          .accessibilityText(`Host: ${this.activeHostCard.display_name}`)
+          .bindMenu(this.renderHostPickerMenu())
+        }
+
+        if (this.isDraftSession()) {
+          Button({ type: ButtonType.Capsule, stateEffect: true }) {
+            Row({ space: 6 }) {
+              SymbolGlyph(
+                this.store.draftUseWorktree
+                  ? $r('sys.symbol.arrow_triangle_divide')
+                  : $r('sys.symbol.pc')
+              )
+                .fontSize(14)
+                .fontColor([this.store.palette.iconSecondary])
+              Text(this.store.draftUseWorktree ? 'Worktree' : 'Local')
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+                .maxLines(1)
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(11)
+                .fontColor([this.store.palette.fgMuted])
+            }
+            .alignItems(VerticalAlign.Center)
+          }
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding({ left: 14, right: 12 })
+          .margin({ left: 4, right: 4, top: 4, bottom: 4 })
+          .backgroundColor(this.store.palette.subtleSurface)
+          .accessibilityText(`Execution environment: ${this.store.draftUseWorktree ? 'Worktree' : 'Local'}`)
+          .bindMenu(this.renderExecutionModeMenu())
+        }
+      }
       .width('100%')
+      .margin({ top: OrbitTokens.SPACE_MD })
+
+      if (this.activeHostCard !== null && !this.isHostOnline(this.activeHostCard)) {
+        Row({ space: 6 }) {
+          Row()
+            .width(6)
+            .height(6)
+            .borderRadius(3)
+            .backgroundColor(resolveHostStatusColor(this.activeHostCard, this.store))
+          Text(
+            `${formatCompactTopBarConnectionLabel(
+              this.activeHostCard.connection_state,
+              this.activeHostCard.via_ssh_tunnel
+            )} · ${this.activeHostCard.display_name}`
+          )
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .margin({ top: OrbitTokens.SPACE_SM })
+        .alignItems(VerticalAlign.Center)
+      } else if (this.store.activeGitBranch().length > 0) {
+        Row({ space: 4 }) {
+          SymbolGlyph($r('sys.symbol.arrow_triangle_divide'))
+            .fontSize(12)
+            .fontColor([this.store.palette.fgMuted])
+          Text(
+            this.store.draftUseWorktree
+              ? `Worktree from ${this.store.activeGitBranch()}`
+              : this.store.activeGitBranch()
+          )
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+        .margin({ top: OrbitTokens.SPACE_SM })
+        .alignItems(VerticalAlign.Center)
+      }
 
       if (this.store.lastError.length > 0) {
         Text(this.store.lastError)
           .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
           .textAlign(TextAlign.Center)
+          .margin({ top: OrbitTokens.SPACE_MD })
       }
 
       Blank()
     }
     .width('100%')
     .height('100%')
-    .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+    .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, bottom: OrbitTokens.SPACE_XL })
     .alignItems(HorizontalAlign.Center)
   }
 
@@ -313,7 +490,7 @@ export struct StreamStage {
         this.handlePullRefresh();
       })
       .width('100%')
-      .layoutWeight(1)
+      .height('100%')
     } else {
       Stack({ alignContent: Alignment.Bottom }) {
         Refresh({ refreshing: $$this.isRefreshing }) {
@@ -325,7 +502,11 @@ export struct StreamStage {
             Repeat<StageTurnDto>(this.store.stageTurns)
               .each((ri: RepeatItem<StageTurnDto>) => {
                 ListItem() {
-                  StageTurnView({ turn: ri.item })
+                  StageTurnView({
+                    turn: ri.item,
+                    isTurnActive: ri.item.has_active_item ||
+                      (this.store.isActiveAgentRunning() && ri.index === this.store.stageTurns.length - 1)
+                  })
                 }
               })
               .key((t: StageTurnDto) => t.key)
@@ -341,6 +522,11 @@ export struct StreamStage {
           })
           .scrollBar(BarState.Auto)
           .edgeEffect(EdgeEffect.Spring)
+          .onScrollStart(() => {
+            if (this.store.keyboardHeightVp > 0) {
+              dismissHarmonyKeyboard(this.getUIContext());
+            }
+          })
           .onScrollIndex((firstIndex: number, endIndex: number) => {
             const totalItems = this.store.stageTurns.length;
             this.firstVisibleIndex = firstIndex;
@@ -367,68 +553,53 @@ export struct StreamStage {
         .height('100%')
 
         if (this.showJumpToLatest()) {
-          Stack({ alignContent: Alignment.Center }) {
-            Row({ space: OrbitTokens.SPACE_XS }) {
-              if (this.store.isActiveAgentRunning()) {
-                Row()
-                  .width(OrbitTokens.DOT_SIZE)
-                  .height(OrbitTokens.DOT_SIZE)
-                  .borderRadius(3)
-                  .backgroundColor(this.store.palette.accentPrimary)
-              }
-              Text(this.store.isActiveAgentRunning() ? '↓ Streaming' : '↓ Latest')
-                .attributeModifier(
-                  orbitTextMeta(
-                    this.store.isActiveAgentRunning()
-                      ? this.store.palette.accentPrimary
-                      : this.store.palette.fgPrimary,
-                    FontWeight.Medium
-                  )
-                )
+          Badge({
+            count: this.store.isActiveAgentRunning() ? 1 : 0,
+            style: {
+              badgeColor: this.store.palette.accentPrimaryFill,
+              badgeSize: 8
+            },
+            position: BadgePosition.RightTop
+          }) {
+            Button({ type: ButtonType.Circle, stateEffect: true }) {
+              SymbolGlyph($r('sys.symbol.arrow_down'))
+                .fontSize(18)
+                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                .fontColor([this.store.palette.iconPrimary])
             }
-            .height(32)
-            .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-            .backgroundColor(this.store.palette.elevated)
-            .borderRadius(OrbitTokens.SPACE_LG)
-            .border({
-              width: OrbitTokens.HAIRLINE,
-              color: this.store.isActiveAgentRunning()
-                ? this.store.palette.accentPrimary
-                : this.store.palette.hairline
+            .width(OrbitTokens.HIT_COMPACT)
+            .height(OrbitTokens.HIT_COMPACT)
+            .padding(0)
+            .attributeModifier(
+              orbitSurface(
+                this.store.palette.listCard,
+                this.store.palette.hairline,
+                OrbitTokens.HAIRLINE,
+                ShadowStyle.OUTER_FLOATING_SM
+              )
+            )
+            .accessibilityText(
+              this.store.isActiveAgentRunning()
+                ? 'Scroll to latest streaming output'
+                : 'Scroll to latest message'
+            )
+            .onClick(() => {
+              const lastIdx = Math.max(0, this.store.stageTurns.length - 1);
+              this.atBottomEdge = true;
+              this.lastVisibleIndex = lastIdx;
+              this.listScroller.scrollToIndex(lastIdx, true, ScrollAlign.END);
+              this.listScroller.scrollEdge(Edge.Bottom);
+              this.store.triggerHaptic(8);
             })
-            .shadow({
-              radius: 12,
-              color: '#22000000',
-              offsetX: 0,
-              offsetY: 4
-            })
-            .alignItems(VerticalAlign.Center)
           }
-          .height(OrbitTokens.HIT_MIN)
-          .constraintSize({ minWidth: OrbitTokens.HIT_MIN })
-          .margin({ bottom: OrbitTokens.SPACE_XS })
-          .accessibilityText(
-            this.store.isActiveAgentRunning()
-              ? 'Scroll to latest streaming output'
-              : 'Scroll to latest message'
-          )
-          .onClick(() => {
-            const lastIdx = Math.max(0, this.store.stageTurns.length - 1);
-            this.atBottomEdge = true;
-            this.lastVisibleIndex = lastIdx;
-            this.listScroller.scrollToIndex(lastIdx, true, ScrollAlign.END);
-            this.listScroller.scrollEdge(Edge.Bottom);
-            this.store.triggerHaptic(8);
-          })
+          .margin({ bottom: OrbitTokens.SPACE_SM })
         }
       }
       .width('100%')
-      .layoutWeight(1)
+      .height('100%')
       .onAreaChange((oldArea: Area, newArea: Area) => {
         const prevH = Number(oldArea.height);
         const nextH = Number(newArea.height);
-        // When StickyDecisionDock or soft keyboard shrinks Stage height while anchored at bottom,
-        // smoothly re-scroll so the latest Assistant reply stays snug right above StickyDecisionDock.
         if (
           prevH > 0 &&
           nextH > 0 &&
@@ -441,11 +612,15 @@ export struct StreamStage {
           this.lastVisibleIndex = lastIdx;
           this.listScroller.scrollToIndex(lastIdx, true, ScrollAlign.END);
           this.listScroller.scrollEdge(Edge.Bottom);
-          setTimeout(() => {
+          if (this.resizeTimerId !== -1) {
+            clearTimeout(this.resizeTimerId);
+          }
+          this.resizeTimerId = setTimeout(() => {
             if (this.atBottomEdge && this.store.stageTurns.length > 0) {
               this.listScroller.scrollEdge(Edge.Bottom);
             }
             this.isAutoAnchoringResize = false;
+            this.resizeTimerId = -1;
           }, 80);
         }
       })

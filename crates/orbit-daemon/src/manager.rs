@@ -68,6 +68,8 @@ pub struct AgentOrchestrator {
     store: Arc<OrbitStore>,
     live_agents: RwLock<HashMap<String, mpsc::Sender<DriverCommand>>>,
     agent_extra_dirs: RwLock<HashMap<String, Vec<PathBuf>>>,
+    pending_permissions: RwLock<HashMap<String, Vec<String>>>,
+    pending_questions: RwLock<HashMap<String, Vec<String>>>,
     live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
@@ -82,6 +84,8 @@ impl AgentOrchestrator {
             store,
             live_agents: RwLock::new(HashMap::new()),
             agent_extra_dirs: RwLock::new(HashMap::new()),
+            pending_permissions: RwLock::new(HashMap::new()),
+            pending_questions: RwLock::new(HashMap::new()),
             live_terminals: RwLock::new(HashMap::new()),
             broadcast_tx,
         });
@@ -404,6 +408,44 @@ impl AgentOrchestrator {
         if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
             let _ = tx.send(DriverCommand::Interrupt).await;
         }
+        let cancelled_perms = self
+            .pending_permissions
+            .write()
+            .await
+            .remove(agent_id)
+            .unwrap_or_default();
+        for request_id in cancelled_perms {
+            if let Ok(ev) = self.store.append_timeline_event(
+                agent_id,
+                1,
+                None,
+                TimelinePayload::PermissionResolved {
+                    request_id,
+                    decision: "cancelled".into(),
+                },
+            ) {
+                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            }
+        }
+        let cancelled_questions = self
+            .pending_questions
+            .write()
+            .await
+            .remove(agent_id)
+            .unwrap_or_default();
+        for request_id in cancelled_questions {
+            if let Ok(ev) = self.store.append_timeline_event(
+                agent_id,
+                1,
+                None,
+                TimelinePayload::QuestionResolved {
+                    request_id,
+                    answers: Vec::new(),
+                },
+            ) {
+                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            }
+        }
         Ok(())
     }
 
@@ -501,6 +543,37 @@ impl AgentOrchestrator {
         Ok(())
     }
 
+    async fn record_pending_request(
+        map: &RwLock<HashMap<String, Vec<String>>>,
+        agent_id: &str,
+        request_id: &str,
+    ) {
+        let mut guard = map.write().await;
+        let list = guard.entry(agent_id.to_string()).or_default();
+        if !list.iter().any(|id| id == request_id) {
+            list.push(request_id.to_string());
+        }
+    }
+
+    async fn remove_pending_request(
+        map: &RwLock<HashMap<String, Vec<String>>>,
+        agent_id: &str,
+        request_id: &str,
+    ) {
+        let mut guard = map.write().await;
+        if let Some(list) = guard.get_mut(agent_id) {
+            list.retain(|id| id != request_id);
+            if list.is_empty() {
+                guard.remove(agent_id);
+            }
+        }
+    }
+
+    async fn clear_pending_requests(&self, agent_id: &str) {
+        self.pending_permissions.write().await.remove(agent_id);
+        self.pending_questions.write().await.remove(agent_id);
+    }
+
     pub async fn resolve_permission(
         &self,
         agent_id: &str,
@@ -514,6 +587,8 @@ impl AgentOrchestrator {
             })
             .await
             .map_err(|_| anyhow::anyhow!("agent session not active"))?;
+
+            Self::remove_pending_request(&self.pending_permissions, agent_id, &request_id).await;
 
             if let Ok(ev) = self.store.append_timeline_event(
                 agent_id,
@@ -544,6 +619,8 @@ impl AgentOrchestrator {
             .await
             .map_err(|_| anyhow::anyhow!("agent session not active"))?;
 
+            Self::remove_pending_request(&self.pending_questions, agent_id, &request_id).await;
+
             if let Ok(ev) = self.store.append_timeline_event(
                 agent_id,
                 1,
@@ -563,6 +640,7 @@ impl AgentOrchestrator {
         if let Some(tx) = self.live_agents.write().await.remove(agent_id) {
             let _ = tx.send(DriverCommand::Shutdown).await;
         }
+        self.clear_pending_requests(agent_id).await;
         self.store.delete_agent(agent_id)?;
         Ok(())
     }
@@ -645,6 +723,7 @@ impl AgentOrchestrator {
                 mgr.ingest_driver_event(&ag_id, evt).await;
             }
             mgr.live_agents.write().await.remove(&ag_id);
+            mgr.clear_pending_requests(&ag_id).await;
         });
 
         Ok(cmd_tx)
@@ -692,23 +771,33 @@ impl AgentOrchestrator {
                 title,
                 detail,
                 allowed_decisions,
-            } => TimelinePayload::PermissionRequest {
-                request_id,
-                title,
-                detail,
-                allowed_decisions,
-            },
+            } => {
+                Self::record_pending_request(&self.pending_permissions, agent_id, &request_id)
+                    .await;
+                TimelinePayload::PermissionRequest {
+                    request_id,
+                    title,
+                    detail,
+                    allowed_decisions,
+                }
+            }
             DriverEvent::QuestionRequest {
                 request_id,
                 questions,
-            } => TimelinePayload::QuestionRequest {
-                request_id,
-                questions: questions as Vec<QuestionItem>,
-            },
+            } => {
+                Self::record_pending_request(&self.pending_questions, agent_id, &request_id).await;
+                TimelinePayload::QuestionRequest {
+                    request_id,
+                    questions: questions as Vec<QuestionItem>,
+                }
+            }
             DriverEvent::Notice { level, message } => TimelinePayload::Notice { level, message },
-            DriverEvent::Exited { .. } => TimelinePayload::StatusChanged {
-                status: AgentStatus::Closed,
-            },
+            DriverEvent::Exited { .. } => {
+                self.clear_pending_requests(agent_id).await;
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::Closed,
+                }
+            }
         };
 
         let is_status_change = matches!(payload, TimelinePayload::StatusChanged { .. });

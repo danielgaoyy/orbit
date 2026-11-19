@@ -1,0 +1,92 @@
+{
+  "color": [
+    {
+      "name": "start_window_background",
+      "value": "#000000"
+    },
+    {
+      "name": "orbit_code_bg",
+      "value": "#16171A"
+    },
+    {
+      "name": "orbit_status_direct_soft",
+      "value": "#2464BB5C"
+    },
+    {
+      "name": "orbit_status_relay",
+      "value": "#A78BFA"
+    },
+    {
+      "name": "orbit_status_relay_soft",
+      "value": "#24A78BFA"
+    },
+    {
+      "name": "orbit_status_warning_soft",
+      "value": "#24ED6F21"
+    },
+    {
+      "name": "orbit_status_danger_soft",
+      "value": "#24E84026"
+    },
+    {
+      "name": "orbit_brand",
+      "value": "#F4F4F6"
+    },
+    {
+      "name": "orbit_on_brand",
+      "value": "#141416"
+    },
+    {
+      "name": "orbit_accent_soft",
+      "value": "#1AF4F4F6"
+    },
+    {
+      "name": "orbit_diff_added_bg",
+      "value": "#2464BB5C"
+    },
+    {
+      "name": "orbit_diff_removed_bg",
+      "value": "#24E84026"
+    },
+    {
+      "name": "orbit_terminal_bg",
+      "value": "#0A0B0E"
+    },
+    {
+      "name": "orbit_terminal_fg",
+      "value": "#EFEFF2"
+    },
+    {
+      "name": "orbit_badge_unread",
+      "value": "#F4F4F6"
+    },
+    {
+      "name": "orbit_scrim",
+      "value": "#66000000"
+    },
+    {
+      "name": "orbit_overlay_pill_bg",
+      "value": "#CC000000"
+    },
+    {
+      "name": "orbit_syntax_string",
+      "value": "#A3BE8C"
+    },
+    {
+      "name": "orbit_syntax_number",
+      "value": "#EBCB8B"
+    },
+    {
+      "name": "orbit_syntax_keyword",
+      "value": "#8FA1B3"
+    },
+    {
+      "name": "orbit_syntax_type",
+      "value": "#B48EAD"
+    },
+    {
+      "name": "orbit_syntax_error",
+      "value": "#BF616A"
+    }
+  ]
+}

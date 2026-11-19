@@ -3,29 +3,34 @@ package dev.orbit.android.ui.composer
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
@@ -42,10 +47,15 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.orbit.android.store.OrbitFormatters
+import dev.orbit.android.ui.theme.OrbitCompactDropdownMenu
+import dev.orbit.android.ui.theme.OrbitMenuOptionRow
+import dev.orbit.android.ui.theme.OrbitMenuSectionHeader
+import dev.orbit.android.ui.theme.OrbitProviderIcon
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 import uniffi.orbit_ffi_uniffi.FfiHostDetail
 import uniffi.orbit_ffi_uniffi.FfiProviderKind
+import uniffi.orbit_ffi_uniffi.FfiProviderModelSpec
 import uniffi.orbit_ffi_uniffi.FfiReasoningEffort
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -55,6 +65,9 @@ fun ModelSelectorSheet(
     currentModel: String?,
     currentEffort: FfiReasoningEffort?,
     hostDetail: FfiHostDetail?,
+    isNewSession: Boolean = true,
+    onSwitchProvider: (FfiProviderKind) -> Unit = {},
+    onSelectEffort: (FfiReasoningEffort) -> Unit = {},
     onSelect: (provider: FfiProviderKind, model: String?, effort: FfiReasoningEffort?) -> Unit,
     onRefreshCatalogs: () -> Unit,
     onDismiss: () -> Unit,
@@ -62,37 +75,49 @@ fun ModelSelectorSheet(
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
     val haptics = LocalHapticFeedback.current
-    // Keep ModelSelectorSheet compact/adaptive
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     var selectedProvider by remember(currentProvider) { mutableStateOf(currentProvider) }
     val catalog = remember(hostDetail, selectedProvider) {
         OrbitFormatters.catalogFor(hostDetail, selectedProvider)
     }
-    var selectedModel by remember(selectedProvider, currentModel) {
+    var selectedModelId by remember(selectedProvider, currentModel, catalog) {
         mutableStateOf(
             if (selectedProvider == currentProvider) {
-                currentModel ?: catalog.configuredDefaultModel ?: catalog.models.firstOrNull { it.isDefault }?.id
+                currentModel
+                    ?: catalog.configuredDefaultModel
+                    ?: catalog.models.firstOrNull { it.isDefault }?.id
+                    ?: catalog.models.firstOrNull()?.id
             } else {
-                catalog.configuredDefaultModel ?: catalog.models.firstOrNull { it.isDefault }?.id
+                catalog.configuredDefaultModel
+                    ?: catalog.models.firstOrNull { it.isDefault }?.id
+                    ?: catalog.models.firstOrNull()?.id
             }
         )
     }
-    val activeModelSpec = remember(catalog, selectedModel) {
-        catalog.models.firstOrNull { it.id == selectedModel } ?: catalog.models.firstOrNull { it.isDefault }
+    val activeModelSpec: FfiProviderModelSpec? = remember(catalog, selectedModelId) {
+        catalog.models.firstOrNull { it.id == selectedModelId }
+            ?: catalog.models.firstOrNull { it.isDefault }
+            ?: catalog.models.firstOrNull()
     }
     var selectedEffort by remember(selectedProvider, activeModelSpec, currentEffort) {
         mutableStateOf(
             OrbitFormatters.resolveEffort(
                 spec = activeModelSpec,
-                desired = currentEffort,
+                desired = if (selectedProvider == currentProvider) currentEffort else null,
                 catalogDefault = catalog.configuredDefaultEffort,
             )
         )
     }
 
-    val availableProviders = hostDetail?.host?.availableProviders.orEmpty()
+    val detectedProviders = remember(hostDetail, currentProvider) {
+        hostDetail?.host?.availableProviders
+            ?.distinct()
+            ?.takeIf { it.isNotEmpty() }
+            ?: listOf(currentProvider)
+    }
     val thinkingOptions = activeModelSpec?.thinkingOptions.orEmpty()
+    var thinkingMenuExpanded by remember { mutableStateOf(false) }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -104,105 +129,78 @@ fun ModelSelectorSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.xs),
+                .padding(horizontal = OrbitSpacing.lg)
+                .padding(bottom = OrbitSpacing.lg),
             verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
         ) {
-            // Header
+            // Compact Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "Model & Reasoning",
+                    text = "Model",
                     style = typography.title,
                     color = colors.fgPrimary,
                 )
-                Box(
-                    modifier = Modifier
-                        .size(OrbitSpacing.touchTarget)
-                        .clip(RoundedCornerShape(OrbitSpacing.md))
-                        .clickable {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onRefreshCatalogs()
-                        },
-                    contentAlignment = Alignment.Center,
+                IconButton(
+                    onClick = {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onRefreshCatalogs()
+                    },
+                    modifier = Modifier.size(36.dp),
                 ) {
                     Icon(
                         imageVector = Icons.Outlined.Refresh,
-                        contentDescription = "Refresh provider models",
+                        contentDescription = "Refresh model catalogs",
                         tint = colors.fgSecondary,
                         modifier = Modifier.size(OrbitSpacing.iconMd),
                     )
                 }
             }
 
-            // 1. PROVIDER Switcher
-            Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs)) {
-                Text(
-                    text = "PROVIDER",
-                    style = typography.metaSemiBold,
-                    color = colors.fgMuted,
-                )
-                Row(
+            // Segmented Provider Switcher (New session & >1 CLI detected)
+            if (isNewSession && detectedProviders.size > 1) {
+                SingleChoiceSegmentedButtonRow(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
                 ) {
-                    FfiProviderKind.entries.forEach { provider ->
-                        val isInstalled = availableProviders.isEmpty() || provider in availableProviders
+                    detectedProviders.forEachIndexed { index, provider ->
                         val active = provider == selectedProvider
-                        val pillShape = RoundedCornerShape(OrbitSpacing.md)
-
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .heightIn(min = 44.dp)
-                                .clip(pillShape)
-                                .background(if (active) colors.subtleFill else colors.code, pillShape)
-                                .border(
-                                    if (active) 1.dp else OrbitSpacing.hairline,
-                                    if (active) colors.primary else colors.hairline,
-                                    pillShape
-                                )
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    selectedProvider = provider
-                                    val nextCat = OrbitFormatters.catalogFor(hostDetail, provider)
-                                    val nextMod = nextCat.configuredDefaultModel
-                                        ?: nextCat.models.firstOrNull { it.isDefault }?.id
-                                        ?: nextCat.models.firstOrNull()?.id
-                                    val nextSpec = nextCat.models.firstOrNull { it.id == nextMod }
-                                    val nextEff = OrbitFormatters.resolveEffort(
-                                        nextSpec,
-                                        selectedEffort,
-                                        nextCat.configuredDefaultEffort,
-                                    )
-                                    selectedModel = nextMod
-                                    selectedEffort = nextEff
-                                    onSelect(provider, nextMod, nextEff)
-                                }
-                                .padding(horizontal = OrbitSpacing.xs, vertical = OrbitSpacing.xs),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center,
+                        SegmentedButton(
+                            selected = active,
+                            onClick = {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                selectedProvider = provider
+                                onSwitchProvider(provider)
+                            },
+                            shape = SegmentedButtonDefaults.itemShape(
+                                index = index,
+                                count = detectedProviders.size,
+                            ),
+                            colors = SegmentedButtonDefaults.colors(
+                                activeContainerColor = colors.primary,
+                                activeContentColor = colors.onPrimary,
+                                inactiveContainerColor = colors.subtleFill,
+                                inactiveContentColor = colors.fgSecondary,
+                                activeBorderColor = colors.primary,
+                                inactiveBorderColor = colors.hairline,
+                            ),
+                            icon = {},
                         ) {
-                            Text(
-                                text = OrbitFormatters.providerLabel(provider),
-                                style = typography.subheadSemiBold,
-                                color = when {
-                                    active -> colors.primary
-                                    isInstalled -> colors.fgPrimary
-                                    else -> colors.fgMuted
-                                },
-                                maxLines = 1,
-                                softWrap = false,
-                            )
-                            if (!isInstalled) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                OrbitProviderIcon(
+                                    provider = provider,
+                                    size = 15.dp,
+                                )
                                 Text(
-                                    text = "Unavailable",
-                                    style = typography.meta,
-                                    color = colors.fgMuted,
+                                    text = OrbitFormatters.providerShortLabel(provider),
+                                    style = typography.subheadMedium,
                                     maxLines = 1,
-                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
                         }
@@ -210,199 +208,218 @@ fun ModelSelectorSheet(
                 }
             }
 
-            // 2. REASONING EFFORT (Immediately below PROVIDER and above MODEL for at-a-glance visibility!)
-            if (thinkingOptions.isNotEmpty()) {
-                val activeEffortDesc = remember(thinkingOptions, selectedEffort) {
-                    selectedEffort?.let { eff ->
-                        thinkingOptions.firstOrNull { it.effort == eff }?.description
-                            ?: OrbitFormatters.effortDescription(eff)
-                    }.orEmpty()
-                }
-
-                Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "REASONING EFFORT",
-                            style = typography.metaSemiBold,
-                            color = colors.fgMuted,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                        if (activeEffortDesc.isNotBlank()) {
-                            Text(
-                                text = activeEffortDesc,
-                                style = typography.meta,
-                                color = colors.fgSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f),
-                            )
+            // Compact Model List
+            val listShape = RoundedCornerShape(14.dp)
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 320.dp)
+                    .clip(listShape)
+                    .background(colors.canvas, listShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, listShape),
+                contentPadding = PaddingValues(vertical = OrbitSpacing.xs),
+            ) {
+                items(
+                    items = catalog.models,
+                    key = { "${selectedProvider.name}:${it.id}" },
+                ) { spec ->
+                    val isSelected = spec.id == (activeModelSpec?.id ?: selectedModelId)
+                    val displayLabel = remember(selectedProvider, spec.label) {
+                        if (selectedProvider == FfiProviderKind.CLAUDE_CODE) {
+                            spec.label.removePrefix("Claude ").trim().ifEmpty { spec.label }
+                        } else {
+                            spec.label
                         }
                     }
-
+                    val subLabel = remember(spec) {
+                        spec.description.trim().takeIf { it.isNotEmpty() }
+                            ?: spec.defaultEffort?.let { "Default · ${OrbitFormatters.effortLabel(it)}" }
+                            ?: if (spec.isDefault) "Default" else null
+                    }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState()),
+                            .background(if (isSelected) colors.subtleFill else Color.Transparent)
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                selectedModelId = spec.id
+                                val nextEffort = OrbitFormatters.resolveEffort(
+                                    spec = spec,
+                                    desired = selectedEffort,
+                                    catalogDefault = catalog.configuredDefaultEffort,
+                                )
+                                selectedEffort = nextEffort
+                                onSelect(selectedProvider, spec.id, nextEffort)
+                                onDismiss()
+                            }
+                            .padding(horizontal = OrbitSpacing.md, vertical = 10.dp),
                         horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        thinkingOptions.forEach { opt ->
-                            val active = opt.effort == selectedEffort
-                            val chipShape = RoundedCornerShape(OrbitSpacing.md)
-                            Box(
-                                modifier = Modifier
-                                    .heightIn(min = 38.dp)
-                                    .clip(chipShape)
-                                    .background(if (active) colors.subtleFill else colors.code, chipShape)
-                                    .border(
-                                        if (active) 1.dp else OrbitSpacing.hairline,
-                                        if (active) colors.primary else colors.hairline,
-                                        chipShape
-                                    )
-                                    .clickable {
-                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        selectedEffort = opt.effort
-                                        onSelect(selectedProvider, selectedModel, opt.effort)
-                                    }
-                                    .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.xs),
-                                contentAlignment = Alignment.Center,
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text(
-                                    text = opt.label.ifBlank { OrbitFormatters.effortLabel(opt.effort) },
-                                    style = typography.subheadMedium,
-                                    color = if (active) colors.primary else colors.fgPrimary,
+                                    text = displayLabel,
+                                    style = if (isSelected) typography.bodySemiBold else typography.body,
+                                    color = colors.fgPrimary,
                                     maxLines = 1,
-                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                if (spec.id == catalog.configuredDefaultModel || (catalog.configuredDefaultModel == null && spec.isDefault)) {
+                                    Text(
+                                        text = "Default",
+                                        style = typography.meta,
+                                        color = colors.fgMuted,
+                                        modifier = Modifier
+                                            .background(colors.subtleFill, RoundedCornerShape(6.dp))
+                                            .padding(horizontal = 6.dp, vertical = 1.dp),
+                                    )
+                                }
+                            }
+                            if (subLabel != null) {
+                                Text(
+                                    text = subLabel,
+                                    style = typography.meta,
+                                    color = colors.fgSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
                                 )
                             }
+                        }
+                        if (isSelected) {
+                            Icon(
+                                imageVector = Icons.Outlined.Check,
+                                contentDescription = "Selected",
+                                tint = colors.primary,
+                                modifier = Modifier.size(OrbitSpacing.iconMd),
+                            )
                         }
                     }
                 }
             }
 
-            HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
-
-            // 3. MODEL List
-            Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs)) {
-                Text(
-                    text = "MODEL",
-                    style = typography.metaSemiBold,
-                    color = colors.fgMuted,
-                )
-
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 260.dp),
-                    verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+            // Pinned Bottom Thinking Effort Controls
+            if (thinkingOptions.isNotEmpty()) {
+                HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
                 ) {
-                    items(catalog.models, key = { it.id }) { spec ->
-                        val isSelected = spec.id == selectedModel
-                        val cleanedDesc = remember(spec.label, spec.id, spec.description) {
-                            stripRedundantModelPrefix(spec.label, spec.id, spec.description)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "Thinking",
+                            style = typography.subheadMedium,
+                            color = colors.fgSecondary,
+                        )
+                        selectedEffort?.let { eff ->
+                            Text(
+                                text = OrbitFormatters.effortDescription(eff),
+                                style = typography.meta,
+                                color = colors.fgMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                         }
-                        val rowShape = RoundedCornerShape(OrbitSpacing.md)
+                    }
 
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = OrbitSpacing.touchTarget)
-                                .clip(rowShape)
-                                .background(if (isSelected) colors.subtleFill else Color.Transparent, rowShape)
-                                .border(
-                                    if (isSelected) 1.dp else OrbitSpacing.hairline,
-                                    if (isSelected) colors.primary else colors.hairline,
-                                    rowShape
-                                )
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    val nextEffort = OrbitFormatters.resolveEffort(
-                                        spec,
-                                        selectedEffort,
-                                        catalog.configuredDefaultEffort,
-                                    )
-                                    selectedModel = spec.id
-                                    selectedEffort = nextEffort
-                                    onSelect(selectedProvider, spec.id, nextEffort)
-                                    onDismiss()
-                                }
-                                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                    if (thinkingOptions.size <= 5) {
+                        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                            thinkingOptions.forEachIndexed { index, opt ->
+                                val active = opt.effort == selectedEffort
+                                SegmentedButton(
+                                    selected = active,
+                                    onClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        selectedEffort = opt.effort
+                                        onSelectEffort(opt.effort)
+                                        onSelect(selectedProvider, activeModelSpec?.id, opt.effort)
+                                    },
+                                    shape = SegmentedButtonDefaults.itemShape(
+                                        index = index,
+                                        count = thinkingOptions.size,
+                                    ),
+                                    colors = SegmentedButtonDefaults.colors(
+                                        activeContainerColor = colors.primary,
+                                        activeContentColor = colors.onPrimary,
+                                        inactiveContainerColor = colors.subtleFill,
+                                        inactiveContentColor = colors.fgSecondary,
+                                        activeBorderColor = colors.primary,
+                                        inactiveBorderColor = colors.hairline,
+                                    ),
+                                    icon = {},
                                 ) {
                                     Text(
-                                        text = spec.label,
-                                        style = typography.bodyMedium,
-                                        color = colors.fgPrimary,
+                                        text = OrbitFormatters.compactEffortLabel(opt.effort),
+                                        style = typography.metaMedium,
                                         maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    if (spec.isDefault) {
-                                        Text(
-                                            text = "Default",
-                                            style = typography.subheadMedium,
-                                            color = colors.fgMuted,
-                                            maxLines = 1,
-                                            softWrap = false,
-                                        )
-                                    }
-                                }
-                                if (cleanedDesc.isNotBlank()) {
-                                    Text(
-                                        text = cleanedDesc,
-                                        style = typography.meta,
-                                        color = colors.fgSecondary,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis,
+                                        overflow = TextOverflow.Clip,
                                     )
                                 }
                             }
-                            if (isSelected) {
-                                Icon(
-                                    imageVector = Icons.Outlined.Check,
-                                    contentDescription = "Selected",
-                                    tint = colors.primary,
-                                    modifier = Modifier.size(OrbitSpacing.iconMd),
+                        }
+                    } else {
+                        val triggerShape = RoundedCornerShape(10.dp)
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(triggerShape)
+                                    .background(colors.subtleFill, triggerShape)
+                                    .border(OrbitSpacing.hairline, colors.hairline, triggerShape)
+                                    .clickable { thinkingMenuExpanded = true }
+                                    .padding(horizontal = OrbitSpacing.md, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    text = selectedEffort?.let { OrbitFormatters.effortLabel(it) } ?: "Auto",
+                                    style = typography.subheadMedium,
+                                    color = colors.fgPrimary,
                                 )
+                                Icon(
+                                    imageVector = Icons.Outlined.KeyboardArrowDown,
+                                    contentDescription = null,
+                                    tint = colors.fgSecondary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            }
+                            OrbitCompactDropdownMenu(
+                                expanded = thinkingMenuExpanded,
+                                onDismissRequest = { thinkingMenuExpanded = false },
+                                width = 264.dp,
+                            ) {
+                                OrbitMenuSectionHeader(title = "Reasoning Effort")
+                                thinkingOptions.forEach { opt ->
+                                    val isCurrent = opt.effort == selectedEffort
+                                    OrbitMenuOptionRow(
+                                        title = OrbitFormatters.effortLabel(opt.effort),
+                                        subtitle = opt.description?.takeIf { it.isNotBlank() },
+                                        selected = isCurrent,
+                                        onClick = {
+                                            thinkingMenuExpanded = false
+                                            selectedEffort = opt.effort
+                                            onSelectEffort(opt.effort)
+                                            onSelect(selectedProvider, activeModelSpec?.id, opt.effort)
+                                        },
+                                    )
+                                }
                             }
                         }
                     }
                 }
+            } else {
+                Spacer(modifier = Modifier.size(OrbitSpacing.xs))
             }
-
-            Spacer(modifier = Modifier.height(OrbitSpacing.xs))
         }
     }
-}
-
-private fun stripRedundantModelPrefix(
-    label: String,
-    modelId: String,
-    rawDescription: String,
-): String {
-    var trimmed = rawDescription.trim()
-    if (trimmed.isEmpty()) return ""
-    val prefixes = listOf(
-        "$label · ",
-        "$label - ",
-        "$label — ",
-        "$modelId · ",
-        "$modelId - ",
-    )
-    for (p in prefixes) {
-        if (trimmed.startsWith(p, ignoreCase = true)) {
-            trimmed = trimmed.substring(p.length).trim()
-            break
-        }
-    }
-    return if (trimmed.equals(label, ignoreCase = true)) "" else trimmed
 }

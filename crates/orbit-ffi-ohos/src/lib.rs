@@ -49,6 +49,7 @@ fn parse_badges_json(raw: Option<&str>) -> Result<Vec<PromptBadge>, String> {
 }
 
 /// Pure-Rust JSON facade shared by both host unit tests and the HarmonyOS N-API wrapper.
+#[derive(Clone)]
 pub struct OhosCoreFacade {
     inner: Arc<OrbitAppCore>,
 }
@@ -401,6 +402,20 @@ impl OhosCoreFacade {
         serde_json::to_string(&self.inner.workspace_files(host_id, cwd)).map_err(|e| e.to_string())
     }
 
+    pub fn stage_attachment_json(
+        &self,
+        host_id: &str,
+        filename: &str,
+        mime_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<String, String> {
+        let staged = self
+            .inner
+            .stage_attachment(host_id, filename, mime_type, bytes)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&staged).map_err(|e| e.to_string())
+    }
+
     pub fn start_terminal(&self, host_id: &str, cwd: &str, cols: u16, rows: u16) {
         self.inner.start_terminal(host_id, cwd, cols, rows);
     }
@@ -448,6 +463,35 @@ mod ohos_napi {
     #[napi]
     pub struct OrbitHarmonyCore {
         facade: OhosCoreFacade,
+    }
+
+    pub struct StageAttachmentTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        filename: String,
+        mime_type: Option<String>,
+        bytes: Vec<u8>,
+    }
+
+    impl Task for StageAttachmentTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            let bytes = std::mem::take(&mut self.bytes);
+            self.facade
+                .stage_attachment_json(
+                    &self.host_id,
+                    &self.filename,
+                    self.mime_type.as_deref(),
+                    bytes,
+                )
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
     }
 
     #[napi]
@@ -829,6 +873,23 @@ mod ohos_napi {
             self.facade
                 .workspace_files_json(&host_id, &cwd)
                 .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn stage_attachment_json(
+            &self,
+            host_id: String,
+            filename: String,
+            mime_type: Option<String>,
+            bytes: Uint8Array,
+        ) -> AsyncTask<StageAttachmentTask> {
+            AsyncTask::new(StageAttachmentTask {
+                facade: self.facade.clone(),
+                host_id,
+                filename,
+                mime_type,
+                bytes: bytes.to_vec(),
+            })
         }
 
         #[napi]

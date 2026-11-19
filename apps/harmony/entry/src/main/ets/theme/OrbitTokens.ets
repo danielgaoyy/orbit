@@ -1,260 +1,356 @@
+import { ColorMetrics, CustomColors, CustomTheme } from '@kit.ArkUI';
+import { common2D, drawing } from '@kit.ArkGraphics2D';
+import { orbitLogWarn } from '../model/OrbitLogger';
+
+class OrbitCustomColors implements CustomColors {
+  public brand: ResourceColor = $r('app.color.orbit_brand');
+  public fontEmphasize: ResourceColor = $r('app.color.orbit_brand');
+  public iconEmphasize: ResourceColor = $r('app.color.orbit_brand');
+  public iconSubEmphasize: ResourceColor = $r('app.color.orbit_brand');
+  public backgroundEmphasize: ResourceColor = $r('app.color.orbit_brand');
+  public compBackgroundEmphasize: ResourceColor = $r('app.color.orbit_brand');
+  public compEmphasizeSecondary: ResourceColor = $r('app.color.orbit_accent_soft');
+  public compEmphasizeTertiary: ResourceColor = $r('app.color.orbit_accent_soft');
+  public fontOnPrimary: ResourceColor = $r('app.color.orbit_on_brand');
+  public iconOnPrimary: ResourceColor = $r('app.color.orbit_on_brand');
+  public interactiveFocus: ResourceColor = $r('app.color.orbit_brand');
+  public interactiveActive: ResourceColor = $r('app.color.orbit_brand');
+}
+
+class OrbitBrandTheme implements CustomTheme {
+  public colors: CustomColors = new OrbitCustomColors();
+}
+
+export const ORBIT_DEFAULT_THEME: CustomTheme = new OrbitBrandTheme();
+
+export function orbitColorMetrics(color: ResourceColor): ColorMetrics | undefined {
+  try {
+    return ColorMetrics.resourceColor(color);
+  } catch (err) {
+    orbitLogWarn('OrbitTokens', 'Failed to convert ColorMetrics', err as Object);
+    return undefined;
+  }
+}
+
+export function orbitSegmentSelectedBg(palette: OrbitThemePalette): ColorMetrics | undefined {
+  return orbitColorMetrics(palette.isDark ? '#F4F4F6' : '#141416');
+}
+
+export function orbitSegmentSelectedFg(palette: OrbitThemePalette): ColorMetrics | undefined {
+  return orbitColorMetrics(palette.isDark ? '#141416' : '#FFFFFF');
+}
+
+export function orbitTintColorFilter(hexColor: string): drawing.ColorFilter | undefined {
+  try {
+    const clean = hexColor.startsWith('#') ? hexColor.substring(1) : hexColor;
+    let alpha = 255;
+    let red = 0;
+    let green = 0;
+    let blue = 0;
+    if (clean.length === 8) {
+      alpha = parseInt(clean.substring(0, 2), 16);
+      red = parseInt(clean.substring(2, 4), 16);
+      green = parseInt(clean.substring(4, 6), 16);
+      blue = parseInt(clean.substring(6, 8), 16);
+    } else if (clean.length === 6) {
+      red = parseInt(clean.substring(0, 2), 16);
+      green = parseInt(clean.substring(2, 4), 16);
+      blue = parseInt(clean.substring(4, 6), 16);
+    } else {
+      return undefined;
+    }
+    const argb: common2D.Color = {
+      alpha: isNaN(alpha) ? 255 : alpha,
+      red: isNaN(red) ? 0 : red,
+      green: isNaN(green) ? 0 : green,
+      blue: isNaN(blue) ? 0 : blue,
+    };
+    return drawing.ColorFilter.createBlendModeColorFilter(argb, drawing.BlendMode.SRC_IN);
+  } catch (err) {
+    orbitLogWarn('OrbitTokens', 'Failed to create ColorFilter', err as Object);
+    return undefined;
+  }
+}
+
 export class OrbitTokens {
-  // Strict 4-Tier Typography Scale (fp)
-  public static readonly FONT_TITLE: number = 18;
-  public static readonly LH_TITLE: number = 24;
+  // HarmonyOS 7 Official Typography Scale ($r('sys.float.*'))
+  public static readonly FONT_TITLE_RES: Resource = $r('sys.float.Title_S');       // 20fp
+  public static readonly FONT_SUBTITLE_RES: Resource = $r('sys.float.Subtitle_M'); // 16fp
+  public static readonly FONT_BODY_RES: Resource = $r('sys.float.Body_L');         // 16fp
+  public static readonly FONT_SUBHEAD_RES: Resource = $r('sys.float.Body_M');      // 14fp
+  public static readonly FONT_META_RES: Resource = $r('sys.float.Body_S');         // 12fp
+  public static readonly FONT_CAPTION_RES: Resource = $r('sys.float.Caption_M');   // 10fp
 
-  public static readonly FONT_BODY: number = 15;
-  public static readonly LH_BODY: number = 22;
-
-  public static readonly FONT_SUBHEAD: number = 13;
-  public static readonly LH_SUBHEAD: number = 18;
-
+  // Numeric equivalents strictly for Span / LengthMetrics APIs that require numeric fp
+  public static readonly FONT_TITLE: number = 20;
+  public static readonly FONT_BODY: number = 16;
+  public static readonly FONT_SUBHEAD: number = 14;
   public static readonly FONT_META: number = 12;
-  public static readonly LH_META: number = 16;
 
-  public static readonly FAMILY_SANS: string = 'HarmonyOS Sans';
+  public static readonly MAX_FONT_SCALE_CHROME: number = 1.45;
+  public static readonly MAX_FONT_SCALE_BODY: number = 2.0;
+
   public static readonly FAMILY_MONO: string = 'HarmonyOS Sans Mono';
 
-  // Strict 4vp Spatial Grid (vp)
+  // HarmonyOS 7 Spatial Grid (vp)
   public static readonly SPACE_XS: number = 4;
   public static readonly SPACE_SM: number = 8;
   public static readonly SPACE_MD: number = 12;
   public static readonly SPACE_LG: number = 16;
   public static readonly SPACE_XL: number = 24;
-  public static readonly SPACE_XXL: number = 32;
 
-  // Hit Targets, Radii & Hairline
-  public static readonly HIT_MIN: number = 44;
-  public static readonly TOP_BAR_HEIGHT: number = 52;
-  public static readonly TOAST_OFFSET_TOP: number = 56;
-  public static readonly COMPOSER_RADIUS: number = 20;
-  public static readonly CARD_RADIUS: number = 12;
-  public static readonly PILL_RADIUS: number = 8;
+  // HarmonyOS 7 Corner Radius Tokens ($r('sys.float.corner_radius_level*'))
+  public static readonly RADIUS_XS: Resource = $r('sys.float.corner_radius_level2');  // 4vp
+  public static readonly RADIUS_SM: Resource = $r('sys.float.corner_radius_level4');  // 8vp
+  public static readonly RADIUS_MD: Resource = $r('sys.float.corner_radius_level6');  // 12vp
+  public static readonly RADIUS_LG: Resource = $r('sys.float.corner_radius_level8');  // 16vp
+  public static readonly RADIUS_XL: Resource = $r('sys.float.corner_radius_level10'); // 20vp
+  public static readonly RADIUS_XXL: Resource = $r('sys.float.corner_radius_level12'); // 24vp
+
+  // Touch Targets & Chrome Metrics (HarmonyOS 7: 48vp primary / 40vp compact)
+  public static readonly HIT_MIN: number = 48;
+  public static readonly HIT_COMPACT: number = 40;
+  public static readonly TOP_BAR_HEIGHT: number = 56;
   public static readonly DOT_SIZE: number = 6;
   public static readonly HAIRLINE: number = 0.5;
 
-  // Multi-Form-Factor Breakpoints:
-  // - Phone (< 700vp): Single-column Stage + Overlay FleetSidebar (260vp)
-  // - Dual-Fold / Portrait Tablet (700..1023vp): 2-column (FleetSidebar 260vp + Stage >= 440vp), Git Diff in bindSheet
-  // - Mate XT Full 3-Screen Unfolded / Landscape MatePad (>= 1024vp): 3-column (FleetSidebar 260vp + Stage + GitDiffInspector 360vp)
+  // Multi-Form-Factor Breakpoints
   public static readonly BP_FOLDABLE_MIN: number = 700;
   public static readonly BP_EXPANDED_MIN: number = 1024;
-  public static readonly SIDEBAR_FOLD_WIDTH: number = 260;
-  public static readonly SIDEBAR_EXPANDED_WIDTH: number = 260;
+  public static readonly SIDEBAR_FOLD_WIDTH: number = 280;
   public static readonly DIFF_PANE_EXPANDED_WIDTH: number = 360;
 }
 
+/**
+ * Pure HarmonyOS 7 native semantic palette backed exclusively by `$r('sys.color.*')`
+ * and dual `base/` + `dark/` `$r('app.color.*')` resources so `configColorModeChangePerformanceInArkUI`
+ * performs zero-JS-rebuild dark/light transitions natively.
+ */
 export interface OrbitThemePalette {
   id: string;
   isDark: boolean;
-  canvas: string;
-  drawer: string;
-  elevated: string;
-  code: string;
-  subtleSurface: string;
-  userBubble: string;
-  fgPrimary: string;
-  fgSecondary: string;
-  fgMuted: string;
-  hairline: string;
-  accentPrimary: string;
-  accentPrimaryFill: string;
-  accentPrimarySoft: string;
-  onAccent: string;
-  statusDirect: string;
-  statusDirectSoft: string;
-  statusRelay: string;
-  statusRelaySoft: string;
-  statusWarning: string;
-  statusWarningSoft: string;
-  statusDanger: string;
-  statusDangerSoft: string;
-  diffAddedBg: string;
-  diffRemovedBg: string;
+  canvas: ResourceColor;
+  drawer: ResourceColor;
+  elevated: ResourceColor;
+  listCard: ResourceColor;
+  code: ResourceColor;
+  subtleSurface: ResourceColor;
+  userBubble: ResourceColor;
+  fgPrimary: ResourceColor;
+  fgSecondary: ResourceColor;
+  fgMuted: ResourceColor;
+  iconPrimary: ResourceColor;
+  iconSecondary: ResourceColor;
+  hairline: ResourceColor;
+  accentPrimary: ResourceColor;
+  accentPrimaryFill: ResourceColor;
+  accentPrimarySoft: ResourceColor;
+  onAccent: ResourceColor;
+  statusDirect: ResourceColor;
+  statusDirectSoft: ResourceColor;
+  statusRelay: ResourceColor;
+  statusRelaySoft: ResourceColor;
+  statusWarning: ResourceColor;
+  statusWarningSoft: ResourceColor;
+  statusDanger: ResourceColor;
+  statusDangerSoft: ResourceColor;
+  diffAddedBg: ResourceColor;
+  diffRemovedBg: ResourceColor;
+  terminalBg: ResourceColor;
+  terminalFg: ResourceColor;
+  unreadBadge: ResourceColor;
+  scrim: ResourceColor;
+  overlayPillBg: ResourceColor;
+  // Raw hex strings strictly for non-Resource APIs (drawing.ColorFilter)
+  tintPrimaryHex: string;
+  tintMutedHex: string;
+  tintDirectHex: string;
+  tintWarningHex: string;
+  tintDangerHex: string;
 }
 
-export const LIGHT_PALETTE: OrbitThemePalette = {
+const SHARED_NATIVE_COLORS_LIGHT: OrbitThemePalette = {
   id: 'light',
   isDark: false,
-  canvas: '#FFFFFF',
-  drawer: '#F6F7F9',
-  elevated: '#FFFFFF',
-  code: '#F8F9FB',
-  subtleSurface: '#EFF1F5',
-  userBubble: '#F3F5F8',
-  fgPrimary: '#18191D',
-  fgSecondary: '#686B75',
-  fgMuted: '#9CA0AB',
-  hairline: '#14000000',
-  accentPrimary: '#2B5CE6',
-  accentPrimaryFill: '#2B5CE6',
-  accentPrimarySoft: '#142B5CE6',
-  onAccent: '#FFFFFF',
-  statusDirect: '#16A34A',
-  statusDirectSoft: '#1416A34A',
-  statusRelay: '#7C3AED',
-  statusRelaySoft: '#147C3AED',
-  statusWarning: '#D97706',
-  statusWarningSoft: '#16D97706',
-  statusDanger: '#DC2626',
-  statusDangerSoft: '#14DC2626',
-  diffAddedBg: '#1616A34A',
-  diffRemovedBg: '#16DC2626'
+  canvas: $r('sys.color.background_primary'),
+  drawer: $r('sys.color.background_secondary'),
+  elevated: $r('sys.color.comp_background_primary'),
+  listCard: $r('sys.color.comp_background_list_card'),
+  code: $r('app.color.orbit_code_bg'),
+  subtleSurface: $r('sys.color.comp_background_tertiary'),
+  userBubble: $r('sys.color.comp_background_list_card'),
+  fgPrimary: $r('sys.color.font_primary'),
+  fgSecondary: $r('sys.color.font_secondary'),
+  fgMuted: $r('sys.color.font_tertiary'),
+  iconPrimary: $r('sys.color.icon_primary'),
+  iconSecondary: $r('sys.color.icon_secondary'),
+  hairline: $r('sys.color.comp_divider'),
+  accentPrimary: $r('app.color.orbit_brand'),
+  accentPrimaryFill: $r('app.color.orbit_brand'),
+  accentPrimarySoft: $r('app.color.orbit_accent_soft'),
+  onAccent: $r('app.color.orbit_on_brand'),
+  statusDirect: $r('sys.color.confirm'),
+  statusDirectSoft: $r('app.color.orbit_status_direct_soft'),
+  statusRelay: $r('app.color.orbit_status_relay'),
+  statusRelaySoft: $r('app.color.orbit_status_relay_soft'),
+  statusWarning: $r('sys.color.warning'),
+  statusWarningSoft: $r('app.color.orbit_status_warning_soft'),
+  statusDanger: $r('sys.color.alert'),
+  statusDangerSoft: $r('app.color.orbit_status_danger_soft'),
+  diffAddedBg: $r('app.color.orbit_diff_added_bg'),
+  diffRemovedBg: $r('app.color.orbit_diff_removed_bg'),
+  terminalBg: $r('app.color.orbit_terminal_bg'),
+  terminalFg: $r('app.color.orbit_terminal_fg'),
+  unreadBadge: $r('app.color.orbit_badge_unread'),
+  scrim: $r('app.color.orbit_scrim'),
+  overlayPillBg: $r('app.color.orbit_overlay_pill_bg'),
+  tintPrimaryHex: '#E6000000',
+  tintMutedHex: '#99000000',
+  tintDirectHex: '#FF64BB5C',
+  tintWarningHex: '#FFED6F21',
+  tintDangerHex: '#FFE84026'
 };
 
-export const GRAPHITE_DARK_PALETTE: OrbitThemePalette = {
+const SHARED_NATIVE_COLORS_DARK: OrbitThemePalette = {
   id: 'dark',
   isDark: true,
-  canvas: '#17181C',
-  drawer: '#111216',
-  elevated: '#202227',
-  code: '#121418',
-  subtleSurface: '#262930',
-  userBubble: '#22252C',
-  fgPrimary: '#EFEFF2',
-  fgSecondary: '#969AA6',
-  fgMuted: '#636773',
-  hairline: '#14FFFFFF',
-  accentPrimary: '#6B93F6',
-  accentPrimaryFill: '#2B5CE6',
-  accentPrimarySoft: '#226B93F6',
-  onAccent: '#FFFFFF',
-  statusDirect: '#34D399',
-  statusDirectSoft: '#1E34D399',
-  statusRelay: '#A78BFA',
-  statusRelaySoft: '#1EA78BFA',
-  statusWarning: '#FBBF24',
-  statusWarningSoft: '#1EFBBF24',
-  statusDanger: '#F87171',
-  statusDangerSoft: '#1EF87171',
-  diffAddedBg: '#1F34D399',
-  diffRemovedBg: '#1FF87171'
+  canvas: $r('sys.color.background_primary'),
+  drawer: $r('sys.color.background_secondary'),
+  elevated: $r('sys.color.comp_background_primary'),
+  listCard: $r('sys.color.comp_background_list_card'),
+  code: $r('app.color.orbit_code_bg'),
+  subtleSurface: $r('sys.color.comp_background_tertiary'),
+  userBubble: $r('sys.color.comp_background_list_card'),
+  fgPrimary: $r('sys.color.font_primary'),
+  fgSecondary: $r('sys.color.font_secondary'),
+  fgMuted: $r('sys.color.font_tertiary'),
+  iconPrimary: $r('sys.color.icon_primary'),
+  iconSecondary: $r('sys.color.icon_secondary'),
+  hairline: $r('sys.color.comp_divider'),
+  accentPrimary: $r('app.color.orbit_brand'),
+  accentPrimaryFill: $r('app.color.orbit_brand'),
+  accentPrimarySoft: $r('app.color.orbit_accent_soft'),
+  onAccent: $r('app.color.orbit_on_brand'),
+  statusDirect: $r('sys.color.confirm'),
+  statusDirectSoft: $r('app.color.orbit_status_direct_soft'),
+  statusRelay: $r('app.color.orbit_status_relay'),
+  statusRelaySoft: $r('app.color.orbit_status_relay_soft'),
+  statusWarning: $r('sys.color.warning'),
+  statusWarningSoft: $r('app.color.orbit_status_warning_soft'),
+  statusDanger: $r('sys.color.alert'),
+  statusDangerSoft: $r('app.color.orbit_status_danger_soft'),
+  diffAddedBg: $r('app.color.orbit_diff_added_bg'),
+  diffRemovedBg: $r('app.color.orbit_diff_removed_bg'),
+  terminalBg: $r('app.color.orbit_terminal_bg'),
+  terminalFg: $r('app.color.orbit_terminal_fg'),
+  unreadBadge: $r('app.color.orbit_badge_unread'),
+  scrim: $r('app.color.orbit_scrim'),
+  overlayPillBg: $r('app.color.orbit_overlay_pill_bg'),
+  tintPrimaryHex: '#DBFFFFFF',
+  tintMutedHex: '#99FFFFFF',
+  tintDirectHex: '#FF64BB5C',
+  tintWarningHex: '#FFED6F21',
+  tintDangerHex: '#FFE84026'
 };
 
-export const OLED_PURE_PALETTE: OrbitThemePalette = {
-  id: 'oled',
-  isDark: true,
-  canvas: '#000000',
-  drawer: '#08090B',
-  elevated: '#121317',
-  code: '#0A0B0E',
-  subtleSurface: '#17191F',
-  userBubble: '#14161B',
-  fgPrimary: '#F4F4F6',
-  fgSecondary: '#8E929E',
-  fgMuted: '#5C606B',
-  hairline: '#1CFFFFFF',
-  accentPrimary: '#6B93F6',
-  accentPrimaryFill: '#2B5CE6',
-  accentPrimarySoft: '#246B93F6',
-  onAccent: '#FFFFFF',
-  statusDirect: '#34D399',
-  statusDirectSoft: '#2034D399',
-  statusRelay: '#A78BFA',
-  statusRelaySoft: '#20A78BFA',
-  statusWarning: '#FBBF24',
-  statusWarningSoft: '#20FBBF24',
-  statusDanger: '#F87171',
-  statusDangerSoft: '#20F87171',
-  diffAddedBg: '#2234D399',
-  diffRemovedBg: '#22F87171'
-};
+export const LIGHT_PALETTE: OrbitThemePalette = SHARED_NATIVE_COLORS_LIGHT;
+export const DARK_PALETTE: OrbitThemePalette = SHARED_NATIVE_COLORS_DARK;
 
 export function resolveOrbitPalette(themeMode: string, systemIsDark: boolean): OrbitThemePalette {
   if (themeMode === 'light') {
     return LIGHT_PALETTE;
   }
-  if (themeMode === 'oled') {
-    return OLED_PURE_PALETTE;
+  if (themeMode === 'dark') {
+    return DARK_PALETTE;
   }
-  if (themeMode === 'system') {
-    return systemIsDark ? GRAPHITE_DARK_PALETTE : LIGHT_PALETTE;
-  }
-  return GRAPHITE_DARK_PALETTE;
+  return systemIsDark ? DARK_PALETTE : LIGHT_PALETTE;
 }
 
-// Centralized ArkUI V2 AttributeModifiers & Span Font Presets — ALL .fontSize() calls live strictly here.
+// Centralized ArkUI V2 AttributeModifiers using HarmonyOS 7 `$r('sys.float.*')` & scalable `maxFontScale`
 
 export class OrbitTextModifier implements AttributeModifier<TextAttribute> {
-  private readonly sizeFp: number;
-  private readonly lineHeightVp: number;
+  private readonly sizeRes: Resource;
   private readonly color: ResourceColor;
   private readonly weight: FontWeight;
-  private readonly family: string;
+  private readonly mono: boolean;
+  private readonly maxScale: number;
 
   constructor(
-    sizeFp: number,
-    lineHeightVp: number,
+    sizeRes: Resource,
     color: ResourceColor,
     weight: FontWeight,
-    family: string
+    mono: boolean = false,
+    maxScale: number = OrbitTokens.MAX_FONT_SCALE_BODY
   ) {
-    this.sizeFp = sizeFp;
-    this.lineHeightVp = lineHeightVp;
+    this.sizeRes = sizeRes;
     this.color = color;
     this.weight = weight;
-    this.family = family;
+    this.mono = mono;
+    this.maxScale = maxScale;
   }
 
   applyNormalAttribute(instance: TextAttribute): void {
-    instance.fontSize(this.sizeFp);
-    instance.lineHeight(this.lineHeightVp);
+    instance.fontSize(this.sizeRes);
     instance.fontWeight(this.weight);
-    instance.fontFamily(this.family);
     instance.fontColor(this.color);
+    instance.maxFontScale(this.maxScale);
+    if (this.mono) {
+      instance.fontFamily(OrbitTokens.FAMILY_MONO);
+    }
   }
 }
 
 export class OrbitButtonModifier implements AttributeModifier<ButtonAttribute> {
-  private readonly sizeFp: number;
+  private readonly sizeRes: Resource;
   private readonly fgColor: ResourceColor;
   private readonly bgColor: ResourceColor;
-  private readonly family: string;
 
-  constructor(sizeFp: number, fgColor: ResourceColor, bgColor: ResourceColor, family: string) {
-    this.sizeFp = sizeFp;
+  constructor(sizeRes: Resource, fgColor: ResourceColor, bgColor: ResourceColor) {
+    this.sizeRes = sizeRes;
     this.fgColor = fgColor;
     this.bgColor = bgColor;
-    this.family = family;
   }
 
   applyNormalAttribute(instance: ButtonAttribute): void {
-    instance.fontSize(this.sizeFp);
+    instance.fontSize(this.sizeRes);
     instance.fontWeight(FontWeight.Medium);
-    instance.fontFamily(this.family);
     instance.fontColor(this.fgColor);
     instance.backgroundColor(this.bgColor);
+    instance.stateEffect(true);
   }
 }
 
 export class OrbitInputModifier implements AttributeModifier<TextInputAttribute> {
-  private readonly sizeFp: number;
+  private readonly sizeRes: Resource;
   private readonly fgColor: ResourceColor;
   private readonly placeholderColor: ResourceColor;
   private readonly bgColor: ResourceColor;
-  private readonly family: string;
+  private readonly mono: boolean;
 
   constructor(
-    sizeFp: number,
+    sizeRes: Resource,
     fgColor: ResourceColor,
     placeholderColor: ResourceColor,
     bgColor: ResourceColor,
-    family: string
+    mono: boolean = false
   ) {
-    this.sizeFp = sizeFp;
+    this.sizeRes = sizeRes;
     this.fgColor = fgColor;
     this.placeholderColor = placeholderColor;
     this.bgColor = bgColor;
-    this.family = family;
+    this.mono = mono;
   }
 
   applyNormalAttribute(instance: TextInputAttribute): void {
-    instance.fontSize(this.sizeFp);
-    instance.fontFamily(this.family);
+    instance.fontSize(this.sizeRes);
     instance.fontColor(this.fgColor);
     instance.placeholderColor(this.placeholderColor);
-    instance.placeholderFont({ size: this.sizeFp, family: this.family });
+    instance.placeholderFont({ size: this.sizeRes });
     instance.backgroundColor(this.bgColor);
+    instance.maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME);
+    if (this.mono) {
+      instance.fontFamily(OrbitTokens.FAMILY_MONO);
+    }
   }
 }
 
@@ -268,171 +364,182 @@ export class OrbitComposerAreaModifier implements AttributeModifier<TextAreaAttr
   }
 
   applyNormalAttribute(instance: TextAreaAttribute): void {
-    instance.fontSize(OrbitTokens.FONT_BODY);
-    instance.lineHeight(OrbitTokens.LH_BODY);
-    instance.fontFamily(OrbitTokens.FAMILY_SANS);
+    instance.fontSize(OrbitTokens.FONT_BODY_RES);
     instance.fontColor(this.fgColor);
     instance.placeholderColor(this.placeholderColor);
-    instance.placeholderFont({
-      size: OrbitTokens.FONT_BODY,
-      family: OrbitTokens.FAMILY_SANS
-    });
+    instance.placeholderFont({ size: OrbitTokens.FONT_BODY_RES });
     instance.backgroundColor(Color.Transparent);
+    instance.maxFontScale(OrbitTokens.MAX_FONT_SCALE_BODY);
   }
+}
+
+export class OrbitSurfaceModifier implements AttributeModifier<CommonAttribute> {
+  private readonly bg: ResourceColor;
+  private readonly borderCol: ResourceColor;
+  private readonly borderWidth: number;
+  private readonly shadowStyle?: ShadowStyle;
+
+  constructor(
+    bg: ResourceColor,
+    borderCol: ResourceColor,
+    borderWidth: number = OrbitTokens.HAIRLINE,
+    shadowStyle?: ShadowStyle
+  ) {
+    this.bg = bg;
+    this.borderCol = borderCol;
+    this.borderWidth = borderWidth;
+    this.shadowStyle = shadowStyle;
+  }
+
+  applyNormalAttribute(instance: CommonAttribute): void {
+    instance.backgroundColor(this.bg);
+    if (this.borderWidth > 0) {
+      instance.border({ width: this.borderWidth, color: this.borderCol });
+    }
+    if (this.shadowStyle !== undefined) {
+      instance.shadow(this.shadowStyle);
+    }
+  }
+}
+
+// Modifier caches to avoid per-render heap allocations for common presets
+const textModifierCache: Map<string, OrbitTextModifier> = new Map<string, OrbitTextModifier>();
+
+function cachedTextMod(
+  tierKey: string,
+  sizeRes: Resource,
+  color: ResourceColor,
+  weight: FontWeight,
+  mono: boolean,
+  maxScale: number
+): OrbitTextModifier {
+  const colorKey = typeof color === 'string'
+    ? color
+    : `${(color as Resource).id ?? 0}_${(color as Resource).bundleName ?? ''}`;
+  const key = `${tierKey}|${colorKey}|${weight}|${mono ? 1 : 0}|${maxScale}`;
+  const existing = textModifierCache.get(key);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const mod = new OrbitTextModifier(sizeRes, color, weight, mono, maxScale);
+  textModifierCache.set(key, mod);
+  return mod;
 }
 
 export function orbitTextTitle(
   color: ResourceColor,
   weight: FontWeight = FontWeight.Bold
 ): OrbitTextModifier {
-  return new OrbitTextModifier(
-    OrbitTokens.FONT_TITLE,
-    OrbitTokens.LH_TITLE,
-    color,
-    weight,
-    OrbitTokens.FAMILY_SANS
-  );
+  return cachedTextMod('title', OrbitTokens.FONT_TITLE_RES, color, weight, false, OrbitTokens.MAX_FONT_SCALE_CHROME);
+}
+
+export function orbitTextSubtitle(
+  color: ResourceColor,
+  weight: FontWeight = FontWeight.Medium
+): OrbitTextModifier {
+  return cachedTextMod('subtitle', OrbitTokens.FONT_SUBTITLE_RES, color, weight, false, OrbitTokens.MAX_FONT_SCALE_CHROME);
 }
 
 export function orbitTextBody(
   color: ResourceColor,
   weight: FontWeight = FontWeight.Normal
 ): OrbitTextModifier {
-  return new OrbitTextModifier(
-    OrbitTokens.FONT_BODY,
-    OrbitTokens.LH_BODY,
-    color,
-    weight,
-    OrbitTokens.FAMILY_SANS
-  );
+  return cachedTextMod('body', OrbitTokens.FONT_BODY_RES, color, weight, false, OrbitTokens.MAX_FONT_SCALE_BODY);
 }
 
 export function orbitTextSubhead(
   color: ResourceColor,
-  weight: FontWeight = FontWeight.Medium
+  weight: FontWeight = FontWeight.Normal
 ): OrbitTextModifier {
-  return new OrbitTextModifier(
-    OrbitTokens.FONT_SUBHEAD,
-    OrbitTokens.LH_SUBHEAD,
-    color,
-    weight,
-    OrbitTokens.FAMILY_SANS
-  );
+  return cachedTextMod('subhead', OrbitTokens.FONT_SUBHEAD_RES, color, weight, false, OrbitTokens.MAX_FONT_SCALE_CHROME);
 }
 
 export function orbitTextMeta(
   color: ResourceColor,
   weight: FontWeight = FontWeight.Normal
 ): OrbitTextModifier {
-  return new OrbitTextModifier(
-    OrbitTokens.FONT_META,
-    OrbitTokens.LH_META,
-    color,
-    weight,
-    OrbitTokens.FAMILY_SANS
-  );
+  return cachedTextMod('meta', OrbitTokens.FONT_META_RES, color, weight, false, OrbitTokens.MAX_FONT_SCALE_CHROME);
+}
+
+export function orbitTextCaption(
+  color: ResourceColor,
+  weight: FontWeight = FontWeight.Normal
+): OrbitTextModifier {
+  return cachedTextMod('caption', OrbitTokens.FONT_CAPTION_RES, color, weight, false, OrbitTokens.MAX_FONT_SCALE_CHROME);
 }
 
 export function orbitTextMono(
   color: ResourceColor,
   weight: FontWeight = FontWeight.Normal
 ): OrbitTextModifier {
-  return new OrbitTextModifier(
-    OrbitTokens.FONT_META,
-    OrbitTokens.LH_META,
-    color,
-    weight,
-    OrbitTokens.FAMILY_MONO
-  );
+  return cachedTextMod('mono', OrbitTokens.FONT_META_RES, color, weight, true, OrbitTokens.MAX_FONT_SCALE_BODY);
 }
 
-export function orbitSpanTitleFont(weight: FontWeight = FontWeight.Bold): Font {
-  const f: Font = {
-    size: OrbitTokens.FONT_TITLE,
-    weight: weight,
-    family: OrbitTokens.FAMILY_SANS
+export function orbitSpanHeadingFont(level: number): Font {
+  const size = level <= 1 ? OrbitTokens.FONT_TITLE : (level === 2 ? 18 : OrbitTokens.FONT_BODY);
+  return {
+    size: size,
+    weight: FontWeight.Bold
   };
-  return f;
 }
 
 export function orbitSpanBodyFont(
   weight: FontWeight = FontWeight.Normal,
   italic: boolean = false
 ): Font {
-  const f: Font = {
+  return {
     size: OrbitTokens.FONT_BODY,
     weight: weight,
-    style: italic ? FontStyle.Italic : FontStyle.Normal,
-    family: OrbitTokens.FAMILY_SANS
+    style: italic ? FontStyle.Italic : FontStyle.Normal
   };
-  return f;
 }
 
-export function orbitSpanSubheadFont(weight: FontWeight = FontWeight.Medium): Font {
-  const f: Font = {
+export function orbitSpanSubheadFont(
+  weight: FontWeight = FontWeight.Normal,
+  italic: boolean = false
+): Font {
+  return {
     size: OrbitTokens.FONT_SUBHEAD,
     weight: weight,
-    family: OrbitTokens.FAMILY_SANS
+    style: italic ? FontStyle.Italic : FontStyle.Normal
   };
-  return f;
 }
 
-export function orbitSpanMetaFont(weight: FontWeight = FontWeight.Normal): Font {
-  const f: Font = {
+export function orbitSpanMetaFont(
+  weight: FontWeight = FontWeight.Normal,
+  italic: boolean = false
+): Font {
+  return {
     size: OrbitTokens.FONT_META,
     weight: weight,
-    family: OrbitTokens.FAMILY_SANS
+    style: italic ? FontStyle.Italic : FontStyle.Normal
   };
-  return f;
 }
 
 export function orbitSpanMonoFont(
   weight: FontWeight = FontWeight.Normal,
   italic: boolean = false
 ): Font {
-  const f: Font = {
+  return {
     size: OrbitTokens.FONT_META,
     weight: weight,
-    style: italic ? FontStyle.Italic : FontStyle.Normal,
-    family: OrbitTokens.FAMILY_MONO
+    family: OrbitTokens.FAMILY_MONO,
+    style: italic ? FontStyle.Italic : FontStyle.Normal
   };
-  return f;
 }
 
 export function orbitButtonSubhead(
   fgColor: ResourceColor,
   bgColor: ResourceColor
 ): OrbitButtonModifier {
-  return new OrbitButtonModifier(
-    OrbitTokens.FONT_SUBHEAD,
-    fgColor,
-    bgColor,
-    OrbitTokens.FAMILY_SANS
-  );
+  return new OrbitButtonModifier(OrbitTokens.FONT_SUBHEAD_RES, fgColor, bgColor);
 }
 
 export function orbitButtonMeta(
   fgColor: ResourceColor,
   bgColor: ResourceColor
 ): OrbitButtonModifier {
-  return new OrbitButtonModifier(
-    OrbitTokens.FONT_META,
-    fgColor,
-    bgColor,
-    OrbitTokens.FAMILY_SANS
-  );
-}
-
-export function orbitButtonMono(
-  fgColor: ResourceColor,
-  bgColor: ResourceColor
-): OrbitButtonModifier {
-  return new OrbitButtonModifier(
-    OrbitTokens.FONT_META,
-    fgColor,
-    bgColor,
-    OrbitTokens.FAMILY_MONO
-  );
+  return new OrbitButtonModifier(OrbitTokens.FONT_META_RES, fgColor, bgColor);
 }
 
 export function orbitInputSubhead(
@@ -440,13 +547,7 @@ export function orbitInputSubhead(
   placeholderColor: ResourceColor,
   bgColor: ResourceColor
 ): OrbitInputModifier {
-  return new OrbitInputModifier(
-    OrbitTokens.FONT_SUBHEAD,
-    fgColor,
-    placeholderColor,
-    bgColor,
-    OrbitTokens.FAMILY_SANS
-  );
+  return new OrbitInputModifier(OrbitTokens.FONT_SUBHEAD_RES, fgColor, placeholderColor, bgColor, false);
 }
 
 export function orbitInputMono(
@@ -454,13 +555,7 @@ export function orbitInputMono(
   placeholderColor: ResourceColor,
   bgColor: ResourceColor
 ): OrbitInputModifier {
-  return new OrbitInputModifier(
-    OrbitTokens.FONT_META,
-    fgColor,
-    placeholderColor,
-    bgColor,
-    OrbitTokens.FAMILY_MONO
-  );
+  return new OrbitInputModifier(OrbitTokens.FONT_META_RES, fgColor, placeholderColor, bgColor, true);
 }
 
 export function orbitComposerArea(
@@ -468,4 +563,69 @@ export function orbitComposerArea(
   placeholderColor: ResourceColor
 ): OrbitComposerAreaModifier {
   return new OrbitComposerAreaModifier(fgColor, placeholderColor);
+}
+
+export function orbitSurface(
+  bg: ResourceColor,
+  borderCol: ResourceColor = $r('sys.color.comp_divider'),
+  borderWidth: number = OrbitTokens.HAIRLINE,
+  shadowStyle?: ShadowStyle
+): OrbitSurfaceModifier {
+  return new OrbitSurfaceModifier(bg, borderCol, borderWidth, shadowStyle);
+}
+
+const ORBIT_LOCKFILE_NAMES: string[] = [
+  'cargo.lock', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock',
+  'bun.lock', 'bun.lockb', 'flake.lock', 'poetry.lock', 'uv.lock', 'oh-package-lock.json5'
+];
+
+const ORBIT_CODE_EXTS: string[] = [
+  'rs', 'ts', 'tsx', 'ets', 'js', 'jsx', 'mjs', 'cjs', 'py', 'go', 'swift',
+  'kt', 'kts', 'java', 'c', 'h', 'cc', 'cpp', 'hpp', 'cs', 'rb', 'php', 'lua',
+  'zig', 'nix', 'proto', 'graphql', 'gql', 'css', 'scss', 'less', 'html', 'vue', 'svelte'
+];
+
+export function resolveSemanticFileSymbol(basename: string): Resource {
+  const lower = basename.trim().toLowerCase();
+  if (ORBIT_LOCKFILE_NAMES.includes(lower) || lower.endsWith('.lock')) {
+    return $r('sys.symbol.lock');
+  }
+  if (
+    lower === 'dockerfile' ||
+    lower.startsWith('dockerfile.') ||
+    lower.startsWith('.env') ||
+    lower.includes('.config.')
+  ) {
+    return $r('sys.symbol.gearshape');
+  }
+  if (lower === 'makefile' || lower === 'justfile') {
+    return $r('sys.symbol.code_square');
+  }
+  if (lower === 'license' || lower.startsWith('readme') || lower.startsWith('changelog')) {
+    return $r('sys.symbol.doc_text');
+  }
+  const dotIdx = lower.lastIndexOf('.');
+  const ext = dotIdx >= 0 ? lower.substring(dotIdx + 1) : '';
+  if (ext === 'toml' || ext === 'yaml' || ext === 'yml' || ext === 'ini' || ext === 'conf' || ext === 'json5') {
+    return $r('sys.symbol.gearshape');
+  }
+  if (ext === 'sh' || ext === 'zsh' || ext === 'bash' || ext === 'fish' || ext === 'ps1') {
+    return $r('sys.symbol.code_square');
+  }
+  if (ext === 'md' || ext === 'mdx' || ext === 'txt' || ext === 'rst' || ext === 'json' || ext === 'jsonc') {
+    return $r('sys.symbol.doc_text');
+  }
+  if (
+    ext === 'png' || ext === 'jpg' || ext === 'jpeg' || ext === 'webp' ||
+    ext === 'gif' || ext === 'svg' || ext === 'ico' || ext === 'bmp' || ext === 'heic'
+  ) {
+    return $r('sys.symbol.picture');
+  }
+  if (ext === 'sql' || ext === 'sqlite' || ext === 'db') {
+    return $r('sys.symbol.archivebox');
+  }
+  if (ORBIT_CODE_EXTS.includes(ext)) {
+    return $r('sys.symbol.code');
+  }
+  return $r('sys.symbol.doc');
 }

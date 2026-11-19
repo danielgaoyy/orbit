@@ -32,6 +32,8 @@ export interface WorkSummaryResult {
   label: string;
   /** Active streaming summary label while steps are still in flight (e.g. `Reading omni-composer.tsx…`). */
   liveLabel: string;
+  /** Optional muted secondary context for live status (e.g. active thinking headline). */
+  liveDetail: string | null;
   /** Whether the primary `label` already embeds failure wording (e.g. `Command failed`). */
   labelIncludesFailure: boolean;
 }
@@ -64,25 +66,40 @@ export type TurnLiveSegment =
       label: string;
     };
 
+export interface TurnCompactionItem {
+  seq: number;
+  label: string;
+}
+
 export interface StageTurn {
   key: string;
   turnIndex: number;
   anchorSeq: number;
   userPrompt: Extract<TimelineItemView, { item_type: "user_prompt" }> | null;
   isCompactionCommand: boolean;
-  /** Intermediate steps prior to `terminalReply` (eligible for pre-reply auto-fold). */
+  /** Intermediate steps prior to `terminalReply` (all thinking, tool calls, resolved gates, and interim notes). */
   foldedSteps: TimelineItemView[];
   /** Aggregated counts of work performed inside `foldedSteps`. */
   workCounts: TurnWorkCounts;
   /** Settled summary sentence for `foldedSteps` (`Edited 2 files, ran a command`). */
   workSummaryLabel: string;
+  /** Active live status label while work is in flight (`Reading stream-stage.tsx…`, `Thinking`). */
+  workSummaryLiveLabel: string;
+  /** Optional secondary detail for live status (e.g. active thinking headline). */
+  workSummaryLiveDetail: string | null;
   /** Whether `workSummaryLabel` already states failure (`Command failed`). */
   workSummaryIncludesFailure: boolean;
+  /** Computed thinking duration in ms when timestamps span >= 1s. */
+  thoughtDurationMs: number | null;
+  /** Computed work duration in ms across `foldedSteps` up to `terminalReply` when >= 1s. */
+  workDurationMs: number | null;
   /** Final synthesis reply of the turn, kept visible when pre-reply work folds. */
   terminalReply: Extract<TimelineItemView, { item_type: "assistant_message" }> | null;
   /** Notices (warnings/errors) surfaced unconditionally so system alerts are never buried. */
   notices: Extract<TimelineItemView, { item_type: "notice" }>[];
-  /** Chronological segments used while the turn has not yet reached a terminal reply (or when unfolded). */
+  /** Context compaction notices preserved in chronological turn context. */
+  compactions: TurnCompactionItem[];
+  /** Chronological segments retained for API compatibility. */
   liveSegments: TurnLiveSegment[];
   /** Deduplicated per-file diff stats touched during this turn. */
   turnDiffs: TurnFileDiffSummary[];
@@ -92,6 +109,8 @@ export interface StageTurn {
   hasUnrecoveredError: boolean;
   /** Whether any tool call or message in this turn is currently in flight. */
   hasActiveItem: boolean;
+  /** Epoch milliseconds when this turn started (user prompt or first body item). */
+  startedAtMs: number | null;
   /** Epoch milliseconds when this turn completed (or latest body event timestamp). */
   completedAtMs: number | null;
 }
@@ -582,41 +601,77 @@ function summarizeSingleToolCall(
   }
 }
 
-function buildLiveStepLabel(item: TimelineItemView | undefined): string {
-  if (!item) return "Working…";
+function buildLiveStepStatus(item: TimelineItemView | undefined): {
+  label: string;
+  detail: string | null;
+} {
+  if (!item) return { label: "Working…", detail: null };
   if (item.item_type === "assistant_thinking") {
     const headline = extractThinkingHeadline(item.text, true);
-    return headline || "Thinking…";
+    if (headline) {
+      return { label: "Thinking", detail: headline };
+    }
+    return { label: "Thinking…", detail: null };
   }
   if (item.item_type !== "tool_call") {
-    return "Working…";
+    return { label: "Working…", detail: null };
   }
 
   switch (item.detail.kind) {
     case "file_read": {
       const name = basenameOfPath(item.detail.path);
-      return name ? `Reading ${name}…` : "Reading a file…";
+      return {
+        label: name ? `Reading ${name}…` : "Reading a file…",
+        detail: null,
+      };
     }
     case "file_edit": {
       const isCreate = isFileCreateToolCall(item);
       const name = basenameOfPath(item.detail.path);
       const verb = isCreate ? "Creating" : "Editing";
-      return name ? `${verb} ${name}…` : `${verb} a file…`;
+      return {
+        label: name ? `${verb} ${name}…` : `${verb} a file…`,
+        detail: null,
+      };
     }
     case "search": {
       const subkind = classifySearchTool(item.detail.query, item.summary_title);
-      if (subkind === "web") return "Searching the web…";
-      if (subkind === "glob") return "Looking for files…";
-      return "Searching files…";
+      if (subkind === "web") return { label: "Searching the web…", detail: null };
+      if (subkind === "glob") return { label: "Looking for files…", detail: null };
+      const q = item.detail.query.trim().replace(/\s+/g, " ");
+      return {
+        label: q.length >= 1 && q.length <= 28 ? `Searching "${q}"…` : "Searching files…",
+        detail: null,
+      };
     }
-    case "shell":
-      return "Running a command…";
-    case "subagent":
-      return "Running subagent…";
+    case "shell": {
+      const firstLine =
+        item.detail.command
+          .split(/\r?\n/)
+          .map((ln) => ln.replace(/\s+/g, " ").trim())
+          .find((ln) => ln.length > 0) ?? "";
+      if (!firstLine) {
+        return { label: "Running a command…", detail: null };
+      }
+      const shortCmd = firstLine.length > 36 ? firstLine.slice(0, 36).trimEnd() : firstLine;
+      const label = shortCmd.endsWith("…") ? `Running ${shortCmd}` : `Running ${shortCmd}…`;
+      return { label, detail: null };
+    }
+    case "subagent": {
+      const role = item.detail.role.trim().replace(/\s+/g, " ");
+      return {
+        label:
+          role.length >= 1 && role.length <= 28 ? `Running ${role}…` : "Running subagent…",
+        detail: null,
+      };
+    }
     case "generic": {
       const parsed = parseGenericToolName(item.detail.tool_name);
-      if (parsed.serverName) return `Using ${parsed.serverName}…`;
-      return parsed.displayLabel ? `Using ${parsed.displayLabel}…` : "Using a tool…";
+      if (parsed.serverName) return { label: `Using ${parsed.serverName}…`, detail: null };
+      return {
+        label: parsed.displayLabel ? `Using ${parsed.displayLabel}…` : "Using a tool…",
+        detail: null,
+      };
     }
   }
 }
@@ -793,7 +848,9 @@ export function summarizeWorkItems(
       .reverse()
       .find((it) => it.item_type === "tool_call" && it.status === "running") ??
     items[items.length - 1];
-  const liveLabel = buildLiveStepLabel(activeTail);
+  const liveStatus = buildLiveStepStatus(activeTail);
+  const liveLabel = liveStatus.label;
+  const liveDetail = liveStatus.detail;
 
   let label = "";
   let labelIncludesFailure = false;
@@ -996,6 +1053,7 @@ export function summarizeWorkItems(
     },
     label,
     liveLabel,
+    liveDetail,
     labelIncludesFailure,
   };
 }
@@ -1045,7 +1103,7 @@ function buildLiveSegments(bodyItems: TimelineItemView[]): TurnLiveSegment[] {
         item: it,
       });
     } else if (it.item_type === "notice") {
-      if (/compact/i.test(it.message)) {
+      if (it.level !== "error" && /compact/i.test(it.message)) {
         flushSteps(true);
         rawSegments.push({
           kind: "compaction",
@@ -1087,6 +1145,52 @@ function shallowItemsEqual(a: TimelineItemView[], b: TimelineItemView[]): boolea
   return true;
 }
 
+function validTimestampMs(item: TimelineItemView | null | undefined): number | null {
+  const ts = item?.timestamp_ms;
+  return typeof ts === "number" && Number.isFinite(ts) && ts > 0 ? ts : null;
+}
+
+function computeThoughtDurationFromTimestamps(
+  items: TimelineItemView[],
+  followingItem?: TimelineItemView | null,
+): number | null {
+  let firstIdx = -1;
+  let startTs: number | null = null;
+  for (let i = 0; i < items.length; i += 1) {
+    if (items[i].item_type === "assistant_thinking") {
+      const ts = validTimestampMs(items[i]);
+      if (ts !== null) {
+        firstIdx = i;
+        startTs = ts;
+        break;
+      }
+    }
+  }
+  if (firstIdx < 0 || startTs === null) return null;
+
+  let endTs: number | null = null;
+  for (let i = firstIdx + 1; i < items.length; i += 1) {
+    if (items[i].item_type !== "assistant_thinking") {
+      const ts = validTimestampMs(items[i]);
+      if (ts !== null) {
+        endTs = ts;
+        break;
+      }
+    }
+  }
+  if (
+    endTs === null &&
+    followingItem &&
+    followingItem.item_type !== "assistant_thinking"
+  ) {
+    endTs = validTimestampMs(followingItem);
+  }
+
+  if (endTs === null) return null;
+  const delta = endTs - startTs;
+  return delta >= 1000 ? delta : null;
+}
+
 function finalizeTurn(
   turnIndex: number,
   userPrompt: Extract<TimelineItemView, { item_type: "user_prompt" }> | null,
@@ -1115,6 +1219,7 @@ function finalizeTurn(
   );
 
   const notices: Extract<TimelineItemView, { item_type: "notice" }>[] = [];
+  const compactions: TurnCompactionItem[] = [];
   const nonNoticeBody: TimelineItemView[] = [];
   let hasError = false;
   let hasActiveItem = false;
@@ -1150,7 +1255,9 @@ function finalizeTurn(
     }
 
     if (it.item_type === "notice") {
-      if (!/compact/i.test(it.message)) {
+      if (it.level !== "error" && /compact/i.test(it.message)) {
+        compactions.push({ seq: it.seq, label: it.message });
+      } else {
         notices.push(it);
       }
       continue;
@@ -1168,7 +1275,7 @@ function finalizeTurn(
       break;
     }
     // If a tool call or thinking step occurred *after* the last assistant message,
-    // there is no final synthesis reply yet — keep steps in live segment view.
+    // there is no final synthesis reply yet — keep all steps folded together.
     if (isStepRowItem(candidate)) {
       break;
     }
@@ -1196,30 +1303,41 @@ function finalizeTurn(
   const foldedSteps =
     terminalReply !== null
       ? nonNoticeBody.slice(0, terminalReplyIndex)
-      : terminalReplyIndex === -1
-        ? nonNoticeBody
-        : [];
+      : nonNoticeBody;
 
-  const summary = summarizeWorkItems(foldedSteps);
-  const fullTurnToolSummary = summarizeWorkItems(nonNoticeBody);
+  const thoughtDurationMs = computeThoughtDurationFromTimestamps(foldedSteps, terminalReply);
+  const summary = summarizeWorkItems(foldedSteps, { thoughtDurationMs });
+  const fullTurnToolSummary = summarizeWorkItems(nonNoticeBody, { thoughtDurationMs });
 
-  let completedAtMs: number | null = terminalReply?.timestamp_ms ?? null;
+  const startedAtMs =
+    validTimestampMs(userPrompt) ??
+    bodyItems.map(validTimestampMs).find((v) => v !== null) ??
+    null;
+
+  const workStartMs =
+    foldedSteps.map(validTimestampMs).find((v) => v !== null) ??
+    validTimestampMs(userPrompt);
+  const workEndMs =
+    validTimestampMs(terminalReply) ??
+    [...foldedSteps].reverse().map(validTimestampMs).find((v) => v !== null) ??
+    null;
+  const workDurationMs =
+    workStartMs !== null && workEndMs !== null && workEndMs - workStartMs >= 1000
+      ? workEndMs - workStartMs
+      : null;
+
+  let completedAtMs: number | null = validTimestampMs(terminalReply);
   if (completedAtMs === null) {
     for (let i = bodyItems.length - 1; i >= 0; i -= 1) {
-      const ts = bodyItems[i]?.timestamp_ms;
-      if (typeof ts === "number" && Number.isFinite(ts) && ts > 0) {
+      const ts = validTimestampMs(bodyItems[i]);
+      if (ts !== null) {
         completedAtMs = ts;
         break;
       }
     }
   }
-  if (
-    completedAtMs === null &&
-    typeof userPrompt?.timestamp_ms === "number" &&
-    Number.isFinite(userPrompt.timestamp_ms) &&
-    userPrompt.timestamp_ms > 0
-  ) {
-    completedAtMs = userPrompt.timestamp_ms;
+  if (completedAtMs === null) {
+    completedAtMs = validTimestampMs(userPrompt);
   }
 
   const turn: StageTurn = {
@@ -1231,14 +1349,20 @@ function finalizeTurn(
     foldedSteps,
     workCounts: summary.counts,
     workSummaryLabel: summary.label,
+    workSummaryLiveLabel: summary.liveLabel,
+    workSummaryLiveDetail: summary.liveDetail,
     workSummaryIncludesFailure: summary.labelIncludesFailure,
+    thoughtDurationMs,
+    workDurationMs,
     terminalReply,
     notices,
+    compactions,
     liveSegments: buildLiveSegments(bodyItems),
     turnDiffs: Array.from(diffByPath.values()),
     hasError,
     hasUnrecoveredError: fullTurnToolSummary.counts.unrecoveredFailureCount > 0,
     hasActiveItem,
+    startedAtMs,
     completedAtMs,
   };
 
@@ -1288,6 +1412,31 @@ export function findFirstPendingPermission(
     }
   }
   return null;
+}
+
+export type FocusedDecisionTarget =
+  | { kind: "permission"; requestId: string }
+  | { kind: "question"; requestId: string }
+  | null;
+
+let activeFocusedDecisionTarget: FocusedDecisionTarget = null;
+
+/** Returns the decision card currently focused in `StickyApprovalDock`. */
+export function getFocusedDecisionTarget(): FocusedDecisionTarget {
+  return activeFocusedDecisionTarget;
+}
+
+/** Updates the currently visible decision target for scoped keyboard approval shortcuts. */
+export function setFocusedDecisionTarget(target: FocusedDecisionTarget): void {
+  activeFocusedDecisionTarget = target;
+}
+
+export function isDenyDecision(dec: string): boolean {
+  return /deny|reject|decline|cancel/i.test(dec);
+}
+
+export function isAlwaysDecision(dec: string): boolean {
+  return /always|session|forever/i.test(dec);
 }
 
 /**

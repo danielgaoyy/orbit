@@ -1,5 +1,4 @@
 import {
-  DiffFileDto,
   DiffLineDto,
   InlineSpanDto,
   PromptBadgeDto,
@@ -10,7 +9,8 @@ import {
   TurnFileDiffSummaryDto,
   TurnLiveSegmentDto,
   basenameOfPath,
-  formatCompactDuration
+  formatRelativeTimeLabel,
+  stripWorkspacePrefix
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
@@ -22,8 +22,10 @@ import {
   orbitTextBody,
   orbitTextMeta,
   orbitTextMono,
-  orbitTextSubhead
+  orbitTextSubhead,
+  resolveSemanticFileSymbol
 } from '../../theme/OrbitTokens';
+import { OrbitCopyIconButton } from '../common/OrbitCommonControls';
 import { RichMarkdownView } from './RichMarkdownView';
 
 interface MiniDiffPreviewRow {
@@ -33,10 +35,132 @@ interface MiniDiffPreviewRow {
   line: DiffLineDto | null;
 }
 
+interface CleanedPromptText {
+  body: string;
+  inferredSlash: string;
+}
+
+const LEGACY_WRAPPER_MARKERS: string[] = [
+  'Attached image file:',
+  'Referenced workspace files:',
+  'Working Tree Diff:',
+  'Staged Diff:',
+  'Active terminal output:',
+  'Reference `',
+  'Quoted diff lines:',
+  'Quoted assistant context:'
+];
+
+function cleanLegacyPromptText(rawText: string): CleanedPromptText {
+  let working = rawText.replace(/<WORKFLOW_INSTRUCTION[^>]*>[\s\S]*?<\/WORKFLOW_INSTRUCTION>\s*/gi, '').trim();
+
+  let startsWithLegacy = false;
+  for (let i = 0; i < LEGACY_WRAPPER_MARKERS.length; i++) {
+    if (working.startsWith(LEGACY_WRAPPER_MARKERS[i])) {
+      startsWithLegacy = true;
+      break;
+    }
+  }
+  if (startsWithLegacy && working.indexOf('\n\n') >= 0) {
+    const reqIdx = working.indexOf('<USER_REQUEST>');
+    if (reqIdx >= 0) {
+      working = working.substring(reqIdx + '<USER_REQUEST>'.length);
+      const endIdx = working.indexOf('</USER_REQUEST>');
+      if (endIdx >= 0) {
+        working = working.substring(0, endIdx);
+      }
+      working = working.trim();
+    } else {
+      const blocks = working.split('\n\n');
+      for (let b = blocks.length - 1; b >= 0; b--) {
+        const cand = blocks[b].trim();
+        let isMarker = false;
+        for (let m = 0; m < LEGACY_WRAPPER_MARKERS.length; m++) {
+          if (cand.startsWith(LEGACY_WRAPPER_MARKERS[m])) {
+            isMarker = true;
+            break;
+          }
+        }
+        if (cand.length > 0 && !isMarker && !cand.startsWith('```')) {
+          working = cand;
+          break;
+        }
+      }
+    }
+  }
+
+  const slashCmds: string[] = ['/plan', '/review', '/compact'];
+  const lower = working.toLowerCase();
+  for (let i = 0; i < slashCmds.length; i++) {
+    const cmd = slashCmds[i];
+    if (lower === cmd) {
+      return { body: '', inferredSlash: cmd };
+    }
+    if (lower.startsWith(`${cmd} `) || lower.startsWith(`${cmd}\n`) || lower.startsWith(`${cmd}\t`)) {
+      return {
+        body: working.substring(cmd.length).trim(),
+        inferredSlash: cmd
+      };
+    }
+  }
+  return { body: working, inferredSlash: '' };
+}
+
+function isBareCompactionPrompt(prompt: TimelineItemDto): boolean {
+  const cleaned = cleanLegacyPromptText(prompt.text ?? '');
+  const badges = prompt.badges ?? [];
+  let hasCompactBadge = false;
+  for (let i = 0; i < badges.length; i++) {
+    if (badges[i].kind === 'slash' && badges[i].label.toLowerCase() === '/compact') {
+      hasCompactBadge = true;
+      break;
+    }
+  }
+  if (hasCompactBadge && cleaned.body.length === 0) {
+    return true;
+  }
+  return (prompt.text ?? '').trim().toLowerCase() === '/compact';
+}
+
+function stepDescriptorSymbol(desc: ToolStepDescriptorDto | null): Resource {
+  if (desc === null) {
+    return $r('sys.symbol.wrench_and_screwdriver');
+  }
+  const k = desc.kind.toLowerCase();
+  if (k === 'file_read' || k === 'read') {
+    return resolveSemanticFileSymbol(basenameOfPath(desc.target));
+  }
+  if (k === 'file_edit' || k === 'file_create' || k === 'edit' || k === 'write') {
+    return $r('sys.symbol.doc_plaintext_and_pencil');
+  }
+  if (k === 'shell' || k === 'bash' || k === 'terminal') {
+    return $r('sys.symbol.code');
+  }
+  if (k === 'search' || k === 'web') {
+    const lowerTarget = desc.target.toLowerCase();
+    if (
+      lowerTarget.startsWith('http://') ||
+      lowerTarget.startsWith('https://') ||
+      lowerTarget.indexOf('web') >= 0
+    ) {
+      return $r('sys.symbol.website');
+    }
+    return $r('sys.symbol.magnifyingglass');
+  }
+  if (k === 'subagent') {
+    return $r('sys.symbol.person_2');
+  }
+  return $r('sys.symbol.wrench_and_screwdriver');
+}
+
+function stepStableKey(step: TimelineItemDto): string {
+  const uid = step.call_id ?? step.item_id ?? '';
+  return `${step.item_type}_${step.seq}_${uid}`;
+}
+
 @ComponentV2
 struct StepItemRow {
   @Param item: TimelineItemDto = { item_type: 'tool_call', seq: 0 };
-  @Local stepCopied: boolean = false;
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
   private stepKey(): string {
@@ -44,6 +168,12 @@ struct StepItemRow {
       return this.item.call_id;
     }
     return `seq_${this.item.seq}`;
+  }
+
+  private toggleExpanded(): void {
+    this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
+      this.store.toggleToolExpanded(this.stepKey());
+    });
   }
 
   private hasStepDiffFiles(): boolean {
@@ -158,22 +288,36 @@ struct StepItemRow {
     if (this.item.item_type === 'assistant_thinking') {
       if ((this.item.text ?? '').trim().length > 0) {
         Column({ space: OrbitTokens.SPACE_XS }) {
-          Row({ space: OrbitTokens.SPACE_SM }) {
+          Row({ space: OrbitTokens.SPACE_XS }) {
+            SymbolGlyph($r('sys.symbol.wand_and_stars'))
+              .fontSize(13)
+              .fontColor([this.store.palette.fgMuted])
             Text('Thought')
-              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
-            Text(this.store.isToolExpanded(this.stepKey()) ? '▾' : '▸')
-              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+            SymbolGlyph(
+              this.store.isToolExpanded(this.stepKey())
+                ? $r('sys.symbol.chevron_down')
+                : $r('sys.symbol.chevron_right')
+            )
+              .fontSize(12)
+              .fontColor([this.store.palette.fgMuted])
           }
-          .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+          .constraintSize({ minHeight: 36 })
           .alignItems(VerticalAlign.Center)
           .onClick(() => {
-            this.store.toggleToolExpanded(this.stepKey());
+            this.toggleExpanded();
           })
 
           if (this.store.isToolExpanded(this.stepKey())) {
-            Text((this.item.text ?? '').trim())
-              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
-              .padding({ bottom: OrbitTokens.SPACE_XS })
+            Column() {
+              Text((this.item.text ?? '').trim())
+                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
+                .copyOption(CopyOptions.LocalDevice)
+                .padding({ bottom: OrbitTokens.SPACE_XS })
+            }
+            .width('100%')
+            .alignItems(HorizontalAlign.Start)
+            .clip(true)
           }
         }
         .alignItems(HorizontalAlign.Start)
@@ -191,7 +335,11 @@ struct StepItemRow {
         this.renderDescriptorRow(this.store.describeToolStepFallback(this.item))
 
         if (this.store.isToolExpanded(this.stepKey())) {
-          this.renderExpandedToolDetail(this.store.describeToolStepFallback(this.item))
+          Column() {
+            this.renderExpandedToolDetail(this.store.describeToolStepFallback(this.item))
+          }
+          .width('100%')
+          .clip(true)
         }
       }
       .alignItems(HorizontalAlign.Start)
@@ -203,17 +351,20 @@ struct StepItemRow {
   private renderDescriptorRow(desc: ToolStepDescriptorDto | null) {
     if (desc !== null) {
       Row({ space: OrbitTokens.SPACE_SM }) {
-        Row()
-          .width(OrbitTokens.DOT_SIZE)
-          .height(OrbitTokens.DOT_SIZE)
-          .borderRadius(3)
-          .backgroundColor(
-            desc.is_failed || desc.is_denied
-              ? this.store.palette.statusDanger
-              : desc.is_running
-                ? this.store.palette.accentPrimary
+        if (desc.is_running) {
+          LoadingProgress()
+            .width(14)
+            .height(14)
+            .color(this.store.palette.accentPrimary)
+        } else {
+          SymbolGlyph(stepDescriptorSymbol(desc))
+            .fontSize(13)
+            .fontColor([
+              desc.is_failed || desc.is_denied
+                ? this.store.palette.statusDanger
                 : this.store.palette.fgMuted
-          )
+            ])
+        }
 
         Text() {
           Span(desc.verb)
@@ -224,9 +375,13 @@ struct StepItemRow {
                 : this.store.palette.fgSecondary
             )
           if (desc.target.length > 0) {
-            Span(`  ${desc.target}`)
+            Span(`  ${stripWorkspacePrefix(desc.target, this.store.activeCwd)}`)
               .font(orbitSpanMonoFont(FontWeight.Medium))
-              .fontColor(this.store.palette.fgPrimary)
+              .fontColor(
+                desc.is_failed || desc.is_denied
+                  ? this.store.palette.statusDanger
+                  : this.store.palette.fgPrimary
+              )
           }
           if (desc.secondary_meta !== null && desc.secondary_meta.length > 0) {
             Span(`  ${desc.secondary_meta}`)
@@ -258,32 +413,45 @@ struct StepItemRow {
             .attributeModifier(orbitTextMono(this.store.palette.statusDanger, FontWeight.Medium))
         }
 
-        Text(this.store.isToolExpanded(this.stepKey()) ? '▾' : '▸')
-          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+        SymbolGlyph(
+          this.store.isToolExpanded(this.stepKey())
+            ? $r('sys.symbol.chevron_down')
+            : $r('sys.symbol.chevron_right')
+        )
+          .fontSize(12)
+          .fontColor([this.store.palette.fgMuted])
       }
       .width('100%')
-      .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-      .padding({ top: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_XS })
+      .constraintSize({ minHeight: 36 })
+      .padding({ top: 3, bottom: 3 })
       .alignItems(VerticalAlign.Center)
       .onClick(() => {
-        this.store.toggleToolExpanded(this.stepKey());
+        this.toggleExpanded();
       })
     } else {
       Row({ space: OrbitTokens.SPACE_SM }) {
+        SymbolGlyph($r('sys.symbol.wrench_and_screwdriver'))
+          .fontSize(13)
+          .fontColor([this.store.palette.fgMuted])
         Text(this.item.summary_title ?? 'Tool step')
           .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
-        Text(this.store.isToolExpanded(this.stepKey()) ? '▾' : '▸')
-          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+        SymbolGlyph(
+          this.store.isToolExpanded(this.stepKey())
+            ? $r('sys.symbol.chevron_down')
+            : $r('sys.symbol.chevron_right')
+        )
+          .fontSize(12)
+          .fontColor([this.store.palette.fgMuted])
       }
       .width('100%')
-      .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-      .padding({ top: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_XS })
+      .constraintSize({ minHeight: 36 })
+      .padding({ top: 3, bottom: 3 })
       .alignItems(VerticalAlign.Center)
       .onClick(() => {
-        this.store.toggleToolExpanded(this.stepKey());
+        this.toggleExpanded();
       })
     }
   }
@@ -297,7 +465,7 @@ struct StepItemRow {
             this.miniDiffPreviewRows(),
             (row: MiniDiffPreviewRow) => {
               if (row.isFileHeader) {
-                Text(row.filePath)
+                Text(stripWorkspacePrefix(row.filePath, this.store.activeCwd))
                   .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Bold))
                   .padding({ top: OrbitTokens.SPACE_XS, bottom: 2 })
                   .maxLines(1)
@@ -315,11 +483,12 @@ struct StepItemRow {
                         : row.line.kind === 'removed'
                           ? this.store.palette.statusDanger
                           : row.line.kind === 'hunk_header' || row.line.kind === 'meta'
-                            ? this.store.palette.accentPrimary
+                            ? this.store.palette.fgMuted
                             : this.store.palette.fgSecondary
                     )
                   )
                   .width('100%')
+                  .copyOption(CopyOptions.LocalDevice)
                   .backgroundColor(
                     row.line.kind === 'added'
                       ? this.store.palette.diffAddedBg
@@ -338,12 +507,12 @@ struct StepItemRow {
         .width('100%')
 
         Row() {
-          Button('Inspect Full Diff')
+          Button('Inspect Full Diff', { type: ButtonType.Capsule, stateEffect: true })
             .attributeModifier(
-              orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+              orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
             )
-            .height(36)
-            .borderRadius(OrbitTokens.PILL_RADIUS)
+            .height(OrbitTokens.HIT_COMPACT)
+            .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
             .onClick(() => {
               this.store.openGitInspector(this.firstDiffFilePath());
             })
@@ -354,7 +523,7 @@ struct StepItemRow {
       .width('100%')
       .padding(OrbitTokens.SPACE_SM)
       .backgroundColor(this.store.palette.code)
-      .borderRadius(OrbitTokens.PILL_RADIUS)
+      .borderRadius(OrbitTokens.RADIUS_SM)
       .border({
         width: OrbitTokens.HAIRLINE,
         color: this.store.palette.hairline
@@ -363,36 +532,26 @@ struct StepItemRow {
       Column({ space: OrbitTokens.SPACE_XS }) {
         Row() {
           Blank()
-          Button(this.stepCopied ? 'Copied' : 'Copy')
-            .attributeModifier(
-              orbitButtonMeta(
-                this.stepCopied ? this.store.palette.statusDirect : this.store.palette.fgSecondary,
-                this.stepCopied ? this.store.palette.statusDirectSoft : this.store.palette.elevated
-              )
-            )
-            .height(28)
-            .borderRadius(OrbitTokens.PILL_RADIUS)
-            .onClick(() => {
-              const snippet = this.buildFullStepSnippet(desc);
-              this.store.copyToClipboard(snippet, 'Copied step detail');
-              this.stepCopied = true;
-              setTimeout(() => {
-                this.stepCopied = false;
-              }, 1600);
-            })
+          OrbitCopyIconButton({
+            content: this.buildFullStepSnippet(desc),
+            toastLabel: 'Copied step detail',
+            accessibilityLabel: 'Copy step detail',
+            buttonSize: OrbitTokens.HIT_COMPACT
+          })
         }
         .width('100%')
 
         Text(this.buildFullStepSnippet(desc))
           .attributeModifier(orbitTextMono(this.store.palette.fgPrimary))
           .width('100%')
+          .copyOption(CopyOptions.LocalDevice)
           .maxLines(14)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
       }
       .width('100%')
       .padding(OrbitTokens.SPACE_SM)
-      .backgroundColor(this.store.palette.subtleSurface)
-      .borderRadius(OrbitTokens.PILL_RADIUS)
+      .backgroundColor(this.store.palette.code)
+      .borderRadius(OrbitTokens.RADIUS_SM)
       .border({
         width: OrbitTokens.HAIRLINE,
         color: this.store.palette.hairline
@@ -444,13 +603,68 @@ export struct StageTurnView {
     started_at_ms: null,
     completed_at_ms: null
   };
+  @Param isTurnActive: boolean = false;
 
-  @Local pulseBright: boolean = true;
-  @Local replyCopied: boolean = false;
+  @Local userPromptExpanded: boolean = false;
+  @Local changesExpanded: boolean = false;
+  @Local elapsedSeconds: number = 0;
+
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  private timerHandle: number = -1;
 
-  private isSettledTurn(): boolean {
-    return this.turn.terminal_reply !== null && !this.turn.has_active_item;
+  @Computed
+  get cleanedUserPrompt(): CleanedPromptText {
+    return cleanLegacyPromptText(this.turn.user_prompt?.text ?? '');
+  }
+
+  aboutToAppear(): void {
+    this.syncElapsedTimer();
+  }
+
+  aboutToDisappear(): void {
+    this.clearElapsedTimer();
+  }
+
+  @Monitor('isTurnActive', 'turn')
+  onActiveStateChanged(_mon: IMonitor): void {
+    this.syncElapsedTimer();
+  }
+
+  private clearElapsedTimer(): void {
+    if (this.timerHandle >= 0) {
+      clearInterval(this.timerHandle);
+      this.timerHandle = -1;
+    }
+  }
+
+  private syncElapsedTimer(): void {
+    this.clearElapsedTimer();
+    const active = this.isTurnActive || this.turn.has_active_item;
+    if (!active) {
+      return;
+    }
+    const updateTick = () => {
+      const startMs = this.turn.started_at_ms ?? Date.now();
+      this.elapsedSeconds = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+    };
+    updateTick();
+    this.timerHandle = setInterval(() => {
+      updateTick();
+    }, 1000);
+  }
+
+  private isEffectiveActive(): boolean {
+    return this.isTurnActive || this.turn.has_active_item;
+  }
+
+  private isCompactionOnly(): boolean {
+    if (this.turn.is_compaction_command) {
+      return true;
+    }
+    if (this.turn.user_prompt !== null) {
+      return isBareCompactionPrompt(this.turn.user_prompt);
+    }
+    return false;
   }
 
   private extractReplyText(reply: TimelineItemDto): string {
@@ -481,121 +695,197 @@ export struct StageTurnView {
     return parts.join('\n\n').trim();
   }
 
-  @Builder
-  private renderTerminalReplyActions(reply: TimelineItemDto) {
-    if (this.extractReplyText(reply).length > 0) {
-      Row({ space: OrbitTokens.SPACE_XS }) {
-        Row() {
-          Text(this.replyCopied ? 'Copied' : 'Copy')
-            .attributeModifier(
-              orbitTextMeta(
-                this.replyCopied ? this.store.palette.statusDirect : this.store.palette.fgMuted,
-                FontWeight.Medium
-              )
-            )
-        }
-        .height(28)
-        .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-        .backgroundColor(
-          this.replyCopied ? this.store.palette.statusDirectSoft : Color.Transparent
-        )
-        .borderRadius(OrbitTokens.PILL_RADIUS)
-        .alignItems(VerticalAlign.Center)
-        .onClick(() => {
-          const text = this.extractReplyText(reply);
-          this.store.copyToClipboard(text, 'Copied reply to clipboard');
-          this.replyCopied = true;
-          setTimeout(() => {
-            this.replyCopied = false;
-          }, 1800);
-        })
-
-        Row() {
-          Text('Quote')
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
-        }
-        .height(28)
-        .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-        .borderRadius(OrbitTokens.PILL_RADIUS)
-        .alignItems(VerticalAlign.Center)
-        .onClick(() => {
-          const text = this.extractReplyText(reply);
-          this.store.quoteAssistantReplyIntoComposer(text, this.turn.turn_index);
-        })
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
+  private badgeSymbol(badge: PromptBadgeDto): Resource {
+    if (badge.kind === 'image') {
+      return $r('sys.symbol.picture');
     }
+    if (badge.kind === 'git_diff' || badge.kind === 'git' || badge.kind === 'diff' || badge.kind === 'staged') {
+      return $r('sys.symbol.arrow_left_arrow_right');
+    }
+    if (badge.kind === 'terminal') {
+      return $r('sys.symbol.code');
+    }
+    if (badge.kind === 'quote') {
+      return $r('sys.symbol.quote');
+    }
+    const clean = badge.label.startsWith('@') ? badge.label.substring(1) : badge.label;
+    return resolveSemanticFileSymbol(clean);
+  }
+
+  @Builder
+  private renderCompactionDivider(label: string) {
+    Row({ space: OrbitTokens.SPACE_SM }) {
+      Divider()
+        .strokeWidth(OrbitTokens.HAIRLINE)
+        .color(this.store.palette.hairline)
+        .layoutWeight(1)
+      Row({ space: 5 }) {
+        SymbolGlyph($r('sys.symbol.cut'))
+          .fontSize(12)
+          .fontColor([this.store.palette.fgMuted])
+        Text(label)
+          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+      }
+      .alignItems(VerticalAlign.Center)
+      Divider()
+        .strokeWidth(OrbitTokens.HAIRLINE)
+        .color(this.store.palette.hairline)
+        .layoutWeight(1)
+    }
+    .width('100%')
+    .padding({ top: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_XS })
   }
 
   @Builder
   private renderUserBubble(prompt: TimelineItemDto) {
     Row() {
       Blank()
-      Column({ space: OrbitTokens.SPACE_SM }) {
-        if (prompt.badges !== undefined && prompt.badges.length > 0) {
+      Column({ space: OrbitTokens.SPACE_XS }) {
+        // Non-slash Context Badges
+        if (prompt.badges !== undefined && prompt.badges.some((b: PromptBadgeDto) => b.kind !== 'slash')) {
           Flex({ wrap: FlexWrap.Wrap }) {
             ForEach(
-              prompt.badges,
+              prompt.badges.filter((b: PromptBadgeDto) => b.kind !== 'slash'),
               (badge: PromptBadgeDto) => {
-                Row() {
+                Row({ space: 4 }) {
+                  SymbolGlyph(this.badgeSymbol(badge))
+                    .fontSize(11)
+                    .fontColor([this.store.palette.fgSecondary])
                   Text(badge.label)
-                    .attributeModifier(
-                      orbitTextMono(this.store.palette.accentPrimary, FontWeight.Medium)
-                    )
+                    .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
                 }
-                .padding({
-                  left: OrbitTokens.SPACE_SM,
-                  right: OrbitTokens.SPACE_SM,
-                  top: 2,
-                  bottom: 2
-                })
-                .margin({ right: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_XS })
-                .backgroundColor(this.store.palette.accentPrimarySoft)
-                .borderRadius(OrbitTokens.PILL_RADIUS)
+                .padding({ left: 7, right: 7, top: 2, bottom: 2 })
+                .margin({ right: 5, bottom: 4 })
+                .backgroundColor(this.store.palette.subtleSurface)
+                .borderRadius(7)
+                .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                .alignItems(VerticalAlign.Center)
               },
-              (badge: PromptBadgeDto, bIdx: number) => `${badge.label}_${bIdx}`
+              (badge: PromptBadgeDto, bIdx: number) => `ub_${badge.kind}_${badge.label}_${bIdx}`
             )
           }
         }
 
-        Text(prompt.text ?? '')
-          .attributeModifier(orbitTextBody(this.store.palette.fgPrimary, FontWeight.Normal))
+        // Cleaned Body + Inline Leading Slash Prefix (natively selectable!)
+        Row({ space: 6 }) {
+          if (
+            (prompt.badges !== undefined && prompt.badges.some((b: PromptBadgeDto) => b.kind === 'slash')) ||
+            this.cleanedUserPrompt.inferredSlash.length > 0
+          ) {
+            Text(
+              prompt.badges?.find((b: PromptBadgeDto) => b.kind === 'slash')?.label ??
+                this.cleanedUserPrompt.inferredSlash
+            )
+              .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Medium))
+              .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+              .backgroundColor(this.store.palette.subtleSurface)
+              .borderRadius(OrbitTokens.RADIUS_XS)
+              .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+          }
+
+          if (this.cleanedUserPrompt.body.length > 0) {
+            Text(this.cleanedUserPrompt.body)
+              .attributeModifier(orbitTextBody(this.store.palette.fgPrimary, FontWeight.Normal))
+              .maxLines(this.userPromptExpanded ? 200 : 8)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .copyOption(CopyOptions.LocalDevice)
+              .flexShrink(1)
+          }
+        }
+        .alignItems(VerticalAlign.Top)
+
+        if (this.cleanedUserPrompt.body.split('\n').length > 8) {
+          Button(this.userPromptExpanded ? 'Show less' : 'Show more', { type: ButtonType.Normal, stateEffect: true })
+            .attributeModifier(orbitButtonMeta(this.store.palette.accentPrimary, Color.Transparent))
+            .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+            .padding({ left: 0, right: OrbitTokens.SPACE_SM })
+            .onClick(() => {
+              this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
+                this.userPromptExpanded = !this.userPromptExpanded;
+              });
+            })
+        }
       }
       .alignItems(HorizontalAlign.Start)
-      .constraintSize({ maxWidth: '88%' })
-      .padding({
-        left: OrbitTokens.SPACE_MD,
-        right: OrbitTokens.SPACE_MD,
-        top: OrbitTokens.SPACE_SM + 2,
-        bottom: OrbitTokens.SPACE_SM + 2
-      })
+      .constraintSize({ maxWidth: '84%' })
+      .padding({ left: 14, right: 14, top: 10, bottom: 10 })
       .backgroundColor(this.store.palette.userBubble)
-      .borderRadius(OrbitTokens.SPACE_LG)
+      .borderRadius(OrbitTokens.RADIUS_XL)
       .border({
         width: OrbitTokens.HAIRLINE,
         color: this.store.palette.hairline
       })
+      .shadow(ShadowStyle.OUTER_DEFAULT_XS)
     }
     .width('100%')
+  }
+
+  @Builder
+  private renderTurnFooter() {
+    Row({ space: OrbitTokens.SPACE_SM }) {
+      if (this.isEffectiveActive()) {
+        LoadingProgress()
+          .width(14)
+          .height(14)
+          .color(this.store.palette.fgMuted)
+        Text(`${Math.floor(this.elapsedSeconds / 60)}:${(this.elapsedSeconds % 60).toString().padStart(2, '0')}`)
+          .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+      } else {
+        if (this.turn.terminal_reply !== null && this.extractReplyText(this.turn.terminal_reply).length > 0) {
+          OrbitCopyIconButton({
+            content: this.extractReplyText(this.turn.terminal_reply),
+            toastLabel: 'Copied reply to clipboard',
+            accessibilityLabel: 'Copy response',
+            buttonSize: OrbitTokens.HIT_COMPACT
+          })
+        }
+
+        if ((this.turn.completed_at_ms ?? this.turn.started_at_ms ?? 0) > 0) {
+          Text(
+            formatRelativeTimeLabel(
+              Math.floor((this.turn.completed_at_ms ?? this.turn.started_at_ms ?? 0) / 1000)
+            )
+          )
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+        }
+      }
+    }
+    .width('100%')
+    .padding({ top: 2 })
+    .alignItems(VerticalAlign.Center)
+  }
+
+  private settledSummaryLabel(): string {
+    const base = this.turn.work_summary_label.length > 0
+      ? this.turn.work_summary_label
+      : `${this.turn.folded_steps.length} steps`;
+    if (this.turn.thought_duration_ms !== null && this.turn.thought_duration_ms >= 1000) {
+      return `${base} · Thought ${Math.floor(this.turn.thought_duration_ms / 1000)}s`;
+    }
+    return base;
   }
 
   @Builder
   private renderSettledSummaryAndRail() {
     if (this.turn.folded_steps.length > 0) {
       Column({ space: OrbitTokens.SPACE_XS }) {
-        Row({ space: OrbitTokens.SPACE_SM }) {
-          Text(this.store.isTurnExpanded(this.turn.key) ? '▾' : '▸')
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-
-          Text(
-            this.turn.work_summary_label.length > 0
-              ? this.turn.work_summary_label
-              : `${this.turn.folded_steps.length} steps completed`
+        Row({ space: OrbitTokens.SPACE_XS }) {
+          SymbolGlyph(
+            this.store.isTurnExpanded(this.turn.key)
+              ? $r('sys.symbol.chevron_down')
+              : $r('sys.symbol.chevron_right')
           )
+            .fontSize(13)
+            .fontColor([
+              this.turn.work_summary_includes_failure
+                ? this.store.palette.statusDanger
+                : this.store.palette.fgMuted
+            ])
+
+          Text(this.settledSummaryLabel())
             .attributeModifier(
               orbitTextSubhead(
-                this.turn.has_unrecovered_error
+                this.turn.work_summary_includes_failure
                   ? this.store.palette.statusDanger
                   : this.store.palette.fgSecondary,
                 FontWeight.Medium
@@ -604,34 +894,14 @@ export struct StageTurnView {
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .layoutWeight(1)
-
-          if (this.turn.work_counts.additions > 0 || this.turn.work_counts.deletions > 0) {
-            Row({ space: OrbitTokens.SPACE_XS }) {
-              if (this.turn.work_counts.additions > 0) {
-                Text(`+${this.turn.work_counts.additions}`)
-                  .attributeModifier(
-                    orbitTextMeta(this.store.palette.statusDirect, FontWeight.Medium)
-                  )
-              }
-              if (this.turn.work_counts.deletions > 0) {
-                Text(`-${this.turn.work_counts.deletions}`)
-                  .attributeModifier(
-                    orbitTextMeta(this.store.palette.statusDanger, FontWeight.Medium)
-                  )
-              }
-            }
-          }
-
-          if (this.turn.turn_duration_ms !== null && this.turn.turn_duration_ms >= 1000) {
-            Text(formatCompactDuration(this.turn.turn_duration_ms))
-              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-          }
         }
         .width('100%')
-        .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+        .constraintSize({ minHeight: 38 })
         .alignItems(VerticalAlign.Center)
         .onClick(() => {
-          this.store.toggleTurnExpanded(this.turn.key);
+          this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
+            this.store.toggleTurnExpanded(this.turn.key);
+          });
         })
 
         if (this.store.isTurnExpanded(this.turn.key)) {
@@ -641,7 +911,7 @@ export struct StageTurnView {
               (step: TimelineItemDto) => {
                 StepItemRow({ item: step })
               },
-              (step: TimelineItemDto) => `${step.item_type}_${step.seq}`
+              (step: TimelineItemDto) => stepStableKey(step)
             )
           }
           .width('100%')
@@ -651,6 +921,7 @@ export struct StageTurnView {
             width: { left: 1 },
             color: this.store.palette.hairline
           })
+          .clip(true)
         }
       }
       .width('100%')
@@ -665,30 +936,20 @@ export struct StageTurnView {
         (seg: TurnLiveSegmentDto) => {
           if (seg.kind === 'step_group' && seg.items !== undefined) {
             Column({ space: OrbitTokens.SPACE_XS }) {
-              Row({ space: OrbitTokens.SPACE_SM }) {
+              Row({ space: OrbitTokens.SPACE_XS }) {
                 if (seg.has_running_step === true) {
-                  Row()
-                    .width(OrbitTokens.SPACE_SM)
-                    .height(OrbitTokens.SPACE_SM)
-                    .borderRadius(OrbitTokens.SPACE_XS)
-                    .backgroundColor(this.store.palette.accentPrimary)
-                    .opacity(this.pulseBright ? 1.0 : 0.35)
-                    .onAppear(() => {
-                      this.getUIContext().animateTo(
-                        {
-                          duration: 750,
-                          iterations: -1,
-                          playMode: PlayMode.Alternate,
-                          curve: Curve.EaseInOut
-                        },
-                        () => {
-                          this.pulseBright = false;
-                        }
-                      );
-                    })
+                  LoadingProgress()
+                    .width(14)
+                    .height(14)
+                    .color(this.store.palette.accentPrimary)
                 } else {
-                  Text(this.store.isTurnExpanded(seg.key) ? '▾' : '▸')
-                    .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
+                  SymbolGlyph(
+                    this.store.isTurnExpanded(seg.key) || (seg.items.length < 5 && seg.has_following_content !== true)
+                      ? $r('sys.symbol.chevron_down')
+                      : $r('sys.symbol.chevron_right')
+                  )
+                    .fontSize(13)
+                    .fontColor([this.store.palette.fgMuted])
                 }
 
                 Text(
@@ -698,8 +959,8 @@ export struct StageTurnView {
                 )
                   .attributeModifier(
                     orbitTextSubhead(
-                      seg.has_running_step === true
-                        ? this.store.palette.fgPrimary
+                      seg.summary?.label_includes_failure === true
+                        ? this.store.palette.statusDanger
                         : this.store.palette.fgSecondary,
                       FontWeight.Medium
                     )
@@ -709,25 +970,36 @@ export struct StageTurnView {
                   .layoutWeight(1)
               }
               .width('100%')
-              .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+              .constraintSize({ minHeight: 38 })
               .alignItems(VerticalAlign.Center)
               .onClick(() => {
-                this.store.toggleTurnExpanded(seg.key);
+                this.getUIContext().animateTo({ duration: 180, curve: Curve.EaseInOut }, () => {
+                  this.store.toggleTurnExpanded(seg.key);
+                });
               })
 
-              if (
-                seg.has_running_step === true ||
-                seg.has_following_content !== true ||
-                this.store.isTurnExpanded(seg.key)
-              ) {
+              // Roll up automatically when >= 5 steps unless expanded, while keeping latest running step visible
+              if (this.store.isTurnExpanded(seg.key) || (seg.items.length < 5 && (seg.has_running_step === true || seg.has_following_content !== true))) {
                 Column({ space: OrbitTokens.SPACE_XS }) {
                   ForEach(
                     seg.items,
                     (step: TimelineItemDto) => {
                       StepItemRow({ item: step })
                     },
-                    (step: TimelineItemDto) => `${step.item_type}_${step.seq}_${step.status ?? ''}`
+                    (step: TimelineItemDto) => stepStableKey(step)
                   )
+                }
+                .width('100%')
+                .padding({ left: OrbitTokens.SPACE_MD, top: 2, bottom: OrbitTokens.SPACE_XS })
+                .margin({ left: OrbitTokens.SPACE_XS })
+                .border({
+                  width: { left: 1 },
+                  color: this.store.palette.hairline
+                })
+                .clip(true)
+              } else if (seg.items.length >= 5) {
+                Column({ space: OrbitTokens.SPACE_XS }) {
+                  StepItemRow({ item: seg.items[seg.items.length - 1] })
                 }
                 .width('100%')
                 .padding({ left: OrbitTokens.SPACE_MD, top: 2, bottom: OrbitTokens.SPACE_XS })
@@ -742,156 +1014,205 @@ export struct StageTurnView {
           } else if (seg.kind === 'assistant_message' && seg.item !== undefined) {
             RichMarkdownView({
               blocks: seg.item.blocks ?? [],
-              fallbackText: seg.item.text ?? ''
+              fallbackText: seg.item.text ?? '',
+              turnIndex: this.turn.turn_index
             })
           } else if (seg.kind === 'compaction') {
-            Row({ space: OrbitTokens.SPACE_SM }) {
-              Divider()
-                .strokeWidth(OrbitTokens.HAIRLINE)
-                .color(this.store.palette.hairline)
-                .layoutWeight(1)
-              Text(seg.label ?? 'Context compacted')
-                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-              Divider()
-                .strokeWidth(OrbitTokens.HAIRLINE)
-                .color(this.store.palette.hairline)
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .padding({ top: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_XS })
+            this.renderCompactionDivider(seg.label ?? 'Context compacted')
           }
         },
-        (seg: TurnLiveSegmentDto) => `${seg.key}_${seg.has_running_step ? '1' : '0'}_${seg.items?.length ?? 0}_${seg.item?.text?.length ?? 0}`
+        (seg: TurnLiveSegmentDto) => `${seg.key}_${seg.has_running_step ? '1' : '0'}_${seg.items?.length ?? 0}`
       )
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)
   }
 
+  @Computed
+  get totalTurnAdditions(): number {
+    let total = 0;
+    for (let i = 0; i < this.turn.turn_diffs.length; i++) {
+      total += this.turn.turn_diffs[i].additions;
+    }
+    return total;
+  }
+
+  @Computed
+  get totalTurnDeletions(): number {
+    let total = 0;
+    for (let i = 0; i < this.turn.turn_diffs.length; i++) {
+      total += this.turn.turn_diffs[i].deletions;
+    }
+    return total;
+  }
+
   @Builder
-  private renderTurnDiffStrip() {
+  private renderTurnChangesBar() {
     if (this.turn.turn_diffs.length > 0) {
-      Scroll() {
-        Row({ space: OrbitTokens.SPACE_SM }) {
-          ForEach(
-            this.turn.turn_diffs,
-            (df: TurnFileDiffSummaryDto) => {
-              Row({ space: OrbitTokens.SPACE_XS }) {
-                Text(basenameOfPath(df.path))
-                  .attributeModifier(
-                    orbitTextMono(this.store.palette.fgSecondary, FontWeight.Medium)
-                  )
-                if (df.additions > 0) {
-                  Text(`+${df.additions}`)
-                    .attributeModifier(
-                      orbitTextMeta(this.store.palette.statusDirect, FontWeight.Medium)
-                    )
+      Column({ space: OrbitTokens.SPACE_XS }) {
+        Button({ type: ButtonType.Normal, stateEffect: true }) {
+          Row({ space: OrbitTokens.SPACE_XS }) {
+            SymbolGlyph($r('sys.symbol.arrow_left_arrow_right'))
+              .fontSize(14)
+              .fontColor([this.store.palette.iconSecondary])
+            Text(
+              this.turn.turn_diffs.length === 1
+                ? stripWorkspacePrefix(this.turn.turn_diffs[0].path, this.store.activeCwd)
+                : `${this.turn.turn_diffs.length} files changed`
+            )
+              .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Medium))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+              .textAlign(TextAlign.Start)
+
+            if (this.totalTurnAdditions > 0) {
+              Text(`+${this.totalTurnAdditions}`)
+                .attributeModifier(orbitTextMeta(this.store.palette.statusDirect))
+            }
+            if (this.totalTurnDeletions > 0) {
+              Text(`-${this.totalTurnDeletions}`)
+                .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
+            }
+            if (this.turn.turn_diffs.length > 1) {
+              SymbolGlyph(
+                this.changesExpanded ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right')
+              )
+                .fontSize(12)
+                .fontColor([this.store.palette.fgMuted])
+            }
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+        }
+        .width('100%')
+        .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+        .padding({ left: OrbitTokens.SPACE_XS, right: OrbitTokens.SPACE_XS })
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          if (this.turn.turn_diffs.length === 1) {
+            this.store.openGitInspector(this.turn.turn_diffs[0].path);
+          } else {
+            this.getUIContext().animateTo({ duration: 160, curve: Curve.EaseInOut }, () => {
+              this.changesExpanded = !this.changesExpanded;
+            });
+          }
+        })
+
+        if (this.turn.turn_diffs.length > 1 && this.changesExpanded) {
+          Flex({ wrap: FlexWrap.Wrap }) {
+            ForEach(
+              this.turn.turn_diffs,
+              (df: TurnFileDiffSummaryDto) => {
+                Button({ type: ButtonType.Capsule, stateEffect: true }) {
+                  Row({ space: 4 }) {
+                    Text(basenameOfPath(df.path))
+                      .attributeModifier(orbitTextMono(this.store.palette.fgPrimary))
+                    if (df.additions > 0) {
+                      Text(`+${df.additions}`)
+                        .attributeModifier(orbitTextMeta(this.store.palette.statusDirect))
+                    }
+                    if (df.deletions > 0) {
+                      Text(`-${df.deletions}`)
+                        .attributeModifier(orbitTextMeta(this.store.palette.statusDanger))
+                    }
+                  }
                 }
-                if (df.deletions > 0) {
-                  Text(`-${df.deletions}`)
-                    .attributeModifier(
-                      orbitTextMeta(this.store.palette.statusDanger, FontWeight.Medium)
-                    )
-                }
-              }
-              .height(32)
-              .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-              .backgroundColor(this.store.palette.subtleSurface)
-              .borderRadius(OrbitTokens.PILL_RADIUS)
-              .border({
-                width: OrbitTokens.HAIRLINE,
-                color: this.store.palette.hairline
-              })
-              .onClick(() => {
-                this.store.openGitInspector(df.path);
-              })
-            },
-            (df: TurnFileDiffSummaryDto) => df.path
-          )
+                .height(32)
+                .padding({ left: 10, right: 10 })
+                .margin({ right: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_XS })
+                .backgroundColor(this.store.palette.canvas)
+                .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                .onClick(() => {
+                  this.store.openGitInspector(df.path);
+                })
+              },
+              (df: TurnFileDiffSummaryDto) => df.path
+            )
+          }
+          .clip(true)
         }
       }
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
       .width('100%')
+      .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, top: 4, bottom: 4 })
+      .backgroundColor(this.store.palette.subtleSurface)
+      .borderRadius(OrbitTokens.RADIUS_MD)
+      .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
     }
   }
 
   build() {
     Column({ space: OrbitTokens.SPACE_MD }) {
-      if (this.turn.user_prompt !== null) {
+      if (this.isCompactionOnly()) {
+        this.renderCompactionDivider('Context compacted')
+      } else if (this.turn.user_prompt !== null) {
         this.renderUserBubble(this.turn.user_prompt)
       }
 
-      if (this.turn.is_compaction_command) {
-        Row({ space: OrbitTokens.SPACE_SM }) {
-          Divider()
-            .strokeWidth(OrbitTokens.HAIRLINE)
-            .color(this.store.palette.hairline)
-            .layoutWeight(1)
-          Text('Context compacted')
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-          Divider()
-            .strokeWidth(OrbitTokens.HAIRLINE)
-            .color(this.store.palette.hairline)
-            .layoutWeight(1)
-        }
-        .width('100%')
-      }
-
-      if (this.isSettledTurn()) {
+      if (this.isEffectiveActive()) {
+        this.renderLiveSegments()
+      } else {
         this.renderSettledSummaryAndRail()
+
+        if (this.turn.notices.length > 0) {
+          Column({ space: OrbitTokens.SPACE_XS }) {
+            ForEach(
+              this.turn.notices,
+              (notice: TimelineItemDto) => {
+                Row({ space: OrbitTokens.SPACE_SM }) {
+                  SymbolGlyph($r('sys.symbol.warning'))
+                    .fontSize(14)
+                    .fontColor([
+                      notice.level === 'error'
+                        ? this.store.palette.statusDanger
+                        : this.store.palette.fgSecondary
+                    ])
+                  Text(notice.message ?? '')
+                    .attributeModifier(
+                      orbitTextMeta(
+                        notice.level === 'error'
+                          ? this.store.palette.statusDanger
+                          : this.store.palette.fgSecondary
+                      )
+                    )
+                    .copyOption(CopyOptions.LocalDevice)
+                    .layoutWeight(1)
+                }
+                .width('100%')
+                .padding(OrbitTokens.SPACE_SM)
+                .backgroundColor(
+                  notice.level === 'error'
+                    ? this.store.palette.diffRemovedBg
+                    : this.store.palette.subtleSurface
+                )
+                .borderRadius(OrbitTokens.RADIUS_SM)
+                .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+              },
+              (notice: TimelineItemDto) => `notice_${notice.seq}`
+            )
+          }
+          .width('100%')
+        }
+
         if (this.turn.terminal_reply !== null) {
           RichMarkdownView({
             blocks: this.turn.terminal_reply.blocks ?? [],
-            fallbackText: this.turn.terminal_reply.text ?? ''
+            fallbackText: this.turn.terminal_reply.text ?? '',
+            turnIndex: this.turn.turn_index
           })
-          this.renderTerminalReplyActions(this.turn.terminal_reply)
         }
-      } else {
-        this.renderLiveSegments()
       }
 
-      this.renderTurnDiffStrip()
+      this.renderTurnChangesBar()
 
-      if (this.turn.notices.length > 0) {
-        Column({ space: OrbitTokens.SPACE_XS }) {
-          ForEach(
-            this.turn.notices,
-            (notice: TimelineItemDto) => {
-              Row({ space: OrbitTokens.SPACE_SM }) {
-                Row()
-                  .width(OrbitTokens.DOT_SIZE)
-                  .height(OrbitTokens.DOT_SIZE)
-                  .borderRadius(3)
-                  .backgroundColor(
-                    notice.level === 'error'
-                      ? this.store.palette.statusDanger
-                      : this.store.palette.statusWarning
-                  )
-                Text(notice.message ?? '')
-                  .attributeModifier(
-                    orbitTextSubhead(
-                      notice.level === 'error'
-                        ? this.store.palette.statusDanger
-                        : this.store.palette.statusWarning,
-                      FontWeight.Normal
-                    )
-                  )
-                  .layoutWeight(1)
-              }
-              .width('100%')
-              .padding(OrbitTokens.SPACE_SM)
-              .backgroundColor(
-                notice.level === 'error'
-                  ? this.store.palette.statusDangerSoft
-                  : this.store.palette.statusWarningSoft
-              )
-              .borderRadius(OrbitTokens.PILL_RADIUS)
-            },
-            (notice: TimelineItemDto) => `notice_${notice.seq}`
-          )
-        }
-        .width('100%')
+      if (
+        this.isEffectiveActive() ||
+        (!this.isCompactionOnly() &&
+          (this.turn.terminal_reply !== null ||
+            this.turn.folded_steps.length > 0 ||
+            this.turn.completed_at_ms !== null))
+      ) {
+        this.renderTurnFooter()
       }
     }
     .width('100%')

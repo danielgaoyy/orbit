@@ -561,6 +561,7 @@ private struct WorkspaceStagePane: View {
     @available(iOS 26.0, *)
     @ToolbarContentBuilder
     private func trailingToolbarContent(ctx: WorkspaceHeaderContext) -> some ToolbarContent {
+        #if compiler(>=6.4)
         if #available(iOS 27.0, *) {
             if store.hosts.isEmpty {
                 ToolbarItem(placement: .topBarPinnedTrailing) {
@@ -592,45 +593,54 @@ private struct WorkspaceStagePane: View {
                 }
             }
         } else {
-            if store.hosts.isEmpty {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        store.hapticLight()
-                        store.activeSheet = .settings
-                    } label: {
-                        Label("Settings", systemImage: "gearshape")
-                    }
-                }
-            } else if store.activeAgent != nil {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Menu {
-                        workspaceHeaderMoreMenuItems(
-                            store: store,
-                            canShowInlineInspector: canShowInlineInspector,
-                            ctx: ctx
-                        )
-                    } label: {
-                        Label("More Actions", systemImage: "ellipsis")
-                    }
+            trailingToolbarContentIOS26(ctx: ctx)
+        }
+        #else
+        trailingToolbarContentIOS26(ctx: ctx)
+        #endif
+    }
 
-                    Button {
-                        store.hapticLight()
-                        store.startNewSessionDraft()
-                    } label: {
-                        Label("New Conversation", systemImage: "square.and.pencil")
-                    }
+    @available(iOS 26.0, *)
+    @ToolbarContentBuilder
+    private func trailingToolbarContentIOS26(ctx: WorkspaceHeaderContext) -> some ToolbarContent {
+        if store.hosts.isEmpty {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    store.hapticLight()
+                    store.activeSheet = .settings
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
                 }
-            } else {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        workspaceHeaderMoreMenuItems(
-                            store: store,
-                            canShowInlineInspector: canShowInlineInspector,
-                            ctx: ctx
-                        )
-                    } label: {
-                        Label("More Actions", systemImage: "ellipsis")
-                    }
+            }
+        } else if store.activeAgent != nil {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Menu {
+                    workspaceHeaderMoreMenuItems(
+                        store: store,
+                        canShowInlineInspector: canShowInlineInspector,
+                        ctx: ctx
+                    )
+                } label: {
+                    Label("More Actions", systemImage: "ellipsis")
+                }
+
+                Button {
+                    store.hapticLight()
+                    store.startNewSessionDraft()
+                } label: {
+                    Label("New Conversation", systemImage: "square.and.pencil")
+                }
+            }
+        } else {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    workspaceHeaderMoreMenuItems(
+                        store: store,
+                        canShowInlineInspector: canShowInlineInspector,
+                        ctx: ctx
+                    )
+                } label: {
+                    Label("More Actions", systemImage: "ellipsis")
                 }
             }
         }

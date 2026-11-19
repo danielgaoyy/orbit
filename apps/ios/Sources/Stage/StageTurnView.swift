@@ -744,7 +744,7 @@ struct UserPromptBubbleView: View {
         switch first {
         case let .paragraph(spans):
             return spans.contains { $0.bold || $0.italic || $0.strikethrough || $0.inlineCode || $0.linkUrl != nil }
-        case .heading, .listItem, .blockQuote, .codeBlock, .horizontalRule:
+        case .heading, .listItem, .blockQuote, .codeBlock, .table, .horizontalRule:
             return true
         }
     }

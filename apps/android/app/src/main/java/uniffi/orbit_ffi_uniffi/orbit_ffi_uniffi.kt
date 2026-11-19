@@ -4751,6 +4751,72 @@ public object FfiConverterTypeFfiStagedAttachment: FfiConverterRustBuffer<FfiSta
 
 
 
+data class FfiTableCell (
+    var `spans`: List<FfiInlineSpan>
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiTableCell: FfiConverterRustBuffer<FfiTableCell> {
+    override fun read(buf: ByteBuffer): FfiTableCell {
+        return FfiTableCell(
+            FfiConverterSequenceTypeFfiInlineSpan.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiTableCell) = (
+            FfiConverterSequenceTypeFfiInlineSpan.allocationSize(value.`spans`)
+    )
+
+    override fun write(value: FfiTableCell, buf: ByteBuffer) {
+            FfiConverterSequenceTypeFfiInlineSpan.write(value.`spans`, buf)
+    }
+}
+
+
+
+data class FfiTableRow (
+    var `cells`: List<FfiTableCell>
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiTableRow: FfiConverterRustBuffer<FfiTableRow> {
+    override fun read(buf: ByteBuffer): FfiTableRow {
+        return FfiTableRow(
+            FfiConverterSequenceTypeFfiTableCell.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiTableRow) = (
+            FfiConverterSequenceTypeFfiTableCell.allocationSize(value.`cells`)
+    )
+
+    override fun write(value: FfiTableRow, buf: ByteBuffer) {
+            FfiConverterSequenceTypeFfiTableCell.write(value.`cells`, buf)
+    }
+}
+
+
+
 data class FfiTerminalRow (
     var `rowIndex`: kotlin.UShort
     , 
@@ -5833,6 +5899,17 @@ sealed class FfiRichBlock {
         companion object
     }
     
+    data class Table(
+        val `alignments`: List<uniffi.orbit_ffi_uniffi.FfiTableAlignment>, 
+        val `headers`: List<uniffi.orbit_ffi_uniffi.FfiTableCell>, 
+        val `rows`: List<uniffi.orbit_ffi_uniffi.FfiTableRow>) : FfiRichBlock()
+        
+    {
+        
+
+        companion object
+    }
+    
     object HorizontalRule : FfiRichBlock()
     
     
@@ -5873,7 +5950,12 @@ public object FfiConverterTypeFfiRichBlock : FfiConverterRustBuffer<FfiRichBlock
             5 -> FfiRichBlock.BlockQuote(
                 FfiConverterSequenceTypeFfiInlineSpan.read(buf),
                 )
-            6 -> FfiRichBlock.HorizontalRule
+            6 -> FfiRichBlock.Table(
+                FfiConverterSequenceTypeFfiTableAlignment.read(buf),
+                FfiConverterSequenceTypeFfiTableCell.read(buf),
+                FfiConverterSequenceTypeFfiTableRow.read(buf),
+                )
+            7 -> FfiRichBlock.HorizontalRule
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
         }
     }
@@ -5920,6 +6002,15 @@ public object FfiConverterTypeFfiRichBlock : FfiConverterRustBuffer<FfiRichBlock
                 + FfiConverterSequenceTypeFfiInlineSpan.allocationSize(value.`spans`)
             )
         }
+        is FfiRichBlock.Table -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterSequenceTypeFfiTableAlignment.allocationSize(value.`alignments`)
+                + FfiConverterSequenceTypeFfiTableCell.allocationSize(value.`headers`)
+                + FfiConverterSequenceTypeFfiTableRow.allocationSize(value.`rows`)
+            )
+        }
         is FfiRichBlock.HorizontalRule -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
@@ -5961,8 +6052,15 @@ public object FfiConverterTypeFfiRichBlock : FfiConverterRustBuffer<FfiRichBlock
                 FfiConverterSequenceTypeFfiInlineSpan.write(value.`spans`, buf)
                 Unit
             }
-            is FfiRichBlock.HorizontalRule -> {
+            is FfiRichBlock.Table -> {
                 buf.putInt(6)
+                FfiConverterSequenceTypeFfiTableAlignment.write(value.`alignments`, buf)
+                FfiConverterSequenceTypeFfiTableCell.write(value.`headers`, buf)
+                FfiConverterSequenceTypeFfiTableRow.write(value.`rows`, buf)
+                Unit
+            }
+            is FfiRichBlock.HorizontalRule -> {
+                buf.putInt(7)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -6081,6 +6179,42 @@ public object FfiConverterTypeFfiSessionMode : FfiConverterRustBuffer<FfiSession
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+
+enum class FfiTableAlignment {
+    
+    NONE,
+    LEFT,
+    CENTER,
+    RIGHT;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiTableAlignment: FfiConverterRustBuffer<FfiTableAlignment> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiTableAlignment.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiTableAlignment) = 4UL
+
+    override fun write(value: FfiTableAlignment, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
@@ -7972,6 +8106,62 @@ public object FfiConverterSequenceTypeFfiStageTurn: FfiConverterRustBuffer<List<
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeFfiTableCell: FfiConverterRustBuffer<List<FfiTableCell>> {
+    override fun read(buf: ByteBuffer): List<FfiTableCell> {
+        val len = buf.getInt()
+        return List<FfiTableCell>(len) {
+            FfiConverterTypeFfiTableCell.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiTableCell>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiTableCell.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiTableCell>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiTableCell.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiTableRow: FfiConverterRustBuffer<List<FfiTableRow>> {
+    override fun read(buf: ByteBuffer): List<FfiTableRow> {
+        val len = buf.getInt()
+        return List<FfiTableRow>(len) {
+            FfiConverterTypeFfiTableRow.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiTableRow>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiTableRow.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiTableRow>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiTableRow.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeFfiTerminalRow: FfiConverterRustBuffer<List<FfiTerminalRow>> {
     override fun read(buf: ByteBuffer): List<FfiTerminalRow> {
         val len = buf.getInt()
@@ -8186,6 +8376,34 @@ public object FfiConverterSequenceTypeFfiRichBlock: FfiConverterRustBuffer<List<
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFfiRichBlock.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiTableAlignment: FfiConverterRustBuffer<List<FfiTableAlignment>> {
+    override fun read(buf: ByteBuffer): List<FfiTableAlignment> {
+        val len = buf.getInt()
+        return List<FfiTableAlignment>(len) {
+            FfiConverterTypeFfiTableAlignment.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiTableAlignment>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiTableAlignment.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiTableAlignment>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiTableAlignment.write(it, buf)
         }
     }
 }

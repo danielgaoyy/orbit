@@ -286,12 +286,30 @@ fn wildcard_match(pat: &str, text: &str) -> bool {
 }
 
 /// Remotely install/update Orbit on an SSH host from `~/.ssh/config` and start `orbit relay up`
-/// locked to `allow_pubkey`, returning the resolved `ws://...` Relay URL.
+/// locked to `allow_pubkey`. Defaults to Zero-Port SSH-tunneled Relay (`ssh+relay://...`),
+/// or direct TCP port Relay (`ws://...`) when `direct_public` is true.
 pub fn provision_relay_via_ssh(
+    home_dir: &Path,
     entry: &SshHostEntry,
     relay_port: u16,
     allow_pubkey: &str,
+    host_id: &str,
+    direct_public: bool,
 ) -> anyhow::Result<String> {
+    if !direct_public {
+        return orbit_client_core::desktop_ops::provision_ssh_tunnel_relay_with_home(
+            home_dir,
+            &entry.alias,
+            &entry.host_name,
+            entry.user.as_deref(),
+            entry.port,
+            relay_port,
+            &[allow_pubkey.to_string()],
+            host_id,
+        )
+        .map_err(|e| anyhow::anyhow!(e));
+    }
+
     let escaped_key = allow_pubkey.replace('\'', "");
     let remote_cmd = format!(
         "set -eu; \

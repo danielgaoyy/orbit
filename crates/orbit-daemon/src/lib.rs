@@ -4,6 +4,7 @@
 //! supervises detached Shims, serves direct WebSocket clients, and optionally registers outbound to Relay
 //! with full `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
 
+pub mod attachments;
 pub mod discovery;
 pub mod git;
 pub mod manager;
@@ -32,19 +33,20 @@ use orbit_providers::{
     catalogs_to_model_map, discover_installed_providers, probe_all_provider_models,
     probe_all_provider_quotas,
 };
+use orbit_relay_transport::{RelayConnector, is_ssh_relay_url, redact_relay_url};
 use orbit_store::OrbitStore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message as TungMsg};
+use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::{info, warn};
 
+use crate::attachments::AttachmentStagingManager;
 use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files};
 use crate::manager::{AgentOrchestrator, DaemonBroadcast, PtyBroadcast};
 
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
 const E2EE_FRAME_WIRE: u8 = 0x00;
 const E2EE_FRAME_TERMINAL: u8 = 0x01;
-const MAX_REMOTE_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonPersistedConfig {
@@ -63,7 +65,14 @@ impl DaemonPersistedConfig {
     pub fn save(&self, home_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(home_dir)?;
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(home_dir.join("config.json"), raw)
+        let config_path = home_dir.join("config.json");
+        std::fs::write(&config_path, raw)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 }
 
@@ -142,6 +151,7 @@ pub struct DaemonRuntime {
     pub keypair: HostIdentityKeypair,
     pub store: Arc<OrbitStore>,
     pub orchestrator: Arc<AgentOrchestrator>,
+    pub attachments: Arc<AttachmentStagingManager>,
     pub home_dir: PathBuf,
     provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
     catalog_refresh_lock: AsyncMutex<()>,
@@ -171,6 +181,7 @@ impl DaemonRuntime {
 
         let store = Arc::new(OrbitStore::open(home_dir.join("orbit.db"))?);
         let orchestrator = AgentOrchestrator::new(home_dir.to_path_buf(), store.clone()).await;
+        let attachments = Arc::new(AttachmentStagingManager::new(home_dir));
 
         let discovered = discover_installed_providers();
         let available_providers = discovered.into_iter().map(|d| d.kind).collect();
@@ -191,6 +202,7 @@ impl DaemonRuntime {
             keypair,
             store,
             orchestrator,
+            attachments,
             home_dir: home_dir.to_path_buf(),
             provider_catalogs: RwLock::new(None),
             catalog_refresh_lock: AsyncMutex::new(()),
@@ -276,16 +288,19 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         vec![format!("ws://{bound_addr}/ws")]
     };
     let offer = runtime.build_pairing_offer(direct_eps, effective_relay.clone());
+    let redacted_relay = effective_relay.as_deref().map(redact_relay_url);
 
     info!(
         host_id = %runtime.host_info.host_id,
         hostname = %runtime.host_info.hostname,
         providers = ?runtime.host_info.available_providers,
         listen = %bound_addr,
-        relay = ?effective_relay,
+        relay = ?redacted_relay,
         "Orbit Daemon ready"
     );
-    if let Ok(uri) = offer.to_qr_uri() {
+    if effective_relay.as_deref().is_some_and(is_ssh_relay_url) {
+        info!("Run 'orbit pair' to print Multi-Host pairing URI");
+    } else if let Ok(uri) = offer.to_qr_uri() {
         info!(pairing_uri = %uri, "Scan or import this Multi-Host pairing URI on Orbit Mobile");
     }
 
@@ -345,42 +360,54 @@ async fn healthz_handler(State(runtime): State<Arc<DaemonRuntime>>) -> impl Into
 // --- Outbound Relay Control & Noise NK E2EE Tunnel Spawner ---
 
 async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
-    let base = relay_base.trim_end_matches('/').to_string();
+    let display_relay = redact_relay_url(&relay_base);
     let pubkey = runtime.keypair.public_key_b64.clone();
-    let ctrl_url = format!("{base}/v1/daemon/control?pubkey={pubkey}");
+    let ctrl_path = format!("/v1/daemon/control?pubkey={pubkey}");
 
     loop {
-        match connect_async(&ctrl_url).await {
-            Ok((ws, _)) => {
-                info!(relay = %base, "Connected outbound to Orbit Relay");
-                let (mut sink, mut stream) = ws.split();
-                while let Some(Ok(msg)) = stream.next().await {
-                    match msg {
-                        TungMsg::Text(txt) => {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
-                                && v.get("op").and_then(|x| x.as_str()) == Some("open_tunnel")
-                                && let Some(tid) = v.get("tunnel_id").and_then(|x| x.as_str())
-                            {
-                                let rt_tun = runtime.clone();
-                                let base_tun = base.clone();
-                                let tid_owned = tid.to_string();
-                                tokio::spawn(async move {
-                                    let _ = serve_e2ee_relay_tunnel(rt_tun, &base_tun, &tid_owned)
-                                        .await;
-                                });
+        match RelayConnector::connect(&relay_base).await {
+            Ok(connector) => {
+                let connector = Arc::new(connector);
+                match connector.open_ws(&ctrl_path).await {
+                    Ok(ws) => {
+                        info!(relay = %display_relay, "Connected outbound to Orbit Relay");
+                        let (mut sink, mut stream) = ws.split();
+                        while let Some(Ok(msg)) = stream.next().await {
+                            match msg {
+                                TungMsg::Text(txt) => {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+                                        && v.get("op").and_then(|x| x.as_str())
+                                            == Some("open_tunnel")
+                                        && let Some(tid) =
+                                            v.get("tunnel_id").and_then(|x| x.as_str())
+                                    {
+                                        let rt_tun = runtime.clone();
+                                        let conn_tun = Arc::clone(&connector);
+                                        let tid_owned = tid.to_string();
+                                        tokio::spawn(async move {
+                                            let _ = serve_e2ee_relay_tunnel(
+                                                rt_tun, &conn_tun, &tid_owned,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                }
+                                TungMsg::Ping(p) => {
+                                    let _ = sink.send(TungMsg::Pong(p)).await;
+                                }
+                                TungMsg::Close(_) => break,
+                                _ => {}
                             }
                         }
-                        TungMsg::Ping(p) => {
-                            let _ = sink.send(TungMsg::Pong(p)).await;
-                        }
-                        TungMsg::Close(_) => break,
-                        _ => {}
+                        warn!(relay = %display_relay, "Disconnected from Relay, reconnecting in 2s...");
+                    }
+                    Err(e) => {
+                        warn!(relay = %display_relay, error = %e, "Relay control stream failed, retrying in 2s...");
                     }
                 }
-                warn!(relay = %base, "Disconnected from Relay, reconnecting in 2s...");
             }
             Err(e) => {
-                warn!(relay = %base, error = %e, "Relay connection failed, retrying in 2s...");
+                warn!(relay = %display_relay, error = %e, "Relay connection failed, retrying in 2s...");
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -389,14 +416,14 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
 
 async fn serve_e2ee_relay_tunnel(
     runtime: Arc<DaemonRuntime>,
-    relay_base: &str,
+    connector: &Arc<RelayConnector>,
     tunnel_id: &str,
 ) -> anyhow::Result<()> {
     let pubkey = &runtime.keypair.public_key_b64;
     let priv_bytes = runtime.keypair.private_bytes()?;
-    let tun_url = format!("{relay_base}/v1/daemon/tunnel?tunnel_id={tunnel_id}&pubkey={pubkey}");
+    let tun_path = format!("/v1/daemon/tunnel?tunnel_id={tunnel_id}&pubkey={pubkey}");
 
-    let (ws, _) = connect_async(&tun_url).await?;
+    let ws = connector.open_ws(&tun_path).await?;
     let (mut sink, mut stream) = ws.split();
 
     // Receive Noise NK Message 1 from Client
@@ -836,38 +863,6 @@ async fn handle_wire_rpc(
             });
             None
         }
-        WireMessage::StageAttachment {
-            request_id,
-            filename,
-            mime_type: _,
-            data_b64,
-        } => {
-            let tx = out_tx.clone();
-            let home_dir = runtime.home_dir.clone();
-            let zstd = *use_zstd;
-            tokio::spawn(async move {
-                let reply = match tokio::task::spawn_blocking(move || {
-                    stage_daemon_attachment(&home_dir, &filename, &data_b64)
-                })
-                .await
-                {
-                    Ok(Ok((path, clean_name, size_bytes))) => WireMessage::AttachmentStaged {
-                        request_id,
-                        path,
-                        filename: clean_name,
-                        size_bytes,
-                    },
-                    Ok(Err(e)) => rpc_err(request_id, "stage_attachment_error", e),
-                    Err(e) => rpc_err(
-                        request_id,
-                        "stage_attachment_error",
-                        format!("attachment worker panicked: {e}"),
-                    ),
-                };
-                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
-            });
-            None
-        }
 
         // Agents
         WireMessage::ListAgents {
@@ -1161,6 +1156,38 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::StageAttachmentChunk {
+            request_id,
+            upload_id,
+            filename,
+            chunk_index,
+            total_chunks,
+            data_b64,
+        } => {
+            let rt = Arc::clone(runtime);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match rt
+                    .attachments
+                    .ingest_chunk(upload_id, filename, chunk_index, total_chunks, data_b64)
+                    .await
+                {
+                    Ok(res) => WireMessage::AttachmentStaged {
+                        request_id,
+                        upload_id: res.upload_id,
+                        chunk_index: res.chunk_index,
+                        completed: res.completed,
+                        path: res.path,
+                        filename: res.filename,
+                        size_bytes: res.size_bytes,
+                    },
+                    Err(e) => rpc_err(request_id, "stage_attachment_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         _ => None,
     }
 }
@@ -1248,64 +1275,6 @@ fn rpc_err(request_id: uuid::Uuid, code: &str, message: impl ToString) -> WireMe
     }
 }
 
-fn stage_daemon_attachment(
-    home_dir: &Path,
-    raw_filename: &str,
-    data_b64: &str,
-) -> Result<(String, String, u64), String> {
-    use base64::Engine as _;
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data_b64.trim())
-        .map_err(|e| format!("Invalid base64 payload: {e}"))?;
-
-    if bytes.is_empty() {
-        return Err("Attachment is empty".into());
-    }
-    if bytes.len() > MAX_REMOTE_ATTACHMENT_BYTES {
-        return Err("Attachment exceeds 10 MiB limit".into());
-    }
-
-    let leaf = raw_filename.rsplit(['/', '\\']).next().unwrap_or("");
-    let sanitized: String = leaf
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = sanitized.trim_start_matches(['.', '_']);
-    let clean_name = if trimmed.is_empty() || trimmed == ".." {
-        "attachment.bin".to_string()
-    } else {
-        trimmed.to_string()
-    };
-
-    let attachments_dir = home_dir.join("attachments");
-    std::fs::create_dir_all(&attachments_dir)
-        .map_err(|e| format!("Failed to create attachments directory: {e}"))?;
-
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let uid_hex = uuid::Uuid::new_v4().simple().to_string();
-    let short_id = uid_hex.get(..8).unwrap_or(&uid_hex);
-    let unique_name = format!("{ts_ms}_{short_id}_{clean_name}");
-    let dest = attachments_dir.join(unique_name);
-
-    std::fs::write(&dest, &bytes).map_err(|e| format!("Failed to write staged attachment: {e}"))?;
-
-    Ok((
-        dest.to_string_lossy().to_string(),
-        clean_name,
-        bytes.len() as u64,
-    ))
-}
-
 fn hostname_string() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -1316,45 +1285,4 @@ fn hostname_string() -> String {
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "orbit-host".to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use base64::Engine as _;
-
-    #[test]
-    fn stage_daemon_attachment_writes_sanitized_file_and_rejects_oversize() {
-        let dir =
-            std::env::temp_dir().join(format!("orbit_daemon_attach_{}", uuid::Uuid::new_v4()));
-        let payload = b"hello orbit attachment";
-        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
-
-        // Normal file write
-        let (path, name, size) =
-            stage_daemon_attachment(&dir, "screenshot 1.jpg", &b64).expect("stage normal");
-        assert_eq!(name, "screenshot_1.jpg");
-        assert_eq!(size, payload.len() as u64);
-        assert!(Path::new(&path).starts_with(dir.join("attachments")));
-        assert_eq!(std::fs::read(&path).expect("read back"), payload);
-
-        // Path traversal input is confined to home_dir/attachments
-        let (trav_path, trav_name, _) =
-            stage_daemon_attachment(&dir, "../../etc/passwd", &b64).expect("stage traversal");
-        assert_eq!(trav_name, "passwd");
-        assert!(Path::new(&trav_path).starts_with(dir.join("attachments")));
-
-        // Hidden / dot-only fallback
-        let (dot_path, dot_name, _) =
-            stage_daemon_attachment(&dir, "...", &b64).expect("stage dot");
-        assert_eq!(dot_name, "attachment.bin");
-        assert!(Path::new(&dot_path).starts_with(dir.join("attachments")));
-
-        // Oversize payload (> 10 MiB) is rejected
-        let too_big = vec![0x41u8; MAX_REMOTE_ATTACHMENT_BYTES + 1];
-        let big_b64 = base64::engine::general_purpose::STANDARD.encode(too_big);
-        assert!(stage_daemon_attachment(&dir, "big.bin", &big_b64).is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

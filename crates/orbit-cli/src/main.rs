@@ -9,7 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use orbit_client_core::{ClientInboundEvent, connect_direct};
+use orbit_client_core::{
+    ClientInboundEvent, HostConnectionState, HostRouteMode, HostSessionHandle, SavedHostProfile,
+    connect_direct, connect_smart,
+};
+use orbit_crypto::PairingOffer;
 use orbit_daemon::{
     DaemonConfig, DaemonPersistedConfig, DaemonRuntime, discover_lan_ws_endpoints, run_daemon,
 };
@@ -18,6 +22,7 @@ use orbit_protocol::{
 };
 use orbit_providers::{discover_installed_providers, probe_all_provider_quotas};
 use orbit_relay::{RelayConfig, RelayPersistedConfig, run_relay};
+use orbit_relay_transport::{is_ssh_relay_url, redact_relay_url};
 use orbit_shim::{ShimSpawnSpec, run_shim};
 use uuid::Uuid;
 
@@ -150,11 +155,14 @@ enum Commands {
 
     /// Auto-discover `~/.ssh/config` or attach to an E2EE Relay, auto-deploy via SSH if given an SSH alias, and print Pairing Code.
     UseRelay {
-        /// SSH config host alias (e.g. `devbox`) OR Relay URL (`203.0.113.10:7878`). Omit to pick from `~/.ssh/config`.
+        /// SSH config host alias (e.g. `devbox`) OR Relay URL (`203.0.113.10:7878` or `ssh+relay://...`). Omit to pick from `~/.ssh/config`.
         relay_url: Option<String>,
         /// Relay TCP port when deploying/connecting via SSH alias (defaults to `7878`).
         #[arg(long, default_value_t = 7878)]
         port: u16,
+        /// Deploy a public-port WebSocket Relay (`0.0.0.0:<port>`) instead of a Zero-Port SSH-tunneled Relay.
+        #[arg(long)]
+        direct: bool,
         /// Skip automatic SSH relay provisioning when `relay_url` matches an SSH config alias.
         #[arg(long)]
         no_provision: bool,
@@ -198,6 +206,9 @@ enum Commands {
     Ls {
         #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
         server: String,
+        /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
+        #[arg(long)]
+        via_relay: bool,
     },
 
     /// Create and stream a live coding agent session (`agy`, `codex`, or `claude`).
@@ -215,6 +226,9 @@ enum Commands {
         worktree: bool,
         #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
         server: String,
+        /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
+        #[arg(long)]
+        via_relay: bool,
         /// Initial prompt to send to the agent.
         prompt: String,
     },
@@ -225,6 +239,9 @@ enum Commands {
         prompt: String,
         #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
         server: String,
+        /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
+        #[arg(long)]
+        via_relay: bool,
     },
 
     /// Read timeline history of an agent from an Orbit Daemon.
@@ -232,6 +249,9 @@ enum Commands {
         agent_id: String,
         #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
         server: String,
+        /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
+        #[arg(long)]
+        via_relay: bool,
     },
 
     /// Internal detached process supervisor invoked by `orbit daemon`.
@@ -298,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
                 active_port
             );
             match &persisted.relay_url {
-                Some(r) => println!("Relay Route  : {r} (Noise NK E2EE)"),
+                Some(r) => println!("Relay Route  : {} (Noise NK E2EE)", redact_relay_url(r)),
                 None => println!(
                     "Relay Route  : (not configured — LAN/Tailscale only; run `orbit use-relay <HOST:PORT>`)"
                 ),
@@ -372,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::UseRelay {
             relay_url,
             port,
+            direct,
             no_provision,
             clear,
         } => {
@@ -453,15 +474,31 @@ async fn main() -> anyhow::Result<()> {
                 if no_provision {
                     format!("ws://{}:{port}", ssh_entry.host_name)
                 } else {
+                    if direct {
+                        println!(
+                            "Auto-deploying Orbit E2EE Relay (direct TCP port {port}) onto SSH host `{}` ({})...",
+                            ssh_entry.alias,
+                            ssh_entry.display_target()
+                        );
+                    } else {
+                        println!(
+                            "Auto-deploying Zero-Port SSH Relay onto SSH host `{}` ({})...",
+                            ssh_entry.alias,
+                            ssh_entry.display_target()
+                        );
+                    }
+                    let deployed_url = provision_relay_via_ssh(
+                        &home_dir,
+                        ssh_entry,
+                        port,
+                        &pubkey,
+                        &expected_host_id,
+                        direct,
+                    )?;
                     println!(
-                        "Auto-deploying Orbit E2EE Relay onto SSH host `{}` ({})...",
+                        "[✓] Relay deployed & authorized on `{}` -> {}",
                         ssh_entry.alias,
-                        ssh_entry.display_target()
-                    );
-                    let deployed_url = provision_relay_via_ssh(ssh_entry, port, &pubkey)?;
-                    println!(
-                        "[✓] Relay deployed & authorized on `{}` -> {deployed_url}",
-                        ssh_entry.alias
+                        redact_relay_url(&deployed_url)
                     );
                     normalize_relay_url(&deployed_url)?
                 }
@@ -469,7 +506,8 @@ async fn main() -> anyhow::Result<()> {
                 normalize_relay_url(&chosen_input)?
             };
 
-            println!("Probing Relay {normalized} with host pubkey `{pubkey}`...");
+            let display_relay = redact_relay_url(&normalized);
+            println!("Probing Relay {display_relay} with host pubkey `{pubkey}`...");
             match preflight_probe_relay(&normalized, &pubkey).await {
                 RelayProbeOutcome::Authorized => {
                     println!("[✓] Relay reachable & host public key authorized!");
@@ -487,10 +525,16 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 RelayProbeOutcome::Unreachable(reason) => {
-                    println!("[!] Could not reach {normalized} right now: {reason}");
-                    println!(
-                        "    Ensure TCP port {port} is open in your cloud firewall / AWS Security Group."
-                    );
+                    println!("[!] Could not reach {display_relay} right now: {reason}");
+                    if is_ssh_relay_url(&normalized) {
+                        println!(
+                            "    Ensure SSH TCP forwarding (`AllowTcpForwarding yes`) is enabled on the SSH server."
+                        );
+                    } else {
+                        println!(
+                            "    Ensure TCP port {port} is open in your cloud firewall / AWS Security Group."
+                        );
+                    }
                     println!(
                         "    (Saving Relay config now — local daemon will auto-connect in background as soon as reachable.)"
                     );
@@ -507,7 +551,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(&expected_host_id),
             )
             .await?;
-            println!("[✓] Orbit Daemon active via {mgr} -> attached to {normalized}");
+            println!("[✓] Orbit Daemon active via {mgr} -> attached to {display_relay}");
             println!(
                 "\nCopy & import this updated Pairing Code in Orbit App (Mac / iOS / Android):"
             );
@@ -579,7 +623,8 @@ async fn main() -> anyhow::Result<()> {
                     persisted
                         .relay_url
                         .as_deref()
-                        .unwrap_or("(none — LAN/Tailscale direct)")
+                        .map(redact_relay_url)
+                        .unwrap_or_else(|| "(none — LAN/Tailscale direct)".to_string())
                 );
                 println!("\nPairing Code for Orbit App:");
                 print_pairing_summary(
@@ -633,7 +678,11 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!(
                     "Relay URL    : {}",
-                    persisted.relay_url.as_deref().unwrap_or("(not configured)")
+                    persisted
+                        .relay_url
+                        .as_deref()
+                        .map(redact_relay_url)
+                        .unwrap_or_else(|| "(not configured)".to_string())
                 );
             }
             Some(DaemonAction::Down) => {
@@ -764,8 +813,8 @@ async fn main() -> anyhow::Result<()> {
             }
         },
 
-        Commands::Ls { server } => {
-            let client = connect_direct(&server, None).await?;
+        Commands::Ls { server, via_relay } => {
+            let client = connect_cli_server(&server, via_relay).await?;
             let req_id = Uuid::new_v4();
             let resp = client
                 .request(
@@ -801,12 +850,13 @@ async fn main() -> anyhow::Result<()> {
             cwd,
             worktree,
             server,
+            via_relay,
             prompt,
         } => {
             let target_cwd = cwd
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let client = connect_direct(&server, None).await?;
+            let client = connect_cli_server(&server, via_relay).await?;
             let mut sub_rx = client.subscribe();
 
             let req_id = Uuid::new_v4();
@@ -861,8 +911,9 @@ async fn main() -> anyhow::Result<()> {
             agent_id,
             prompt,
             server,
+            via_relay,
         } => {
-            let client = connect_direct(&server, None).await?;
+            let client = connect_cli_server(&server, via_relay).await?;
             let mut sub_rx = client.subscribe();
             let req_id = Uuid::new_v4();
             let resp = client
@@ -891,8 +942,12 @@ async fn main() -> anyhow::Result<()> {
             stream_turn_to_stdout(&client, &mut sub_rx, &agent_id).await?;
         }
 
-        Commands::Logs { agent_id, server } => {
-            let client = connect_direct(&server, None).await?;
+        Commands::Logs {
+            agent_id,
+            server,
+            via_relay,
+        } => {
+            let client = connect_cli_server(&server, via_relay).await?;
             let req_id = Uuid::new_v4();
             let resp = client
                 .request(
@@ -919,6 +974,33 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn connect_cli_server(server: &str, via_relay: bool) -> anyhow::Result<HostSessionHandle> {
+    let trimmed = server.trim();
+    if trimmed.starts_with("orbit://pair/") {
+        let offer = PairingOffer::from_qr_uri(trimmed)?;
+        let profile = SavedHostProfile {
+            host_id: offer.host_id,
+            hostname: offer.hostname,
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: if via_relay {
+                HostRouteMode::RelayOnly
+            } else {
+                HostRouteMode::Auto
+            },
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: offer.daemon_pubkey_b64,
+            direct_endpoints: offer.direct_endpoints,
+            relay_url: offer.relay_url,
+            state: HostConnectionState::Disconnected,
+        };
+        Ok(connect_smart(&profile, None).await?)
+    } else {
+        Ok(connect_direct(trimmed, None).await?)
+    }
 }
 
 async fn print_pairing_summary(
@@ -948,14 +1030,16 @@ async fn print_pairing_summary(
     };
 
     let offer = runtime.build_pairing_offer(endpoints.clone(), relay.clone());
+    let relay_summary = relay
+        .as_deref()
+        .map(redact_relay_url)
+        .unwrap_or_else(|| "none (LAN only — run `orbit use-relay <HOST:PORT>` for remote)".into());
     eprintln!(
         "Host `{}` ({}) | Direct: {} | Relay: {}",
         runtime.host_info.hostname,
         runtime.host_info.host_id,
         endpoints.join(", "),
-        relay
-            .as_deref()
-            .unwrap_or("none (LAN only — run `orbit use-relay <HOST:PORT>` for remote)")
+        relay_summary
     );
     println!("{}", offer.to_qr_uri()?);
     Ok(())

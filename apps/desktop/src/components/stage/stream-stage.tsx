@@ -395,7 +395,13 @@ const StepItemRow = memo(function StepItemRow({
           <span className="text-muted-foreground/75 mt-[2px] flex size-4 shrink-0 items-center justify-center">
             <MessageSquareText className="size-3.5 stroke-[1.75]" />
           </span>
-          <span className="selectable-text text-foreground/78">{trimmed}</span>
+          {item.blocks.length > 0 ? (
+            <div className="min-w-0 flex-1">
+              <MarkdownBlocksView blocks={item.blocks} streaming={item.streaming} compact />
+            </div>
+          ) : (
+            <span className="selectable-text text-foreground/78">{trimmed}</span>
+          )}
         </div>
       );
     }
@@ -976,6 +982,13 @@ function extractUserPromptPresentation(
     sanitized = true;
     const name = rawPath.split("/").pop() || rawPath;
     inferredBadges.push({ kind: "image", label: name });
+    return "";
+  });
+
+  working = working.replace(/^Attached file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
+    sanitized = true;
+    const name = rawPath.split("/").pop() || rawPath;
+    inferredBadges.push({ kind: "file", label: name });
     return "";
   });
 

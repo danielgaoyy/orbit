@@ -234,6 +234,16 @@ export interface HighlightedLineView {
   tokens: HighlightedTokenView[];
 }
 
+export type TableAlignmentView = "none" | "left" | "center" | "right";
+
+export interface TableCellView {
+  spans: InlineSpanView[];
+}
+
+export interface TableRowView {
+  cells: TableCellView[];
+}
+
 export type RichBlockView =
   | { kind: "heading"; level: number; spans: InlineSpanView[] }
   | { kind: "paragraph"; spans: InlineSpanView[] }
@@ -251,6 +261,12 @@ export type RichBlockView =
       spans: InlineSpanView[];
     }
   | { kind: "block_quote"; spans: InlineSpanView[] }
+  | {
+      kind: "table";
+      alignments: TableAlignmentView[];
+      headers: TableCellView[];
+      rows: TableRowView[];
+    }
   | { kind: "horizontal_rule" };
 
 export type DiffLineKind = "meta" | "hunk_header" | "context" | "added" | "removed";
@@ -868,6 +884,22 @@ export const orbitIpc = {
     return invoke<StagedAttachmentInfo>("stage_attachment", { filename, bytes });
   },
 
+  stageHostAttachment: async (
+    hostId: string,
+    filename: string,
+    dataB64: string,
+  ): Promise<StagedAttachmentInfo> => {
+    if (!isTauriRuntime()) {
+      const approxBytes = Math.floor((dataB64.length * 3) / 4);
+      return { path: `/tmp/${filename}`, filename, size_bytes: approxBytes };
+    }
+    return invoke<StagedAttachmentInfo>("stage_host_attachment", {
+      hostId,
+      filename,
+      dataB64,
+    });
+  },
+
   provisionSshRelay: async (params: {
     targetHostId: string;
     sshAlias: string;
@@ -878,7 +910,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.3.0";
+    if (!isTauriRuntime()) return "0.3.3";
     return invoke<string>("get_app_version");
   },
 

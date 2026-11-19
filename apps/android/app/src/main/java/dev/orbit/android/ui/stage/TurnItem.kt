@@ -90,6 +90,7 @@ import kotlinx.coroutines.delay
 import uniffi.orbit_ffi_uniffi.FfiDiffFile
 import uniffi.orbit_ffi_uniffi.FfiDiffLineKind
 import uniffi.orbit_ffi_uniffi.FfiPromptBadge
+import uniffi.orbit_ffi_uniffi.FfiRichBlock
 import uniffi.orbit_ffi_uniffi.FfiStageTurn
 import uniffi.orbit_ffi_uniffi.FfiTimelineItem
 import uniffi.orbit_ffi_uniffi.FfiToolCallDetail
@@ -522,8 +523,33 @@ private fun AssistantTurnFooter(
     }
 }
 
-private fun extractAssistantReplyText(reply: FfiTimelineItem.AssistantMessage): String =
-    reply.text.trim()
+private fun extractAssistantReplyText(reply: FfiTimelineItem.AssistantMessage): String {
+    if (reply.text.isNotBlank()) return reply.text.trim()
+    return buildString {
+        reply.blocks.forEach { block ->
+            when (block) {
+                is FfiRichBlock.Heading -> appendLine(block.spans.joinToString("") { it.text })
+                is FfiRichBlock.Paragraph -> appendLine(block.spans.joinToString("") { it.text })
+                is FfiRichBlock.ListItem -> appendLine("• " + block.spans.joinToString("") { it.text })
+                is FfiRichBlock.BlockQuote -> appendLine("> " + block.spans.joinToString("") { it.text })
+                is FfiRichBlock.CodeBlock -> {
+                    appendLine("```${block.language}")
+                    appendLine(block.rawCode)
+                    appendLine("```")
+                }
+                is FfiRichBlock.Table -> {
+                    if (block.headers.isNotEmpty()) {
+                        appendLine(block.headers.joinToString(" | ") { cell -> cell.spans.joinToString("") { it.text } })
+                    }
+                    block.rows.forEach { row ->
+                        appendLine(row.cells.joinToString(" | ") { cell -> cell.spans.joinToString("") { it.text } })
+                    }
+                }
+                FfiRichBlock.HorizontalRule -> appendLine("---")
+            }
+        }
+    }.trim()
+}
 
 private fun stepStableKey(item: FfiTimelineItem): String = when (item) {
     is FfiTimelineItem.UserPrompt -> "user:${item.messageId}"

@@ -172,6 +172,16 @@ struct RichMarkdownView: View {
 
         var idx = 0
         while idx < blocks.count {
+            if case let .table(_, headers, rows) = blocks[idx] {
+                flushProseBuffer()
+                let model = MarkdownTableModel(
+                    headers: headers.map(\.spans),
+                    rows: rows.map { $0.cells.map(\.spans) }
+                )
+                out.append(.table(model))
+                idx += 1
+                continue
+            }
             if let tableRowCells = extractDelimitedTableCells(from: blocks[idx]) {
                 var rawRows: [[[FfiInlineSpan]]] = [tableRowCells]
                 var next = idx + 1
@@ -207,6 +217,8 @@ struct RichMarkdownView: View {
             case let .codeBlock(language, rawCode, lines):
                 flushProseBuffer()
                 out.append(.codeBlock(language: language, rawCode: rawCode, lines: lines))
+            case .table:
+                break
             }
             idx += 1
         }

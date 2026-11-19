@@ -61,69 +61,29 @@ pub enum RelayProbeOutcome {
     Unreachable(String),
 }
 
-/// Normalize user-entered relay address (`host:port`, `ip`, `http://...`, `ws://...`, `wss://...`)
-/// into a clean base WebSocket URL (`ws://host:port` or `wss://host`).
+/// Normalize user-entered relay address (`host:port`, `ip`, `http://...`, `ws://...`, `wss://...`, or `ssh+relay://...`)
+/// into a canonical Relay URL.
 pub fn normalize_relay_url(raw: &str) -> anyhow::Result<String> {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        anyhow::bail!("relay URL cannot be empty");
-    }
-
-    let had_scheme = trimmed.contains("://");
-    let with_scheme = if let Some(rest) = trimmed.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
-        trimmed.to_string()
-    } else {
-        format!("ws://{trimmed}")
-    };
-
-    let (scheme, after_scheme) = with_scheme
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("invalid relay URL: {raw}"))?;
-
-    // Strip accidental path suffixes like `/ws` or `/v1/...`
-    let authority = after_scheme
-        .split('/')
-        .next()
-        .unwrap_or(after_scheme)
-        .trim();
-    if authority.is_empty() {
-        anyhow::bail!("missing host in relay URL: {raw}");
-    }
-
-    // If user typed a bare IPv4 or `localhost` without `:port`, default to `:7878`
-    let final_authority = if !had_scheme
-        && !authority.contains(':')
-        && (authority == "localhost" || authority.parse::<Ipv4Addr>().is_ok())
-    {
-        format!("{authority}:7878")
-    } else {
-        authority.to_string()
-    };
-
-    Ok(format!("{scheme}://{final_authority}"))
+    orbit_relay_transport::normalize_relay_url(raw).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// Perform a fast 4-second preflight WebSocket check against the Relay control endpoint.
+/// Perform a fast 6-second preflight WebSocket check against the Relay control endpoint
+/// (supports both direct `ws(s)://` and tunneled `ssh+relay://`).
 pub async fn preflight_probe_relay(relay_base: &str, pubkey: &str) -> RelayProbeOutcome {
-    let base = relay_base.trim_end_matches('/');
-    let ctrl_url = format!("{base}/v1/daemon/control?pubkey={pubkey}");
+    let path_and_query = format!("/v1/daemon/control?pubkey={pubkey}");
 
     let res = tokio::time::timeout(
-        Duration::from_secs(4),
-        tokio_tungstenite::connect_async(&ctrl_url),
+        Duration::from_secs(6),
+        orbit_relay_transport::connect_relay_ws(relay_base, &path_and_query),
     )
     .await;
 
     match res {
-        Ok(Ok((mut ws, _))) => {
-            let _ = ws.close(None).await;
+        Ok(Ok(mut ws)) => {
+            let _ = SinkExt::close(&mut ws).await;
             RelayProbeOutcome::Authorized
         }
-        Ok(Err(WsError::Http(resp))) if resp.status().as_u16() == 403 => {
+        Ok(Err(orbit_relay_transport::RelayTransportError::WebSocket(err))) if matches!(err.as_ref(), WsError::Http(resp) if resp.status().as_u16() == 403) => {
             RelayProbeOutcome::Forbidden403
         }
         Ok(Err(e)) => {
@@ -135,8 +95,7 @@ pub async fn preflight_probe_relay(relay_base: &str, pubkey: &str) -> RelayProbe
             }
         }
         Err(_) => RelayProbeOutcome::Unreachable(
-            "connection timed out after 4s (check port / cloud firewall / AWS Security Group)"
-                .to_string(),
+            "connection timed out after 6s (check SSH connectivity / relay port)".to_string(),
         ),
     }
 }
@@ -810,6 +769,18 @@ mod tests {
                 .ok()
                 .as_deref(),
             Some("wss://relay.example.com:8443")
+        );
+        let key = orbit_relay_transport::generate_ssh_tunnel_key().expect("keygen");
+        let ssh_uri = format!("ssh+relay://ec2-user@13.228.27.154/?key={}", key.seed_b64);
+        assert_eq!(
+            normalize_relay_url(&ssh_uri).ok().as_deref(),
+            Some(
+                format!(
+                    "ssh+relay://ec2-user@13.228.27.154:22/7878?key={}",
+                    key.seed_b64
+                )
+                .as_str()
+            )
         );
     }
 

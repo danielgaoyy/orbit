@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
+use crate::attachments::build_codex_input_items;
 use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 
 /// Serialize concurrent `codex app-server` SQLite state runtime startups.
@@ -195,6 +196,8 @@ async fn run_codex_actor(
                 match cmd {
                     DriverCommand::SendPrompt { turn_id, prompt } => {
                         // If a turn is already active and we know `native_turn_id`, steer in-place!
+                        let input_items =
+                            build_codex_input_items(&prompt, cfg.attachments_dir.as_deref());
                         if let Some(ref active_nat_tid) = native_turn_id {
                             let req_id = next_id;
                             next_id += 1;
@@ -204,11 +207,7 @@ async fn run_codex_actor(
                                 "params": {
                                     "threadId": thread_id,
                                     "expectedTurnId": active_nat_tid,
-                                    "input": [{
-                                        "type": "text",
-                                        "text": prompt,
-                                        "text_elements": []
-                                    }]
+                                    "input": input_items
                                 }
                             });
                             let _ = shim.write_stdin_line(steer.to_string()).await;
@@ -229,11 +228,7 @@ async fn run_codex_actor(
                         next_id += 1;
                         let mut params = json!({
                             "threadId": thread_id,
-                            "input": [{
-                                "type": "text",
-                                "text": prompt,
-                                "text_elements": []
-                            }],
+                            "input": input_items,
                             "cwd": cfg.cwd.to_string_lossy(),
                             "approvalPolicy": pol,
                             "approvalsReviewer": "user",

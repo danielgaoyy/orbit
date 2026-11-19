@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// First-class supported coding agent CLIs in Orbit Phase 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -484,19 +484,6 @@ pub enum WireMessage {
         cwd: String,
         files: Vec<String>,
     },
-    StageAttachment {
-        request_id: Uuid,
-        filename: String,
-        #[serde(default)]
-        mime_type: Option<String>,
-        data_b64: String,
-    },
-    AttachmentStaged {
-        request_id: Uuid,
-        path: String,
-        filename: String,
-        size_bytes: u64,
-    },
 
     // Agents & Interactive Orchestration
     ListAgents {
@@ -656,6 +643,28 @@ pub enum WireMessage {
         catalogs: Vec<ProviderModelCatalog>,
     },
 
+    // Remote Attachment Staging (Chunked to stay far below 16 MiB Zstd cap)
+    StageAttachmentChunk {
+        request_id: Uuid,
+        upload_id: String,
+        filename: String,
+        chunk_index: u32,
+        total_chunks: u32,
+        data_b64: String,
+    },
+    AttachmentStaged {
+        request_id: Uuid,
+        upload_id: String,
+        chunk_index: u32,
+        completed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_bytes: Option<u64>,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -813,50 +822,63 @@ mod tests {
     }
 
     #[test]
-    fn stage_attachment_wire_roundtrip() {
+    fn attachment_chunk_and_staged_zstd_roundtrip() {
         let req_id = Uuid::new_v4();
-        let req = WireMessage::StageAttachment {
+        let chunk = WireMessage::StageAttachmentChunk {
             request_id: req_id,
-            filename: "screenshot.jpg".into(),
-            mime_type: Some("image/jpeg".into()),
-            data_b64: "SGVsbG8=".into(),
+            upload_id: "up_123".into(),
+            filename: "shot.png".into(),
+            chunk_index: 0,
+            total_chunks: 2,
+            data_b64: "iVBORw0KGgo=".into(),
         };
-        let encoded = req.encode_zstd(3).expect("compress req");
-        match WireMessage::decode_zstd(&encoded).expect("decompress req") {
-            WireMessage::StageAttachment {
+        let z = chunk.encode_zstd(3).expect("compress chunk");
+        let dec = WireMessage::decode_zstd(&z).expect("decode chunk");
+        match dec {
+            WireMessage::StageAttachmentChunk {
                 request_id,
+                upload_id,
                 filename,
-                mime_type,
+                chunk_index,
+                total_chunks,
                 data_b64,
             } => {
                 assert_eq!(request_id, req_id);
-                assert_eq!(filename, "screenshot.jpg");
-                assert_eq!(mime_type.as_deref(), Some("image/jpeg"));
-                assert_eq!(data_b64, "SGVsbG8=");
+                assert_eq!(upload_id, "up_123");
+                assert_eq!(filename, "shot.png");
+                assert_eq!(chunk_index, 0);
+                assert_eq!(total_chunks, 2);
+                assert_eq!(data_b64, "iVBORw0KGgo=");
             }
-            _ => panic!("unexpected variant"),
+            other => panic!("unexpected variant: {other:?}"),
         }
 
-        let resp = WireMessage::AttachmentStaged {
+        let staged = WireMessage::AttachmentStaged {
             request_id: req_id,
-            path: "/home/user/.orbit/attachments/1_screenshot.jpg".into(),
-            filename: "screenshot.jpg".into(),
-            size_bytes: 5,
+            upload_id: "up_123".into(),
+            chunk_index: 1,
+            completed: true,
+            path: Some("/home/user/.orbit/attachments/123_shot.png".into()),
+            filename: Some("shot.png".into()),
+            size_bytes: Some(2048),
         };
-        let encoded_resp = resp.encode_zstd(3).expect("compress resp");
-        match WireMessage::decode_zstd(&encoded_resp).expect("decompress resp") {
+        let z2 = staged.encode_zstd(3).expect("compress staged");
+        let dec2 = WireMessage::decode_zstd(&z2).expect("decode staged");
+        match dec2 {
             WireMessage::AttachmentStaged {
-                request_id,
+                completed,
                 path,
-                filename,
                 size_bytes,
+                ..
             } => {
-                assert_eq!(request_id, req_id);
-                assert_eq!(path, "/home/user/.orbit/attachments/1_screenshot.jpg");
-                assert_eq!(filename, "screenshot.jpg");
-                assert_eq!(size_bytes, 5);
+                assert!(completed);
+                assert_eq!(
+                    path.as_deref(),
+                    Some("/home/user/.orbit/attachments/123_shot.png")
+                );
+                assert_eq!(size_bytes, Some(2048));
             }
-            _ => panic!("unexpected variant"),
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 }

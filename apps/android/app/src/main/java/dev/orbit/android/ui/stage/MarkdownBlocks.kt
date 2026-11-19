@@ -46,6 +46,7 @@ import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.ParagraphStyle
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -66,12 +67,15 @@ import kotlinx.coroutines.delay
 import uniffi.orbit_ffi_uniffi.FfiHighlightedLine
 import uniffi.orbit_ffi_uniffi.FfiInlineSpan
 import uniffi.orbit_ffi_uniffi.FfiRichBlock
+import uniffi.orbit_ffi_uniffi.FfiTableAlignment
+import uniffi.orbit_ffi_uniffi.FfiTableCell
 
 private sealed class MarkdownRenderSegment {
     data class ProseRun(val blocks: List<FfiRichBlock>) : MarkdownRenderSegment()
     data class TaskListItem(val block: FfiRichBlock.ListItem) : MarkdownRenderSegment()
     data class BlockQuote(val block: FfiRichBlock.BlockQuote) : MarkdownRenderSegment()
     data class CodeBlock(val block: FfiRichBlock.CodeBlock) : MarkdownRenderSegment()
+    data class Table(val block: FfiRichBlock.Table) : MarkdownRenderSegment()
     data object HorizontalRule : MarkdownRenderSegment()
 }
 
@@ -81,6 +85,7 @@ private fun isProseMergeable(block: FfiRichBlock): Boolean = when (block) {
     is FfiRichBlock.ListItem -> block.checked == null
     is FfiRichBlock.BlockQuote,
     is FfiRichBlock.CodeBlock,
+    is FfiRichBlock.Table,
     FfiRichBlock.HorizontalRule -> false
 }
 
@@ -104,6 +109,7 @@ private fun groupMarkdownBlocks(blocks: List<FfiRichBlock>): List<MarkdownRender
                 is FfiRichBlock.ListItem -> result += MarkdownRenderSegment.TaskListItem(block)
                 is FfiRichBlock.BlockQuote -> result += MarkdownRenderSegment.BlockQuote(block)
                 is FfiRichBlock.CodeBlock -> result += MarkdownRenderSegment.CodeBlock(block)
+                is FfiRichBlock.Table -> result += MarkdownRenderSegment.Table(block)
                 FfiRichBlock.HorizontalRule -> result += MarkdownRenderSegment.HorizontalRule
                 is FfiRichBlock.Heading,
                 is FfiRichBlock.Paragraph -> Unit
@@ -233,6 +239,10 @@ fun MarkdownBlocks(
                         CodeBlockSurface(block = seg.block)
                     }
 
+                    is MarkdownRenderSegment.Table -> {
+                        MarkdownTableSurface(block = seg.block, textColor = textColor)
+                    }
+
                     MarkdownRenderSegment.HorizontalRule -> {
                         HorizontalDivider(
                             thickness = OrbitSpacing.hairline,
@@ -316,6 +326,7 @@ private fun buildCombinedProseAnnotatedString(
 
             is FfiRichBlock.BlockQuote,
             is FfiRichBlock.CodeBlock,
+            is FfiRichBlock.Table,
             FfiRichBlock.HorizontalRule -> Unit
         }
     }
@@ -326,6 +337,7 @@ private fun RichSpanText(
     spans: List<FfiInlineSpan>,
     textColor: Color,
     modifier: Modifier = Modifier,
+    style: TextStyle = OrbitTheme.typography.body,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
@@ -341,7 +353,7 @@ private fun RichSpanText(
     }
     Text(
         text = styled,
-        style = typography.body,
+        style = style,
         color = textColor,
         modifier = modifier,
     )
@@ -467,6 +479,110 @@ private fun CodeBlockSurface(block: FfiRichBlock.CodeBlock) {
                         Text(
                             text = buildHighlightedLine(line, defaultCodeFg),
                             style = typography.code,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownTableSurface(
+    block: FfiRichBlock.Table,
+    textColor: Color,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val colCount = maxOf(
+        block.headers.size,
+        block.rows.maxOfOrNull { it.cells.size } ?: 0,
+        1,
+    )
+    val shape = RoundedCornerShape(OrbitSpacing.md)
+
+    @Composable
+    fun TableCellBox(
+        cell: FfiTableCell?,
+        isHeader: Boolean,
+        colIndex: Int,
+    ) {
+        val align = block.alignments.getOrNull(colIndex) ?: FfiTableAlignment.NONE
+        val boxAlign = when (align) {
+            FfiTableAlignment.CENTER -> Alignment.Center
+            FfiTableAlignment.RIGHT -> Alignment.CenterEnd
+            else -> Alignment.CenterStart
+        }
+        Box(
+            modifier = Modifier
+                .width(OrbitSpacing.xl * 7)
+                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+            contentAlignment = boxAlign,
+        ) {
+            RichSpanText(
+                spans = cell?.spans ?: emptyList(),
+                textColor = if (isHeader) colors.fgPrimary else textColor,
+                style = if (isHeader) typography.subheadSemiBold else typography.subhead,
+            )
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(colors.code, shape)
+            .border(OrbitSpacing.hairline, colors.hairline, shape)
+            .horizontalScroll(rememberScrollState()),
+    ) {
+        Column(
+            modifier = Modifier.width(IntrinsicSize.Max),
+        ) {
+            if (block.headers.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .background(colors.subtleFill)
+                        .height(IntrinsicSize.Min),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    for (colIdx in 0 until colCount) {
+                        if (colIdx > 0) {
+                            Box(
+                                modifier = Modifier
+                                    .width(OrbitSpacing.hairline)
+                                    .fillMaxHeight()
+                                    .background(colors.hairline)
+                            )
+                        }
+                        TableCellBox(
+                            cell = block.headers.getOrNull(colIdx),
+                            isHeader = true,
+                            colIndex = colIdx,
+                        )
+                    }
+                }
+            }
+            block.rows.forEachIndexed { rowIdx, row ->
+                HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+                Row(
+                    modifier = Modifier
+                        .background(if (rowIdx % 2 == 1) colors.subtleFill.copy(alpha = 0.45f) else Color.Transparent)
+                        .height(IntrinsicSize.Min),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    for (colIdx in 0 until colCount) {
+                        if (colIdx > 0) {
+                            Box(
+                                modifier = Modifier
+                                    .width(OrbitSpacing.hairline)
+                                    .fillMaxHeight()
+                                    .background(colors.hairline)
+                            )
+                        }
+                        TableCellBox(
+                            cell = row.cells.getOrNull(colIdx),
+                            isHeader = false,
+                            colIndex = colIdx,
                         )
                     }
                 }

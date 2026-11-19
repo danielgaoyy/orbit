@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::attachments::{build_agy_prompt_blocks, is_path_within_dir};
 use crate::driver::{
     DriverCommand, DriverEvent, ProviderSessionHandle, RpcId, SessionLaunchConfig,
 };
@@ -360,6 +361,7 @@ async fn run_agy_actor(
                         } else if dispatch_agy_prompt(
                             &shim,
                             &session_id,
+                            cfg.attachments_dir.as_deref(),
                             &mut next_rpc_id,
                             &mut active_turn_id,
                             &mut active_prompt_rpc_key,
@@ -590,6 +592,7 @@ async fn run_agy_actor(
                                         if dispatch_agy_prompt(
                                             &shim,
                                             &session_id,
+                                            cfg.attachments_dir.as_deref(),
                                             &mut next_rpc_id,
                                             &mut active_turn_id,
                                             &mut active_prompt_rpc_key,
@@ -643,6 +646,7 @@ async fn run_agy_actor(
                             handle_acp_permission_request(
                                 &val,
                                 &mode,
+                                cfg.attachments_dir.as_deref(),
                                 &active_turn_id,
                                 &shim,
                                 &mut pending_perms,
@@ -726,6 +730,7 @@ async fn run_agy_actor(
 async fn dispatch_agy_prompt(
     shim: &orbit_shim::ShimClient,
     session_id: &str,
+    attachments_dir: Option<&Path>,
     next_rpc_id: &mut i64,
     active_turn_id: &mut Option<String>,
     active_prompt_rpc_key: &mut Option<String>,
@@ -756,13 +761,14 @@ async fn dispatch_agy_prompt(
     let key = RpcId::Num(id).as_key();
     *active_prompt_rpc_key = Some(key);
 
+    let prompt_blocks = build_agy_prompt_blocks(&prompt, attachments_dir);
     let req = json!({
         "jsonrpc": "2.0",
         "id": id,
         "method": "session/prompt",
         "params": {
             "sessionId": session_id,
-            "prompt": [{ "type": "text", "text": prompt }]
+            "prompt": prompt_blocks
         }
     })
     .to_string();
@@ -1159,6 +1165,7 @@ fn parse_raw_question_items(q_arr: &[Value]) -> Vec<QuestionItem> {
 async fn handle_acp_permission_request(
     val: &Value,
     mode: &SessionMode,
+    attachments_dir: Option<&Path>,
     active_turn_id: &Option<String>,
     shim: &orbit_shim::ShimClient,
     pending_perms: &mut HashMap<String, PendingPerm>,
@@ -1210,9 +1217,27 @@ async fn handle_acp_permission_request(
         return;
     }
 
-    // Auto-approve logic for `FullAccess` or native file edits in `AcceptEdits`
+    // Auto-approve logic for staged attachment reads, `FullAccess`, or native file edits in `AcceptEdits`
     let kind_str = tool_call.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    let auto_approve = matches!(mode, SessionMode::FullAccess)
+    let is_attachment_read = kind_str == "read"
+        && attachments_dir.is_some_and(|dir| {
+            tool_call
+                .get("rawInput")
+                .and_then(|i| {
+                    i.get("Path")
+                        .or_else(|| i.get("AbsolutePath"))
+                        .or_else(|| i.get("path"))
+                })
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    tool_call
+                        .pointer("/locations/0/path")
+                        .and_then(|v| v.as_str())
+                })
+                .is_some_and(|p| is_path_within_dir(Path::new(p), dir))
+        });
+    let auto_approve = is_attachment_read
+        || matches!(mode, SessionMode::FullAccess)
         || (matches!(mode, SessionMode::AcceptEdits)
             && matches!(
                 kind_str,

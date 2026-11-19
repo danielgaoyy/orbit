@@ -322,6 +322,25 @@ struct StageTurnView: View {
                 if !cleanCode.isEmpty {
                     parts.append(cleanCode)
                 }
+            case let .table(_, headers, rows):
+                var tableLines: [String] = []
+                let headerLine = headers
+                    .map { $0.spans.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .joined(separator: " | ")
+                if !headerLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    tableLines.append(headerLine)
+                }
+                for row in rows {
+                    let rowLine = row.cells
+                        .map { $0.spans.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .joined(separator: " | ")
+                    if !rowLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        tableLines.append(rowLine)
+                    }
+                }
+                if !tableLines.isEmpty {
+                    parts.append(tableLines.joined(separator: "\n"))
+                }
             case .horizontalRule:
                 break
             }

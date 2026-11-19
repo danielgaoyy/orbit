@@ -677,13 +677,19 @@ impl AgentOrchestrator {
             .join("shims")
             .join(format!("agent_{}.sock", summary.agent_id));
 
-        let extra_dirs = self
+        let mut extra_dirs = self
             .agent_extra_dirs
             .read()
             .await
             .get(&summary.agent_id)
             .cloned()
             .unwrap_or_default();
+
+        let attachments_dir = self.home_dir.join("attachments");
+        let _ = std::fs::create_dir_all(&attachments_dir);
+        if !extra_dirs.contains(&attachments_dir) {
+            extra_dirs.push(attachments_dir.clone());
+        }
 
         let handle = spawn_provider_session(SessionLaunchConfig {
             agent_id: summary.agent_id.clone(),
@@ -693,6 +699,7 @@ impl AgentOrchestrator {
             shim_socket,
             cwd: PathBuf::from(&summary.cwd),
             extra_dirs,
+            attachments_dir: Some(attachments_dir),
             model: summary.model.clone(),
             effort: summary.effort,
             mode: summary.mode.clone(),

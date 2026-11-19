@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
@@ -23,8 +24,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::desktop_ops::{
-    bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri, extract_ws_port,
-    normalize_relay_input,
+    StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
+    extract_ws_port, normalize_relay_input, stage_local_attachment,
 };
 use crate::render::{
     DiffFileView, RichBlockView, TerminalGridEmulator, TerminalScreenView, parse_markdown_blocks,
@@ -275,12 +276,22 @@ pub struct GitReviewView {
     pub diff_files: Vec<DiffFileView>,
 }
 
+#[derive(Debug, Clone)]
+struct AttachmentStageAck {
+    completed: bool,
+    path: Option<String>,
+    filename: Option<String>,
+    size_bytes: Option<u64>,
+}
+
 struct HostMemoryState {
     profile: SavedHostProfile,
+    is_local: bool,
     last_error: Option<String>,
     via_ssh_tunnel: bool,
     last_ping_ms: Option<u32>,
     daemon_version: Option<String>,
+    daemon_protocol_version: Option<u32>,
     os_arch: Option<String>,
     reconnect_attempt: u32,
     ssh_heal_attempted: bool,
@@ -288,6 +299,8 @@ struct HostMemoryState {
     available_providers: Vec<ProviderKind>,
     session: Option<HostSessionHandle>,
     pending_outbox: Vec<WireMessage>,
+    pending_attachment_acks:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AttachmentStageAck, String>>>,
     optimistic_by_req_id: HashMap<Uuid, String>,
     agent_req_by_req_id: HashMap<Uuid, String>,
     replaced_optimistic_agents: HashMap<String, String>,
@@ -298,7 +311,7 @@ struct HostMemoryState {
     workspaces: Vec<WorkspaceSummary>,
     agents: HashMap<String, AgentSummary>,
     timelines: HashMap<String, Vec<TimelineEvent>>,
-    markdown_cache: HashMap<(u64, usize, bool), Vec<RichBlockView>>,
+    markdown_cache: HashMap<(String, u64, usize, bool), Vec<RichBlockView>>,
     quotas: Vec<ProviderQuotaSnapshot>,
     provider_catalogs: Vec<ProviderModelCatalog>,
     terminals: Vec<TerminalSummary>,
@@ -314,10 +327,12 @@ impl HostMemoryState {
     fn new(profile: SavedHostProfile) -> Self {
         Self {
             profile,
+            is_local: false,
             last_error: None,
             via_ssh_tunnel: false,
             last_ping_ms: None,
             daemon_version: None,
+            daemon_protocol_version: None,
             os_arch: None,
             reconnect_attempt: 0,
             ssh_heal_attempted: false,
@@ -329,6 +344,7 @@ impl HostMemoryState {
             ],
             session: None,
             pending_outbox: Vec::new(),
+            pending_attachment_acks: HashMap::new(),
             optimistic_by_req_id: HashMap::new(),
             agent_req_by_req_id: HashMap::new(),
             replaced_optimistic_agents: HashMap::new(),
@@ -401,9 +417,6 @@ impl HostMemoryState {
     }
 }
 
-type PendingAttachmentMap =
-    Arc<Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<Result<StagedAttachmentView, String>>>>>;
-
 /// Thread-safe, self-contained Rust Application Core with its own background Tokio runtime.
 pub struct OrbitAppCore {
     runtime: tokio::runtime::Runtime,
@@ -411,7 +424,6 @@ pub struct OrbitAppCore {
     hosts: Arc<RwLock<HashMap<String, HostMemoryState>>>,
     projects: Arc<RwLock<HashMap<String, ClientProjectView>>>,
     subscribers: Arc<Mutex<Vec<Arc<dyn CoreEventSubscriber>>>>,
-    pending_attachments: PendingAttachmentMap,
     revision: Arc<AtomicU64>,
 }
 
@@ -480,12 +492,16 @@ impl OrbitAppCore {
             }
             if let Some(existing) = initial_hosts.get_mut(&offer.host_id) {
                 if existing.profile.daemon_pubkey_b64 == offer.daemon_pubkey_b64 {
+                    existing.is_local = true;
                     existing.profile.direct_endpoints = endpoints;
                     existing.profile.remote_daemon_port = local_port;
+                    if offer.relay_url.is_some() {
+                        existing.profile.relay_url = offer.relay_url;
+                    }
                     let _ = store.upsert_client_host(&existing.to_stored_host());
                 }
             } else {
-                let mem = HostMemoryState::new(SavedHostProfile {
+                let mut mem = HostMemoryState::new(SavedHostProfile {
                     host_id: offer.host_id.clone(),
                     hostname: offer.hostname,
                     custom_name: None,
@@ -498,6 +514,7 @@ impl OrbitAppCore {
                     relay_url: offer.relay_url,
                     state: HostConnectionState::Disconnected,
                 });
+                mem.is_local = true;
                 let _ = store.upsert_client_host(&mem.to_stored_host());
                 initial_hosts.insert(offer.host_id, mem);
             }
@@ -525,7 +542,6 @@ impl OrbitAppCore {
             hosts: Arc::new(RwLock::new(initial_hosts)),
             projects: Arc::new(RwLock::new(initial_projects)),
             subscribers: Arc::new(Mutex::new(Vec::new())),
-            pending_attachments: Arc::new(Mutex::new(HashMap::new())),
             revision: Arc::new(AtomicU64::new(1)),
         }))
     }
@@ -755,7 +771,10 @@ impl OrbitAppCore {
                     text,
                     badges,
                 } => {
-                    let key = (ev.seq, text.len(), false);
+                    let key = (agent_id.to_string(), ev.seq, text.len(), false);
+                    if host_state.markdown_cache.len() > 2048 {
+                        host_state.markdown_cache.clear();
+                    }
                     let blocks = host_state
                         .markdown_cache
                         .entry(key)
@@ -783,7 +802,10 @@ impl OrbitAppCore {
                     text,
                     streaming,
                 } => {
-                    let key = (ev.seq, text.len(), *streaming);
+                    let key = (agent_id.to_string(), ev.seq, text.len(), *streaming);
+                    if host_state.markdown_cache.len() > 2048 {
+                        host_state.markdown_cache.clear();
+                    }
                     let blocks = host_state
                         .markdown_cache
                         .entry(key)
@@ -1109,7 +1131,9 @@ impl OrbitAppCore {
                 .hosts
                 .write()
                 .map_err(|_| ClientCoreError::LockPoisoned)?;
-            guard.remove(host_id);
+            if let Some(mut removed) = guard.remove(host_id) {
+                fail_pending_attachment_acks(&mut removed, "Host removed during attachment upload");
+            }
         }
         if let Ok(mut projs) = self.projects.write() {
             projs.retain(|_, p| p.host_id != host_id);
@@ -1248,6 +1272,7 @@ impl OrbitAppCore {
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
             }
+            fail_pending_attachment_acks(h, "Host reconnecting during attachment upload");
             h.profile.clone()
         };
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -1469,6 +1494,7 @@ impl OrbitAppCore {
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
             }
+            fail_pending_attachment_acks(h, "Host disconnected during attachment upload");
             should_reconnect = true;
         }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -1510,10 +1536,6 @@ impl OrbitAppCore {
         let mut auto_subscribe_agent: Option<String> = None;
         let mut continue_catchup: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
-        let mut pending_attachment_resolution: Option<(
-            Uuid,
-            Result<StagedAttachmentView, String>,
-        )> = None;
 
         if let Ok(mut guard) = self.hosts.write()
             && let Some(state) = guard.get_mut(host_id)
@@ -1522,6 +1544,7 @@ impl OrbitAppCore {
                 WireMessage::Welcome { host } => {
                     state.profile.hostname = host.hostname;
                     state.daemon_version = Some(host.daemon_version);
+                    state.daemon_protocol_version = Some(host.protocol_version);
                     state.os_arch = Some(format!("{} / {}", host.os, host.arch));
                     if !host.available_providers.is_empty() {
                         state.available_providers = host.available_providers;
@@ -1661,21 +1684,6 @@ impl OrbitAppCore {
                     state.workspace_files.insert(cwd.clone(), files);
                     notify_git_cwd = Some(cwd);
                 }
-                WireMessage::AttachmentStaged {
-                    request_id,
-                    path,
-                    filename,
-                    size_bytes,
-                } => {
-                    pending_attachment_resolution = Some((
-                        request_id,
-                        Ok(StagedAttachmentView {
-                            path,
-                            filename,
-                            size_bytes,
-                        }),
-                    ));
-                }
                 WireMessage::TerminalsSnapshot { terminals, .. } => {
                     state.terminals = terminals;
                     notify_host = true;
@@ -1700,49 +1708,74 @@ impl OrbitAppCore {
                 WireMessage::Ack { request_id } => {
                     state.agent_req_by_req_id.remove(&request_id);
                 }
+                WireMessage::AttachmentStaged {
+                    request_id,
+                    completed,
+                    path,
+                    filename,
+                    size_bytes,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_attachment_acks.remove(&request_id) {
+                        let _ = tx.send(Ok(AttachmentStageAck {
+                            completed,
+                            path,
+                            filename,
+                            size_bytes,
+                        }));
+                    }
+                }
                 WireMessage::RpcError {
                     request_id,
                     code,
                     message,
                 } => {
                     let formatted_err = format!("[{code}] {message}");
-                    state.last_error = Some(formatted_err.clone());
-                    if let Some(req_id) = request_id {
-                        pending_attachment_resolution = Some((req_id, Err(formatted_err.clone())));
-                        if let Some(opt_id) = state.optimistic_by_req_id.remove(&req_id) {
-                            record_agent_rpc_error(state, &opt_id, &message, message.clone(), true);
-                            notify_fleet = true;
-                            notify_timeline_agent = Some(opt_id);
-                        } else if let Some(agent_id) = state.agent_req_by_req_id.remove(&req_id) {
-                            let is_pending_turn = state
-                                .agents
-                                .get(&agent_id)
-                                .is_some_and(|ag| matches!(&ag.status, AgentStatus::Running { turn_id } if turn_id == "pending"));
-                            let reset_status = is_pending_turn || code == "send_prompt_failed";
-                            record_agent_rpc_error(
-                                state,
-                                &agent_id,
-                                &message,
-                                formatted_err,
-                                reset_status,
-                            );
-                            if reset_status {
+                    if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_attachment_acks.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else {
+                        state.last_error = Some(formatted_err.clone());
+                        if let Some(req_id) = request_id {
+                            if let Some(opt_id) = state.optimistic_by_req_id.remove(&req_id) {
+                                record_agent_rpc_error(
+                                    state,
+                                    &opt_id,
+                                    &message,
+                                    message.clone(),
+                                    true,
+                                );
                                 notify_fleet = true;
+                                notify_timeline_agent = Some(opt_id);
+                            } else if let Some(agent_id) = state.agent_req_by_req_id.remove(&req_id)
+                            {
+                                let is_pending_turn =
+                                    state.agents.get(&agent_id).is_some_and(|ag| {
+                                        matches!(
+                                            &ag.status,
+                                            AgentStatus::Running { turn_id } if turn_id == "pending"
+                                        )
+                                    });
+                                let reset_status = is_pending_turn || code == "send_prompt_failed";
+                                record_agent_rpc_error(
+                                    state,
+                                    &agent_id,
+                                    &message,
+                                    formatted_err,
+                                    reset_status,
+                                );
+                                if reset_status {
+                                    notify_fleet = true;
+                                }
+                                notify_timeline_agent = Some(agent_id);
                             }
-                            notify_timeline_agent = Some(agent_id);
                         }
+                        notify_host = true;
                     }
-                    notify_host = true;
                 }
                 _ => {}
             }
-        }
-
-        if let Some((req_id, result)) = pending_attachment_resolution
-            && let Ok(mut pending) = self.pending_attachments.lock()
-            && let Some(tx) = pending.remove(&req_id)
-        {
-            let _ = tx.send(result);
         }
 
         if let Some(stored) = host_to_persist {
@@ -2465,66 +2498,21 @@ impl OrbitAppCore {
         self: &Arc<Self>,
         host_id: &str,
         filename: &str,
-        mime_type: Option<&str>,
+        _mime_type: Option<&str>,
         bytes: Vec<u8>,
     ) -> Result<StagedAttachmentView, ClientCoreError> {
-        use base64::Engine as _;
-
         if bytes.is_empty() {
             return Err(ClientCoreError::Transport("Attachment is empty".into()));
         }
-        if bytes.len() > 10 * 1024 * 1024 {
-            return Err(ClientCoreError::Transport(
-                "Attachment exceeds 10 MiB limit".into(),
-            ));
-        }
-
-        let handle = self
-            .hosts
-            .read()
-            .map_err(|_| ClientCoreError::LockPoisoned)?
-            .get(host_id)
-            .and_then(|h| h.session.clone())
-            .ok_or_else(|| ClientCoreError::Transport("Host is not connected".into()))?;
-
-        let data_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let request_id = Uuid::new_v4();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let mut pending = self
-                .pending_attachments
-                .lock()
-                .map_err(|_| ClientCoreError::LockPoisoned)?;
-            pending.insert(request_id, tx);
-        }
-
-        let filename_owned = filename.to_string();
-        let mime_owned = mime_type.map(ToOwned::to_owned);
-        let res = self.runtime.block_on(async move {
-            handle
-                .send_wire(WireMessage::StageAttachment {
-                    request_id,
-                    filename: filename_owned,
-                    mime_type: mime_owned,
-                    data_b64,
-                })
-                .await?;
-            match tokio::time::timeout(Duration::from_secs(20), rx).await {
-                Ok(Ok(Ok(view))) => Ok(view),
-                Ok(Ok(Err(err_msg))) => Err(ClientCoreError::Transport(err_msg)),
-                Ok(Err(_)) => Err(ClientCoreError::ChannelClosed),
-                Err(_) => Err(ClientCoreError::Transport(
-                    "Staging attachment timed out".into(),
-                )),
-            }
-        });
-
-        if res.is_err()
-            && let Ok(mut pending) = self.pending_attachments.lock()
-        {
-            pending.remove(&request_id);
-        }
-        res
+        let info = self
+            .runtime
+            .block_on(self.stage_attachment_on_host(host_id, filename, bytes))
+            .map_err(ClientCoreError::Transport)?;
+        Ok(StagedAttachmentView {
+            path: info.path,
+            filename: info.filename,
+            size_bytes: info.size_bytes as u64,
+        })
     }
 
     pub fn workspace_files(&self, host_id: &str, cwd: &str) -> Vec<String> {
@@ -2790,6 +2778,219 @@ impl OrbitAppCore {
             });
         }
     }
+
+    pub async fn stage_attachment_b64_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        filename: &str,
+        data_b64: &str,
+    ) -> Result<StagedAttachmentInfo, String> {
+        let bytes = B64
+            .decode(data_b64.trim())
+            .map_err(|e| format!("invalid base64 attachment payload: {e}"))?;
+        self.stage_attachment_on_host(host_id, filename, bytes)
+            .await
+    }
+
+    pub async fn stage_attachment_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> Result<StagedAttachmentInfo, String> {
+        const MAX_BYTES: usize = 25 * 1024 * 1024;
+        const CHUNK_BYTES: usize = 512 * 1024;
+
+        if bytes.len() > MAX_BYTES {
+            return Err("Attachment exceeds 25 MiB limit".into());
+        }
+
+        let (session, is_local, daemon_version, daemon_protocol_version) = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            (
+                h.session.clone(),
+                h.is_local,
+                h.daemon_version.clone(),
+                h.daemon_protocol_version,
+            )
+        };
+
+        let Some(session) = session else {
+            if is_local {
+                return stage_local_attachment(filename, &bytes);
+            }
+            return Err(
+                "Remote host is disconnected; reconnect before uploading attachments".into(),
+            );
+        };
+
+        let supports_remote_attachments = daemon_protocol_version.is_some_and(|pv| pv >= 2);
+        if !supports_remote_attachments
+            && let Some(ref ver) = daemon_version
+            && !version_supports_remote_attachments(ver)
+        {
+            return Err(format!(
+                "Remote orbit daemon (v{ver}) does not support remote attachment upload; please upgrade it to v0.3.3+"
+            ));
+        }
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let owned_filename = filename.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let result = core
+                .upload_attachment_chunks(
+                    AttachmentUploadTarget {
+                        host_id: &owned_host_id,
+                        session,
+                        daemon_version: daemon_version.as_deref(),
+                        daemon_protocol_version,
+                    },
+                    &owned_filename,
+                    &bytes,
+                    CHUNK_BYTES,
+                )
+                .await;
+            let _ = res_tx.send(result);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "attachment upload task cancelled".to_string())?
+    }
+
+    async fn upload_attachment_chunks(
+        self: &Arc<Self>,
+        target: AttachmentUploadTarget<'_>,
+        filename: &str,
+        bytes: &[u8],
+        chunk_size: usize,
+    ) -> Result<StagedAttachmentInfo, String> {
+        let AttachmentUploadTarget {
+            host_id,
+            session,
+            daemon_version,
+            daemon_protocol_version,
+        } = target;
+        let chunks: Vec<&[u8]> = if bytes.is_empty() {
+            vec![&[]]
+        } else {
+            bytes.chunks(chunk_size).collect()
+        };
+        let total_chunks = chunks.len() as u32;
+        let upload_id = Uuid::new_v4().simple().to_string();
+
+        for (idx, slice) in chunks.into_iter().enumerate() {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            {
+                let mut guard = self
+                    .hosts
+                    .write()
+                    .map_err(|_| "host state lock poisoned".to_string())?;
+                let Some(h) = guard.get_mut(host_id) else {
+                    return Err(format!("host `{host_id}` removed during attachment upload"));
+                };
+                if h.session.is_none() {
+                    return Err("Host disconnected during attachment upload".into());
+                }
+                h.pending_attachment_acks.insert(req_id, ack_tx);
+            }
+
+            let wire_msg = WireMessage::StageAttachmentChunk {
+                request_id: req_id,
+                upload_id: upload_id.clone(),
+                filename: filename.to_string(),
+                chunk_index: idx as u32,
+                total_chunks,
+                data_b64: B64.encode(slice),
+            };
+
+            if let Err(e) = session.send_wire(wire_msg).await {
+                if let Ok(mut guard) = self.hosts.write()
+                    && let Some(h) = guard.get_mut(host_id)
+                {
+                    h.pending_attachment_acks.remove(&req_id);
+                }
+                return Err(format!("failed to send attachment chunk: {e}"));
+            }
+
+            let ack = match tokio::time::timeout(Duration::from_secs(30), ack_rx).await {
+                Ok(Ok(Ok(ack))) => ack,
+                Ok(Ok(Err(rpc_err))) => return Err(rpc_err),
+                Ok(Err(_)) => return Err("Host disconnected during attachment upload".into()),
+                Err(_) => {
+                    if let Ok(mut guard) = self.hosts.write()
+                        && let Some(h) = guard.get_mut(host_id)
+                    {
+                        h.pending_attachment_acks.remove(&req_id);
+                    }
+                    if !daemon_protocol_version.is_some_and(|pv| pv >= 2)
+                        && let Some(ver) = daemon_version
+                        && !version_supports_remote_attachments(ver)
+                    {
+                        return Err(format!(
+                            "Remote orbit daemon (v{ver}) does not support remote attachment upload; please upgrade it to v0.3.3+"
+                        ));
+                    }
+                    return Err("Timed out waiting for host to acknowledge attachment chunk".into());
+                }
+            };
+
+            if idx + 1 == total_chunks as usize {
+                if !ack.completed {
+                    return Err("Daemon did not mark final attachment chunk as completed".into());
+                }
+                let remote_path = ack
+                    .path
+                    .ok_or_else(|| "Daemon did not return staged attachment path".to_string())?;
+                return Ok(StagedAttachmentInfo {
+                    path: remote_path,
+                    filename: ack.filename.unwrap_or_else(|| filename.to_string()),
+                    size_bytes: ack.size_bytes.map(|n| n as usize).unwrap_or(bytes.len()),
+                });
+            }
+        }
+
+        Err("Attachment upload ended without confirmation".into())
+    }
+}
+
+struct AttachmentUploadTarget<'a> {
+    host_id: &'a str,
+    session: HostSessionHandle,
+    daemon_version: Option<&'a str>,
+    daemon_protocol_version: Option<u32>,
+}
+
+fn fail_pending_attachment_acks(h: &mut HostMemoryState, reason: &str) {
+    for (_, tx) in h.pending_attachment_acks.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+}
+
+fn version_supports_remote_attachments(raw: &str) -> bool {
+    let clean = raw
+        .trim()
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("");
+    let mut parts = clean.split('.').map(|s| s.parse::<u32>());
+    let (Some(Ok(maj)), Some(Ok(min)), Some(Ok(pat))) = (parts.next(), parts.next(), parts.next())
+    else {
+        return true;
+    };
+    (maj, min, pat) >= (0, 3, 3)
 }
 
 fn normalize_cwd_trim(raw: &str) -> &str {
@@ -3759,64 +3960,99 @@ mod tests {
     }
 
     #[test]
-    fn stage_attachment_pending_resolution_handles_success_and_rpc_error() {
+    fn markdown_cache_keys_isolate_different_agents_on_same_host() {
         let core = OrbitAppCore::open_in_memory().expect("open core");
         let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
         let offer = PairingOffer {
-            host_id: "host_attach".into(),
-            hostname: "mac-studio".into(),
+            host_id: "host_cache".into(),
+            hostname: "cache-box".into(),
             daemon_pubkey_b64: kp.public_key_b64,
             direct_endpoints: Vec::new(),
             relay_url: None,
             pairing_secret: "sec".into(),
         };
-        let uri = offer.to_qr_uri().expect("uri");
-        core.pair_host(&uri).expect("pair");
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
 
-        // 1. Success via AttachmentStaged
-        let req_ok = Uuid::new_v4();
-        let (tx_ok, mut rx_ok) = tokio::sync::oneshot::channel();
-        core.pending_attachments
-            .lock()
-            .expect("lock")
-            .insert(req_ok, tx_ok);
+        // Same seq=1, same length (11 bytes), streaming=false, different markdown blocks!
         core.handle_inbound_wire(
-            "host_attach",
-            WireMessage::AttachmentStaged {
-                request_id: req_ok,
-                path: "/Users/jess/.orbit/attachments/1_photo.jpg".into(),
-                filename: "photo.jpg".into(),
-                size_bytes: 128,
+            "host_cache",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 1,
+                    epoch: 1,
+                    agent_id: "ag_one".into(),
+                    turn_id: None,
+                    timestamp: Utc::now(),
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "m1".into(),
+                        text: "# Heading 1".into(),
+                        streaming: false,
+                    },
+                },
             },
         );
-        let ok_res = rx_ok
-            .try_recv()
-            .expect("should resolve")
-            .expect("ok result");
-        assert_eq!(ok_res.filename, "photo.jpg");
-        assert_eq!(ok_res.size_bytes, 128);
-
-        // 2. Failure via RpcError
-        let req_err = Uuid::new_v4();
-        let (tx_err, mut rx_err) = tokio::sync::oneshot::channel();
-        core.pending_attachments
-            .lock()
-            .expect("lock")
-            .insert(req_err, tx_err);
         core.handle_inbound_wire(
-            "host_attach",
-            WireMessage::RpcError {
-                request_id: Some(req_err),
-                code: "stage_attachment_error".into(),
-                message: "Attachment exceeds 10 MiB limit".into(),
+            "host_cache",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 1,
+                    epoch: 1,
+                    agent_id: "ag_two".into(),
+                    turn_id: None,
+                    timestamp: Utc::now(),
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "m2".into(),
+                        text: "`codeblock`".into(),
+                        streaming: false,
+                    },
+                },
             },
         );
-        let err_res = rx_err.try_recv().expect("should resolve error");
-        assert!(
-            err_res
-                .expect_err("expected err")
-                .contains("Attachment exceeds 10 MiB limit")
-        );
+
+        let tl1 = core.agent_timeline("host_cache", "ag_one");
+        let tl2 = core.agent_timeline("host_cache", "ag_two");
+        match (&tl1.items[0], &tl2.items[0]) {
+            (
+                TimelineItemView::AssistantMessage { blocks: b1, .. },
+                TimelineItemView::AssistantMessage { blocks: b2, .. },
+            ) => {
+                assert!(matches!(b1[0], RichBlockView::Heading { .. }));
+                assert!(matches!(b2[0], RichBlockView::Paragraph { .. }));
+            }
+            other => panic!("unexpected timeline items: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_host_attachment_upload_rejects_disconnected_and_legacy_daemon() {
+        assert!(!version_supports_remote_attachments("0.3.2"));
+        assert!(version_supports_remote_attachments("0.3.3"));
+        assert!(version_supports_remote_attachments("v0.3.3-rc1"));
+        assert!(version_supports_remote_attachments("0.4.0"));
+
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = PairingOffer {
+            host_id: "host_remote_att".into(),
+            hostname: "devbox".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: Some("ws://127.0.0.1:7878".into()),
+            pairing_secret: "sec".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let err = core
+            .runtime
+            .block_on(core.stage_attachment_on_host(
+                "host_remote_att",
+                "shot.png",
+                b"png-bytes".to_vec(),
+            ))
+            .expect_err("disconnected remote host must not fall back to local disk");
+        assert!(err.contains("disconnected"));
     }
 
     #[test]

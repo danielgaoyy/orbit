@@ -2,7 +2,9 @@ import {
   HighlightedLineDto,
   HighlightedTokenDto,
   InlineSpanDto,
-  RichBlockDto
+  RichBlockDto,
+  TableCellDto,
+  TableRowDto
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import { openExternalWebUrl } from '../../model/OrbitDeviceBridge';
@@ -836,11 +838,19 @@ export struct RichMarkdownView {
     while (idx < this.blocks.length) {
       const blk = this.blocks[idx];
       if (blk.kind === 'table') {
+        const headers: string[] = (blk.headers ?? []).map((h: string | TableCellDto) =>
+          typeof h === 'string' ? h : spansPlainText(h.spans)
+        );
+        const rows: string[][] = (blk.rows ?? []).map((r: string[] | TableRowDto) =>
+          Array.isArray(r)
+            ? r
+            : r.cells.map((c: TableCellDto) => spansPlainText(c.spans))
+        );
         out.push({
           key: `tbl_${idx}`,
           kind: 'table',
-          tableHeaders: blk.headers ?? [],
-          tableRows: blk.rows ?? [],
+          tableHeaders: headers,
+          tableRows: rows,
           proseSpans: [],
           plainText: '',
           block: null

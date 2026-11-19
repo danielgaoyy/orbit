@@ -56,7 +56,7 @@ export function GeneralSection() {
   const preferredEditor = useOrbitSelector((s) => s.preferredEditor);
   const mod = modSymbol();
 
-  const [appVersion, setAppVersion] = useState("0.3.0");
+  const [appVersion, setAppVersion] = useState("0.3.3");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseUpdateInfo | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);

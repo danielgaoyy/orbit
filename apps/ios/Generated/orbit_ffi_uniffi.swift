@@ -3536,6 +3536,106 @@ public func FfiConverterTypeFfiStagedAttachment_lower(_ value: FfiStagedAttachme
 }
 
 
+public struct FfiTableCell: Equatable, Hashable {
+    public var spans: [FfiInlineSpan]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(spans: [FfiInlineSpan]) {
+        self.spans = spans
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiTableCell: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTableCell: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTableCell {
+        return
+            try FfiTableCell(
+                spans: FfiConverterSequenceTypeFfiInlineSpan.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTableCell, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeFfiInlineSpan.write(value.spans, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTableCell_lift(_ buf: RustBuffer) throws -> FfiTableCell {
+    return try FfiConverterTypeFfiTableCell.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTableCell_lower(_ value: FfiTableCell) -> RustBuffer {
+    return FfiConverterTypeFfiTableCell.lower(value)
+}
+
+
+public struct FfiTableRow: Equatable, Hashable {
+    public var cells: [FfiTableCell]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(cells: [FfiTableCell]) {
+        self.cells = cells
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiTableRow: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTableRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTableRow {
+        return
+            try FfiTableRow(
+                cells: FfiConverterSequenceTypeFfiTableCell.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTableRow, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeFfiTableCell.write(value.cells, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTableRow_lift(_ buf: RustBuffer) throws -> FfiTableRow {
+    return try FfiConverterTypeFfiTableRow.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTableRow_lower(_ value: FfiTableRow) -> RustBuffer {
+    return FfiConverterTypeFfiTableRow.lower(value)
+}
+
+
 public struct FfiTerminalRow: Equatable, Hashable {
     public var rowIndex: UInt16
     public var spans: [FfiTerminalSpan]
@@ -4877,6 +4977,8 @@ public enum FfiRichBlock: Equatable, Hashable {
     )
     case blockQuote(spans: [FfiInlineSpan]
     )
+    case table(alignments: [FfiTableAlignment], headers: [FfiTableCell], rows: [FfiTableRow]
+    )
     case horizontalRule
 
 
@@ -4914,7 +5016,10 @@ public struct FfiConverterTypeFfiRichBlock: FfiConverterRustBuffer {
         case 5: return .blockQuote(spans: try FfiConverterSequenceTypeFfiInlineSpan.read(from: &buf)
         )
         
-        case 6: return .horizontalRule
+        case 6: return .table(alignments: try FfiConverterSequenceTypeFfiTableAlignment.read(from: &buf), headers: try FfiConverterSequenceTypeFfiTableCell.read(from: &buf), rows: try FfiConverterSequenceTypeFfiTableRow.read(from: &buf)
+        )
+        
+        case 7: return .horizontalRule
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -4955,8 +5060,15 @@ public struct FfiConverterTypeFfiRichBlock: FfiConverterRustBuffer {
             FfiConverterSequenceTypeFfiInlineSpan.write(spans, into: &buf)
             
         
-        case .horizontalRule:
+        case let .table(alignments,headers,rows):
             writeInt(&buf, Int32(6))
+            FfiConverterSequenceTypeFfiTableAlignment.write(alignments, into: &buf)
+            FfiConverterSequenceTypeFfiTableCell.write(headers, into: &buf)
+            FfiConverterSequenceTypeFfiTableRow.write(rows, into: &buf)
+            
+        
+        case .horizontalRule:
+            writeInt(&buf, Int32(7))
         
         }
     }
@@ -5065,6 +5177,86 @@ public func FfiConverterTypeFfiSessionMode_lift(_ buf: RustBuffer) throws -> Ffi
 #endif
 public func FfiConverterTypeFfiSessionMode_lower(_ value: FfiSessionMode) -> RustBuffer {
     return FfiConverterTypeFfiSessionMode.lower(value)
+}
+
+
+
+
+public enum FfiTableAlignment: Equatable, Hashable {
+    
+    case none
+    case left
+    case center
+    case right
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiTableAlignment: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTableAlignment: FfiConverterRustBuffer {
+    typealias SwiftType = FfiTableAlignment
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTableAlignment {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .none
+        
+        case 2: return .left
+        
+        case 3: return .center
+        
+        case 4: return .right
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiTableAlignment, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .none:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .left:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .center:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .right:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTableAlignment_lift(_ buf: RustBuffer) throws -> FfiTableAlignment {
+    return try FfiConverterTypeFfiTableAlignment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTableAlignment_lower(_ value: FfiTableAlignment) -> RustBuffer {
+    return FfiConverterTypeFfiTableAlignment.lower(value)
 }
 
 
@@ -6515,6 +6707,56 @@ fileprivate struct FfiConverterSequenceTypeFfiStageTurn: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiTableCell: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiTableCell]
+
+    public static func write(_ value: [FfiTableCell], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiTableCell.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiTableCell] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiTableCell]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiTableCell.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiTableRow: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiTableRow]
+
+    public static func write(_ value: [FfiTableRow], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiTableRow.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiTableRow] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiTableRow]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiTableRow.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiTerminalRow: FfiConverterRustBuffer {
     typealias SwiftType = [FfiTerminalRow]
 
@@ -6707,6 +6949,31 @@ fileprivate struct FfiConverterSequenceTypeFfiRichBlock: FfiConverterRustBuffer 
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiRichBlock.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiTableAlignment: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiTableAlignment]
+
+    public static func write(_ value: [FfiTableAlignment], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiTableAlignment.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiTableAlignment] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiTableAlignment]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiTableAlignment.read(from: &buf))
         }
         return seq
     }

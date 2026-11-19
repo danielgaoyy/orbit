@@ -66,6 +66,8 @@ jobs:
     name: Build macOS Tauri v2 Desktop App (Orbit.dmg)
     needs: rust-quality-and-e2e
     runs-on: macos-latest
+    outputs:
+      notarized: ${{ steps.macos-signing.outputs.notarized }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -79,12 +81,133 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "apps/desktop/src-tauri -> target"
+      - name: Prepare macOS Signing & Notarization
+        id: macos-signing
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY || secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER || secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY || secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            if [ -z "$APPLE_CERTIFICATE_PASSWORD" ]; then
+              echo "::error::APPLE_CERTIFICATE is set, but APPLE_CERTIFICATE_PASSWORD is missing."
+              exit 1
+            fi
+            echo "mode=developer-id" >> "$GITHUB_OUTPUT"
+            if [ -n "$API_KEY_ID" ] && [ -n "$API_ISSUER_ID" ] && [ -n "$API_PRIVATE_KEY" ]; then
+              umask 077
+              KEY_PATH="$RUNNER_TEMP/AuthKey_${API_KEY_ID}.p8"
+              printf '%s\n' "$API_PRIVATE_KEY" > "$KEY_PATH"
+              chmod 600 "$KEY_PATH"
+              echo "notarize=api-key" >> "$GITHUB_OUTPUT"
+              echo "notarized=true" >> "$GITHUB_OUTPUT"
+              echo "api_key_path=$KEY_PATH" >> "$GITHUB_OUTPUT"
+            elif [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+              echo "notarize=apple-id" >> "$GITHUB_OUTPUT"
+              echo "notarized=true" >> "$GITHUB_OUTPUT"
+              echo "api_key_path=" >> "$GITHUB_OUTPUT"
+            else
+              echo "notarize=none" >> "$GITHUB_OUTPUT"
+              echo "notarized=false" >> "$GITHUB_OUTPUT"
+              echo "api_key_path=" >> "$GITHUB_OUTPUT"
+              echo "::warning::APPLE_CERTIFICATE is configured without Apple notarization secrets; macOS Gatekeeper will still block browser-downloaded builds until notarization secrets are added (see deploy/MACOS_SIGNING.md)."
+            fi
+          else
+            echo "mode=ad-hoc" >> "$GITHUB_OUTPUT"
+            echo "notarize=none" >> "$GITHUB_OUTPUT"
+            echo "notarized=false" >> "$GITHUB_OUTPUT"
+            echo "api_key_path=" >> "$GITHUB_OUTPUT"
+            echo "::notice::APPLE_CERTIFICATE secret is not configured; building an ad-hoc signed macOS bundle. Configure Developer ID + notarization secrets (see deploy/MACOS_SIGNING.md) for zero-warning public releases."
+          fi
       - name: Build Tauri v2 macOS Bundle
         working-directory: apps/desktop
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY_OVERRIDE: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY || secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER || secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SIGNING_MODE: ${{ steps.macos-signing.outputs.mode }}
+          NOTARIZE_MODE: ${{ steps.macos-signing.outputs.notarize }}
+          API_KEY_PATH: ${{ steps.macos-signing.outputs.api_key_path }}
         run: |
+          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+
+          TAURI_EXTRA_ARGS=()
+          if [ "$SIGNING_MODE" = "developer-id" ]; then
+            export APPLE_CERTIFICATE="$CERT_B64"
+            export APPLE_CERTIFICATE_PASSWORD="$CERT_PASSWORD"
+            if [ -n "$SIGNING_IDENTITY_OVERRIDE" ]; then
+              export APPLE_SIGNING_IDENTITY="$SIGNING_IDENTITY_OVERRIDE"
+            fi
+            if [ "$NOTARIZE_MODE" = "api-key" ]; then
+              export APPLE_API_KEY="$API_KEY_ID"
+              export APPLE_API_ISSUER="$API_ISSUER_ID"
+              export APPLE_API_KEY_PATH="$API_KEY_PATH"
+            elif [ "$NOTARIZE_MODE" = "apple-id" ]; then
+              export APPLE_ID="$NOTARY_APPLE_ID"
+              export APPLE_PASSWORD="$NOTARY_APPLE_PASSWORD"
+              export APPLE_TEAM_ID="$NOTARY_APPLE_TEAM_ID"
+            fi
+          else
+            export APPLE_SIGNING_IDENTITY="-"
+            TAURI_EXTRA_ARGS=(--config '{"bundle":{"macOS":{"hardenedRuntime":false}}}')
+          fi
+
           npm ci
-          npx tauri build --target aarch64-apple-darwin --bundles dmg
+          npx tauri build --target aarch64-apple-darwin --bundles dmg "${TAURI_EXTRA_ARGS[@]}"
           cp src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg Orbit-macOS-AppleSilicon.dmg
+      - name: Verify Signature & Notarize macOS DMG
+        working-directory: apps/desktop
+        env:
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY || secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER || secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SIGNING_MODE: ${{ steps.macos-signing.outputs.mode }}
+          NOTARIZE_MODE: ${{ steps.macos-signing.outputs.notarize }}
+          API_KEY_PATH: ${{ steps.macos-signing.outputs.api_key_path }}
+        run: |
+          APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Orbit.app"
+          DMG_PATH="Orbit-macOS-AppleSilicon.dmg"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          codesign -dv --verbose=4 "$APP_PATH"
+
+          if [ "$SIGNING_MODE" = "developer-id" ] && [ "$NOTARIZE_MODE" != "none" ]; then
+            spctl --assess --type execute --verbose=4 "$APP_PATH"
+            xcrun stapler validate -v "$APP_PATH"
+
+            if [ "$NOTARIZE_MODE" = "api-key" ]; then
+              xcrun notarytool submit "$DMG_PATH" \
+                --key "$API_KEY_PATH" \
+                --key-id "$API_KEY_ID" \
+                --issuer "$API_ISSUER_ID" \
+                --wait
+            elif [ "$NOTARIZE_MODE" = "apple-id" ]; then
+              xcrun notarytool submit "$DMG_PATH" \
+                --apple-id "$NOTARY_APPLE_ID" \
+                --password "$NOTARY_APPLE_PASSWORD" \
+                --team-id "$NOTARY_APPLE_TEAM_ID" \
+                --wait
+            fi
+
+            xcrun stapler staple -v "$DMG_PATH"
+            xcrun stapler validate -v "$DMG_PATH"
+          fi
+      - name: Cleanup Temporary Signing Key
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8
       - uses: actions/upload-artifact@v4
         with:
           name: Orbit-macOS-AppleSilicon.dmg
@@ -219,10 +342,30 @@ jobs:
           chmod +x orbit-cli-*
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
+      - name: Prepare Release Notes
+        id: release-notes
+        env:
+          NOTARIZED: ${{ needs.build-macos-desktop.outputs.notarized }}
+        run: |
+          if [ "$NOTARIZED" != "true" ]; then
+            {
+              echo "body<<ORBIT_RELEASE_BODY_EOF"
+              cat <<'NOTE'
+          > **macOS First Launch Note**: This build is ad-hoc signed without Apple Notarization. On first launch, go to **System Settings → Privacy & Security** and click **Open Anyway**. On macOS Sequoia (15+) or newer, if the *Open Anyway* button does not appear, run:
+          > ```bash
+          > xattr -dr com.apple.quarantine /Applications/Orbit.app
+          > ```
+          NOTE
+              echo "ORBIT_RELEASE_BODY_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "body=" >> "$GITHUB_OUTPUT"
+          fi
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: ${{ steps.release-notes.outputs.body }}
           files: |
             release-dist/Orbit-macOS-AppleSilicon.dmg
             release-dist/Orbit-Linux-arm64.deb

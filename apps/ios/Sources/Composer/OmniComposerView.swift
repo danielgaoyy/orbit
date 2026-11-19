@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 private struct InlineMentionCandidate: Identifiable, Equatable {
     let id: String
@@ -19,6 +20,42 @@ struct OmniComposerView: View {
 
     @Environment(\.orbitPalette) private var palette
     @FocusState private var isComposerFocused: Bool
+    @State private var isSoftwareKeyboardVisible: Bool = false
+
+    private var hasHomeIndicatorInset: Bool {
+        guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let window = scene.windows.first(where: \.isKeyWindow) ?? scene.windows.first else {
+            return false
+        }
+        return window.safeAreaInsets.bottom >= 20
+    }
+
+    private var composerBottomPadding: CGFloat {
+        if isSoftwareKeyboardVisible {
+            return OrbitSpacing.sm
+        }
+        return hasHomeIndicatorInset ? -14 : 10
+    }
+
+    private func updateSoftwareKeyboardVisibility(from notification: Notification) {
+        guard let endFrame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else {
+            return
+        }
+        let windowHeight: CGFloat = {
+            if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+               let window = scene.windows.first(where: \.isKeyWindow) ?? scene.windows.first {
+                return window.bounds.height
+            }
+            return UIScreen.main.bounds.height
+        }()
+        let visibleOverlap = max(0, windowHeight - endFrame.minY)
+        let nextVisible = visibleOverlap > 100
+        if nextVisible != isSoftwareKeyboardVisible {
+            withAnimation(.easeOut(duration: 0.22)) {
+                isSoftwareKeyboardVisible = nextVisible
+            }
+        }
+    }
 
     private var hasTrayItems: Bool {
         store.slashDirective != nil
@@ -47,15 +84,17 @@ struct OmniComposerView: View {
         return "Send follow-up or steer session…"
     }
 
-    private var modeIconColor: Color {
-        switch store.selectedMode {
-        case .fullAccess:
-            return palette.warning
-        case .acceptEdits, .plan:
-            return palette.primary
-        case .default, .custom:
-            return palette.fgSecondary
-        }
+    private var normalizedPermissionMode: FfiSessionMode {
+        OrbitFormatters.normalizePermissionMode(store.selectedMode)
+    }
+
+    private var permissionModeSelectionBinding: Binding<FfiSessionMode> {
+        Binding(
+            get: { normalizedPermissionMode },
+            set: { newMode in
+                store.applySessionMode(newMode)
+            }
+        )
     }
 
     // MARK: - Inline `/` Slash & `@` Mention Detection
@@ -242,25 +281,37 @@ struct OmniComposerView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
-            if !matchingSlashDirectives.isEmpty {
-                slashAutocompletePopover
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            } else if !matchingMentionCandidates.isEmpty {
-                mentionAutocompletePopover
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+        OrbitGlassContainer(spacing: OrbitSpacing.sm) {
+            VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+                if !matchingSlashDirectives.isEmpty {
+                    slashAutocompletePopover
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                } else if !matchingMentionCandidates.isEmpty {
+                    mentionAutocompletePopover
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
 
-            if !store.activeQueuedPrompts.isEmpty {
-                queuedPromptsTray
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
+                if !store.activeQueuedPrompts.isEmpty {
+                    queuedPromptsTray
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
 
-            composerCard
+                composerCard
+            }
         }
-        .padding(.horizontal, OrbitSpacing.lg)
+        .padding(.horizontal, OrbitSpacing.md)
         .padding(.top, OrbitSpacing.sm)
-        .padding(.bottom, OrbitSpacing.sm)
+        .padding(.bottom, composerBottomPadding)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+            updateSoftwareKeyboardVisibility(from: note)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            if isSoftwareKeyboardVisible {
+                withAnimation(.easeOut(duration: 0.22)) {
+                    isSoftwareKeyboardVisible = false
+                }
+            }
+        }
         .onAppear {
             if activeAtQuery != nil && store.workspaceFilesList.isEmpty {
                 store.refreshWorkspaceFiles()
@@ -314,13 +365,12 @@ struct OmniComposerView: View {
             }
         }
         .padding(.vertical, OrbitSpacing.xs)
-        .background(palette.elevated)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(palette.hairline, lineWidth: 0.5)
+        .orbitGlassSurface(
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous),
+            fallbackFill: palette.elevated,
+            fallbackBorder: palette.hairline,
+            fallbackShadowOpacity: palette.isDark ? 0.28 : 0.08
         )
-        .shadow(color: Color.black.opacity(palette.isDark ? 0.28 : 0.08), radius: 12, y: 4)
     }
 
     // MARK: - Floating `@` Mention Autocomplete Popover
@@ -370,13 +420,12 @@ struct OmniComposerView: View {
             }
         }
         .padding(.vertical, OrbitSpacing.xs)
-        .background(palette.elevated)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(palette.hairline, lineWidth: 0.5)
+        .orbitGlassSurface(
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous),
+            fallbackFill: palette.elevated,
+            fallbackBorder: palette.hairline,
+            fallbackShadowOpacity: palette.isDark ? 0.28 : 0.08
         )
-        .shadow(color: Color.black.opacity(palette.isDark ? 0.28 : 0.08), radius: 12, y: 4)
     }
 
     private func selectInlineSlashDirective(_ directive: OrbitSlashDirective) {
@@ -473,11 +522,10 @@ struct OmniComposerView: View {
                 .frame(minHeight: OrbitSpacing.hitTarget)
             }
         }
-        .background(palette.elevated)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(palette.hairline, lineWidth: 0.5)
+        .orbitGlassSurface(
+            in: RoundedRectangle(cornerRadius: 16, style: .continuous),
+            fallbackFill: palette.elevated,
+            fallbackBorder: palette.hairline
         )
     }
 
@@ -496,13 +544,13 @@ struct OmniComposerView: View {
                 .foregroundStyle(palette.fgPrimary)
                 .lineLimit(1...6)
                 .focused($isComposerFocused)
-                .padding(.horizontal, OrbitSpacing.md + 2)
-                .padding(.top, hasTrayItems ? OrbitSpacing.xs : OrbitSpacing.md)
-                .padding(.bottom, OrbitSpacing.xs)
+                .padding(.horizontal, OrbitSpacing.lg)
+                .padding(.top, hasTrayItems ? OrbitSpacing.xs : OrbitSpacing.md + 2)
+                .padding(.bottom, 2)
 
-            // Bottom Control Bar
-            HStack(spacing: OrbitSpacing.xs) {
-                // [+] Context & Slash Picker Trigger
+            // Bottom Control Bar — balanced optical spacing (~12pt paired gaps, concentric 10pt Send inset)
+            HStack(spacing: 0) {
+                // [+] Context & Slash Picker Trigger (borderless, left edge aligned at 16pt)
                 Button {
                     store.hapticLight()
                     if store.selectedHostId == nil && !store.hasDemoStageOverlay {
@@ -515,39 +563,39 @@ struct OmniComposerView: View {
                     Image(systemName: "plus")
                         .font(OrbitTypography.icon)
                         .foregroundStyle(palette.fgSecondary)
-                        .frame(width: 28, height: 28)
-                        .background(palette.subtleFill)
-                        .clipShape(Circle())
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .frame(width: 34, height: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Add Context or Slash Workflow")
 
-                // [Provider Dot + Model · Effort] Capsule
+                // [Agent Icon + Model + Effort ⌄] (aligned 1:1 with Desktop ComposerModelPicker)
                 Button {
                     store.hapticLight()
                     store.activeSheet = .modelPicker
                 } label: {
-                    HStack(spacing: OrbitSpacing.xs + 2) {
-                        Circle()
-                            .fill(palette.providerAccent(store.selectedProvider))
-                            .frame(width: 6, height: 6)
+                    HStack(spacing: 6) {
+                        OrbitProviderIcon(provider: store.selectedProvider, size: 16)
 
-                        Text(store.composerModelSummaryLabel)
-                            .font(OrbitTypography.meta(.medium))
-                            .foregroundStyle(palette.fgSecondary)
+                        Text(store.composerModelDisplayName)
+                            .font(.system(size: 13.5, weight: .regular))
+                            .foregroundStyle(palette.fgPrimary.opacity(0.88))
                             .lineLimit(1)
 
-                        Image(systemName: "chevron.up.chevron.down")
-                            .font(OrbitTypography.iconMicro)
-                            .foregroundStyle(palette.fgMuted)
+                        if let effortLabel = store.composerEffortDisplayLabel {
+                            Text(effortLabel)
+                                .font(.system(size: 13.5, weight: .regular))
+                                .foregroundStyle(palette.fgPrimary.opacity(0.48))
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.fgPrimary.opacity(0.45))
                     }
-                    .padding(.horizontal, OrbitSpacing.sm + 2)
-                    .padding(.vertical, 5)
-                    .background(palette.subtleFill)
-                    .clipShape(Capsule())
-                    .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
+                    .padding(.leading, 2)
+                    .padding(.trailing, OrbitSpacing.sm)
                     .frame(minHeight: OrbitSpacing.hitTarget)
                     .contentShape(Rectangle())
                 }
@@ -555,99 +603,81 @@ struct OmniComposerView: View {
                 .layoutPriority(1)
                 .accessibilityLabel("Select Provider, Model, and Reasoning Effort")
 
-                Spacer(minLength: 0)
+                Spacer(minLength: OrbitSpacing.xs)
 
-                // [Mode Shield] Menu (Always Ask / Accept Edits / Full Access)
+                // [Access Permissions] Menu (aligned with Desktop: Always Ask / Accept Edits / Full Access)
                 Menu {
-                    Button {
-                        store.applySessionMode(.default)
-                    } label: {
-                        Label(
-                            "Always Ask",
-                            systemImage: store.selectedMode == .default ? "checkmark" : "shield"
-                        )
-                    }
+                    Section("Access Permissions") {
+                        Picker("Access Permissions", selection: permissionModeSelectionBinding) {
+                            Label {
+                                Text("Always Ask")
+                                Text("Require approval before file edits and commands")
+                            } icon: {
+                                Image(systemName: "shield")
+                            }
+                            .tag(FfiSessionMode.default)
 
-                    Button {
-                        store.applySessionMode(.acceptEdits)
-                    } label: {
-                        Label(
-                            "Accept Edits",
-                            systemImage: store.selectedMode == .acceptEdits ? "checkmark" : "checkmark.shield"
-                        )
-                    }
+                            Label {
+                                Text("Accept Edits")
+                                Text("Auto-approve file edits, ask before commands")
+                            } icon: {
+                                Image(systemName: "checkmark.shield")
+                            }
+                            .tag(FfiSessionMode.acceptEdits)
 
-                    Button {
-                        store.applySessionMode(.fullAccess)
-                    } label: {
-                        Label(
-                            "Full Access",
-                            systemImage: store.selectedMode == .fullAccess ? "checkmark" : "bolt.shield"
-                        )
-                    }
-
-                    Divider()
-
-                    Button {
-                        store.applySessionMode(.plan)
-                    } label: {
-                        Label(
-                            "Plan Mode",
-                            systemImage: store.selectedMode == .plan ? "checkmark" : "list.bullet.clipboard"
-                        )
+                            Label {
+                                Text("Full Access")
+                                Text("Edit files and run commands without prompts")
+                            } icon: {
+                                Image(systemName: "shield.slash")
+                            }
+                            .tag(FfiSessionMode.fullAccess)
+                        }
                     }
                 } label: {
-                    HStack(spacing: OrbitSpacing.xs) {
-                        Image(systemName: OrbitFormatters.sessionModeIcon(store.selectedMode))
-                            .font(OrbitTypography.iconSmall)
-                            .foregroundStyle(modeIconColor)
-                    }
-                    .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
-                    .contentShape(Rectangle())
+                    Image(systemName: OrbitFormatters.sessionModeIcon(normalizedPermissionMode))
+                        .font(OrbitTypography.iconSmall)
+                        .foregroundStyle(palette.fgSecondary)
+                        .frame(width: 36, height: OrbitSpacing.hitTarget)
+                        .contentShape(Rectangle())
                 }
-                .accessibilityLabel("Access Mode: \(OrbitFormatters.sessionModeLabel(store.selectedMode))")
+                .menuOrder(.fixed)
+                .accessibilityLabel("Access Permissions: \(OrbitFormatters.sessionModeLabel(normalizedPermissionMode))")
 
-                // Compact Muted Stop Pill when user is typing a queued prompt during active run
+                // Borderless Stop action when user is typing a queued prompt during active run
                 if isRunningWithDraft {
                     Button {
                         store.interruptActiveAgent()
                     } label: {
                         HStack(spacing: OrbitSpacing.xs) {
-                            Image(systemName: "stop.fill")
-                                .font(OrbitTypography.iconMicro)
+                            Image(systemName: "stop.circle.fill")
+                                .font(OrbitTypography.iconSmall)
                             Text("Stop")
                                 .font(OrbitTypography.meta(.semibold))
                         }
                         .foregroundStyle(palette.danger)
-                        .padding(.horizontal, OrbitSpacing.sm)
-                        .padding(.vertical, OrbitSpacing.xs)
-                        .background(palette.danger.opacity(0.12))
-                        .clipShape(Capsule())
-                        .overlay(
-                            Capsule()
-                                .strokeBorder(palette.danger.opacity(0.28), lineWidth: 0.5)
-                        )
-                        .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
+                        .padding(.horizontal, OrbitSpacing.xs + 2)
+                        .frame(minHeight: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Stop Generation")
                 }
 
-                // Primary Right Circle Action: Stop ■ / Queue ⤒ / Send ↑
+                // Primary Right Circle Action: Stop ■ / Queue ⤒ / Send ↑ (only control with background)
                 if showPrimaryStopButton {
                     Button {
                         store.interruptActiveAgent()
                     } label: {
                         ZStack {
                             Circle()
-                                .fill(palette.danger)
+                                .fill(palette.subtleFill)
                                 .frame(width: 32, height: 32)
-                            Image(systemName: "stop.fill")
-                                .font(OrbitTypography.iconMicro)
-                                .foregroundStyle(Color.white)
+                            RoundedRectangle(cornerRadius: 2.5, style: .continuous)
+                                .fill(Color(hex: "#EF4444"))
+                                .frame(width: 11, height: 11)
                         }
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .frame(width: 36, height: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -662,9 +692,9 @@ struct OmniComposerView: View {
                                 .frame(width: 32, height: 32)
                             Image(systemName: "arrow.up.to.line")
                                 .font(OrbitTypography.iconSmall)
-                                .foregroundStyle(Color.white)
+                                .foregroundStyle(palette.onPrimary)
                         }
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .frame(width: 36, height: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -682,10 +712,10 @@ struct OmniComposerView: View {
                                 .fill(store.canSubmitComposer ? palette.primary : palette.subtleFill)
                                 .frame(width: 32, height: 32)
                             Image(systemName: "arrow.up")
-                                .font(OrbitTypography.iconSmall)
-                                .foregroundStyle(store.canSubmitComposer ? Color.white : palette.fgMuted)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(store.canSubmitComposer ? palette.onPrimary : palette.fgMuted)
                         }
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .frame(width: 36, height: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -693,16 +723,16 @@ struct OmniComposerView: View {
                     .accessibilityLabel("Send Prompt")
                 }
             }
-            .padding(.horizontal, OrbitSpacing.xs)
-            .padding(.bottom, 2)
+            .padding(.leading, 6)
+            .padding(.trailing, 8)
+            .padding(.bottom, 4)
         }
-        .background(palette.elevated)
-        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .strokeBorder(palette.hairline, lineWidth: 0.5)
+        .orbitGlassSurface(
+            in: RoundedRectangle(cornerRadius: 26, style: .continuous),
+            fallbackFill: palette.elevated,
+            fallbackBorder: palette.hairline,
+            fallbackShadowOpacity: palette.isDark ? 0.22 : 0.06
         )
-        .shadow(color: Color.black.opacity(palette.isDark ? 0.22 : 0.06), radius: 10, y: 2)
     }
 
     // MARK: - Removable Context Chips Tray

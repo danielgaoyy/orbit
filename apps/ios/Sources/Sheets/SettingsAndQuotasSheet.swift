@@ -163,7 +163,7 @@ struct SettingsAndQuotasSheet: View {
                 Circle()
                     .fill(
                         LinearGradient(
-                            colors: [Color.white, Color(hex: "#17181C")],
+                            colors: [Color.white, Color(hex: "#191A1C")],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )
@@ -180,7 +180,7 @@ struct SettingsAndQuotasSheet: View {
                 .overlay(Circle().strokeBorder(Color.black.opacity(0.18), lineWidth: 1))
         case .dark:
             Circle()
-                .fill(Color(hex: "#17181C"))
+                .fill(Color(hex: "#191A1C"))
                 .frame(width: 20, height: 20)
                 .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 1))
         case .oled:
@@ -473,7 +473,7 @@ struct SettingsAndQuotasSheet: View {
                 } label: {
                     Text("Save & Reconnect")
                         .font(OrbitTypography.subhead(.semibold))
-                        .foregroundStyle(Color.white)
+                        .foregroundStyle(palette.onPrimary)
                         .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
                         .background(palette.primary)
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))

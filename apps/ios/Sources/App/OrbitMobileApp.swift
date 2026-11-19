@@ -1,45 +1,40 @@
 import SwiftUI
+import UIKit
 
 @main
 struct OrbitMobileApp: App {
     @StateObject private var store = OrbitIosStore()
     @AppStorage("orbit.appearance") private var appearanceRaw: String = OrbitAppearanceMode.system.rawValue
+    @State private var debugAppearanceOverride: OrbitAppearanceMode?
     @Environment(\.scenePhase) private var scenePhase
 
-    init() {
-        let args = CommandLine.arguments
-        if let themeIdx = args.firstIndex(of: "-orbitTheme"), themeIdx + 1 < args.count {
-            let raw = args[themeIdx + 1].lowercased()
-            let resolved: OrbitAppearanceMode? = {
-                if raw == "graphite" {
-                    return .dark
-                }
-                return OrbitAppearanceMode(rawValue: raw)
-            }()
-            if let mode = resolved {
-                UserDefaults.standard.set(mode.rawValue, forKey: "orbit.appearance")
-            }
-        }
+    private var appearanceMode: OrbitAppearanceMode {
+        debugAppearanceOverride ?? (OrbitAppearanceMode(rawValue: appearanceRaw) ?? .system)
     }
 
-    private var appearanceMode: OrbitAppearanceMode {
-        OrbitAppearanceMode(rawValue: appearanceRaw) ?? .system
+    private var appearanceBinding: Binding<String> {
+        Binding(
+            get: { appearanceMode.rawValue },
+            set: { newValue in
+                debugAppearanceOverride = nil
+                appearanceRaw = newValue
+            }
+        )
     }
 
     var body: some Scene {
         WindowGroup {
             OrbitThemedRootContainer(
                 store: store,
-                appearanceRaw: $appearanceRaw,
+                appearanceRaw: appearanceBinding,
                 appearanceMode: appearanceMode
             )
-            .preferredColorScheme(appearanceMode.preferredColorScheme)
             .onOpenURL { url in
                 store.handleDeepLink(url)
             }
             .onAppear {
                 store.applyLaunchArguments(CommandLine.arguments) { mode in
-                    appearanceRaw = mode.rawValue
+                    debugAppearanceOverride = mode
                 }
             }
         }
@@ -78,5 +73,20 @@ private struct OrbitThemedRootContainer: View {
         .environment(\.orbitPalette, resolvedPalette)
         .preferredColorScheme(appearanceMode.preferredColorScheme)
         .tint(resolvedPalette.primary)
+        .onAppear {
+            syncWindowInterfaceStyle(appearanceMode.userInterfaceStyle)
+        }
+        .onChange(of: appearanceMode) { newMode in
+            syncWindowInterfaceStyle(newMode.userInterfaceStyle)
+        }
+    }
+
+    private func syncWindowInterfaceStyle(_ style: UIUserInterfaceStyle) {
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            for window in windowScene.windows where window.overrideUserInterfaceStyle != style {
+                window.overrideUserInterfaceStyle = style
+            }
+        }
     }
 }

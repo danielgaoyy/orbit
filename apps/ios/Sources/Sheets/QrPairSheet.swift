@@ -104,7 +104,7 @@ struct QrPairSheet: View {
                     Text("Pair from Clipboard")
                         .font(OrbitTypography.subhead(.semibold))
                 }
-                .foregroundStyle(Color.white)
+                .foregroundStyle(palette.onPrimary)
                 .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
                 .background(palette.primary)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -148,7 +148,7 @@ struct QrPairSheet: View {
             } label: {
                 Text("Connect Local Simulator Host")
                     .font(OrbitTypography.subhead(.semibold))
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(palette.onPrimary)
                     .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
                     .background(palette.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -288,7 +288,7 @@ struct QrPairSheet: View {
             } label: {
                 Text("Pair Host")
                     .font(OrbitTypography.subhead(.semibold))
-                    .foregroundStyle(manualUri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? palette.fgMuted : Color.white)
+                    .foregroundStyle(manualUri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? palette.fgMuted : palette.onPrimary)
                     .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
                     .background(
                         manualUri.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty

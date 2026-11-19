@@ -447,7 +447,7 @@ struct NativePtySheet: View {
         Button(action: action) {
             Text(label)
                 .font(OrbitTypography.code(.semibold))
-                .foregroundStyle(isArmed ? Color.white : palette.fgPrimary)
+                .foregroundStyle(isArmed ? palette.onPrimary : palette.fgPrimary)
                 .padding(.horizontal, OrbitSpacing.sm + 2)
                 .frame(minWidth: 44, minHeight: 34)
                 .background(isArmed ? palette.primary : palette.elevated)
@@ -511,7 +511,7 @@ struct NativePtySheet: View {
             } label: {
                 Image(systemName: "return")
                     .font(OrbitTypography.iconSmall)
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(palette.onPrimary)
                     .frame(width: 34, height: 34)
                     .background(palette.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))

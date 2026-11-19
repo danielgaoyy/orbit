@@ -117,19 +117,25 @@ struct ModelPickerSheet: View {
                             effort: store.selectedEffort
                         )
                     } label: {
-                        VStack(spacing: 2) {
-                            Text(OrbitFormatters.providerShortLabel(provider))
-                                .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
-                                .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
-                                .lineLimit(1)
+                        HStack(spacing: 6) {
+                            OrbitProviderIcon(provider: provider, size: 15)
+                                .opacity(isInstalled ? 1.0 : 0.45)
 
-                            if !isInstalled {
-                                Text("Offline")
-                                    .font(OrbitTypography.meta(.regular))
-                                    .foregroundStyle(palette.fgMuted)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(OrbitFormatters.providerShortLabel(provider))
+                                    .font(OrbitTypography.subhead(isSelected ? .medium : .regular))
+                                    .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
                                     .lineLimit(1)
+
+                                if !isInstalled {
+                                    Text("Offline")
+                                        .font(OrbitTypography.meta(.regular))
+                                        .foregroundStyle(palette.fgMuted)
+                                        .lineLimit(1)
+                                }
                             }
                         }
+                        .padding(.horizontal, OrbitSpacing.sm)
                         .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
                         .background(isSelected ? palette.elevated : palette.subtleFill)
                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -187,7 +193,7 @@ struct ModelPickerSheet: View {
                         } label: {
                             Text(pillTitle)
                                 .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
-                                .foregroundStyle(isSelected ? Color.white : palette.fgPrimary)
+                                .foregroundStyle(isSelected ? palette.onPrimary : palette.fgPrimary)
                                 .padding(.horizontal, OrbitSpacing.md)
                                 .padding(.vertical, 7)
                                 .background(
@@ -223,6 +229,13 @@ struct ModelPickerSheet: View {
                 ForEach(catalog.models, id: \.id) { spec in
                     let isSelected = (currentProvider == store.selectedProvider)
                         && (store.selectedModel == spec.id || (store.selectedModel == nil && spec.id == activeSpec?.id))
+                    let rowEffort: FfiReasoningEffort? = {
+                        guard !spec.thinkingOptions.isEmpty else { return nil }
+                        if isSelected {
+                            return store.selectedEffort ?? spec.defaultEffort ?? catalog.configuredDefaultEffort
+                        }
+                        return spec.defaultEffort ?? spec.thinkingOptions.first?.effort
+                    }()
 
                     Button {
                         store.applyModelSelection(
@@ -233,11 +246,18 @@ struct ModelPickerSheet: View {
                     } label: {
                         HStack(spacing: OrbitSpacing.md) {
                             VStack(alignment: .leading, spacing: 2) {
-                                HStack(spacing: OrbitSpacing.xs) {
+                                HStack(alignment: .firstTextBaseline, spacing: 6) {
                                     Text(spec.label)
-                                        .font(OrbitTypography.body(isSelected ? .semibold : .regular))
-                                        .foregroundStyle(palette.fgPrimary)
+                                        .font(.system(size: 14, weight: isSelected ? .medium : .regular))
+                                        .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgPrimary.opacity(0.84))
                                         .lineLimit(1)
+
+                                    if let rowEffort {
+                                        Text(formatEffortLabel(effort: rowEffort))
+                                            .font(.system(size: 12.5, weight: .regular))
+                                            .foregroundStyle(palette.fgMuted)
+                                            .lineLimit(1)
+                                    }
 
                                     if spec.isDefault {
                                         Text("Default")
@@ -261,9 +281,9 @@ struct ModelPickerSheet: View {
                             Spacer()
 
                             if isSelected {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .font(OrbitTypography.icon)
-                                    .foregroundStyle(palette.primary)
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 13.5, weight: .semibold))
+                                    .foregroundStyle(palette.fgPrimary)
                             }
                         }
                         .padding(.horizontal, OrbitSpacing.md)
@@ -274,7 +294,7 @@ struct ModelPickerSheet: View {
                         .overlay(
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
                                 .strokeBorder(
-                                    isSelected ? palette.primary.opacity(0.45) : palette.hairline,
+                                    isSelected ? palette.primary.opacity(0.28) : palette.hairline,
                                     lineWidth: 0.5
                                 )
                         )

@@ -66,21 +66,17 @@ struct AdaptiveWorkspaceShell: View {
                 OrbitHairline(axis: .vertical)
             }
 
-            VStack(spacing: 0) {
-                WorkspaceTopBar(
-                    store: store,
-                    showSidebarButton: true,
-                    canShowInlineInspector: canShowInlineInspector,
-                    onToggleSidebar: {
-                        store.hapticLight()
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            store.togglePadSidebarCollapsed()
-                        }
+            WorkspaceStagePane(
+                store: store,
+                showSidebarButton: true,
+                canShowInlineInspector: canShowInlineInspector,
+                onToggleSidebar: {
+                    store.hapticLight()
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        store.togglePadSidebarCollapsed()
                     }
-                )
-                OrbitHairline()
-                StreamStageView(store: store)
-            }
+                }
+            )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(palette.canvas)
 
@@ -110,21 +106,17 @@ struct AdaptiveWorkspaceShell: View {
 
     private var compactDrawerShell: some View {
         ZStack(alignment: .leading) {
-            VStack(spacing: 0) {
-                WorkspaceTopBar(
-                    store: store,
-                    showSidebarButton: true,
-                    canShowInlineInspector: false,
-                    onToggleSidebar: {
-                        store.hapticLight()
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                            store.isDrawerOpen.toggle()
-                        }
+            WorkspaceStagePane(
+                store: store,
+                showSidebarButton: true,
+                canShowInlineInspector: false,
+                onToggleSidebar: {
+                    store.hapticLight()
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                        store.isDrawerOpen.toggle()
                     }
-                )
-                OrbitHairline()
-                StreamStageView(store: store)
-            }
+                }
+            )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(palette.canvas)
 
@@ -139,7 +131,7 @@ struct AdaptiveWorkspaceShell: View {
             // Dimmed Scrim + Fleet Drawer Overlay
             if compactDrawerProgress > 0.001 {
                 Color.black
-                    .opacity(0.46 * Double(compactDrawerProgress))
+                    .opacity(0.36 * Double(compactDrawerProgress))
                     .ignoresSafeArea()
                     .onTapGesture {
                         withAnimation(.spring(response: 0.26, dampingFraction: 0.88)) {
@@ -148,13 +140,27 @@ struct AdaptiveWorkspaceShell: View {
                     }
                     .gesture(drawerCloseGesture)
 
-                HStack(spacing: 0) {
-                    FleetDrawerView(store: store, isCompactOverlay: true)
-                        .frame(width: OrbitSpacing.drawerWidth)
-                    OrbitHairline(axis: .vertical)
-                }
-                .offset(x: compactDrawerOffset)
-                .gesture(drawerCloseGesture)
+                compactDrawerPanel
+                    .offset(x: compactDrawerOffset)
+                    .gesture(drawerCloseGesture)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var compactDrawerPanel: some View {
+        if #available(iOS 26.0, *) {
+            FleetDrawerView(store: store, isCompactOverlay: true)
+                .frame(width: OrbitSpacing.drawerWidth)
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .padding(.leading, OrbitSpacing.sm)
+                .padding(.vertical, OrbitSpacing.xs)
+        } else {
+            HStack(spacing: 0) {
+                FleetDrawerView(store: store, isCompactOverlay: true)
+                    .frame(width: OrbitSpacing.drawerWidth)
+                OrbitHairline(axis: .vertical)
             }
         }
     }
@@ -232,10 +238,12 @@ struct AdaptiveWorkspaceShell: View {
                 }
                 .padding(.horizontal, OrbitSpacing.md)
                 .padding(.vertical, OrbitSpacing.sm)
-                .background(palette.elevated)
-                .clipShape(Capsule())
-                .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
-                .shadow(color: Color.black.opacity(0.12), radius: 8, y: 2)
+                .orbitGlassSurface(
+                    in: Capsule(),
+                    fallbackFill: palette.elevated,
+                    fallbackBorder: palette.hairline,
+                    fallbackShadowOpacity: 0.12
+                )
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
 
@@ -262,17 +270,226 @@ struct AdaptiveWorkspaceShell: View {
                 }
                 .padding(.horizontal, OrbitSpacing.md)
                 .padding(.vertical, OrbitSpacing.sm)
-                .background(palette.elevated)
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(palette.danger.opacity(0.35), lineWidth: 0.5)
+                .orbitGlassSurface(
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous),
+                    tint: palette.danger.opacity(0.12),
+                    fallbackFill: palette.elevated,
+                    fallbackBorder: palette.danger.opacity(0.35),
+                    fallbackShadowOpacity: 0.10
                 )
                 .padding(.horizontal, OrbitSpacing.lg)
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        .padding(.top, 56)
+        .padding(.top, 64)
+    }
+}
+
+// MARK: - Workspace Stage Pane (iOS 26+ Native Floating Liquid Glass NavigationStack + Pre-26 Fallback)
+
+private struct WorkspaceStagePane: View {
+    @ObservedObject var store: OrbitIosStore
+    let showSidebarButton: Bool
+    let canShowInlineInspector: Bool
+    let onToggleSidebar: () -> Void
+
+    @Environment(\.orbitPalette) private var palette
+
+    private var sessionTitle: String {
+        if let agent = store.activeAgent {
+            let trimmed = agent.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "New Session" : trimmed
+        }
+        return "New Session"
+    }
+
+    private var connectionState: FfiConnectionState {
+        store.activeHost?.connectionState ?? .disconnected
+    }
+
+    private var hasTerminals: Bool {
+        !(store.currentHostDetail?.terminals.isEmpty ?? true)
+    }
+
+    var body: some View {
+        if #available(iOS 26.0, *) {
+            NavigationStack {
+                StreamStageView(store: store)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        if showSidebarButton {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Button(action: onToggleSidebar) {
+                                    Image(systemName: "sidebar.left")
+                                        .foregroundStyle(palette.fgPrimary)
+                                        .overlay(alignment: .topTrailing) {
+                                            if store.totalPendingApprovals > 0 {
+                                                Circle()
+                                                    .fill(palette.warning)
+                                                    .frame(width: 7, height: 7)
+                                                    .offset(x: 3, y: -2)
+                                            }
+                                        }
+                                }
+                                .accessibilityLabel("Toggle Fleet Sidebar")
+                            }
+                        }
+
+                        ToolbarItem(placement: .title) {
+                            Button {
+                                if store.activeHost == nil {
+                                    store.activeSheet = .qrPair
+                                } else {
+                                    store.openDirectoryBrowser()
+                                }
+                            } label: {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(sessionTitle)
+                                        .font(OrbitTypography.subhead(.semibold))
+                                        .foregroundStyle(palette.fgPrimary)
+                                        .lineLimit(1)
+
+                                    HStack(spacing: OrbitSpacing.xs) {
+                                        Circle()
+                                            .fill(palette.connectionColor(connectionState))
+                                            .frame(width: 6, height: 6)
+
+                                        if let host = store.activeHost {
+                                            Text(OrbitFormatters.compactTopBarConnectionLabel(for: host))
+                                                .font(OrbitTypography.meta(.regular))
+                                                .foregroundStyle(palette.fgSecondary)
+                                                .lineLimit(1)
+                                                .fixedSize(horizontal: true, vertical: false)
+
+                                            Text("·")
+                                                .font(OrbitTypography.meta(.regular))
+                                                .foregroundStyle(palette.fgMuted)
+
+                                            Text(OrbitFormatters.shortPath(store.activeCwd))
+                                                .font(OrbitTypography.code(.regular))
+                                                .foregroundStyle(palette.fgSecondary)
+                                                .lineLimit(1)
+                                        } else {
+                                            Text("No Host Paired")
+                                                .font(OrbitTypography.meta(.regular))
+                                                .foregroundStyle(palette.fgMuted)
+                                        }
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Workspace Directory: \(OrbitFormatters.shortPath(store.activeCwd))")
+                        }
+
+                        if store.hosts.isEmpty {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button {
+                                    store.hapticLight()
+                                    store.activeSheet = .settings
+                                } label: {
+                                    Image(systemName: "slider.horizontal.3")
+                                        .foregroundStyle(palette.fgPrimary)
+                                }
+                                .accessibilityLabel("Settings")
+                            }
+                        } else {
+                            ToolbarItemGroup(placement: .topBarTrailing) {
+                                glassDiffToolbarButton
+
+                                Button {
+                                    store.hapticLight()
+                                    if store.selectedHostId == nil {
+                                        store.activeSheet = .qrPair
+                                    } else {
+                                        store.activeSheet = .pty
+                                    }
+                                } label: {
+                                    Image(systemName: "terminal")
+                                        .foregroundStyle(palette.fgPrimary)
+                                        .overlay(alignment: .topTrailing) {
+                                            if hasTerminals {
+                                                Circle()
+                                                    .fill(palette.direct)
+                                                    .frame(width: 6, height: 6)
+                                                    .offset(x: 3, y: -2)
+                                            }
+                                        }
+                                }
+                                .accessibilityLabel("Open Terminal")
+
+                                Button {
+                                    store.startNewSessionDraft()
+                                } label: {
+                                    Image(systemName: "plus")
+                                        .foregroundStyle(palette.fgPrimary)
+                                }
+                                .accessibilityLabel("New Session")
+                            }
+                        }
+                    }
+            }
+        } else {
+            VStack(spacing: 0) {
+                WorkspaceTopBar(
+                    store: store,
+                    showSidebarButton: showSidebarButton,
+                    canShowInlineInspector: canShowInlineInspector,
+                    onToggleSidebar: onToggleSidebar
+                )
+                OrbitHairline()
+                StreamStageView(store: store)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var glassDiffToolbarButton: some View {
+        let totals = store.diffTotals
+        Button {
+            store.hapticLight()
+            guard store.selectedHostId != nil else {
+                store.activeSheet = .qrPair
+                return
+            }
+            if canShowInlineInspector {
+                store.refreshGitReview()
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                    store.isPadDiffInspectorVisible.toggle()
+                }
+            } else {
+                store.openGitDiff()
+            }
+        } label: {
+            if totals.additions > 0 || totals.deletions > 0 {
+                HStack(spacing: OrbitSpacing.xs) {
+                    Text("+\(totals.additions)")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.added)
+                    Text("-\(totals.deletions)")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.removed)
+                }
+                .fixedSize(horizontal: true, vertical: false)
+            } else {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundStyle(
+                        canShowInlineInspector && store.isPadDiffInspectorVisible
+                            ? palette.primary
+                            : palette.fgPrimary
+                    )
+            }
+        }
+        .contextMenu {
+            Button {
+                store.refreshGitReview()
+                store.activeSheet = .gitDiff
+            } label: {
+                Label("Open Full Diff Sheet", systemImage: "arrow.up.left.and.arrow.down.right")
+            }
+        }
+        .accessibilityLabel("Git Diff")
     }
 }
 

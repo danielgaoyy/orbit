@@ -35,24 +35,25 @@ struct StreamStageView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            Group {
-                if store.hosts.isEmpty {
-                    unpairedZeroState
-                } else if turns.isEmpty {
-                    newSessionZeroState
-                } else {
-                    turnStreamScrollView
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if !store.hosts.isEmpty || store.hasDemoStageOverlay {
-                StickyDecisionDock(store: store)
-                OmniComposerView(store: store)
+        Group {
+            if store.hosts.isEmpty {
+                unpairedZeroState
+            } else if turns.isEmpty {
+                newSessionZeroState
+            } else {
+                turnStreamScrollView
             }
         }
-        .background(palette.canvas)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(palette.canvas.ignoresSafeArea())
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if !store.hosts.isEmpty || store.hasDemoStageOverlay {
+                VStack(spacing: 0) {
+                    StickyDecisionDock(store: store)
+                    OmniComposerView(store: store)
+                }
+            }
+        }
     }
 
     // MARK: - Turn Stream ScrollView
@@ -89,6 +90,7 @@ struct StreamStageView: View {
                     .padding(.bottom, OrbitSpacing.lg)
                 }
                 .coordinateSpace(name: "stageScrollSpace")
+                .orbitSoftScrollEdgeEffect()
                 .scrollDismissesKeyboard(.interactively)
                 .refreshable {
                     await store.pullToRefreshStage()
@@ -191,11 +193,14 @@ struct StreamStageView: View {
                                     .foregroundStyle(palette.fgPrimary)
                             }
                             .padding(.horizontal, OrbitSpacing.md)
-                            .frame(height: 32)
-                            .background(palette.elevated)
-                            .clipShape(Capsule())
-                            .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
-                            .shadow(color: Color.black.opacity(palette.isDark ? 0.24 : 0.10), radius: 8, y: 2)
+                            .frame(height: 34)
+                            .orbitGlassSurface(
+                                in: Capsule(),
+                                interactive: true,
+                                fallbackFill: palette.elevated,
+                                fallbackBorder: palette.hairline,
+                                fallbackShadowOpacity: palette.isDark ? 0.24 : 0.10
+                            )
                             .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
                             .contentShape(Rectangle())
                         }
@@ -269,7 +274,7 @@ struct StreamStageView: View {
                             Text("Connect Local Simulator Host")
                                 .font(OrbitTypography.subhead(.semibold))
                         }
-                        .foregroundStyle(Color.white)
+                        .foregroundStyle(palette.onPrimary)
                         .padding(.horizontal, OrbitSpacing.lg)
                         .frame(minWidth: 240, minHeight: OrbitSpacing.hitTarget)
                         .background(palette.primary)
@@ -288,7 +293,7 @@ struct StreamStageView: View {
                         Text("Scan QR Code")
                             .font(OrbitTypography.subhead(.semibold))
                     }
-                    .foregroundStyle(store.localDaemonUri == nil ? Color.white : palette.fgPrimary)
+                    .foregroundStyle(store.localDaemonUri == nil ? palette.onPrimary : palette.fgPrimary)
                     .padding(.horizontal, OrbitSpacing.lg)
                     .frame(minWidth: 240, minHeight: OrbitSpacing.hitTarget)
                     .background(store.localDaemonUri == nil ? palette.primary : palette.elevated)
@@ -363,7 +368,7 @@ struct StreamStageView: View {
                                         .foregroundStyle(palette.fgMuted)
                                     Text(branch)
                                         .font(OrbitTypography.code(.regular))
-                                        .foregroundStyle(palette.primary)
+                                        .foregroundStyle(palette.fgSecondary)
                                         .lineLimit(1)
                                 }
 
@@ -373,9 +378,12 @@ struct StreamStageView: View {
                             }
                             .padding(.horizontal, OrbitSpacing.md)
                             .frame(minHeight: OrbitSpacing.hitTarget)
-                            .background(palette.elevated)
-                            .clipShape(Capsule())
-                            .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
+                            .orbitGlassSurface(
+                                in: Capsule(),
+                                interactive: true,
+                                fallbackFill: palette.elevated,
+                                fallbackBorder: palette.hairline
+                            )
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
@@ -414,6 +422,7 @@ struct StreamStageView: View {
                 .padding(.horizontal, OrbitSpacing.lg)
                 .frame(minWidth: geo.size.width, minHeight: geo.size.height)
             }
+            .orbitSoftScrollEdgeEffect()
             .scrollDismissesKeyboard(.interactively)
             .refreshable {
                 await store.pullToRefreshStage()

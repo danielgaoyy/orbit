@@ -435,14 +435,28 @@ public final class OrbitIosStore: ObservableObject {
         return cat.models.first(where: { $0.isDefault }) ?? cat.models.first
     }
 
-    public var composerModelSummaryLabel: String {
+    public var composerModelDisplayName: String {
         let cat = catalog(for: selectedProvider)
-        let modelLabel = formatCatalogModelLabel(catalog: cat, rawModelId: selectedModel)
-        if let effort = selectedEffort {
-            let shortEffort = OrbitFormatters.compactEffortLabel(effort)
-            return "\(modelLabel) · \(shortEffort)"
+        return formatCatalogModelLabel(catalog: cat, rawModelId: selectedModel)
+    }
+
+    public var composerEffortDisplayLabel: String? {
+        let cat = catalog(for: selectedProvider)
+        let spec = activeModelSpec
+        guard let spec, !spec.thinkingOptions.isEmpty else {
+            guard let effort = selectedEffort else { return nil }
+            return formatEffortLabel(effort: effort)
         }
-        return modelLabel
+        let resolved = selectedEffort ?? spec.defaultEffort ?? cat.configuredDefaultEffort
+        guard let effort = resolved else { return nil }
+        return formatEffortLabel(effort: effort)
+    }
+
+    public var composerModelSummaryLabel: String {
+        if let effortLabel = composerEffortDisplayLabel {
+            return "\(composerModelDisplayName) \(effortLabel)"
+        }
+        return composerModelDisplayName
     }
 
     public var canSubmitComposer: Bool {

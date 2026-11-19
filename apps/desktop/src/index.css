@@ -5,20 +5,20 @@
 
 :root {
   --background: oklch(1 0 0);
-  --foreground: oklch(0.19 0.004 260);
+  --foreground: oklch(0.185 0.004 260);
   --surface-sidebar: oklch(0.968 0.002 260);
   --surface-canvas: oklch(1 0 0);
   --surface-elevated: oklch(1 0 0);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.19 0.004 260);
+  --card-foreground: oklch(0.185 0.004 260);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.19 0.004 260);
+  --popover-foreground: oklch(0.185 0.004 260);
   --primary: oklch(0.46 0.14 256);
   --primary-foreground: oklch(0.99 0 0);
   --secondary: oklch(0.958 0.002 260);
-  --secondary-foreground: oklch(0.21 0.004 260);
-  --muted: oklch(0.958 0.002 260);
-  --muted-foreground: oklch(0.51 0.006 260);
+  --secondary-foreground: oklch(0.205 0.004 260);
+  --muted: oklch(0.956 0.002 260);
+  --muted-foreground: oklch(0.475 0.006 260);
   --accent: oklch(0.946 0.003 260);
   --accent-foreground: oklch(0.18 0.004 260);
   --destructive: oklch(0.56 0.20 25);
@@ -26,6 +26,11 @@
   --input: oklch(0 0 0 / 10%);
   --ring: oklch(0.46 0.14 256);
   --radius: 0.625rem;
+
+  /* Global Motion System Tokens (Restrained, Front-Loaded Velocity) */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-panel: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
 }
 
 .dark {
@@ -43,7 +48,7 @@
   --secondary: oklch(0.282 0.006 260);
   --secondary-foreground: oklch(0.92 0.003 260);
   --muted: oklch(0.275 0.005 260);
-  --muted-foreground: oklch(0.66 0.006 260);
+  --muted-foreground: oklch(0.685 0.005 260);
   --accent: oklch(0.292 0.006 260);
   --accent-foreground: oklch(0.95 0.003 260);
   --destructive: oklch(0.62 0.19 25);
@@ -94,15 +99,36 @@
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
     -webkit-font-smoothing: antialiased;
     user-select: none;
+    -webkit-user-select: none;
   }
 
-  /* Allow natural text selection inside reading streams, diffs, and inputs */
+  /* Opt-in natural text selection strictly for reading prose, code/diff bodies, diagnostics, and inputs */
   .selectable-text,
-  pre,
-  code,
   textarea,
-  input {
+  input,
+  [contenteditable="true"] {
     user-select: text;
+    -webkit-user-select: text;
+  }
+
+  /* Ensure interactive controls & chrome nested inside selectable streams never pollute drag-selection */
+  button,
+  [role="button"],
+  [role="menuitem"],
+  [role="option"],
+  [role="tab"],
+  kbd,
+  .select-none {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  ::selection {
+    background: oklch(0.62 0.16 255 / 20%);
+  }
+
+  .dark ::selection {
+    background: oklch(0.72 0.14 252 / 28%);
   }
 }
 
@@ -203,23 +229,13 @@
     0 0 8px 0 oklch(0 0 0 / 18%);
 }
 
-/* Subtle ergonomic scrollbars */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+/* Hide native scrollbars strictly inside Base UI ScrollArea viewports */
+[data-slot="scroll-area-viewport"] {
+  scrollbar-width: none;
 }
 
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-  background: oklch(0.5 0 0 / 16%);
-  border-radius: 9999px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: oklch(0.5 0 0 / 30%);
+[data-slot="scroll-area-viewport"]::-webkit-scrollbar {
+  display: none;
 }
 
 .tabular-nums {
@@ -250,4 +266,311 @@
   background-clip: text;
   color: transparent;
   animation: orbit-text-shimmer 1.85s linear infinite;
+}
+
+/* ============================================================================
+ * Orbit Global Motion Primitives (120Hz Compositor-Only, Zero Layout Thrash)
+ * ============================================================================ */
+
+@keyframes orbit-floating-in {
+  from {
+    opacity: 0;
+    transform: translate3d(var(--orbit-slide-x, 0px), var(--orbit-slide-y, -4px), 0) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+.orbit-floating-content {
+  --orbit-slide-x: 0px;
+  --orbit-slide-y: -4px;
+  transform-origin: var(--transform-origin, center);
+  transition:
+    transform 145ms var(--ease-out-expo),
+    opacity 130ms var(--ease-out-expo);
+  will-change: transform, opacity;
+}
+
+.orbit-floating-content[data-side="top"] {
+  --orbit-slide-y: 4px;
+}
+
+.orbit-floating-content[data-side="left"] {
+  --orbit-slide-x: 4px;
+  --orbit-slide-y: 0px;
+}
+
+.orbit-floating-content[data-side="right"] {
+  --orbit-slide-x: -4px;
+  --orbit-slide-y: 0px;
+}
+
+.orbit-floating-content[data-starting-style],
+.orbit-floating-content[data-ending-style] {
+  opacity: 0;
+  transform: translate3d(var(--orbit-slide-x, 0px), var(--orbit-slide-y, -4px), 0) scale(0.96);
+}
+
+.orbit-floating-content[data-ending-style] {
+  pointer-events: none;
+  transition:
+    transform 95ms var(--ease-exit),
+    opacity 95ms var(--ease-exit);
+}
+
+/* Tooltip with Instant Warm-Handoff (`data-instant` skips animation when gliding across icons) */
+.orbit-tooltip-content {
+  --orbit-slide-x: 0px;
+  --orbit-slide-y: -3px;
+  transform-origin: var(--transform-origin, center);
+  transition:
+    transform 120ms var(--ease-out-expo),
+    opacity 110ms var(--ease-out-expo);
+}
+
+.orbit-tooltip-content[data-side="top"] {
+  --orbit-slide-y: 3px;
+}
+
+.orbit-tooltip-content[data-starting-style],
+.orbit-tooltip-content[data-ending-style] {
+  opacity: 0;
+  transform: translate3d(var(--orbit-slide-x, 0px), var(--orbit-slide-y, -3px), 0) scale(0.96);
+}
+
+.orbit-tooltip-content[data-ending-style] {
+  pointer-events: none;
+  transition:
+    transform 85ms var(--ease-exit),
+    opacity 85ms var(--ease-exit);
+}
+
+.orbit-tooltip-content[data-instant] {
+  transition-duration: 0ms;
+}
+
+/* Inline Floating Menus (`/` Slash, `@` Mention, Level-2 Model Flyout) */
+.orbit-inline-menu-up {
+  --orbit-slide-x: 0px;
+  --orbit-slide-y: 5px;
+  transform-origin: bottom center;
+  animation: orbit-floating-in 140ms var(--ease-out-expo);
+}
+
+.orbit-inline-flyout-side {
+  --orbit-slide-x: -4px;
+  --orbit-slide-y: 0px;
+  transform-origin: left top;
+  animation: orbit-floating-in 130ms var(--ease-out-expo);
+}
+
+/* Modal Backdrop & Centered Dialog (`⌘K`, Settings, Remote Folder Browser) */
+@keyframes orbit-backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes orbit-backdrop-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes orbit-modal-card-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 5px, 0) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes orbit-modal-card-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(0, 3px, 0) scale(0.982);
+  }
+}
+
+.orbit-dialog-overlay {
+  transition: opacity 150ms var(--ease-out-expo);
+}
+
+.orbit-dialog-overlay[data-starting-style],
+.orbit-dialog-overlay[data-ending-style] {
+  opacity: 0;
+}
+
+.orbit-dialog-overlay[data-ending-style] {
+  pointer-events: none;
+  transition: opacity 110ms var(--ease-exit);
+}
+
+.orbit-dialog-content {
+  transition:
+    transform 175ms var(--ease-out-expo),
+    opacity 160ms var(--ease-out-expo);
+}
+
+.orbit-dialog-content[data-starting-style],
+.orbit-dialog-content[data-ending-style] {
+  opacity: 0;
+  transform: translate3d(0, 5px, 0) scale(0.975);
+}
+
+.orbit-dialog-content[data-ending-style] {
+  pointer-events: none;
+  transition:
+    transform 110ms var(--ease-exit),
+    opacity 110ms var(--ease-exit);
+}
+
+/* Smooth `0fr <-> 1fr` Accordion Disclosure Grid */
+.orbit-collapse-grid {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows 180ms var(--ease-panel),
+    opacity 140ms var(--ease-out-expo);
+}
+
+.orbit-collapse-grid[data-open="true"] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+.orbit-collapse-inner {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Stage Cross-Dissolve, Fresh Message Bubble, Sticky Approval Dock, Pills & Toast */
+@keyframes orbit-stage-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes orbit-bubble-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 6px, 0) scale(0.988);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes orbit-dock-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0) scale(0.988);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes orbit-pill-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes orbit-toast-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes orbit-toast-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(0, 5px, 0) scale(0.98);
+  }
+}
+
+.orbit-stage-enter {
+  animation: orbit-stage-in 130ms var(--ease-out-expo);
+}
+
+.orbit-bubble-enter {
+  animation: orbit-bubble-in 180ms var(--ease-out-expo);
+}
+
+.orbit-dock-enter {
+  animation: orbit-dock-in 200ms var(--ease-out-expo);
+}
+
+.orbit-pill-enter {
+  animation: orbit-pill-in 130ms var(--ease-out-expo);
+}
+
+.orbit-toast-enter {
+  animation: orbit-toast-in 200ms var(--ease-out-expo);
+}
+
+.orbit-toast-exit {
+  animation: orbit-toast-out 140ms var(--ease-exit) forwards;
+}
+
+/* Subtle Tactile Press Compression */
+.orbit-press {
+  transition:
+    transform 90ms var(--ease-out-expo),
+    background-color 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease;
+}
+
+.orbit-press:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+/* System Accessibility Guard (`prefers-reduced-motion`) */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }

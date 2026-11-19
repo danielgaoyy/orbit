@@ -1,3 +1,4 @@
+import { memo } from "react";
 import {
   FileDiff,
   FileText,
@@ -33,7 +34,7 @@ function splitPathDisplay(rawPath: string): { basename: string; dirHint: string 
   return { basename, dirHint: shortDir };
 }
 
-export function ContextTray({
+export const ContextTray = memo(function ContextTray({
   contexts,
   quotes,
   pastes,
@@ -48,13 +49,13 @@ export function ContextTray({
   const nonImages = contexts.filter((c) => c.kind !== "image");
 
   return (
-    <div className="flex flex-wrap items-center gap-1.5 px-4 pt-3 pb-0.5">
+    <div className="flex flex-wrap items-center gap-1.5 px-[14px] pt-2.5 pb-0.5">
       {/* 1. Image Thumbnails (48×48) */}
       {images.map((img) => (
         <div
           key={img.id}
           title={`${img.filename} (${Math.max(1, Math.round(img.sizeBytes / 1024))} KB)`}
-          className="group border-border bg-muted/50 relative size-12 shrink-0 overflow-hidden rounded-xl border"
+          className="orbit-pill-enter group border-border bg-muted/50 relative size-12 shrink-0 overflow-hidden rounded-xl border"
         >
           <img
             src={img.previewUrl}
@@ -81,7 +82,7 @@ export function ContextTray({
             <span
               key={item.id}
               title={item.path}
-              className="border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors"
+              className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors"
             >
               <FileIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
               <span className="truncate font-mono font-medium">{basename}</span>
@@ -106,7 +107,7 @@ export function ContextTray({
           return (
             <span
               key={item.id}
-              className="border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
+              className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
             >
               <DiffIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
               <span className="font-medium">{item.label}</span>
@@ -125,7 +126,7 @@ export function ContextTray({
           return (
             <span
               key={item.id}
-              className="border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
+              className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
             >
               <SquareTerminal className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
               <span className="font-medium">{item.label}</span>
@@ -148,7 +149,7 @@ export function ContextTray({
         <span
           key={q.id}
           title={q.code}
-          className="border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
+          className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
         >
           <Quote className="text-foreground/65 size-3 shrink-0" />
           <span className="truncate font-mono">
@@ -172,7 +173,7 @@ export function ContextTray({
           <span
             key={p.id}
             title={`${p.content.slice(0, 280)}${p.content.length > 280 ? "…" : ""}`}
-            className="border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
+            className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px]"
           >
             <PasteIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
             <span className="font-medium">{p.label}</span>
@@ -188,4 +189,4 @@ export function ContextTray({
       })}
     </div>
   );
-}
+});

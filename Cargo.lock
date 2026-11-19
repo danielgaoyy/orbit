@@ -1589,6 +1589,7 @@ dependencies = [
  "napi-derive-ohos",
  "napi-ohos",
  "orbit-client-core",
+ "orbit-crypto",
  "orbit-protocol",
  "serde",
  "serde_json",

@@ -326,12 +326,14 @@ export type TimelineItemView =
       text: string;
       badges?: PromptBadge[];
       blocks: RichBlockView[];
+      timestamp_ms?: number | null;
     }
   | {
       item_type: "assistant_thinking";
       seq: number;
       item_id: string;
       text: string;
+      timestamp_ms?: number | null;
     }
   | {
       item_type: "assistant_message";
@@ -340,6 +342,7 @@ export type TimelineItemView =
       text: string;
       streaming: boolean;
       blocks: RichBlockView[];
+      timestamp_ms?: number | null;
     }
   | {
       item_type: "tool_call";
@@ -349,6 +352,7 @@ export type TimelineItemView =
       summary_title: string;
       detail: ToolCallDetail;
       diff_files: DiffFileView[];
+      timestamp_ms?: number | null;
     }
   | {
       item_type: "permission_request";
@@ -358,6 +362,7 @@ export type TimelineItemView =
       detail: ToolCallDetail;
       allowed_decisions: string[];
       resolved_decision: string | null;
+      timestamp_ms?: number | null;
     }
   | {
       item_type: "question_request";
@@ -365,12 +370,14 @@ export type TimelineItemView =
       request_id: string;
       questions: QuestionItem[];
       resolved_answers: string[][] | null;
+      timestamp_ms?: number | null;
     }
   | {
       item_type: "notice";
       seq: number;
       level: string;
       message: string;
+      timestamp_ms?: number | null;
     };
 
 export interface AgentTimelineView {
@@ -835,6 +842,13 @@ export const orbitIpc = {
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("open_in_editor", { editor, cwd, sshTarget });
+  },
+
+  pickProjectFolder: async (initialDir?: string | null): Promise<string | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<string | null>("pick_project_folder", {
+      initialDir: initialDir ?? null,
+    });
   },
 
   getWorkspaceFiles: async (hostId: string, cwd: string): Promise<string[]> => {

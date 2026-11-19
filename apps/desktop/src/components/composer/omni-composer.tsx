@@ -1,45 +1,32 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ArrowUp,
   AtSign,
-  Check,
-  ChevronDown,
-  ChevronRight,
   Clock,
   FileSearch,
-  Folder,
   FoldVertical,
-  GitBranch,
-  Laptop,
   ListTodo,
   Paperclip,
   Plus,
-  Server,
-  Shield,
-  ShieldCheck,
-  ShieldOff,
   SquareSlash,
   X,
   Zap,
 } from "lucide-react";
 import {
-  defaultEffortDescription,
-  formatCatalogModelLabel,
-  formatEffortLabel,
-  getCatalogForProvider,
-  prettifyModelSlug,
-  resolveActiveModelSpec,
-  resolveSupportedEffortForModel,
-  stripAgyEffortSuffix,
-} from "@/lib/model-catalog";
-import {
-  type GitFileEntry,
-  type ProviderKind,
-  type ReasoningEffort,
-  type SessionMode,
-  type ThinkingOptionSpec,
-  orbitIpc,
-} from "@/lib/orbit-ipc";
+  collapseStrippedToken,
+  normalizePermissionMode,
+} from "@/components/composer/composer-constants";
+import { ComposerHeroHeader } from "@/components/composer/composer-hero-header";
+import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
+import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
 import { ContextTray } from "@/components/composer/context-tray";
 import {
   type MentionCandidate,
@@ -51,19 +38,17 @@ import {
   SlashCommandMenu,
   filterSlashCommands,
 } from "@/components/composer/slash-menu";
-import { ProviderIcon } from "@/components/ui/provider-icons";
+import {
+  type GitFileEntry,
+  type SessionMode,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
-  Kbd,
-  KbdGroup,
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
 } from "@/components/ui/overlays";
 import {
   type ContextMentionItem,
@@ -72,6 +57,7 @@ import {
   type QueuedPromptItem,
   composerScopeKey,
   orbitActions,
+  useComposerDraft,
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -84,120 +70,51 @@ const EMPTY_QUEUED: readonly QueuedPromptItem[] = [];
 const EMPTY_FILES: readonly string[] = [];
 const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
 
-function collapseStrippedToken(
-  before: string,
-  after: string,
-): { text: string; cursor: number } {
-  const cleanBefore = before.replace(/[ \t]+$/, "");
-  const cleanAfter = after.replace(/^[ \t]+/, "");
-  if (!cleanBefore) {
-    return { text: cleanAfter, cursor: 0 };
-  }
-  if (!cleanAfter) {
-    return { text: cleanBefore, cursor: cleanBefore.length };
-  }
-  return { text: `${cleanBefore} ${cleanAfter}`, cursor: cleanBefore.length + 1 };
-}
-
-function conciseThinkingDescription(opt: ThinkingOptionSpec): string {
-  const raw = (opt.description ?? "").trim();
-  if (raw && raw.length <= 34) {
-    return raw;
-  }
-  return defaultEffortDescription(opt.effort);
-}
-
-const PROVIDERS: { id: ProviderKind; label: string; shortLabel: string }[] = [
-  { id: "claude_code", label: "Claude Code", shortLabel: "Claude" },
-  { id: "codex", label: "Codex", shortLabel: "Codex" },
-  { id: "antigravity", label: "Antigravity", shortLabel: "Antigravity" },
-];
-
-const PERMISSION_MODES: {
-  id: Exclude<SessionMode, "plan" | { custom: string }>;
-  label: string;
-  desc: string;
-}[] = [
-  {
-    id: "default",
-    label: "Always Ask",
-    desc: "Require approval before file edits and commands",
-  },
-  {
-    id: "accept_edits",
-    label: "Accept Edits",
-    desc: "Auto-approve file edits, ask before commands",
-  },
-  {
-    id: "full_access",
-    label: "Full Access",
-    desc: "Edit files and run commands without prompts",
-  },
-];
-
-function normalizePermissionMode(mode: SessionMode): SessionMode {
-  return mode === "plan" ? "default" : mode;
-}
-
-function modeLabel(mode: SessionMode): string {
-  const normalized = normalizePermissionMode(mode);
-  if (typeof normalized === "object") return normalized.custom;
-  switch (normalized) {
-    case "plan":
-    case "default":
-      return "Always Ask";
-    case "accept_edits":
-      return "Accept Edits";
-    case "full_access":
-      return "Full Access";
-  }
-}
-
-function ModeIcon({ mode, className }: { mode: SessionMode; className?: string }) {
-  const normalized = normalizePermissionMode(mode);
-  if (typeof normalized === "object") {
-    return <Shield className={cn("size-[15px] stroke-[1.75]", className)} />;
-  }
-  switch (normalized) {
-    case "plan":
-    case "default":
-      return <Shield className={cn("size-[15px] stroke-[1.75]", className)} />;
-    case "accept_edits":
-      return <ShieldCheck className={cn("size-[15px] stroke-[1.75]", className)} />;
-    case "full_access":
-      return <ShieldOff className={cn("size-[15px] stroke-[1.75]", className)} />;
-  }
-}
-
-function basenameOfCwd(cwd: string): string {
-  const trimmed = cwd.replace(/\/+$/, "");
-  if (!trimmed || trimmed === "~") return "~";
-  const idx = trimmed.lastIndexOf("/");
-  return idx >= 0 ? trimmed.slice(idx + 1) : trimmed;
-}
-
 export interface OmniComposerProps {
   variant?: "hero" | "docked";
   occluding?: boolean;
 }
 
-export function OmniComposer({ variant = "docked", occluding = false }: OmniComposerProps) {
-  const fleet = useOrbitSelector((s) => s.fleet);
+export const OmniComposer = memo(function OmniComposer({
+  variant = "docked",
+  occluding = false,
+}: OmniComposerProps) {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
-  const draftProvider = useOrbitSelector((s) => s.draftProvider);
-  const draftModels = useOrbitSelector((s) => s.draftModels);
-  const draftEffort = useOrbitSelector((s) => s.draftEffort);
   const draftMode = useOrbitSelector((s) => s.draftMode);
-  const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
-  const draftWorktreeBranch = useOrbitSelector((s) => s.draftWorktreeBranch);
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const promptHistory = useOrbitSelector((s) => s.promptHistory);
 
+  // Primitive/narrow selectors instead of subscribing to full `HostDetailView`
+  const hasCurrentAgent = useOrbitSelector((s) =>
+    Boolean(
+      !s.isDraftNewSession &&
+        s.selectedHostId &&
+        s.selectedAgentId &&
+        s.hostDetails[s.selectedHostId]?.agents.some((a) => a.agent_id === s.selectedAgentId),
+    ),
+  );
+  const isRunning = useOrbitSelector((s) =>
+    Boolean(
+      !s.isDraftNewSession &&
+        s.selectedHostId &&
+        s.selectedAgentId &&
+        s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
+          ?.is_running,
+    ),
+  );
+  const activeAgentMode = useOrbitSelector((s) => {
+    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return null;
+    return (
+      s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
+        ?.mode ?? null
+    );
+  });
+
   const scopeKey = useOrbitSelector(composerScopeKey);
-  const draftText = useOrbitSelector((s) => s.composerDrafts[composerScopeKey(s)] ?? "");
+  const draftText = useComposerDraft(scopeKey);
   const slashDirective = useOrbitSelector(
     (s) => s.slashDirectives[composerScopeKey(s)] ?? null,
   );
@@ -210,9 +127,6 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
   const quotes = useOrbitSelector((s) => s.diffQuotes[composerScopeKey(s)] ?? EMPTY_QUOTES);
   const queued = useOrbitSelector((s) => s.queuedPrompts[composerScopeKey(s)] ?? EMPTY_QUEUED);
 
-  const hostDetail = useOrbitSelector((s) =>
-    s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
-  );
   const workspaceFiles = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedWorkspaceCwd
       ? (s.workspaceFilesCache[`${s.selectedHostId}::${s.selectedWorkspaceCwd}`] ?? EMPTY_FILES)
@@ -226,12 +140,13 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
   );
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const mirrorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const lastTextareaHeightRef = useRef<number>(46);
+  const draftTextRef = useRef<string>(draftText);
+  draftTextRef.current = draftText;
   const directivePrefixRef = useRef<HTMLSpanElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const modelPopoverRef = useRef<HTMLDivElement | null>(null);
-  const modelListRef = useRef<HTMLDivElement | null>(null);
-  const hoveredRowElRef = useRef<HTMLButtonElement | null>(null);
-  const thinkingSubmenuRef = useRef<HTMLDivElement | null>(null);
+  const savedDraftBeforeHistoryRef = useRef<string>("");
 
   const [cursorOffset, setCursorOffset] = useState<number>(0);
   const [directiveIndentPx, setDirectiveIndentPx] = useState<number>(0);
@@ -239,60 +154,10 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
-  const [modelPopoverOpen, setModelPopoverOpen] = useState<boolean>(false);
-  const [browsedProvider, setBrowsedProvider] = useState<ProviderKind>("codex");
-  const [hoveredModelKey, setHoveredModelKey] = useState<string | null>(null);
-  const [submenuPos, setSubmenuPos] = useState<{ top: number; flipLeft: boolean }>({
-    top: -1,
-    flipLeft: false,
-  });
-  const savedDraftBeforeHistoryRef = useRef<string>("");
 
-  const currentAgent = useMemo(
-    () => hostDetail?.agents.find((a) => a.agent_id === selectedAgentId) ?? null,
-    [hostDetail, selectedAgentId],
-  );
-
-  const availableProviders = hostDetail?.host.available_providers ?? [];
-  const detectedProviders = useMemo(
-    () => PROVIDERS.filter((p) => availableProviders.includes(p.id)),
-    [availableProviders],
-  );
-  const resolvedDraftProvider: ProviderKind =
-    detectedProviders.length > 0 && !detectedProviders.some((p) => p.id === draftProvider)
-      ? detectedProviders[0].id
-      : draftProvider;
-
-  const activeProvider: ProviderKind =
-    !isDraft && currentAgent ? currentAgent.provider : resolvedDraftProvider;
-  const activeCatalog = useMemo(
-    () => getCatalogForProvider(hostDetail?.provider_catalogs, activeProvider),
-    [hostDetail?.provider_catalogs, activeProvider],
-  );
-  const rawActiveModel: string | null =
-    !isDraft && currentAgent ? currentAgent.model : (draftModels[activeProvider] ?? null);
-  const activeModelSpec = useMemo(
-    () => resolveActiveModelSpec(activeCatalog, rawActiveModel),
-    [activeCatalog, rawActiveModel],
-  );
-
-  const inferredAgyEffort =
-    activeProvider === "antigravity" && rawActiveModel
-      ? stripAgyEffortSuffix(rawActiveModel).inferredEffort
-      : null;
-  const rawDesiredEffort: ReasoningEffort | null =
-    !isDraft && currentAgent
-      ? (currentAgent.effort ?? inferredAgyEffort ?? draftEffort)
-      : draftEffort;
-  const effectiveActiveEffort: ReasoningEffort | null = resolveSupportedEffortForModel(
-    activeModelSpec,
-    rawDesiredEffort,
-    activeCatalog.configured_default_effort,
-  );
   const activeMode: SessionMode = normalizePermissionMode(
-    !isDraft && currentAgent ? currentAgent.mode : draftMode,
+    !isDraft && activeAgentMode ? activeAgentMode : draftMode,
   );
-  const isRunning = Boolean(!isDraft && currentAgent?.is_running);
 
   // Warm workspace file list lazily so `@` mentions feel instantaneous
   useEffect(() => {
@@ -303,8 +168,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
     return () => window.clearTimeout(timer);
   }, [selectedHostId, selectedCwd]);
 
-  // Unified global Composer geometry (aligned 1:1 with Antigravity: `944px` width × `100px` base height)
-  const minTextareaHeight = 54;
+  const minTextareaHeight = 46;
   const maxTextareaHeight = 220;
 
   useLayoutEffect(() => {
@@ -318,12 +182,36 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
     setDirectiveIndentPx((prev) => (prev === nextIndent ? prev : nextIndent));
   }, [slashDirective]);
 
-  useEffect(() => {
+  // Measure wrapped textarea height from the invisible off-flow mirror BEFORE paint (`useLayoutEffect`),
+  // fast-pathing empty drafts to `minTextareaHeight` without forcing a layout read.
+  useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    el.style.height = "0px";
-    el.style.height = `${Math.min(maxTextareaHeight, Math.max(minTextareaHeight, el.scrollHeight))}px`;
-  }, [draftText, scopeKey, directiveIndentPx]);
+
+    if (draftText.length === 0 && !slashDirective) {
+      if (lastTextareaHeightRef.current !== minTextareaHeight || el.style.height !== "46px") {
+        lastTextareaHeightRef.current = minTextareaHeight;
+        el.style.height = "46px";
+      }
+      if (el.style.overflowY !== "hidden") {
+        el.style.overflowY = "hidden";
+      }
+      return;
+    }
+
+    const mirror = mirrorTextareaRef.current;
+    if (!mirror) return;
+    const measured = mirror.scrollHeight;
+    const nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
+    if (lastTextareaHeightRef.current !== nextHeight || el.style.height !== `${nextHeight}px`) {
+      lastTextareaHeightRef.current = nextHeight;
+      el.style.height = `${nextHeight}px`;
+    }
+    const nextOverflow = measured > maxTextareaHeight ? "auto" : "hidden";
+    if (el.style.overflowY !== nextOverflow) {
+      el.style.overflowY = nextOverflow;
+    }
+  }, [draftText, scopeKey, slashDirective, directiveIndentPx]);
 
   useEffect(() => {
     return orbitActions.onComposerFocusRequest(() => {
@@ -331,8 +219,8 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
     });
   }, []);
 
-  // Detect Slash (`/`) or Mention (`@`) trigger at cursor
   const slashTrigger = useMemo(() => {
+    if (!draftText.includes("/")) return null;
     const safeOffset = Math.min(cursorOffset, draftText.length);
     const before = draftText.slice(0, safeOffset);
     const match = /(?:^|\s)\/([a-zA-Z0-9_-]*)$/.exec(before);
@@ -347,7 +235,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
   }, [draftText, cursorOffset, dismissedToken]);
 
   const mentionTrigger = useMemo(() => {
-    if (slashTrigger) return null;
+    if (slashTrigger || !draftText.includes("@")) return null;
     const safeOffset = Math.min(cursorOffset, draftText.length);
     const before = draftText.slice(0, safeOffset);
     const match = /(?:^|\s)@([^\s@]*)$/.exec(before);
@@ -361,33 +249,6 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
     return { atIndex, endIndex: safeOffset, query, tokenKey, items };
   }, [slashTrigger, draftText, cursorOffset, dismissedToken, workspaceFiles, gitFiles]);
 
-  const repoProjects = useMemo(() => {
-    if (!hostDetail) return [];
-    const seen = new Set<string>();
-    const list: { path: string; name: string; branch: string | null }[] = [];
-
-    for (const w of hostDetail.workspaces) {
-      if (!w.is_worktree && !seen.has(w.cwd)) {
-        seen.add(w.cwd);
-        list.push({ path: w.cwd, name: w.title || basenameOfCwd(w.cwd), branch: w.git_branch });
-      }
-    }
-    for (const p of hostDetail.discovered_projects) {
-      if (!seen.has(p.path)) {
-        seen.add(p.path);
-        list.push({ path: p.path, name: p.name, branch: p.git_branch });
-      }
-    }
-    return list.slice(0, 12);
-  }, [hostDetail]);
-
-  const activeRepoBranch = useMemo(() => {
-    const matched = repoProjects.find((p) => p.path === selectedCwd);
-    return matched?.branch ?? null;
-  }, [repoProjects, selectedCwd]);
-
-  if (!selectedHostId) return null;
-
   const hasSubstantiveInput =
     draftText.trim().length > 0 ||
     contexts.length > 0 ||
@@ -396,44 +257,16 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
   const hasPayload =
     hasSubstantiveInput || slashDirective === "review" || slashDirective === "compact";
 
-  const canSwitchAgentEngine = isDraft || !currentAgent;
-
-  const handleSelectModelAndEffort = (
-    provider: ProviderKind,
-    model: string | null,
-    effort: ReasoningEffort | null,
-  ) => {
-    if (canSwitchAgentEngine) {
-      orbitActions.setDraftConfig({
-        provider,
-        model,
-        ...(effort ? { effort } : {}),
-      });
-      return;
-    }
-    if (currentAgent) {
-      // Active conversations strictly retain their original Agent engine
-      orbitActions.setDraftConfig({
-        provider: currentAgent.provider,
-        model,
-        ...(effort ? { effort } : {}),
-      });
-      void orbitIpc.setAgentConfig(
-        selectedHostId,
-        currentAgent.agent_id,
-        model,
-        effort,
-      );
-    }
-  };
-
-  const handleSelectMode = (m: SessionMode) => {
-    if (isDraft || !currentAgent) {
-      orbitActions.setDraftConfig({ mode: m });
-    } else {
-      void orbitIpc.setSessionMode(selectedHostId, currentAgent.agent_id, m);
-    }
-  };
+  const handleSelectMode = useCallback(
+    (m: SessionMode) => {
+      if (isDraft || !hasCurrentAgent || !selectedHostId || !selectedAgentId) {
+        orbitActions.setDraftConfig({ mode: m });
+      } else {
+        void orbitIpc.setSessionMode(selectedHostId, selectedAgentId, m);
+      }
+    },
+    [isDraft, hasCurrentAgent, selectedHostId, selectedAgentId],
+  );
 
   const executeSlashCommand = (cmd: SlashCommandDef) => {
     const joined = slashTrigger
@@ -468,7 +301,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
         orbitActions.toggleInspector();
         break;
       case "compact":
-        if (!isDraft && currentAgent) {
+        if (!isDraft && hasCurrentAgent) {
           orbitActions.setSlashDirective("compact");
         } else {
           orbitActions.showToast("Start an active session first to compact context");
@@ -558,14 +391,15 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
     setMenuHighlightIdx(0);
   };
 
-  const triggerAtMentionFromButton = () => {
-    if (selectedCwd && selectedCwd !== "~") {
+  const triggerAtMentionFromButton = useCallback(() => {
+    if (selectedHostId && selectedCwd && selectedCwd !== "~") {
       void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
     }
+    const curDraft = draftTextRef.current;
     const el = textareaRef.current;
-    const pos = el?.selectionStart ?? draftText.length;
-    const before = draftText.slice(0, pos);
-    const after = draftText.slice(pos);
+    const pos = el?.selectionStart ?? curDraft.length;
+    const before = curDraft.slice(0, pos);
+    const after = curDraft.slice(pos);
     const needsSpace = before.length > 0 && !/\s$/.test(before);
     const prefix = needsSpace ? " @" : "@";
     const next = `${before}${prefix}${after}`;
@@ -580,13 +414,14 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
         textareaRef.current.setSelectionRange(nextPos, nextPos);
       }
     });
-  };
+  }, [selectedHostId, selectedCwd]);
 
-  const triggerSlashActionsFromButton = () => {
+  const triggerSlashActionsFromButton = useCallback(() => {
+    const curDraft = draftTextRef.current;
     const el = textareaRef.current;
-    const pos = el?.selectionStart ?? draftText.length;
-    const before = draftText.slice(0, pos);
-    const after = draftText.slice(pos);
+    const pos = el?.selectionStart ?? curDraft.length;
+    const before = curDraft.slice(0, pos);
+    const after = curDraft.slice(pos);
     const needsSpace = before.length > 0 && !/\s$/.test(before);
     const prefix = needsSpace ? " /" : "/";
     const next = `${before}${prefix}${after}`;
@@ -601,7 +436,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
         textareaRef.current.setSelectionRange(nextPos, nextPos);
       }
     });
-  };
+  }, []);
 
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     const items = Array.from(e.clipboardData.items ?? []);
@@ -787,110 +622,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
     }
   };
 
-  const activeHostLabel =
-    hostDetail?.host.display_name ??
-    fleet.hosts.find((h) => h.host_id === selectedHostId)?.display_name ??
-    "Host";
-
-  const rawBrowsedProvider: ProviderKind = canSwitchAgentEngine
-    ? modelPopoverOpen
-      ? browsedProvider
-      : activeProvider
-    : activeProvider;
-  const effectiveBrowsedProvider: ProviderKind =
-    canSwitchAgentEngine &&
-    detectedProviders.length > 0 &&
-    !detectedProviders.some((p) => p.id === rawBrowsedProvider)
-      ? detectedProviders[0].id
-      : rawBrowsedProvider;
-  const browsedCatalog = getCatalogForProvider(
-    hostDetail?.provider_catalogs,
-    effectiveBrowsedProvider,
-  );
-  const resolvedSelectedModelIdOnActive = activeModelSpec?.id ?? rawActiveModel;
-  const isCustomModelActiveOnBrowsed =
-    effectiveBrowsedProvider === activeProvider &&
-    rawActiveModel !== null &&
-    activeModelSpec === null;
-
-  const defaultCustomThinkingOptions: ThinkingOptionSpec[] = (
-    ["low", "medium", "high", "xhigh", "max"] as ReasoningEffort[]
-  ).map((eff) => ({
-    effort: eff,
-    label: formatEffortLabel(eff),
-    description: defaultEffortDescription(eff),
-  }));
-
-  const browsedRows: {
-    key: string;
-    id: string;
-    label: string;
-    desc: string;
-    defaultEffort: ReasoningEffort | null;
-    thinkingOptions: ThinkingOptionSpec[];
-  }[] = [
-    ...(isCustomModelActiveOnBrowsed && rawActiveModel
-      ? [
-          {
-            key: `custom:${rawActiveModel}`,
-            id: rawActiveModel,
-            label: prettifyModelSlug(rawActiveModel, effectiveBrowsedProvider),
-            desc: rawActiveModel,
-            defaultEffort: "medium" as ReasoningEffort,
-            thinkingOptions: defaultCustomThinkingOptions,
-          },
-        ]
-      : []),
-    ...browsedCatalog.models.map((m) => ({
-      key: m.id,
-      id: m.id,
-      label:
-        effectiveBrowsedProvider === "claude_code"
-          ? m.label.replace(/^Claude\s+/i, "")
-          : m.label,
-      desc: m.description,
-      defaultEffort: m.default_effort,
-      thinkingOptions: m.thinking_options,
-    })),
-  ];
-
-  const hoveredRow = hoveredModelKey
-    ? (browsedRows.find((r) => r.key === hoveredModelKey) ?? null)
-    : null;
-
-  // Align the top of the Level-2 Thinking Mode flyout flush with the currently hovered model item,
-  // clamping only when it would otherwise overflow outside the window viewport.
-  useLayoutEffect(() => {
-    if (!modelPopoverOpen || !hoveredRow || hoveredRow.thinkingOptions.length === 0) return;
-    const popEl = modelPopoverRef.current;
-    const rowEl = hoveredRowElRef.current;
-    const subEl = thinkingSubmenuRef.current;
-    if (!popEl || !rowEl || !subEl) return;
-
-    const popRect = popEl.getBoundingClientRect();
-    const rowRect = rowEl.getBoundingClientRect();
-    const originY = popRect.top + popEl.clientTop;
-    const subHeight = subEl.offsetHeight;
-    const subWidth = subEl.offsetWidth;
-    const edgeMargin = 12;
-
-    const desiredTop = rowRect.top - originY;
-    const maxTopRelative = window.innerHeight - edgeMargin - originY - subHeight;
-    const minTopRelative = edgeMargin - originY;
-    const clampedTop = Math.round(
-      Math.max(minTopRelative, Math.min(desiredTop, maxTopRelative)),
-    );
-
-    const flipLeft =
-      popRect.right + subWidth + 8 > window.innerWidth - edgeMargin &&
-      popRect.left - subWidth - 8 >= edgeMargin;
-
-    setSubmenuPos((prev) =>
-      prev.top === clampedTop && prev.flipLeft === flipLeft
-        ? prev
-        : { top: clampedTop, flipLeft },
-    );
-  }, [modelPopoverOpen, hoveredRow]);
+  if (!selectedHostId) return null;
 
   return (
     <div
@@ -995,212 +727,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
             />
           )}
 
-          {/* New-Session Composer Top Bar (Codex / Antigravity style: Project + Local/Worktree at Top of Composer) */}
-          {variant === "hero" && (
-            <div className="flex flex-wrap items-center justify-between gap-2 px-1 pb-2">
-              <div className="flex min-w-0 items-center gap-1">
-                {/* 1. Project / Workspace Repository Selector */}
-                <Popover>
-                  <PopoverTrigger asChild>
-                    <button
-                      type="button"
-                      title={selectedCwd}
-                      className="text-foreground/72 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                    >
-                      <Folder className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-                      <span className="max-w-48 truncate font-normal">
-                        {basenameOfCwd(selectedCwd)}
-                      </span>
-                      <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-                    </button>
-                  </PopoverTrigger>
-                  <PopoverContent side="bottom" align="start" className="w-80 space-y-2 p-2">
-                    <div className="text-muted-foreground px-2.5 pt-1 pb-0.5 text-[12px] font-medium">
-                      Project Workspace
-                    </div>
-                    {repoProjects.length > 0 && (
-                      <div className="max-h-56 space-y-0.5 overflow-y-auto">
-                        {repoProjects.map((proj) => {
-                          const active = proj.path === selectedCwd;
-                          return (
-                            <button
-                              key={proj.path}
-                              type="button"
-                              onClick={() => orbitActions.setSelectedWorkspaceCwd(proj.path)}
-                              className={cn(
-                                "flex w-full cursor-pointer items-center justify-between gap-2 rounded-[9px] px-2.5 py-1.5 text-left text-[13px] transition-colors",
-                                active
-                                  ? "bg-accent text-accent-foreground font-medium"
-                                  : "text-foreground/90 hover:bg-accent/60",
-                              )}
-                            >
-                              <div className="min-w-0">
-                                <div className="flex items-center gap-1.5">
-                                  <span className="truncate">{proj.name}</span>
-                                  {proj.branch && (
-                                    <span className="text-muted-foreground shrink-0 font-mono text-[11px]">
-                                      {proj.branch}
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="text-muted-foreground truncate font-mono text-[11px]">
-                                  {proj.path}
-                                </div>
-                              </div>
-                              {active && <Check className="size-3.5 shrink-0" />}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                    <div className="border-border border-t pt-2">
-                      <input
-                        type="text"
-                        value={selectedCwd}
-                        onChange={(e) => orbitActions.setSelectedWorkspaceCwd(e.target.value)}
-                        placeholder="/path/to/repository"
-                        className="border-border bg-background text-foreground h-8 w-full rounded-[9px] border px-2.5 font-mono text-[12px] outline-none focus:border-foreground/30"
-                      />
-                    </div>
-                  </PopoverContent>
-                </Popover>
-
-                {/* Optional Multi-Host Fleet Target Selector (when >1 host paired) */}
-                {fleet.hosts.length > 1 && (
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <button
-                        type="button"
-                        className="text-foreground/65 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                      >
-                        <Server className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-                        <span className="max-w-36 truncate">{activeHostLabel}</span>
-                        <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-                      </button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="start" side="bottom" className="w-54">
-                      <DropdownMenuLabel>Target Host</DropdownMenuLabel>
-                      {fleet.hosts.map((h) => {
-                        const active = h.host_id === selectedHostId;
-                        const online = h.connection_state.startsWith("online");
-                        return (
-                          <DropdownMenuItem
-                            key={h.host_id}
-                            onSelect={() => orbitActions.selectHost(h.host_id)}
-                          >
-                            <span className="flex min-w-0 items-center gap-2">
-                              <span
-                                className={cn(
-                                  "size-1.5 shrink-0 rounded-full",
-                                  online ? "bg-emerald-500" : "bg-zinc-400",
-                                )}
-                              />
-                              <span className="truncate">{h.display_name}</span>
-                            </span>
-                            {active && <Check className="size-3.5 shrink-0" />}
-                          </DropdownMenuItem>
-                        );
-                      })}
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem onSelect={() => orbitActions.openSettings("hosts")}>
-                        <span className="text-muted-foreground">Manage Hosts…</span>
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                )}
-              </div>
-
-              {/* 2. Right: Local Checkout vs Isolated Git Worktree + Base Branch */}
-              <Popover>
-                <PopoverTrigger asChild>
-                  <button
-                    type="button"
-                    className="text-foreground/72 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                  >
-                    {draftUseWorktree ? (
-                      <GitBranch className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-                    ) : (
-                      <Laptop className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-                    )}
-                    <span>
-                      {draftUseWorktree
-                        ? draftWorktreeBranch.trim() || "Worktree"
-                        : "Local"}
-                    </span>
-                    {activeRepoBranch && (
-                      <span className="text-foreground/45 max-w-28 truncate font-mono text-[12px]">
-                        · {activeRepoBranch}
-                      </span>
-                    )}
-                    <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-                  </button>
-                </PopoverTrigger>
-                <PopoverContent side="bottom" align="end" className="w-74 space-y-2 p-2.5">
-                  <div className="text-muted-foreground px-1.5 pt-0.5 text-[12px] font-medium">
-                    Execution Environment
-                  </div>
-                  <div className="space-y-1">
-                    <button
-                      type="button"
-                      onClick={() => orbitActions.setDraftConfig({ useWorktree: false })}
-                      className={cn(
-                        "flex w-full cursor-pointer items-start justify-between gap-2 rounded-[9px] p-2 text-left transition-colors",
-                        !draftUseWorktree ? "bg-accent" : "hover:bg-accent/50",
-                      )}
-                    >
-                      <div className="flex items-start gap-2">
-                        <Laptop className="text-foreground/70 mt-0.5 size-3.5 shrink-0 stroke-[1.75]" />
-                        <div>
-                          <div className="text-[13px] font-medium">Local</div>
-                          <div className="text-muted-foreground text-[11.5px]">
-                            Run directly inside current checkout
-                          </div>
-                        </div>
-                      </div>
-                      {!draftUseWorktree && <Check className="mt-0.5 size-3.5 shrink-0" />}
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => orbitActions.setDraftConfig({ useWorktree: true })}
-                      className={cn(
-                        "flex w-full cursor-pointer items-start justify-between gap-2 rounded-[9px] p-2 text-left transition-colors",
-                        draftUseWorktree ? "bg-accent" : "hover:bg-accent/50",
-                      )}
-                    >
-                      <div className="flex items-start gap-2">
-                        <GitBranch className="text-foreground/70 mt-0.5 size-3.5 shrink-0 stroke-[1.75]" />
-                        <div>
-                          <div className="text-[13px] font-medium">Worktree</div>
-                          <div className="text-muted-foreground text-[11.5px]">
-                            Isolated git worktree for parallel tasks
-                          </div>
-                        </div>
-                      </div>
-                      {draftUseWorktree && <Check className="mt-0.5 size-3.5 shrink-0" />}
-                    </button>
-                  </div>
-
-                  {draftUseWorktree && (
-                    <div className="border-border space-y-1 border-t pt-2">
-                      <label className="text-muted-foreground block px-0.5 text-[11.5px]">
-                        Branch name (optional)
-                      </label>
-                      <input
-                        type="text"
-                        value={draftWorktreeBranch}
-                        onChange={(e) =>
-                          orbitActions.setDraftConfig({ worktreeBranch: e.target.value })
-                        }
-                        placeholder={activeRepoBranch ? `from ${activeRepoBranch} (auto)` : "auto"}
-                        className="border-border bg-background text-foreground h-8 w-full rounded-[9px] border px-2.5 font-mono text-[12px] outline-none focus:border-foreground/30"
-                      />
-                    </div>
-                  )}
-                </PopoverContent>
-              </Popover>
-            </div>
-          )}
+          {variant === "hero" && <ComposerHeroHeader />}
 
           <div
             data-occluding={occluding ? "true" : undefined}
@@ -1216,13 +743,9 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
             )}
 
             {/* Unified Context Tray — strictly for uploaded files/images, diff quotes & large pastes */}
-            <ContextTray
-              contexts={contexts}
-              quotes={quotes}
-              pastes={pastes}
-            />
+            <ContextTray contexts={contexts} quotes={quotes} pastes={pastes} />
 
-            {/* Auto-growing Prose Textarea + Inline Slash Token (`[icon] plan |`) + Placeholder */}
+            {/* Auto-growing Prose Textarea + Off-Flow Mirror Sizer + Inline Slash Token + Placeholder */}
             <div className="relative">
               {slashDirective && (
                 <span
@@ -1231,7 +754,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
                     e.preventDefault();
                     textareaRef.current?.focus();
                   }}
-                  className="pointer-events-auto absolute top-[17px] left-[18px] z-10 inline-flex h-[20px] cursor-text items-center gap-[5.5px] select-none"
+                  className="orbit-pill-enter pointer-events-auto absolute top-[13px] left-[14px] z-10 inline-flex h-[20px] cursor-text items-center gap-[5.5px] select-none"
                 >
                   {slashDirective === "plan" ? (
                     <ListTodo className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
@@ -1249,13 +772,29 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
               {!slashDirective && draftText.length === 0 && (
                 <div
                   aria-hidden="true"
-                  className="text-foreground/45 pointer-events-none absolute top-[17px] right-[18px] left-[18px] truncate text-[15px] leading-[20px] select-none"
+                  className="text-foreground/45 pointer-events-none absolute top-[13px] right-[14px] left-[14px] truncate text-[15px] leading-[20px] select-none"
                 >
                   {isRunning
                     ? "Ask a follow-up, @ to mention, or ⌥↵ to steer"
                     : "Ask anything, @ to mention, / for actions"}
                 </div>
               )}
+
+              {/* Off-flow mirror sizer: measures exact wrapped height without collapsing live `<textarea>` to `0px` */}
+              <textarea
+                ref={mirrorTextareaRef}
+                value={draftText}
+                readOnly
+                tabIndex={-1}
+                aria-hidden="true"
+                rows={1}
+                style={
+                  slashDirective && directiveIndentPx > 0
+                    ? { height: "0px", textIndent: `${directiveIndentPx}px` }
+                    : { height: "0px" }
+                }
+                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full resize-none overflow-hidden px-[14px] py-[13px] text-[15px] leading-[20px]"
+              />
 
               <textarea
                 ref={textareaRef}
@@ -1272,24 +811,35 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
                   setHistoryCursor(null);
                   setDismissedToken(null);
                   setMenuHighlightIdx(0);
-                  setCursorOffset(pos);
+                  if (val.includes("/") || val.includes("@")) {
+                    setCursorOffset(pos);
+                  }
                   orbitActions.setComposerDraft(val);
                   if (val.includes("@") && selectedCwd && selectedCwd !== "~") {
                     void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
                   }
                 }}
-                onSelect={(e) => setCursorOffset(e.currentTarget.selectionStart ?? 0)}
-                onClick={(e) => setCursorOffset(e.currentTarget.selectionStart ?? 0)}
+                onSelect={(e) => {
+                  const val = e.currentTarget.value;
+                  if (val.includes("/") || val.includes("@")) {
+                    setCursorOffset(e.currentTarget.selectionStart ?? 0);
+                  }
+                }}
+                onClick={(e) => {
+                  const val = e.currentTarget.value;
+                  if (val.includes("/") || val.includes("@")) {
+                    setCursorOffset(e.currentTarget.selectionStart ?? 0);
+                  }
+                }}
                 onPaste={handlePaste}
                 onKeyDown={handleKeyDown}
                 rows={1}
-                className="text-foreground block w-full resize-none bg-transparent px-[18px] pt-[17px] pb-2.5 text-[15px] leading-[20px] outline-none"
+                className="text-foreground block min-h-[46px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] py-[13px] text-[15px] leading-[20px] outline-none"
               />
             </div>
 
-            {/* Paseo / Antigravity Bottom Control Bar (`34px` uniform control rhythm) */}
-            <div className="flex items-center justify-between gap-2 px-3 pt-0 pb-2.5">
-              {/* Left Cluster: `[+]` -> `Model Picker` -> `Thinking Effort` */}
+            {/* Bottom Control Bar (`34px` uniform control rhythm) */}
+            <div className="flex items-center justify-between gap-2 px-2.5 pt-0 pb-2">
               <div className="flex min-w-0 items-center gap-0.5">
                 {/* 1. `[+]` Add Context Menu (`34×34` -> Files, Mentions, Actions) */}
                 <DropdownMenu>
@@ -1305,7 +855,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
                   <DropdownMenuContent
                     align="start"
                     side="top"
-                    onCloseAutoFocus={(e) => e.preventDefault()}
+                    finalFocus={false}
                     className="w-[180px] p-1.5"
                   >
                     <DropdownMenuLabel>Add Context</DropdownMenuLabel>
@@ -1339,319 +889,34 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
                   </DropdownMenuContent>
                 </DropdownMenu>
 
-                {/* 2. Paseo Catalog + Antigravity-Style Cascading Model -> Thinking Mode Selector */}
-                <Popover
-                  open={modelPopoverOpen}
-                  onOpenChange={(open) => {
-                    setModelPopoverOpen(open);
-                    if (open) {
-                      setBrowsedProvider(activeProvider);
-                      setHoveredModelKey(null);
-                      if (!hostDetail?.provider_catalogs?.length) {
-                        void orbitIpc.refreshProviderModels(selectedHostId, false);
-                      }
-                    }
-                  }}
-                >
-                  <PopoverTrigger asChild>
-                    <button
-                      type="button"
-                      className="hover:text-foreground inline-flex h-8.5 max-w-76 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13.5px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                    >
-                      <ProviderIcon provider={activeProvider} className="size-4" />
-                      <span className="text-foreground/88 truncate font-normal">
-                        {formatCatalogModelLabel(activeCatalog, rawActiveModel)}
-                      </span>
-                      {effectiveActiveEffort && (
-                        <span className="text-foreground/48 shrink-0 font-normal">
-                          {formatEffortLabel(effectiveActiveEffort)}
-                        </span>
-                      )}
-                      <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-                    </button>
-                  </PopoverTrigger>
-                  <PopoverContent
-                    ref={modelPopoverRef}
-                    side="top"
-                    align="start"
-                    collisionPadding={12}
-                    className="relative w-[280px] overflow-visible p-1.5"
-                  >
-                    <div className="flex flex-col gap-1">
-                      {/* Segmented Agent Engine Switcher — strictly New Session & detected CLIs only */}
-                      {canSwitchAgentEngine && detectedProviders.length > 1 ? (
-                        <div
-                          onMouseEnter={() => setHoveredModelKey(null)}
-                          style={{
-                            gridTemplateColumns: `repeat(${detectedProviders.length}, minmax(0, 1fr))`,
-                          }}
-                          className="bg-muted/85 grid gap-0.5 rounded-[9px] p-0.5"
-                        >
-                          {detectedProviders.map((p) => {
-                            const isTabSelected = p.id === effectiveBrowsedProvider;
-                            return (
-                              <button
-                                key={p.id}
-                                type="button"
-                                onClick={() => {
-                                  setBrowsedProvider(p.id);
-                                  setHoveredModelKey(null);
-                                }}
-                                className={cn(
-                                  "flex h-[26px] cursor-pointer items-center justify-center gap-1.5 rounded-[7px] px-2 text-[12px] font-medium transition-colors",
-                                  isTabSelected
-                                    ? "bg-elevated text-foreground shadow-2xs"
-                                    : "text-muted-foreground hover:text-foreground",
-                                )}
-                              >
-                                <ProviderIcon provider={p.id} className="size-3.5" />
-                                <span className="truncate">{p.shortLabel}</span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <div
-                          onMouseEnter={() => setHoveredModelKey(null)}
-                          className="text-foreground/55 flex items-center px-2 pt-0.5 pb-0.5 text-[12px] font-medium"
-                        >
-                          <span className="flex items-center gap-1.5">
-                            <ProviderIcon provider={activeProvider} className="size-3.5" />
-                            <span>
-                              {PROVIDERS.find((p) => p.id === activeProvider)?.label ??
-                                activeProvider}
-                            </span>
-                          </span>
-                        </div>
-                      )}
-
-                      {/* Level 1: Compact Antigravity-Styled Model List */}
-                      <div
-                        ref={modelListRef}
-                        onScroll={() => setHoveredModelKey(null)}
-                        className="max-h-[304px] overflow-y-auto"
-                      >
-                        {browsedRows.map((row) => {
-                          const isModelActive =
-                            effectiveBrowsedProvider === activeProvider &&
-                            resolvedSelectedModelIdOnActive?.toLowerCase() === row.id.toLowerCase();
-                          const isSubOpen = hoveredModelKey === row.key;
-                          const hasThinkingSubmenu = row.thinkingOptions.length > 0;
-                          const rowEffort: ReasoningEffort | null = hasThinkingSubmenu
-                            ? isModelActive
-                              ? effectiveActiveEffort
-                              : (row.defaultEffort ?? row.thinkingOptions[0]?.effort ?? null)
-                            : null;
-
-                          return (
-                            <button
-                              key={row.key}
-                              type="button"
-                              onMouseEnter={(e) => {
-                                hoveredRowElRef.current = e.currentTarget;
-                                setHoveredModelKey(row.key);
-                              }}
-                              onClick={() => {
-                                const nextEffort = hasThinkingSubmenu
-                                  ? (row.thinkingOptions.some(
-                                      (o) => o.effort === effectiveActiveEffort,
-                                    )
-                                      ? effectiveActiveEffort
-                                      : (row.defaultEffort ??
-                                        row.thinkingOptions[0]?.effort ??
-                                        null))
-                                  : null;
-                                handleSelectModelAndEffort(
-                                  effectiveBrowsedProvider,
-                                  row.id,
-                                  nextEffort,
-                                );
-                                setModelPopoverOpen(false);
-                              }}
-                              className={cn(
-                                "group/model flex h-[28px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2 text-left transition-colors",
-                                isSubOpen ? "bg-accent/75" : "hover:bg-accent/65",
-                              )}
-                            >
-                              <div className="flex min-w-0 items-baseline gap-1.5">
-                                <span
-                                  className={cn(
-                                    "truncate text-[12.5px] leading-normal",
-                                    isModelActive
-                                      ? "text-foreground font-medium"
-                                      : "text-foreground/82 group-hover/model:text-foreground font-normal",
-                                  )}
-                                >
-                                  {row.label}
-                                </span>
-                                {rowEffort && (
-                                  <span className="text-muted-foreground shrink-0 text-[11.5px] leading-normal font-normal">
-                                    {formatEffortLabel(rowEffort)}
-                                  </span>
-                                )}
-                              </div>
-
-                              <div className="flex shrink-0 items-center">
-                                {isModelActive ? (
-                                  <Check className="text-foreground size-3.5 shrink-0 stroke-[1.9]" />
-                                ) : hasThinkingSubmenu ? (
-                                  <ChevronRight className="text-muted-foreground/75 size-3.5 shrink-0 stroke-[1.75]" />
-                                ) : null}
-                              </div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Zero-Footprint Overlay Anchor for Level-2 Thinking Mode Flyout */}
-                    <div className="pointer-events-none absolute inset-0 overflow-visible">
-                      {hoveredRow && hoveredRow.thinkingOptions.length > 0 && (
-                        <div
-                          ref={thinkingSubmenuRef}
-                          style={{ top: `${submenuPos.top}px` }}
-                          className={cn(
-                            "pointer-events-auto absolute z-50",
-                            submenuPos.flipLeft ? "right-full pr-1.5" : "left-full pl-1.5",
-                          )}
-                        >
-                          <div className="bg-popover text-popover-foreground floating-surface w-[264px] rounded-[14px] border border-black/[0.09] p-1.5 dark:border-white/[0.10]">
-                            <div className="text-muted-foreground px-2 pt-0.5 pb-1 text-[12px] font-medium">
-                              Thinking Mode
-                            </div>
-                            {hoveredRow.thinkingOptions.map((opt) => {
-                              const isHoveredModelActive =
-                                effectiveBrowsedProvider === activeProvider &&
-                                resolvedSelectedModelIdOnActive?.toLowerCase() ===
-                                  hoveredRow.id.toLowerCase();
-                              const isEffortSelected = isHoveredModelActive
-                                ? opt.effort === effectiveActiveEffort
-                                : opt.effort === hoveredRow.defaultEffort;
-                              return (
-                                <button
-                                  key={opt.effort}
-                                  type="button"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleSelectModelAndEffort(
-                                      effectiveBrowsedProvider,
-                                      hoveredRow.id,
-                                      opt.effort,
-                                    );
-                                    setModelPopoverOpen(false);
-                                  }}
-                                  className="hover:bg-accent/65 flex w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2 py-1 text-left transition-colors"
-                                >
-                                  <div className="min-w-0">
-                                    <div
-                                      className={cn(
-                                        "text-[12px] leading-snug",
-                                        isEffortSelected && isHoveredModelActive
-                                          ? "text-foreground font-medium"
-                                          : "text-foreground/85",
-                                      )}
-                                    >
-                                      {opt.label}
-                                    </div>
-                                    <div className="text-muted-foreground truncate text-[10.5px] leading-normal">
-                                      {conciseThinkingDescription(opt)}
-                                    </div>
-                                  </div>
-                                  {isEffortSelected && isHoveredModelActive && (
-                                    <Check className="text-foreground size-3.5 shrink-0 stroke-[1.9]" />
-                                  )}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </PopoverContent>
-                </Popover>
+                {/* 2. Isolated Agent + Model + Thinking Mode Selector */}
+                <ComposerModelPicker />
               </div>
 
-              {/* Right Cluster: Access Permissions Selector + `34×34` Primary Action Circle */}
+              {/* Right Cluster: Isolated Access Permissions Selector + `34×34` Primary Action Circle */}
               <div className="flex shrink-0 items-center gap-1.5">
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <button
-                      type="button"
-                      title="Access permissions (⇧Tab)"
-                      className="text-foreground/78 hover:text-foreground inline-flex h-8.5 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13.5px] font-normal transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                    >
-                      <ModeIcon mode={activeMode} className="opacity-75" />
-                      <span className="hidden sm:inline">{modeLabel(activeMode)}</span>
-                      <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent
-                    align="end"
-                    side="top"
-                    className="w-[368px] p-1.5"
-                  >
-                    <DropdownMenuLabel className="flex items-center justify-between">
-                      <span>Access Permissions</span>
-                      <KbdGroup>
-                        <Kbd>⇧</Kbd>
-                        <Kbd>Tab</Kbd>
-                      </KbdGroup>
-                    </DropdownMenuLabel>
-                    {PERMISSION_MODES.map((m) => {
-                      const selected = m.id === activeMode;
-                      return (
-                        <DropdownMenuItem
-                          key={m.id}
-                          onSelect={() => handleSelectMode(m.id)}
-                          className="items-start gap-3 px-2.5 py-2"
-                        >
-                          <div className="flex min-w-0 flex-1 items-start gap-2.5">
-                            <ModeIcon
-                              mode={m.id}
-                              className={cn(
-                                "mt-0.5 size-4 shrink-0",
-                                selected ? "text-foreground" : "text-muted-foreground",
-                              )}
-                            />
-                            <div className="flex min-w-0 flex-col gap-0.5">
-                              <span className="text-foreground text-[13px] leading-tight font-medium whitespace-nowrap">
-                                {m.label}
-                              </span>
-                              <span className="text-muted-foreground text-[11.5px] leading-snug whitespace-nowrap">
-                                {m.desc}
-                              </span>
-                            </div>
-                          </div>
-                          {selected && (
-                            <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
-                          )}
-                        </DropdownMenuItem>
-                      );
-                    })}
-                  </DropdownMenuContent>
-                </DropdownMenu>
+                <ComposerModePicker mode={activeMode} onSelectMode={handleSelectMode} />
 
-                {/* Primary Morphing Action Circle (`34px × 34px` = `size-8.5`): Stop | Steer + Queue | Send */}
                 {isRunning && !hasPayload ? (
                   <button
                     type="button"
                     title="Stop generation"
                     onClick={() => {
-                      if (currentAgent) {
-                        void orbitIpc.interruptAgent(selectedHostId, currentAgent.agent_id);
+                      if (selectedAgentId) {
+                        void orbitIpc.interruptAgent(selectedHostId, selectedAgentId);
                       }
                     }}
-                    className="inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] transition-colors hover:bg-black/[0.10] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]"
+                    className="orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] hover:bg-black/[0.10] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]"
                   >
                     <span className="size-[11px] rounded-[2.5px] bg-[#EF4444]" />
                   </button>
                 ) : isRunning && hasPayload ? (
-                  <div className="flex items-center gap-1.5">
+                  <div className="orbit-pill-enter flex items-center gap-1.5">
                     <button
                       type="button"
                       title="Interrupt and steer immediately (⌥↵)"
                       onClick={() => void orbitActions.submitComposer(true)}
-                      className="border-border bg-secondary/85 text-foreground hover:bg-accent inline-flex h-8.5 cursor-pointer items-center gap-1 rounded-full border px-3 text-[13px] font-medium transition-colors"
+                      className="border-border bg-secondary/85 text-foreground hover:bg-accent orbit-press inline-flex h-8.5 cursor-pointer items-center gap-1 rounded-full border px-3 text-[13px] font-medium"
                     >
                       <Zap className="size-3.5" />
                       <span>Steer</span>
@@ -1660,7 +925,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
                       type="button"
                       title="Queue follow-up"
                       onClick={() => void orbitActions.submitComposer(false)}
-                      className="inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full bg-[#141416] text-white transition-colors hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
+                      className="orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full bg-[#141416] text-white hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
                     >
                       <ArrowUp className="size-[17px] stroke-[2.2]" />
                     </button>
@@ -1672,7 +937,7 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
                     title="Send"
                     onClick={() => void orbitActions.submitComposer(false)}
                     className={cn(
-                      "inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full transition-colors",
+                      "orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full",
                       hasPayload
                         ? "bg-[#141416] text-white hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
                         : "text-foreground/30 pointer-events-none bg-black/[0.055] dark:bg-white/[0.08] dark:text-white/30",
@@ -1688,4 +953,4 @@ export function OmniComposer({ variant = "docked", occluding = false }: OmniComp
       </div>
     </div>
   );
-}
+});

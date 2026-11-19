@@ -1,8 +1,8 @@
-import { useId } from "react";
+import { memo, useId } from "react";
 import type { ProviderKind } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
 
-export function ProviderIcon({
+export const ProviderIcon = memo(function ProviderIcon({
   provider,
   className,
 }: {
@@ -55,17 +55,11 @@ export function ProviderIcon({
       );
 
     case "antigravity": {
-      const m0 = `agy_m_${uid}`;
-      const f1 = `agy_f1_${uid}`;
-      const f2 = `agy_f2_${uid}`;
-      const f3 = `agy_f3_${uid}`;
-      const f5 = `agy_f5_${uid}`;
-      const f6 = `agy_f6_${uid}`;
-      const f7 = `agy_f7_${uid}`;
-      const f8 = `agy_f8_${uid}`;
-      const f9 = `agy_f9_${uid}`;
-      const f10 = `agy_f10_${uid}`;
-      const f11 = `agy_f11_${uid}`;
+      // Pure GPU vector `<clipPath>` + `<radialGradient>` mesh (zero `<feGaussianBlur>` CPU filter passes)
+      const clipId = `agy_clip_${uid}`;
+      const gGreen = `agy_green_${uid}`;
+      const gYellow = `agy_yellow_${uid}`;
+      const gRed = `agy_red_${uid}`;
 
       return (
         <svg
@@ -74,108 +68,34 @@ export function ProviderIcon({
           aria-hidden="true"
           className={cn("size-3.5 shrink-0", className)}
         >
-          <mask id={m0} maskUnits="userSpaceOnUse" x="0" y="1" width="24" height="23">
-            <path
-              fill="#fff"
-              d="M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z"
-            />
-          </mask>
-          <g mask={`url(#${m0})`}>
-            <g filter={`url(#${f1})`}>
-              <path
-                fill="#FFE432"
-                d="M-1.018-3.992c-.408 3.591 2.686 6.89 6.91 7.37 4.225.48 7.98-2.043 8.387-5.633.408-3.59-2.686-6.89-6.91-7.37-4.225-.479-7.98 2.043-8.387 5.633z"
-              />
-            </g>
-            <g filter={`url(#${f2})`}>
-              <path
-                fill="#FC413D"
-                d="M15.269 7.747c1.058 4.557 5.691 7.374 10.348 6.293 4.657-1.082 7.575-5.653 6.516-10.21-1.058-4.556-5.691-7.374-10.348-6.292-4.657 1.082-7.575 5.653-6.516 10.21z"
-              />
-            </g>
-            <g filter={`url(#${f3})`}>
-              <path
-                fill="#00B95C"
-                d="M-12.443 10.804c1.338 4.703 7.36 7.11 13.453 5.378 6.092-1.733 9.947-6.95 8.61-11.652C8.282-.173 2.26-2.58-3.833-.848-9.925.884-13.78 6.1-12.443 10.804z"
-              />
-            </g>
-            <g filter={`url(#${f5})`}>
-              <path
-                fill="#00B95C"
-                d="M-7.608 14.703c3.352 3.424 9.126 3.208 12.896-.483 3.77-3.69 4.108-9.459.756-12.883C2.69-2.087-3.083-1.871-6.853 1.82c-3.77 3.69-4.108 9.458-.755 12.883z"
-              />
-            </g>
-            <g filter={`url(#${f6})`}>
-              <path
-                fill="#3186FF"
-                d="M9.932 27.617c1.04 4.482 5.384 7.303 9.7 6.3 4.316-1.002 6.971-5.448 5.93-9.93-1.04-4.483-5.384-7.304-9.7-6.301-4.316 1.002-6.971 5.448-5.93 9.93z"
-              />
-            </g>
-            <g filter={`url(#${f7})`}>
-              <path
-                fill="#FBBC04"
-                d="M2.572-8.185C.392-3.329 2.778 2.472 7.9 4.771c5.122 2.3 11.042.227 13.222-4.63 2.18-4.855-.205-10.656-5.327-12.955-5.122-2.3-11.042-.227-13.222 4.63z"
-              />
-            </g>
-            <g filter={`url(#${f8})`}>
-              <path
-                fill="#3186FF"
-                d="M-3.267 38.686c-5.277-2.072 3.742-19.117 5.984-24.83 2.243-5.712 8.34-8.664 13.616-6.592 5.278 2.071 11.533 13.482 9.29 19.195-2.242 5.713-23.613 14.298-28.89 12.227z"
-              />
-            </g>
-            <g filter={`url(#${f9})`}>
-              <path
-                fill="#749BFF"
-                d="M28.71 17.471c-1.413 1.649-5.1.808-8.236-1.878-3.135-2.687-4.531-6.201-3.118-7.85 1.412-1.649 5.1-.808 8.235 1.878s4.532 6.2 3.119 7.85z"
-              />
-            </g>
-            <g filter={`url(#${f10})`}>
-              <path
-                fill="#FC413D"
-                d="M18.163 9.077c5.81 3.93 12.502 4.19 14.946.577 2.443-3.612-.287-9.727-6.098-13.658-5.81-3.931-12.502-4.19-14.946-.577-2.443 3.612.287 9.727 6.098 13.658z"
-              />
-            </g>
-            <g filter={`url(#${f11})`}>
-              <path
-                fill="#FFEE48"
-                d="M-.915 2.684c-1.44 3.473-.97 6.967 1.05 7.804 2.02.837 4.824-1.3 6.264-4.772 1.44-3.473.97-6.967-1.05-7.804-2.02-.837-4.824 1.3-6.264 4.772z"
-              />
-            </g>
+          <g clipPath={`url(#${clipId})`}>
+            <rect x="0" y="0" width="24" height="24" fill="#3186FF" />
+            <rect x="0" y="0" width="24" height="24" fill={`url(#${gGreen})`} />
+            <rect x="0" y="0" width="24" height="24" fill={`url(#${gRed})`} />
+            <rect x="0" y="0" width="24" height="24" fill={`url(#${gYellow})`} />
           </g>
           <defs>
-            <filter id={f1} x="-3.288" y="-11.917" width="19.838" height="17.587" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="1.117" />
-            </filter>
-            <filter id={f2} x="4.251" y="-13.493" width="38.9" height="38.565" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="5.4" />
-            </filter>
-            <filter id={f3} x="-21.889" y="-10.592" width="40.955" height="36.517" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="4.591" />
-            </filter>
-            <filter id={f5} x="-19.099" y="-10.278" width="36.632" height="36.595" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="4.591" />
-            </filter>
-            <filter id={f6} x=".981" y="8.758" width="33.533" height="34.087" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="4.363" />
-            </filter>
-            <filter id={f7} x="-6.143" y="-21.659" width="35.978" height="35.276" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="3.954" />
-            </filter>
-            <filter id={f8} x="-11.96" y="-.46" width="45.114" height="46.523" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="3.531" />
-            </filter>
-            <filter id={f9} x="10.485" y=".58" width="25.094" height="24.054" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="3.159" />
-            </filter>
-            <filter id={f10} x="5.833" y="-12.467" width="33.508" height="30.007" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="2.669" />
-            </filter>
-            <filter id={f11} x="-8.355" y="-8.876" width="22.194" height="26.151" filterUnits="userSpaceOnUse" colorInterpolationFilters="sRGB">
-              <feGaussianBlur stdDeviation="3.303" />
-            </filter>
+            <clipPath id={clipId}>
+              <path d="M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z" />
+            </clipPath>
+            <radialGradient id={gGreen} cx="2" cy="11" r="14" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stopColor="#00B95C" />
+              <stop offset="58%" stopColor="#00B95C" stopOpacity="0.82" />
+              <stop offset="100%" stopColor="#00B95C" stopOpacity="0" />
+            </radialGradient>
+            <radialGradient id={gRed} cx="20" cy="6" r="13" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stopColor="#FC413D" />
+              <stop offset="55%" stopColor="#FC413D" stopOpacity="0.78" />
+              <stop offset="100%" stopColor="#FC413D" stopOpacity="0" />
+            </radialGradient>
+            <radialGradient id={gYellow} cx="10.5" cy="2" r="10.5" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stopColor="#FFE432" />
+              <stop offset="55%" stopColor="#FBBC04" stopOpacity="0.9" />
+              <stop offset="100%" stopColor="#FBBC04" stopOpacity="0" />
+            </radialGradient>
           </defs>
         </svg>
       );
     }
   }
-}
+});

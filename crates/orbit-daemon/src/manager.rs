@@ -116,7 +116,7 @@ impl AgentOrchestrator {
         worktree_branch: Option<String>,
         base_ref: Option<String>,
     ) -> anyhow::Result<WorkspaceSummary> {
-        let src_path = PathBuf::from(source_cwd);
+        let src_path = crate::expand_host_path(source_cwd);
         let (final_path, is_worktree) = if let Some(ref branch) = worktree_branch {
             let wt =
                 create_isolated_worktree(&self.home_dir, &src_path, branch, base_ref.as_deref())
@@ -199,7 +199,7 @@ impl AgentOrchestrator {
         let extra_paths: Vec<PathBuf> = extra_dirs
             .into_iter()
             .filter(|s| !s.trim().is_empty() && s.trim() != ws.cwd)
-            .map(PathBuf::from)
+            .map(|s| crate::expand_host_path(&s))
             .collect();
         if !extra_paths.is_empty() {
             self.agent_extra_dirs
@@ -717,6 +717,18 @@ impl AgentOrchestrator {
 
     // --- Detached PTY Terminals ---
 
+    pub async fn list_live_terminals(&self) -> Vec<TerminalSummary> {
+        let mut live: Vec<TerminalSummary> = self
+            .live_terminals
+            .read()
+            .await
+            .values()
+            .map(|t| t.summary.clone())
+            .collect();
+        live.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+        live
+    }
+
     pub async fn create_terminal(
         self: &Arc<Self>,
         cwd: String,
@@ -730,20 +742,27 @@ impl AgentOrchestrator {
             .home_dir
             .join("shims")
             .join(format!("pty_{term_id}.sock"));
+        let candidate_cwd = crate::expand_host_path(&cwd);
+        let resolved_cwd = if candidate_cwd.is_dir() {
+            candidate_cwd
+        } else {
+            crate::expand_host_path("~")
+        };
+        let resolved_cwd_str = resolved_cwd.to_string_lossy().to_string();
 
         let spec = ShimSpawnSpec {
             shim_id: format!("pty_{term_id}"),
             mode: ShimMode::Pty { cols, rows },
             program: shell.clone(),
             args: vec![],
-            cwd: PathBuf::from(&cwd),
+            cwd: resolved_cwd,
             env: HashMap::new(),
         };
 
         let shim = spawn_detached_shim(&self.orbit_exe, &sock_path, &spec).await?;
         let summary = TerminalSummary {
             terminal_id: term_id,
-            cwd,
+            cwd: resolved_cwd_str,
             title: title.unwrap_or_else(|| {
                 Path::new(&shell)
                     .file_name()

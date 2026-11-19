@@ -1,4 +1,4 @@
-import { Suspense, lazy, useMemo } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Plus, Terminal as TerminalIcon, X } from "lucide-react";
 import {
   DropdownMenu,
@@ -28,6 +28,14 @@ export function TerminalDock() {
   const hostDetail = useOrbitSelector((s) =>
     s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
   );
+  const [isResizing, setIsResizing] = useState(false);
+  const [hasEverOpened, setHasEverOpened] = useState(terminalOpen);
+
+  useEffect(() => {
+    if (terminalOpen) {
+      setHasEverOpened(true);
+    }
+  }, [terminalOpen]);
 
   const hostTabs = useMemo(
     () => terminalTabs.filter((t) => t.hostId === selectedHostId),
@@ -41,33 +49,61 @@ export function TerminalDock() {
     );
   }, [hostDetail, hostTabs]);
 
-  if (!selectedHostId) return null;
+  const resizeCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      resizeCleanupRef.current?.();
+    };
+  }, []);
+
+  if (!selectedHostId || (!hasEverOpened && !terminalOpen)) return null;
 
   const startResize = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
+    resizeCleanupRef.current?.();
     const startY = e.clientY;
     const startH = terminalHeight;
+    setIsResizing(true);
 
     const onMove = (ev: MouseEvent) => {
       const delta = startY - ev.clientY;
       orbitActions.setTerminalHeight(startH + delta);
     };
-    const onUp = () => {
+    const cleanup = () => {
+      setIsResizing(false);
       window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("mouseup", cleanup);
+      window.removeEventListener("blur", cleanup);
+      if (resizeCleanupRef.current === cleanup) {
+        resizeCleanupRef.current = null;
+      }
     };
+    resizeCleanupRef.current = cleanup;
     window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
+    window.addEventListener("mouseup", cleanup);
+    window.addEventListener("blur", cleanup);
   };
 
   return (
-    <section
-      style={{ height: `${terminalHeight}px` }}
+    <div
+      style={{ height: terminalOpen ? `${terminalHeight}px` : "0px" }}
       className={cn(
-        "border-border text-foreground relative flex shrink-0 flex-col border-t bg-[#F7F8FA] select-none dark:bg-[#0B0E14]",
-        !terminalOpen && "hidden",
+        "shrink-0 overflow-hidden",
+        !isResizing && "transition-[height] duration-[200ms] ease-[var(--ease-panel)]",
       )}
     >
+      <section
+        style={{ height: `${terminalHeight}px` }}
+        className={cn(
+          "border-border text-foreground relative flex flex-col border-t bg-[#F7F8FA] select-none dark:bg-[#0B0E14]",
+          !isResizing &&
+            "transition-[transform,opacity] duration-[185ms] ease-[var(--ease-panel)]",
+          terminalOpen
+            ? "translate-y-0 opacity-100"
+            : "pointer-events-none translate-y-2 opacity-0",
+        )}
+      >
       {/* Top Drag Resize Handle */}
       <div
         onMouseDown={startResize}
@@ -75,7 +111,7 @@ export function TerminalDock() {
       />
 
       {/* Compact Terminal Tab Header */}
-      <div className="border-border bg-sidebar flex h-8 shrink-0 items-center justify-between border-b px-2.5">
+      <div className="border-border bg-sidebar flex h-[34px] shrink-0 items-center justify-between border-b px-2.5">
         <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
           {hostTabs.map((tab) => {
             const active = tab.key === activeTerminalTabKey;
@@ -84,14 +120,14 @@ export function TerminalDock() {
                 key={tab.key}
                 onClick={() => orbitActions.setActiveTerminalTab(tab.key)}
                 className={cn(
-                  "group inline-flex h-6 cursor-pointer items-center gap-1.5 rounded px-2 text-[11px] transition-colors",
+                  "group inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-[12px] transition-colors",
                   active
                     ? "bg-accent text-foreground font-medium"
                     : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
                 )}
               >
-                <TerminalIcon className="size-3 shrink-0 opacity-75" />
-                <span className="max-w-36 truncate font-mono">
+                <TerminalIcon className="h-[13.5px] w-[13.5px] shrink-0 opacity-75" />
+                <span className="max-w-40 truncate font-mono">
                   {tab.title} · {shortDir(tab.cwd)}
                 </span>
                 <button
@@ -103,7 +139,7 @@ export function TerminalDock() {
                   }}
                   className="rounded p-0.5 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15"
                 >
-                  <X className="size-2.5" />
+                  <X className="h-[12px] w-[12px]" />
                 </button>
               </div>
             );
@@ -113,9 +149,9 @@ export function TerminalDock() {
             type="button"
             title="New detached PTY shell"
             onClick={() => orbitActions.spawnNewTerminalTab(selectedHostId, selectedCwd || "~")}
-            className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex size-6 cursor-pointer items-center justify-center rounded"
+            className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md"
           >
-            <Plus className="size-3.5" />
+            <Plus className="h-[14.5px] w-[14.5px]" />
           </button>
 
           {detachedTerminals.length > 0 && (
@@ -123,10 +159,10 @@ export function TerminalDock() {
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
-                  className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-6 cursor-pointer items-center gap-1 rounded px-1.5 text-[10.5px]"
+                  className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md px-2 text-[12px]"
                 >
                   <span>Attach ({detachedTerminals.length})</span>
-                  <ChevronDown className="size-2.5" />
+                  <ChevronDown className="h-[12px] w-[12px]" />
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="start" className="w-56">
@@ -143,7 +179,7 @@ export function TerminalDock() {
                       )
                     }
                   >
-                    <span className="truncate font-mono">
+                    <span className="truncate font-mono text-[12.5px]">
                       {t.title} · {shortDir(t.cwd)}
                     </span>
                   </DropdownMenuItem>
@@ -157,22 +193,22 @@ export function TerminalDock() {
           type="button"
           title="Hide terminal drawer"
           onClick={() => orbitActions.toggleTerminalDock(false)}
-          className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex size-6 cursor-pointer items-center justify-center rounded"
+          className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md"
         >
-          <X className="size-3.5" />
+          <X className="h-[14.5px] w-[14.5px]" />
         </button>
       </div>
 
       {/* Persistent Xterm Pool (keeps ALL tabs mounted across host & drawer switches!) */}
       <div className="min-h-0 flex-1">
         {terminalTabs.length === 0 ? (
-          <div className="flex h-full items-center justify-center text-xs text-zinc-500">
+          <div className="text-muted-foreground flex h-full items-center justify-center text-[13px]">
             Launching remote PTY shim...
           </div>
         ) : (
           <Suspense
             fallback={
-              <div className="flex h-full items-center justify-center text-xs text-zinc-500">
+              <div className="text-muted-foreground flex h-full items-center justify-center text-[13px]">
                 Initializing WebGL terminal...
               </div>
             }
@@ -189,6 +225,7 @@ export function TerminalDock() {
           </Suspense>
         )}
       </div>
-    </section>
+      </section>
+    </div>
   );
 }

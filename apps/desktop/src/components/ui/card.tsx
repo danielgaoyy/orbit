@@ -16,15 +16,15 @@ function CardHeader({ className, ...props }: React.ComponentProps<"div">) {
 }
 
 function CardTitle({ className, ...props }: React.ComponentProps<"div">) {
-  return <div data-slot="card-title" className={cn("leading-none font-semibold text-sm", className)} {...props} />;
+  return <div data-slot="card-title" className={cn("leading-none font-semibold text-[13.5px]", className)} {...props} />;
 }
 
 function CardDescription({ className, ...props }: React.ComponentProps<"div">) {
-  return <div data-slot="card-description" className={cn("text-muted-foreground text-xs", className)} {...props} />;
+  return <div data-slot="card-description" className={cn("text-muted-foreground text-[12.5px]", className)} {...props} />;
 }
 
 function CardContent({ className, ...props }: React.ComponentProps<"div">) {
-  return <div data-slot="card-content" className={cn("text-sm", className)} {...props} />;
+  return <div data-slot="card-content" className={cn("text-[13.5px]", className)} {...props} />;
 }
 
 export { Card, CardHeader, CardTitle, CardDescription, CardContent };

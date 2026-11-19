@@ -1,27 +1,27 @@
 import * as React from "react";
+import { useRender } from "@base-ui/react/use-render";
 import { cva, type VariantProps } from "class-variance-authority";
-import { Slot } from "radix-ui";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium transition-all disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4 shrink-0 outline-none focus-visible:ring-2 focus-visible:ring-ring/50 cursor-pointer",
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg text-[13px] font-medium transition-all disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg:not([class*='size-'])]:size-4 shrink-0 outline-none focus-visible:ring-2 focus-visible:ring-ring/50 cursor-pointer",
   {
     variants: {
       variant: {
-        default: "bg-primary text-primary-foreground shadow-xs hover:bg-primary/90",
+        default: "bg-foreground text-background shadow-2xs hover:opacity-90",
         destructive: "bg-destructive text-white shadow-xs hover:bg-destructive/90",
         outline:
-          "border border-border bg-background shadow-xs hover:bg-accent hover:text-accent-foreground",
-        secondary: "bg-secondary text-secondary-foreground shadow-xs hover:bg-secondary/80",
+          "border border-border bg-background shadow-2xs hover:bg-accent hover:text-accent-foreground",
+        secondary: "bg-secondary text-secondary-foreground shadow-2xs hover:bg-secondary/80",
         ghost: "hover:bg-accent hover:text-accent-foreground",
-        link: "text-primary underline-offset-4 hover:underline",
+        link: "text-foreground underline-offset-4 hover:underline",
       },
       size: {
-        default: "h-9 px-4 py-2",
-        sm: "h-8 rounded-md gap-1.5 px-3 text-xs",
-        xs: "h-7 rounded px-2.5 text-xs",
-        lg: "h-10 rounded-md px-6",
-        icon: "size-8",
+        default: "h-[34px] px-3.5 py-1.5",
+        sm: "h-[30px] rounded-lg gap-1.5 px-3 text-[12.5px]",
+        xs: "h-[26px] rounded-md px-2.5 text-[12px]",
+        lg: "h-[38px] rounded-lg px-5 text-[13.5px]",
+        icon: "size-[32px]",
       },
     },
     defaultVariants: {
@@ -36,19 +36,27 @@ function Button({
   variant,
   size,
   asChild = false,
+  render,
+  children,
   ...props
 }: React.ComponentProps<"button"> &
   VariantProps<typeof buttonVariants> & {
     asChild?: boolean;
+    render?: useRender.RenderProp<Record<string, never>>;
   }) {
-  const Comp = asChild ? Slot.Root : "button";
-  return (
-    <Comp
-      data-slot="button"
-      className={cn(buttonVariants({ variant, size, className }))}
-      {...props}
-    />
-  );
+  const effectiveRender =
+    render ?? (asChild && React.isValidElement(children) ? children : undefined);
+
+  return useRender({
+    defaultTagName: "button",
+    render: effectiveRender,
+    props: {
+      "data-slot": "button",
+      className: cn(buttonVariants({ variant, size, className })),
+      children: asChild && React.isValidElement(children) ? undefined : children,
+      ...props,
+    },
+  });
 }
 
 export { Button, buttonVariants };

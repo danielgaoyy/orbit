@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { modSymbol } from "@/lib/keybindings";
 import { ShortcutKbd } from "@/components/ui/overlays";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 
 export type SlashCommandId =
@@ -166,8 +167,8 @@ export function SlashCommandMenu({
   if (items.length === 0) return null;
 
   return (
-    <div className="bg-popover text-popover-foreground floating-surface absolute right-0 bottom-full left-0 z-40 mb-2 overflow-hidden rounded-[14px] border border-black/[0.09] dark:border-white/[0.10]">
-      <div ref={listRef} className="max-h-64 overflow-y-auto p-1.5">
+    <div className="bg-popover text-popover-foreground floating-surface orbit-inline-menu-up absolute right-0 bottom-full left-0 z-40 mb-2 overflow-hidden rounded-[14px] border border-black/[0.09] dark:border-white/[0.10]">
+      <ScrollArea viewportRef={listRef} viewportClassName="max-h-64 p-1.5">
         {items.map((cmd, idx) => {
           const Icon = cmd.icon;
           const active = idx === activeIndex;
@@ -209,7 +210,7 @@ export function SlashCommandMenu({
             </button>
           );
         })}
-      </div>
+      </ScrollArea>
     </div>
   );
 }

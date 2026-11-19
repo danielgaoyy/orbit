@@ -9,7 +9,7 @@ export function Kbd({ className, ...props }: React.ComponentProps<"kbd">) {
     <kbd
       data-slot="kbd"
       className={cn(
-        "bg-muted text-muted-foreground pointer-events-none inline-flex h-[20px] w-fit min-w-[20px] items-center justify-center gap-1 rounded-[4px] px-1.5 font-sans text-[11px] leading-none font-medium select-none dark:bg-white/[0.09]",
+        "bg-muted text-muted-foreground pointer-events-none inline-flex h-[20px] w-fit min-w-[20px] items-center justify-center gap-1 rounded-[5px] px-1.5 font-sans text-[11.5px] leading-none font-medium select-none dark:bg-white/[0.09]",
         "[&_svg:not([class*='size-'])]:size-3",
         "[[data-slot=tooltip-content]_&]:bg-background/20 [[data-slot=tooltip-content]_&]:text-background dark:[[data-slot=tooltip-content]_&]:bg-background/15",
         className,
@@ -87,7 +87,7 @@ export function ShortcutKbd({
       <span className={cn("inline-flex items-center gap-1.5", className)}>
         {alts.map((alt, idx) => (
           <React.Fragment key={idx}>
-            {idx > 0 && <span className="text-muted-foreground/55 text-[10.5px]">/</span>}
+            {idx > 0 && <span className="text-muted-foreground/55 text-[11.5px]">/</span>}
             <ShortcutKbd keys={alt} kbdClassName={kbdClassName} />
           </React.Fragment>
         ))}
@@ -101,7 +101,7 @@ export function ShortcutKbd({
       <span className={cn("inline-flex items-center gap-1", className)}>
         {parts.map((part, idx) => (
           <React.Fragment key={idx}>
-            {idx > 0 && <span className="text-muted-foreground/55 text-[10.5px]">..</span>}
+            {idx > 0 && <span className="text-muted-foreground/55 text-[11.5px]">..</span>}
             <ShortcutKbd keys={part} kbdClassName={kbdClassName} />
           </React.Fragment>
         ))}

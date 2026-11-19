@@ -92,6 +92,8 @@ export interface StageTurn {
   hasUnrecoveredError: boolean;
   /** Whether any tool call or message in this turn is currently in flight. */
   hasActiveItem: boolean;
+  /** Epoch milliseconds when this turn completed (or latest body event timestamp). */
+  completedAtMs: number | null;
 }
 
 export interface ProcessedTimelineStage {
@@ -1065,11 +1067,44 @@ function buildLiveSegments(bodyItems: TimelineItemView[]): TurnLiveSegment[] {
   return rawSegments;
 }
 
+interface CachedTurnEntry {
+  turnIndex: number;
+  userPrompt: Extract<TimelineItemView, { item_type: "user_prompt" }> | null;
+  bodyItems: TimelineItemView[];
+  turn: StageTurn;
+}
+
+const turnMemoCache = new WeakMap<TimelineItemView, CachedTurnEntry>();
+const stageResultCache = new WeakMap<TimelineItemView[], ProcessedTimelineStage>();
+const sessionDiffCountCache = new WeakMap<TimelineItemView[], number>();
+
+function shallowItemsEqual(a: TimelineItemView[], b: TimelineItemView[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 function finalizeTurn(
   turnIndex: number,
   userPrompt: Extract<TimelineItemView, { item_type: "user_prompt" }> | null,
   bodyItems: TimelineItemView[],
 ): StageTurn {
+  const cacheAnchor: TimelineItemView | undefined = userPrompt ?? bodyItems[0];
+  if (cacheAnchor) {
+    const cached = turnMemoCache.get(cacheAnchor);
+    if (
+      cached &&
+      cached.turnIndex === turnIndex &&
+      cached.userPrompt === userPrompt &&
+      shallowItemsEqual(cached.bodyItems, bodyItems)
+    ) {
+      return cached.turn;
+    }
+  }
+
   const anchorSeq = userPrompt?.seq ?? bodyItems[0]?.seq ?? turnIndex;
   const key = userPrompt ? `turn-${userPrompt.message_id}` : `turn-init-${anchorSeq}`;
   const isCompactionCommand = Boolean(
@@ -1168,7 +1203,26 @@ function finalizeTurn(
   const summary = summarizeWorkItems(foldedSteps);
   const fullTurnToolSummary = summarizeWorkItems(nonNoticeBody);
 
-  return {
+  let completedAtMs: number | null = terminalReply?.timestamp_ms ?? null;
+  if (completedAtMs === null) {
+    for (let i = bodyItems.length - 1; i >= 0; i -= 1) {
+      const ts = bodyItems[i]?.timestamp_ms;
+      if (typeof ts === "number" && Number.isFinite(ts) && ts > 0) {
+        completedAtMs = ts;
+        break;
+      }
+    }
+  }
+  if (
+    completedAtMs === null &&
+    typeof userPrompt?.timestamp_ms === "number" &&
+    Number.isFinite(userPrompt.timestamp_ms) &&
+    userPrompt.timestamp_ms > 0
+  ) {
+    completedAtMs = userPrompt.timestamp_ms;
+  }
+
+  const turn: StageTurn = {
     key,
     turnIndex,
     anchorSeq,
@@ -1185,11 +1239,60 @@ function finalizeTurn(
     hasError,
     hasUnrecoveredError: fullTurnToolSummary.counts.unrecoveredFailureCount > 0,
     hasActiveItem,
+    completedAtMs,
   };
+
+  if (cacheAnchor) {
+    turnMemoCache.set(cacheAnchor, {
+      turnIndex,
+      userPrompt,
+      bodyItems: [...bodyItems],
+      turn,
+    });
+  }
+
+  return turn;
+}
+
+/**
+ * Fast O(n) helper for TopBar badge count — reuses `stageResultCache` when already computed
+ * without segmenting turns or running tool-summary bucketing when not needed.
+ */
+export function countSessionTurnDiffs(items: TimelineItemView[]): number {
+  const cachedStage = stageResultCache.get(items);
+  if (cachedStage) return cachedStage.sessionTurnDiffs.length;
+
+  const cachedCount = sessionDiffCountCache.get(items);
+  if (cachedCount !== undefined) return cachedCount;
+
+  let count = 0;
+  for (const item of items) {
+    if (item.item_type === "tool_call") {
+      count += item.diff_files.length;
+    }
+  }
+  sessionDiffCountCache.set(items, count);
+  return count;
+}
+
+/** Fast lookup of the first unresolved permission request for keyboard approval chords (`⌘Y`). */
+export function findFirstPendingPermission(
+  items: TimelineItemView[],
+): Extract<TimelineItemView, { item_type: "permission_request" }> | null {
+  const cachedStage = stageResultCache.get(items);
+  if (cachedStage) return cachedStage.pendingPermissions[0] ?? null;
+
+  for (const item of items) {
+    if (item.item_type === "permission_request" && !item.resolved_decision) {
+      return item;
+    }
+  }
+  return null;
 }
 
 /**
  * Structures the flat timeline into semantic Conversation Turns with:
+ * - Incremental WeakMap turn reuse so historical `StageTurn` references stay 100% stable across streaming deltas
  * - Settled step-batch & pre-reply auto-folding (`Edited 2 files, ran a command`)
  * - Live streaming vertical step timelines with rolling overflow collapse
  * - Turn-end aggregated diff summaries and sticky HITL approval/question gates
@@ -1198,6 +1301,9 @@ export function processTimelineForStage(
   items: TimelineItemView[],
   _enableCoalescing = true,
 ): ProcessedTimelineStage {
+  const cached = stageResultCache.get(items);
+  if (cached) return cached;
+
   const turns: StageTurn[] = [];
   const pendingPermissions: Extract<TimelineItemView, { item_type: "permission_request" }>[] = [];
   const pendingQuestions: Extract<TimelineItemView, { item_type: "question_request" }>[] = [];
@@ -1250,10 +1356,13 @@ export function processTimelineForStage(
 
   flushTurn();
 
-  return {
+  const result: ProcessedTimelineStage = {
     turns,
     pendingPermissions,
     pendingQuestions,
     sessionTurnDiffs,
   };
+  stageResultCache.set(items, result);
+  sessionDiffCountCache.set(items, sessionTurnDiffs.length);
+  return result;
 }

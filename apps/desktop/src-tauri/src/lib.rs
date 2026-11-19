@@ -18,8 +18,8 @@ use orbit_client_core::app_core::{
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
-    open_in_external_editor, provision_relay_over_ssh, resolve_user_home, stage_local_attachment,
-    upgrade_remote_daemon_over_ssh,
+    open_in_external_editor, pick_local_directory, provision_relay_over_ssh, resolve_user_home,
+    stage_local_attachment, upgrade_remote_daemon_over_ssh,
 };
 use orbit_protocol::{PromptBadge, ProviderKind, ReasoningEffort, SessionMode};
 use tauri::{State, ipc::Channel};
@@ -487,6 +487,13 @@ fn open_in_editor(
 }
 
 #[tauri::command]
+async fn pick_project_folder(initial_dir: Option<String>) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || pick_local_directory(initial_dir.as_deref()))
+        .await
+        .map_err(|e| format!("folder picker task error: {e}"))?
+}
+
+#[tauri::command]
 fn get_workspace_files(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -606,6 +613,7 @@ pub fn run() {
             list_ssh_hosts,
             list_external_editors,
             open_in_editor,
+            pick_project_folder,
             get_workspace_files,
             stage_attachment,
             provision_ssh_relay,

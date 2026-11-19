@@ -1,5 +1,6 @@
 import { memo, useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, MessageSquarePlus } from "lucide-react";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import type { DiffFileView, DiffLineView } from "@/lib/orbit-ipc";
 import type { DiffLayoutMode } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -55,7 +56,7 @@ function buildSplitRows(lines: DiffLineView[]): SplitRow[] {
   return rows;
 }
 
-function SingleFileDiffCard({
+const SingleFileDiffCard = memo(function SingleFileDiffCard({
   file,
   layout,
   onQuoteLine,
@@ -65,29 +66,38 @@ function SingleFileDiffCard({
   onQuoteLine?: (path: string, lineNumber: number | null, code: string) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
+
+  const omissionNotice = useMemo(
+    () => file.lines.find((l) => l.kind === "meta" && l.content.startsWith("…"))?.content ?? null,
+    [file.lines],
+  );
+
   const splitRows = useMemo(
     () => (layout === "split" ? buildSplitRows(file.lines) : []),
     [file.lines, layout],
   );
 
   return (
-    <div className="border-border overflow-hidden rounded-lg border bg-zinc-50/80 text-zinc-800 dark:bg-[#0B0F17] dark:text-zinc-200">
+    <div
+      style={{ contain: "content" }}
+      className="border-border overflow-hidden rounded-lg border bg-zinc-50/80 text-zinc-800 dark:bg-[#0B0F17] dark:text-zinc-200"
+    >
       <button
         type="button"
         onClick={() => setCollapsed((v) => !v)}
-        className="border-border flex w-full cursor-pointer items-center justify-between gap-2 border-b bg-black/[0.02] px-3 py-1.5 text-left transition-colors hover:bg-black/[0.045] dark:bg-white/[0.025] dark:hover:bg-white/[0.045]"
+        className="border-border flex w-full cursor-pointer items-center justify-between gap-2 border-b bg-black/[0.02] px-3 py-2 text-left transition-colors hover:bg-black/[0.045] dark:bg-white/[0.025] dark:hover:bg-white/[0.045]"
       >
         <div className="flex min-w-0 items-center gap-1.5">
           {collapsed ? (
-            <ChevronRight className="text-muted-foreground size-3.5 shrink-0" />
+            <ChevronRight className="text-muted-foreground h-[14px] w-[14px] shrink-0" />
           ) : (
-            <ChevronDown className="text-muted-foreground size-3.5 shrink-0" />
+            <ChevronDown className="text-muted-foreground h-[14px] w-[14px] shrink-0" />
           )}
-          <span className="text-foreground truncate font-mono text-[11.5px] font-medium">
+          <span className="text-foreground truncate font-mono text-[12.5px] font-medium">
             {file.path}
           </span>
         </div>
-        <div className="tabular-nums flex shrink-0 items-center gap-2 font-mono text-[11px]">
+        <div className="tabular-nums flex shrink-0 items-center gap-2 font-mono text-[12px]">
           {file.additions > 0 && (
             <span className="text-emerald-600 dark:text-emerald-400">+{file.additions}</span>
           )}
@@ -99,7 +109,10 @@ function SingleFileDiffCard({
 
       {!collapsed &&
         (layout === "unified" ? (
-          <div className="selectable-text overflow-x-auto font-mono text-[11.5px] leading-[1.5]">
+          <ScrollArea
+            orientation="horizontal"
+            viewportClassName="selectable-text font-mono text-[12px] leading-[1.55]"
+          >
             {file.lines.map((line, lIdx) => {
               if (line.kind === "meta") return null;
 
@@ -109,7 +122,7 @@ function SingleFileDiffCard({
                   : line.kind === "removed"
                     ? "bg-rose-500/[0.12] text-rose-950 dark:bg-rose-500/[0.11] dark:text-rose-100"
                     : line.kind === "hunk_header"
-                      ? "bg-sky-500/[0.09] text-sky-800 dark:bg-sky-500/[0.08] dark:text-sky-300/90 py-0.5"
+                      ? "bg-sky-500/[0.09] text-sky-800 dark:bg-sky-500/[0.08] dark:text-sky-300/90 py-0.5 select-none"
                       : "text-zinc-700 dark:text-zinc-300/90";
 
               const prefix =
@@ -118,10 +131,10 @@ function SingleFileDiffCard({
 
               return (
                 <div key={lIdx} className={cn("group flex min-w-fit items-center px-2", rowClass)}>
-                  <span className="tabular-nums w-8 shrink-0 pr-1.5 text-right text-[10.5px] text-zinc-400 select-none dark:text-zinc-600">
+                  <span className="tabular-nums w-8 shrink-0 pr-1.5 text-right text-[11.5px] text-zinc-400 select-none dark:text-zinc-600">
                     {line.old_line ?? ""}
                   </span>
-                  <span className="tabular-nums w-8 shrink-0 pr-2 text-right text-[10.5px] text-zinc-400 select-none dark:text-zinc-600">
+                  <span className="tabular-nums w-8 shrink-0 pr-2 text-right text-[11.5px] text-zinc-400 select-none dark:text-zinc-600">
                     {line.new_line ?? ""}
                   </span>
                   {onQuoteLine && line.kind !== "hunk_header" ? (
@@ -129,12 +142,12 @@ function SingleFileDiffCard({
                       type="button"
                       title="Quote line into Composer"
                       onClick={() => onQuoteLine(file.path, targetLn, line.content)}
-                      className="mr-1 inline-flex size-4 shrink-0 cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15"
+                      className="mr-1 inline-flex h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15"
                     >
-                      <MessageSquarePlus className="text-primary size-2.5" />
+                      <MessageSquarePlus className="text-foreground h-[12px] w-[12px]" />
                     </button>
                   ) : (
-                    <span className="w-3 shrink-0" />
+                    <span className="w-3 shrink-0 select-none" />
                   )}
                   <span className="w-3.5 shrink-0 opacity-60 select-none">
                     {line.kind === "hunk_header" ? "" : prefix}
@@ -143,15 +156,18 @@ function SingleFileDiffCard({
                 </div>
               );
             })}
-          </div>
+          </ScrollArea>
         ) : (
-          <div className="selectable-text overflow-x-auto font-mono text-[11px] leading-[1.5]">
+          <ScrollArea
+            orientation="horizontal"
+            viewportClassName="selectable-text font-mono text-[12px] leading-[1.55]"
+          >
             {splitRows.map((row, rIdx) => {
               if (row.kind === "header") {
                 return (
                   <div
                     key={rIdx}
-                    className="bg-sky-500/[0.09] px-3 py-0.5 text-[10.5px] text-sky-800 dark:bg-sky-500/[0.08] dark:text-sky-300/90"
+                    className="bg-sky-500/[0.09] px-3 py-0.5 text-[11.5px] text-sky-800 select-none dark:bg-sky-500/[0.08] dark:text-sky-300/90"
                   >
                     {row.headerText}
                   </div>
@@ -175,7 +191,7 @@ function SingleFileDiffCard({
                           : "bg-black/[0.015] dark:bg-white/[0.01]",
                     )}
                   >
-                    <span className="tabular-nums w-7 shrink-0 pr-1.5 text-right text-[10px] text-zinc-400 select-none dark:text-zinc-600">
+                    <span className="tabular-nums w-8 shrink-0 pr-1.5 text-right text-[11.5px] text-zinc-400 select-none dark:text-zinc-600">
                       {left?.old_line ?? ""}
                     </span>
                     <span className="w-3 shrink-0 opacity-60 select-none">
@@ -195,7 +211,7 @@ function SingleFileDiffCard({
                           : "bg-black/[0.015] dark:bg-white/[0.01]",
                     )}
                   >
-                    <span className="tabular-nums w-7 shrink-0 pr-1.5 text-right text-[10px] text-zinc-400 select-none dark:text-zinc-600">
+                    <span className="tabular-nums w-8 shrink-0 pr-1.5 text-right text-[11.5px] text-zinc-400 select-none dark:text-zinc-600">
                       {right?.new_line ?? ""}
                     </span>
                     {onQuoteLine && right ? (
@@ -203,9 +219,9 @@ function SingleFileDiffCard({
                         type="button"
                         title="Quote line into Composer"
                         onClick={() => onQuoteLine(file.path, right.new_line, right.content)}
-                        className="mr-0.5 inline-flex size-3.5 shrink-0 cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15"
+                        className="mr-0.5 inline-flex h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover:opacity-100 hover:bg-black/10 dark:hover:bg-white/15"
                       >
-                        <MessageSquarePlus className="text-primary size-2.5" />
+                        <MessageSquarePlus className="text-foreground h-[12px] w-[12px]" />
                       </button>
                     ) : (
                       <span className="w-3 shrink-0 opacity-60 select-none">
@@ -217,11 +233,17 @@ function SingleFileDiffCard({
                 </div>
               );
             })}
-          </div>
+          </ScrollArea>
         ))}
+
+      {!collapsed && omissionNotice && (
+        <div className="border-border text-muted-foreground border-t px-3 py-1.5 text-center font-mono text-[11.5px] select-none">
+          {omissionNotice}
+        </div>
+      )}
     </div>
   );
-}
+});
 
 export const DiffFilesViewer = memo(function DiffFilesViewer({
   files,
@@ -234,7 +256,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
 }) {
   if (files.length === 0) {
     return (
-      <div className="text-muted-foreground flex h-36 items-center justify-center rounded-lg border border-dashed text-xs">
+      <div className="text-muted-foreground flex h-36 items-center justify-center rounded-xl border border-dashed text-[13px]">
         Working tree clean — no changes to review.
       </div>
     );

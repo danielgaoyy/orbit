@@ -882,6 +882,22 @@ export const orbitIpc = {
     return invoke<StagedAttachmentInfo>("stage_attachment", { filename, bytes });
   },
 
+  stageHostAttachment: async (
+    hostId: string,
+    filename: string,
+    dataB64: string,
+  ): Promise<StagedAttachmentInfo> => {
+    if (!isTauriRuntime()) {
+      const approxBytes = Math.floor((dataB64.length * 3) / 4);
+      return { path: `/tmp/${filename}`, filename, size_bytes: approxBytes };
+    }
+    return invoke<StagedAttachmentInfo>("stage_host_attachment", {
+      hostId,
+      filename,
+      dataB64,
+    });
+  },
+
   provisionSshRelay: async (params: {
     targetHostId: string;
     sshAlias: string;

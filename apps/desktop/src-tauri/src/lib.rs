@@ -513,6 +513,19 @@ fn stage_attachment(filename: String, bytes: Vec<u8>) -> Result<StagedAttachment
 }
 
 #[tauri::command]
+async fn stage_host_attachment(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    filename: String,
+    data_b64: String,
+) -> Result<StagedAttachmentInfo, String> {
+    state
+        .core
+        .stage_attachment_b64_on_host(&host_id, &filename, &data_b64)
+        .await
+}
+
+#[tauri::command]
 async fn provision_ssh_relay(
     state: State<'_, DesktopAppState>,
     target_host_id: String,
@@ -616,6 +629,7 @@ pub fn run() {
             pick_project_folder,
             get_workspace_files,
             stage_attachment,
+            stage_host_attachment,
             provision_ssh_relay,
             get_app_version,
             check_app_update,

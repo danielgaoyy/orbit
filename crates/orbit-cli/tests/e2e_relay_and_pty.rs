@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use orbit_client_core::{
-    ClientInboundEvent, HostConnectionState, MultiHostFleet, connect_via_relay,
+    ClientInboundEvent, HostConnectionState, MultiHostFleet, app_core::OrbitAppCore,
+    connect_via_relay,
 };
 use orbit_crypto::HostIdentityKeypair;
 use orbit_daemon::spawn_embedded_daemon;
@@ -418,5 +419,118 @@ async fn ssh_tunneled_e2ee_relay_integration() {
         .expect("list agents over ssh+relay");
     assert!(matches!(resp, WireMessage::AgentsSnapshot { .. }));
 
+    let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+#[tokio::test]
+async fn e2ee_relay_chunked_attachment_staging_integration() {
+    let base_tmp = if std::path::Path::new("/tmp").is_dir() {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let short_id = &Uuid::new_v4().simple().to_string()[..8];
+    let temp_home = base_tmp.join(format!("orb_att_e2e_{short_id}"));
+    std::fs::create_dir_all(&temp_home).expect("mkdir");
+
+    let pre_rt = orbit_daemon::DaemonRuntime::bootstrap(&temp_home)
+        .await
+        .expect("bootstrap");
+    let allowed_pubkey = pre_rt.keypair.public_key_b64.clone();
+    drop(pre_rt);
+
+    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    drop(relay_listener);
+
+    let mut allow_set = HashSet::new();
+    allow_set.insert(allowed_pubkey.clone());
+    let relay_cfg = RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: Arc::new(allow_set),
+    };
+    tokio::spawn(async move {
+        let _ = run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let relay_url = format!("ws://{relay_addr}");
+    let (_daemon_addr, runtime) = spawn_embedded_daemon(temp_home.clone(), Some(relay_url.clone()))
+        .await
+        .expect("spawn daemon");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let offer = runtime.build_pairing_offer(vec!["ws://127.0.0.1:1/ws".into()], Some(relay_url));
+    let qr_uri = offer.to_qr_uri().expect("qr uri");
+    let host_id = offer.host_id.clone();
+
+    let core = OrbitAppCore::open_in_memory().expect("open core");
+    core.pair_host(&qr_uri).expect("pair host");
+
+    let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    let mut connected_online = false;
+    while tokio::time::Instant::now() < connect_deadline {
+        if let Some(card) = core
+            .fleet_overview()
+            .hosts
+            .into_iter()
+            .find(|h| h.host_id == host_id)
+            && card.connection_state == HostConnectionState::OnlineRelay
+            && card.daemon_version.is_some()
+        {
+            connected_online = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(connected_online, "core should connect via E2EE relay");
+
+    // 1. Single-chunk PNG upload
+    let png_bytes = b"\x89PNG\r\n\x1a\ne2ee-relay-png-test".to_vec();
+    let png_info = core
+        .stage_attachment_on_host(&host_id, "screenshot.png", png_bytes.clone())
+        .await
+        .expect("stage png over relay");
+    let png_path = std::path::PathBuf::from(&png_info.path);
+    assert!(png_path.starts_with(temp_home.join("attachments")));
+    assert_eq!(png_info.size_bytes, png_bytes.len());
+    assert_eq!(std::fs::read(&png_path).expect("read png"), png_bytes);
+
+    // 2. Multi-chunk 1.2 MiB upload (3 chunks of 512 KiB)
+    let big_bytes: Vec<u8> = (0..(1_200 * 1024)).map(|i| ((i * 7) % 251) as u8).collect();
+    let big_info = core
+        .stage_attachment_on_host(&host_id, "trace_dump.bin", big_bytes.clone())
+        .await
+        .expect("stage 1.2 MiB over relay");
+    let big_path = std::path::PathBuf::from(&big_info.path);
+    assert!(big_path.starts_with(temp_home.join("attachments")));
+    assert_eq!(big_info.size_bytes, big_bytes.len());
+    assert_eq!(std::fs::read(&big_path).expect("read big"), big_bytes);
+
+    let leftover_tmp: Vec<_> = std::fs::read_dir(temp_home.join("attachments/.tmp"))
+        .expect("read tmp")
+        .flatten()
+        .collect();
+    assert!(leftover_tmp.is_empty(), "expected clean .tmp dir");
+
+    // 3. Reject > 25 MiB
+    let oversized = vec![0u8; 25 * 1024 * 1024 + 1];
+    let over_err = core
+        .stage_attachment_on_host(&host_id, "too_big.bin", oversized)
+        .await
+        .expect_err("oversized must fail");
+    assert!(over_err.contains("25 MiB"));
+
+    // 4. Removing/disconnecting host fails upload immediately
+    core.remove_host(&host_id).expect("remove host");
+    let missing_err = core
+        .stage_attachment_on_host(&host_id, "after_remove.png", png_bytes)
+        .await
+        .expect_err("removed host must fail");
+    assert!(missing_err.contains("not found"));
+
+    let _ = tokio::task::spawn_blocking(move || drop(core)).await;
     let _ = std::fs::remove_dir_all(&temp_home);
 }

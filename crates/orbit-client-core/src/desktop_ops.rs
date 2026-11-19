@@ -11,6 +11,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use orbit_relay_transport::{
+    GeneratedTunnelKey, SshRelaySpec, compute_openssh_pubkey_sha256_b64,
+    derive_openssh_pubkey_from_seed, format_restricted_authorized_key_line,
+    generate_ssh_tunnel_key, normalize_relay_url as transport_normalize_relay_url,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,32 +69,13 @@ impl Drop for SshTunnelGuard {
     }
 }
 
-/// Normalize user-entered Relay host/URL (`1.2.3.4`, `https://relay.example.com`, `ws://host:7878/`) into a clean `ws://` or `wss://` base URL.
+/// Normalize user-entered Relay host/URL (`1.2.3.4`, `https://relay.example.com`, `ws://host:7878/`, or `ssh+relay://...`) into a clean canonical Relay URL.
 pub fn normalize_relay_input(raw: Option<&str>) -> Option<String> {
-    let trimmed = raw?.trim().trim_end_matches('/');
+    let trimmed = raw?.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let had_scheme = trimmed.contains("://");
-    let with_scheme = if let Some(rest) = trimmed.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
-        trimmed.to_string()
-    } else {
-        format!("ws://{trimmed}")
-    };
-
-    let (scheme, rest) = with_scheme.split_once("://")?;
-    let mut authority = rest.split('/').next()?.trim().to_string();
-    let is_ipv4 = authority.split('.').count().eq(&4)
-        && authority.split('.').all(|part| part.parse::<u8>().is_ok());
-
-    if !had_scheme && !authority.contains(':') && (authority == "localhost" || is_ipv4) {
-        authority = format!("{authority}:7878");
-    }
-    Some(format!("{scheme}://{authority}"))
+    transport_normalize_relay_url(trimmed).ok()
 }
 
 /// Resolve the real user home directory across macOS, Linux, Windows, and Xcode iOS Simulator (`SIMULATOR_HOST_HOME`).
@@ -226,12 +212,21 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "localhost".to_string());
+    let relay_url = fs::read_to_string(home.join(".orbit").join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("relay_url")
+                .and_then(|r| r.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .and_then(|r| normalize_relay_input(Some(&r)));
     let offer = orbit_crypto::PairingOffer {
         host_id,
         hostname,
         daemon_pubkey_b64: kp.public_key_b64,
         direct_endpoints: vec!["ws://127.0.0.1:6868/ws".to_string()],
-        relay_url: None,
+        relay_url,
         pairing_secret: "local".to_string(),
     };
     offer.to_qr_uri().ok()
@@ -656,13 +651,99 @@ pub fn spawn_ssh_local_tunnel(alias: &str, remote_port: u16) -> Result<SshTunnel
     })
 }
 
-/// Deploy/update Orbit on a remote SSH host and start `orbit relay up` locked to `allowed_pubkeys`.
-pub fn provision_relay_over_ssh(
+#[derive(Serialize, Deserialize)]
+struct StoredTunnelKey {
+    seed_b64: String,
+}
+
+/// Load or create a persistent Ed25519 tunnel identity keypair in `<home_dir>/ssh-relay-tunnel-key.json` (`0600`).
+pub fn load_or_create_ssh_tunnel_key(home_dir: &Path) -> Result<GeneratedTunnelKey, String> {
+    let path = home_dir.join("ssh-relay-tunnel-key.json");
+    if let Ok(raw) = fs::read_to_string(&path)
+        && let Ok(stored) = serde_json::from_str::<StoredTunnelKey>(&raw)
+        && let Ok(openssh_pubkey) = derive_openssh_pubkey_from_seed(&stored.seed_b64)
+    {
+        return Ok(GeneratedTunnelKey {
+            seed_b64: stored.seed_b64,
+            openssh_pubkey,
+        });
+    }
+
+    let generated = generate_ssh_tunnel_key().map_err(|e| e.to_string())?;
+    fs::create_dir_all(home_dir)
+        .map_err(|e| format!("failed to create {}: {e}", home_dir.display()))?;
+    let payload = serde_json::to_string_pretty(&StoredTunnelKey {
+        seed_b64: generated.seed_b64.clone(),
+    })
+    .map_err(|e| format!("failed to serialize tunnel key: {e}"))?;
+    fs::write(&path, payload).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(generated)
+}
+
+/// Resolve effective `(hostname, user, port)` for an SSH alias via `ssh -G`, falling back to explicit metadata.
+pub fn resolve_ssh_effective_target(
+    alias: &str,
+    fallback_host: &str,
+    fallback_user: Option<&str>,
+    fallback_port: Option<u16>,
+) -> (String, String, u16) {
+    let mut hostname: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut port: Option<u16> = None;
+
+    if let Ok(out) = build_ssh_command().args(["-G", alias]).output()
+        && out.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if let Some((k, v)) = trimmed.split_once(char::is_whitespace) {
+                let val = v.trim();
+                if val.is_empty() {
+                    continue;
+                }
+                match k {
+                    "hostname" if hostname.is_none() => hostname = Some(val.to_string()),
+                    "user" if user.is_none() => user = Some(val.to_string()),
+                    "port" if port.is_none() => {
+                        port = val.parse::<u16>().ok().filter(|p| *p > 0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let resolved_host = hostname.unwrap_or_else(|| fallback_host.to_string());
+    let resolved_user = user
+        .or_else(|| fallback_user.map(ToOwned::to_owned))
+        .or_else(|| std::env::var("USER").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "root".to_string());
+    let resolved_port = port.or(fallback_port).filter(|p| *p > 0).unwrap_or(22);
+
+    (resolved_host, resolved_user, resolved_port)
+}
+
+/// Deploy/update Orbit on a remote SSH host bound strictly to `127.0.0.1:<relay_port>`,
+/// install a restricted `authorized_keys` tunnel key, and return the canonical `ssh+relay://...` URL.
+#[allow(clippy::too_many_arguments)]
+pub fn provision_ssh_tunnel_relay_with_home(
+    home_dir: &Path,
     alias: &str,
     fallback_hostname: &str,
+    fallback_user: Option<&str>,
+    fallback_port: Option<u16>,
     relay_port: u16,
     allowed_pubkeys: &[String],
+    tag_owner: &str,
 ) -> Result<String, String> {
+    let tunnel_key = load_or_create_ssh_tunnel_key(home_dir)?;
+
     let mut unique_keys: Vec<String> = allowed_pubkeys
         .iter()
         .map(|k| k.replace('\'', "").trim().to_string())
@@ -677,13 +758,31 @@ pub fn provision_relay_over_ssh(
         .collect::<Vec<_>>()
         .join(" ");
 
+    let clean_owner = tag_owner.replace(['\'', ' '], "");
+    let tag = format!("orbit-relay-tunnel:{clean_owner}:{relay_port}");
+    let restricted_line =
+        format_restricted_authorized_key_line(&tunnel_key.openssh_pubkey, relay_port, &tag)
+            .replace('\'', "");
+
     let remote_script = format!(
         "set -eu; \
-         export PATH=\"$HOME/.local/bin:/usr/local/bin:$PATH\"; \
+         export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
          if ! command -v orbit >/dev/null 2>&1 || orbit --version 2>&1 | grep -q 'GLIBC_' || ! orbit relay --help 2>&1 | grep -q 'allow'; then \
            curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh; \
          fi; \
-         orbit relay up --port {relay_port} {pubkey_flags}"
+         orbit relay up --listen 127.0.0.1:{relay_port} {pubkey_flags}; \
+         mkdir -p \"$HOME/.ssh\" && chmod 700 \"$HOME/.ssh\"; \
+         touch \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"; \
+         (grep -Fv ' {tag}' \"$HOME/.ssh/authorized_keys\" || true) > \"$HOME/.ssh/authorized_keys.orbit.tmp\"; \
+         printf '%s\\n' '{restricted_line}' >> \"$HOME/.ssh/authorized_keys.orbit.tmp\"; \
+         mv \"$HOME/.ssh/authorized_keys.orbit.tmp\" \"$HOME/.ssh/authorized_keys\" && chmod 600 \"$HOME/.ssh/authorized_keys\"; \
+         printf 'ORBIT_SSH_USER=%s\\n' \"$(whoami)\"; \
+         find /etc/ssh -maxdepth 1 -name 'ssh_host_*_key.pub' -type f 2>/dev/null | while IFS= read -r pubf; do \
+           if [ -r \"$pubf\" ]; then \
+             line=\"$(cat \"$pubf\" 2>/dev/null || true)\"; \
+             if [ -n \"$line\" ]; then printf 'ORBIT_HOST_PUBKEY=%s\\n' \"$line\"; fi; \
+           fi; \
+         done || true"
     );
 
     let out = build_ssh_command()
@@ -711,18 +810,61 @@ pub fn provision_relay_over_ssh(
         });
     }
 
+    let mut remote_user: Option<String> = None;
+    let mut host_key_fps_b64: Vec<String> = Vec::new();
     for line in stdout.lines() {
-        if let Some(rest) = line.trim().strip_prefix("Relay URL")
-            && let Some((_, url_part)) = rest.split_once(':')
-        {
-            let url = url_part.trim();
-            if !url.is_empty() && !url.contains("<YOUR_SERVER_IP>") {
-                return Ok(url.to_string());
+        let trimmed = line.trim();
+        if let Some(u) = trimmed.strip_prefix("ORBIT_SSH_USER=") {
+            let clean = u.trim();
+            if !clean.is_empty() {
+                remote_user = Some(clean.to_string());
             }
+        } else if let Some(pub_line) = trimmed.strip_prefix("ORBIT_HOST_PUBKEY=")
+            && let Ok(fp) = compute_openssh_pubkey_sha256_b64(pub_line.trim())
+            && !host_key_fps_b64.contains(&fp)
+        {
+            host_key_fps_b64.push(fp);
         }
     }
 
-    Ok(format!("ws://{fallback_hostname}:{relay_port}"))
+    let (ssh_host, resolved_user, ssh_port) =
+        resolve_ssh_effective_target(alias, fallback_hostname, fallback_user, fallback_port);
+    let spec = SshRelaySpec {
+        user: remote_user.unwrap_or(resolved_user),
+        ssh_host,
+        ssh_port,
+        relay_port,
+        key_seed_b64: tunnel_key.seed_b64,
+        host_key_fps_b64,
+    };
+    Ok(spec.to_uri())
+}
+
+/// Deploy/update Orbit on a remote SSH host and start a zero-port SSH-tunneled E2EE Relay locked to `allowed_pubkeys`.
+pub fn provision_relay_over_ssh(
+    alias: &str,
+    fallback_hostname: &str,
+    relay_port: u16,
+    allowed_pubkeys: &[String],
+) -> Result<String, String> {
+    let home_dir = resolve_user_home()
+        .ok_or_else(|| "cannot resolve user home directory for tunnel key storage".to_string())?
+        .join(".orbit");
+    let tag_owner = allowed_pubkeys
+        .first()
+        .map(|k| k.chars().take(12).collect::<String>())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "desktop".to_string());
+    provision_ssh_tunnel_relay_with_home(
+        &home_dir,
+        alias,
+        fallback_hostname,
+        None,
+        None,
+        relay_port,
+        allowed_pubkeys,
+        &tag_owner,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1404,6 +1546,15 @@ mod tests {
         assert_eq!(
             normalize_relay_input(Some("https://relay.orbit.dev/")),
             Some("wss://relay.orbit.dev".into())
+        );
+        let key = generate_ssh_tunnel_key().expect("keygen");
+        let ssh_uri = format!(
+            "ssh+relay://ec2-user@13.228.27.154:22/7878?key={}",
+            key.seed_b64
+        );
+        assert_eq!(
+            normalize_relay_input(Some(&ssh_uri)).as_deref(),
+            Some(ssh_uri.as_str())
         );
     }
 

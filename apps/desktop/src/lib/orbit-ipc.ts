@@ -910,7 +910,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.3.4";
+    if (!isTauriRuntime()) return "0.3.5";
     return invoke<string>("get_app_version");
   },
 

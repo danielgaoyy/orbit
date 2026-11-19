@@ -56,7 +56,7 @@ export function GeneralSection() {
   const preferredEditor = useOrbitSelector((s) => s.preferredEditor);
   const mod = modSymbol();
 
-  const [appVersion, setAppVersion] = useState("0.2.4");
+  const [appVersion, setAppVersion] = useState("0.3.0");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseUpdateInfo | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
@@ -115,7 +115,8 @@ export function GeneralSection() {
     try {
       await orbitIpc.performAppSelfUpdate(updateInfo, (ev) => {
         if (ev.status) {
-          const pct = ev.progress > 0 && ev.progress < 100 ? ` (${Math.round(ev.progress)}%)` : "";
+          const pctVal = ev.progress <= 1 ? Math.round(ev.progress * 100) : Math.round(ev.progress);
+          const pct = pctVal > 0 && pctVal < 100 ? ` (${pctVal}%)` : "";
           setUpdateStatus(`${ev.status}${pct}`);
         }
       });

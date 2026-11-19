@@ -14,7 +14,7 @@ android {
         applicationId = "dev.orbit.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 2020
+        versionCode = 3000
         versionName = "0.3.0"
 
         ndk {

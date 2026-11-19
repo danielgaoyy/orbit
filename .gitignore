@@ -33,6 +33,7 @@ apps/android/app/src/main/jniLibs/
 apps/android/local.properties
 
 # HarmonyOS 7+ Native (Hvigor + ohrs outputs)
+apps/harmony/.idea/
 apps/harmony/.hvigor/
 apps/harmony/oh_modules/
 apps/harmony/build/

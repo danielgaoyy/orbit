@@ -456,14 +456,68 @@ pub struct DiffFileView {
     pub lines: Vec<DiffLineView>,
 }
 
+const MAX_RENDERED_DIFF_LINES_PER_FILE: usize = 400;
+
+fn is_generated_or_lockfile_path(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    let base = norm.rsplit('/').next().unwrap_or(norm.as_str());
+    matches!(
+        base,
+        "Cargo.lock"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "Podfile.lock"
+            | "Gemfile.lock"
+            | "composer.lock"
+            | "poetry.lock"
+            | "uv.lock"
+            | "bun.lockb"
+            | "bun.lock"
+            | "go.sum"
+    ) || base.ends_with(".lock")
+        || base.ends_with(".pbxproj")
+        || base.ends_with(".min.js")
+        || base.ends_with(".min.css")
+        || base.starts_with("orbit_ffi_uniffi.")
+        || norm.contains("/Generated/")
+        || norm.starts_with("Generated/")
+}
+
+fn flush_omitted_diff_notice(files: &mut [DiffFileView], omitted_lines: &mut usize) {
+    if *omitted_lines > 0
+        && let Some(last) = files.last_mut()
+    {
+        last.lines.push(DiffLineView {
+            kind: DiffLineKind::Meta,
+            old_line: None,
+            new_line: None,
+            content: format!("… {} more diff lines omitted", *omitted_lines),
+        });
+    }
+    *omitted_lines = 0;
+}
+
+fn push_capped_diff_line(file: &mut DiffFileView, omitted_lines: &mut usize, line: DiffLineView) {
+    if file.lines.len() < MAX_RENDERED_DIFF_LINES_PER_FILE {
+        file.lines.push(line);
+    } else {
+        *omitted_lines += 1;
+    }
+}
+
 /// Parse a `git diff` unified output string into per-file structured diff lines with dual line numbers.
+/// Counts exact `additions` / `deletions` across arbitrarily large files while capping rendered lines per file
+/// and sorting handwritten source files ahead of lockfiles & generated bindings.
 pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
     let mut files: Vec<DiffFileView> = Vec::new();
     let mut old_ln: u32 = 0;
     let mut new_ln: u32 = 0;
+    let mut omitted_lines: usize = 0;
 
     for raw_line in unified_diff.lines() {
         if let Some(rest) = raw_line.strip_prefix("diff --git ") {
+            flush_omitted_diff_notice(&mut files, &mut omitted_lines);
             let path = rest
                 .split_whitespace()
                 .last()
@@ -502,12 +556,16 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             || raw_line.starts_with("new file mode")
             || raw_line.starts_with("deleted file mode")
         {
-            cur_file.lines.push(DiffLineView {
-                kind: DiffLineKind::Meta,
-                old_line: None,
-                new_line: None,
-                content: raw_line.to_string(),
-            });
+            push_capped_diff_line(
+                cur_file,
+                &mut omitted_lines,
+                DiffLineView {
+                    kind: DiffLineKind::Meta,
+                    old_line: None,
+                    new_line: None,
+                    content: raw_line.to_string(),
+                },
+            );
             continue;
         }
 
@@ -515,12 +573,16 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             let (o, n) = parse_hunk_header_numbers(raw_line);
             old_ln = o;
             new_ln = n;
-            cur_file.lines.push(DiffLineView {
-                kind: DiffLineKind::HunkHeader,
-                old_line: None,
-                new_line: None,
-                content: raw_line.to_string(),
-            });
+            push_capped_diff_line(
+                cur_file,
+                &mut omitted_lines,
+                DiffLineView {
+                    kind: DiffLineKind::HunkHeader,
+                    old_line: None,
+                    new_line: None,
+                    content: raw_line.to_string(),
+                },
+            );
             continue;
         }
 
@@ -528,22 +590,30 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             cur_file.additions += 1;
             let ln = new_ln;
             new_ln = new_ln.saturating_add(1);
-            cur_file.lines.push(DiffLineView {
-                kind: DiffLineKind::Added,
-                old_line: None,
-                new_line: Some(ln),
-                content: added.to_string(),
-            });
+            push_capped_diff_line(
+                cur_file,
+                &mut omitted_lines,
+                DiffLineView {
+                    kind: DiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(ln),
+                    content: added.to_string(),
+                },
+            );
         } else if let Some(removed) = raw_line.strip_prefix('-') {
             cur_file.deletions += 1;
             let ln = old_ln;
             old_ln = old_ln.saturating_add(1);
-            cur_file.lines.push(DiffLineView {
-                kind: DiffLineKind::Removed,
-                old_line: Some(ln),
-                new_line: None,
-                content: removed.to_string(),
-            });
+            push_capped_diff_line(
+                cur_file,
+                &mut omitted_lines,
+                DiffLineView {
+                    kind: DiffLineKind::Removed,
+                    old_line: Some(ln),
+                    new_line: None,
+                    content: removed.to_string(),
+                },
+            );
         } else {
             let content = raw_line.strip_prefix(' ').unwrap_or(raw_line).to_string();
             let o = if old_ln > 0 { Some(old_ln) } else { None };
@@ -554,24 +624,34 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             if new_ln > 0 {
                 new_ln = new_ln.saturating_add(1);
             }
-            cur_file.lines.push(DiffLineView {
-                kind: DiffLineKind::Context,
-                old_line: o,
-                new_line: n,
-                content,
-            });
+            push_capped_diff_line(
+                cur_file,
+                &mut omitted_lines,
+                DiffLineView {
+                    kind: DiffLineKind::Context,
+                    old_line: o,
+                    new_line: n,
+                    content,
+                },
+            );
         }
     }
 
+    flush_omitted_diff_notice(&mut files, &mut omitted_lines);
+    files.sort_by_key(|f| is_generated_or_lockfile_path(&f.path));
     files
 }
 
 /// Compute a line-by-line diff between two snapshots in pure Rust using `similar`.
 pub fn diff_two_texts(path: &str, old_text: &str, new_text: &str) -> DiffFileView {
     let diff = TextDiff::from_lines(old_text, new_text);
-    let mut additions = 0u32;
-    let mut deletions = 0u32;
-    let mut lines = Vec::new();
+    let mut file = DiffFileView {
+        path: path.to_string(),
+        additions: 0,
+        deletions: 0,
+        lines: Vec::new(),
+    };
+    let mut omitted_lines = 0usize;
 
     for change in diff.iter_all_changes() {
         let content = change
@@ -579,39 +659,55 @@ pub fn diff_two_texts(path: &str, old_text: &str, new_text: &str) -> DiffFileVie
             .trim_end_matches(&['\r', '\n'][..])
             .to_string();
         match change.tag() {
-            ChangeTag::Equal => lines.push(DiffLineView {
-                kind: DiffLineKind::Context,
-                old_line: change.old_index().map(|i| (i + 1) as u32),
-                new_line: change.new_index().map(|i| (i + 1) as u32),
-                content,
-            }),
-            ChangeTag::Delete => {
-                deletions += 1;
-                lines.push(DiffLineView {
-                    kind: DiffLineKind::Removed,
+            ChangeTag::Equal => push_capped_diff_line(
+                &mut file,
+                &mut omitted_lines,
+                DiffLineView {
+                    kind: DiffLineKind::Context,
                     old_line: change.old_index().map(|i| (i + 1) as u32),
-                    new_line: None,
-                    content,
-                });
-            }
-            ChangeTag::Insert => {
-                additions += 1;
-                lines.push(DiffLineView {
-                    kind: DiffLineKind::Added,
-                    old_line: None,
                     new_line: change.new_index().map(|i| (i + 1) as u32),
                     content,
-                });
+                },
+            ),
+            ChangeTag::Delete => {
+                file.deletions += 1;
+                push_capped_diff_line(
+                    &mut file,
+                    &mut omitted_lines,
+                    DiffLineView {
+                        kind: DiffLineKind::Removed,
+                        old_line: change.old_index().map(|i| (i + 1) as u32),
+                        new_line: None,
+                        content,
+                    },
+                );
+            }
+            ChangeTag::Insert => {
+                file.additions += 1;
+                push_capped_diff_line(
+                    &mut file,
+                    &mut omitted_lines,
+                    DiffLineView {
+                        kind: DiffLineKind::Added,
+                        old_line: None,
+                        new_line: change.new_index().map(|i| (i + 1) as u32),
+                        content,
+                    },
+                );
             }
         }
     }
 
-    DiffFileView {
-        path: path.to_string(),
-        additions,
-        deletions,
-        lines,
+    if omitted_lines > 0 {
+        file.lines.push(DiffLineView {
+            kind: DiffLineKind::Meta,
+            old_line: None,
+            new_line: None,
+            content: format!("… {omitted_lines} more diff lines omitted"),
+        });
     }
+
+    file
 }
 
 fn parse_hunk_header_numbers(header: &str) -> (u32, u32) {
@@ -642,6 +738,10 @@ pub struct TerminalSpanView {
     pub fg_hex: String,
     pub bg_hex: Option<String>,
     pub bold: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub inverse: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,7 +779,9 @@ impl TerminalGridEmulator {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let r = std::num::NonZeroU16::new(rows.max(4)).unwrap_or(std::num::NonZeroU16::MIN);
         let c = std::num::NonZeroU16::new(cols.max(20)).unwrap_or(std::num::NonZeroU16::MIN);
-        self.parser.screen_mut().set_size(r, c);
+        if self.parser.screen().size() != (r, c) {
+            self.parser.screen_mut().set_size(r, c);
+        }
     }
 
     pub fn clear(&mut self) {
@@ -721,11 +823,15 @@ impl TerminalGridEmulator {
                     (fg, bg)
                 };
                 let bold = cell.bold();
+                let underline = cell.underline();
+                let inverse = cell.inverse();
 
                 if let Some(last) = spans.last_mut()
                     && last.fg_hex == raw_fg
                     && last.bg_hex == raw_bg
                     && last.bold == bold
+                    && last.underline == underline
+                    && last.inverse == inverse
                 {
                     last.text.push_str(rendered);
                 } else {
@@ -734,6 +840,8 @@ impl TerminalGridEmulator {
                         fg_hex: raw_fg,
                         bg_hex: raw_bg,
                         bold,
+                        underline,
+                        inverse,
                     });
                 }
             }
@@ -741,6 +849,8 @@ impl TerminalGridEmulator {
             // Trim trailing default-background whitespace for lean native layout
             if let Some(last) = spans.last_mut()
                 && last.bg_hex.is_none()
+                && !last.underline
+                && !last.inverse
             {
                 let trimmed_len = last.text.trim_end_matches(' ').len();
                 last.text.truncate(trimmed_len);
@@ -841,6 +951,33 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
+    fn unified_diff_parser_caps_large_files_and_sorts_lockfiles_last() {
+        let mut raw = String::from(
+            "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,2 +1,502 @@\n",
+        );
+        for i in 0..500 {
+            raw.push_str(&format!("+pkg = \"{i}\"\n"));
+        }
+        raw.push_str(
+            "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,2 @@\n fn main() {}\n+fn helper() {}\n",
+        );
+        let files = parse_unified_diff(&raw);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert_eq!(files[0].additions, 1);
+        assert_eq!(files[1].path, "Cargo.lock");
+        assert_eq!(files[1].additions, 500);
+        assert_eq!(files[1].lines.len(), MAX_RENDERED_DIFF_LINES_PER_FILE + 1);
+        assert!(
+            files[1]
+                .lines
+                .last()
+                .map(|l| l.content.contains("omitted"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
     fn vt100_grid_coalesces_ansi_colored_spans() {
         let mut term = TerminalGridEmulator::new(80, 24);
         term.process(b"orbit$ \x1b[32mcargo test\x1b[0m\r\nPASS");
@@ -849,6 +986,21 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert_eq!(snap.rows_data[0].spans[0].text, "orbit$ ");
         assert_eq!(snap.rows_data[0].spans[1].text, "cargo test");
         assert_eq!(snap.rows_data[0].spans[1].fg_hex, "#4ADE80");
+        assert!(!snap.rows_data[0].spans[1].underline);
+        assert!(!snap.rows_data[0].spans[1].inverse);
         assert_eq!(snap.rows_data[1].spans[0].text, "PASS");
+    }
+
+    #[test]
+    fn vt100_grid_tracks_underline_and_inverse_attributes() {
+        let mut term = TerminalGridEmulator::new(80, 24);
+        term.process(b"\x1b[4mlink\x1b[0m \x1b[7mSEL\x1b[0m");
+        let snap = term.snapshot();
+        assert_eq!(snap.rows_data[0].spans.len(), 3);
+        assert_eq!(snap.rows_data[0].spans[0].text, "link");
+        assert!(snap.rows_data[0].spans[0].underline);
+        assert!(!snap.rows_data[0].spans[0].inverse);
+        assert_eq!(snap.rows_data[0].spans[2].text, "SEL");
+        assert!(snap.rows_data[0].spans[2].inverse);
     }
 }

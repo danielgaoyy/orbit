@@ -1,6 +1,6 @@
 {
   "name": "liborbit_ohos.so",
   "types": "./index.d.ts",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Orbit Rust Core N-API bindings for HarmonyOS 7+ (API 26)"
 }

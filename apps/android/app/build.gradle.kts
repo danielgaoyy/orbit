@@ -1,3 +1,5 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -6,15 +8,14 @@ plugins {
 
 android {
     namespace = "dev.orbit.android"
-    // Strictly aligned with Paseo (Expo SDK 57 / app.config.js): minSdk = 29, compileSdk = 36, targetSdk = 36
     compileSdk = 36
 
     defaultConfig {
         applicationId = "dev.orbit.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 2010
-        versionName = "0.2.1"
+        versionCode = 2020
+        versionName = "0.3.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
@@ -37,18 +38,22 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     buildFeatures {
         compose = true
+        buildConfig = true
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
     }
 }
 
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
@@ -56,6 +61,12 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
+    implementation(libs.androidx.material.icons.extended)
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
+    implementation(libs.zxing.core)
     implementation(libs.kotlinx.coroutines.android)
     implementation("${libs.jna.aar.get()}@aar")
 }

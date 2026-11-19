@@ -176,16 +176,22 @@ impl OrbitStore {
         // Non-destructive forward-compatible column migrations for pre-existing databases
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN effort_json TEXT", []);
         let _ = conn.execute("ALTER TABLE client_hosts ADD COLUMN meta_json TEXT", []);
-        // Self-heal client replica caches that previously collapsed turns via shared default item_ids
-        let _ = conn.execute(
-            "DELETE FROM client_replica_events
-             WHERE agent_id IN (
-                 SELECT DISTINCT agent_id FROM client_replica_events
-                 WHERE payload_json LIKE '%\"agy_msg_default\"%'
-                    OR payload_json LIKE '%\"agy_thought_default\"%'
-             )",
-            [],
-        );
+        // One-time schema v2 migration: self-heal legacy pre-v0.2.4 client replica caches once
+        let user_ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if user_ver < 2 {
+            let _ = conn.execute(
+                "DELETE FROM client_replica_events
+                 WHERE agent_id IN (
+                     SELECT DISTINCT agent_id FROM client_replica_events
+                     WHERE payload_json LIKE '%\"agy_msg_default\"%'
+                        OR payload_json LIKE '%\"agy_thought_default\"%'
+                 )",
+                [],
+            );
+            let _ = conn.execute_batch("PRAGMA user_version = 2;");
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -914,6 +920,13 @@ impl OrbitStore {
             "DELETE FROM client_projects WHERE project_id = ?1",
             params![project_id],
         )?;
+        Ok(())
+    }
+
+    /// Passive non-blocking WAL checkpoint safe to invoke when a mobile app enters background.
+    pub fn checkpoint_passive(&self) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
     }
 }

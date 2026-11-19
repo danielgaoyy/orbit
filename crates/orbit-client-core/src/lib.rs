@@ -8,8 +8,10 @@
 //! - Pure-Rust streaming Markdown AST, `syntect` syntax highlighting, Git diff model, and VT100 terminal grid
 
 pub mod app_core;
+pub mod catalog;
 pub mod desktop_ops;
 pub mod render;
+pub mod stage;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -566,7 +568,7 @@ async fn try_connect_ssh_tunnel(
 
     let guard = tokio::task::spawn_blocking(move || spawn_ssh_local_tunnel(&alias, port))
         .await
-        .map_err(|e| ClientCoreError::Handshake(format!("SSH 线程启动异常: {e}")))?
+        .map_err(|e| ClientCoreError::Handshake(format!("Failed to spawn SSH task: {e}")))?
         .map_err(ClientCoreError::Handshake)?;
 
     let shared_guard = Arc::new(guard);
@@ -575,7 +577,7 @@ async fn try_connect_ssh_tunnel(
         if shared_guard.has_exited() {
             let detail = shared_guard
                 .take_stderr_summary()
-                .unwrap_or_else(|| "SSH 隧道进程意外退出".into());
+                .unwrap_or_else(|| "SSH tunnel exited unexpectedly".into());
             return Err(ClientCoreError::Handshake(detail));
         }
         match tokio::time::timeout(
@@ -597,31 +599,119 @@ async fn try_connect_ssh_tunnel(
         tokio::time::sleep(Duration::from_millis(220)).await;
     }
 
-    Err(last_err.unwrap_or_else(|| ClientCoreError::Handshake("SSH 端口转发连接超时".into())))
+    Err(last_err.unwrap_or_else(|| {
+        ClientCoreError::Handshake("SSH port-forward connection timed out".into())
+    }))
+}
+
+fn endpoint_priority_tier(ep: &str) -> u8 {
+    let authority = ep
+        .trim()
+        .strip_prefix("ws://")
+        .or_else(|| ep.strip_prefix("wss://"))
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("");
+    let host = authority.split(':').next().unwrap_or("");
+    if host == "127.0.0.1" || host == "10.0.2.2" || host.eq_ignore_ascii_case("localhost") {
+        0
+    } else if host.starts_with("198.18.") || host.starts_with("198.19.") {
+        // RFC 2544 / Clash / Surge fake-IP TUN interfaces often accept TCP SYN then blackhole WS handshakes
+        3
+    } else if host.starts_with("192.168.139.") || host.starts_with("192.168.215.") {
+        // Common local VM / bridge virtual subnets
+        2
+    } else {
+        1
+    }
+}
+
+fn has_custom_direct_endpoint(profile: &SavedHostProfile) -> bool {
+    profile
+        .custom_direct_endpoint
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 async fn try_connect_direct_endpoints(
     profile: &SavedHostProfile,
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
-    let mut endpoints = Vec::new();
+    let has_custom = has_custom_direct_endpoint(profile);
+    // Tuple of (endpoint_url, is_configured_in_profile)
+    let mut raw_endpoints: Vec<(String, bool)> = Vec::new();
     if let Some(ref custom) = profile.custom_direct_endpoint
         && !custom.trim().is_empty()
     {
-        endpoints.push(custom.trim().to_string());
+        raw_endpoints.push((custom.trim().to_string(), true));
     }
-    endpoints.extend(profile.direct_endpoints.iter().cloned());
+    if (cfg!(target_os = "ios") && std::env::var_os("SIMULATOR_HOST_HOME").is_some())
+        || cfg!(target_env = "ohos")
+        || cfg!(target_os = "android")
+    {
+        raw_endpoints.push((
+            format!("ws://127.0.0.1:{}/ws", profile.remote_daemon_port),
+            false,
+        ));
+    }
+    if cfg!(target_os = "android") {
+        raw_endpoints.push((
+            format!("ws://10.0.2.2:{}/ws", profile.remote_daemon_port),
+            false,
+        ));
+    }
+    raw_endpoints.extend(
+        profile
+            .direct_endpoints
+            .iter()
+            .cloned()
+            .map(|ep| (ep, true)),
+    );
+
+    // Deduplicate while preserving order and promoting configured flag if present in profile
+    let mut endpoints: Vec<(String, bool)> = Vec::with_capacity(raw_endpoints.len());
+    for (ep, configured) in raw_endpoints {
+        if let Some(existing) = endpoints.iter_mut().find(|(e, _)| *e == ep) {
+            existing.1 |= configured;
+        } else {
+            endpoints.push((ep, configured));
+        }
+    }
+    if !has_custom {
+        endpoints.sort_by_key(|(ep, _)| endpoint_priority_tier(ep));
+    }
+    if endpoints.is_empty() {
+        return Err(ClientCoreError::Unreachable);
+    }
+
+    // Happy-Eyeballs concurrent racing (60ms stagger) so dead TUN/VM adapters never block LAN Wi-Fi
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, (ep, configured)) in endpoints.into_iter().enumerate() {
+        let host_id = profile.host_id.clone();
+        let rep = replica.clone();
+        let stagger_ms = (idx as u64) * 60;
+        set.spawn(async move {
+            if stagger_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+            }
+            let res = tokio::time::timeout(
+                Duration::from_millis(1500),
+                connect_direct_with_host_id(&host_id, &ep, rep, None),
+            )
+            .await;
+            (configured, res)
+        });
+    }
 
     let mut mismatch_err = None;
-    for ep in &endpoints {
-        match tokio::time::timeout(
-            Duration::from_millis(1200),
-            connect_direct_with_host_id(&profile.host_id, ep, replica.clone(), None),
-        )
-        .await
-        {
-            Ok(Ok(handle)) => return Ok(handle),
-            Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. })) => mismatch_err = Some(e),
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((_, Ok(Ok(handle)))) => {
+                set.abort_all();
+                return Ok(handle);
+            }
+            Ok((true, Ok(Err(e @ ClientCoreError::HostIdentityMismatch { .. })))) => {
+                mismatch_err = Some(e);
+            }
             _ => {}
         }
     }
@@ -655,12 +745,14 @@ pub async fn connect_smart(
                 )
                 .await
             } else {
-                Err(ClientCoreError::Handshake("尚未配置 E2EE 中继地址".into()))
+                Err(ClientCoreError::Handshake(
+                    "No E2EE relay URL configured".into(),
+                ))
             }
         }
         HostRouteMode::Auto => {
             let mut last_ssh_err = None;
-            if has_ssh && profile.custom_direct_endpoint.is_none() {
+            if has_ssh && !has_custom_direct_endpoint(profile) {
                 match try_connect_ssh_tunnel(profile, replica.clone()).await {
                     Ok(h) => return Ok(h),
                     Err(e) => last_ssh_err = Some(e),

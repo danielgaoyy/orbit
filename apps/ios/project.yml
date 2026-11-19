@@ -42,6 +42,12 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+        NSCameraUsageDescription: "Scan `orbit pair` QR codes to securely connect to your hosts."
+        CFBundleURLTypes:
+          - CFBundleTypeRole: Editor
+            CFBundleURLName: dev.orbit.app
+            CFBundleURLSchemes:
+              - orbit
         ITSAppUsesNonExemptEncryption: false
     settings:
       base:

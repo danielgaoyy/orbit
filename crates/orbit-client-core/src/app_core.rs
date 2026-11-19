@@ -179,11 +179,15 @@ pub enum TimelineItemView {
         #[serde(default)]
         badges: Vec<PromptBadge>,
         blocks: Vec<RichBlockView>,
+        #[serde(default)]
+        timestamp_ms: Option<i64>,
     },
     AssistantThinking {
         seq: u64,
         item_id: String,
         text: String,
+        #[serde(default)]
+        timestamp_ms: Option<i64>,
     },
     AssistantMessage {
         seq: u64,
@@ -191,6 +195,8 @@ pub enum TimelineItemView {
         text: String,
         streaming: bool,
         blocks: Vec<RichBlockView>,
+        #[serde(default)]
+        timestamp_ms: Option<i64>,
     },
     ToolCall {
         seq: u64,
@@ -198,7 +204,11 @@ pub enum TimelineItemView {
         status: ToolCallStatus,
         summary_title: String,
         detail: ToolCallDetail,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_descriptor: Option<crate::stage::ToolStepDescriptorView>,
         diff_files: Vec<DiffFileView>,
+        #[serde(default)]
+        timestamp_ms: Option<i64>,
     },
     PermissionRequest {
         seq: u64,
@@ -207,17 +217,23 @@ pub enum TimelineItemView {
         detail: ToolCallDetail,
         allowed_decisions: Vec<String>,
         resolved_decision: Option<String>,
+        #[serde(default)]
+        timestamp_ms: Option<i64>,
     },
     QuestionRequest {
         seq: u64,
         request_id: String,
         questions: Vec<QuestionItem>,
         resolved_answers: Option<Vec<Vec<String>>>,
+        #[serde(default)]
+        timestamp_ms: Option<i64>,
     },
     Notice {
         seq: u64,
         level: String,
         message: String,
+        #[serde(default)]
+        timestamp_ms: Option<i64>,
     },
 }
 
@@ -442,7 +458,6 @@ impl OrbitAppCore {
         if auto_discover_local_daemon
             && let Some(uri) = discover_local_daemon_pairing_uri()
             && let Ok(offer) = PairingOffer::from_qr_uri(&uri)
-            && !initial_hosts.contains_key(&offer.host_id)
         {
             let local_port = extract_ws_port(&offer.direct_endpoints).unwrap_or(6868);
             let mut endpoints = offer.direct_endpoints;
@@ -450,21 +465,29 @@ impl OrbitAppCore {
             if !endpoints.contains(&loopback) {
                 endpoints.insert(0, loopback);
             }
-            let mem = HostMemoryState::new(SavedHostProfile {
-                host_id: offer.host_id.clone(),
-                hostname: offer.hostname,
-                custom_name: None,
-                ssh_alias: None,
-                route_mode: HostRouteMode::Auto,
-                remote_daemon_port: local_port,
-                custom_direct_endpoint: None,
-                daemon_pubkey_b64: offer.daemon_pubkey_b64,
-                direct_endpoints: endpoints,
-                relay_url: offer.relay_url,
-                state: HostConnectionState::Disconnected,
-            });
-            let _ = store.upsert_client_host(&mem.to_stored_host());
-            initial_hosts.insert(offer.host_id, mem);
+            if let Some(existing) = initial_hosts.get_mut(&offer.host_id) {
+                if existing.profile.daemon_pubkey_b64 == offer.daemon_pubkey_b64 {
+                    existing.profile.direct_endpoints = endpoints;
+                    existing.profile.remote_daemon_port = local_port;
+                    let _ = store.upsert_client_host(&existing.to_stored_host());
+                }
+            } else {
+                let mem = HostMemoryState::new(SavedHostProfile {
+                    host_id: offer.host_id.clone(),
+                    hostname: offer.hostname,
+                    custom_name: None,
+                    ssh_alias: None,
+                    route_mode: HostRouteMode::Auto,
+                    remote_daemon_port: local_port,
+                    custom_direct_endpoint: None,
+                    daemon_pubkey_b64: offer.daemon_pubkey_b64,
+                    direct_endpoints: endpoints,
+                    relay_url: offer.relay_url,
+                    state: HostConnectionState::Disconnected,
+                });
+                let _ = store.upsert_client_host(&mem.to_stored_host());
+                initial_hosts.insert(offer.host_id, mem);
+            }
         }
 
         let mut initial_projects = HashMap::new();
@@ -497,6 +520,23 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.subscribers.lock() {
             guard.push(sub);
         }
+    }
+
+    pub fn subscribe_coalesced(&self, min_interval_ms: u64, sub: Arc<dyn CoreEventSubscriber>) {
+        if min_interval_ms == 0 {
+            self.subscribe(sub);
+            return;
+        }
+        let coalesced = Arc::new(CoalescingSubscriber::new(
+            sub,
+            self.runtime.handle().clone(),
+            Duration::from_millis(min_interval_ms),
+        ));
+        self.subscribe(coalesced);
+    }
+
+    pub fn discover_local_daemon_uri(&self) -> Option<String> {
+        discover_local_daemon_pairing_uri()
     }
 
     fn emit(&self, make_event: impl FnOnce(u64) -> CoreNotification) {
@@ -562,11 +602,36 @@ impl OrbitAppCore {
             last_created_agent_id: state.last_created_agent_id.clone(),
             replaced_optimistic_agents: state.replaced_optimistic_agents.clone(),
             quotas: state.quotas.clone(),
-            provider_catalogs: state.provider_catalogs.clone(),
+            provider_catalogs: crate::catalog::effective_provider_catalogs(
+                &state.provider_catalogs,
+            ),
             terminals: state.terminals.clone(),
             active_terminal_id: state.active_terminal_id.clone(),
             active_terminal_slot: state.active_terminal_slot,
         })
+    }
+
+    pub fn agent_stage(&self, host_id: &str, agent_id: &str) -> crate::stage::AgentStageView {
+        let tl = self.agent_timeline(host_id, agent_id);
+        let cwd = tl.agent.as_ref().map(|a| a.cwd.as_str());
+        let latest_seq = tl
+            .items
+            .iter()
+            .map(crate::stage::timeline_item_seq)
+            .max()
+            .unwrap_or_else(|| tl.agent.as_ref().map(|a| a.latest_seq).unwrap_or(0));
+        let (turns, pending_permissions, pending_questions, session_turn_diffs) =
+            crate::stage::process_timeline_for_stage(&tl.items, cwd);
+        crate::stage::AgentStageView {
+            revision: tl.revision,
+            host_id: tl.host_id,
+            agent: tl.agent,
+            turns,
+            pending_permissions,
+            pending_questions,
+            session_turn_diffs,
+            latest_seq,
+        }
     }
 
     pub fn agent_timeline(&self, host_id: &str, agent_id: &str) -> AgentTimelineView {
@@ -623,6 +688,7 @@ impl OrbitAppCore {
         }
 
         let agent_card = host_state.agents.get(agent_id).map(agent_to_card_view);
+        let agent_cwd = agent_card.as_ref().map(|a| a.cwd.clone());
         let events = host_state
             .timelines
             .get(agent_id)
@@ -666,6 +732,7 @@ impl OrbitAppCore {
             if since_seq > 0 && ev.seq <= since_seq {
                 continue;
             }
+            let ts_ms = Some(ev.timestamp.timestamp_millis());
             match &ev.payload {
                 TimelinePayload::UserPrompt {
                     message_id,
@@ -684,6 +751,7 @@ impl OrbitAppCore {
                         text: text.clone(),
                         badges: badges.clone(),
                         blocks,
+                        timestamp_ms: ts_ms,
                     });
                 }
                 TimelinePayload::AssistantThinking { item_id, text } => {
@@ -691,6 +759,7 @@ impl OrbitAppCore {
                         seq: ev.seq,
                         item_id: item_id.clone(),
                         text: text.clone(),
+                        timestamp_ms: ts_ms,
                     });
                 }
                 TimelinePayload::AssistantMessage {
@@ -710,6 +779,7 @@ impl OrbitAppCore {
                         text: text.clone(),
                         streaming: *streaming,
                         blocks,
+                        timestamp_ms: ts_ms,
                     });
                 }
                 TimelinePayload::ToolCall {
@@ -718,13 +788,22 @@ impl OrbitAppCore {
                     detail,
                 } => {
                     let (summary_title, diff_files) = summarize_tool_detail(detail);
+                    let step_descriptor = Some(crate::stage::describe_tool_detail(
+                        *status,
+                        &summary_title,
+                        detail,
+                        &diff_files,
+                        agent_cwd.as_deref(),
+                    ));
                     upserted_items.push(TimelineItemView::ToolCall {
                         seq: ev.seq,
                         call_id: call_id.clone(),
                         status: *status,
                         summary_title,
                         detail: detail.clone(),
+                        step_descriptor,
                         diff_files,
+                        timestamp_ms: ts_ms,
                     });
                 }
                 TimelinePayload::PermissionRequest {
@@ -740,6 +819,7 @@ impl OrbitAppCore {
                         detail: detail.clone(),
                         allowed_decisions: allowed_decisions.clone(),
                         resolved_decision: all_resolved_perms.get(request_id).cloned(),
+                        timestamp_ms: ts_ms,
                     });
                 }
                 TimelinePayload::QuestionRequest {
@@ -751,6 +831,7 @@ impl OrbitAppCore {
                         request_id: request_id.clone(),
                         questions: questions.clone(),
                         resolved_answers: all_resolved_questions.get(request_id).cloned(),
+                        timestamp_ms: ts_ms,
                     });
                 }
                 TimelinePayload::Notice { level, message } => {
@@ -758,6 +839,7 @@ impl OrbitAppCore {
                         seq: ev.seq,
                         level: level.clone(),
                         message: message.clone(),
+                        timestamp_ms: ts_ms,
                     });
                 }
                 TimelinePayload::PermissionResolved { .. }
@@ -802,16 +884,38 @@ impl OrbitAppCore {
             };
         };
 
-        let key = format!("{cwd}::{}", path.unwrap_or("__all__"));
-        let raw_diff = host_state.git_diffs.get(&key).cloned().unwrap_or_default();
+        let path_suffix = format!("::{}", path.unwrap_or("__all__"));
+        let exact_key = format!("{cwd}{path_suffix}");
+        let raw_diff = host_state
+            .git_diffs
+            .get(&exact_key)
+            .or_else(|| {
+                host_state.git_diffs.iter().find_map(|(k, v)| {
+                    let stored_cwd = k.strip_suffix(&path_suffix)?;
+                    cwd_paths_equivalent(stored_cwd, cwd).then_some(v)
+                })
+            })
+            .cloned()
+            .unwrap_or_default();
+        let status = host_state
+            .git_statuses
+            .get(cwd)
+            .or_else(|| {
+                host_state
+                    .git_statuses
+                    .iter()
+                    .find_map(|(k, v)| cwd_paths_equivalent(k, cwd).then_some(v))
+            })
+            .cloned();
         let diff_files = parse_unified_diff(&raw_diff);
+        let capped_raw_diff = truncate_utf8_prefix(&raw_diff, 32_768);
         GitReviewView {
             revision: rev,
             host_id: host_id.to_string(),
             cwd: cwd.to_string(),
-            status: host_state.git_statuses.get(cwd).cloned(),
+            status,
             selected_path: path.map(ToOwned::to_owned),
-            raw_diff,
+            raw_diff: capped_raw_diff,
             diff_files,
         }
     }
@@ -1526,7 +1630,6 @@ impl OrbitAppCore {
                 WireMessage::TerminalAttached { terminal, slot, .. } => {
                     state.active_terminal_id = Some(terminal.terminal_id.clone());
                     state.active_terminal_slot = slot;
-                    state.terminal_emulator.resize(terminal.cols, terminal.rows);
                     state
                         .terminals
                         .retain(|t| t.terminal_id != terminal.terminal_id);
@@ -1628,16 +1731,22 @@ impl OrbitAppCore {
         {
             match frame {
                 TerminalBinaryFrame::Output { slot, data } => {
-                    state.terminal_emulator.process(&data);
-                    raw_out = Some((slot, data));
+                    if slot == state.active_terminal_slot {
+                        state.terminal_emulator.process(&data);
+                        raw_out = Some((slot, data));
+                    }
                 }
                 TerminalBinaryFrame::Snapshot { slot, data } => {
-                    state.terminal_emulator.clear();
-                    state.terminal_emulator.process(&data);
-                    raw_out = Some((slot, data));
+                    if slot == state.active_terminal_slot {
+                        state.terminal_emulator.clear();
+                        state.terminal_emulator.process(&data);
+                        raw_out = Some((slot, data));
+                    }
                 }
-                TerminalBinaryFrame::Resize { cols, rows, .. } => {
-                    state.terminal_emulator.resize(cols, rows);
+                TerminalBinaryFrame::Resize { slot, cols, rows } => {
+                    if slot == state.active_terminal_slot {
+                        state.terminal_emulator.resize(cols, rows);
+                    }
                 }
                 TerminalBinaryFrame::Input { .. } => {}
             }
@@ -1741,8 +1850,8 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn refresh_provider_models(&self, host_id: &str, force_refresh: bool) {
-        self.dispatch_wire(
+    pub fn refresh_provider_models(self: &Arc<Self>, host_id: &str, force_refresh: bool) {
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::ListProviderModels {
                 request_id: Uuid::new_v4(),
@@ -1751,8 +1860,8 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn refresh_quotas(&self, host_id: &str) {
-        self.dispatch_wire(
+    pub fn refresh_quotas(self: &Arc<Self>, host_id: &str) {
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::RefreshQuotas {
                 request_id: Uuid::new_v4(),
@@ -1925,7 +2034,7 @@ impl OrbitAppCore {
         opt_id
     }
 
-    pub fn open_agent_timeline(&self, host_id: &str, agent_id: &str) {
+    pub fn open_agent_timeline(self: &Arc<Self>, host_id: &str, agent_id: &str) {
         if agent_id.starts_with("opt_") {
             return;
         }
@@ -1939,7 +2048,7 @@ impl OrbitAppCore {
                     .and_then(|list| list.iter().map(|e| e.seq).max())
             })
             .unwrap_or(0);
-        self.dispatch_wire(
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::SubscribeTimeline {
                 request_id: Uuid::new_v4(),
@@ -2204,8 +2313,8 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn fetch_git_status(&self, host_id: &str, cwd: &str) {
-        self.dispatch_wire(
+    pub fn fetch_git_status(self: &Arc<Self>, host_id: &str, cwd: &str) {
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::GetGitStatus {
                 request_id: Uuid::new_v4(),
@@ -2214,8 +2323,14 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn fetch_git_diff(&self, host_id: &str, cwd: &str, path: Option<&str>, staged: bool) {
-        self.dispatch_wire(
+    pub fn fetch_git_diff(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: Option<&str>,
+        staged: bool,
+    ) {
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::GetGitDiff {
                 request_id: Uuid::new_v4(),
@@ -2226,8 +2341,8 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn fetch_workspace_files(&self, host_id: &str, cwd: &str) {
-        self.dispatch_wire(
+    pub fn fetch_workspace_files(self: &Arc<Self>, host_id: &str, cwd: &str) {
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::ListWorkspaceFiles {
                 request_id: Uuid::new_v4(),
@@ -2242,19 +2357,25 @@ impl OrbitAppCore {
         };
         guard
             .get(host_id)
-            .and_then(|h| h.workspace_files.get(cwd))
+            .and_then(|h| {
+                h.workspace_files.get(cwd).or_else(|| {
+                    h.workspace_files
+                        .iter()
+                        .find_map(|(k, v)| cwd_paths_equivalent(k, cwd).then_some(v))
+                })
+            })
             .cloned()
             .unwrap_or_default()
     }
 
-    pub fn start_terminal(&self, host_id: &str, cwd: &str, cols: u16, rows: u16) {
+    pub fn start_terminal(self: &Arc<Self>, host_id: &str, cwd: &str, cols: u16, rows: u16) {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
             h.terminal_emulator.clear();
             h.terminal_emulator.resize(cols, rows);
         }
-        self.dispatch_wire(
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::CreateTerminal {
                 request_id: Uuid::new_v4(),
@@ -2266,8 +2387,18 @@ impl OrbitAppCore {
         );
     }
 
-    pub fn attach_terminal(&self, host_id: &str, terminal_id: &str, slot: u8) {
-        self.dispatch_wire(
+    pub fn attach_terminal(self: &Arc<Self>, host_id: &str, terminal_id: &str, slot: u8) {
+        let slot = slot.max(1);
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if h.active_terminal_id.as_deref() != Some(terminal_id) {
+                h.terminal_emulator.clear();
+            }
+            h.active_terminal_id = Some(terminal_id.to_string());
+            h.active_terminal_slot = slot;
+        }
+        self.dispatch_wire_queued(
             host_id,
             WireMessage::AttachTerminal {
                 request_id: Uuid::new_v4(),
@@ -2358,6 +2489,328 @@ impl OrbitAppCore {
             });
         }
     }
+
+    // --- Mobile App & Network Lifecycle Hooks (iOS / Android / HarmonyOS) ---
+
+    /// Invoked when a mobile client returns to foreground:
+    /// - Resets `reconnect_attempt = 0` and immediately reconnects disconnected hosts.
+    /// - Sends a fresh `Ping` + `ListWorkspaces` + `ListAgents` (plus active timeline catch-ups)
+    ///   on connected hosts so suspended mobile sockets immediately detect staleness or catch up.
+    pub fn on_app_foreground(self: &Arc<Self>) {
+        type ConnectedRefresh = (String, HostSessionHandle, Vec<(String, u64)>);
+
+        let mut disconnected_ids: Vec<String> = Vec::new();
+        let mut connected: Vec<ConnectedRefresh> = Vec::new();
+
+        if let Ok(mut guard) = self.hosts.write() {
+            for (host_id, h) in guard.iter_mut() {
+                if let Some(ref handle) = h.session
+                    && h.profile.state != HostConnectionState::Disconnected
+                {
+                    let resubs: Vec<(String, u64)> = h
+                        .timelines
+                        .iter()
+                        .filter(|(aid, _)| !aid.starts_with("opt_"))
+                        .map(|(aid, evs)| {
+                            let max_seq = evs.iter().map(|e| e.seq).max().unwrap_or(0);
+                            (aid.clone(), max_seq)
+                        })
+                        .collect();
+                    connected.push((host_id.clone(), handle.clone(), resubs));
+                } else {
+                    h.reconnect_attempt = 0;
+                    h.ssh_heal_attempted = false;
+                    if !h.connecting_in_flight {
+                        disconnected_ids.push(host_id.clone());
+                    }
+                }
+            }
+        }
+
+        for host_id in disconnected_ids {
+            self.connect_host_async(host_id);
+        }
+
+        for (host_id, handle, resubs) in connected {
+            let core = Arc::clone(self);
+            self.runtime.spawn(async move {
+                let ping_res = handle
+                    .send_wire(WireMessage::Ping {
+                        ts_ms: unix_ms_now(),
+                    })
+                    .await;
+                if ping_res.is_err() {
+                    core.handle_unexpected_disconnect(&host_id);
+                    return;
+                }
+                let _ = handle
+                    .send_wire(WireMessage::ListWorkspaces {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListAgents {
+                        request_id: Uuid::new_v4(),
+                        workspace_id: None,
+                    })
+                    .await;
+                for (agent_id, since_seq) in resubs {
+                    let _ = handle
+                        .send_wire(WireMessage::SubscribeTimeline {
+                            request_id: Uuid::new_v4(),
+                            agent_id,
+                            since_seq,
+                        })
+                        .await;
+                }
+            });
+        }
+    }
+
+    /// Invoked when a mobile client enters background: performs a passive SQLite WAL checkpoint
+    /// without dropping active WebSocket / Noise E2EE sessions.
+    pub fn on_app_background(&self) {
+        let _ = self.store.checkpoint_passive();
+    }
+
+    /// Invoked when mobile network reachability changes (e.g. Wi-Fi <-> Cellular):
+    /// - Resets `reconnect_attempt = 0` across all hosts.
+    /// - Connects disconnected hosts immediately and sends an immediate `Ping` on connected hosts
+    ///   so dead LAN sockets flip to E2EE Relay fast.
+    pub fn on_network_changed(self: &Arc<Self>) {
+        let mut disconnected_ids: Vec<String> = Vec::new();
+        let mut connected: Vec<(String, HostSessionHandle)> = Vec::new();
+
+        if let Ok(mut guard) = self.hosts.write() {
+            for (host_id, h) in guard.iter_mut() {
+                h.reconnect_attempt = 0;
+                h.ssh_heal_attempted = false;
+                if let Some(ref handle) = h.session
+                    && h.profile.state != HostConnectionState::Disconnected
+                {
+                    connected.push((host_id.clone(), handle.clone()));
+                } else if !h.connecting_in_flight {
+                    disconnected_ids.push(host_id.clone());
+                }
+            }
+        }
+
+        for host_id in disconnected_ids {
+            self.connect_host_async(host_id);
+        }
+
+        for (host_id, handle) in connected {
+            let core = Arc::clone(self);
+            self.runtime.spawn(async move {
+                if handle
+                    .send_wire(WireMessage::Ping {
+                        ts_ms: unix_ms_now(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    core.handle_unexpected_disconnect(&host_id);
+                }
+            });
+        }
+    }
+}
+
+fn normalize_cwd_trim(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed == "/" {
+        "/"
+    } else {
+        trimmed.trim_end_matches('/')
+    }
+}
+
+fn cwd_paths_equivalent(stored_cwd: &str, query_cwd: &str) -> bool {
+    let a = normalize_cwd_trim(stored_cwd);
+    let b = normalize_cwd_trim(query_cwd);
+    if a == b {
+        return true;
+    }
+    if let Some(rel) = b.strip_prefix("~/") {
+        let suffix = format!("/{rel}");
+        if a.ends_with(&suffix) {
+            return true;
+        }
+    }
+    if let Some(rel) = a.strip_prefix("~/") {
+        let suffix = format!("/{rel}");
+        if b.ends_with(&suffix) {
+            return true;
+        }
+    }
+    false
+}
+
+struct CoalesceSlot<T> {
+    last_emit: Option<tokio::time::Instant>,
+    pending: Option<T>,
+    timer_scheduled: bool,
+}
+
+impl<T> Default for CoalesceSlot<T> {
+    fn default() -> Self {
+        Self {
+            last_emit: None,
+            pending: None,
+            timer_scheduled: false,
+        }
+    }
+}
+
+struct CoalescingState {
+    timelines: HashMap<(String, String), CoalesceSlot<CoreNotification>>,
+    terminals: HashMap<(String, u8), CoalesceSlot<CoreNotification>>,
+}
+
+struct CoalescingSubscriber {
+    downstream: Arc<dyn CoreEventSubscriber>,
+    runtime_handle: tokio::runtime::Handle,
+    interval: Duration,
+    state: Arc<Mutex<CoalescingState>>,
+}
+
+impl CoalescingSubscriber {
+    fn new(
+        downstream: Arc<dyn CoreEventSubscriber>,
+        runtime_handle: tokio::runtime::Handle,
+        interval: Duration,
+    ) -> Self {
+        Self {
+            downstream,
+            runtime_handle,
+            interval,
+            state: Arc::new(Mutex::new(CoalescingState {
+                timelines: HashMap::new(),
+                terminals: HashMap::new(),
+            })),
+        }
+    }
+}
+
+impl CoreEventSubscriber for CoalescingSubscriber {
+    fn on_notification(&self, event: CoreNotification) {
+        match event {
+            CoreNotification::FleetChanged { .. }
+            | CoreNotification::HostChanged { .. }
+            | CoreNotification::GitChanged { .. } => {
+                self.downstream.on_notification(event);
+            }
+            CoreNotification::TimelineChanged {
+                ref host_id,
+                ref agent_id,
+                ..
+            } => {
+                let key = (host_id.clone(), agent_id.clone());
+                let now = tokio::time::Instant::now();
+                let mut emit_now = false;
+                let mut schedule_after: Option<Duration> = None;
+
+                if let Ok(mut guard) = self.state.lock() {
+                    let slot = guard.timelines.entry(key.clone()).or_default();
+                    let elapsed = slot.last_emit.map(|t| now.saturating_duration_since(t));
+                    if !slot.timer_scheduled && elapsed.is_none_or(|d| d >= self.interval) {
+                        slot.last_emit = Some(now);
+                        emit_now = true;
+                    } else {
+                        slot.pending = Some(event.clone());
+                        if !slot.timer_scheduled {
+                            slot.timer_scheduled = true;
+                            let wait = elapsed
+                                .map(|d| self.interval.saturating_sub(d))
+                                .unwrap_or(self.interval);
+                            schedule_after = Some(wait);
+                        }
+                    }
+                }
+
+                if emit_now {
+                    self.downstream.on_notification(event);
+                } else if let Some(wait) = schedule_after {
+                    let state = Arc::clone(&self.state);
+                    let downstream = Arc::clone(&self.downstream);
+                    self.runtime_handle.spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        let ready = state.lock().ok().and_then(|mut g| {
+                            let slot = g.timelines.get_mut(&key)?;
+                            slot.timer_scheduled = false;
+                            let ev = slot.pending.take()?;
+                            slot.last_emit = Some(tokio::time::Instant::now());
+                            Some(ev)
+                        });
+                        if let Some(ev) = ready {
+                            downstream.on_notification(ev);
+                        }
+                    });
+                }
+            }
+            CoreNotification::TerminalChanged {
+                revision,
+                ref host_id,
+                slot: term_slot,
+                ref raw_bytes,
+            } => {
+                let key = (host_id.clone(), term_slot);
+                let now = tokio::time::Instant::now();
+                let mut emit_now = false;
+                let mut schedule_after: Option<Duration> = None;
+
+                if let Ok(mut guard) = self.state.lock() {
+                    let slot = guard.terminals.entry(key.clone()).or_default();
+                    let elapsed = slot.last_emit.map(|t| now.saturating_duration_since(t));
+                    if !slot.timer_scheduled && elapsed.is_none_or(|d| d >= self.interval) {
+                        slot.last_emit = Some(now);
+                        emit_now = true;
+                    } else {
+                        match slot.pending {
+                            Some(CoreNotification::TerminalChanged {
+                                revision: ref mut prev_rev,
+                                raw_bytes: ref mut prev_bytes,
+                                ..
+                            }) => {
+                                *prev_rev = revision;
+                                prev_bytes.extend_from_slice(raw_bytes);
+                            }
+                            _ => {
+                                slot.pending = Some(event.clone());
+                            }
+                        }
+                        if !slot.timer_scheduled {
+                            slot.timer_scheduled = true;
+                            let wait = elapsed
+                                .map(|d| self.interval.saturating_sub(d))
+                                .unwrap_or(self.interval);
+                            schedule_after = Some(wait);
+                        }
+                    }
+                }
+
+                if emit_now {
+                    self.downstream.on_notification(event);
+                } else if let Some(wait) = schedule_after {
+                    let state = Arc::clone(&self.state);
+                    let downstream = Arc::clone(&self.downstream);
+                    self.runtime_handle.spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        let ready = state.lock().ok().and_then(|mut g| {
+                            let slot = g.terminals.get_mut(&key)?;
+                            slot.timer_scheduled = false;
+                            let ev = slot.pending.take()?;
+                            slot.last_emit = Some(tokio::time::Instant::now());
+                            Some(ev)
+                        });
+                        if let Some(ev) = ready {
+                            downstream.on_notification(ev);
+                        }
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn unix_ms_now() -> u64 {
@@ -2367,10 +2820,21 @@ fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn truncate_utf8_prefix(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 fn folder_basename(path: &str) -> String {
     let clean = path.trim_end_matches('/');
     if clean.is_empty() || clean == "~" {
-        return "主目录".to_string();
+        return "Home".to_string();
     }
     clean
         .rsplit('/')
@@ -2552,15 +3016,13 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
 
 fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
     let (status_label, is_running, is_awaiting_permission) = match &a.status {
-        AgentStatus::Initializing => ("启动中".to_string(), true, false),
-        AgentStatus::Idle => ("就绪".to_string(), false, false),
-        AgentStatus::Running { .. } => ("思考执行中".to_string(), true, false),
-        AgentStatus::AutonomousWakeup { source, .. } => {
-            (format!("后台唤醒 ({source})"), true, false)
-        }
-        AgentStatus::AwaitingPermission { .. } => ("等待确认".to_string(), false, true),
-        AgentStatus::Error { .. } => ("异常".to_string(), false, false),
-        AgentStatus::Closed => ("已结束".to_string(), false, false),
+        AgentStatus::Initializing => ("Starting".to_string(), true, false),
+        AgentStatus::Idle => ("Idle".to_string(), false, false),
+        AgentStatus::Running { .. } => ("Working".to_string(), true, false),
+        AgentStatus::AutonomousWakeup { source, .. } => (format!("Waking ({source})"), true, false),
+        AgentStatus::AwaitingPermission { .. } => ("Needs approval".to_string(), false, true),
+        AgentStatus::Error { .. } => ("Error".to_string(), false, false),
+        AgentStatus::Closed => ("Closed".to_string(), false, false),
     };
     AgentCardView {
         agent_id: a.agent_id.clone(),
@@ -2585,16 +3047,16 @@ fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
 fn summarize_tool_detail(detail: &ToolCallDetail) -> (String, Vec<DiffFileView>) {
     match detail {
         ToolCallDetail::Shell { command, .. } => (format!("$ {command}"), Vec::new()),
-        ToolCallDetail::FileRead { path, .. } => (format!("读取文件 {path}"), Vec::new()),
+        ToolCallDetail::FileRead { path, .. } => (format!("Read {path}"), Vec::new()),
         ToolCallDetail::FileEdit { path, unified_diff } => {
             let diffs = unified_diff
                 .as_deref()
                 .map(parse_unified_diff)
                 .unwrap_or_default();
-            (format!("编辑文件 {path}"), diffs)
+            (format!("Edit {path}"), diffs)
         }
-        ToolCallDetail::Search { query, .. } => (format!("检索代码 \"{query}\""), Vec::new()),
-        ToolCallDetail::Subagent { role, .. } => (format!("子代理协作 · {role}"), Vec::new()),
+        ToolCallDetail::Search { query, .. } => (format!("Search \"{query}\""), Vec::new()),
+        ToolCallDetail::Subagent { role, .. } => (format!("Subagent · {role}"), Vec::new()),
         ToolCallDetail::Generic { tool_name, .. } => (tool_name.clone(), Vec::new()),
     }
 }
@@ -2607,37 +3069,37 @@ fn default_client_models_map() -> HashMap<ProviderKind, Vec<ModelOption>> {
             ModelOption {
                 id: "gemini-4-carbon-high".into(),
                 label: "Gemini 4 Carbon (High)".into(),
-                description: Some("最新旗舰深度推理与多步编排模型".into()),
+                description: Some("Flagship deep reasoning and multi-step orchestration".into()),
                 is_default: true,
             },
             ModelOption {
                 id: "gemini-4-carbon-medium".into(),
                 label: "Gemini 4 Carbon (Medium)".into(),
-                description: Some("速度与深度均衡主力".into()),
+                description: Some("Balanced speed and reasoning depth".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "gemini-4-argon-high".into(),
                 label: "Gemini 4 Argon (High)".into(),
-                description: Some("高强度复杂代码推理".into()),
+                description: Some("High-intensity code architecture reasoning".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "claude-opus-5-5-high".into(),
                 label: "Claude Opus 5.5 (High)".into(),
-                description: Some("Antigravity 内置 Opus 深度模式".into()),
+                description: Some("Antigravity Opus deep reasoning mode".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "claude-sonnet-5-5-high".into(),
                 label: "Claude Sonnet 5.5 (High)".into(),
-                description: Some("高响应速度编码模式".into()),
+                description: Some("Responsive daily software engineering".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "gemini-3.8-flash-high".into(),
                 label: "Gemini 3.8 Flash (High)".into(),
-                description: Some("极速轻量任务响应".into()),
+                description: Some("Low-latency lightweight execution".into()),
                 is_default: false,
             },
         ],
@@ -2648,25 +3110,25 @@ fn default_client_models_map() -> HashMap<ProviderKind, Vec<ModelOption>> {
             ModelOption {
                 id: "gpt-6.1-sol".into(),
                 label: "GPT-6.1-Sol".into(),
-                description: Some("最新日常编码与重构主力模型".into()),
+                description: Some("Primary daily coding and refactoring model".into()),
                 is_default: true,
             },
             ModelOption {
                 id: "gpt-6-astra".into(),
                 label: "GPT-6-Astra".into(),
-                description: Some("高复杂度架构与攻坚模型".into()),
+                description: Some("Complex systems architecture model".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "gpt-6.1-terra".into(),
                 label: "GPT-6.1-Terra".into(),
-                description: Some("均衡稳定编码模型".into()),
+                description: Some("Balanced coding and computer-use model".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "gpt-5.4".into(),
                 label: "GPT-5.4".into(),
-                description: Some("通用高兼容 Codex 模型".into()),
+                description: Some("General-purpose compatible Codex model".into()),
                 is_default: false,
             },
         ],
@@ -2677,31 +3139,31 @@ fn default_client_models_map() -> HashMap<ProviderKind, Vec<ModelOption>> {
             ModelOption {
                 id: "claude-opus-5-5".into(),
                 label: "Opus 5.5".into(),
-                description: Some("最新旗舰深度架构与推理模型".into()),
+                description: Some("Flagship architecture and deep reasoning".into()),
                 is_default: true,
             },
             ModelOption {
                 id: "claude-sonnet-5-5".into(),
                 label: "Sonnet 5.5".into(),
-                description: Some("高速高质主力编码模型".into()),
+                description: Some("Fast, high-precision coding model".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "claude-opus-4-6".into(),
                 label: "Opus 4.6".into(),
-                description: Some("经典稳定复杂工程模型".into()),
+                description: Some("Proven complex engineering model".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "claude-sonnet-4-6".into(),
                 label: "Sonnet 4.6".into(),
-                description: Some("轻量快速日常开发".into()),
+                description: Some("Fast everyday development".into()),
                 is_default: false,
             },
             ModelOption {
                 id: "claude-haiku-5-5".into(),
                 label: "Haiku 5.5".into(),
-                description: Some("瞬时响应问答与检索".into()),
+                description: Some("Instant Q&A and codebase search".into()),
                 is_default: false,
             },
         ],
@@ -2992,5 +3454,91 @@ mod tests {
             }
             _ => panic!("unexpected timeline order: {list:?}"),
         }
+    }
+
+    #[test]
+    fn host_detail_effective_catalogs_agent_stage_and_lifecycle_hooks() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = PairingOffer {
+            host_id: "host_mobile".into(),
+            hostname: "mac-studio".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        let uri = offer.to_qr_uri().expect("uri");
+        core.pair_host(&uri).expect("pair");
+
+        let detail = core.host_detail("host_mobile").expect("detail");
+        assert_eq!(detail.provider_catalogs.len(), 3);
+
+        let opt_id = core.create_agent_with_config(CreateAgentRequest {
+            host_id: "host_mobile",
+            cwd: "/Users/jess/Code/orbit",
+            extra_dirs: Vec::new(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("claude-opus-5-5".into()),
+            effort: Some(ReasoningEffort::High),
+            mode: SessionMode::AcceptEdits,
+            initial_prompt: "Run clippy",
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch: None,
+        });
+
+        let stage = core.agent_stage("host_mobile", &opt_id);
+        assert_eq!(stage.turns.len(), 1);
+        assert!(stage.turns[0].user_prompt.is_some());
+
+        core.on_app_background();
+        core.on_app_foreground();
+        core.on_network_changed();
+    }
+
+    #[test]
+    fn subscribe_coalesced_throttles_timeline_bursts_while_passing_fleet_immediately() {
+        struct CountSub {
+            fleet_count: AtomicU64,
+            timeline_count: AtomicU64,
+        }
+        impl CoreEventSubscriber for CountSub {
+            fn on_notification(&self, event: CoreNotification) {
+                match event {
+                    CoreNotification::FleetChanged { .. } => {
+                        self.fleet_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    CoreNotification::TimelineChanged { .. } => {
+                        self.timeline_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let counter = Arc::new(CountSub {
+            fleet_count: AtomicU64::new(0),
+            timeline_count: AtomicU64::new(0),
+        });
+        core.subscribe_coalesced(30, counter.clone());
+
+        // FleetChanged passes immediately without coalescing
+        core.emit(|revision| CoreNotification::FleetChanged { revision });
+        core.emit(|revision| CoreNotification::FleetChanged { revision });
+        assert_eq!(counter.fleet_count.load(Ordering::SeqCst), 2);
+
+        // Emit 10 rapid TimelineChanged events for the same agent -> 1 immediate + 1 trailing flush
+        for _ in 0..10 {
+            core.emit(|revision| CoreNotification::TimelineChanged {
+                revision,
+                host_id: "h1".into(),
+                agent_id: "a1".into(),
+            });
+        }
+        assert_eq!(counter.timeline_count.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(counter.timeline_count.load(Ordering::SeqCst), 2);
     }
 }

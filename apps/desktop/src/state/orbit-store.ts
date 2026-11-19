@@ -4,6 +4,7 @@ import {
   resolveActiveModelSpec,
   resolveSupportedEffortForModel,
 } from "@/lib/model-catalog";
+import { isLocalHostCard } from "@/lib/projects";
 import {
   type AgentCardView,
   type AgentTimelineDeltaView,
@@ -95,14 +96,30 @@ export type DiffLayoutMode = "unified" | "split";
 export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
+export type WorkspacePanelMode = "conversation" | "automations";
+export type HostSettingsTab = "agents" | "usage" | "connection";
 export type SettingsSection =
   | "general"
-  | "hosts"
-  | "providers"
-  | "worktrees"
-  | "editor_terminal"
-  | "keybindings";
+  | "appearance"
+  | "shortcuts"
+  | "notifications"
+  | "add_host"
+  | `host:${string}:${HostSettingsTab}`;
+export type SettingsSectionTarget = SettingsSection | "hosts" | "providers";
 export type TerminalCursorStyle = "bar" | "block" | "underline";
+export type SidebarProjectSort = "recent" | "alphabetical";
+export type SidebarThreadFilter = "all" | "active_unread";
+
+export interface ArchivedThreadEntry {
+  key: string;
+  hostId: string;
+  agentId: string;
+  archivedAtMs: number;
+}
+
+export function threadScopeKey(hostId: string, agentId: string): string {
+  return `${hostId}::${agentId}`;
+}
 
 export interface OrbitUiState {
   fleet: FleetOverviewView;
@@ -111,6 +128,7 @@ export interface OrbitUiState {
   selectedAgentId: string | null;
   selectedWorkspaceCwd: string;
   isDraftNewSession: boolean;
+  sessionScrollNonce: number;
 
   // Draft new-session launch configuration
   draftProvider: ProviderKind;
@@ -145,8 +163,17 @@ export interface OrbitUiState {
 
   // Sidebar & Layout
   sidebarOpen: boolean;
+  sidebarDesktopOpenPref: boolean;
+  isCompactViewport: boolean;
   sidebarWidth: number;
   collapsedHostIds: Record<string, boolean>;
+  collapsedProjectIds: Record<string, boolean>;
+  pinnedThreadKeys: string[];
+  threadCustomTitles: Record<string, string>;
+  archivedThreads: Record<string, ArchivedThreadEntry>;
+  seenAgentSeqs: Record<string, number>;
+  sidebarProjectSort: SidebarProjectSort;
+  sidebarThreadFilter: SidebarThreadFilter;
 
   // Persistent Multi-Slot Terminal Dock
   terminalOpen: boolean;
@@ -157,10 +184,12 @@ export interface OrbitUiState {
 
   // Modals, Views & Overlays
   activeView: ActiveViewMode;
+  workspacePanel: WorkspacePanelMode;
   settingsSection: SettingsSection;
   commandPaletteOpen: boolean;
   pairDialogOpen: boolean;
   relayDialogOpen: boolean;
+  remoteFolderPickerHostId: string | null;
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
   toastNotice: string | null;
@@ -194,6 +223,12 @@ interface PersistedPrefs {
   terminalScrollback?: number;
   sidebarOpen?: boolean;
   sidebarWidth?: number;
+  pinnedThreadKeys?: string[];
+  threadCustomTitles?: Record<string, string>;
+  archivedThreads?: Record<string, ArchivedThreadEntry>;
+  seenAgentSeqs?: Record<string, number>;
+  sidebarProjectSort?: SidebarProjectSort;
+  sidebarThreadFilter?: SidebarThreadFilter;
   inspectorWidth?: number;
   terminalHeight?: number;
   diffLayout?: DiffLayoutMode;
@@ -216,36 +251,70 @@ function loadPrefs(): PersistedPrefs {
   }
 }
 
-function savePrefs(state: OrbitUiState): void {
+let savePrefsTimer: ReturnType<typeof setTimeout> | null = null;
+let savePrefsPending = false;
+
+function writePrefsNow(snap: OrbitUiState): void {
   if (typeof window === "undefined") return;
+  savePrefsPending = false;
+  if (savePrefsTimer !== null) {
+    clearTimeout(savePrefsTimer);
+    savePrefsTimer = null;
+  }
   try {
     const payload: PersistedPrefs = {
-      theme: state.theme,
-      enterToSend: state.enterToSend,
-      notifyOnApproval: state.notifyOnApproval,
-      notifyOnTurnComplete: state.notifyOnTurnComplete,
-      coalesceExploration: state.coalesceExploration,
-      worktreeBranchPrefix: state.worktreeBranchPrefix,
-      preferredEditor: state.preferredEditor,
-      terminalFontSize: state.terminalFontSize,
-      terminalCursorStyle: state.terminalCursorStyle,
-      terminalScrollback: state.terminalScrollback,
-      sidebarOpen: state.sidebarOpen,
-      sidebarWidth: state.sidebarWidth,
-      inspectorWidth: state.inspectorWidth,
-      terminalHeight: state.terminalHeight,
-      diffLayout: state.diffLayout,
-      draftProvider: state.draftProvider,
-      draftModels: state.draftModels,
-      draftEffort: state.draftEffort,
-      draftMode: state.draftMode,
-      draftUseWorktree: state.draftUseWorktree,
-      promptHistory: state.promptHistory.slice(-30),
+      theme: snap.theme,
+      enterToSend: snap.enterToSend,
+      notifyOnApproval: snap.notifyOnApproval,
+      notifyOnTurnComplete: snap.notifyOnTurnComplete,
+      coalesceExploration: snap.coalesceExploration,
+      worktreeBranchPrefix: snap.worktreeBranchPrefix,
+      preferredEditor: snap.preferredEditor,
+      terminalFontSize: snap.terminalFontSize,
+      terminalCursorStyle: snap.terminalCursorStyle,
+      terminalScrollback: snap.terminalScrollback,
+      sidebarOpen: snap.sidebarDesktopOpenPref,
+      sidebarWidth: snap.sidebarWidth,
+      pinnedThreadKeys: snap.pinnedThreadKeys,
+      threadCustomTitles: snap.threadCustomTitles,
+      archivedThreads: snap.archivedThreads,
+      seenAgentSeqs: snap.seenAgentSeqs,
+      sidebarProjectSort: snap.sidebarProjectSort,
+      sidebarThreadFilter: snap.sidebarThreadFilter,
+      inspectorWidth: snap.inspectorWidth,
+      terminalHeight: snap.terminalHeight,
+      diffLayout: snap.diffLayout,
+      draftProvider: snap.draftProvider,
+      draftModels: snap.draftModels,
+      draftEffort: snap.draftEffort,
+      draftMode: snap.draftMode,
+      draftUseWorktree: snap.draftUseWorktree,
+      promptHistory: snap.promptHistory.slice(-30),
     };
     window.localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(payload));
   } catch {
     // Ignore storage quota errors
   }
+}
+
+function scheduleSavePrefs(): void {
+  if (typeof window === "undefined") return;
+  savePrefsPending = true;
+  if (savePrefsTimer !== null) return;
+  savePrefsTimer = setTimeout(() => {
+    savePrefsTimer = null;
+    if (savePrefsPending) {
+      writePrefsNow(state);
+    }
+  }, 180);
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeunload", () => {
+    if (savePrefsPending) {
+      writePrefsNow(state);
+    }
+  });
 }
 
 function detectSystemTheme(): ResolvedTheme {
@@ -305,13 +374,21 @@ function sanitizeSavedModel(slug: string | null | undefined): string | null {
   return slug;
 }
 
+const COMPACT_VIEWPORT_COLLAPSE_PX = 800;
+const COMPACT_VIEWPORT_EXPAND_PX = 824;
+
+const initialDesktopSidebarOpenPref = initialPrefs.sidebarOpen ?? true;
+const initialIsCompactViewport =
+  typeof window !== "undefined" ? window.innerWidth < COMPACT_VIEWPORT_COLLAPSE_PX : false;
+
 let state: OrbitUiState = {
-  fleet: { revision: 0, total_pending_approvals: 0, hosts: [] },
+  fleet: { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] },
   hostDetails: {},
   selectedHostId: null,
   selectedAgentId: null,
   selectedWorkspaceCwd: "",
   isDraftNewSession: false,
+  sessionScrollNonce: 0,
 
   draftProvider: initialPrefs.draftProvider ?? "codex",
   draftModels: {
@@ -347,7 +424,9 @@ let state: OrbitUiState = {
   selectedDiffPath: null,
   gitReviews: {},
 
-  sidebarOpen: initialPrefs.sidebarOpen ?? true,
+  sidebarOpen: initialIsCompactViewport ? false : initialDesktopSidebarOpenPref,
+  sidebarDesktopOpenPref: initialDesktopSidebarOpenPref,
+  isCompactViewport: initialIsCompactViewport,
   sidebarWidth:
     initialPrefs.sidebarWidth &&
     initialPrefs.sidebarWidth !== 248 &&
@@ -356,6 +435,13 @@ let state: OrbitUiState = {
       ? initialPrefs.sidebarWidth
       : 256,
   collapsedHostIds: {},
+  collapsedProjectIds: {},
+  pinnedThreadKeys: initialPrefs.pinnedThreadKeys ?? [],
+  threadCustomTitles: initialPrefs.threadCustomTitles ?? {},
+  archivedThreads: initialPrefs.archivedThreads ?? {},
+  seenAgentSeqs: initialPrefs.seenAgentSeqs ?? {},
+  sidebarProjectSort: initialPrefs.sidebarProjectSort ?? "recent",
+  sidebarThreadFilter: initialPrefs.sidebarThreadFilter ?? "all",
 
   terminalOpen: false,
   terminalHeight: initialPrefs.terminalHeight ?? 260,
@@ -364,10 +450,12 @@ let state: OrbitUiState = {
   terminalFocused: false,
 
   activeView: "workspace",
+  workspacePanel: "conversation",
   settingsSection: "general",
   commandPaletteOpen: false,
   pairDialogOpen: false,
   relayDialogOpen: false,
+  remoteFolderPickerHostId: null,
   sshHosts: [],
   externalEditors: [],
   toastNotice: null,
@@ -380,13 +468,67 @@ let state: OrbitUiState = {
   coalesceExploration: initialPrefs.coalesceExploration ?? true,
   worktreeBranchPrefix: initialPrefs.worktreeBranchPrefix ?? "auto",
   preferredEditor: initialPrefs.preferredEditor ?? null,
-  terminalFontSize: initialPrefs.terminalFontSize ?? 12.5,
+  terminalFontSize:
+    initialPrefs.terminalFontSize !== undefined
+      ? Math.min(18, Math.max(10, Math.round(initialPrefs.terminalFontSize)))
+      : 13,
   terminalCursorStyle: initialPrefs.terminalCursorStyle ?? "bar",
   terminalScrollback: initialPrefs.terminalScrollback ?? 5000,
 };
 
 const listeners = new Set<() => void>();
+const composerDraftListeners = new Set<() => void>();
 const composerFocusListeners = new Set<() => void>();
+
+// Coalesced single-flight gates so daemon bursts never pile up overlapping IPC roundtrips or duplicate renders
+interface TimelinePullGate {
+  inFlight: boolean;
+  queued: boolean;
+  forceFull: boolean;
+  rafId: number | null;
+}
+interface SimpleSyncGate {
+  inFlight: boolean;
+  queued: boolean;
+  rafId: number | null;
+}
+const timelinePullGates = new Map<string, TimelinePullGate>();
+const hostSyncGates = new Map<string, SimpleSyncGate>();
+const fleetSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
+
+function scheduleCoalescedGate(gate: SimpleSyncGate, run: () => Promise<void>): void {
+  if (gate.inFlight) {
+    gate.queued = true;
+    return;
+  }
+  if (gate.rafId !== null) return;
+
+  const exec = async () => {
+    gate.rafId = null;
+    if (gate.inFlight) {
+      gate.queued = true;
+      return;
+    }
+    gate.inFlight = true;
+    try {
+      while (true) {
+        gate.queued = false;
+        await run();
+        if (!gate.queued) break;
+      }
+    } finally {
+      gate.inFlight = false;
+    }
+  };
+
+  if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+    gate.rafId = window.requestAnimationFrame(() => {
+      void exec();
+    });
+  } else {
+    void exec();
+  }
+}
 
 // Terminal raw stream ring buffers and subscribers per `hostId::slot`
 interface TerminalStreamChannel {
@@ -401,12 +543,22 @@ function emitChange(): void {
   }
 }
 
+function emitComposerDraftChange(): void {
+  for (const l of composerDraftListeners) {
+    l();
+  }
+}
+
 function setState(updater: (prev: OrbitUiState) => OrbitUiState, persist = false): void {
-  const next = updater(state);
-  if (next === state) return;
+  const prev = state;
+  const next = updater(prev);
+  if (next === prev) return;
   state = next;
   if (persist) {
-    savePrefs(state);
+    scheduleSavePrefs();
+  }
+  if (next.composerDrafts !== prev.composerDrafts) {
+    emitComposerDraftChange();
   }
   emitChange();
 }
@@ -619,6 +771,20 @@ async function drainPromptQueueIfIdle(hostId: string, detail: HostDetailView): P
   }
 }
 
+function resolveSettingsSectionTarget(
+  s: OrbitUiState,
+  section?: SettingsSectionTarget,
+): SettingsSection {
+  const targetHostId = s.selectedHostId ?? s.fleet.hosts[0]?.host_id ?? null;
+  if (section === "hosts") {
+    return targetHostId ? `host:${targetHostId}:connection` : "add_host";
+  }
+  if (section === "providers") {
+    return targetHostId ? `host:${targetHostId}:agents` : "general";
+  }
+  return section ?? s.settingsSection;
+}
+
 export const orbitActions = {
   async init(): Promise<void> {
     if (initialized) return;
@@ -630,16 +796,49 @@ export const orbitActions = {
     ]);
     setState((s) => ({ ...s, externalEditors: editors, sshHosts: sshList }));
 
-    await orbitActions.reloadFleetAndHosts();
+    await orbitActions.reloadFleetAndHosts(true);
 
     await orbitIpc.subscribe((ev: CoreNotification) => {
       if (ev.kind === "fleet_changed") {
-        void orbitActions.reloadFleetAndHosts();
+        scheduleCoalescedGate(fleetSyncGate, () => orbitActions.reloadFleetAndHosts(false));
       } else if (ev.kind === "host_changed") {
-        void orbitActions.reloadFleetOnly();
-        void orbitActions.reloadHostDetail(ev.host_id);
+        let gate = hostSyncGates.get(ev.host_id);
+        if (!gate) {
+          gate = { inFlight: false, queued: false, rafId: null };
+          hostSyncGates.set(ev.host_id, gate);
+        }
+        const hostId = ev.host_id;
+        scheduleCoalescedGate(gate, () => orbitActions.reloadHostDetail(hostId, true));
       } else if (ev.kind === "timeline_changed") {
-        void orbitActions.pullTimelineDelta(ev.host_id, ev.agent_id);
+        // Only stream live timeline deltas for the actively viewed session;
+        // background sessions catch up cleanly from `latestSeq` when selected.
+        if (
+          !state.isDraftNewSession &&
+          ev.host_id === state.selectedHostId &&
+          ev.agent_id === state.selectedAgentId
+        ) {
+          const tlKey = `${ev.host_id}::${ev.agent_id}`;
+          let gate = timelinePullGates.get(tlKey);
+          if (!gate) {
+            gate = { inFlight: false, queued: false, forceFull: false, rafId: null };
+            timelinePullGates.set(tlKey, gate);
+          }
+          if (gate.inFlight) {
+            gate.queued = true;
+          } else if (gate.rafId === null) {
+            const hid = ev.host_id;
+            const aid = ev.agent_id;
+            if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+              gate.rafId = window.requestAnimationFrame(() => {
+                const curGate = timelinePullGates.get(tlKey);
+                if (curGate) curGate.rafId = null;
+                void orbitActions.pullTimelineDelta(hid, aid);
+              });
+            } else {
+              void orbitActions.pullTimelineDelta(hid, aid);
+            }
+          }
+        }
       } else if (ev.kind === "git_changed") {
         if (ev.host_id === state.selectedHostId && ev.cwd === state.selectedWorkspaceCwd) {
           void orbitActions.loadGitReviewSnapshot(ev.host_id, ev.cwd, state.selectedDiffPath);
@@ -677,7 +876,7 @@ export const orbitActions = {
     syncAttentionIndicators(state.fleet, state.hostDetails);
   },
 
-  async reloadFleetAndHosts(): Promise<void> {
+  async reloadFleetAndHosts(initialBootstrap = false): Promise<void> {
     const snap = await orbitIpc.getFleetOverview();
     const targetHostId = state.selectedHostId ?? snap.hosts[0]?.host_id ?? null;
 
@@ -702,12 +901,30 @@ export const orbitActions = {
 
       let nextAgentId = s.selectedAgentId;
       let nextDraft = s.isDraftNewSession;
-      if (!s.isDraftNewSession && activeDetail) {
+      if (!s.isDraftNewSession && activeDetail && activeHostId) {
         const stillExists =
-          nextAgentId && activeDetail.agents.some((a) => a.agent_id === nextAgentId);
+          nextAgentId &&
+          !s.archivedThreads[threadScopeKey(activeHostId, nextAgentId)] &&
+          activeDetail.agents.some((a) => a.agent_id === nextAgentId);
         if (!stillExists) {
-          nextAgentId = activeDetail.agents[0]?.agent_id ?? null;
+          const firstVisible = activeDetail.agents.find(
+            (a) => !s.archivedThreads[threadScopeKey(activeHostId, a.agent_id)],
+          );
+          nextAgentId = firstVisible?.agent_id ?? null;
           nextDraft = nextAgentId === null;
+        }
+      }
+
+      const nextSeenSeqs: Record<string, number> = { ...s.seenAgentSeqs };
+      for (const [hid, det] of Object.entries(nextDetails)) {
+        for (const ag of det.agents) {
+          const k = threadScopeKey(hid, ag.agent_id);
+          if (nextSeenSeqs[k] === undefined) {
+            nextSeenSeqs[k] = ag.latest_seq;
+          }
+          if (!nextDraft && hid === activeHostId && ag.agent_id === nextAgentId) {
+            nextSeenSeqs[k] = Math.max(nextSeenSeqs[k] ?? 0, ag.latest_seq);
+          }
         }
       }
 
@@ -732,24 +949,33 @@ export const orbitActions = {
         selectedWorkspaceCwd: nextCwd,
         isDraftNewSession: nextDraft,
         draftProvider: nextDraftProvider,
+        seenAgentSeqs: nextSeenSeqs,
       };
-    });
+    }, true);
 
     syncAttentionIndicators(state.fleet, state.hostDetails);
 
     if (state.selectedHostId) {
-      void orbitIpc.refreshQuotas(state.selectedHostId);
+      if (initialBootstrap) {
+        void orbitIpc.refreshQuotas(state.selectedHostId);
+      }
       if (state.selectedAgentId && !state.isDraftNewSession) {
-        void orbitIpc.openAgentTimeline(state.selectedHostId, state.selectedAgentId);
-        void orbitActions.pullTimelineDelta(state.selectedHostId, state.selectedAgentId, true);
+        const tlKey = `${state.selectedHostId}::${state.selectedAgentId}`;
+        if (initialBootstrap || !state.timelines[tlKey]) {
+          void orbitIpc.openAgentTimeline(state.selectedHostId, state.selectedAgentId);
+          void orbitActions.pullTimelineDelta(state.selectedHostId, state.selectedAgentId, true);
+        }
       }
     }
   },
 
-  async reloadHostDetail(hostId: string): Promise<void> {
-    const detail = await orbitIpc.getHostDetail(hostId);
+  async reloadHostDetail(hostId: string, includeFleetOverview = false): Promise<void> {
+    const [detail, overview] = includeFleetOverview
+      ? await Promise.all([orbitIpc.getHostDetail(hostId), orbitIpc.getFleetOverview()])
+      : [await orbitIpc.getHostDetail(hostId), null];
     if (!detail) return;
 
+    const hadPrevDetail = Boolean(state.hostDetails[hostId]);
     const prevAgents = state.hostDetails[hostId]?.agents ?? [];
     const newestCreated =
       state.selectedHostId === hostId && state.isDraftNewSession
@@ -773,6 +999,7 @@ export const orbitActions = {
       }
     }
 
+    let seenMutated = false;
     setState((s) => {
       const nextDetails = { ...s.hostDetails, [hostId]: detail };
       let nextAgentId = s.selectedAgentId;
@@ -784,9 +1011,43 @@ export const orbitActions = {
         nextDraft = false;
         nextCwd = newestCreated.cwd;
       } else if (s.selectedHostId === hostId && !s.isDraftNewSession) {
-        if (!nextAgentId || !detail.agents.some((a) => a.agent_id === nextAgentId)) {
-          nextAgentId = detail.agents[0]?.agent_id ?? null;
+        if (
+          !nextAgentId ||
+          s.archivedThreads[threadScopeKey(hostId, nextAgentId)] ||
+          !detail.agents.some((a) => a.agent_id === nextAgentId)
+        ) {
+          const firstVisible = detail.agents.find(
+            (a) => !s.archivedThreads[threadScopeKey(hostId, a.agent_id)],
+          );
+          nextAgentId = firstVisible?.agent_id ?? null;
           nextDraft = nextAgentId === null;
+        }
+      }
+
+      let nextSeenSeqs = s.seenAgentSeqs;
+      for (const ag of detail.agents) {
+        const k = threadScopeKey(hostId, ag.agent_id);
+        const isCurrentlyViewing =
+          s.workspacePanel === "conversation" &&
+          !nextDraft &&
+          s.selectedHostId === hostId &&
+          nextAgentId === ag.agent_id;
+        if (isCurrentlyViewing) {
+          const prevSeen = nextSeenSeqs[k] ?? 0;
+          if (ag.latest_seq > prevSeen || nextSeenSeqs[k] === undefined) {
+            if (!seenMutated) {
+              nextSeenSeqs = { ...nextSeenSeqs };
+              seenMutated = true;
+            }
+            nextSeenSeqs[k] = Math.max(prevSeen, ag.latest_seq);
+          }
+        } else if (nextSeenSeqs[k] === undefined) {
+          if (!seenMutated) {
+            nextSeenSeqs = { ...nextSeenSeqs };
+            seenMutated = true;
+          }
+          // Seed pre-existing historical agents as seen on initial hydration; mark newly spawned background agents as unseen (`0`)
+          nextSeenSeqs[k] = hadPrevDetail ? 0 : ag.latest_seq;
         }
       }
 
@@ -821,6 +1082,12 @@ export const orbitActions = {
 
       return {
         ...s,
+        ...(overview
+          ? {
+              fleet: overview,
+              selectedHostId: s.selectedHostId ?? overview.hosts[0]?.host_id ?? null,
+            }
+          : {}),
         hostDetails: nextDetails,
         selectedAgentId: nextAgentId,
         isDraftNewSession: nextDraft,
@@ -828,8 +1095,9 @@ export const orbitActions = {
         draftProvider: nextDraftProvider,
         terminalTabs: nextTabs,
         activeTerminalTabKey: nextActiveTab,
+        seenAgentSeqs: nextSeenSeqs,
       };
-    });
+    }, seenMutated);
 
     syncAttentionIndicators(state.fleet, state.hostDetails);
     void drainPromptQueueIfIdle(hostId, detail);
@@ -842,21 +1110,94 @@ export const orbitActions = {
 
   async pullTimelineDelta(hostId: string, agentId: string, forceFull = false): Promise<void> {
     const tlKey = `${hostId}::${agentId}`;
-    const existing = state.timelines[tlKey];
-    const sinceSeq = forceFull || !existing ? 0 : existing.latestSeq;
-    const delta = await orbitIpc.getAgentTimelineDelta(hostId, agentId, sinceSeq);
-    setState((s) => ({
-      ...s,
-      timelines: {
-        ...s.timelines,
-        [tlKey]: mergeTimelineDelta(s.timelines[tlKey], delta, sinceSeq === 0),
-      },
-    }));
+    let gate = timelinePullGates.get(tlKey);
+    if (!gate) {
+      gate = { inFlight: false, queued: false, forceFull: false, rafId: null };
+      timelinePullGates.set(tlKey, gate);
+    }
+    if (gate.rafId !== null && typeof window !== "undefined") {
+      window.cancelAnimationFrame(gate.rafId);
+      gate.rafId = null;
+    }
+    if (gate.inFlight) {
+      gate.queued = true;
+      gate.forceFull = gate.forceFull || forceFull;
+      return;
+    }
+
+    gate.inFlight = true;
+    let nextForceFull = forceFull;
+
+    try {
+      while (true) {
+        gate.queued = false;
+        gate.forceFull = false;
+
+        const existing = state.timelines[tlKey];
+        const sinceSeq = nextForceFull || !existing ? 0 : existing.latestSeq;
+        const delta = await orbitIpc.getAgentTimelineDelta(hostId, agentId, sinceSeq);
+
+        const prevAgent = existing?.agent ?? null;
+        const nextAgent = delta.agent;
+        const agentChanged =
+          nextAgent !== null &&
+          (prevAgent === null ||
+            prevAgent.status_label !== nextAgent.status_label ||
+            prevAgent.latest_seq !== nextAgent.latest_seq ||
+            prevAgent.is_running !== nextAgent.is_running ||
+            prevAgent.is_awaiting_permission !== nextAgent.is_awaiting_permission ||
+            prevAgent.model !== nextAgent.model ||
+            prevAgent.effort !== nextAgent.effort ||
+            prevAgent.title !== nextAgent.title ||
+            prevAgent.cwd !== nextAgent.cwd ||
+            prevAgent.updated_at_rfc3339 !== nextAgent.updated_at_rfc3339 ||
+            JSON.stringify(prevAgent.mode) !== JSON.stringify(nextAgent.mode));
+
+        const hasChanges =
+          sinceSeq === 0 ||
+          delta.upserted_items.length > 0 ||
+          Object.keys(delta.resolved_permissions).length > 0 ||
+          Object.keys(delta.resolved_questions).length > 0 ||
+          agentChanged;
+
+        if (hasChanges) {
+          setState((s) => {
+            const merged = mergeTimelineDelta(s.timelines[tlKey], delta, sinceSeq === 0);
+            const isViewing =
+              s.workspacePanel === "conversation" &&
+              !s.isDraftNewSession &&
+              s.selectedHostId === hostId &&
+              s.selectedAgentId === agentId;
+            const prevSeen = s.seenAgentSeqs[tlKey] ?? 0;
+            const nextSeenSeqs =
+              isViewing && merged.latestSeq > prevSeen
+                ? { ...s.seenAgentSeqs, [tlKey]: merged.latestSeq }
+                : s.seenAgentSeqs;
+            return {
+              ...s,
+              timelines: {
+                ...s.timelines,
+                [tlKey]: merged,
+              },
+              seenAgentSeqs: nextSeenSeqs,
+            };
+          });
+        }
+
+        if (!gate.queued) break;
+        nextForceFull = gate.forceFull;
+      }
+    } finally {
+      gate.inFlight = false;
+    }
   },
 
   selectHost(hostId: string): void {
     const detail = state.hostDetails[hostId];
-    const firstAgent = detail?.agents[0] ?? null;
+    const firstAgent =
+      detail?.agents.find(
+        (a) => !state.archivedThreads[threadScopeKey(hostId, a.agent_id)],
+      ) ?? null;
     const nextCwd =
       firstAgent?.cwd ??
       detail?.workspaces[0]?.cwd ??
@@ -864,16 +1205,34 @@ export const orbitActions = {
       "~";
     const avail = detail?.host.available_providers ?? [];
 
-    setState((s) => ({
-      ...s,
-      selectedHostId: hostId,
-      selectedAgentId: firstAgent?.agent_id ?? null,
-      isDraftNewSession: firstAgent === null,
-      selectedWorkspaceCwd: nextCwd,
-      selectedDiffPath: null,
-      draftProvider:
-        avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
-    }));
+    setState(
+      (s) => {
+        const nextSeenSeqs = firstAgent
+          ? {
+              ...s.seenAgentSeqs,
+              [threadScopeKey(hostId, firstAgent.agent_id)]: Math.max(
+                s.seenAgentSeqs[threadScopeKey(hostId, firstAgent.agent_id)] ?? 0,
+                firstAgent.latest_seq,
+              ),
+            }
+          : s.seenAgentSeqs;
+        return {
+          ...s,
+          activeView: "workspace",
+          workspacePanel: "conversation",
+          selectedHostId: hostId,
+          selectedAgentId: firstAgent?.agent_id ?? null,
+          isDraftNewSession: firstAgent === null,
+          sessionScrollNonce: s.sessionScrollNonce + 1,
+          selectedWorkspaceCwd: nextCwd,
+          selectedDiffPath: null,
+          seenAgentSeqs: nextSeenSeqs,
+          draftProvider:
+            avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
+        };
+      },
+      Boolean(firstAgent),
+    );
 
     void orbitIpc.refreshQuotas(hostId);
     if (firstAgent) {
@@ -889,16 +1248,39 @@ export const orbitActions = {
     const detail = state.hostDetails[hostId];
     const ag = detail?.agents.find((a) => a.agent_id === agentId);
     const nextCwd = ag?.cwd ?? state.selectedWorkspaceCwd;
+    const tKey = threadScopeKey(hostId, agentId);
 
-    setState((s) => ({
-      ...s,
-      activeView: "workspace",
-      selectedHostId: hostId,
-      selectedAgentId: agentId,
-      isDraftNewSession: false,
-      selectedWorkspaceCwd: nextCwd,
-      selectedDiffPath: null,
-    }));
+    setState(
+      (s) => {
+        const latestSeq = Math.max(
+          s.seenAgentSeqs[tKey] ?? 0,
+          ag?.latest_seq ?? 0,
+          s.timelines[tKey]?.latestSeq ?? 0,
+        );
+        let nextArchived = s.archivedThreads;
+        if (nextArchived[tKey]) {
+          nextArchived = { ...nextArchived };
+          delete nextArchived[tKey];
+        }
+        return {
+          ...s,
+          activeView: "workspace",
+          workspacePanel: "conversation",
+          selectedHostId: hostId,
+          selectedAgentId: agentId,
+          isDraftNewSession: false,
+          sessionScrollNonce: s.sessionScrollNonce + 1,
+          selectedWorkspaceCwd: nextCwd,
+          selectedDiffPath: null,
+          archivedThreads: nextArchived,
+          seenAgentSeqs: {
+            ...s.seenAgentSeqs,
+            [tKey]: latestSeq,
+          },
+        };
+      },
+      true,
+    );
 
     void orbitIpc.openAgentTimeline(hostId, agentId);
     void orbitActions.pullTimelineDelta(hostId, agentId, false);
@@ -907,14 +1289,19 @@ export const orbitActions = {
     }
   },
 
-  startNewThreadDraft(hostId?: string, cwd?: string): void {
+  startNewThreadDraft(
+    hostId?: string,
+    cwd?: string,
+    prefillPrompt?: string,
+    prefillSlash?: SlashDirective | null,
+  ): void {
     const targetHostId = hostId ?? state.selectedHostId ?? state.fleet.hosts[0]?.host_id ?? null;
     const detail = targetHostId ? state.hostDetails[targetHostId] : undefined;
     const defaultCwd =
-      cwd ??
-      (targetHostId === state.selectedHostId ? state.selectedWorkspaceCwd : "") ??
-      detail?.workspaces[0]?.cwd ??
-      detail?.discovered_projects[0]?.path ??
+      cwd ||
+      (targetHostId === state.selectedHostId ? state.selectedWorkspaceCwd : "") ||
+      detail?.workspaces[0]?.cwd ||
+      detail?.discovered_projects[0]?.path ||
       "~";
 
     const available = detail?.host.available_providers ?? [];
@@ -922,18 +1309,45 @@ export const orbitActions = {
       available.length > 0 && !available.includes(state.draftProvider)
         ? available[0]
         : state.draftProvider;
+    const draftKey = `draft::${targetHostId ?? "none"}`;
 
     setState((s) => ({
       ...s,
       activeView: "workspace",
+      workspacePanel: "conversation",
       selectedHostId: targetHostId,
       isDraftNewSession: true,
       selectedWorkspaceCwd: defaultCwd || "~",
       draftProvider: nextProvider,
       commandPaletteOpen: false,
+      ...(prefillPrompt !== undefined
+        ? {
+            composerDrafts: {
+              ...s.composerDrafts,
+              [draftKey]: prefillPrompt,
+            },
+          }
+        : {}),
+      ...(prefillSlash !== undefined
+        ? {
+            slashDirectives: {
+              ...s.slashDirectives,
+              [draftKey]: prefillSlash,
+            },
+          }
+        : {}),
     }));
 
     orbitActions.focusComposer();
+  },
+
+  openAutomations(): void {
+    setState((s) => ({
+      ...s,
+      activeView: "workspace",
+      workspacePanel: "automations",
+      commandPaletteOpen: false,
+    }));
   },
 
   focusComposer(): void {
@@ -953,6 +1367,23 @@ export const orbitActions = {
     setState((s) => ({ ...s, selectedWorkspaceCwd: cwd, selectedDiffPath: null }));
     if (state.inspectorOpen && state.selectedHostId) {
       void orbitActions.refreshGit(state.selectedHostId, cwd, null, state.diffStaged);
+    }
+  },
+
+  selectProjectWorkspace(hostId: string, cwd: string): void {
+    const detail = state.hostDetails[hostId];
+    const avail = detail?.host.available_providers ?? [];
+    setState((s) => ({
+      ...s,
+      selectedHostId: hostId,
+      selectedWorkspaceCwd: cwd,
+      selectedDiffPath: null,
+      draftProvider:
+        avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
+    }));
+    void orbitActions.ensureWorkspaceFiles(hostId, cwd);
+    if (state.inspectorOpen) {
+      void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
     }
   },
 
@@ -1003,13 +1434,16 @@ export const orbitActions = {
 
   setComposerDraft(text: string): void {
     const key = composerScopeKey(state);
-    setState((s) => ({
-      ...s,
+    if ((state.composerDrafts[key] ?? "") === text) return;
+    // Update draft slice without broadcasting global `emitChange()` across unrelated components
+    state = {
+      ...state,
       composerDrafts: {
-        ...s.composerDrafts,
+        ...state.composerDrafts,
         [key]: text,
       },
-    }));
+    };
+    emitComposerDraftChange();
   },
 
   setSlashDirective(directive: SlashDirective | null): void {
@@ -1596,6 +2030,7 @@ export const orbitActions = {
       return;
     }
 
+    setState((s) => ({ ...s, sessionScrollNonce: s.sessionScrollNonce + 1 }));
     await orbitIpc.sendPrompt(hostId, agentId, assembledWirePrompt, {
       displayPrompt: cleanUserText,
       badges,
@@ -1678,7 +2113,11 @@ export const orbitActions = {
     for (const host of state.fleet.hosts) {
       const detail = state.hostDetails[host.host_id];
       if (!detail) continue;
-      const blocked = detail.agents.find((a) => a.is_awaiting_permission);
+      const blocked = detail.agents.find(
+        (a) =>
+          a.is_awaiting_permission &&
+          !state.archivedThreads[threadScopeKey(host.host_id, a.agent_id)],
+      );
       if (blocked) {
         orbitActions.selectAgent(host.host_id, blocked.agent_id);
         return;
@@ -1693,7 +2132,9 @@ export const orbitActions = {
       const detail = state.hostDetails[h.host_id];
       if (!detail) continue;
       for (const ag of detail.agents) {
-        ordered.push({ hostId: h.host_id, agentId: ag.agent_id });
+        if (!state.archivedThreads[threadScopeKey(h.host_id, ag.agent_id)]) {
+          ordered.push({ hostId: h.host_id, agentId: ag.agent_id });
+        }
       }
     }
     const target = ordered[indexZeroBased];
@@ -1702,8 +2143,255 @@ export const orbitActions = {
     }
   },
 
+  togglePinThread(hostId: string, agentId: string): void {
+    const tKey = threadScopeKey(hostId, agentId);
+    setState(
+      (s) => {
+        const exists = s.pinnedThreadKeys.includes(tKey);
+        return {
+          ...s,
+          pinnedThreadKeys: exists
+            ? s.pinnedThreadKeys.filter((k) => k !== tKey)
+            : [tKey, ...s.pinnedThreadKeys],
+        };
+      },
+      true,
+    );
+  },
+
+  renameThread(hostId: string, agentId: string, newTitle: string): void {
+    const tKey = threadScopeKey(hostId, agentId);
+    const trimmed = newTitle.trim();
+    const originalTitle =
+      state.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId)?.title ?? "";
+    setState(
+      (s) => {
+        const nextTitles = { ...s.threadCustomTitles };
+        if (!trimmed || trimmed === originalTitle) {
+          delete nextTitles[tKey];
+        } else {
+          nextTitles[tKey] = trimmed;
+        }
+        return { ...s, threadCustomTitles: nextTitles };
+      },
+      true,
+    );
+  },
+
+  markThreadUnread(hostId: string, agentId: string): void {
+    const tKey = threadScopeKey(hostId, agentId);
+    const isCurrentlySelected =
+      !state.isDraftNewSession &&
+      state.selectedHostId === hostId &&
+      state.selectedAgentId === agentId;
+
+    setState(
+      (s) => ({
+        ...s,
+        seenAgentSeqs: {
+          ...s.seenAgentSeqs,
+          [tKey]: 0,
+        },
+        ...(isCurrentlySelected ? { isDraftNewSession: true, selectedAgentId: null } : {}),
+      }),
+      true,
+    );
+  },
+
+  markThreadRead(hostId: string, agentId: string): void {
+    const tKey = threadScopeKey(hostId, agentId);
+    const detail = state.hostDetails[hostId];
+    const ag =
+      detail?.agents.find((a) => a.agent_id === agentId) ??
+      state.timelines[tKey]?.agent ??
+      null;
+    const targetSeq = Math.max(
+      ag?.latest_seq ?? 0,
+      state.timelines[tKey]?.latestSeq ?? 0,
+      1,
+    );
+    setState(
+      (s) => ({
+        ...s,
+        seenAgentSeqs: {
+          ...s.seenAgentSeqs,
+          [tKey]: targetSeq,
+        },
+      }),
+      true,
+    );
+  },
+
+  async copyThread(hostId: string, agentId: string): Promise<void> {
+    const tKey = threadScopeKey(hostId, agentId);
+    let items = state.timelines[tKey]?.items;
+    if (!items || items.length === 0) {
+      try {
+        const full = await orbitIpc.getAgentTimeline(hostId, agentId);
+        items = full.items;
+      } catch {
+        items = [];
+      }
+    }
+
+    const sections: string[] = [];
+    for (const item of items) {
+      if (item.item_type === "user_prompt") {
+        const txt = item.text.trim();
+        if (txt) sections.push(`## User\n\n${txt}`);
+      } else if (item.item_type === "assistant_message") {
+        const txt = item.text.trim();
+        if (txt) sections.push(`## Assistant\n\n${txt}`);
+      }
+    }
+
+    const fallbackTitle =
+      state.threadCustomTitles[tKey] ||
+      state.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId)?.title ||
+      agentId;
+    const payload = sections.length > 0 ? sections.join("\n\n---\n\n") : fallbackTitle;
+    try {
+      await navigator.clipboard.writeText(payload);
+      notifyToast("Copied conversation");
+    } catch {
+      notifyToast("Failed to copy conversation");
+    }
+  },
+
+  archiveThread(hostId: string, agentId: string): void {
+    const tKey = threadScopeKey(hostId, agentId);
+    const wasSelected =
+      !state.isDraftNewSession &&
+      state.selectedHostId === hostId &&
+      state.selectedAgentId === agentId;
+
+    let fallbackAgentId: string | null = null;
+    if (wasSelected) {
+      const detail = state.hostDetails[hostId];
+      const nextCandidate = detail?.agents.find(
+        (a) =>
+          a.agent_id !== agentId &&
+          !state.archivedThreads[threadScopeKey(hostId, a.agent_id)],
+      );
+      fallbackAgentId = nextCandidate?.agent_id ?? null;
+    }
+
+    setState(
+      (s) => ({
+        ...s,
+        archivedThreads: {
+          ...s.archivedThreads,
+          [tKey]: {
+            key: tKey,
+            hostId,
+            agentId,
+            archivedAtMs: Date.now(),
+          },
+        },
+        ...(wasSelected && !fallbackAgentId
+          ? {
+              selectedAgentId: null,
+              isDraftNewSession: true,
+            }
+          : {}),
+      }),
+      true,
+    );
+
+    if (wasSelected && fallbackAgentId) {
+      orbitActions.selectAgent(hostId, fallbackAgentId);
+    }
+    notifyToast("Conversation archived");
+  },
+
+  restoreArchivedThread(hostId: string, agentId: string): void {
+    const tKey = threadScopeKey(hostId, agentId);
+    setState(
+      (s) => {
+        const nextArchived = { ...s.archivedThreads };
+        delete nextArchived[tKey];
+        return {
+          ...s,
+          archivedThreads: nextArchived,
+        };
+      },
+      true,
+    );
+    orbitActions.selectAgent(hostId, agentId);
+    notifyToast("Conversation restored");
+  },
+
+  async deleteThreadPermanently(hostId: string, agentId: string): Promise<void> {
+    const tKey = threadScopeKey(hostId, agentId);
+    const wasSelected =
+      !state.isDraftNewSession &&
+      state.selectedHostId === hostId &&
+      state.selectedAgentId === agentId;
+
+    setState(
+      (s) => {
+        const nextArchived = { ...s.archivedThreads };
+        delete nextArchived[tKey];
+        const nextTitles = { ...s.threadCustomTitles };
+        delete nextTitles[tKey];
+        const nextSeen = { ...s.seenAgentSeqs };
+        delete nextSeen[tKey];
+        return {
+          ...s,
+          archivedThreads: nextArchived,
+          threadCustomTitles: nextTitles,
+          seenAgentSeqs: nextSeen,
+          pinnedThreadKeys: s.pinnedThreadKeys.filter((k) => k !== tKey),
+          ...(wasSelected ? { selectedAgentId: null, isDraftNewSession: true } : {}),
+        };
+      },
+      true,
+    );
+
+    await orbitIpc.archiveAgent(hostId, agentId);
+  },
+
+  setSidebarViewPrefs(patch: {
+    projectSort?: SidebarProjectSort;
+    threadFilter?: SidebarThreadFilter;
+  }): void {
+    setState(
+      (s) => ({
+        ...s,
+        sidebarProjectSort: patch.projectSort ?? s.sidebarProjectSort,
+        sidebarThreadFilter: patch.threadFilter ?? s.sidebarThreadFilter,
+      }),
+      true,
+    );
+  },
+
   toggleSidebar(): void {
-    setState((s) => ({ ...s, sidebarOpen: !s.sidebarOpen }), true);
+    const isCompact = state.isCompactViewport;
+    setState(
+      (s) => {
+        const nextOpen = !s.sidebarOpen;
+        return {
+          ...s,
+          sidebarOpen: nextOpen,
+          sidebarDesktopOpenPref: s.isCompactViewport ? s.sidebarDesktopOpenPref : nextOpen,
+        };
+      },
+      !isCompact,
+    );
+  },
+
+  updateViewportWidth(viewportWidth: number): void {
+    const nextCompact = state.isCompactViewport
+      ? viewportWidth < COMPACT_VIEWPORT_EXPAND_PX
+      : viewportWidth < COMPACT_VIEWPORT_COLLAPSE_PX;
+
+    if (nextCompact === state.isCompactViewport) return;
+
+    setState((s) => ({
+      ...s,
+      isCompactViewport: nextCompact,
+      sidebarOpen: nextCompact ? false : s.sidebarDesktopOpenPref,
+    }));
   },
 
   setSidebarWidth(w: number): void {
@@ -1718,6 +2406,89 @@ export const orbitActions = {
         [hostId]: !s.collapsedHostIds[hostId],
       },
     }));
+  },
+
+  toggleProjectCollapsed(projectId: string): void {
+    setState((s) => ({
+      ...s,
+      collapsedProjectIds: {
+        ...s.collapsedProjectIds,
+        [projectId]: !s.collapsedProjectIds[projectId],
+      },
+    }));
+  },
+
+  async addProjectDirectory(hostId: string, dirPath: string, name?: string): Promise<void> {
+    const cleanPath = dirPath.trim();
+    if (!hostId || !cleanPath) return;
+    try {
+      const created = await orbitIpc.upsertProject({
+        hostId,
+        name: (name ?? basenameFromPath(cleanPath)) || cleanPath,
+        directories: [cleanPath],
+      });
+      setState((s) => ({
+        ...s,
+        remoteFolderPickerHostId: null,
+        collapsedProjectIds: {
+          ...s.collapsedProjectIds,
+          [created.project_id]: false,
+        },
+      }));
+      await orbitActions.reloadFleetOnly();
+      orbitActions.startNewThreadDraft(hostId, created.directories[0] ?? cleanPath);
+    } catch (err) {
+      notifyToast(`Failed to add project: ${String(err)}`);
+    }
+  },
+
+  async promptAddProject(preferredHostId?: string): Promise<void> {
+    const targetHost =
+      (preferredHostId
+        ? state.fleet.hosts.find((h) => h.host_id === preferredHostId)
+        : undefined) ??
+      state.fleet.hosts.find((h) => h.host_id === state.selectedHostId) ??
+      state.fleet.hosts[0];
+
+    if (!targetHost) {
+      orbitActions.openSettings("hosts");
+      return;
+    }
+
+    if (isLocalHostCard(targetHost)) {
+      const initialDir =
+        state.selectedHostId === targetHost.host_id ? state.selectedWorkspaceCwd : null;
+      try {
+        const picked = await orbitIpc.pickProjectFolder(initialDir);
+        if (picked) {
+          await orbitActions.addProjectDirectory(targetHost.host_id, picked);
+        }
+      } catch (err) {
+        notifyToast(`Could not open folder picker: ${String(err)}`);
+      }
+      return;
+    }
+
+    // Remote host (SSH / LAN / Relay): open click-to-navigate Remote Folder Browser
+    const existingListing = state.hostDetails[targetHost.host_id]?.directory_listing;
+    setState((s) => ({ ...s, remoteFolderPickerHostId: targetHost.host_id }));
+    void orbitIpc.listDirectory(
+      targetHost.host_id,
+      existingListing?.current_path ?? null,
+    );
+  },
+
+  closeRemoteFolderPicker(): void {
+    setState((s) => ({ ...s, remoteFolderPickerHostId: null }));
+  },
+
+  async removePinnedProject(projectId: string): Promise<void> {
+    try {
+      await orbitIpc.removeProject(projectId);
+      await orbitActions.reloadFleetOnly();
+    } catch (err) {
+      notifyToast(`Failed to remove project: ${String(err)}`);
+    }
   },
 
   toggleInspector(openOverride?: boolean): void {
@@ -1953,14 +2724,14 @@ export const orbitActions = {
     }
   },
 
-  openSettings(section?: SettingsSection): void {
+  openSettings(section?: SettingsSectionTarget): void {
     void orbitIpc.listSshHosts().then((sshList) => {
       setState((s) => ({ ...s, sshHosts: sshList }));
     });
     setState((s) => ({
       ...s,
       activeView: "settings",
-      settingsSection: section ?? s.settingsSection,
+      settingsSection: resolveSettingsSectionTarget(s, section),
       commandPaletteOpen: false,
     }));
   },
@@ -1969,8 +2740,9 @@ export const orbitActions = {
     setState((s) => ({ ...s, activeView: "workspace" }));
   },
 
-  toggleSettings(section?: SettingsSection): void {
-    if (state.activeView === "settings" && (!section || state.settingsSection === section)) {
+  toggleSettings(section?: SettingsSectionTarget): void {
+    const resolved = section ? resolveSettingsSectionTarget(state, section) : null;
+    if (state.activeView === "settings" && (!resolved || state.settingsSection === resolved)) {
       orbitActions.closeSettings();
     } else {
       orbitActions.openSettings(section);
@@ -1987,7 +2759,7 @@ export const orbitActions = {
 
   setPairDialogOpen(open: boolean): void {
     if (open) {
-      orbitActions.openSettings("hosts");
+      orbitActions.openSettings("add_host");
     } else {
       setState((s) => ({ ...s, pairDialogOpen: false }));
     }
@@ -2080,12 +2852,31 @@ export const orbitActions = {
   },
 };
 
+function subscribeStore(onStoreChange: () => void): () => void {
+  listeners.add(onStoreChange);
+  return () => {
+    listeners.delete(onStoreChange);
+  };
+}
+
+function subscribeComposerDraft(onDraftChange: () => void): () => void {
+  composerDraftListeners.add(onDraftChange);
+  return () => {
+    composerDraftListeners.delete(onDraftChange);
+  };
+}
+
 export function useOrbitSelector<T>(selector: (s: OrbitUiState) => T): T {
+  return useSyncExternalStore(subscribeStore, () => selector(state));
+}
+
+/**
+ * Isolated Composer draft text subscription:
+ * Fires strictly when `composerDrafts` mutates, keeping keystrokes 100% isolated from the rest of the app.
+ */
+export function useComposerDraft(scopeKey: string): string {
   return useSyncExternalStore(
-    (onStoreChange) => {
-      listeners.add(onStoreChange);
-      return () => listeners.delete(onStoreChange);
-    },
-    () => selector(state),
+    subscribeComposerDraft,
+    () => state.composerDrafts[scopeKey] ?? "",
   );
 }

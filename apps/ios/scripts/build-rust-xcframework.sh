@@ -22,7 +22,10 @@ cargo run -p orbit-ffi-uniffi --bin uniffi-bindgen -- generate \
   --out-dir "$IOS_DIR/Generated"
 
 HEADERS_STAGE="$IOS_DIR/build/headers"
-rm -rf "$HEADERS_STAGE" "$IOS_DIR/Frameworks/OrbitCoreFFI.xcframework"
+rm -rf "$HEADERS_STAGE" \
+  "$IOS_DIR/Frameworks/OrbitCoreFFI.xcframework" \
+  "$IOS_DIR/build/SimDerivedData/Build/Products" \
+  "$IOS_DIR/build/ReleaseDerivedData/Build/Products"
 mkdir -p "$HEADERS_STAGE" "$IOS_DIR/Frameworks"
 
 cp "$IOS_DIR/Generated/orbit_ffi_uniffiFFI.h" "$HEADERS_STAGE/"

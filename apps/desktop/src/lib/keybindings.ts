@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { isMacDesktop, orbitIpc } from "@/lib/orbit-ipc";
-import { processTimelineForStage } from "@/lib/timeline-coalesce";
+import { findFirstPendingPermission } from "@/lib/timeline-coalesce";
 import { orbitActions } from "@/state/orbit-store";
 
 export function modSymbol(): string {
@@ -19,6 +19,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 1. Command Palette (`⌘K` / `Ctrl+K`) — always works everywhere
       if (mod && !e.shiftKey && !e.altKey && keyLower === "k") {
         e.preventDefault();
+        if (e.repeat) return;
         orbitActions.setCommandPaletteOpen(!snap.commandPaletteOpen);
         return;
       }
@@ -26,6 +27,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 1b. Settings Center (`⌘,` / `Ctrl+,`) — native standard preferences shortcut
       if (mod && !e.shiftKey && !e.altKey && e.key === ",") {
         e.preventDefault();
+        if (e.repeat) return;
         orbitActions.toggleSettings();
         return;
       }
@@ -46,6 +48,7 @@ export function useGlobalErgonomicKeybindings(): void {
         (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === "`")
       ) {
         e.preventDefault();
+        if (e.repeat) return;
         orbitActions.toggleTerminalDock();
         return;
       }
@@ -55,9 +58,22 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
+      // Guard: do not toggle workspace panels behind full-window Settings or modal dialogs
+      const isModalOverlayOpen =
+        snap.activeView === "settings" ||
+        snap.commandPaletteOpen ||
+        snap.pairDialogOpen ||
+        snap.relayDialogOpen ||
+        snap.remoteFolderPickerHostId !== null;
+
+      if (isModalOverlayOpen) {
+        return;
+      }
+
       // 3. New Agent Thread (`⌘N` / `Ctrl+N`)
       if (mod && !e.shiftKey && !e.altKey && keyLower === "n") {
         e.preventDefault();
+        if (e.repeat) return;
         orbitActions.startNewThreadDraft();
         return;
       }
@@ -65,6 +81,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 4. Jump to Next Attention / Approval Item (`⌘⇧A` / `Ctrl+Shift+A`)
       if (mod && e.shiftKey && !e.altKey && keyLower === "a") {
         e.preventDefault();
+        if (e.repeat) return;
         orbitActions.jumpToNextAttentionItem();
         return;
       }
@@ -72,6 +89,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 5. Toggle Left Fleet Sidebar (`⌘B` / `Ctrl+B`)
       if (mod && !e.shiftKey && !e.altKey && keyLower === "b") {
         e.preventDefault();
+        if (e.repeat) return;
         orbitActions.toggleSidebar();
         return;
       }
@@ -79,6 +97,7 @@ export function useGlobalErgonomicKeybindings(): void {
       // 6. Toggle Right Diff Review Inspector (`⌘D` / `Ctrl+D`)
       if (mod && !e.shiftKey && !e.altKey && keyLower === "d") {
         e.preventDefault();
+        if (e.repeat) return;
         orbitActions.toggleInspector();
         return;
       }
@@ -111,8 +130,7 @@ export function useGlobalErgonomicKeybindings(): void {
       if (mod && snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession) {
         const tl = snap.timelines[`${snap.selectedHostId}::${snap.selectedAgentId}`];
         if (tl) {
-          const { pendingPermissions } = processTimelineForStage(tl.items);
-          const firstPerm = pendingPermissions[0];
+          const firstPerm = findFirstPendingPermission(tl.items);
           if (firstPerm) {
             if (!e.shiftKey && keyLower === "y") {
               e.preventDefault();

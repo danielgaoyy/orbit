@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ExternalLink,
+  Clock,
+  FolderOpen,
+  FolderPlus,
+  GitCompareArrows,
   Monitor,
   Moon,
   PanelLeft,
-  PanelRight,
   Plus,
   Radio,
   RefreshCw,
@@ -13,14 +15,15 @@ import {
   Settings2,
   ShieldAlert,
   Sparkles,
+  SquareTerminal,
   Sun,
-  Terminal as TerminalIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs";
 import { Kbd, ShortcutKbd } from "@/components/ui/overlays";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { modSymbol } from "@/lib/keybindings";
 import { orbitIpc } from "@/lib/orbit-ipc";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 interface PaletteItem {
@@ -36,12 +39,24 @@ interface PaletteItem {
 
 export function CommandPalette() {
   const open = useOrbitSelector((s) => s.commandPaletteOpen);
+  return (
+    <Dialog open={open} onOpenChange={(v) => orbitActions.setCommandPaletteOpen(v)}>
+      <DialogContent className="max-w-xl gap-0 overflow-hidden p-0 [&>button]:hidden">
+        <CommandPaletteDialog />
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function CommandPaletteDialog() {
   const fleet = useOrbitSelector((s) => s.fleet);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const externalEditors = useOrbitSelector((s) => s.externalEditors);
   const theme = useOrbitSelector((s) => s.theme);
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
+  const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
+  const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
 
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
@@ -49,12 +64,9 @@ export function CommandPalette() {
   const mod = modSymbol();
 
   useEffect(() => {
-    if (open) {
-      setQuery("");
-      setActiveIndex(0);
-      setTimeout(() => inputRef.current?.focus(), 10);
-    }
-  }, [open]);
+    const id = setTimeout(() => inputRef.current?.focus(), 10);
+    return () => clearTimeout(id);
+  }, []);
 
   const allItems = useMemo<PaletteItem[]>(() => {
     const list: PaletteItem[] = [];
@@ -64,11 +76,12 @@ export function CommandPalette() {
       const detail = hostDetails[h.host_id];
       if (!detail) continue;
       for (const ag of detail.agents) {
-        if (ag.is_awaiting_permission) {
+        const tKey = threadScopeKey(h.host_id, ag.agent_id);
+        if (ag.is_awaiting_permission && !archivedThreads[tKey]) {
           list.push({
             id: `attn-${h.host_id}-${ag.agent_id}`,
             section: "Needs Your Approval",
-            title: ag.title,
+            title: threadCustomTitles[tKey] || ag.title,
             subtitle: `${h.display_name} · ${ag.cwd}`,
             shortcut: `${mod}⇧A`,
             accent: "amber",
@@ -84,11 +97,30 @@ export function CommandPalette() {
       {
         id: "act-new-thread",
         section: "Actions",
-        title: "New Agent Session",
-        subtitle: "Open zero-modal launchpad and focus Composer",
+        title: "New Conversation",
+        subtitle: "Open launchpad and focus Composer",
         shortcut: `${mod}N`,
         icon: <Plus className="size-3.5" />,
         run: () => orbitActions.startNewThreadDraft(),
+      },
+      {
+        id: "act-add-project",
+        section: "Actions",
+        title: "Add Project Folder…",
+        subtitle: "Choose a repository directory from your machine or remote host",
+        icon: <FolderPlus className="size-3.5" />,
+        run: () => {
+          orbitActions.setCommandPaletteOpen(false);
+          void orbitActions.promptAddProject();
+        },
+      },
+      {
+        id: "act-automations",
+        section: "Actions",
+        title: "Open Automations",
+        subtitle: "Repeatable engineering workflows and checks",
+        icon: <Clock className="size-3.5" />,
+        run: () => orbitActions.openAutomations(),
       },
       {
         id: "act-cycle-mode",
@@ -104,7 +136,7 @@ export function CommandPalette() {
         section: "Actions",
         title: "Toggle Diff Review Inspector",
         shortcut: `${mod}D`,
-        icon: <PanelRight className="size-3.5" />,
+        icon: <GitCompareArrows className="size-3.5" />,
         run: () => orbitActions.toggleInspector(),
       },
       {
@@ -112,13 +144,13 @@ export function CommandPalette() {
         section: "Actions",
         title: "Toggle Persistent PTY Terminal",
         shortcut: `${mod}J`,
-        icon: <TerminalIcon className="size-3.5" />,
+        icon: <SquareTerminal className="size-3.5" />,
         run: () => orbitActions.toggleTerminalDock(),
       },
       {
         id: "act-toggle-sidebar",
         section: "Actions",
-        title: "Toggle Fleet Sidebar (Zen Mode)",
+        title: "Toggle Fleet Sidebar",
         shortcut: `${mod}B`,
         icon: <PanelLeft className="size-3.5" />,
         run: () => orbitActions.toggleSidebar(),
@@ -132,20 +164,23 @@ export function CommandPalette() {
         section: "Open Workspace In",
         title: `Open in ${ed.label}`,
         shortcut: ed.kind === "cursor" ? `${mod}O` : undefined,
-        icon: <ExternalLink className="size-3.5" />,
+        icon: <FolderOpen className="size-3.5" />,
         run: () => void orbitActions.openWorkspaceInEditor(ed.kind),
       });
     }
 
-    // 4. All Agent Threads Across Multi-Host Fleet
+    // 4. All Agent Threads Across Multi-Host Fleet (Active first, Archived in separate section)
     for (const h of fleet.hosts) {
       const detail = hostDetails[h.host_id];
       if (!detail) continue;
       for (const ag of detail.agents) {
+        const tKey = threadScopeKey(h.host_id, ag.agent_id);
+        const isArchived = Boolean(archivedThreads[tKey]);
+        const effectiveTitle = threadCustomTitles[tKey] || ag.title;
         list.push({
           id: `thread-${h.host_id}-${ag.agent_id}`,
-          section: "Sessions",
-          title: ag.title,
+          section: isArchived ? "Archived Sessions" : "Sessions",
+          title: effectiveTitle,
           subtitle: `${h.display_name} · ${ag.provider_label} · ${ag.cwd}`,
           icon: <Server className="size-3.5 opacity-70" />,
           run: () => orbitActions.selectAgent(h.host_id, ag.agent_id),
@@ -228,7 +263,17 @@ export function CommandPalette() {
     }
 
     return list;
-  }, [fleet.hosts, hostDetails, externalEditors, theme, enterToSend, selectedHostId, mod]);
+  }, [
+    fleet.hosts,
+    hostDetails,
+    externalEditors,
+    theme,
+    enterToSend,
+    selectedHostId,
+    threadCustomTitles,
+    archivedThreads,
+    mod,
+  ]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -267,25 +312,24 @@ export function CommandPalette() {
   };
 
   return (
-    <Dialog open={open} onOpenChange={(v) => orbitActions.setCommandPaletteOpen(v)}>
-      <DialogContent className="max-w-xl gap-0 overflow-hidden p-0 [&>button]:hidden">
-        <DialogTitle className="sr-only">Orbit Command Palette</DialogTitle>
-        <div className="border-border flex items-center gap-2.5 border-b px-3.5 py-2.5">
-          <Search className="text-muted-foreground size-4 shrink-0" />
+    <>
+      <DialogTitle className="sr-only">Orbit Command Palette</DialogTitle>
+      <div className="border-border flex h-[46px] items-center gap-2.5 border-b px-4">
+          <Search className="text-muted-foreground h-[16px] w-[16px] shrink-0" />
           <input
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Jump to session, run action, or switch host..."
-            className="text-foreground placeholder:text-muted-foreground w-full bg-transparent text-sm outline-none"
+            className="text-foreground placeholder:text-muted-foreground w-full bg-transparent text-[14px] outline-none"
           />
           <Kbd>Esc</Kbd>
         </div>
 
-        <div className="max-h-88 overflow-y-auto p-1.5">
+        <ScrollArea viewportClassName="max-h-96 p-1.5">
           {filtered.length === 0 ? (
-            <div className="text-muted-foreground py-8 text-center text-xs">
+            <div className="text-muted-foreground py-8 text-center text-[13px]">
               No matching commands or sessions.
             </div>
           ) : (
@@ -297,7 +341,7 @@ export function CommandPalette() {
               return (
                 <div key={item.id}>
                   {showSection && (
-                    <div className="text-muted-foreground px-2.5 pt-2 pb-1 text-[10.5px] font-medium">
+                    <div className="text-muted-foreground px-3 pt-2.5 pb-1 text-[12px] font-medium">
                       {item.section}
                     </div>
                   )}
@@ -306,23 +350,25 @@ export function CommandPalette() {
                     onMouseEnter={() => setActiveIndex(idx)}
                     onClick={() => executeItem(item)}
                     className={cn(
-                      "flex w-full cursor-pointer items-center justify-between gap-3 rounded-md px-2.5 py-1.5 text-left text-xs transition-colors",
+                      "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-3 py-2 text-left text-[13.5px] transition-colors",
                       selected ? "bg-accent text-foreground" : "text-foreground/85",
                     )}
                   >
                     <div className="flex min-w-0 items-center gap-2.5">
-                      <span className="text-muted-foreground shrink-0">{item.icon}</span>
+                      <span className="text-muted-foreground shrink-0 [&_svg]:h-[15px] [&_svg]:w-[15px]">
+                        {item.icon}
+                      </span>
                       <div className="min-w-0">
                         <div
                           className={cn(
                             "truncate font-medium",
-                            item.accent === "amber" && "text-amber-400",
+                            item.accent === "amber" && "text-amber-600 dark:text-amber-400",
                           )}
                         >
                           {item.title}
                         </div>
                         {item.subtitle && (
-                          <div className="text-muted-foreground truncate text-[10.5px]">
+                          <div className="text-muted-foreground truncate text-[12px]">
                             {item.subtitle}
                           </div>
                         )}
@@ -334,8 +380,7 @@ export function CommandPalette() {
               );
             })
           )}
-        </div>
-      </DialogContent>
-    </Dialog>
+        </ScrollArea>
+    </>
   );
 }

@@ -16,10 +16,14 @@
         "title": "Orbit",
         "width": 1400,
         "height": 900,
-        "minWidth": 500,
-        "minHeight": 400,
+        "minWidth": 680,
+        "minHeight": 560,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 15,
+          "y": 23
+        }
       }
     ],
     "security": {

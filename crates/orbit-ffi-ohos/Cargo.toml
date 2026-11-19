@@ -17,6 +17,9 @@ orbit-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+orbit-crypto.workspace = true
+
 [target.'cfg(target_env = "ohos")'.dependencies]
 napi-ohos.workspace = true
 napi-derive-ohos.workspace = true

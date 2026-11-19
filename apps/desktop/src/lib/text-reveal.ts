@@ -135,43 +135,72 @@ export function usePacedRichBlocks(blocks: RichBlockView[], streaming = false): 
   const targetChars = useMemo(() => countRichBlocksChars(blocks), [blocks]);
   const [revealedChars, setRevealedChars] = useState<number>(() => targetChars);
   const targetRef = useRef<number>(targetChars);
+  const revealedRef = useRef<number>(revealedChars);
+  const rafIdRef = useRef<number>(0);
+  const prevFrameMsRef = useRef<number | null>(null);
+
   targetRef.current = targetChars;
 
   useEffect(() => {
     if (!streaming) {
-      setRevealedChars(targetChars);
+      if (rafIdRef.current !== 0) {
+        window.cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = 0;
+      }
+      prevFrameMsRef.current = null;
+      revealedRef.current = targetChars;
+      setRevealedChars((prev) => (prev === targetChars ? prev : targetChars));
       return;
     }
-    setRevealedChars((prev) => (targetChars < prev ? targetChars : prev));
-  }, [streaming, targetChars]);
 
-  useEffect(() => {
-    if (!streaming || revealedChars >= targetChars) return;
+    if (targetChars < revealedRef.current) {
+      revealedRef.current = targetChars;
+      setRevealedChars(targetChars);
+    }
 
-    let rafId = 0;
-    let prevFrameMs: number | null = null;
+    if (revealedRef.current >= targetChars || rafIdRef.current !== 0) {
+      return;
+    }
+
+    prevFrameMsRef.current = null;
 
     const stepFrame = (nowMs: number) => {
+      const prevMs = prevFrameMsRef.current;
       const elapsed =
-        prevFrameMs === null ? FRAME_INTERVAL_MS : Math.min(MAX_ELAPSED_MS, nowMs - prevFrameMs);
-      if (elapsed >= FRAME_INTERVAL_MS) {
-        prevFrameMs = nowMs - (elapsed % FRAME_INTERVAL_MS);
-        setRevealedChars((cur) => {
-          const target = targetRef.current;
-          const backlog = target - cur;
-          if (backlog <= 0) return target;
+        prevMs === null ? FRAME_INTERVAL_MS : Math.min(MAX_ELAPSED_MS, nowMs - prevMs);
+
+      if (elapsed >= FRAME_INTERVAL_MS * 0.85) {
+        prevFrameMsRef.current = nowMs;
+        const cur = revealedRef.current;
+        const target = targetRef.current;
+        const backlog = target - cur;
+        if (backlog > 0) {
           const delta = Math.max(1, Math.ceil((backlog * elapsed) / TEXT_REVEAL_HORIZON_MS));
-          return Math.min(target, cur + delta);
-        });
+          const next = Math.min(target, cur + delta);
+          revealedRef.current = next;
+          setRevealedChars(next);
+        }
       }
-      if (targetRef.current > revealedChars) {
-        rafId = window.requestAnimationFrame(stepFrame);
+
+      if (revealedRef.current < targetRef.current) {
+        rafIdRef.current = window.requestAnimationFrame(stepFrame);
+      } else {
+        rafIdRef.current = 0;
+        prevFrameMsRef.current = null;
       }
     };
 
-    rafId = window.requestAnimationFrame(stepFrame);
-    return () => window.cancelAnimationFrame(rafId);
-  }, [streaming, targetChars, revealedChars]);
+    rafIdRef.current = window.requestAnimationFrame(stepFrame);
+  }, [streaming, targetChars]);
+
+  useEffect(() => {
+    return () => {
+      if (rafIdRef.current !== 0) {
+        window.cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = 0;
+      }
+    };
+  }, []);
 
   return useMemo(
     () => (streaming && revealedChars < targetChars ? sliceRichBlocks(blocks, revealedChars) : blocks),

@@ -92,8 +92,13 @@ pub fn normalize_relay_input(raw: Option<&str>) -> Option<String> {
     Some(format!("{scheme}://{authority}"))
 }
 
-/// Resolve the real user home directory across macOS, Linux, and Windows.
+/// Resolve the real user home directory across macOS, Linux, Windows, and Xcode iOS Simulator (`SIMULATOR_HOST_HOME`).
 pub fn resolve_user_home() -> Option<PathBuf> {
+    if let Ok(sim_home) = std::env::var("SIMULATOR_HOST_HOME")
+        && !sim_home.trim().is_empty()
+    {
+        return Some(PathBuf::from(sim_home));
+    }
     let raw = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
@@ -163,13 +168,16 @@ pub fn extract_ws_port(endpoints: &[String]) -> Option<u16> {
     None
 }
 
-/// Automatically discover and ensure the current user's isolated local Orbit Daemon on Desktop if `orbit` CLI is installed.
+/// Automatically discover and ensure the current user's isolated local Orbit Daemon on Desktop (or Xcode iOS Simulator).
 pub fn discover_local_daemon_pairing_uri() -> Option<String> {
-    if !cfg!(any(
+    let is_desktop = cfg!(any(
         target_os = "macos",
         target_os = "linux",
         target_os = "windows"
-    )) {
+    ));
+    let is_ios_simulator =
+        cfg!(target_os = "ios") && std::env::var_os("SIMULATOR_HOST_HOME").is_some();
+    if !is_desktop && !is_ios_simulator {
         return None;
     }
     let home = resolve_user_home()?;
@@ -180,7 +188,7 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         PathBuf::from("/usr/local/bin/orbit"),
         PathBuf::from("/opt/homebrew/bin/orbit"),
     ];
-    if let Some(orbit_bin) = candidates.into_iter().find(|p| p.is_file()) {
+    if is_desktop && let Some(orbit_bin) = candidates.into_iter().find(|p| p.is_file()) {
         let status_out = Command::new(&orbit_bin)
             .args(["daemon", "status"])
             .output()
@@ -519,14 +527,14 @@ pub fn bootstrap_ssh_host_and_pair(
             &remote_script,
         ])
         .output()
-        .map_err(|e| format!("无法启动 SSH 进程: {e}"))?;
+        .map_err(|e| format!("Failed to start SSH process: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
         let detail = stderr.trim();
         return Err(if detail.is_empty() {
-            format!("SSH 连接退出状态 {}", out.status)
+            format!("SSH exited with status {}", out.status)
         } else {
             detail.to_string()
         });
@@ -537,7 +545,7 @@ pub fn bootstrap_ssh_host_and_pair(
         .map(str::trim)
         .find(|line| line.starts_with("orbit://pair/"))
         .map(ToOwned::to_owned)
-        .ok_or_else(|| format!("未能在 {alias} 获取到有效配对码"))
+        .ok_or_else(|| format!("No valid pairing URI returned from {alias}"))
 }
 
 /// One-click remote Orbit Daemon upgrade & restart over SSH (preserving per-user port isolation).
@@ -569,13 +577,13 @@ pub fn upgrade_remote_daemon_over_ssh(
             &remote_script,
         ])
         .output()
-        .map_err(|e| format!("无法启动 SSH 升级: {e}"))?;
+        .map_err(|e| format!("Failed to launch SSH upgrade: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if !out.status.success() {
         return Err(if stderr.is_empty() {
-            format!("远端升级失败 ({})", out.status)
+            format!("Remote upgrade failed ({})", out.status)
         } else {
             stderr
         });
@@ -598,10 +606,10 @@ pub fn upgrade_remote_daemon_over_ssh(
 /// without raw TCP probe resets or `ControlMaster` multiplexing drops.
 pub fn spawn_ssh_local_tunnel(alias: &str, remote_port: u16) -> Result<SshTunnelGuard, String> {
     let listener =
-        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("本地端口分配失败: {e}"))?;
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Failed to bind local port: {e}"))?;
     let local_port = listener
         .local_addr()
-        .map_err(|e| format!("读取本地端口失败: {e}"))?
+        .map_err(|e| format!("Failed to inspect local port: {e}"))?
         .port();
     drop(listener);
 
@@ -635,11 +643,11 @@ pub fn spawn_ssh_local_tunnel(alias: &str, remote_port: u16) -> Result<SshTunnel
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("无法拉起 SSH 隧道进程: {e}"))?;
+        .map_err(|e| format!("Failed to spawn SSH tunnel: {e}"))?;
 
     std::thread::sleep(Duration::from_millis(220));
     if let Ok(Some(status)) = child.try_wait() {
-        return Err(format!("SSH 隧道立即退出 ({alias}: {status})"));
+        return Err(format!("SSH tunnel exited immediately ({alias}: {status})"));
     }
 
     Ok(SshTunnelGuard {
@@ -850,6 +858,194 @@ fn expand_local_tilde(cwd: &str) -> PathBuf {
     PathBuf::from(cwd)
 }
 
+fn resolve_folder_picker_start_dir(initial_dir: Option<&str>) -> Option<PathBuf> {
+    let home = resolve_user_home();
+    if let Some(raw) = initial_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        let expanded = expand_local_tilde(raw);
+        if expanded.is_dir() {
+            let is_home = home.as_ref().is_some_and(|h| h == &expanded);
+            if !is_home
+                && let Some(parent) = expanded.parent()
+                && parent.is_dir()
+                && parent != Path::new("/")
+            {
+                return Some(parent.to_path_buf());
+            }
+            if !is_home {
+                return Some(expanded);
+            }
+        }
+    }
+
+    if let Some(h) = home {
+        for candidate in ["Code", "Projects", "Developer", "workspace", "src"] {
+            let sub = h.join(candidate);
+            if sub.is_dir() {
+                return Some(sub);
+            }
+        }
+        if h.is_dir() {
+            return Some(h);
+        }
+    }
+    None
+}
+
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    allow(dead_code)
+)]
+fn normalize_picked_posix_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let clean = trimmed.trim_end_matches('/');
+    if clean.is_empty() {
+        Some("/".to_string())
+    } else {
+        Some(clean.to_string())
+    }
+}
+
+/// Open the native OS directory chooser sheet (`NSOpenPanel` on macOS, `zenity`/`kdialog` on Linux,
+/// `FolderBrowserDialog` on Windows). Returns `Ok(None)` cleanly when the user cancels.
+pub fn pick_local_directory(initial_dir: Option<&str>) -> Result<Option<String>, String> {
+    let start_dir = resolve_folder_picker_start_dir(initial_dir);
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("/usr/bin/osascript");
+        if let Some(ref dir) = start_dir {
+            cmd.args([
+                "-e",
+                "on run argv",
+                "-e",
+                "try",
+                "-e",
+                "set startAlias to POSIX file (item 1 of argv) as alias",
+                "-e",
+                "return POSIX path of (choose folder with prompt \"Select Project Folder\" default location startAlias)",
+                "-e",
+                "on error errMsg number errNum",
+                "-e",
+                "if errNum is -128 then error number -128",
+                "-e",
+                "return POSIX path of (choose folder with prompt \"Select Project Folder\")",
+                "-e",
+                "end try",
+                "-e",
+                "end run",
+                "--",
+            ])
+            .arg(dir);
+        } else {
+            cmd.args([
+                "-e",
+                "POSIX path of (choose folder with prompt \"Select Project Folder\")",
+            ]);
+        }
+
+        let out = cmd
+            .output()
+            .map_err(|e| format!("failed to open macOS folder picker: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let lower = stderr.to_ascii_lowercase();
+            if stderr.contains("(-128)")
+                || lower.contains("canceled")
+                || lower.contains("cancelled")
+            {
+                return Ok(None);
+            }
+            return Err(format!("folder picker failed: {}", stderr.trim()));
+        }
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Ok(normalize_picked_posix_path(&stdout))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if binary_exists_on_path("zenity") {
+            let mut cmd = Command::new("zenity");
+            cmd.args([
+                "--file-selection",
+                "--directory",
+                "--title=Select Project Folder",
+            ]);
+            if let Some(ref dir) = start_dir {
+                cmd.arg(format!("--filename={}/", dir.to_string_lossy()));
+            }
+            let out = cmd
+                .output()
+                .map_err(|e| format!("failed to launch zenity: {e}"))?;
+            if !out.status.success() {
+                return Ok(None);
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Ok(normalize_picked_posix_path(&stdout));
+        }
+
+        if binary_exists_on_path("kdialog") {
+            let mut cmd = Command::new("kdialog");
+            cmd.arg("--getexistingdirectory");
+            if let Some(ref dir) = start_dir {
+                cmd.arg(dir);
+            } else {
+                cmd.arg(".");
+            }
+            let out = cmd
+                .output()
+                .map_err(|e| format!("failed to launch kdialog: {e}"))?;
+            if !out.status.success() {
+                return Ok(None);
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Ok(normalize_picked_posix_path(&stdout));
+        }
+
+        Err("Install `zenity` or `kdialog` to open the native Linux folder chooser".into())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let init_line = start_dir
+            .as_ref()
+            .map(|d| {
+                let escaped = d.to_string_lossy().replace('\'', "''");
+                format!("$d.SelectedPath = '{escaped}'; ")
+            })
+            .unwrap_or_default();
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $d = New-Object System.Windows.Forms.FolderBrowserDialog; \
+             $d.Description = 'Select Project Folder'; \
+             {init_line}\
+             if ($d.ShowDialog() -eq 'OK') {{ [Console]::Out.WriteLine($d.SelectedPath) }}"
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-Sta", "-Command", &script])
+            .output()
+            .map_err(|e| format!("failed to open Windows folder picker: {e}"))?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let trimmed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed))
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = start_dir;
+        Err("Native folder picker is not supported on this platform".into())
+    }
+}
+
 /// Launch the requested external editor or OS tool at `cwd` (either locally or via SSH remote URI).
 pub fn open_in_external_editor(
     editor: ExternalEditorKind,
@@ -1048,6 +1244,11 @@ pub fn open_in_external_editor(
                     .map_err(|e| format!("failed to launch terminal: {e}"))?;
                 Ok(())
             }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            {
+                let _ = &local_path;
+                Err("External terminal launch is not supported on mobile OS targets".into())
+            }
         }
         ExternalEditorKind::FileManager => {
             #[cfg(target_os = "macos")]
@@ -1073,6 +1274,11 @@ pub fn open_in_external_editor(
                     .spawn()
                     .map_err(|e| format!("failed to open Explorer: {e}"))?;
                 Ok(())
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            {
+                let _ = &local_path;
+                Err("External file manager launch is not supported on mobile OS targets".into())
             }
         }
     }
@@ -1236,6 +1442,16 @@ mod tests {
             extract_ws_port(&["wss://devbox.internal:7001/ws".to_string()]),
             Some(7001)
         );
+    }
+
+    #[test]
+    fn picked_posix_path_strips_trailing_slash() {
+        assert_eq!(
+            normalize_picked_posix_path("/Users/jess/Code/orbit/\n"),
+            Some("/Users/jess/Code/orbit".into())
+        );
+        assert_eq!(normalize_picked_posix_path("/\n"), Some("/".into()));
+        assert_eq!(normalize_picked_posix_path("   "), None);
     }
 
     #[test]

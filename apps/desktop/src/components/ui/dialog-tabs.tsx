@@ -1,39 +1,57 @@
 import * as React from "react";
-import { Dialog as DialogPrimitive, Tabs as TabsPrimitive } from "radix-ui";
+import { Dialog as BaseDialog } from "@base-ui/react/dialog";
+import { Tabs as BaseTabs } from "@base-ui/react/tabs";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-function Dialog(props: React.ComponentProps<typeof DialogPrimitive.Root>) {
-  return <DialogPrimitive.Root data-slot="dialog" {...props} />;
+function Dialog(props: React.ComponentProps<typeof BaseDialog.Root>) {
+  return <BaseDialog.Root {...props} />;
 }
 
-function DialogTrigger(props: React.ComponentProps<typeof DialogPrimitive.Trigger>) {
-  return <DialogPrimitive.Trigger data-slot="dialog-trigger" {...props} />;
+type DialogTriggerProps = Omit<React.ComponentProps<typeof BaseDialog.Trigger>, "render"> & {
+  asChild?: boolean;
+  render?: React.ReactElement;
+};
+
+function DialogTrigger({ asChild, render, children, nativeButton, ...props }: DialogTriggerProps) {
+  const targetEl = render ?? (asChild && React.isValidElement(children) ? children : undefined);
+  const isNonNativeButton =
+    targetEl && typeof targetEl.type === "string" && targetEl.type !== "button";
+  return (
+    <BaseDialog.Trigger
+      data-slot="dialog-trigger"
+      render={targetEl}
+      nativeButton={nativeButton ?? (isNonNativeButton ? false : undefined)}
+      {...props}
+    >
+      {asChild && React.isValidElement(children) ? undefined : children}
+    </BaseDialog.Trigger>
+  );
 }
 
 function DialogContent({
   className,
   children,
   ...props
-}: React.ComponentProps<typeof DialogPrimitive.Content>) {
+}: React.ComponentProps<typeof BaseDialog.Popup>) {
   return (
-    <DialogPrimitive.Portal>
-      <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/65 backdrop-blur-xs" />
-      <DialogPrimitive.Content
+    <BaseDialog.Portal>
+      <BaseDialog.Backdrop className="orbit-dialog-overlay fixed inset-0 z-50 bg-black/45 backdrop-blur-[2px]" />
+      <BaseDialog.Popup
         data-slot="dialog-content"
         className={cn(
-          "bg-card border-border fixed top-1/2 left-1/2 z-50 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border p-6 shadow-xl",
+          "bg-elevated text-foreground floating-surface orbit-dialog-content fixed top-1/2 left-1/2 z-50 grid w-full max-w-lg -translate-x-1/2 -translate-y-1/2 gap-4 rounded-[16px] border border-black/[0.09] p-6 outline-none dark:border-white/[0.10]",
           className,
         )}
         {...props}
       >
         {children}
-        <DialogPrimitive.Close className="text-muted-foreground hover:text-foreground absolute top-4 right-4 rounded-sm opacity-70 transition-opacity hover:opacity-100 cursor-pointer">
-          <X className="size-4" />
+        <BaseDialog.Close className="text-muted-foreground hover:text-foreground absolute top-4 right-4 cursor-pointer rounded-md opacity-70 transition-opacity hover:opacity-100">
+          <X className="h-[16px] w-[16px]" />
           <span className="sr-only">Close</span>
-        </DialogPrimitive.Close>
-      </DialogPrimitive.Content>
-    </DialogPrimitive.Portal>
+        </BaseDialog.Close>
+      </BaseDialog.Popup>
+    </BaseDialog.Portal>
   );
 }
 
@@ -41,31 +59,36 @@ function DialogHeader({ className, ...props }: React.ComponentProps<"div">) {
   return <div className={cn("flex flex-col gap-1.5 text-left", className)} {...props} />;
 }
 
-function DialogTitle({ className, ...props }: React.ComponentProps<typeof DialogPrimitive.Title>) {
-  return <DialogPrimitive.Title className={cn("text-base font-semibold", className)} {...props} />;
+function DialogTitle({ className, ...props }: React.ComponentProps<typeof BaseDialog.Title>) {
+  return (
+    <BaseDialog.Title
+      className={cn("text-[16px] font-semibold tracking-[-0.01em]", className)}
+      {...props}
+    />
+  );
 }
 
 function DialogDescription({
   className,
   ...props
-}: React.ComponentProps<typeof DialogPrimitive.Description>) {
+}: React.ComponentProps<typeof BaseDialog.Description>) {
   return (
-    <DialogPrimitive.Description
-      className={cn("text-muted-foreground text-xs", className)}
+    <BaseDialog.Description
+      className={cn("text-muted-foreground text-[13px]", className)}
       {...props}
     />
   );
 }
 
-function Tabs({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.Root>) {
-  return <TabsPrimitive.Root className={cn("flex flex-col", className)} {...props} />;
+function Tabs({ className, ...props }: React.ComponentProps<typeof BaseTabs.Root>) {
+  return <BaseTabs.Root className={cn("flex flex-col", className)} {...props} />;
 }
 
-function TabsList({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.List>) {
+function TabsList({ className, ...props }: React.ComponentProps<typeof BaseTabs.List>) {
   return (
-    <TabsPrimitive.List
+    <BaseTabs.List
       className={cn(
-        "bg-muted text-muted-foreground inline-flex h-8 w-fit items-center justify-center rounded-lg p-0.5",
+        "bg-muted text-muted-foreground inline-flex h-[32px] w-fit items-center justify-center rounded-[10px] p-1",
         className,
       )}
       {...props}
@@ -73,11 +96,11 @@ function TabsList({ className, ...props }: React.ComponentProps<typeof TabsPrimi
   );
 }
 
-function TabsTrigger({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.Trigger>) {
+function TabsTrigger({ className, ...props }: React.ComponentProps<typeof BaseTabs.Tab>) {
   return (
-    <TabsPrimitive.Trigger
+    <BaseTabs.Tab
       className={cn(
-        "data-[state=active]:bg-background data-[state=active]:text-foreground inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1 text-xs font-medium whitespace-nowrap transition-all cursor-pointer data-[state=active]:shadow-2xs",
+        "data-[active]:bg-background data-[active]:text-foreground inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-[7px] px-3 py-1 text-[12.5px] font-medium whitespace-nowrap transition-all data-[active]:shadow-2xs",
         className,
       )}
       {...props}
@@ -85,8 +108,8 @@ function TabsTrigger({ className, ...props }: React.ComponentProps<typeof TabsPr
   );
 }
 
-function TabsContent({ className, ...props }: React.ComponentProps<typeof TabsPrimitive.Content>) {
-  return <TabsPrimitive.Content className={cn("flex-1 outline-none", className)} {...props} />;
+function TabsContent({ className, ...props }: React.ComponentProps<typeof BaseTabs.Panel>) {
+  return <BaseTabs.Panel className={cn("flex-1 outline-none", className)} {...props} />;
 }
 
 export {

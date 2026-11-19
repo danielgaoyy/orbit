@@ -692,35 +692,66 @@ async fn handle_wire_rpc(
         // Workspaces & Git
         WireMessage::DiscoverProjects { request_id } => {
             let store = runtime.store.clone();
-            let projects = tokio::task::spawn_blocking(move || {
-                crate::discovery::discover_host_projects(&store)
-            })
-            .await
-            .unwrap_or_default();
-            Some(WireMessage::DiscoveredProjectsSnapshot {
-                request_id,
-                projects,
-            })
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let projects = tokio::task::spawn_blocking(move || {
+                    crate::discovery::discover_host_projects(&store)
+                })
+                .await
+                .unwrap_or_default();
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::DiscoveredProjectsSnapshot {
+                            request_id,
+                            projects,
+                        },
+                        zstd,
+                    })
+                    .await;
+            });
+            None
         }
         WireMessage::ListDirectory { request_id, path } => {
-            let (current_path, parent_path, entries) = tokio::task::spawn_blocking(move || {
-                crate::discovery::list_directory_entries(path.as_deref())
-            })
-            .await
-            .unwrap_or_else(|_| ("/".into(), None, Vec::new()));
-            Some(WireMessage::DirectoryEntriesResponse {
-                request_id,
-                current_path,
-                parent_path,
-                entries,
-            })
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let (current_path, parent_path, entries) = tokio::task::spawn_blocking(move || {
+                    crate::discovery::list_directory_entries(path.as_deref())
+                })
+                .await
+                .unwrap_or_else(|_| ("/".into(), None, Vec::new()));
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::DirectoryEntriesResponse {
+                            request_id,
+                            current_path,
+                            parent_path,
+                            entries,
+                        },
+                        zstd,
+                    })
+                    .await;
+            });
+            None
         }
         WireMessage::ListModels { request_id } => {
-            let catalogs = runtime.get_or_probe_provider_catalogs(false).await;
-            Some(WireMessage::ModelsSnapshot {
-                request_id,
-                models: catalogs_to_model_map(&catalogs),
-            })
+            let rt = Arc::clone(runtime);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let catalogs = rt.get_or_probe_provider_catalogs(false).await;
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::ModelsSnapshot {
+                            request_id,
+                            models: catalogs_to_model_map(&catalogs),
+                        },
+                        zstd,
+                    })
+                    .await;
+            });
+            None
         }
         WireMessage::ListWorkspaces { request_id } => match runtime.store.list_workspaces() {
             Ok(workspaces) => Some(WireMessage::WorkspacesSnapshot {
@@ -747,30 +778,62 @@ async fn handle_wire_rpc(
             Err(e) => Some(rpc_err(request_id, "workspace_error", e)),
         },
         WireMessage::GetGitStatus { request_id, cwd } => {
-            let status = inspect_git_status(Path::new(&cwd)).await;
-            Some(WireMessage::GitStatusResponse { request_id, status })
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let mut status = inspect_git_status(&resolved).await;
+                status.cwd = cwd;
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::GitStatusResponse { request_id, status },
+                        zstd,
+                    })
+                    .await;
+            });
+            None
         }
         WireMessage::GetGitDiff {
             request_id,
             cwd,
             path,
             staged,
-        } => match compute_git_diff(Path::new(&cwd), path.as_deref(), staged).await {
-            Ok(unified_diff) => Some(WireMessage::GitDiffResponse {
-                request_id,
-                cwd,
-                path,
-                unified_diff,
-            }),
-            Err(e) => Some(rpc_err(request_id, "git_diff_error", e)),
-        },
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let reply = match compute_git_diff(&resolved, path.as_deref(), staged).await {
+                    Ok(unified_diff) => WireMessage::GitDiffResponse {
+                        request_id,
+                        cwd,
+                        path,
+                        unified_diff,
+                    },
+                    Err(e) => rpc_err(request_id, "git_diff_error", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::ListWorkspaceFiles { request_id, cwd } => {
-            let files = list_workspace_files(Path::new(&cwd), 2500).await;
-            Some(WireMessage::WorkspaceFilesResponse {
-                request_id,
-                cwd,
-                files,
-            })
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let files = list_workspace_files(&resolved, 2500).await;
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::WorkspaceFilesResponse {
+                            request_id,
+                            cwd,
+                            files,
+                        },
+                        zstd,
+                    })
+                    .await;
+            });
+            None
         }
 
         // Agents
@@ -943,13 +1006,13 @@ async fn handle_wire_rpc(
         }
 
         // Terminals
-        WireMessage::ListTerminals { request_id } => match runtime.store.list_terminals() {
-            Ok(terminals) => Some(WireMessage::TerminalsSnapshot {
+        WireMessage::ListTerminals { request_id } => {
+            let terminals = runtime.orchestrator.list_live_terminals().await;
+            Some(WireMessage::TerminalsSnapshot {
                 request_id,
                 terminals,
-            }),
-            Err(e) => Some(rpc_err(request_id, "terminal_list_error", e)),
-        },
+            })
+        }
         WireMessage::CreateTerminal {
             request_id,
             cwd,
@@ -1026,26 +1089,62 @@ async fn handle_wire_rpc(
             }
         }
 
-        // Quotas & Provider Model Catalogs
+        // Quotas & Provider Model Catalogs (spawned off-loop so slow CLI probes never block RPC or PTY!)
         WireMessage::RefreshQuotas { request_id } => {
-            let snapshots = probe_all_provider_quotas().await;
-            Some(WireMessage::QuotaReport {
-                request_id: Some(request_id),
-                snapshots,
-            })
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let snapshots = probe_all_provider_quotas().await;
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::QuotaReport {
+                            request_id: Some(request_id),
+                            snapshots,
+                        },
+                        zstd,
+                    })
+                    .await;
+            });
+            None
         }
         WireMessage::ListProviderModels {
             request_id,
             force_refresh,
         } => {
-            let catalogs = runtime.get_or_probe_provider_catalogs(force_refresh).await;
-            Some(WireMessage::ProviderModelsSnapshot {
-                request_id,
-                catalogs,
-            })
+            let rt = Arc::clone(runtime);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let catalogs = rt.get_or_probe_provider_catalogs(force_refresh).await;
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::ProviderModelsSnapshot {
+                            request_id,
+                            catalogs,
+                        },
+                        zstd,
+                    })
+                    .await;
+            });
+            None
         }
         _ => None,
     }
+}
+
+pub(crate) fn expand_host_path(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(trimmed)
 }
 
 async fn bind_terminal_stream_to_client(

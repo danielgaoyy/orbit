@@ -19,7 +19,8 @@ use orbit_client_core::catalog::{
 };
 use orbit_client_core::render::{
     DiffFileView, DiffLineKind, DiffLineView, HighlightedLineView, HighlightedTokenView,
-    InlineSpanView, RichBlockView, TerminalRowView, TerminalScreenView, TerminalSpanView,
+    InlineSpanView, RichBlockView, TableAlignmentView, TableCellView, TableRowView,
+    TerminalRowView, TerminalScreenView, TerminalSpanView,
 };
 use orbit_client_core::stage::{
     AgentStageView, StageTurnView, ToolStepDescriptorView, ToolStepKind, TurnFileDiffSummaryView,
@@ -757,6 +758,51 @@ impl From<HighlightedLineView> for FfiHighlightedLine {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiTableAlignment {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+impl From<TableAlignmentView> for FfiTableAlignment {
+    fn from(v: TableAlignmentView) -> Self {
+        match v {
+            TableAlignmentView::None => Self::None,
+            TableAlignmentView::Left => Self::Left,
+            TableAlignmentView::Center => Self::Center,
+            TableAlignmentView::Right => Self::Right,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiTableCell {
+    pub spans: Vec<FfiInlineSpan>,
+}
+
+impl From<TableCellView> for FfiTableCell {
+    fn from(v: TableCellView) -> Self {
+        Self {
+            spans: v.spans.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiTableRow {
+    pub cells: Vec<FfiTableCell>,
+}
+
+impl From<TableRowView> for FfiTableRow {
+    fn from(v: TableRowView) -> Self {
+        Self {
+            cells: v.cells.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiRichBlock {
     Heading {
@@ -779,6 +825,11 @@ pub enum FfiRichBlock {
     },
     BlockQuote {
         spans: Vec<FfiInlineSpan>,
+    },
+    Table {
+        alignments: Vec<FfiTableAlignment>,
+        headers: Vec<FfiTableCell>,
+        rows: Vec<FfiTableRow>,
     },
     HorizontalRule,
 }
@@ -815,6 +866,15 @@ impl From<RichBlockView> for FfiRichBlock {
             },
             RichBlockView::BlockQuote { spans } => Self::BlockQuote {
                 spans: spans.into_iter().map(Into::into).collect(),
+            },
+            RichBlockView::Table {
+                alignments,
+                headers,
+                rows,
+            } => Self::Table {
+                alignments: alignments.into_iter().map(Into::into).collect(),
+                headers: headers.into_iter().map(Into::into).collect(),
+                rows: rows.into_iter().map(Into::into).collect(),
             },
             RichBlockView::HorizontalRule => Self::HorizontalRule,
         }

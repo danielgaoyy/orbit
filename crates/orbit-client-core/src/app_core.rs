@@ -290,7 +290,7 @@ struct HostMemoryState {
     workspaces: Vec<WorkspaceSummary>,
     agents: HashMap<String, AgentSummary>,
     timelines: HashMap<String, Vec<TimelineEvent>>,
-    markdown_cache: HashMap<(u64, usize, bool), Vec<RichBlockView>>,
+    markdown_cache: HashMap<(String, u64, usize, bool), Vec<RichBlockView>>,
     quotas: Vec<ProviderQuotaSnapshot>,
     provider_catalogs: Vec<ProviderModelCatalog>,
     terminals: Vec<TerminalSummary>,
@@ -742,7 +742,10 @@ impl OrbitAppCore {
                     text,
                     badges,
                 } => {
-                    let key = (ev.seq, text.len(), false);
+                    let key = (agent_id.to_string(), ev.seq, text.len(), false);
+                    if host_state.markdown_cache.len() > 2048 {
+                        host_state.markdown_cache.clear();
+                    }
                     let blocks = host_state
                         .markdown_cache
                         .entry(key)
@@ -770,7 +773,10 @@ impl OrbitAppCore {
                     text,
                     streaming,
                 } => {
-                    let key = (ev.seq, text.len(), *streaming);
+                    let key = (agent_id.to_string(), ev.seq, text.len(), *streaming);
+                    if host_state.markdown_cache.len() > 2048 {
+                        host_state.markdown_cache.clear();
+                    }
                     let blocks = host_state
                         .markdown_cache
                         .entry(key)
@@ -3543,5 +3549,70 @@ mod tests {
         assert_eq!(counter.timeline_count.load(Ordering::SeqCst), 1);
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(counter.timeline_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn markdown_cache_keys_isolate_different_agents_on_same_host() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = PairingOffer {
+            host_id: "host_cache".into(),
+            hostname: "cache-box".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        // Same seq=1, same length (11 bytes), streaming=false, different markdown blocks!
+        core.handle_inbound_wire(
+            "host_cache",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 1,
+                    epoch: 1,
+                    agent_id: "ag_one".into(),
+                    turn_id: None,
+                    timestamp: Utc::now(),
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "m1".into(),
+                        text: "# Heading 1".into(),
+                        streaming: false,
+                    },
+                },
+            },
+        );
+        core.handle_inbound_wire(
+            "host_cache",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 1,
+                    epoch: 1,
+                    agent_id: "ag_two".into(),
+                    turn_id: None,
+                    timestamp: Utc::now(),
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "m2".into(),
+                        text: "`codeblock`".into(),
+                        streaming: false,
+                    },
+                },
+            },
+        );
+
+        let tl1 = core.agent_timeline("host_cache", "ag_one");
+        let tl2 = core.agent_timeline("host_cache", "ag_two");
+        match (&tl1.items[0], &tl2.items[0]) {
+            (
+                TimelineItemView::AssistantMessage { blocks: b1, .. },
+                TimelineItemView::AssistantMessage { blocks: b2, .. },
+            ) => {
+                assert!(matches!(b1[0], RichBlockView::Heading { .. }));
+                assert!(matches!(b2[0], RichBlockView::Paragraph { .. }));
+            }
+            other => panic!("unexpected timeline items: {other:?}"),
+        }
     }
 }

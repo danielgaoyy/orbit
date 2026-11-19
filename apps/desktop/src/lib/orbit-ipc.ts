@@ -234,6 +234,16 @@ export interface HighlightedLineView {
   tokens: HighlightedTokenView[];
 }
 
+export type TableAlignmentView = "none" | "left" | "center" | "right";
+
+export interface TableCellView {
+  spans: InlineSpanView[];
+}
+
+export interface TableRowView {
+  cells: TableCellView[];
+}
+
 export type RichBlockView =
   | { kind: "heading"; level: number; spans: InlineSpanView[] }
   | { kind: "paragraph"; spans: InlineSpanView[] }
@@ -251,6 +261,12 @@ export type RichBlockView =
       spans: InlineSpanView[];
     }
   | { kind: "block_quote"; spans: InlineSpanView[] }
+  | {
+      kind: "table";
+      alignments: TableAlignmentView[];
+      headers: TableCellView[];
+      rows: TableRowView[];
+    }
   | { kind: "horizontal_rule" };
 
 export type DiffLineKind = "meta" | "hunk_header" | "context" | "added" | "removed";

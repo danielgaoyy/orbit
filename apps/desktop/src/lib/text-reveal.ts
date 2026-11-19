@@ -43,6 +43,16 @@ export function countRichBlocksChars(blocks: RichBlockView[]): number {
       case "code_block":
         total += b.raw_code.length;
         break;
+      case "table":
+        for (const h of b.headers) {
+          total += countSpansLength(h.spans);
+        }
+        for (const r of b.rows) {
+          for (const c of r.cells) {
+            total += countSpansLength(c.spans);
+          }
+        }
+        break;
       case "horizontal_rule":
         total += 1;
         break;
@@ -115,6 +125,41 @@ export function sliceRichBlocks(blocks: RichBlockView[], budget: number): RichBl
           });
           rem = 0;
         }
+        break;
+      }
+      case "table": {
+        const nextHeaders = block.headers.map((h) => {
+          if (rem <= 0) return { spans: [] };
+          const len = countSpansLength(h.spans);
+          if (len <= rem) {
+            rem -= len;
+            return h;
+          }
+          const sliced = sliceSpans(h.spans, rem);
+          rem = 0;
+          return { spans: sliced };
+        });
+        const nextRows = [];
+        for (const row of block.rows) {
+          if (rem <= 0) break;
+          const nextCells = row.cells.map((c) => {
+            if (rem <= 0) return { spans: [] };
+            const len = countSpansLength(c.spans);
+            if (len <= rem) {
+              rem -= len;
+              return c;
+            }
+            const sliced = sliceSpans(c.spans, rem);
+            rem = 0;
+            return { spans: sliced };
+          });
+          nextRows.push({ cells: nextCells });
+        }
+        out.push({
+          ...block,
+          headers: nextHeaders,
+          rows: nextRows,
+        });
         break;
       }
       case "horizontal_rule":

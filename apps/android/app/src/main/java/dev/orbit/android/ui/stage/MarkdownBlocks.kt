@@ -63,6 +63,8 @@ import kotlinx.coroutines.delay
 import uniffi.orbit_ffi_uniffi.FfiHighlightedLine
 import uniffi.orbit_ffi_uniffi.FfiInlineSpan
 import uniffi.orbit_ffi_uniffi.FfiRichBlock
+import uniffi.orbit_ffi_uniffi.FfiTableAlignment
+import uniffi.orbit_ffi_uniffi.FfiTableCell
 
 @Composable
 fun MarkdownBlocks(
@@ -167,6 +169,9 @@ fun MarkdownBlocks(
                     }
                     is FfiRichBlock.CodeBlock -> {
                         CodeBlockSurface(block = block)
+                    }
+                    is FfiRichBlock.Table -> {
+                        MarkdownTableSurface(block = block, textColor = textColor)
                     }
                     FfiRichBlock.HorizontalRule -> {
                         HorizontalDivider(
@@ -401,6 +406,111 @@ private fun CodeBlockSurface(block: FfiRichBlock.CodeBlock) {
                             color = colors.fgPrimary,
                             maxLines = 1,
                             softWrap = false,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownTableSurface(
+    block: FfiRichBlock.Table,
+    textColor: Color,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val colCount = maxOf(
+        block.headers.size,
+        block.rows.maxOfOrNull { it.cells.size } ?: 0,
+        1,
+    )
+    val shape = RoundedCornerShape(OrbitSpacing.md)
+
+    @Composable
+    fun TableCellBox(
+        cell: FfiTableCell?,
+        isHeader: Boolean,
+        colIndex: Int,
+    ) {
+        val align = block.alignments.getOrNull(colIndex) ?: FfiTableAlignment.NONE
+        val boxAlign = when (align) {
+            FfiTableAlignment.CENTER -> Alignment.Center
+            FfiTableAlignment.RIGHT -> Alignment.CenterEnd
+            else -> Alignment.CenterStart
+        }
+        Box(
+            modifier = Modifier
+                .width(OrbitSpacing.xl * 7)
+                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+            contentAlignment = boxAlign,
+        ) {
+            RichSpanText(
+                spans = cell?.spans ?: emptyList(),
+                style = if (isHeader) typography.subheadSemiBold else typography.subhead,
+                defaultColor = if (isHeader) colors.fgPrimary else textColor,
+                colors = colors,
+            )
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(colors.code, shape)
+            .border(OrbitSpacing.hairline, colors.hairline, shape)
+            .horizontalScroll(rememberScrollState()),
+    ) {
+        Column(
+            modifier = Modifier.width(IntrinsicSize.Max),
+        ) {
+            if (block.headers.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .background(colors.subtleFill)
+                        .height(IntrinsicSize.Min),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    for (colIdx in 0 until colCount) {
+                        if (colIdx > 0) {
+                            Box(
+                                modifier = Modifier
+                                    .width(OrbitSpacing.hairline)
+                                    .fillMaxHeight()
+                                    .background(colors.hairline)
+                            )
+                        }
+                        TableCellBox(
+                            cell = block.headers.getOrNull(colIdx),
+                            isHeader = true,
+                            colIndex = colIdx,
+                        )
+                    }
+                }
+            }
+            block.rows.forEachIndexed { rowIdx, row ->
+                HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+                Row(
+                    modifier = Modifier
+                        .background(if (rowIdx % 2 == 1) colors.subtleFill.copy(alpha = 0.45f) else Color.Transparent)
+                        .height(IntrinsicSize.Min),
+                    verticalAlignment = Alignment.Top,
+                ) {
+                    for (colIdx in 0 until colCount) {
+                        if (colIdx > 0) {
+                            Box(
+                                modifier = Modifier
+                                    .width(OrbitSpacing.hairline)
+                                    .fillMaxHeight()
+                                    .background(colors.hairline)
+                            )
+                        }
+                        TableCellBox(
+                            cell = row.cells.getOrNull(colIdx),
+                            isHeader = false,
+                            colIndex = colIdx,
                         )
                     }
                 }

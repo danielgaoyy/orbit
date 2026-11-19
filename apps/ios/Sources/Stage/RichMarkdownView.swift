@@ -28,6 +28,15 @@ struct RichMarkdownView: View {
         var out: [MarkdownRenderSegment] = []
         var idx = 0
         while idx < blocks.count {
+            if case let .table(_, headers, rows) = blocks[idx] {
+                let model = MarkdownTableModel(
+                    headers: headers.map(\.spans),
+                    rows: rows.map { $0.cells.map(\.spans) }
+                )
+                out.append(.table(model))
+                idx += 1
+                continue
+            }
             if let tableRowCells = extractDelimitedTableCells(from: blocks[idx]) {
                 var rawRows: [[[FfiInlineSpan]]] = [tableRowCells]
                 var next = idx + 1
@@ -138,6 +147,17 @@ struct RichMarkdownView: View {
 
         case let .codeBlock(language, rawCode, lines):
             CodeBlockView(language: language, rawCode: rawCode, lines: lines)
+
+        case let .table(_, headers, rows):
+            MarkdownTableView(
+                model: MarkdownTableModel(
+                    headers: headers.map(\.spans),
+                    rows: rows.map { $0.cells.map(\.spans) }
+                ),
+                buildAttributed: { spans, baseColor, isHeader in
+                    buildTableCellAttributed(spans, baseColor: baseColor, isHeader: isHeader)
+                }
+            )
         }
     }
 

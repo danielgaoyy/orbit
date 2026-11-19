@@ -210,6 +210,14 @@ export interface HighlightedLineDto {
   tokens: HighlightedTokenDto[];
 }
 
+export interface TableCellDto {
+  spans: InlineSpanDto[];
+}
+
+export interface TableRowDto {
+  cells: TableCellDto[];
+}
+
 export interface RichBlockDto {
   kind: string;
   level?: number;
@@ -220,8 +228,9 @@ export interface RichBlockDto {
   ordered?: boolean;
   index?: number;
   checked?: boolean | null;
-  headers?: string[];
-  rows?: string[][];
+  alignments?: string[];
+  headers?: (string | TableCellDto)[];
+  rows?: (string[] | TableRowDto)[];
 }
 
 export interface DiffLineDto {

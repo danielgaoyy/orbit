@@ -174,6 +174,14 @@ private fun extractAssistantReplyText(reply: FfiTimelineItem.AssistantMessage): 
                     appendLine(block.rawCode)
                     appendLine("```")
                 }
+                is FfiRichBlock.Table -> {
+                    if (block.headers.isNotEmpty()) {
+                        appendLine(block.headers.joinToString(" | ") { cell -> cell.spans.joinToString("") { it.text } })
+                    }
+                    block.rows.forEach { row ->
+                        appendLine(row.cells.joinToString(" | ") { cell -> cell.spans.joinToString("") { it.text } })
+                    }
+                }
                 FfiRichBlock.HorizontalRule -> appendLine("---")
             }
         }

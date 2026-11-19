@@ -105,6 +105,16 @@ export const OmniComposer = memo(function OmniComposer({
           ?.is_running,
     ),
   );
+  const isAwaitingPermission = useOrbitSelector((s) =>
+    Boolean(
+      !s.isDraftNewSession &&
+        s.selectedHostId &&
+        s.selectedAgentId &&
+        s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
+          ?.is_awaiting_permission,
+    ),
+  );
+  const isTurnBusy = isRunning || isAwaitingPermission;
   const activeAgentMode = useOrbitSelector((s) => {
     if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return null;
     return (
@@ -774,9 +784,7 @@ export const OmniComposer = memo(function OmniComposer({
                   aria-hidden="true"
                   className="text-foreground/45 pointer-events-none absolute top-[13px] right-[14px] left-[14px] truncate text-[15px] leading-[20px] select-none"
                 >
-                  {isRunning
-                    ? "Ask a follow-up, @ to mention, or ⌥↵ to steer"
-                    : "Ask anything, @ to mention, / for actions"}
+                  Ask anything, @ to mention, / for actions
                 </div>
               )}
 
@@ -897,7 +905,7 @@ export const OmniComposer = memo(function OmniComposer({
               <div className="flex shrink-0 items-center gap-1.5">
                 <ComposerModePicker mode={activeMode} onSelectMode={handleSelectMode} />
 
-                {isRunning && !hasPayload ? (
+                {isTurnBusy && !hasPayload ? (
                   <button
                     type="button"
                     title="Stop generation"
@@ -910,7 +918,7 @@ export const OmniComposer = memo(function OmniComposer({
                   >
                     <span className="size-[11px] rounded-[2.5px] bg-[#EF4444]" />
                   </button>
-                ) : isRunning && hasPayload ? (
+                ) : isTurnBusy && hasPayload ? (
                   <div className="orbit-pill-enter flex items-center gap-1.5">
                     <button
                       type="button"

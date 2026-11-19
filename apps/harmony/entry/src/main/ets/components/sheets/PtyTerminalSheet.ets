@@ -9,15 +9,12 @@ import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
   orbitButtonMeta,
-  orbitButtonMono,
   orbitButtonSubhead,
   orbitInputMono,
   orbitSpanMonoFont,
-  orbitTextMeta,
-  orbitTextMono,
-  orbitTextSubhead,
-  orbitTextTitle
+  orbitTextMono
 } from '../../theme/OrbitTokens';
+import { dismissHarmonyKeyboard } from '../common/OrbitCommonControls';
 
 const DEV_KEYBAR_ITEMS: DevKeyItem[] = [
   { id: 'esc', label: 'ESC', sequence: '\x1b', isModifier: false, a11yLabel: 'Escape key' },
@@ -42,21 +39,34 @@ export struct PtyTerminalSheet {
   @Local shellInput: string = '';
   @Local copiedFeedback: boolean = false;
   @Local sheetHeightVp: number = 0;
+
+  private copiedTimerId: number = -1;
+  private navPathStack: NavPathStack = new NavPathStack();
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
-  private isCompactLandscape(): boolean {
+  aboutToDisappear(): void {
+    if (this.copiedTimerId !== -1) {
+      clearTimeout(this.copiedTimerId);
+      this.copiedTimerId = -1;
+    }
+  }
+
+  @Computed
+  get isCompactLandscape(): boolean {
     if (this.sheetHeightVp > 0 && this.sheetHeightVp < 430) {
       return true;
     }
     return this.store.windowHeightVp > 0 && this.store.windowHeightVp < 430;
   }
 
-  private terminals(): TerminalSummaryDto[] {
+  @Computed
+  get terminals(): TerminalSummaryDto[] {
     const detail = this.store.currentHostDetail;
     return detail !== null ? detail.terminals : [];
   }
 
-  private activeTerminalId(): string {
+  @Computed
+  get activeTerminalId(): string {
     const detail = this.store.currentHostDetail;
     return detail !== null && detail.active_terminal_id !== null ? detail.active_terminal_id : '';
   }
@@ -86,349 +96,346 @@ export struct PtyTerminalSheet {
     this.store.triggerHaptic(6);
   }
 
+  @Builder
+  private renderTerminalMenus() {
+    Row({ space: OrbitTokens.SPACE_XS }) {
+      Button({ type: ButtonType.Circle, stateEffect: true }) {
+        SymbolGlyph(
+          this.copiedFeedback ? $r('sys.symbol.checkmark') : $r('sys.symbol.square_and_square')
+        )
+          .fontSize(17)
+          .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+          .fontColor([
+            this.copiedFeedback ? this.store.palette.statusDirect : this.store.palette.iconPrimary
+          ])
+      }
+      .width(OrbitTokens.HIT_COMPACT)
+      .height(OrbitTokens.HIT_COMPACT)
+      .padding(0)
+      .backgroundColor(
+        this.copiedFeedback
+          ? this.store.palette.statusDirectSoft
+          : this.store.palette.subtleSurface
+      )
+      .accessibilityText('Copy terminal output')
+      .onClick(() => {
+        this.store.copyTerminalSnapshot();
+        this.copiedFeedback = true;
+        if (this.copiedTimerId !== -1) {
+          clearTimeout(this.copiedTimerId);
+        }
+        this.copiedTimerId = setTimeout(() => {
+          this.copiedFeedback = false;
+          this.copiedTimerId = -1;
+        }, 1600);
+      })
+
+      Button('Quote', { type: ButtonType.Capsule, stateEffect: true })
+        .attributeModifier(
+          orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+        )
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+        .accessibilityText('Quote terminal output into composer')
+        .onClick(() => {
+          dismissHarmonyKeyboard(this.getUIContext());
+          this.store.quoteTerminalIntoComposer();
+        })
+
+      Button({ type: ButtonType.Circle, stateEffect: true }) {
+        SymbolGlyph($r('sys.symbol.plus'))
+          .fontSize(18)
+          .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+          .fontColor([this.store.palette.iconPrimary])
+      }
+      .width(OrbitTokens.HIT_COMPACT)
+      .height(OrbitTokens.HIT_COMPACT)
+      .padding(0)
+      .backgroundColor(this.store.palette.subtleSurface)
+      .accessibilityText('Spawn new terminal session')
+      .onClick(() => {
+        this.store.startNewTerminal();
+      })
+    }
+    .padding({ right: OrbitTokens.SPACE_MD })
+    .alignItems(VerticalAlign.Center)
+  }
+
   build() {
-    Column({ space: this.isCompactLandscape() ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_SM }) {
-      Row({ space: OrbitTokens.SPACE_XS }) {
-        if (this.isCompactLandscape()) {
-          Row({ space: OrbitTokens.SPACE_SM }) {
-            Text('PTY')
-              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
-            Text(
-              `${basenameOfPath(this.store.activeCwd)} · ${this.store.terminalCols}×${this.store.terminalGridRows}`
-            )
-              .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
+    Navigation(this.navPathStack) {
+      Column({ space: this.isCompactLandscape ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_SM }) {
+        if (this.terminals.length > 0) {
+          Scroll() {
+            Row({ space: this.isCompactLandscape ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_SM }) {
+              ForEach(
+                this.terminals,
+                (term: TerminalSummaryDto, tIdx: number) => {
+                  Row({ space: 2 }) {
+                    Button({ type: ButtonType.Normal, stateEffect: true }) {
+                      Text(term.title.length > 0 ? term.title : `Shell ${tIdx + 1}`)
+                        .attributeModifier(
+                          orbitTextMono(
+                            this.activeTerminalId === term.terminal_id
+                              ? this.store.palette.accentPrimary
+                              : this.store.palette.fgSecondary,
+                            FontWeight.Medium
+                          )
+                        )
+                    }
+                    .height(OrbitTokens.HIT_COMPACT)
+                    .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_XS })
+                    .backgroundColor(Color.Transparent)
+                    .onClick(() => {
+                      this.store.attachTerminal(term.terminal_id, 1);
+                    })
+
+                    Button({ type: ButtonType.Circle, stateEffect: true }) {
+                      SymbolGlyph($r('sys.symbol.xmark'))
+                        .fontSize(12)
+                        .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                        .fontColor([this.store.palette.iconSecondary])
+                    }
+                    .width(OrbitTokens.HIT_COMPACT)
+                    .height(OrbitTokens.HIT_COMPACT)
+                    .padding(0)
+                    .backgroundColor(Color.Transparent)
+                    .accessibilityText(
+                      `Kill terminal ${term.title.length > 0 ? term.title : `Shell ${tIdx + 1}`}`
+                    )
+                    .onClick(() => {
+                      this.store.killTerminal(term.terminal_id);
+                    })
+                  }
+                  .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+                  .backgroundColor(
+                    this.activeTerminalId === term.terminal_id
+                      ? this.store.palette.accentPrimarySoft
+                      : this.store.palette.listCard
+                  )
+                  .borderRadius(OrbitTokens.RADIUS_MD)
+                  .alignItems(VerticalAlign.Center)
+                },
+                (term: TerminalSummaryDto) => term.terminal_id
+              )
+            }
           }
-          .alignItems(VerticalAlign.Center)
-          .layoutWeight(1)
-        } else {
-          Column({ space: 2 }) {
-            Text('PTY Terminal')
-              .attributeModifier(orbitTextTitle(this.store.palette.fgPrimary, FontWeight.Bold))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-            Text(
-              `${basenameOfPath(this.store.activeCwd)} · ${this.store.terminalCols}×${this.store.terminalGridRows}`
-            )
-              .attributeModifier(orbitTextMono(this.store.palette.fgSecondary))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
+          .scrollable(ScrollDirection.Horizontal)
+          .scrollBar(BarState.Off)
+          .width('100%')
         }
 
-        Button(this.copiedFeedback ? 'Copied' : 'Copy')
-          .attributeModifier(
-            orbitButtonMeta(
-              this.copiedFeedback ? this.store.palette.statusDirect : this.store.palette.fgPrimary,
-              this.copiedFeedback
-                ? this.store.palette.statusDirectSoft
-                : this.store.palette.subtleSurface
-            )
-          )
-          .height(OrbitTokens.HIT_MIN)
-          .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-          .borderRadius(OrbitTokens.PILL_RADIUS)
-          .accessibilityText('Copy terminal output')
-          .onClick(() => {
-            this.store.copyTerminalSnapshot();
-            this.copiedFeedback = true;
-            setTimeout(() => {
-              this.copiedFeedback = false;
-            }, 1600);
-          })
-
-        Button('Quote')
-          .attributeModifier(
-            orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
-          )
-          .height(OrbitTokens.HIT_MIN)
-          .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-          .borderRadius(OrbitTokens.PILL_RADIUS)
-          .accessibilityText('Quote terminal output into composer')
-          .onClick(() => {
-            this.store.quoteTerminalIntoComposer();
-          })
-
-        Button('+ New')
-          .attributeModifier(
-            orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
-          )
-          .height(OrbitTokens.HIT_MIN)
-          .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-          .borderRadius(OrbitTokens.PILL_RADIUS)
-          .accessibilityText('Spawn new terminal session')
-          .onClick(() => {
-            this.store.startNewTerminal();
-          })
-
-        Button('Done')
-          .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
-          .height(OrbitTokens.HIT_MIN)
-          .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_XS })
-          .onClick(() => {
-            this.store.showPtySheet = false;
-          })
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-
-      if (this.terminals().length > 0) {
-        Scroll() {
-          Row({ space: this.isCompactLandscape() ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_SM }) {
-            ForEach(
-              this.terminals(),
-              (term: TerminalSummaryDto, tIdx: number) => {
-                Row({ space: OrbitTokens.SPACE_XS }) {
-                  Row() {
-                    Text(term.title.length > 0 ? term.title : `Shell ${tIdx + 1}`)
-                      .attributeModifier(
-                        orbitTextMono(
-                          this.activeTerminalId() === term.terminal_id
-                            ? this.store.palette.accentPrimary
-                            : this.store.palette.fgSecondary,
-                          FontWeight.Medium
-                        )
-                      )
-                  }
-                  .height(this.isCompactLandscape() ? 36 : OrbitTokens.HIT_MIN)
-                  .padding({
-                    left: this.isCompactLandscape() ? OrbitTokens.SPACE_SM : OrbitTokens.SPACE_MD,
-                    right: OrbitTokens.SPACE_XS
-                  })
-                  .alignItems(VerticalAlign.Center)
-                  .onClick(() => {
-                    this.store.attachTerminal(term.terminal_id, 1);
-                  })
-
-                  Stack({ alignContent: Alignment.Center }) {
-                    Text('×')
-                      .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-                  }
-                  .width(OrbitTokens.HIT_MIN)
-                  .height(this.isCompactLandscape() ? 36 : OrbitTokens.HIT_MIN)
-                  .accessibilityText(
-                    `Kill terminal ${term.title.length > 0 ? term.title : `Shell ${tIdx + 1}`}`
-                  )
-                  .onClick(() => {
-                    this.store.killTerminal(term.terminal_id);
-                  })
-                }
-                .constraintSize({ minHeight: this.isCompactLandscape() ? 36 : OrbitTokens.HIT_MIN })
-                .backgroundColor(
-                  this.activeTerminalId() === term.terminal_id
-                    ? this.store.palette.accentPrimarySoft
-                    : this.store.palette.subtleSurface
+        Column() {
+          if (this.store.terminalRows.length === 0) {
+            Column({ space: OrbitTokens.SPACE_SM }) {
+              Blank()
+              Text('orbit shim detached PTY ready')
+                .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
+              Button('Spawn Shell Session')
+                .attributeModifier(
+                  orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
                 )
-                .borderRadius(OrbitTokens.PILL_RADIUS)
-                .alignItems(VerticalAlign.Center)
+                .height(OrbitTokens.HIT_MIN)
+                .borderRadius(OrbitTokens.RADIUS_MD)
+                .onClick(() => {
+                  this.store.startNewTerminal();
+                })
+              Blank()
+            }
+            .width('100%')
+            .height('100%')
+            .alignItems(HorizontalAlign.Center)
+          } else {
+            List({ space: 0 }) {
+              Repeat<TerminalRowDto>(this.store.terminalRows)
+                .each((ri: RepeatItem<TerminalRowDto>) => {
+                  ListItem() {
+                    Text() {
+                      if (ri.item.spans.length === 0) {
+                        Span(' ')
+                          .font(orbitSpanMonoFont())
+                          .fontColor(this.store.palette.terminalFg)
+                      } else {
+                        ForEach(
+                          ri.item.spans,
+                          (sp: TerminalSpanDto) => {
+                            if (sp.bg_hex !== null && sp.bg_hex.length > 0) {
+                              Span(sp.text)
+                                .font(
+                                  orbitSpanMonoFont(
+                                    sp.bold ? FontWeight.Bold : FontWeight.Normal
+                                  )
+                                )
+                                .fontColor(sp.fg_hex)
+                                .textBackgroundStyle({
+                                  color: sp.bg_hex,
+                                  radius: 0
+                                })
+                                .decoration({
+                                  type: sp.underline
+                                    ? TextDecorationType.Underline
+                                    : TextDecorationType.None,
+                                  color: sp.fg_hex
+                                })
+                            } else {
+                              Span(sp.text)
+                                .font(
+                                  orbitSpanMonoFont(
+                                    sp.bold ? FontWeight.Bold : FontWeight.Normal
+                                  )
+                                )
+                                .fontColor(sp.fg_hex)
+                                .decoration({
+                                  type: sp.underline
+                                    ? TextDecorationType.Underline
+                                    : TextDecorationType.None,
+                                  color: sp.fg_hex
+                                })
+                            }
+                          },
+                          (_sp: TerminalSpanDto, sIdx: number) => `${ri.item.row_index}_${sIdx}`
+                        )
+                      }
+                    }
+                    .copyOption(CopyOptions.LocalDevice)
+                    .width('100%')
+                  }
+                })
+                .key((r: TerminalRowDto) => r.row_index.toString())
+                .virtualScroll()
+            }
+            .width('100%')
+            .height('100%')
+            .scrollBar(BarState.Off)
+            .onScrollStart(() => {
+              dismissHarmonyKeyboard(this.getUIContext());
+            })
+          }
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .padding(this.isCompactLandscape ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_SM)
+        .backgroundColor(this.store.palette.terminalBg)
+        .borderRadius(OrbitTokens.RADIUS_LG)
+        .border({
+          width: OrbitTokens.HAIRLINE,
+          color: this.store.palette.hairline
+        })
+        .onAreaChange((_oldArea: Area, newArea: Area) => {
+          const w = Number(newArea.width);
+          const h = Number(newArea.height);
+          if (w > 120 && h > 64) {
+            const pad = this.isCompactLandscape ? 8 : 16;
+            const cols = Math.floor((w - pad) / 7.4);
+            const rows = Math.floor((h - pad) / 16.0);
+            this.store.resizeTerminalIfChanged(cols, rows);
+          }
+        })
+
+        Scroll() {
+          Row({ space: OrbitTokens.SPACE_XS }) {
+            ForEach(
+              DEV_KEYBAR_ITEMS,
+              (keyItem: DevKeyItem) => {
+                Button(keyItem.label)
+                  .attributeModifier(
+                    orbitButtonMeta(
+                      this.isKeyActiveModifier(keyItem)
+                        ? this.store.palette.onAccent
+                        : this.store.palette.fgPrimary,
+                      this.isKeyActiveModifier(keyItem)
+                        ? this.store.palette.accentPrimaryFill
+                        : this.store.palette.listCard
+                    )
+                  )
+                  .fontFamily(OrbitTokens.FAMILY_MONO)
+                  .height(OrbitTokens.HIT_COMPACT)
+                  .constraintSize({ minWidth: OrbitTokens.HIT_COMPACT })
+                  .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
+                  .borderRadius(OrbitTokens.RADIUS_SM)
+                  .accessibilityText(keyItem.a11yLabel)
+                  .onClick(() => {
+                    this.handleDevKeyTap(keyItem);
+                  })
               },
-              (term: TerminalSummaryDto) => term.terminal_id
+              (keyItem: DevKeyItem) => keyItem.id
             )
           }
         }
         .scrollable(ScrollDirection.Horizontal)
         .scrollBar(BarState.Off)
         .width('100%')
-      }
 
-      Column() {
-        if (this.store.terminalRows.length === 0) {
-          Column({ space: OrbitTokens.SPACE_SM }) {
-            Blank()
-            Text('orbit shim detached PTY ready')
-              .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
-            Button('Spawn Shell Session')
-              .attributeModifier(
-                orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+        Row({ space: OrbitTokens.SPACE_SM }) {
+          TextInput({
+            placeholder: 'Send command or raw keys…',
+            text: this.shellInput
+          })
+            .attributeModifier(
+              orbitInputMono(
+                this.store.palette.fgPrimary,
+                this.store.palette.fgMuted,
+                this.store.palette.listCard
               )
-              .height(OrbitTokens.HIT_MIN)
-              .borderRadius(OrbitTokens.CARD_RADIUS)
-              .onClick(() => {
-                this.store.startNewTerminal();
-              })
-            Blank()
-          }
-          .width('100%')
-          .height('100%')
-          .alignItems(HorizontalAlign.Center)
-        } else {
-          List({ space: 0 }) {
-            Repeat<TerminalRowDto>(this.store.terminalRows)
-              .each((ri: RepeatItem<TerminalRowDto>) => {
-                ListItem() {
-                  Text() {
-                    if (ri.item.spans.length === 0) {
-                      Span(' ')
-                        .font(orbitSpanMonoFont())
-                        .fontColor('#EFEFF2')
-                    } else {
-                      ForEach(
-                        ri.item.spans,
-                        (sp: TerminalSpanDto) => {
-                          if (sp.bg_hex !== null && sp.bg_hex.length > 0) {
-                            Span(sp.text)
-                              .font(
-                                orbitSpanMonoFont(
-                                  sp.bold ? FontWeight.Bold : FontWeight.Normal
-                                )
-                              )
-                              .fontColor(sp.fg_hex)
-                              .textBackgroundStyle({
-                                color: sp.bg_hex,
-                                radius: 0
-                              })
-                              .decoration({
-                                type: sp.underline
-                                  ? TextDecorationType.Underline
-                                  : TextDecorationType.None,
-                                color: sp.fg_hex
-                              })
-                          } else {
-                            Span(sp.text)
-                              .font(
-                                orbitSpanMonoFont(
-                                  sp.bold ? FontWeight.Bold : FontWeight.Normal
-                                )
-                              )
-                              .fontColor(sp.fg_hex)
-                              .decoration({
-                                type: sp.underline
-                                  ? TextDecorationType.Underline
-                                  : TextDecorationType.None,
-                                color: sp.fg_hex
-                              })
-                          }
-                        },
-                        (_sp: TerminalSpanDto, sIdx: number) => `${ri.item.row_index}_${sIdx}`
-                      )
-                    }
-                  }
-                  .lineHeight(OrbitTokens.LH_META)
-                  .width('100%')
-                }
-              })
-              .key((r: TerminalRowDto) => r.row_index.toString())
-              .virtualScroll()
-          }
-          .width('100%')
-          .height('100%')
-          .scrollBar(BarState.Off)
-        }
-      }
-      .width('100%')
-      .layoutWeight(1)
-      .padding(this.isCompactLandscape() ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_SM)
-      .backgroundColor('#0A0B0E')
-      .borderRadius(OrbitTokens.CARD_RADIUS)
-      .border({
-        width: OrbitTokens.HAIRLINE,
-        color: this.store.palette.hairline
-      })
-      .onAreaChange((_oldArea: Area, newArea: Area) => {
-        const w = Number(newArea.width);
-        const h = Number(newArea.height);
-        if (w > 120 && h > 64) {
-          const pad = this.isCompactLandscape() ? 8 : 16;
-          const cols = Math.floor((w - pad) / 7.4);
-          const rows = Math.floor((h - pad) / 16.0);
-          this.store.resizeTerminalIfChanged(cols, rows);
-        }
-      })
-
-      Scroll() {
-        Row({ space: OrbitTokens.SPACE_XS }) {
-          ForEach(
-            DEV_KEYBAR_ITEMS,
-            (keyItem: DevKeyItem) => {
-              Button(keyItem.label)
-                .attributeModifier(
-                  orbitButtonMono(
-                    this.isKeyActiveModifier(keyItem)
-                      ? this.store.palette.onAccent
-                      : this.store.palette.fgPrimary,
-                    this.isKeyActiveModifier(keyItem)
-                      ? this.store.palette.accentPrimaryFill
-                      : this.store.palette.subtleSurface
-                  )
-                )
-                .height(OrbitTokens.HIT_MIN)
-                .constraintSize({ minWidth: OrbitTokens.HIT_MIN })
-                .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-                .borderRadius(OrbitTokens.PILL_RADIUS)
-                .accessibilityText(keyItem.a11yLabel)
-                .onClick(() => {
-                  this.handleDevKeyTap(keyItem);
-                })
-            },
-            (keyItem: DevKeyItem) => keyItem.id
-          )
-        }
-      }
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
-      .width('100%')
-
-      Row({ space: OrbitTokens.SPACE_SM }) {
-        TextInput({
-          placeholder: 'Send command or raw keys…',
-          text: this.shellInput
-        })
-          .attributeModifier(
-            orbitInputMono(
-              this.store.palette.fgPrimary,
-              this.store.palette.fgMuted,
-              this.store.palette.code
             )
-          )
-          .height(OrbitTokens.HIT_MIN)
-          .borderRadius(OrbitTokens.CARD_RADIUS)
-          .border({
-            width: OrbitTokens.HAIRLINE,
-            color: this.store.palette.hairline
-          })
-          .layoutWeight(1)
-          .onChange((val: string) => {
-            this.shellInput = val;
-          })
-          .onSubmit(() => {
-            this.store.sendTerminalKeys(`${this.shellInput}\r`);
-            this.shellInput = '';
-          })
+            .height(OrbitTokens.HIT_MIN)
+            .borderRadius(OrbitTokens.RADIUS_MD)
+            .layoutWeight(1)
+            .onChange((val: string) => {
+              this.shellInput = val;
+            })
+            .onSubmit(() => {
+              this.store.sendTerminalKeys(`${this.shellInput}\r`);
+              this.shellInput = '';
+            })
 
-        Button('Send ↵')
-          .attributeModifier(
-            orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
-          )
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            SymbolGlyph($r('sys.symbol.paperplane_fill'))
+              .fontSize(18)
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+              .fontColor([this.store.palette.onAccent])
+          }
+          .width(OrbitTokens.HIT_MIN)
           .height(OrbitTokens.HIT_MIN)
-          .borderRadius(OrbitTokens.CARD_RADIUS)
+          .padding(0)
+          .backgroundColor(this.store.palette.accentPrimaryFill)
+          .accessibilityText('Send terminal command')
           .onClick(() => {
             this.store.sendTerminalKeys(`${this.shellInput}\r`);
             this.shellInput = '';
           })
+        }
+        .width('100%')
       }
       .width('100%')
+      .height('100%')
+      .padding({
+        left: this.isCompactLandscape ? OrbitTokens.SPACE_MD : OrbitTokens.SPACE_LG,
+        right: this.isCompactLandscape ? OrbitTokens.SPACE_MD : OrbitTokens.SPACE_LG,
+        top: OrbitTokens.SPACE_XS,
+        bottom: this.store.keyboardHeightVp > 0
+          ? (this.isCompactLandscape ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_SM)
+          : Math.max(
+            this.isCompactLandscape ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_MD,
+            this.store.safeBottomVp
+          )
+      })
+      .onAreaChange((_oldArea: Area, newArea: Area) => {
+        const h = Number(newArea.height);
+        if (h > 0) {
+          this.sheetHeightVp = h;
+        }
+      })
     }
+    .title({
+      main: 'PTY Terminal',
+      sub: `${basenameOfPath(this.store.activeCwd)} · ${this.store.terminalCols}×${this.store.terminalGridRows}`
+    })
+    .titleMode(NavigationTitleMode.Mini)
+    .hideBackButton(true)
+    .menus(this.renderTerminalMenus())
+    .mode(NavigationMode.Stack)
     .width('100%')
     .height('100%')
-    .padding({
-      left: this.isCompactLandscape() ? OrbitTokens.SPACE_MD : OrbitTokens.SPACE_LG,
-      right: this.isCompactLandscape() ? OrbitTokens.SPACE_MD : OrbitTokens.SPACE_LG,
-      top: this.isCompactLandscape() ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_LG,
-      bottom: Math.max(
-        this.isCompactLandscape() ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_MD,
-        this.store.keyboardHeightVp > 0 ? this.store.keyboardHeightVp : this.store.safeBottomVp
-      )
-    })
-    .backgroundColor(this.store.palette.canvas)
-    .onAreaChange((_oldArea: Area, newArea: Area) => {
-      const h = Number(newArea.height);
-      if (h > 0) {
-        this.sheetHeightVp = h;
-      }
-    })
+    .backgroundColor(this.store.palette.drawer)
   }
 }

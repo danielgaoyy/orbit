@@ -8,8 +8,6 @@ import UIKit
 public enum OrbitSheetDestination: String, Identifiable, Equatable {
     case gitDiff
     case pty
-    case modelPicker
-    case contextPicker
     case qrPair
     case directoryBrowser
     case settings
@@ -18,8 +16,6 @@ public enum OrbitSheetDestination: String, Identifiable, Equatable {
 
     public var defaultDetent: PresentationDetent {
         switch self {
-        case .modelPicker, .contextPicker:
-            return .medium
         case .gitDiff, .pty, .settings, .directoryBrowser, .qrPair:
             return .large
         }
@@ -53,9 +49,9 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
 
     public var icon: String {
         switch self {
-        case .plan: return "list.bullet.clipboard"
+        case .plan: return "checklist"
         case .review: return "doc.text.magnifyingglass"
-        case .compact: return "arrow.down.right.and.arrow.up.left"
+        case .compact: return "rectangle.compress.vertical"
         }
     }
 
@@ -79,6 +75,117 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
     }
 }
 
+public enum OrbitSlashCommand: String, CaseIterable, Identifiable, Equatable {
+    case plan
+    case review
+    case diff
+    case compact
+    case ask
+    case edits
+    case full
+    case terminal
+    case new
+    case settings
+
+    public var id: String { rawValue }
+
+    public var command: String { "/\(rawValue)" }
+
+    public var label: String {
+        switch self {
+        case .plan: return "Draft Implementation Plan"
+        case .review: return "Code Review Working Tree"
+        case .diff: return "Toggle Diff Inspector"
+        case .compact: return "Compact Context"
+        case .ask: return "Always Ask Permissions"
+        case .edits: return "Accept Edits Permissions"
+        case .full: return "Full Access Permissions"
+        case .terminal: return "Toggle PTY Terminal"
+        case .new: return "New Agent Session"
+        case .settings: return "Settings"
+        }
+    }
+
+    public var description: String {
+        switch self {
+        case .plan: return "Prompt the agent to design a step-by-step plan before editing"
+        case .review: return "Attach uncommitted git diff and prepare an engineering review"
+        case .diff: return "Open or close the Git & Turn Diff panel"
+        case .compact: return "Ask active agent to summarize and compact conversation history"
+        case .ask: return "Require approval before file edits and shell commands"
+        case .edits: return "Auto-approve file edits, ask before shell commands"
+        case .full: return "Edit files and run commands without approval prompts"
+        case .terminal: return "Show or hide the persistent multi-slot terminal"
+        case .new: return "Start a fresh isolated session in the stage"
+        case .settings: return "Configure hosts, engines, worktrees, and appearance"
+        }
+    }
+
+    public var icon: String {
+        switch self {
+        case .plan: return "checklist"
+        case .review: return "doc.text.magnifyingglass"
+        case .diff: return "arrow.left.arrow.right"
+        case .compact: return "rectangle.compress.vertical"
+        case .ask: return "shield"
+        case .edits: return "checkmark.shield"
+        case .full: return "shield.slash"
+        case .terminal: return "terminal"
+        case .new: return "square.and.pencil"
+        case .settings: return "gearshape"
+        }
+    }
+
+    public var keywords: [String] {
+        switch self {
+        case .plan: return ["plan", "design", "architect", "checklist"]
+        case .review: return ["review", "audit", "critique", "git"]
+        case .diff: return ["diff", "inspector", "changes"]
+        case .compact: return ["compact", "summarize", "context", "memory"]
+        case .ask: return ["ask", "supervised", "default", "safe", "permission"]
+        case .edits: return ["edits", "auto", "edit", "accept", "permission"]
+        case .full: return ["full", "autonomous", "bypass", "unrestricted", "permission"]
+        case .terminal: return ["terminal", "pty", "shell", "console"]
+        case .new: return ["new", "thread", "session", "clear"]
+        case .settings: return ["settings", "preferences", "config"]
+        }
+    }
+
+    public static func filter(query: String) -> [OrbitSlashCommand] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return allCases }
+        return allCases.filter { cmd in
+            cmd.rawValue.contains(q)
+                || cmd.label.lowercased().contains(q)
+                || cmd.keywords.contains(where: { $0.contains(q) })
+        }
+    }
+}
+
+public struct InlineMentionRegistration: Equatable, Hashable {
+    public let token: String
+    public let item: ComposerContextItem
+
+    public init(token: String, item: ComposerContextItem) {
+        self.token = token
+        self.item = item
+    }
+}
+
+public struct OrbitLaunchpadProject: Identifiable, Hashable {
+    public let id: String
+    public let name: String
+    public let path: String
+    public let branch: String?
+
+    public init(id: String, name: String, path: String, branch: String?) {
+        self.id = id
+        self.name = name
+        self.path = path
+        self.branch = branch
+    }
+}
+
 public enum OrbitDrawerFilter: String, CaseIterable, Identifiable, Equatable {
     case all
     case active
@@ -95,11 +202,61 @@ public enum OrbitDrawerFilter: String, CaseIterable, Identifiable, Equatable {
     }
 }
 
+public enum OrbitSidebarProjectSort: String, CaseIterable, Identifiable, Equatable {
+    case recent
+    case alphabetical
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .recent: return "Recent activity"
+        case .alphabetical: return "Alphabetical"
+        }
+    }
+}
+
+public enum OrbitSidebarThreadFilter: String, CaseIterable, Identifiable, Equatable {
+    case all
+    case activeUnread
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .all: return "All conversations"
+        case .activeUnread: return "Active & unread"
+        }
+    }
+}
+
 public enum ComposerContextItem: Identifiable, Equatable, Hashable {
     case file(path: String)
     case gitDiff(staged: Bool, label: String)
     case terminalOutput(label: String, content: String)
     case assistantQuote(id: String, label: String, excerpt: String)
+    case stagedImage(
+        id: String,
+        filename: String,
+        remotePath: String?,
+        previewData: Data,
+        sizeBytes: Int,
+        isUploading: Bool
+    )
+    case stagedFile(
+        id: String,
+        filename: String,
+        remotePath: String?,
+        sizeBytes: Int,
+        isUploading: Bool
+    )
+    case inlineFile(
+        id: String,
+        filename: String,
+        content: String,
+        lineCount: Int,
+        sizeBytes: Int
+    )
 
     public var id: String {
         switch self {
@@ -111,6 +268,12 @@ public enum ComposerContextItem: Identifiable, Equatable, Hashable {
             return "terminal:active"
         case let .assistantQuote(id, _, _):
             return "quote:\(id)"
+        case let .stagedImage(id, _, _, _, _, _):
+            return "img:\(id)"
+        case let .stagedFile(id, _, _, _, _):
+            return "sfile:\(id)"
+        case let .inlineFile(id, _, _, _, _):
+            return "ifile:\(id)"
         }
     }
 
@@ -124,19 +287,31 @@ public enum ComposerContextItem: Identifiable, Equatable, Hashable {
             return label
         case let .assistantQuote(_, label, _):
             return label
+        case let .stagedImage(_, filename, _, _, _, _):
+            return filename
+        case let .stagedFile(_, filename, _, _, _):
+            return filename
+        case let .inlineFile(_, filename, _, _, _):
+            return filename
         }
     }
 
     public var icon: String {
         switch self {
-        case .file:
-            return "doc.text"
-        case .gitDiff:
-            return "arrow.triangle.branch"
+        case let .file(path):
+            return OrbitFormatters.semanticFileIcon(for: OrbitFormatters.shortPath(path))
+        case let .stagedFile(_, filename, _, _, _):
+            return OrbitFormatters.semanticFileIcon(for: filename)
+        case let .inlineFile(_, filename, _, _, _):
+            return OrbitFormatters.semanticFileIcon(for: filename)
+        case let .gitDiff(staged, _):
+            return staged ? "arrow.left.arrow.right" : "doc.badge.plus"
         case .terminalOutput:
             return "terminal"
         case .assistantQuote:
             return "text.quote"
+        case .stagedImage:
+            return "photo"
         }
     }
 }
@@ -237,6 +412,7 @@ public final class OrbitIosStore: ObservableObject {
     // Workspace, Files, Git, Terminal
     @Published public var activeCwd: String = "~"
     @Published public var activeExtraDirs: [String] = []
+    @Published public var draftUseWorktree: Bool = false
     @Published public private(set) var workspaceFilesList: [String] = []
     @Published public private(set) var gitReview: FfiGitReview?
     @Published public var gitStagedMode: Bool = false
@@ -252,7 +428,12 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var selectedEffort: FfiReasoningEffort?
     @Published public var selectedMode: FfiSessionMode = .acceptEdits
     @Published public var slashDirective: OrbitSlashDirective?
+    private var hasUserCustomizedDraftModel: Bool = false
+    private var draftSelectionsByProvider: [FfiProviderKind: (modelId: String?, effort: FfiReasoningEffort?)] = [:]
+    private var hasSyncedLiveCatalogDefault: Bool = false
     @Published public var attachedContexts: [ComposerContextItem] = []
+    @Published public var registeredInlineMentions: [InlineMentionRegistration] = []
+    @Published public var composerFocusNonce: Int = 0
     @Published public var quotedDiffSnippets: [QuotedDiffSnippet] = []
     @Published public var queuedPromptsByAgent: [String: [QueuedPromptItem]] = [:]
 
@@ -262,9 +443,15 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var isPadSidebarCollapsed: Bool = false
     @Published public var drawerSearchQuery: String = ""
     @Published public var drawerFilter: OrbitDrawerFilter = .all
+    @Published public var sidebarProjectSort: OrbitSidebarProjectSort = .recent
+    @Published public var sidebarThreadFilter: OrbitSidebarThreadFilter = .all
+    @Published public var collapsedProjectIds: Set<String> = []
+    @Published public var pinnedThreadKeys: [String] = []
+    @Published public private(set) var seenSeqByAgentKey: [String: UInt64] = [:]
     @Published public var diffFileFilterQuery: String = ""
     @Published public var isPadDiffInspectorVisible: Bool = false
     @Published public var activeSheet: OrbitSheetDestination?
+    @Published public var isModelPickerPresented: Bool = false
     @Published public var expandFirstTurnByDefault: Bool = false
     @Published public var expandFirstStepByDefault: Bool = false
     @Published public var expandAllWorkGroupsByDefault: Bool = false
@@ -290,7 +477,12 @@ public final class OrbitIosStore: ObservableObject {
     private var pendingLaunchPtyCommand: String?
     private var ptyLaunchCmdDispatched: Bool = false
 
+    private static let pinnedThreadKeysDefaultsKey = "orbit.ios.pinnedThreadKeys"
+    private static let draftUseWorktreeDefaultsKey = "orbit.ios.draftUseWorktree"
+
     public init() {
+        self.pinnedThreadKeys = UserDefaults.standard.stringArray(forKey: Self.pinnedThreadKeysDefaultsKey) ?? []
+        self.draftUseWorktree = UserDefaults.standard.bool(forKey: Self.draftUseWorktreeDefaultsKey)
         let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         let dbPath = docDir?.appendingPathComponent("orbit_ios_v3.sqlite").path ?? ":memory:"
 
@@ -416,6 +608,155 @@ public final class OrbitIosStore: ObservableObject {
         return projects.filter { $0.hostId == hid }
     }
 
+    public var launchpadProjects: [OrbitLaunchpadProject] {
+        guard let hid = selectedHostId else { return [] }
+        let detail = currentHostDetail
+        var results: [OrbitLaunchpadProject] = []
+
+        func isBareHomePath(_ raw: String) -> Bool {
+            var clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean.isEmpty || clean == "~" || clean == "/" { return true }
+            while clean.count > 1 && clean.hasSuffix("/") { clean.removeLast() }
+            let parts = clean.split(separator: "/")
+            return parts.count == 2 && (parts[0] == "Users" || parts[0] == "home")
+        }
+
+        func resolvedBranch(for dir: String) -> String? {
+            if let branch = activeGitBranch, OrbitFormatters.arePathsEquivalent(dir, activeCwd) {
+                return branch
+            }
+            if let dp = detail?.discoveredProjects.first(where: { OrbitFormatters.arePathsEquivalent($0.path, dir) }),
+               let b = dp.gitBranch, !b.isEmpty {
+                return b
+            }
+            if let ws = detail?.workspaces.first(where: { OrbitFormatters.arePathsEquivalent($0.cwd, dir) }),
+               let b = ws.gitBranch, !b.isEmpty {
+                return b
+            }
+            return nil
+        }
+
+        func appendIfUnique(id: String, name: String, path: String, branch: String?) {
+            let clean = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty else { return }
+            if results.contains(where: { OrbitFormatters.arePathsEquivalent($0.path, clean) }) {
+                return
+            }
+            let resolvedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            results.append(OrbitLaunchpadProject(
+                id: id,
+                name: resolvedName.isEmpty ? OrbitFormatters.shortPath(clean) : resolvedName,
+                path: clean,
+                branch: branch ?? resolvedBranch(for: clean)
+            ))
+        }
+
+        for proj in hostPinnedProjects {
+            if let primary = proj.directories.first {
+                appendIfUnique(
+                    id: proj.projectId,
+                    name: proj.name,
+                    path: primary,
+                    branch: nil
+                )
+            }
+        }
+
+        for ws in detail?.workspaces ?? [] where !ws.isWorktree {
+            guard !isBareHomePath(ws.cwd) else { continue }
+            appendIfUnique(
+                id: "\(hid)::ws::\(ws.workspaceId)",
+                name: ws.title.isEmpty ? OrbitFormatters.shortPath(ws.cwd) : ws.title,
+                path: ws.cwd,
+                branch: ws.gitBranch
+            )
+        }
+
+        for dp in detail?.discoveredProjects ?? [] {
+            guard !isBareHomePath(dp.path), !dp.path.contains("/worktrees/") else { continue }
+            appendIfUnique(
+                id: "\(hid)::dp::\(dp.path)",
+                name: dp.name,
+                path: dp.path,
+                branch: dp.gitBranch
+            )
+        }
+
+        if !activeCwd.isEmpty, !isBareHomePath(activeCwd) {
+            appendIfUnique(
+                id: "\(hid)::active::\(activeCwd)",
+                name: OrbitFormatters.shortPath(activeCwd),
+                path: activeCwd,
+                branch: activeGitBranch
+            )
+        }
+
+        if results.isEmpty, let firstDp = detail?.discoveredProjects.first {
+            appendIfUnique(
+                id: "\(hid)::dp::\(firstDp.path)",
+                name: firstDp.name,
+                path: firstDp.path,
+                branch: firstDp.gitBranch
+            )
+        }
+
+        return results
+    }
+
+    public var otherHostsPendingApprovals: UInt32 {
+        hosts.reduce(0) { total, host in
+            host.hostId == selectedHostId ? total : total + host.pendingApprovalCount
+        }
+    }
+
+    public func threadKey(hostId: String, agentId: String) -> String {
+        "\(hostId)::\(agentId)"
+    }
+
+    public func isThreadPinned(hostId: String, agentId: String) -> Bool {
+        pinnedThreadKeys.contains(threadKey(hostId: hostId, agentId: agentId))
+    }
+
+    public func togglePinThread(hostId: String, agentId: String) {
+        let key = threadKey(hostId: hostId, agentId: agentId)
+        if let idx = pinnedThreadKeys.firstIndex(of: key) {
+            pinnedThreadKeys.remove(at: idx)
+        } else {
+            pinnedThreadKeys.insert(key, at: 0)
+        }
+        UserDefaults.standard.set(pinnedThreadKeys, forKey: Self.pinnedThreadKeysDefaultsKey)
+        hapticLight()
+    }
+
+    public func toggleProjectCollapsed(_ projectId: String) {
+        if collapsedProjectIds.contains(projectId) {
+            collapsedProjectIds.remove(projectId)
+        } else {
+            collapsedProjectIds.insert(projectId)
+        }
+        hapticLight()
+    }
+
+    public func markAgentSeen(hostId: String, agentId: String, seq: UInt64) {
+        let key = threadKey(hostId: hostId, agentId: agentId)
+        let current = seenSeqByAgentKey[key] ?? 0
+        if seq >= current || seenSeqByAgentKey[key] == nil {
+            seenSeqByAgentKey[key] = max(current, seq)
+        }
+    }
+
+    public func isThreadUnread(hostId: String, agent: FfiAgentCard) -> Bool {
+        let isSelected = selectedHostId == hostId && selectedAgentId == agent.agentId && !isDraftNewSession
+        if isSelected || agent.isRunning {
+            return false
+        }
+        let key = threadKey(hostId: hostId, agentId: agent.agentId)
+        guard let seen = seenSeqByAgentKey[key] else {
+            return false
+        }
+        return agent.latestSeq > seen
+    }
+
     public func catalog(for provider: FfiProviderKind) -> FfiProviderModelCatalog {
         if let found = currentHostDetail?.providerCatalogs.first(where: { $0.provider == provider }),
            !found.models.isEmpty {
@@ -442,13 +783,18 @@ public final class OrbitIosStore: ObservableObject {
 
     public var composerEffortDisplayLabel: String? {
         let cat = catalog(for: selectedProvider)
-        let spec = activeModelSpec
-        guard let spec, !spec.thinkingOptions.isEmpty else {
+        guard let spec = activeModelSpec else {
             guard let effort = selectedEffort else { return nil }
             return formatEffortLabel(effort: effort)
         }
-        let resolved = selectedEffort ?? spec.defaultEffort ?? cat.configuredDefaultEffort
-        guard let effort = resolved else { return nil }
+        guard !spec.thinkingOptions.isEmpty else { return nil }
+        guard let effort = resolveSupportedEffortForModel(
+            spec: spec,
+            desired: selectedEffort,
+            catalogDefault: cat.configuredDefaultEffort
+        ) else {
+            return nil
+        }
         return formatEffortLabel(effort: effort)
     }
 
@@ -459,8 +805,21 @@ public final class OrbitIosStore: ObservableObject {
         return composerModelDisplayName
     }
 
+    public var hasUploadingAttachments: Bool {
+        attachedContexts.contains { item in
+            switch item {
+            case let .stagedImage(_, _, _, _, _, isUploading):
+                return isUploading
+            case let .stagedFile(_, _, _, _, isUploading):
+                return isUploading
+            default:
+                return false
+            }
+        }
+    }
+
     public var canSubmitComposer: Bool {
-        guard selectedHostId != nil else { return false }
+        guard selectedHostId != nil, !hasUploadingAttachments else { return false }
         let hasText = !composerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasAttachments = !attachedContexts.isEmpty || !quotedDiffSnippets.isEmpty
         if slashDirective == .review || slashDirective == .compact {
@@ -547,11 +906,7 @@ public final class OrbitIosStore: ObservableObject {
         #if DEBUG
         if let themeIdx = args.firstIndex(of: "-orbitTheme"), themeIdx + 1 < args.count {
             let raw = args[themeIdx + 1].lowercased()
-            if raw == "graphite" {
-                setAppearance(.dark)
-            } else if let mode = OrbitAppearanceMode(rawValue: raw) {
-                setAppearance(mode)
-            }
+            setAppearance(OrbitAppearanceMode.fromStorage(raw))
         }
 
         if args.contains("-orbitExpandFirstTurn") {
@@ -573,6 +928,13 @@ public final class OrbitIosStore: ObservableObject {
 
         if args.contains("-orbitSelectLatestAgent") {
             autoSelectLatestAgentOnLoad = true
+        }
+
+        if args.contains("-orbitNewSession") {
+            autoSelectLatestAgentOnLoad = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.startNewSessionDraft()
+            }
         }
 
         if args.contains("-orbitCollapseSidebar") {
@@ -695,10 +1057,8 @@ public final class OrbitIosStore: ObservableObject {
                     self.openGitDiff(preferSheet: true)
                 case "pty", "terminal":
                     self.activeSheet = .pty
-                case "model", "models":
-                    self.activeSheet = .modelPicker
-                case "context":
-                    self.activeSheet = .contextPicker
+                case "model", "models", "modelpicker":
+                    self.isModelPickerPresented = true
                 case "pair", "qr":
                     self.activeSheet = .qrPair
                 case "directory", "files":
@@ -707,6 +1067,27 @@ public final class OrbitIosStore: ObservableObject {
                     self.activeSheet = .settings
                 default:
                     break
+                }
+            }
+        }
+
+        if let slashIdx = args.firstIndex(of: "-orbitSlash"), slashIdx + 1 < args.count {
+            let raw = args[slashIdx + 1].lowercased()
+            if let dir = OrbitSlashDirective(rawValue: raw) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.slashDirective = dir
+                }
+            }
+        }
+
+        if let textIdx = args.firstIndex(of: "-orbitComposerText"), textIdx + 1 < args.count {
+            let txt = args[textIdx + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                guard let self else { return }
+                self.composerText = txt
+                if txt.contains("@") {
+                    self.refreshWorkspaceFiles()
+                    self.refreshGitReview()
                 }
             }
         }
@@ -777,6 +1158,11 @@ public final class OrbitIosStore: ObservableObject {
             agentStage = nil
             gitReview = nil
             terminalScreen = nil
+            if !hasUserCustomizedDraftModel {
+                hasSyncedLiveCatalogDefault = false
+                selectedModel = nil
+                selectedEffort = nil
+            }
         }
         core?.connectHost(hostId: hostId)
         core?.refreshHost(hostId: hostId)
@@ -789,7 +1175,8 @@ public final class OrbitIosStore: ObservableObject {
         guard let detail = core?.hostDetail(hostId: hostId) else { return }
         currentHostDetail = detail
 
-        // Migrate queued prompts and running state across optimistic -> permanent agent IDs
+        // Migrate queued prompts, running state, pinned keys, and seen cursors across optimistic -> permanent agent IDs
+        var pinnedChanged = false
         for (oldAid, newAid) in detail.replacedOptimisticAgents {
             let oldKey = "\(hostId)::\(oldAid)"
             let newKey = "\(hostId)::\(newAid)"
@@ -800,6 +1187,27 @@ public final class OrbitIosStore: ObservableObject {
             }
             if let wasRun = lastKnownRunningByAgentKey.removeValue(forKey: oldKey) {
                 lastKnownRunningByAgentKey[newKey] = wasRun
+            }
+            if let seen = seenSeqByAgentKey.removeValue(forKey: oldKey) {
+                seenSeqByAgentKey[newKey] = max(seenSeqByAgentKey[newKey] ?? 0, seen)
+            }
+            if let pinIdx = pinnedThreadKeys.firstIndex(of: oldKey) {
+                pinnedThreadKeys[pinIdx] = newKey
+                pinnedChanged = true
+            }
+        }
+        if pinnedChanged {
+            UserDefaults.standard.set(pinnedThreadKeys, forKey: Self.pinnedThreadKeysDefaultsKey)
+        }
+
+        // Seed initial seen sequences for pre-existing threads and advance currently active thread's seen cursor
+        for ag in detail.agents {
+            let key = threadKey(hostId: hostId, agentId: ag.agentId)
+            let isSelected = selectedHostId == hostId && selectedAgentId == ag.agentId && !isDraftNewSession
+            if isSelected {
+                seenSeqByAgentKey[key] = max(seenSeqByAgentKey[key] ?? 0, ag.latestSeq)
+            } else if seenSeqByAgentKey[key] == nil {
+                seenSeqByAgentKey[key] = ag.latestSeq
             }
         }
 
@@ -827,9 +1235,21 @@ public final class OrbitIosStore: ObservableObject {
            !detail.host.availableProviders.contains(selectedProvider),
            let firstAvailable = detail.host.availableProviders.first {
             selectedProvider = firstAvailable
+            hasSyncedLiveCatalogDefault = detail.providerCatalogs.contains {
+                $0.provider == firstAvailable && !$0.models.isEmpty
+            }
             syncDefaultModelAndEffort(for: firstAvailable)
-        } else if selectedModel == nil && selectedEffort == nil {
-            syncDefaultModelAndEffort(for: selectedProvider)
+        } else {
+            let hasLiveCatalogForSelected = detail.providerCatalogs.contains {
+                $0.provider == selectedProvider && !$0.models.isEmpty
+            }
+            if (selectedModel == nil && selectedEffort == nil)
+                || (isDraftNewSession && !hasUserCustomizedDraftModel && hasLiveCatalogForSelected && !hasSyncedLiveCatalogDefault) {
+                if isDraftNewSession && hasLiveCatalogForSelected {
+                    hasSyncedLiveCatalogDefault = true
+                }
+                syncDefaultModelAndEffort(for: selectedProvider)
+            }
         }
 
         if terminalScreen == nil, !detail.terminals.isEmpty {
@@ -857,13 +1277,15 @@ public final class OrbitIosStore: ObservableObject {
 
     private func syncDefaultModelAndEffort(for provider: FfiProviderKind) {
         let cat = catalog(for: provider)
-        let defaultSpec = cat.configuredDefaultModel.flatMap { id in cat.models.first(where: { $0.id == id }) }
+        let defaultSpec = cat.configuredDefaultModel.flatMap { id in
+            cat.models.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame })
+        }
             ?? cat.models.first(where: { $0.isDefault })
             ?? cat.models.first
-        selectedModel = defaultSpec?.id
+        selectedModel = defaultSpec?.id ?? cat.configuredDefaultModel
         selectedEffort = resolveSupportedEffortForModel(
             spec: defaultSpec,
-            desired: selectedEffort,
+            desired: nil,
             catalogDefault: cat.configuredDefaultEffort
         )
     }
@@ -881,6 +1303,7 @@ public final class OrbitIosStore: ObservableObject {
             selectedEffort = card.effort
             selectedMode = card.mode
             updateActiveWorkspaceCwd(card.cwd)
+            markAgentSeen(hostId: hid, agentId: agentId, seq: max(card.latestSeq, agentStage?.latestSeq ?? 0))
         }
         hapticLight()
     }
@@ -896,6 +1319,12 @@ public final class OrbitIosStore: ObservableObject {
             if !card.cwd.isEmpty && card.cwd != activeCwd {
                 updateActiveWorkspaceCwd(card.cwd)
             }
+            if hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
+                markAgentSeen(hostId: hostId, agentId: agentId, seq: max(card.latestSeq, stage?.latestSeq ?? 0))
+            }
+        } else if let stageSeq = stage?.latestSeq,
+                  hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
+            markAgentSeen(hostId: hostId, agentId: agentId, seq: stageSeq)
         }
 
         if hostId == selectedHostId && agentId == selectedAgentId {
@@ -912,13 +1341,31 @@ public final class OrbitIosStore: ObservableObject {
         extraDirs: [String] = [],
         provider: FfiProviderKind? = nil
     ) {
+        let wasViewingAgent = selectedAgentId != nil
         selectedAgentId = nil
         agentStage = nil
         isDrawerOpen = false
         activeExtraDirs = extraDirs
         if let provider = provider {
             selectedProvider = provider
-            syncDefaultModelAndEffort(for: provider)
+            if let saved = draftSelectionsByProvider[provider] {
+                applyModelSelection(provider: provider, modelId: saved.modelId, effort: saved.effort)
+            } else {
+                hasSyncedLiveCatalogDefault = currentHostDetail?.providerCatalogs.contains {
+                    $0.provider == provider && !$0.models.isEmpty
+                } ?? false
+                syncDefaultModelAndEffort(for: provider)
+            }
+        } else if wasViewingAgent {
+            if let saved = draftSelectionsByProvider[selectedProvider] {
+                applyModelSelection(provider: selectedProvider, modelId: saved.modelId, effort: saved.effort)
+            } else {
+                hasUserCustomizedDraftModel = false
+                hasSyncedLiveCatalogDefault = currentHostDetail?.providerCatalogs.contains {
+                    $0.provider == selectedProvider && !$0.models.isEmpty
+                } ?? false
+                syncDefaultModelAndEffort(for: selectedProvider)
+            }
         }
         if let cwd = cwd, !cwd.isEmpty {
             updateActiveWorkspaceCwd(cwd)
@@ -962,6 +1409,19 @@ public final class OrbitIosStore: ObservableObject {
         refreshPasteboardAvailability()
         hapticLight()
         showToast("Copied path")
+    }
+
+    public func setDraftUseWorktree(_ useWorktree: Bool) {
+        draftUseWorktree = useWorktree
+        UserDefaults.standard.set(useWorktree, forKey: Self.draftUseWorktreeDefaultsKey)
+        hapticLight()
+    }
+
+    public func selectWorkspaceDirectory(_ cwd: String) {
+        let clean = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        updateActiveWorkspaceCwd(clean)
+        hapticLight()
     }
 
     private func updateActiveWorkspaceCwd(_ cwd: String) {
@@ -1131,13 +1591,35 @@ public final class OrbitIosStore: ObservableObject {
 
     // MARK: - Model, Provider & Mode Configuration
 
+    public func switchDraftProvider(_ provider: FfiProviderKind) {
+        if isDraftNewSession, let saved = draftSelectionsByProvider[provider] {
+            applyModelSelection(
+                provider: provider,
+                modelId: saved.modelId,
+                effort: saved.effort
+            )
+            return
+        }
+        let nextCat = catalog(for: provider)
+        let defaultModelId = nextCat.configuredDefaultModel
+            ?? nextCat.models.first(where: { $0.isDefault })?.id
+            ?? nextCat.models.first?.id
+        applyModelSelection(
+            provider: provider,
+            modelId: defaultModelId,
+            effort: nil
+        )
+    }
+
     public func applyModelSelection(
         provider: FfiProviderKind,
         modelId: String?,
         effort: FfiReasoningEffort?
     ) {
         let cat = catalog(for: provider)
-        let spec = modelId.flatMap { id in cat.models.first(where: { $0.id == id }) }
+        let spec = modelId.flatMap { id in
+            cat.models.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame })
+        }
             ?? cat.models.first(where: { $0.isDefault })
             ?? cat.models.first
         let resolvedEffort = resolveSupportedEffortForModel(
@@ -1150,6 +1632,10 @@ public final class OrbitIosStore: ObservableObject {
         selectedProvider = provider
         selectedModel = spec?.id ?? modelId
         selectedEffort = resolvedEffort
+        if isDraftNewSession {
+            hasUserCustomizedDraftModel = true
+            draftSelectionsByProvider[provider] = (selectedModel, selectedEffort)
+        }
 
         if let hid = selectedHostId, let aid = selectedAgentId {
             if providerChanged {
@@ -1194,7 +1680,7 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func removeContextItem(_ item: ComposerContextItem) {
-        attachedContexts.removeAll(where: { $0 == item })
+        attachedContexts.removeAll(where: { $0.id == item.id })
         hapticLight()
     }
 
@@ -1203,18 +1689,255 @@ public final class OrbitIosStore: ObservableObject {
         hapticLight()
     }
 
-    public func applyQuickWorkflow(_ directive: OrbitSlashDirective?, promptText: String = "") {
-        slashDirective = directive
-        if directive == .plan {
-            selectedMode = .plan
+    private static let maxAttachmentBytes = 10 * 1024 * 1024
+    private static let maxInlineTextFileBytes = 64 * 1024
+
+    public func attachImage(filename: String, uploadData: Data, previewData: Data) {
+        guard !uploadData.isEmpty else {
+            showToast("Selected image is empty")
+            return
         }
-        if !promptText.isEmpty {
-            composerText = promptText
+        guard uploadData.count <= Self.maxAttachmentBytes else {
+            showToast("Image exceeds 10 MB limit")
+            return
+        }
+
+        let itemId = UUID().uuidString
+        guard let hid = selectedHostId else {
+            if hasDemoStageOverlay {
+                attachedContexts.append(
+                    .stagedImage(
+                        id: itemId,
+                        filename: filename,
+                        remotePath: "/demo/\(filename)",
+                        previewData: previewData,
+                        sizeBytes: uploadData.count,
+                        isUploading: false
+                    )
+                )
+                hapticLight()
+            } else {
+                activeSheet = .qrPair
+            }
+            return
+        }
+
+        attachedContexts.append(
+            .stagedImage(
+                id: itemId,
+                filename: filename,
+                remotePath: nil,
+                previewData: previewData,
+                sizeBytes: uploadData.count,
+                isUploading: true
+            )
+        )
+        hapticLight()
+
+        performRemoteStage(
+            hostId: hid,
+            contextId: "img:\(itemId)",
+            filename: filename,
+            mimeType: "image/jpeg",
+            data: uploadData
+        ) { staged in
+            .stagedImage(
+                id: itemId,
+                filename: staged.filename,
+                remotePath: staged.path,
+                previewData: previewData,
+                sizeBytes: Int(staged.sizeBytes),
+                isUploading: false
+            )
+        }
+    }
+
+    public func attachFile(filename: String, mimeType: String?, data: Data, isImageHint: Bool) {
+        guard !data.isEmpty else {
+            showToast("\(filename) is empty")
+            return
+        }
+        guard data.count <= Self.maxAttachmentBytes else {
+            showToast("\(filename) exceeds 10 MB limit")
+            return
+        }
+
+        if isImageHint {
+            Task { @MainActor [weak self] in
+                let normalized = await Task.detached(priority: .userInitiated) {
+                    OrbitAttachmentNormalizer.normalizeImageData(data)
+                }.value
+                guard let self else { return }
+                if let normalized {
+                    let base = (filename as NSString).deletingPathExtension
+                    let jpgName = base.isEmpty ? "image.jpg" : "\(base).jpg"
+                    self.attachImage(
+                        filename: jpgName,
+                        uploadData: normalized.uploadData,
+                        previewData: normalized.previewData
+                    )
+                } else {
+                    self.stageOpaqueFile(filename: filename, mimeType: mimeType, data: data)
+                }
+            }
+            return
+        }
+
+        if data.count <= Self.maxInlineTextFileBytes,
+           !data.contains(0),
+           let text = String(data: data, encoding: .utf8) {
+            let lineCount = text.split(separator: "\n", omittingEmptySubsequences: false).count
+            attachedContexts.append(
+                .inlineFile(
+                    id: UUID().uuidString,
+                    filename: filename,
+                    content: text,
+                    lineCount: lineCount,
+                    sizeBytes: data.count
+                )
+            )
+            hapticLight()
+            return
+        }
+
+        stageOpaqueFile(filename: filename, mimeType: mimeType, data: data)
+    }
+
+    private func stageOpaqueFile(filename: String, mimeType: String?, data: Data) {
+        let itemId = UUID().uuidString
+        guard let hid = selectedHostId else {
+            if hasDemoStageOverlay {
+                attachedContexts.append(
+                    .stagedFile(
+                        id: itemId,
+                        filename: filename,
+                        remotePath: "/demo/\(filename)",
+                        sizeBytes: data.count,
+                        isUploading: false
+                    )
+                )
+                hapticLight()
+            } else {
+                activeSheet = .qrPair
+            }
+            return
+        }
+
+        attachedContexts.append(
+            .stagedFile(
+                id: itemId,
+                filename: filename,
+                remotePath: nil,
+                sizeBytes: data.count,
+                isUploading: true
+            )
+        )
+        hapticLight()
+
+        performRemoteStage(
+            hostId: hid,
+            contextId: "sfile:\(itemId)",
+            filename: filename,
+            mimeType: mimeType,
+            data: data
+        ) { staged in
+            .stagedFile(
+                id: itemId,
+                filename: staged.filename,
+                remotePath: staged.path,
+                sizeBytes: Int(staged.sizeBytes),
+                isUploading: false
+            )
+        }
+    }
+
+    private func performRemoteStage(
+        hostId: String,
+        contextId: String,
+        filename: String,
+        mimeType: String?,
+        data: Data,
+        buildCompletedItem: @escaping @MainActor (FfiStagedAttachment) -> ComposerContextItem
+    ) {
+        let coreRef = self.core
+        Task { @MainActor [weak self] in
+            do {
+                let staged: FfiStagedAttachment = try await Task.detached(priority: .userInitiated) {
+                    guard let coreRef else {
+                        throw NSError(
+                            domain: "Orbit",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "Core unavailable"]
+                        )
+                    }
+                    return try coreRef.stageAttachment(
+                        hostId: hostId,
+                        filename: filename,
+                        mimeType: mimeType,
+                        bytes: data
+                    )
+                }.value
+                guard let self else { return }
+                guard let idx = self.attachedContexts.firstIndex(where: { $0.id == contextId }) else {
+                    return
+                }
+                self.attachedContexts[idx] = buildCompletedItem(staged)
+            } catch {
+                let errorDetail: String
+                if case let FfiOrbitError.Core(detail) = error {
+                    errorDetail = detail
+                } else {
+                    errorDetail = error.localizedDescription
+                }
+                guard let self else { return }
+                self.attachedContexts.removeAll(where: { $0.id == contextId })
+                self.hapticWarning()
+                self.showToast("Upload failed: \(errorDetail)")
+            }
+        }
+    }
+
+    public func registerInlineMention(token: String, item: ComposerContextItem) {
+        if let idx = registeredInlineMentions.firstIndex(where: { $0.token == token }) {
+            registeredInlineMentions[idx] = InlineMentionRegistration(token: token, item: item)
+        } else {
+            registeredInlineMentions.append(InlineMentionRegistration(token: token, item: item))
         }
         hapticLight()
     }
 
+    public func requestComposerFocus() {
+        composerFocusNonce &+= 1
+    }
+
+    private func mergedContextsResolvingInlineMentions(
+        for text: String,
+        baseContexts: [ComposerContextItem]
+    ) -> [ComposerContextItem] {
+        var merged = baseContexts
+        for reg in registeredInlineMentions {
+            guard text.contains(reg.token) else { continue }
+            if !merged.contains(where: { $0.id == reg.item.id }) {
+                merged.append(reg.item)
+            }
+        }
+        return merged
+    }
+
+    public func applyQuickWorkflow(_ directive: OrbitSlashDirective?, promptText: String = "") {
+        slashDirective = directive
+        if !promptText.isEmpty {
+            composerText = promptText
+        }
+        requestComposerFocus()
+        hapticLight()
+    }
+
     public func submitComposer() {
+        guard !hasUploadingAttachments else {
+            showToast("Waiting for attachment upload…")
+            return
+        }
         guard let hid = selectedHostId else {
             activeSheet = .qrPair
             return
@@ -1227,10 +1950,13 @@ public final class OrbitIosStore: ObservableObject {
 
         let draftText = composerText
         let draftDirective = slashDirective
-        let draftContexts = attachedContexts
         let draftQuotes = quotedDiffSnippets
-
         let parsed = parseInlineDirective(rawInput: draftText, explicitDirective: draftDirective)
+        let draftContexts = mergedContextsResolvingInlineMentions(
+            for: parsed.cleanText,
+            baseContexts: attachedContexts
+        )
+
         if parsed.directive == .compact && selectedAgentId == nil {
             showToast("Start a session first to compact context")
             return
@@ -1246,6 +1972,7 @@ public final class OrbitIosStore: ObservableObject {
         composerText = ""
         slashDirective = nil
         attachedContexts.removeAll()
+        registeredInlineMentions.removeAll()
         quotedDiffSnippets.removeAll()
         hapticLight()
 
@@ -1260,13 +1987,21 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func enqueueComposerPrompt() {
+        guard !hasUploadingAttachments else {
+            showToast("Waiting for attachment upload…")
+            return
+        }
         guard let hid = selectedHostId, let aid = selectedAgentId else {
             submitComposer()
             return
         }
         let parsed = parseInlineDirective(rawInput: composerText, explicitDirective: slashDirective)
+        let mergedContexts = mergedContextsResolvingInlineMentions(
+            for: parsed.cleanText,
+            baseContexts: attachedContexts
+        )
         let hasContent = !parsed.cleanText.isEmpty
-            || !attachedContexts.isEmpty
+            || !mergedContexts.isEmpty
             || !quotedDiffSnippets.isEmpty
             || parsed.directive == .review
             || parsed.directive == .compact
@@ -1275,7 +2010,7 @@ public final class OrbitIosStore: ObservableObject {
         let item = QueuedPromptItem(
             text: parsed.cleanText,
             slashDirective: parsed.directive,
-            attachedContexts: attachedContexts,
+            attachedContexts: mergedContexts,
             quotedDiffSnippets: quotedDiffSnippets
         )
         let key = "\(hid)::\(aid)"
@@ -1287,6 +2022,7 @@ public final class OrbitIosStore: ObservableObject {
         composerText = ""
         slashDirective = nil
         attachedContexts.removeAll()
+        registeredInlineMentions.removeAll()
         quotedDiffSnippets.removeAll()
         hapticLight()
         showToast("Queued next prompt")
@@ -1433,13 +2169,27 @@ public final class OrbitIosStore: ObservableObject {
         for ctx in contexts {
             switch ctx {
             case let .file(path):
-                badges.append(FfiPromptBadge(kind: "file", label: OrbitFormatters.shortPath(path)))
-            case let .gitDiff(_, label):
-                badges.append(FfiPromptBadge(kind: "git_diff", label: label))
+                let short = OrbitFormatters.shortPath(path)
+                if !rawText.contains("@\(short)") {
+                    badges.append(FfiPromptBadge(kind: "file", label: short))
+                }
+            case let .gitDiff(staged, label):
+                let alias = staged ? "@staged-diff" : "@working-diff"
+                if !rawText.contains(alias) && effectiveDirective != .review {
+                    badges.append(FfiPromptBadge(kind: "git_diff", label: label))
+                }
             case let .terminalOutput(label, _):
-                badges.append(FfiPromptBadge(kind: "terminal", label: label))
+                if !rawText.contains("@terminal") {
+                    badges.append(FfiPromptBadge(kind: "terminal", label: label))
+                }
             case let .assistantQuote(_, label, _):
                 badges.append(FfiPromptBadge(kind: "quote", label: label))
+            case let .stagedImage(_, filename, _, _, _, _):
+                badges.append(FfiPromptBadge(kind: "image", label: filename))
+            case let .stagedFile(_, filename, _, _, _):
+                badges.append(FfiPromptBadge(kind: "file", label: filename))
+            case let .inlineFile(_, filename, _, _, _):
+                badges.append(FfiPromptBadge(kind: "file", label: filename))
             }
         }
         for quote in quotes {
@@ -1450,6 +2200,26 @@ public final class OrbitIosStore: ObservableObject {
         var wireSections: [String] = []
         if let dir = effectiveDirective {
             wireSections.append(dir.workflowInstruction())
+        }
+
+        let stagedImagePaths = contexts.compactMap { item -> String? in
+            if case let .stagedImage(_, _, remotePath, _, _, _) = item { return remotePath }
+            return nil
+        }
+        if !stagedImagePaths.isEmpty {
+            wireSections.append(
+                stagedImagePaths.map { "Attached image file: `\($0)`" }.joined(separator: "\n")
+            )
+        }
+
+        let stagedFilePaths = contexts.compactMap { item -> String? in
+            if case let .stagedFile(_, _, remotePath, _, _) = item { return remotePath }
+            return nil
+        }
+        if !stagedFilePaths.isEmpty {
+            wireSections.append(
+                stagedFilePaths.map { "Attached file: `\($0)`" }.joined(separator: "\n")
+            )
         }
 
         let filePaths = contexts.compactMap { item -> String? in
@@ -1479,7 +2249,9 @@ public final class OrbitIosStore: ObservableObject {
         }
 
         for ctx in contexts {
-            if case let .terminalOutput(_, content) = ctx, !content.isEmpty {
+            if case let .inlineFile(_, filename, content, lineCount, _) = ctx {
+                wireSections.append("File `\(filename)` (\(lineCount) lines):\n```text\n\(content)\n```")
+            } else if case let .terminalOutput(_, content) = ctx, !content.isEmpty {
                 wireSections.append("<TERMINAL_OUTPUT>\n\(content)\n</TERMINAL_OUTPUT>")
             } else if case let .assistantQuote(_, _, excerpt) = ctx, !excerpt.isEmpty {
                 wireSections.append("<QUOTED_EXCERPT>\n\(excerpt)\n</QUOTED_EXCERPT>")
@@ -1532,7 +2304,7 @@ public final class OrbitIosStore: ObservableObject {
                 initialPrompt: finalWirePrompt,
                 initialDisplayPrompt: cleanDisplayPrompt,
                 initialBadges: badges,
-                worktreeBranch: nil
+                worktreeBranch: draftUseWorktree ? "auto" : nil
             )
             if let newId = createdId, !newId.isEmpty {
                 lastKnownRunningByAgentKey["\(hid)::\(newId)"] = true
@@ -1657,16 +2429,22 @@ public final class OrbitIosStore: ObservableObject {
         }
     }
 
-    public func reconnectActiveHost() {
-        guard let hid = selectedHostId else { return }
-        let name = activeHost?.displayName ?? "host"
-        core?.connectHost(hostId: hid)
-        core?.refreshHost(hostId: hid)
-        core?.refreshQuotas(hostId: hid)
+    public func reconnectHost(_ hostId: String) {
+        let name = hosts.first(where: { $0.hostId == hostId })?.displayName ?? "host"
+        core?.connectHost(hostId: hostId)
+        core?.refreshHost(hostId: hostId)
+        core?.refreshQuotas(hostId: hostId)
         reloadFleet()
-        reloadHostDetail(hid)
+        if selectedHostId == hostId {
+            reloadHostDetail(hostId)
+        }
         hapticLight()
         showToast("Reconnecting to \(name)…")
+    }
+
+    public func reconnectActiveHost() {
+        guard let hid = selectedHostId else { return }
+        reconnectHost(hid)
     }
 
     public func copyAssistantReply(_ text: String) {

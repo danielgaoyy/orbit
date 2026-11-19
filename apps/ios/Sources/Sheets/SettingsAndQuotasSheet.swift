@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SettingsAndQuotasSheet: View {
     @ObservedObject var store: OrbitIosStore
@@ -7,111 +8,80 @@ struct SettingsAndQuotasSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.orbitPalette) private var palette
 
-    @State private var customHostName = ""
-    @State private var selectedRouteMode: FfiHostRouteMode = .auto
-    @State private var customDirectEndpoint = ""
-    @State private var relayUrl = ""
-    @State private var confirmRemoveHost = false
-
     private var selectedAppearance: OrbitAppearanceMode {
-        OrbitAppearanceMode(rawValue: appearanceRaw) ?? .system
+        OrbitAppearanceMode.fromStorage(appearanceRaw)
+    }
+
+    private var groupedBackground: Color {
+        palette.isDark ? palette.canvas : palette.drawer
     }
 
     private var quotas: [FfiProviderQuota] {
         store.currentHostDetail?.quotas ?? []
     }
 
-    private let selectableRouteModes: [FfiHostRouteMode] = [.auto, .directOnly, .relayOnly]
+    private var appVersionLabel: String {
+        let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "\(short) (\(build))"
+    }
 
     var body: some View {
-        VStack(spacing: 0) {
-            sheetHeader
-            OrbitHairline()
-
+        NavigationStack {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: OrbitSpacing.xl) {
                     appearanceSection
-                    quotasSection
-                    if let host = store.activeHost {
-                        hostNetworkSection(host)
+                    hostsSection
+                    if store.activeHost != nil {
+                        quotasSection
                     }
+                    aboutSection
                 }
-                .padding(OrbitSpacing.lg)
+                .padding(.horizontal, OrbitSpacing.lg)
+                .padding(.vertical, OrbitSpacing.lg)
             }
-        }
-        .background(palette.canvas.ignoresSafeArea())
-        .onAppear {
-            syncHostFields()
-            store.refreshQuotas()
-        }
-        .onChange(of: store.selectedHostId) { _ in
-            syncHostFields()
-        }
-        .confirmationDialog(
-            "Remove this host from Orbit?",
-            isPresented: $confirmRemoveHost,
-            titleVisibility: .visible
-        ) {
-            if let host = store.activeHost {
-                Button("Remove \(host.displayName)", role: .destructive) {
-                    store.removeHost(host.hostId)
-                    dismiss()
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Running remote agent sessions on the host will not be terminated.")
-        }
-    }
-
-    private func syncHostFields() {
-        guard let host = store.activeHost else { return }
-        customHostName = host.customName ?? ""
-        selectedRouteMode = (host.routeMode == .sshTunnel) ? .auto : host.routeMode
-        customDirectEndpoint = host.customDirectEndpoint ?? ""
-        relayUrl = host.relayUrl ?? ""
-    }
-
-    // MARK: - Header
-
-    private var sheetHeader: some View {
-        HStack {
-            Text("Settings & Quotas")
-                .font(OrbitTypography.title)
-                .foregroundStyle(palette.fgPrimary)
-
-            Spacer()
-
-            Button {
-                dismiss()
-            } label: {
-                Text("Done")
+            .background(groupedBackground.ignoresSafeArea())
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
                     .font(OrbitTypography.subhead(.semibold))
                     .foregroundStyle(palette.primary)
-                    .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
-                    .contentShape(Rectangle())
+                }
             }
-            .buttonStyle(.plain)
+            .navigationDestination(for: String.self) { hostId in
+                HostDetailSettingsView(
+                    store: store,
+                    hostId: hostId,
+                    onHostRemoved: {
+                        if store.hosts.isEmpty {
+                            dismiss()
+                        }
+                    }
+                )
+                .environment(\.orbitPalette, palette)
+            }
         }
-        .padding(.horizontal, OrbitSpacing.lg)
-        .frame(height: 52)
+        .onAppear {
+            if store.activeHost != nil {
+                store.refreshQuotas()
+            }
+        }
     }
 
-    // MARK: - Appearance Selector (System / Light / Graphite / OLED)
+    // MARK: - 1. Appearance (Strictly System / Light / Dark)
 
     private var appearanceSection: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
-            Text("APPEARANCE")
-                .font(OrbitTypography.meta(.semibold))
+        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text("Appearance")
+                .font(OrbitTypography.meta(.medium))
                 .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, OrbitSpacing.xs)
 
-            LazyVGrid(
-                columns: [
-                    GridItem(.flexible(), spacing: OrbitSpacing.sm),
-                    GridItem(.flexible(), spacing: OrbitSpacing.sm)
-                ],
-                spacing: OrbitSpacing.sm
-            ) {
+            HStack(spacing: 4) {
                 ForEach(OrbitAppearanceMode.allCases) { mode in
                     let isSelected = selectedAppearance == mode
                     Button {
@@ -120,84 +90,170 @@ struct SettingsAndQuotasSheet: View {
                             appearanceRaw = mode.rawValue
                         }
                     } label: {
-                        HStack(spacing: OrbitSpacing.sm) {
-                            swatchCircle(for: mode)
-
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(mode.label)
-                                    .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
-                                    .foregroundStyle(palette.fgPrimary)
-                                Text(mode.subtitle)
-                                    .font(OrbitTypography.meta(.regular))
-                                    .foregroundStyle(palette.fgMuted)
-                                    .lineLimit(1)
-                            }
-
-                            Spacer(minLength: 0)
+                        HStack(spacing: 5) {
+                            Image(systemName: mode.systemImage)
+                                .font(.system(size: 12.5, weight: .medium))
+                            Text(mode.label)
+                                .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
                         }
-                        .padding(.horizontal, OrbitSpacing.md)
-                        .padding(.vertical, OrbitSpacing.sm)
-                        .frame(minHeight: OrbitSpacing.hitTarget)
-                        .background(isSelected ? palette.activeRowFill : palette.elevated)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(isSelected ? palette.elevated : Color.clear)
+                        )
                         .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(
-                                    isSelected ? palette.primary : palette.hairline,
-                                    lineWidth: isSelected ? 1.0 : 0.5
-                                )
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .strokeBorder(isSelected ? palette.hairline : Color.clear, lineWidth: 0.5)
                         )
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
             }
+            .padding(4)
+            .background(palette.isDark ? palette.elevated.opacity(0.65) : palette.subtleFill)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(palette.hairline, lineWidth: 0.5)
+            )
         }
     }
 
-    @ViewBuilder
-    private func swatchCircle(for mode: OrbitAppearanceMode) -> some View {
-        switch mode {
-        case .system:
-            ZStack {
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [Color.white, Color(hex: "#191A1C")],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: 20, height: 20)
-                Circle()
-                    .strokeBorder(palette.hairline, lineWidth: 1)
-                    .frame(width: 20, height: 20)
+    // MARK: - 2. Hosts Fleet (Progressive Disclosure Drill-Down)
+
+    private var hostsSection: some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text("Hosts")
+                .font(OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, OrbitSpacing.xs)
+
+            VStack(spacing: 0) {
+                if store.hosts.isEmpty {
+                    HStack(spacing: OrbitSpacing.sm) {
+                        Image(systemName: "network")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(palette.fgMuted)
+                            .frame(width: 20, alignment: .center)
+                        Text("No hosts paired yet")
+                            .font(OrbitTypography.subhead(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                        Spacer()
+                    }
+                    .padding(.horizontal, OrbitSpacing.md)
+                    .frame(minHeight: 46)
+
+                    OrbitHairline()
+                        .padding(.leading, 44)
+                } else {
+                    ForEach(Array(store.hosts.enumerated()), id: \.element.hostId) { idx, host in
+                        NavigationLink(value: host.hostId) {
+                            hostSummaryRow(host)
+                        }
+                        .buttonStyle(.plain)
+
+                        OrbitHairline()
+                            .padding(.leading, 44)
+                    }
+                }
+
+                Button {
+                    store.hapticLight()
+                    dismiss()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                        store.activeSheet = .qrPair
+                    }
+                } label: {
+                    HStack(spacing: OrbitSpacing.sm + 2) {
+                        Image(systemName: "qrcode.viewfinder")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(palette.primary)
+                            .frame(width: 20, alignment: .center)
+
+                        Text("Pair New Host")
+                            .font(OrbitTypography.subhead(.medium))
+                            .foregroundStyle(palette.primary)
+
+                        Spacer()
+                    }
+                    .padding(.horizontal, OrbitSpacing.md)
+                    .frame(minHeight: OrbitSpacing.hitTarget)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
-        case .light:
-            Circle()
-                .fill(Color.white)
-                .frame(width: 20, height: 20)
-                .overlay(Circle().strokeBorder(Color.black.opacity(0.18), lineWidth: 1))
-        case .dark:
-            Circle()
-                .fill(Color(hex: "#191A1C"))
-                .frame(width: 20, height: 20)
-                .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 1))
-        case .oled:
-            Circle()
-                .fill(Color.black)
-                .frame(width: 20, height: 20)
-                .overlay(Circle().strokeBorder(Color.white.opacity(0.32), lineWidth: 1))
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(palette.hairline, lineWidth: 0.5)
+            )
         }
     }
 
-    // MARK: - Account Quota Usage Bars
+    private func hostSummaryRow(_ host: FfiHostCard) -> some View {
+        let isActive = host.hostId == store.selectedHostId
+        let detailParts: [String] = {
+            var parts = [OrbitFormatters.compactTopBarConnectionLabel(for: host)]
+            if let ping = host.lastPingMs {
+                parts.append("\(ping)ms")
+            }
+            if let ver = host.daemonVersion, !ver.isEmpty {
+                parts.append(ver.hasPrefix("v") ? ver : "v\(ver)")
+            }
+            return parts
+        }()
+
+        return HStack(spacing: OrbitSpacing.sm + 2) {
+            Circle()
+                .fill(palette.connectionColor(host.connectionState))
+                .frame(width: 7, height: 7)
+                .frame(width: 20, alignment: .center)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(host.displayName)
+                        .font(OrbitTypography.subhead(.medium))
+                        .foregroundStyle(palette.fgPrimary)
+                        .lineLimit(1)
+
+                    if isActive && store.hosts.count > 1 {
+                        Text("Active")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(palette.fgSecondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(palette.subtleFill, in: Capsule())
+                    }
+                }
+
+                Text(detailParts.joined(separator: " · "))
+                    .font(OrbitTypography.meta(.regular))
+                    .foregroundStyle(palette.fgMuted)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: OrbitSpacing.sm)
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(palette.fgMuted)
+        }
+        .padding(.horizontal, OrbitSpacing.md)
+        .padding(.vertical, 9)
+        .frame(minHeight: 54)
+        .contentShape(Rectangle())
+    }
+
+    // MARK: - 3. Usage & Quotas
 
     private var quotasSection: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
             HStack {
-                Text("PROVIDER QUOTAS")
-                    .font(OrbitTypography.meta(.semibold))
+                Text("Usage & Quotas")
+                    .font(OrbitTypography.meta(.medium))
                     .foregroundStyle(palette.fgMuted)
 
                 Spacer()
@@ -206,48 +262,61 @@ struct SettingsAndQuotasSheet: View {
                     store.hapticLight()
                     store.refreshQuotas()
                 } label: {
-                    HStack(spacing: OrbitSpacing.xs) {
+                    HStack(spacing: 4) {
                         Image(systemName: "arrow.clockwise")
-                            .font(OrbitTypography.iconMicro)
+                            .font(.system(size: 11, weight: .medium))
                         Text("Refresh")
                             .font(OrbitTypography.meta(.medium))
                     }
-                    .foregroundStyle(palette.primary)
-                    .frame(minHeight: 32)
+                    .foregroundStyle(palette.fgSecondary)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
+            .padding(.horizontal, OrbitSpacing.xs)
 
             if quotas.isEmpty {
-                Text(store.selectedHostId == nil
-                     ? "Pair a host to inspect provider account quotas."
-                     : "No quota telemetry reported by installed providers yet.")
-                    .orbitSubheadStyle()
-                    .foregroundStyle(palette.fgSecondary)
-                    .padding(OrbitSpacing.md)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(palette.elevated)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .strokeBorder(palette.hairline, lineWidth: 0.5)
-                    )
+                HStack {
+                    Text("No active rate-limit windows reported yet.")
+                        .font(OrbitTypography.subhead(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                    Spacer()
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .frame(minHeight: 48)
+                .background(palette.elevated)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(palette.hairline, lineWidth: 0.5)
+                )
             } else {
-                VStack(spacing: OrbitSpacing.sm) {
-                    ForEach(Array(quotas.enumerated()), id: \.offset) { _, quota in
-                        quotaCard(quota)
+                VStack(spacing: 0) {
+                    ForEach(Array(quotas.enumerated()), id: \.offset) { idx, quota in
+                        quotaBlock(quota)
+                        if idx < quotas.count - 1 {
+                            OrbitHairline()
+                                .padding(.leading, OrbitSpacing.md)
+                        }
                     }
                 }
+                .background(palette.elevated)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(palette.hairline, lineWidth: 0.5)
+                )
             }
         }
     }
 
-    private func quotaCard(_ quota: FfiProviderQuota) -> some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.md) {
-            HStack {
+    private func quotaBlock(_ quota: FfiProviderQuota) -> some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.sm + 2) {
+            HStack(spacing: OrbitSpacing.sm) {
+                OrbitProviderIcon(provider: quota.provider, size: 15)
+
                 Text(quota.providerLabel)
-                    .font(OrbitTypography.body(.semibold))
+                    .font(OrbitTypography.subhead(.semibold))
                     .foregroundStyle(palette.fgPrimary)
 
                 if let account = quota.accountLabel, !account.isEmpty {
@@ -255,13 +324,14 @@ struct SettingsAndQuotasSheet: View {
                         .font(OrbitTypography.meta(.regular))
                         .foregroundStyle(palette.fgMuted)
                         .lineLimit(1)
+                        .truncationMode(.middle)
                 }
 
-                Spacer()
+                Spacer(minLength: OrbitSpacing.xs)
 
                 if let credits = quota.creditsRemaining {
-                    Text(String(format: "$%.2f left", credits))
-                        .font(OrbitTypography.meta(.medium))
+                    Text(String(format: "$%.2f", credits))
+                        .font(OrbitTypography.code(.medium))
                         .foregroundStyle(palette.direct)
                 }
             }
@@ -273,7 +343,7 @@ struct SettingsAndQuotasSheet: View {
             }
 
             if quota.windows.isEmpty && quota.error == nil {
-                Text("No active rate-limit windows.")
+                Text("No active rate-limit windows")
                     .font(OrbitTypography.meta(.regular))
                     .foregroundStyle(palette.fgMuted)
             } else {
@@ -282,13 +352,8 @@ struct SettingsAndQuotasSheet: View {
                 }
             }
         }
-        .padding(OrbitSpacing.md)
-        .background(palette.elevated)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(palette.hairline, lineWidth: 0.5)
-        )
+        .padding(.horizontal, OrbitSpacing.md)
+        .padding(.vertical, OrbitSpacing.md)
     }
 
     private func quotaWindowBar(_ window: FfiQuotaWindow) -> some View {
@@ -299,13 +364,14 @@ struct SettingsAndQuotasSheet: View {
             return palette.direct
         }()
 
-        return VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-            HStack {
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: OrbitSpacing.xs) {
                 Text(window.label)
-                    .font(OrbitTypography.subhead(.medium))
-                    .foregroundStyle(palette.fgPrimary)
+                    .font(OrbitTypography.meta(.medium))
+                    .foregroundStyle(palette.fgSecondary)
+                    .lineLimit(1)
 
-                Spacer()
+                Spacer(minLength: OrbitSpacing.xs)
 
                 if let reset = OrbitFormatters.resetCountdown(rfc3339: window.resetsAtRfc3339) {
                     Text(reset)
@@ -314,7 +380,7 @@ struct SettingsAndQuotasSheet: View {
                 }
 
                 Text("\(Int(clampedPct.rounded()))%")
-                    .font(OrbitTypography.meta(.semibold))
+                    .font(OrbitTypography.code(.medium))
                     .foregroundStyle(barColor)
             }
 
@@ -322,179 +388,269 @@ struct SettingsAndQuotasSheet: View {
                 ZStack(alignment: .leading) {
                     Capsule()
                         .fill(palette.subtleFill)
-                        .frame(height: 4)
+                        .frame(height: 3.5)
 
                     Capsule()
                         .fill(barColor)
-                        .frame(width: max(4, geo.size.width * CGFloat(clampedPct / 100.0)), height: 4)
+                        .frame(
+                            width: max(3.5, geo.size.width * CGFloat(clampedPct / 100.0)),
+                            height: 3.5
+                        )
                 }
             }
-            .frame(height: 4)
+            .frame(height: 3.5)
         }
     }
 
-    // MARK: - Host Route Mode & E2EE Relay Editor
+    // MARK: - 4. About
 
-    private func hostNetworkSection(_ host: FfiHostCard) -> some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.md) {
-            Text("HOST ROUTE & RELAY (\(host.displayName.uppercased()))")
-                .font(OrbitTypography.meta(.semibold))
+    private var aboutSection: some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text("About")
+                .font(OrbitTypography.meta(.medium))
                 .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, OrbitSpacing.xs)
 
-            VStack(alignment: .leading, spacing: OrbitSpacing.md) {
-                // Telemetry Metadata + 1-Tap Reconnect
-                VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Version")
+                        .font(OrbitTypography.subhead(.regular))
+                        .foregroundStyle(palette.fgPrimary)
+                    Spacer()
+                    Text(appVersionLabel)
+                        .font(OrbitTypography.code(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .frame(minHeight: OrbitSpacing.hitTarget)
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                HStack {
+                    Text("Encryption")
+                        .font(OrbitTypography.subhead(.regular))
+                        .foregroundStyle(palette.fgPrimary)
+                    Spacer()
+                    Text("Noise NK · E2EE")
+                        .font(OrbitTypography.code(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .frame(minHeight: OrbitSpacing.hitTarget)
+            }
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(palette.hairline, lineWidth: 0.5)
+            )
+        }
+    }
+}
+
+// MARK: - Drill-Down Host Detail Settings View
+
+private struct HostDetailSettingsView: View {
+    @ObservedObject var store: OrbitIosStore
+    let hostId: String
+    let onHostRemoved: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.orbitPalette) private var palette
+
+    @State private var customHostName = ""
+    @State private var selectedRouteMode: FfiHostRouteMode = .auto
+    @State private var customDirectEndpoint = ""
+    @State private var relayUrl = ""
+    @State private var confirmRemoveHost = false
+
+    private let selectableRouteModes: [FfiHostRouteMode] = [.auto, .directOnly, .relayOnly]
+
+    private var groupedBackground: Color {
+        palette.isDark ? palette.canvas : palette.drawer
+    }
+
+    private var host: FfiHostCard? {
+        store.hosts.first { $0.hostId == hostId }
+    }
+
+    var body: some View {
+        ScrollView(.vertical, showsIndicators: true) {
+            if let host = host {
+                VStack(alignment: .leading, spacing: OrbitSpacing.xl) {
+                    diagnosticsSection(host)
+                    connectionSection(host)
+                    dangerSection(host)
+                }
+                .padding(.horizontal, OrbitSpacing.lg)
+                .padding(.vertical, OrbitSpacing.lg)
+            } else {
+                Text("Host is no longer available.")
+                    .font(OrbitTypography.subhead(.regular))
+                    .foregroundStyle(palette.fgMuted)
+                    .padding(OrbitSpacing.xl)
+            }
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .background(groupedBackground.ignoresSafeArea())
+        .navigationTitle(host?.displayName ?? "Host")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            syncFields()
+        }
+        .confirmationDialog(
+            "Remove this host from Orbit?",
+            isPresented: $confirmRemoveHost,
+            titleVisibility: .visible
+        ) {
+            if let host = host {
+                Button("Remove \(host.displayName)", role: .destructive) {
+                    store.removeHost(host.hostId)
+                    dismiss()
+                    onHostRemoved()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Running remote agent sessions on the host will not be terminated.")
+        }
+    }
+
+    private func syncFields() {
+        guard let host = host else { return }
+        customHostName = host.customName ?? ""
+        selectedRouteMode = (host.routeMode == .sshTunnel) ? .auto : host.routeMode
+        customDirectEndpoint = host.customDirectEndpoint ?? ""
+        relayUrl = host.relayUrl ?? ""
+    }
+
+    private func diagnosticsSection(_ host: FfiHostCard) -> some View {
+        let daemonSummary: String = {
+            var parts: [String] = []
+            if let ver = host.daemonVersion, !ver.isEmpty {
+                parts.append(ver.hasPrefix("v") ? ver : "v\(ver)")
+            }
+            if let arch = host.osArch, !arch.isEmpty {
+                parts.append(arch)
+            }
+            return parts.isEmpty ? "—" : parts.joined(separator: " · ")
+        }()
+
+        return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text("Diagnostics")
+                .font(OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, OrbitSpacing.xs)
+
+            VStack(spacing: 0) {
+                HStack(spacing: OrbitSpacing.sm) {
+                    Circle()
+                        .fill(palette.connectionColor(host.connectionState))
+                        .frame(width: 7, height: 7)
+
+                    Text(OrbitFormatters.connectionLabel(host.connectionState))
+                        .font(OrbitTypography.subhead(.medium))
+                        .foregroundStyle(palette.fgPrimary)
+
+                    Spacer(minLength: OrbitSpacing.xs)
+
+                    Button {
+                        store.reconnectHost(host.hostId)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("Reconnect")
+                                .font(OrbitTypography.meta(.semibold))
+                        }
+                        .foregroundStyle(palette.primary)
+                        .padding(.horizontal, 10)
+                        .frame(height: 28)
+                        .background(palette.subtleFill, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .frame(minHeight: OrbitSpacing.hitTarget)
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                metricRow(
+                    label: "Latency",
+                    value: host.lastPingMs.map { "\($0) ms" } ?? "—"
+                )
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                metricRow(label: "Daemon", value: daemonSummary)
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                Button {
+                    UIPasteboard.general.string = host.daemonPubkeyB64
+                    store.hapticLight()
+                    store.showToast("Copied public key")
+                } label: {
                     HStack(spacing: OrbitSpacing.sm) {
-                        Circle()
-                            .fill(palette.connectionColor(host.connectionState))
-                            .frame(width: 6, height: 6)
-                        Text(OrbitFormatters.connectionLabel(host.connectionState))
-                            .font(OrbitTypography.subhead(.medium))
+                        Text("Public Key")
+                            .font(OrbitTypography.subhead(.regular))
                             .foregroundStyle(palette.fgPrimary)
 
-                        if let rtt = host.lastPingMs {
-                            Text("· \(rtt)ms")
-                                .font(OrbitTypography.meta(.regular))
-                                .foregroundStyle(palette.fgMuted)
-                        }
+                        Spacer(minLength: OrbitSpacing.sm)
 
-                        Spacer(minLength: OrbitSpacing.xs)
-
-                        Button {
-                            store.reconnectActiveHost()
-                        } label: {
-                            HStack(spacing: OrbitSpacing.xs) {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(OrbitTypography.iconMicro)
-                                Text("Reconnect")
-                                    .font(OrbitTypography.meta(.semibold))
-                            }
-                            .foregroundStyle(palette.primary)
-                            .padding(.horizontal, OrbitSpacing.sm + 2)
-                            .padding(.vertical, OrbitSpacing.xs)
-                            .background(palette.primary.opacity(0.12))
-                            .clipShape(Capsule())
-                            .overlay(
-                                Capsule()
-                                    .strokeBorder(palette.primary.opacity(0.28), lineWidth: 0.5)
-                            )
-                            .frame(minHeight: 36)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Reconnect Host")
-                    }
-
-                    HStack(spacing: OrbitSpacing.xs) {
-                        Text("Pubkey: \(String(host.daemonPubkeyB64.prefix(20)))…")
+                        Text("\(String(host.daemonPubkeyB64.prefix(16)))…")
                             .font(OrbitTypography.code(.regular))
                             .foregroundStyle(palette.fgMuted)
                             .lineLimit(1)
 
-                        Spacer(minLength: OrbitSpacing.xs)
-
-                        if let ver = host.daemonVersion, !ver.isEmpty {
-                            Text("v\(ver)")
-                                .font(OrbitTypography.code(.regular))
-                                .foregroundStyle(palette.fgMuted)
-                        }
-
-                        if let arch = host.osArch {
-                            Text(arch)
-                                .font(OrbitTypography.code(.regular))
-                                .foregroundStyle(palette.fgMuted)
-                        }
+                        Image(systemName: "doc.on.doc")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(palette.fgMuted)
                     }
-                }
-
-                OrbitHairline()
-
-                // Route Mode Selector (Auto / Direct Only / Relay Only)
-                VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-                    Text("Route Mode")
-                        .font(OrbitTypography.subhead(.medium))
-                        .foregroundStyle(palette.fgSecondary)
-
-                    HStack(spacing: OrbitSpacing.xs) {
-                        ForEach(selectableRouteModes, id: \.self) { mode in
-                            let isSelected = selectedRouteMode == mode
-                            Button {
-                                store.hapticLight()
-                                selectedRouteMode = mode
-                            } label: {
-                                Text(OrbitFormatters.routeModeLabel(mode))
-                                    .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
-                                    .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
-                                    .frame(maxWidth: .infinity, minHeight: 38)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(isSelected ? palette.elevated : Color.clear)
-                                    )
-                                    .frame(minHeight: OrbitSpacing.hitTarget)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(3)
-                    .background(palette.subtleFill)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                }
-
-                // Custom Display Name
-                labeledMonoField(
-                    label: "Display Name (Optional)",
-                    placeholder: host.hostname,
-                    text: $customHostName
-                )
-
-                // Custom Direct Endpoint
-                labeledMonoField(
-                    label: "Direct Endpoint Override",
-                    placeholder: host.directEndpoints.first ?? "ws://192.168.1.x:6868",
-                    text: $customDirectEndpoint
-                )
-
-                // E2EE Relay URL
-                labeledMonoField(
-                    label: "Noise E2EE Relay URL",
-                    placeholder: "wss://relay.orbit.dev",
-                    text: $relayUrl
-                )
-
-                Button {
-                    store.saveHostConfig(
-                        hostId: host.hostId,
-                        customName: customHostName,
-                        routeMode: selectedRouteMode,
-                        customDirectEndpoint: customDirectEndpoint,
-                        relayUrl: relayUrl
-                    )
-                } label: {
-                    Text("Save & Reconnect")
-                        .font(OrbitTypography.subhead(.semibold))
-                        .foregroundStyle(palette.onPrimary)
-                        .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
-                        .background(palette.primary)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .contentShape(Rectangle())
+                    .padding(.horizontal, OrbitSpacing.md)
+                    .frame(minHeight: OrbitSpacing.hitTarget)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
-                Button {
-                    confirmRemoveHost = true
-                } label: {
-                    Text("Remove Host")
-                        .font(OrbitTypography.subhead(.medium))
+                if let err = host.lastError, !err.isEmpty {
+                    OrbitHairline()
+                        .padding(.leading, OrbitSpacing.md)
+
+                    Text(err)
+                        .font(OrbitTypography.code(.regular))
                         .foregroundStyle(palette.danger)
-                        .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
-                        .background(palette.danger.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .contentShape(Rectangle())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, OrbitSpacing.md)
+                        .padding(.vertical, OrbitSpacing.sm)
                 }
-                .buttonStyle(.plain)
+
+                if host.hostId != store.selectedHostId {
+                    OrbitHairline()
+                        .padding(.leading, OrbitSpacing.md)
+
+                    Button {
+                        store.hapticLight()
+                        store.selectHost(host.hostId)
+                        dismiss()
+                    } label: {
+                        HStack {
+                            Text("Switch to This Host")
+                                .font(OrbitTypography.subhead(.medium))
+                                .foregroundStyle(palette.primary)
+                            Spacer()
+                        }
+                        .padding(.horizontal, OrbitSpacing.md)
+                        .frame(minHeight: OrbitSpacing.hitTarget)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
             }
-            .padding(OrbitSpacing.md)
             .background(palette.elevated)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(
@@ -504,29 +660,164 @@ struct SettingsAndQuotasSheet: View {
         }
     }
 
-    private func labeledMonoField(
+    private func metricRow(label: String, value: String) -> some View {
+        HStack {
+            Text(label)
+                .font(OrbitTypography.subhead(.regular))
+                .foregroundStyle(palette.fgPrimary)
+            Spacer(minLength: OrbitSpacing.sm)
+            Text(value)
+                .font(OrbitTypography.code(.regular))
+                .foregroundStyle(palette.fgMuted)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, OrbitSpacing.md)
+        .frame(minHeight: OrbitSpacing.hitTarget)
+    }
+
+    private func connectionSection(_ host: FfiHostCard) -> some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+            Text("Connection")
+                .font(OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.fgMuted)
+                .padding(.horizontal, OrbitSpacing.xs)
+
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+                    Text("Route Mode")
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.fgSecondary)
+
+                    HStack(spacing: 3) {
+                        ForEach(selectableRouteModes, id: \.self) { mode in
+                            let isSelected = selectedRouteMode == mode
+                            Button {
+                                store.hapticLight()
+                                selectedRouteMode = mode
+                            } label: {
+                                Text(OrbitFormatters.routeModeLabel(mode))
+                                    .font(OrbitTypography.meta(isSelected ? .semibold : .medium))
+                                    .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
+                                    .frame(maxWidth: .infinity, minHeight: 32)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(isSelected ? palette.elevated : Color.clear)
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .strokeBorder(isSelected ? palette.hairline : Color.clear, lineWidth: 0.5)
+                                    )
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(3)
+                    .background(palette.subtleFill)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, OrbitSpacing.md)
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                groupedInputRow(
+                    label: "Display Name",
+                    placeholder: host.hostname,
+                    text: $customHostName,
+                    isMono: false
+                )
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                groupedInputRow(
+                    label: "Direct Endpoint",
+                    placeholder: host.directEndpoints.first ?? "ws://192.168.1.x:6868",
+                    text: $customDirectEndpoint,
+                    isMono: true
+                )
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                groupedInputRow(
+                    label: "Relay URL",
+                    placeholder: "wss://relay.orbit.dev",
+                    text: $relayUrl,
+                    isMono: true
+                )
+            }
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(palette.hairline, lineWidth: 0.5)
+            )
+
+            Button {
+                store.hapticLight()
+                store.saveHostConfig(
+                    hostId: host.hostId,
+                    customName: customHostName,
+                    routeMode: selectedRouteMode,
+                    customDirectEndpoint: customDirectEndpoint,
+                    relayUrl: relayUrl
+                )
+            } label: {
+                Text("Save & Reconnect")
+                    .font(OrbitTypography.subhead(.semibold))
+                    .foregroundStyle(palette.onPrimary)
+                    .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
+                    .background(palette.primary)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.top, OrbitSpacing.xs)
+        }
+    }
+
+    private func groupedInputRow(
         label: String,
         placeholder: String,
-        text: Binding<String>
+        text: Binding<String>,
+        isMono: Bool
     ) -> some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(label)
                 .font(OrbitTypography.meta(.medium))
                 .foregroundStyle(palette.fgSecondary)
 
             TextField(placeholder, text: text)
-                .font(OrbitTypography.code(.regular))
+                .font(isMono ? OrbitTypography.code(.regular) : OrbitTypography.subhead(.regular))
                 .foregroundStyle(palette.fgPrimary)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
-                .padding(.horizontal, OrbitSpacing.md)
-                .frame(minHeight: OrbitSpacing.hitTarget)
-                .background(palette.code)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .frame(minHeight: 28)
+        }
+        .padding(.horizontal, OrbitSpacing.md)
+        .padding(.vertical, 10)
+    }
+
+    private func dangerSection(_ host: FfiHostCard) -> some View {
+        Button {
+            store.hapticLight()
+            confirmRemoveHost = true
+        } label: {
+            Text("Remove Host")
+                .font(OrbitTypography.subhead(.medium))
+                .foregroundStyle(palette.danger)
+                .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
+                .background(palette.elevated)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(palette.hairline, lineWidth: 0.5)
                 )
+                .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
     }
 }

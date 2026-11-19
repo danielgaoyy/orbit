@@ -20,12 +20,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Check
-import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -34,7 +33,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,24 +43,76 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.ParagraphStyle
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextIndent
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import dev.orbit.android.ui.theme.OrbitColors
+import dev.orbit.android.ui.theme.OrbitCopyIcon
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
+import dev.orbit.android.ui.theme.OrbitTypographyScale
 import dev.orbit.android.ui.theme.parseHexColor
 import kotlinx.coroutines.delay
 import uniffi.orbit_ffi_uniffi.FfiHighlightedLine
 import uniffi.orbit_ffi_uniffi.FfiInlineSpan
 import uniffi.orbit_ffi_uniffi.FfiRichBlock
+
+private sealed class MarkdownRenderSegment {
+    data class ProseRun(val blocks: List<FfiRichBlock>) : MarkdownRenderSegment()
+    data class TaskListItem(val block: FfiRichBlock.ListItem) : MarkdownRenderSegment()
+    data class BlockQuote(val block: FfiRichBlock.BlockQuote) : MarkdownRenderSegment()
+    data class CodeBlock(val block: FfiRichBlock.CodeBlock) : MarkdownRenderSegment()
+    data object HorizontalRule : MarkdownRenderSegment()
+}
+
+private fun isProseMergeable(block: FfiRichBlock): Boolean = when (block) {
+    is FfiRichBlock.Heading -> true
+    is FfiRichBlock.Paragraph -> true
+    is FfiRichBlock.ListItem -> block.checked == null
+    is FfiRichBlock.BlockQuote,
+    is FfiRichBlock.CodeBlock,
+    FfiRichBlock.HorizontalRule -> false
+}
+
+private fun groupMarkdownBlocks(blocks: List<FfiRichBlock>): List<MarkdownRenderSegment> {
+    val result = mutableListOf<MarkdownRenderSegment>()
+    val pendingProse = mutableListOf<FfiRichBlock>()
+
+    fun flushProse() {
+        if (pendingProse.isNotEmpty()) {
+            result += MarkdownRenderSegment.ProseRun(pendingProse.toList())
+            pendingProse.clear()
+        }
+    }
+
+    blocks.forEach { block ->
+        if (isProseMergeable(block)) {
+            pendingProse += block
+        } else {
+            flushProse()
+            when (block) {
+                is FfiRichBlock.ListItem -> result += MarkdownRenderSegment.TaskListItem(block)
+                is FfiRichBlock.BlockQuote -> result += MarkdownRenderSegment.BlockQuote(block)
+                is FfiRichBlock.CodeBlock -> result += MarkdownRenderSegment.CodeBlock(block)
+                FfiRichBlock.HorizontalRule -> result += MarkdownRenderSegment.HorizontalRule
+                is FfiRichBlock.Heading,
+                is FfiRichBlock.Paragraph -> Unit
+            }
+        }
+    }
+    flushProse()
+    return result
+}
 
 @Composable
 fun MarkdownBlocks(
@@ -88,87 +138,102 @@ fun MarkdownBlocks(
         return
     }
 
+    val segments = remember(blocks) { groupMarkdownBlocks(blocks) }
+
     SelectionContainer {
         Column(
             modifier = modifier.fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
         ) {
-            blocks.forEach { block ->
-                when (block) {
-                    is FfiRichBlock.Heading -> {
-                        val headingStyle = if (block.level <= 2u) {
-                            typography.title
-                        } else {
-                            typography.bodySemiBold
+            segments.forEach { seg ->
+                when (seg) {
+                    is MarkdownRenderSegment.ProseRun -> {
+                        val combined = remember(seg.blocks, textColor, colors, typography) {
+                            buildCombinedProseAnnotatedString(
+                                blocks = seg.blocks,
+                                baseColor = textColor,
+                                colors = colors,
+                                typography = typography,
+                            )
                         }
-                        RichSpanText(
-                            spans = block.spans,
-                            style = headingStyle,
-                            defaultColor = colors.fgPrimary,
-                            colors = colors,
-                        )
-                    }
-                    is FfiRichBlock.Paragraph -> {
-                        RichSpanText(
-                            spans = block.spans,
+                        Text(
+                            text = combined,
                             style = typography.body,
-                            defaultColor = textColor,
-                            colors = colors,
+                            color = textColor,
+                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
-                    is FfiRichBlock.ListItem -> {
+
+                    is MarkdownRenderSegment.TaskListItem -> {
+                        val item = seg.block
+                        val checked = item.checked == true
                         Row(
                             modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
                             verticalAlignment = Alignment.Top,
                         ) {
-                            val marker = when {
-                                block.checked == true -> "☑"
-                                block.checked == false -> "☐"
-                                block.ordered -> "${block.index}."
-                                else -> "•"
+                            val boxShape = RoundedCornerShape(4.dp)
+                            Box(
+                                modifier = Modifier
+                                    .padding(top = 3.dp)
+                                    .size(16.dp)
+                                    .clip(boxShape)
+                                    .background(
+                                        if (checked) colors.primary else colors.subtleFill,
+                                        boxShape,
+                                    )
+                                    .border(
+                                        OrbitSpacing.hairline,
+                                        if (checked) colors.primary else colors.hairline,
+                                        boxShape,
+                                    ),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                if (checked) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Check,
+                                        contentDescription = "Checked",
+                                        tint = colors.onPrimary,
+                                        modifier = Modifier.size(11.dp),
+                                    )
+                                }
                             }
-                            Text(
-                                text = marker,
-                                style = typography.bodyMedium,
-                                color = colors.fgSecondary,
-                                modifier = Modifier.width(OrbitSpacing.xl),
-                            )
                             RichSpanText(
-                                spans = block.spans,
-                                style = typography.body,
-                                defaultColor = textColor,
-                                colors = colors,
+                                spans = item.spans,
+                                textColor = if (checked) colors.fgMuted else textColor,
                                 modifier = Modifier.weight(1f),
                             )
                         }
                     }
-                    is FfiRichBlock.BlockQuote -> {
+
+                    is MarkdownRenderSegment.BlockQuote -> {
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(vertical = OrbitSpacing.xs),
-                            verticalAlignment = Alignment.Top,
+                                .height(IntrinsicSize.Min),
                         ) {
                             Box(
                                 modifier = Modifier
-                                    .width(OrbitSpacing.xs / 2)
-                                    .height(OrbitSpacing.xl)
-                                    .background(colors.fgMuted, RoundedCornerShape(OrbitSpacing.xs))
+                                    .width(2.dp)
+                                    .fillMaxHeight()
+                                    .background(colors.hairline, RoundedCornerShape(1.dp))
                             )
                             Spacer(modifier = Modifier.width(OrbitSpacing.md))
                             RichSpanText(
-                                spans = block.spans,
-                                style = typography.subhead,
-                                defaultColor = colors.fgSecondary,
-                                colors = colors,
-                                modifier = Modifier.weight(1f),
+                                spans = seg.block.spans,
+                                textColor = colors.fgSecondary,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(vertical = 2.dp),
                             )
                         }
                     }
-                    is FfiRichBlock.CodeBlock -> {
-                        CodeBlockSurface(block = block)
+
+                    is MarkdownRenderSegment.CodeBlock -> {
+                        CodeBlockSurface(block = seg.block)
                     }
-                    FfiRichBlock.HorizontalRule -> {
+
+                    MarkdownRenderSegment.HorizontalRule -> {
                         HorizontalDivider(
                             thickness = OrbitSpacing.hairline,
                             color = colors.hairline,
@@ -181,67 +246,144 @@ fun MarkdownBlocks(
     }
 }
 
+private fun buildCombinedProseAnnotatedString(
+    blocks: List<FfiRichBlock>,
+    baseColor: Color,
+    colors: OrbitColors,
+    typography: OrbitTypographyScale,
+): AnnotatedString = buildAnnotatedString {
+    blocks.forEachIndexed { idx, block ->
+        val prev = blocks.getOrNull(idx - 1)
+        if (idx > 0) {
+            val tightListPair = prev is FfiRichBlock.ListItem && block is FfiRichBlock.ListItem
+            append(if (tightListPair) "\n" else "\n\n")
+        }
+
+        when (block) {
+            is FfiRichBlock.Heading -> {
+                val (fontSize, lineHeight) = when {
+                    block.level <= 1u -> 18.sp to 25.sp
+                    block.level == 2u.toUByte() -> 16.5.sp to 23.sp
+                    else -> 15.sp to 21.sp
+                }
+                withStyle(ParagraphStyle(lineHeight = lineHeight)) {
+                    withStyle(
+                        SpanStyle(
+                            color = baseColor,
+                            fontSize = fontSize,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    ) {
+                        appendStyledSpans(
+                            spans = block.spans,
+                            baseColor = baseColor,
+                            colors = colors,
+                            typography = typography,
+                        )
+                    }
+                }
+            }
+
+            is FfiRichBlock.Paragraph -> {
+                withStyle(ParagraphStyle(lineHeight = typography.body.lineHeight)) {
+                    appendStyledSpans(
+                        spans = block.spans,
+                        baseColor = baseColor,
+                        colors = colors,
+                        typography = typography,
+                    )
+                }
+            }
+
+            is FfiRichBlock.ListItem -> {
+                val prefix = if (block.ordered) "${block.index}.  " else "•  "
+                val indentStyle = ParagraphStyle(
+                    lineHeight = typography.body.lineHeight,
+                    textIndent = TextIndent(firstLine = 0.sp, restLine = 16.sp),
+                )
+                withStyle(indentStyle) {
+                    withStyle(SpanStyle(color = colors.fgSecondary, fontWeight = FontWeight.Medium)) {
+                        append(prefix)
+                    }
+                    appendStyledSpans(
+                        spans = block.spans,
+                        baseColor = baseColor,
+                        colors = colors,
+                        typography = typography,
+                    )
+                }
+            }
+
+            is FfiRichBlock.BlockQuote,
+            is FfiRichBlock.CodeBlock,
+            FfiRichBlock.HorizontalRule -> Unit
+        }
+    }
+}
+
 @Composable
 private fun RichSpanText(
     spans: List<FfiInlineSpan>,
-    style: TextStyle,
-    defaultColor: Color,
-    colors: OrbitColors,
+    textColor: Color,
     modifier: Modifier = Modifier,
 ) {
-    val annotated = remember(spans, defaultColor, colors) {
-        buildStyledSpans(spans, defaultColor, colors)
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val styled = remember(spans, textColor, colors, typography) {
+        buildAnnotatedString {
+            appendStyledSpans(
+                spans = spans,
+                baseColor = textColor,
+                colors = colors,
+                typography = typography,
+            )
+        }
     }
-
     Text(
-        text = annotated,
-        style = style,
-        color = defaultColor,
+        text = styled,
+        style = typography.body,
+        color = textColor,
         modifier = modifier,
     )
 }
 
-private fun buildStyledSpans(
+private fun AnnotatedString.Builder.appendStyledSpans(
     spans: List<FfiInlineSpan>,
-    defaultColor: Color,
+    baseColor: Color,
     colors: OrbitColors,
-): AnnotatedString = buildAnnotatedString {
+    typography: OrbitTypographyScale,
+) {
     spans.forEach { sp ->
-        val link = sp.linkUrl?.takeIf { it.isNotBlank() }
-        val fg = when {
-            link != null -> colors.primary
-            sp.inlineCode -> colors.fgPrimary
-            else -> defaultColor
-        }
-        val bg = if (sp.inlineCode) colors.subtleFill else Color.Transparent
         val decoration = when {
-            link != null && sp.strikethrough -> TextDecoration.combine(
-                listOf(TextDecoration.Underline, TextDecoration.LineThrough)
+            sp.strikethrough && sp.linkUrl != null -> TextDecoration.combine(
+                listOf(TextDecoration.LineThrough, TextDecoration.Underline)
             )
-            link != null -> TextDecoration.Underline
             sp.strikethrough -> TextDecoration.LineThrough
+            sp.linkUrl != null -> TextDecoration.Underline
             else -> TextDecoration.None
         }
-        val spanStyle = SpanStyle(
-            color = fg,
-            background = bg,
-            fontWeight = when {
-                sp.bold -> FontWeight.SemiBold
-                sp.inlineCode -> FontWeight.Medium
-                else -> null
-            },
-            fontStyle = if (sp.italic) FontStyle.Italic else FontStyle.Normal,
+        val style = SpanStyle(
+            color = if (sp.linkUrl != null) colors.primary else baseColor,
+            fontWeight = if (sp.bold) FontWeight.SemiBold else null,
+            fontStyle = if (sp.italic) FontStyle.Italic else null,
             fontFamily = if (sp.inlineCode) FontFamily.Monospace else null,
+            fontSize = if (sp.inlineCode) 13.sp else typography.body.fontSize,
+            background = if (sp.inlineCode) colors.subtleFill else Color.Transparent,
             textDecoration = decoration,
         )
-        val content = if (sp.inlineCode) "\u00A0${sp.text}\u00A0" else sp.text
-        if (link != null) {
-            withLink(LinkAnnotation.Url(link, TextLinkStyles(style = spanStyle))) {
-                append(content)
+        val url = sp.linkUrl?.takeIf { it.isNotBlank() }
+        if (url != null) {
+            withLink(
+                LinkAnnotation.Url(
+                    url = url,
+                    styles = TextLinkStyles(style = style),
+                )
+            ) {
+                append(sp.text)
             }
         } else {
-            withStyle(spanStyle) {
-                append(content)
+            withStyle(style) {
+                append(sp.text)
             }
         }
     }
@@ -253,154 +395,78 @@ private fun CodeBlockSurface(block: FfiRichBlock.CodeBlock) {
     val typography = OrbitTheme.typography
     val context = LocalContext.current
     val haptics = LocalHapticFeedback.current
-    var copied by remember { mutableStateOf(false) }
-    var showLineNumbers by rememberSaveable { mutableStateOf(false) }
+    var copied by remember(block.rawCode) { mutableStateOf(false) }
 
     LaunchedEffect(copied) {
         if (copied) {
-            delay(1600)
+            delay(1500L)
             copied = false
         }
     }
 
-    val fallbackLines = remember(block.rawCode) {
-        block.rawCode.trimEnd('\n', '\r').split('\n')
-    }
-    val lineCount = if (block.lines.isNotEmpty()) block.lines.size else fallbackLines.size
-    val gutterDigits = lineCount.toString().length.coerceAtLeast(2)
+    val shape = RoundedCornerShape(12.dp)
+    val defaultCodeFg = if (colors.isDark) Color(0xFFE6E8EE) else colors.fgPrimary
 
-    val shape = RoundedCornerShape(OrbitSpacing.md)
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(shape)
             .background(colors.code, shape)
-            .border(OrbitSpacing.hairline, colors.hairline, shape)
+            .border(OrbitSpacing.hairline, colors.hairline, shape),
     ) {
-        DisableSelection {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.xs),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = block.language.ifBlank { "code" },
-                    style = typography.metaMedium,
-                    color = colors.fgMuted,
-                )
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                ) {
-                    val toggleShape = RoundedCornerShape(OrbitSpacing.sm)
-                    Box(
-                        modifier = Modifier
-                            .clip(toggleShape)
-                            .background(
-                                if (showLineNumbers) colors.subtleFill else Color.Transparent,
-                                toggleShape,
-                            )
-                            .clickable {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                showLineNumbers = !showLineNumbers
-                            }
-                            .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            text = "#",
-                            style = typography.codeMedium,
-                            color = if (showLineNumbers) colors.primary else colors.fgSecondary,
-                        )
-                    }
-
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(OrbitSpacing.sm))
-                            .clickable {
-                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                                cm?.setPrimaryClip(ClipData.newPlainText("code", block.rawCode))
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                copied = true
-                            }
-                            .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                    ) {
-                        Icon(
-                            imageVector = if (copied) Icons.Outlined.Check else Icons.Outlined.ContentCopy,
-                            contentDescription = "Copy code",
-                            tint = if (copied) colors.directAdded else colors.fgSecondary,
-                            modifier = Modifier.size(OrbitSpacing.iconSm),
-                        )
-                        Text(
-                            text = if (copied) "Copied" else "Copy",
-                            style = typography.metaMedium,
-                            color = if (copied) colors.directAdded else colors.fgSecondary,
-                        )
-                    }
-                }
-            }
-        }
-        HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(IntrinsicSize.Min)
-                .padding(OrbitSpacing.md),
+                .padding(start = OrbitSpacing.md, end = OrbitSpacing.sm, top = 6.dp, bottom = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (showLineNumbers) {
-                DisableSelection {
-                    Row(modifier = Modifier.fillMaxHeight()) {
-                        Column(
-                            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs / 2),
-                        ) {
-                            for (lineNum in 1..lineCount) {
-                                Text(
-                                    text = lineNum.toString().padStart(gutterDigits, ' '),
-                                    style = typography.code,
-                                    color = colors.fgMuted,
-                                    maxLines = 1,
-                                    softWrap = false,
-                                )
-                            }
-                        }
-                        Spacer(modifier = Modifier.width(OrbitSpacing.sm))
-                        Box(
-                            modifier = Modifier
-                                .width(OrbitSpacing.hairline)
-                                .fillMaxHeight()
-                                .background(colors.hairline)
-                        )
-                        Spacer(modifier = Modifier.width(OrbitSpacing.sm))
-                    }
-                }
+            Text(
+                text = block.language.ifBlank { "text" },
+                style = typography.metaMedium,
+                color = colors.fgMuted,
+            )
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .clickable {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                        cm?.setPrimaryClip(ClipData.newPlainText("Code block", block.rawCode))
+                        copied = true
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = if (copied) Icons.Outlined.Check else OrbitCopyIcon,
+                    contentDescription = "Copy code",
+                    tint = if (copied) colors.directAdded else colors.fgMuted,
+                    modifier = Modifier.size(14.dp),
+                )
             }
+        }
+        HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+
+        SelectionContainer {
             Column(
                 modifier = Modifier
-                    .weight(1f)
-                    .horizontalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs / 2),
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(OrbitSpacing.md),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                if (block.lines.isNotEmpty()) {
-                    block.lines.forEach { ln ->
-                        Text(
-                            text = buildHighlightedLine(ln, colors.fgPrimary),
-                            style = typography.code,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                    }
+                if (block.lines.isEmpty()) {
+                    Text(
+                        text = block.rawCode,
+                        style = typography.code,
+                        color = defaultCodeFg,
+                    )
                 } else {
-                    fallbackLines.forEach { ln ->
+                    block.lines.forEach { line ->
                         Text(
-                            text = ln,
+                            text = buildHighlightedLine(line, defaultCodeFg),
                             style = typography.code,
-                            color = colors.fgPrimary,
-                            maxLines = 1,
-                            softWrap = false,
                         )
                     }
                 }
@@ -412,14 +478,14 @@ private fun CodeBlockSurface(block: FfiRichBlock.CodeBlock) {
 private fun buildHighlightedLine(line: FfiHighlightedLine, fallbackFg: Color): AnnotatedString =
     buildAnnotatedString {
         line.tokens.forEach { tok ->
-            withStyle(
+            pushStyle(
                 SpanStyle(
                     color = parseHexColor(tok.fgHex, fallbackFg),
                     fontWeight = if (tok.bold) FontWeight.SemiBold else FontWeight.Normal,
                     fontStyle = if (tok.italic) FontStyle.Italic else FontStyle.Normal,
                 )
-            ) {
-                append(tok.text)
-            }
+            )
+            append(tok.text)
+            pop()
         }
     }

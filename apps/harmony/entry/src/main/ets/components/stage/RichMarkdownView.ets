@@ -5,39 +5,43 @@ import {
   RichBlockDto
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { openExternalWebUrl } from '../../model/OrbitDeviceBridge';
 import {
   OrbitThemePalette,
   OrbitTokens,
   orbitSpanBodyFont,
+  orbitSpanHeadingFont,
   orbitSpanMonoFont,
-  orbitSpanTitleFont,
   orbitTextMeta,
   orbitTextMono,
   orbitTextSubhead
 } from '../../theme/OrbitTokens';
+import { OrbitCopyIconButton } from '../common/OrbitCommonControls';
 
-function adaptSyntaxColor(hex: string, palette: OrbitThemePalette): string {
-  if (palette.isDark || hex.length !== 7 || !hex.startsWith('#')) {
-    return hex;
+const QUOTE_MENU_ID: string = 'orbit_quote';
+
+function adaptSyntaxColor(hex: string, palette: OrbitThemePalette): ResourceColor {
+  if (hex.length !== 7 || !hex.startsWith('#')) {
+    return palette.fgPrimary;
   }
   const upper = hex.toUpperCase();
   if (upper === '#E2E8F0' || upper === '#C0C5CE' || upper === '#EFF1F5' || upper === '#DFE1E8') {
     return palette.fgPrimary;
   }
   if (upper === '#A3BE8C') {
-    return '#15803D';
+    return $r('app.color.orbit_syntax_string');
   }
   if (upper === '#EBCB8B') {
-    return '#B45309';
+    return $r('app.color.orbit_syntax_number');
   }
   if (upper === '#8FA1B3' || upper === '#96B5B4') {
-    return '#1D4ED8';
+    return $r('app.color.orbit_syntax_keyword');
   }
   if (upper === '#B48EAD') {
-    return '#7E22CE';
+    return $r('app.color.orbit_syntax_type');
   }
   if (upper === '#BF616A' || upper === '#D08770') {
-    return '#B91C1C';
+    return $r('app.color.orbit_syntax_error');
   }
   return hex;
 }
@@ -47,13 +51,26 @@ interface ExtractedGfmTable {
   rows: string[][];
 }
 
+interface FlattenedProseSpan {
+  key: string;
+  text: string;
+  headingLevel: number;
+  bold: boolean;
+  italic: boolean;
+  strikethrough: boolean;
+  inlineCode: boolean;
+  linkUrl: string;
+  isListMarker: boolean;
+}
+
 interface NormalizedRenderBlock {
   key: string;
-  isTable: boolean;
+  kind: string; // 'prose_run' | 'task_item' | 'code_block' | 'block_quote' | 'horizontal_rule' | 'table'
   tableHeaders: string[];
   tableRows: string[][];
+  proseSpans: FlattenedProseSpan[];
+  plainText: string;
   block: RichBlockDto | null;
-  plainFallback: string;
 }
 
 function splitGfmPipeRow(line: string): string[] {
@@ -199,6 +216,16 @@ function parsePipeCellsFromParagraphs(run: RichBlockDto[]): ExtractedGfmTable {
   };
 }
 
+function isMergeableProseBlock(blk: RichBlockDto): boolean {
+  if (blk.kind === 'heading' || blk.kind === 'paragraph') {
+    return !isPipeTableParagraphBlock(blk);
+  }
+  if (blk.kind === 'list_item') {
+    return blk.checked === undefined || blk.checked === null;
+  }
+  return false;
+}
+
 @ComponentV2
 export struct MarkdownTableBox {
   @Param headers: string[] = [];
@@ -206,7 +233,8 @@ export struct MarkdownTableBox {
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
-  private columnCount(): number {
+  @Computed
+  get colCount(): number {
     let maxCols = this.headers.length;
     for (let i = 0; i < this.rows.length; i++) {
       if (this.rows[i].length > maxCols) {
@@ -216,24 +244,29 @@ export struct MarkdownTableBox {
     return maxCols;
   }
 
-  private columnIndices(): number[] {
-    const count = this.columnCount();
+  @Computed
+  get colIndices(): number[] {
     const out: number[] = [];
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < this.colCount; i++) {
       out.push(i);
     }
     return out;
   }
 
-  private columnWidthVp(colIdx: number): number {
-    let maxChars = colIdx < this.headers.length ? this.headers[colIdx].length : 4;
-    for (let r = 0; r < this.rows.length; r++) {
-      if (colIdx < this.rows[r].length && this.rows[r][colIdx].length > maxChars) {
-        maxChars = this.rows[r][colIdx].length;
+  @Computed
+  get colWidths(): number[] {
+    const widths: number[] = [];
+    for (let c = 0; c < this.colCount; c++) {
+      let maxChars = c < this.headers.length ? this.headers[c].length : 4;
+      for (let r = 0; r < this.rows.length; r++) {
+        if (c < this.rows[r].length && this.rows[r][c].length > maxChars) {
+          maxChars = this.rows[r][c].length;
+        }
       }
+      const rawVp = Math.ceil((maxChars * 7.8 + 28) / 4) * 4;
+      widths.push(Math.min(264, Math.max(96, rawVp)));
     }
-    const rawVp = Math.ceil((maxChars * 7.8 + 28) / 4) * 4;
-    return Math.min(264, Math.max(96, rawVp));
+    return widths;
   }
 
   build() {
@@ -243,15 +276,16 @@ export struct MarkdownTableBox {
           if (this.headers.length > 0) {
             Row() {
               ForEach(
-                this.columnIndices(),
+                this.colIndices,
                 (cIdx: number) => {
                   Row() {
                     Text(cIdx < this.headers.length ? this.headers[cIdx] : '')
                       .attributeModifier(
                         orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold)
                       )
+                      .copyOption(CopyOptions.LocalDevice)
                   }
-                  .width(this.columnWidthVp(cIdx))
+                  .width(cIdx < this.colWidths.length ? this.colWidths[cIdx] : 112)
                   .padding({
                     left: OrbitTokens.SPACE_MD,
                     right: OrbitTokens.SPACE_MD,
@@ -260,7 +294,7 @@ export struct MarkdownTableBox {
                   })
                   .border({
                     width: {
-                      right: cIdx < this.columnCount() - 1 ? OrbitTokens.HAIRLINE : 0
+                      right: cIdx < this.colCount - 1 ? OrbitTokens.HAIRLINE : 0
                     },
                     color: this.store.palette.hairline
                   })
@@ -281,15 +315,16 @@ export struct MarkdownTableBox {
             (rowCells: string[], rIdx: number) => {
               Row() {
                 ForEach(
-                  this.columnIndices(),
+                  this.colIndices,
                   (cIdx: number) => {
                     Row() {
                       Text(cIdx < rowCells.length ? rowCells[cIdx] : '')
                         .attributeModifier(
                           orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Normal)
                         )
+                        .copyOption(CopyOptions.LocalDevice)
                     }
-                    .width(this.columnWidthVp(cIdx))
+                    .width(cIdx < this.colWidths.length ? this.colWidths[cIdx] : 112)
                     .padding({
                       left: OrbitTokens.SPACE_MD,
                       right: OrbitTokens.SPACE_MD,
@@ -298,7 +333,7 @@ export struct MarkdownTableBox {
                     })
                     .border({
                       width: {
-                        right: cIdx < this.columnCount() - 1 ? OrbitTokens.HAIRLINE : 0
+                        right: cIdx < this.colCount - 1 ? OrbitTokens.HAIRLINE : 0
                       },
                       color: this.store.palette.hairline
                     })
@@ -308,7 +343,7 @@ export struct MarkdownTableBox {
                 )
               }
               .backgroundColor(
-                rIdx % 2 === 1 ? this.store.palette.elevated : this.store.palette.canvas
+                rIdx % 2 === 1 ? this.store.palette.listCard : this.store.palette.canvas
               )
               .border({
                 width: { bottom: rIdx < this.rows.length - 1 ? OrbitTokens.HAIRLINE : 0 },
@@ -325,7 +360,7 @@ export struct MarkdownTableBox {
       .width('100%')
     }
     .width('100%')
-    .borderRadius(OrbitTokens.CARD_RADIUS)
+    .borderRadius(OrbitTokens.RADIUS_MD)
     .border({
       width: OrbitTokens.HAIRLINE,
       color: this.store.palette.hairline
@@ -334,17 +369,25 @@ export struct MarkdownTableBox {
   }
 }
 
+interface HighlightedRunSpan {
+  key: string;
+  text: string;
+  color: ResourceColor;
+  bold: boolean;
+  italic: boolean;
+}
+
 @ComponentV2
 export struct CodeHighlightBox {
   @Param language: string = '';
   @Param rawCode: string = '';
   @Param lines: HighlightedLineDto[] = [];
-  @Local copied: boolean = false;
   @Local showLineNumbers: boolean = true;
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
-  private displayedLineCount(): number {
+  @Computed
+  get displayedLineCount(): number {
     if (this.lines.length > 0) {
       return this.lines.length;
     }
@@ -354,71 +397,122 @@ export struct CodeHighlightBox {
     return 0;
   }
 
+  @Computed
+  get codeSpans(): HighlightedRunSpan[] {
+    const out: HighlightedRunSpan[] = [];
+    if (this.lines.length > 0) {
+      for (let lIdx = 0; lIdx < this.lines.length; lIdx++) {
+        const ln = this.lines[lIdx];
+        if (this.showLineNumbers) {
+          const lineNo = ln.line_number > 0 ? ln.line_number : lIdx + 1;
+          out.push({
+            key: `ln_${lIdx}`,
+            text: `${lineNo.toString().padStart(3, ' ')}  `,
+            color: this.store.palette.fgMuted,
+            bold: false,
+            italic: false
+          });
+        }
+        for (let tIdx = 0; tIdx < ln.tokens.length; tIdx++) {
+          const tok: HighlightedTokenDto = ln.tokens[tIdx];
+          out.push({
+            key: `tok_${lIdx}_${tIdx}`,
+            text: tok.text,
+            color: adaptSyntaxColor(tok.fg_hex, this.store.palette),
+            bold: tok.bold,
+            italic: tok.italic
+          });
+        }
+        if (lIdx < this.lines.length - 1) {
+          out.push({
+            key: `nl_${lIdx}`,
+            text: '\n',
+            color: this.store.palette.fgPrimary,
+            bold: false,
+            italic: false
+          });
+        }
+      }
+      return out;
+    }
+
+    const rawLines = this.rawCode.split('\n');
+    for (let lIdx = 0; lIdx < rawLines.length; lIdx++) {
+      if (this.showLineNumbers) {
+        out.push({
+          key: `rln_${lIdx}`,
+          text: `${(lIdx + 1).toString().padStart(3, ' ')}  `,
+          color: this.store.palette.fgMuted,
+          bold: false,
+          italic: false
+        });
+      }
+      out.push({
+        key: `raw_${lIdx}`,
+        text: rawLines[lIdx],
+        color: this.store.palette.fgPrimary,
+        bold: false,
+        italic: false
+      });
+      if (lIdx < rawLines.length - 1) {
+        out.push({
+          key: `rnl_${lIdx}`,
+          text: '\n',
+          color: this.store.palette.fgPrimary,
+          bold: false,
+          italic: false
+        });
+      }
+    }
+    return out;
+  }
+
   build() {
     Column() {
-      // Code Block Header
-      Row({ space: OrbitTokens.SPACE_SM }) {
-        Text(this.language.trim().length > 0 ? this.language.trim() : 'code')
-          .attributeModifier(orbitTextMono(this.store.palette.fgSecondary, FontWeight.Medium))
+      // Restrained Code Block Header
+      Row({ space: OrbitTokens.SPACE_XS }) {
+        Text(this.language.trim().length > 0 ? this.language.trim() : 'text')
+          .attributeModifier(orbitTextMono(this.store.palette.fgMuted, FontWeight.Medium))
 
-        if (this.displayedLineCount() >= 8) {
-          Text(`${this.displayedLineCount()} lines`)
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Normal))
+        if (this.displayedLineCount >= 8) {
+          Text(`${this.displayedLineCount} lines`)
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
         }
 
         Blank()
 
-        Stack({ alignContent: Alignment.Center }) {
-          Row() {
-            Text('#')
-              .attributeModifier(
-                orbitTextMono(
-                  this.showLineNumbers
-                    ? this.store.palette.accentPrimary
-                    : this.store.palette.fgMuted,
-                  FontWeight.Bold
-                )
+        Button({ type: ButtonType.Normal, stateEffect: true }) {
+          Text('#')
+            .attributeModifier(
+              orbitTextMono(
+                this.showLineNumbers
+                  ? this.store.palette.fgPrimary
+                  : this.store.palette.fgMuted,
+                FontWeight.Medium
               )
-          }
-          .height(28)
-          .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-          .backgroundColor(
-            this.showLineNumbers ? this.store.palette.accentPrimarySoft : Color.Transparent
-          )
-          .borderRadius(OrbitTokens.PILL_RADIUS)
-          .alignItems(VerticalAlign.Center)
+            )
         }
-        .width(OrbitTokens.HIT_MIN)
-        .height(OrbitTokens.HIT_MIN)
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .borderRadius(OrbitTokens.RADIUS_XS)
+        .backgroundColor(
+          this.showLineNumbers ? this.store.palette.subtleSurface : Color.Transparent
+        )
         .accessibilityText(this.showLineNumbers ? 'Hide line numbers' : 'Show line numbers')
         .onClick(() => {
           this.showLineNumbers = !this.showLineNumbers;
           this.store.triggerHaptic(6);
         })
 
-        Row({ space: OrbitTokens.SPACE_XS }) {
-          Text(this.copied ? 'Copied' : 'Copy')
-            .attributeModifier(
-              orbitTextMeta(
-                this.copied ? this.store.palette.statusDirect : this.store.palette.fgSecondary,
-                FontWeight.Medium
-              )
-            )
-        }
-        .height(28)
-        .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-        .borderRadius(OrbitTokens.PILL_RADIUS)
-        .alignItems(VerticalAlign.Center)
-        .onClick(() => {
-          this.store.copyToClipboard(this.rawCode, 'Copied code block');
-          this.copied = true;
-          setTimeout(() => {
-            this.copied = false;
-          }, 1800);
+        OrbitCopyIconButton({
+          content: this.rawCode,
+          toastLabel: 'Copied code block',
+          accessibilityLabel: 'Copy code',
+          buttonSize: OrbitTokens.HIT_COMPACT
         })
       }
       .width('100%')
-      .height(36)
+      .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
       .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_XS })
       .alignItems(VerticalAlign.Center)
       .border({
@@ -426,61 +520,26 @@ export struct CodeHighlightBox {
         color: this.store.palette.hairline
       })
 
-      // Syntax-Highlighted Scrollable Lines
+      // Selectable Code Body (multi-line native range selection)
       Scroll() {
-        Column({ space: 2 }) {
-          if (this.lines.length > 0) {
+        Column() {
+          Text() {
             ForEach(
-              this.lines,
-              (ln: HighlightedLineDto, lIdx: number) => {
-                Text() {
-                  Span(
-                    this.showLineNumbers
-                      ? `${(ln.line_number > 0 ? ln.line_number : lIdx + 1).toString().padStart(3, ' ')}  `
-                      : ''
+              this.codeSpans,
+              (sp: HighlightedRunSpan) => {
+                Span(sp.text)
+                  .font(
+                    orbitSpanMonoFont(
+                      sp.bold ? FontWeight.Bold : FontWeight.Normal,
+                      sp.italic
+                    )
                   )
-                    .font(orbitSpanMonoFont())
-                    .fontColor(this.store.palette.fgMuted)
-                  ForEach(
-                    ln.tokens,
-                    (tok: HighlightedTokenDto) => {
-                      Span(tok.text)
-                        .font(
-                          orbitSpanMonoFont(
-                            tok.bold ? FontWeight.Bold : FontWeight.Normal,
-                            tok.italic
-                          )
-                        )
-                        .fontColor(adaptSyntaxColor(tok.fg_hex, this.store.palette))
-                    },
-                    (_tok: HighlightedTokenDto, tIdx: number) => `${ln.line_number}_${tIdx}`
-                  )
-                }
-                .lineHeight(OrbitTokens.LH_META)
+                  .fontColor(sp.color)
               },
-              (ln: HighlightedLineDto, lIdx: number) => `${ln.line_number}_${lIdx}`
-            )
-          } else if (this.rawCode.length > 0) {
-            ForEach(
-              this.rawCode.split('\n'),
-              (rawLine: string, lIdx: number) => {
-                Text() {
-                  Span(
-                    this.showLineNumbers
-                      ? `${(lIdx + 1).toString().padStart(3, ' ')}  `
-                      : ''
-                  )
-                    .font(orbitSpanMonoFont())
-                    .fontColor(this.store.palette.fgMuted)
-                  Span(rawLine)
-                    .font(orbitSpanMonoFont())
-                    .fontColor(this.store.palette.fgPrimary)
-                }
-                .lineHeight(OrbitTokens.LH_META)
-              },
-              (_rawLine: string, lIdx: number) => `raw_${lIdx}`
+              (sp: HighlightedRunSpan) => sp.key
             )
           }
+          .copyOption(CopyOptions.LocalDevice)
         }
         .alignItems(HorizontalAlign.Start)
         .padding(OrbitTokens.SPACE_MD)
@@ -491,7 +550,7 @@ export struct CodeHighlightBox {
     }
     .width('100%')
     .backgroundColor(this.store.palette.code)
-    .borderRadius(OrbitTokens.CARD_RADIUS)
+    .borderRadius(OrbitTokens.RADIUS_MD)
     .border({
       width: OrbitTokens.HAIRLINE,
       color: this.store.palette.hairline
@@ -504,11 +563,46 @@ export struct CodeHighlightBox {
 export struct RichMarkdownView {
   @Param blocks: RichBlockDto[] = [];
   @Param fallbackText: string = '';
+  @Param turnIndex: number = 0;
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
+  private buildEditMenuOptions(fullText: string): EditMenuOptions {
+    const store = this.store;
+    const turnIdx = this.turnIndex;
+    const opts: EditMenuOptions = {
+      onCreateMenu(menuItems: Array<TextMenuItem>): Array<TextMenuItem> {
+        const quoteItem: TextMenuItem = {
+          content: 'Quote',
+          id: TextMenuItemId.of(QUOTE_MENU_ID)
+        };
+        const out: Array<TextMenuItem> = [];
+        for (let i = 0; i < menuItems.length; i++) {
+          out.push(menuItems[i]);
+        }
+        out.push(quoteItem);
+        return out;
+      },
+      onMenuItemClick(menuItem: TextMenuItem, textRange: TextRange): boolean {
+        if (menuItem.id.equals(TextMenuItemId.of(QUOTE_MENU_ID))) {
+          const rawStart = textRange.start ?? 0;
+          const rawEnd = textRange.end ?? 0;
+          const s = Math.max(0, Math.min(rawStart, rawEnd));
+          const e = Math.min(fullText.length, Math.max(rawStart, rawEnd));
+          const selected = (e > s ? fullText.substring(s, e) : fullText).trim();
+          if (selected.length > 0) {
+            store.quoteAssistantReplyIntoComposer(selected, turnIdx);
+          }
+          return true;
+        }
+        return false;
+      }
+    };
+    return opts;
+  }
+
   @Builder
-  private renderInlineSpans(spans: InlineSpanDto[], isHeading: boolean, defaultColor: string) {
+  private renderInlineSpans(spans: InlineSpanDto[], defaultColor: ResourceColor) {
     Text() {
       ForEach(
         spans,
@@ -516,15 +610,11 @@ export struct RichMarkdownView {
           if (sp.inline_code) {
             Span(` ${sp.text} `)
               .font(orbitSpanMonoFont(FontWeight.Medium))
-              .fontColor(this.store.palette.accentPrimary)
+              .fontColor(this.store.palette.fgPrimary)
               .textBackgroundStyle({
                 color: this.store.palette.subtleSurface,
                 radius: OrbitTokens.SPACE_XS
               })
-          } else if (isHeading) {
-            Span(sp.text)
-              .font(orbitSpanTitleFont(FontWeight.Bold))
-              .fontColor(defaultColor)
           } else if (sp.link_url !== null && sp.link_url.length > 0) {
             Span(sp.text)
               .font(orbitSpanBodyFont(FontWeight.Medium, sp.italic))
@@ -532,6 +622,12 @@ export struct RichMarkdownView {
               .decoration({
                 type: TextDecorationType.Underline,
                 color: this.store.palette.accentPrimary
+              })
+              .onClick(() => {
+                const url = sp.link_url ?? '';
+                if (!openExternalWebUrl(this.getUIContext().getHostContext(), url)) {
+                  this.store.copyToClipboard(url, 'Copied link');
+                }
               })
           } else if (sp.strikethrough) {
             Span(sp.text)
@@ -555,11 +651,84 @@ export struct RichMarkdownView {
         (_sp: InlineSpanDto, sIdx: number) => sIdx.toString()
       )
     }
-    .lineHeight(isHeading ? OrbitTokens.LH_TITLE : OrbitTokens.LH_BODY)
     .width('100%')
+    .copyOption(CopyOptions.LocalDevice)
+    .editMenuOptions(this.buildEditMenuOptions(spansPlainText(spans)))
   }
 
-  private normalizedBlocks(): NormalizedRenderBlock[] {
+  private buildMergedProseEntry(run: RichBlockDto[], keyIndex: number): NormalizedRenderBlock {
+    const proseSpans: FlattenedProseSpan[] = [];
+    let plain = '';
+
+    for (let bIdx = 0; bIdx < run.length; bIdx++) {
+      const blk = run[bIdx];
+      if (bIdx > 0) {
+        const prev = run[bIdx - 1];
+        const tightList = prev.kind === 'list_item' && blk.kind === 'list_item';
+        const sep = tightList ? '\n' : '\n\n';
+        proseSpans.push({
+          key: `sep_${keyIndex}_${bIdx}`,
+          text: sep,
+          headingLevel: 0,
+          bold: false,
+          italic: false,
+          strikethrough: false,
+          inlineCode: false,
+          linkUrl: '',
+          isListMarker: false
+        });
+        plain += sep;
+      }
+
+      if (blk.kind === 'list_item') {
+        const marker = blk.ordered === true ? `${blk.index ?? 1}.  ` : '•  ';
+        proseSpans.push({
+          key: `lm_${keyIndex}_${bIdx}`,
+          text: marker,
+          headingLevel: 0,
+          bold: true,
+          italic: false,
+          strikethrough: false,
+          inlineCode: false,
+          linkUrl: '',
+          isListMarker: true
+        });
+        plain += marker;
+      }
+
+      const hLevel = blk.kind === 'heading' ? (blk.level ?? 2) : 0;
+      const spans = blk.spans ?? [];
+      for (let sIdx = 0; sIdx < spans.length; sIdx++) {
+        const sp = spans[sIdx];
+        const segText = sp.inline_code ? ` ${sp.text} ` : sp.text;
+        proseSpans.push({
+          key: `sp_${keyIndex}_${bIdx}_${sIdx}`,
+          text: segText,
+          headingLevel: hLevel,
+          bold: sp.bold || hLevel > 0,
+          italic: sp.italic,
+          strikethrough: sp.strikethrough,
+          inlineCode: sp.inline_code,
+          linkUrl: sp.link_url ?? '',
+          isListMarker: false
+        });
+        plain += sp.text;
+      }
+    }
+
+    return {
+      key: `prose_${keyIndex}_${run.length}_${plain.length}`,
+      kind: 'prose_run',
+      tableHeaders: [],
+      tableRows: [],
+      proseSpans: proseSpans,
+      plainText: plain,
+      block: null
+    };
+  }
+
+  @Computed
+  get normalizedBlockList(): NormalizedRenderBlock[] {
     const out: NormalizedRenderBlock[] = [];
     const gfmTables = extractGfmTablesFromMarkdown(this.fallbackText);
     let gfmCursor = 0;
@@ -568,11 +737,22 @@ export struct RichMarkdownView {
       if (gfmTables.length === 0) {
         out.push({
           key: 'fb_plain_0',
-          isTable: false,
+          kind: 'prose_run',
           tableHeaders: [],
           tableRows: [],
-          block: null,
-          plainFallback: this.fallbackText
+          proseSpans: [{
+            key: 'fb_span_0',
+            text: this.fallbackText,
+            headingLevel: 0,
+            bold: false,
+            italic: false,
+            strikethrough: false,
+            inlineCode: false,
+            linkUrl: '',
+            isListMarker: false
+          }],
+          plainText: this.fallbackText,
+          block: null
         });
         return out;
       }
@@ -587,14 +767,26 @@ export struct RichMarkdownView {
           isGfmDelimiterRow(lines[i + 1]) &&
           gfmCursor < gfmTables.length
         ) {
-          if (textBuf.join('\n').trim().length > 0) {
+          const bufText = textBuf.join('\n').trim();
+          if (bufText.length > 0) {
             out.push({
               key: `fb_txt_${i}`,
-              isTable: false,
+              kind: 'prose_run',
               tableHeaders: [],
               tableRows: [],
-              block: null,
-              plainFallback: textBuf.join('\n').trim()
+              proseSpans: [{
+                key: `fb_sp_${i}`,
+                text: bufText,
+                headingLevel: 0,
+                bold: false,
+                italic: false,
+                strikethrough: false,
+                inlineCode: false,
+                linkUrl: '',
+                isListMarker: false
+              }],
+              plainText: bufText,
+              block: null
             });
             textBuf = [];
           }
@@ -602,11 +794,12 @@ export struct RichMarkdownView {
           gfmCursor++;
           out.push({
             key: `fb_tbl_${i}`,
-            isTable: true,
+            kind: 'table',
             tableHeaders: tbl.headers,
             tableRows: tbl.rows,
-            block: null,
-            plainFallback: ''
+            proseSpans: [],
+            plainText: '',
+            block: null
           });
           i += 2 + tbl.rows.length;
           continue;
@@ -614,14 +807,26 @@ export struct RichMarkdownView {
         textBuf.push(lines[i]);
         i++;
       }
-      if (textBuf.join('\n').trim().length > 0) {
+      const rem = textBuf.join('\n').trim();
+      if (rem.length > 0) {
         out.push({
-          key: `fb_txt_end`,
-          isTable: false,
+          key: 'fb_txt_end',
+          kind: 'prose_run',
           tableHeaders: [],
           tableRows: [],
-          block: null,
-          plainFallback: textBuf.join('\n').trim()
+          proseSpans: [{
+            key: 'fb_sp_end',
+            text: rem,
+            headingLevel: 0,
+            bold: false,
+            italic: false,
+            strikethrough: false,
+            inlineCode: false,
+            linkUrl: '',
+            isListMarker: false
+          }],
+          plainText: rem,
+          block: null
         });
       }
       return out;
@@ -633,11 +838,12 @@ export struct RichMarkdownView {
       if (blk.kind === 'table') {
         out.push({
           key: `tbl_${idx}`,
-          isTable: true,
+          kind: 'table',
           tableHeaders: blk.headers ?? [],
           tableRows: blk.rows ?? [],
-          block: null,
-          plainFallback: ''
+          proseSpans: [],
+          plainText: '',
+          block: null
         });
         idx++;
         continue;
@@ -657,22 +863,36 @@ export struct RichMarkdownView {
         }
         out.push({
           key: `ptbl_${idx}_${run.length}`,
-          isTable: true,
+          kind: 'table',
           tableHeaders: parsedTable.headers,
           tableRows: parsedTable.rows,
-          block: null,
-          plainFallback: ''
+          proseSpans: [],
+          plainText: '',
+          block: null
         });
         idx = next;
         continue;
       }
+      if (isMergeableProseBlock(blk)) {
+        const proseRun: RichBlockDto[] = [blk];
+        let next = idx + 1;
+        while (next < this.blocks.length && isMergeableProseBlock(this.blocks[next])) {
+          proseRun.push(this.blocks[next]);
+          next++;
+        }
+        out.push(this.buildMergedProseEntry(proseRun, idx));
+        idx = next;
+        continue;
+      }
+
       out.push({
         key: `${blk.kind}_${idx}_${blk.raw_code?.length ?? blk.spans?.length ?? 0}`,
-        isTable: false,
+        kind: blk.kind === 'list_item' ? 'task_item' : blk.kind,
         tableHeaders: [],
         tableRows: [],
-        block: blk,
-        plainFallback: ''
+        proseSpans: [],
+        plainText: spansPlainText(blk.spans),
+        block: blk
       });
       idx++;
     }
@@ -682,18 +902,72 @@ export struct RichMarkdownView {
   build() {
     Column({ space: OrbitTokens.SPACE_MD }) {
       ForEach(
-        this.normalizedBlocks(),
-        (entry: NormalizedRenderBlock, bIdx: number) => {
-          if (entry.isTable) {
+        this.normalizedBlockList,
+        (entry: NormalizedRenderBlock) => {
+          if (entry.kind === 'table') {
             MarkdownTableBox({
               headers: entry.tableHeaders,
               rows: entry.tableRows
             })
-          } else if (entry.block === null && entry.plainFallback.length > 0) {
-            Text(entry.plainFallback)
-              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal))
-              .lineHeight(OrbitTokens.LH_BODY)
-              .width('100%')
+          } else if (entry.kind === 'prose_run') {
+            Text() {
+              ForEach(
+                entry.proseSpans,
+                (sp: FlattenedProseSpan) => {
+                  if (sp.inlineCode) {
+                    Span(sp.text)
+                      .font(orbitSpanMonoFont(FontWeight.Medium))
+                      .fontColor(this.store.palette.fgPrimary)
+                      .textBackgroundStyle({
+                        color: this.store.palette.subtleSurface,
+                        radius: OrbitTokens.SPACE_XS
+                      })
+                  } else if (sp.headingLevel > 0) {
+                    Span(sp.text)
+                      .font(orbitSpanHeadingFont(sp.headingLevel))
+                      .fontColor(this.store.palette.fgPrimary)
+                  } else if (sp.isListMarker) {
+                    Span(sp.text)
+                      .font(orbitSpanBodyFont(FontWeight.Medium))
+                      .fontColor(this.store.palette.fgSecondary)
+                  } else if (sp.linkUrl.length > 0) {
+                    Span(sp.text)
+                      .font(orbitSpanBodyFont(FontWeight.Medium, sp.italic))
+                      .fontColor(this.store.palette.accentPrimary)
+                      .decoration({
+                        type: TextDecorationType.Underline,
+                        color: this.store.palette.accentPrimary
+                      })
+                      .onClick(() => {
+                        if (!openExternalWebUrl(this.getUIContext().getHostContext(), sp.linkUrl)) {
+                          this.store.copyToClipboard(sp.linkUrl, 'Copied link');
+                        }
+                      })
+                  } else if (sp.strikethrough) {
+                    Span(sp.text)
+                      .font(orbitSpanBodyFont(FontWeight.Normal, sp.italic))
+                      .fontColor(this.store.palette.fgMuted)
+                      .decoration({
+                        type: TextDecorationType.LineThrough,
+                        color: this.store.palette.fgMuted
+                      })
+                  } else {
+                    Span(sp.text)
+                      .font(
+                        orbitSpanBodyFont(
+                          sp.bold ? FontWeight.Bold : FontWeight.Normal,
+                          sp.italic
+                        )
+                      )
+                      .fontColor(this.store.palette.fgPrimary)
+                  }
+                },
+                (sp: FlattenedProseSpan) => sp.key
+              )
+            }
+            .width('100%')
+            .copyOption(CopyOptions.LocalDevice)
+            .editMenuOptions(this.buildEditMenuOptions(entry.plainText))
           } else if (entry.block !== null) {
             if (entry.block.kind === 'code_block') {
               CodeHighlightBox({
@@ -701,38 +975,30 @@ export struct RichMarkdownView {
                 rawCode: entry.block.raw_code ?? '',
                 lines: entry.block.lines ?? []
               })
-            } else if (entry.block.kind === 'heading' && entry.block.spans !== undefined) {
-              Column() {
-                this.renderInlineSpans(
-                  entry.block.spans,
-                  (entry.block.level ?? 2) <= 2,
-                  this.store.palette.fgPrimary
-                )
-              }
-              .width('100%')
-              .padding({ top: bIdx > 0 ? OrbitTokens.SPACE_XS : 0 })
-            } else if (entry.block.kind === 'list_item' && entry.block.spans !== undefined) {
+            } else if (entry.kind === 'task_item' && entry.block.spans !== undefined) {
               Row({ space: OrbitTokens.SPACE_SM }) {
-                if (entry.block.checked !== undefined && entry.block.checked !== null) {
-                  Text(entry.block.checked ? '☑' : '☐')
-                    .attributeModifier(
-                      orbitTextSubhead(
-                        entry.block.checked
-                          ? this.store.palette.statusDirect
-                          : this.store.palette.fgMuted,
-                        FontWeight.Medium
-                      )
-                    )
-                    .margin({ top: 2 })
-                } else {
-                  Text(entry.block.ordered === true ? `${entry.block.index ?? 1}.` : '•')
-                    .attributeModifier(
-                      orbitTextSubhead(this.store.palette.fgSecondary, FontWeight.Medium)
-                    )
-                    .margin({ top: 2 })
+                Stack({ alignContent: Alignment.Center }) {
+                  if (entry.block.checked === true) {
+                    SymbolGlyph($r('sys.symbol.checkmark_square'))
+                      .fontSize(15)
+                      .fontColor([this.store.palette.statusDirect])
+                  } else {
+                    Row()
+                      .width(14)
+                      .height(14)
+                      .borderRadius(3)
+                      .border({ width: 1, color: this.store.palette.fgMuted })
+                  }
                 }
+                .margin({ top: 3 })
+
                 Column() {
-                  this.renderInlineSpans(entry.block.spans, false, this.store.palette.fgPrimary)
+                  this.renderInlineSpans(
+                    entry.block.spans,
+                    entry.block.checked === true
+                      ? this.store.palette.fgMuted
+                      : this.store.palette.fgPrimary
+                  )
                 }
                 .layoutWeight(1)
               }
@@ -741,13 +1007,13 @@ export struct RichMarkdownView {
             } else if (entry.block.kind === 'block_quote' && entry.block.spans !== undefined) {
               Row() {
                 Column() {
-                  this.renderInlineSpans(entry.block.spans, false, this.store.palette.fgSecondary)
+                  this.renderInlineSpans(entry.block.spans, this.store.palette.fgSecondary)
                 }
                 .layoutWeight(1)
                 .padding({ left: OrbitTokens.SPACE_MD, top: 2, bottom: 2 })
                 .border({
                   width: { left: 2 },
-                  color: this.store.palette.accentPrimary
+                  color: this.store.palette.hairline
                 })
               }
               .width('100%')
@@ -757,7 +1023,7 @@ export struct RichMarkdownView {
                 .color(this.store.palette.hairline)
                 .margin({ top: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_XS })
             } else if (entry.block.spans !== undefined) {
-              this.renderInlineSpans(entry.block.spans, false, this.store.palette.fgPrimary)
+              this.renderInlineSpans(entry.block.spans, this.store.palette.fgPrimary)
             }
           }
         },

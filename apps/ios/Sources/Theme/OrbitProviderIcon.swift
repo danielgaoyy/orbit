@@ -1,14 +1,139 @@
 import CoreGraphics
 import SwiftUI
+import UIKit
 
 /// Native vector Agent/Provider icons aligned 1:1 with Orbit Desktop (`provider-icons.tsx`).
 public struct OrbitProviderIcon: View {
     public let provider: FfiProviderKind
     public var size: CGFloat
 
+    @MainActor
+    private static var imageCache: [String: UIImage] = [:]
+
     public init(provider: FfiProviderKind, size: CGFloat = 16) {
         self.provider = provider
         self.size = size
+    }
+
+    /// Cached high-DPI original `UIImage` for native UIKit-backed SwiftUI controls (`Picker`, `Menu`, etc.).
+    @MainActor
+    public static func uiImage(for provider: FfiProviderKind, size: CGFloat = 18) -> UIImage {
+        let key = "\(provider)_\(Int((size * 10).rounded()))"
+        if let cached = imageCache[key] {
+            return cached
+        }
+
+        let format = UIGraphicsImageRendererFormat.preferred()
+        format.opaque = false
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: format)
+        let image = renderer.image { rendererCtx in
+            let cg = rendererCtx.cgContext
+            let scale = size / 24.0
+            cg.scaleBy(x: scale, y: scale)
+
+            switch provider {
+            case .codex:
+                cg.saveGState()
+                cg.addPath(codexCGPath)
+                cg.clip(using: .evenOdd)
+                let colors = [
+                    UIColor(Color(hex: "#9E94FF")).cgColor,
+                    UIColor(Color(hex: "#6B8CFF")).cgColor,
+                    UIColor(Color(hex: "#3B43FF")).cgColor
+                ] as CFArray
+                let locations: [CGFloat] = [0.0, 0.5, 1.0]
+                if let gradient = CGGradient(
+                    colorsSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                    colors: colors,
+                    locations: locations
+                ) {
+                    cg.drawLinearGradient(
+                        gradient,
+                        start: CGPoint(x: 12, y: 0),
+                        end: CGPoint(x: 12, y: 24),
+                        options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+                    )
+                }
+                cg.restoreGState()
+
+            case .claudeCode:
+                cg.saveGState()
+                cg.setFillColor(UIColor(Color(hex: "#D97757")).cgColor)
+                cg.addPath(claudeCGPath)
+                cg.fillPath(using: .winding)
+                cg.restoreGState()
+
+            case .antigravity:
+                cg.saveGState()
+                cg.addPath(antigravityCGPath)
+                cg.clip(using: .winding)
+
+                cg.setFillColor(UIColor(Color(hex: "#3186FF")).cgColor)
+                cg.fill(CGRect(x: 0, y: 0, width: 24, height: 24))
+
+                let space = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+                drawRadialOverlay(
+                    in: cg,
+                    space: space,
+                    center: CGPoint(x: 2, y: 11),
+                    radius: 14,
+                    stops: [
+                        (UIColor(Color(hex: "#00B95C")), 0.0),
+                        (UIColor(Color(hex: "#00B95C")).withAlphaComponent(0.82), 0.58),
+                        (UIColor(Color(hex: "#00B95C")).withAlphaComponent(0.0), 1.0)
+                    ]
+                )
+                drawRadialOverlay(
+                    in: cg,
+                    space: space,
+                    center: CGPoint(x: 20, y: 6),
+                    radius: 13,
+                    stops: [
+                        (UIColor(Color(hex: "#FC413D")), 0.0),
+                        (UIColor(Color(hex: "#FC413D")).withAlphaComponent(0.78), 0.55),
+                        (UIColor(Color(hex: "#FC413D")).withAlphaComponent(0.0), 1.0)
+                    ]
+                )
+                drawRadialOverlay(
+                    in: cg,
+                    space: space,
+                    center: CGPoint(x: 10.5, y: 2),
+                    radius: 10.5,
+                    stops: [
+                        (UIColor(Color(hex: "#FFE432")), 0.0),
+                        (UIColor(Color(hex: "#FBBC04")).withAlphaComponent(0.90), 0.55),
+                        (UIColor(Color(hex: "#FBBC04")).withAlphaComponent(0.0), 1.0)
+                    ]
+                )
+                cg.restoreGState()
+            }
+        }
+        .withRenderingMode(.alwaysOriginal)
+
+        imageCache[key] = image
+        return image
+    }
+
+    private static func drawRadialOverlay(
+        in cg: CGContext,
+        space: CGColorSpace,
+        center: CGPoint,
+        radius: CGFloat,
+        stops: [(UIColor, CGFloat)]
+    ) {
+        let cgColors = stops.map { $0.0.cgColor } as CFArray
+        let locations = stops.map(\.1)
+        guard let gradient = CGGradient(colorsSpace: space, colors: cgColors, locations: locations) else {
+            return
+        }
+        cg.drawRadialGradient(
+            gradient,
+            startCenter: center,
+            startRadius: 0,
+            endCenter: center,
+            endRadius: radius,
+            options: []
+        )
     }
 
     public var body: some View {

@@ -484,6 +484,19 @@ pub enum WireMessage {
         cwd: String,
         files: Vec<String>,
     },
+    StageAttachment {
+        request_id: Uuid,
+        filename: String,
+        #[serde(default)]
+        mime_type: Option<String>,
+        data_b64: String,
+    },
+    AttachmentStaged {
+        request_id: Uuid,
+        path: String,
+        filename: String,
+        size_bytes: u64,
+    },
 
     // Agents & Interactive Orchestration
     ListAgents {
@@ -797,5 +810,53 @@ mod tests {
         let encoded = frame.encode();
         let decoded = TerminalBinaryFrame::decode(&encoded).expect("decode");
         assert_eq!(frame, decoded);
+    }
+
+    #[test]
+    fn stage_attachment_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let req = WireMessage::StageAttachment {
+            request_id: req_id,
+            filename: "screenshot.jpg".into(),
+            mime_type: Some("image/jpeg".into()),
+            data_b64: "SGVsbG8=".into(),
+        };
+        let encoded = req.encode_zstd(3).expect("compress req");
+        match WireMessage::decode_zstd(&encoded).expect("decompress req") {
+            WireMessage::StageAttachment {
+                request_id,
+                filename,
+                mime_type,
+                data_b64,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(filename, "screenshot.jpg");
+                assert_eq!(mime_type.as_deref(), Some("image/jpeg"));
+                assert_eq!(data_b64, "SGVsbG8=");
+            }
+            _ => panic!("unexpected variant"),
+        }
+
+        let resp = WireMessage::AttachmentStaged {
+            request_id: req_id,
+            path: "/home/user/.orbit/attachments/1_screenshot.jpg".into(),
+            filename: "screenshot.jpg".into(),
+            size_bytes: 5,
+        };
+        let encoded_resp = resp.encode_zstd(3).expect("compress resp");
+        match WireMessage::decode_zstd(&encoded_resp).expect("decompress resp") {
+            WireMessage::AttachmentStaged {
+                request_id,
+                path,
+                filename,
+                size_bytes,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(path, "/home/user/.orbit/attachments/1_screenshot.jpg");
+                assert_eq!(filename, "screenshot.jpg");
+                assert_eq!(size_bytes, 5);
+            }
+            _ => panic!("unexpected variant"),
+        }
     }
 }

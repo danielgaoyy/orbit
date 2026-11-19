@@ -1,13 +1,15 @@
 package dev.orbit.android.ui.sheets
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -24,13 +26,24 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.Contrast
+import androidx.compose.material.icons.outlined.DarkMode
+import androidx.compose.material.icons.outlined.LightMode
+import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -44,11 +57,15 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.orbit.android.BuildConfig
 import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.ui.theme.OrbitAppearanceMode
+import dev.orbit.android.ui.theme.OrbitCopyIcon
+import dev.orbit.android.ui.theme.OrbitProviderIcon
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 import java.time.Duration
@@ -60,14 +77,17 @@ import uniffi.orbit_ffi_uniffi.FfiHostRouteMode
 import uniffi.orbit_ffi_uniffi.FfiProviderQuota
 import kotlin.math.roundToInt
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsSheet(
     appearanceMode: OrbitAppearanceMode,
-    selectedHost: FfiHostCard?,
+    hosts: List<FfiHostCard>,
+    selectedHostId: String?,
     quotas: List<FfiProviderQuota>,
     onSelectAppearance: (OrbitAppearanceMode) -> Unit,
-    onReconnectHost: () -> Unit,
+    onSelectHost: (String) -> Unit,
+    onOpenPairHost: () -> Unit,
+    onReconnectHost: (String) -> Unit,
     onSaveHostConfig: (
         hostId: String,
         customName: String?,
@@ -77,6 +97,7 @@ fun SettingsSheet(
     ) -> Unit,
     onRemoveHost: (String) -> Unit,
     onRefreshQuotas: () -> Unit,
+    onShowToast: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val colors = OrbitTheme.colors
@@ -84,16 +105,26 @@ fun SettingsSheet(
     val haptics = LocalHapticFeedback.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-    LaunchedEffect(selectedHost?.hostId) {
-        if (selectedHost != null) {
+    val groupedBg = if (colors.isDark) colors.canvas else colors.drawer
+    var inspectedHostId by remember { mutableStateOf<String?>(null) }
+    val inspectedHost = remember(hosts, inspectedHostId) {
+        inspectedHostId?.let { id -> hosts.firstOrNull { it.hostId == id } }
+    }
+
+    LaunchedEffect(selectedHostId) {
+        if (selectedHostId != null) {
             onRefreshQuotas()
         }
+    }
+
+    BackHandler(enabled = inspectedHost != null) {
+        inspectedHostId = null
     }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
-        containerColor = colors.elevated,
+        containerColor = groupedBg,
         contentColor = colors.fgPrimary,
     ) {
         Column(
@@ -101,78 +132,758 @@ fun SettingsSheet(
                 .fillMaxWidth()
                 .fillMaxHeight(0.86f)
                 .imePadding()
-                .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.sm),
-            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.lg),
+                .navigationBarsPadding(),
         ) {
+            // Sheet Top Navigation Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = OrbitSpacing.lg)
+                    .padding(bottom = OrbitSpacing.sm),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+            ) {
+                if (inspectedHost != null) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                inspectedHostId = null
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = "Back to Settings",
+                            tint = colors.fgPrimary,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
+                }
+
+                Text(
+                    text = inspectedHost?.displayName ?: "Settings",
+                    style = typography.title,
+                    color = colors.fgPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .clickable { onDismiss() },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Close,
+                        contentDescription = "Close",
+                        tint = colors.fgSecondary,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
+            }
+
+            HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+
+            if (inspectedHost != null) {
+                HostDetailSettingsPane(
+                    host = inspectedHost,
+                    isActiveHost = inspectedHost.hostId == selectedHostId,
+                    onReconnect = { onReconnectHost(inspectedHost.hostId) },
+                    onSwitchHost = {
+                        onSelectHost(inspectedHost.hostId)
+                        inspectedHostId = null
+                    },
+                    onSave = { customName, routeMode, endpoint, relay ->
+                        onSaveHostConfig(inspectedHost.hostId, customName, routeMode, endpoint, relay)
+                    },
+                    onRemove = {
+                        val removingLast = hosts.size <= 1
+                        onRemoveHost(inspectedHost.hostId)
+                        inspectedHostId = null
+                        if (removingLast) {
+                            onDismiss()
+                        }
+                    },
+                    onShowToast = onShowToast,
+                    modifier = Modifier.weight(1f),
+                )
+            } else {
+                SettingsRootPane(
+                    appearanceMode = appearanceMode,
+                    hosts = hosts,
+                    selectedHostId = selectedHostId,
+                    quotas = quotas,
+                    onSelectAppearance = onSelectAppearance,
+                    onInspectHost = { inspectedHostId = it },
+                    onOpenPairHost = {
+                        onDismiss()
+                        onOpenPairHost()
+                    },
+                    onRefreshQuotas = onRefreshQuotas,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsRootPane(
+    appearanceMode: OrbitAppearanceMode,
+    hosts: List<FfiHostCard>,
+    selectedHostId: String?,
+    quotas: List<FfiProviderQuota>,
+    onSelectAppearance: (OrbitAppearanceMode) -> Unit,
+    onInspectHost: (String) -> Unit,
+    onOpenPairHost: () -> Unit,
+    onRefreshQuotas: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val haptics = LocalHapticFeedback.current
+    val cardShape = RoundedCornerShape(14.dp)
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.lg),
+        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
+    ) {
+        // 1. Appearance (Strictly System / Light / Dark — M3 SingleChoiceSegmentedButtonRow)
+        Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs + 2.dp)) {
             Text(
-                text = "Settings & Quotas",
-                style = typography.title,
-                color = colors.fgPrimary,
+                text = "Appearance",
+                style = typography.metaMedium,
+                color = colors.fgMuted,
+                modifier = Modifier.padding(horizontal = OrbitSpacing.xs),
             )
 
-            // 1. Quiet Precision 4-Mode Appearance Selector (2x2 Grid, Zero Truncation)
-            Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm)) {
-                Text(
-                    text = "Appearance",
-                    style = typography.subheadSemiBold,
-                    color = colors.fgSecondary,
-                )
-                val rows = remember { OrbitAppearanceMode.entries.chunked(2) }
-                rows.forEach { rowModes ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+            SingleChoiceSegmentedButtonRow(
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                OrbitAppearanceMode.entries.forEachIndexed { index, mode ->
+                    val selected = appearanceMode == mode
+                    val modeIcon = when (mode) {
+                        OrbitAppearanceMode.SYSTEM -> Icons.Outlined.Contrast
+                        OrbitAppearanceMode.LIGHT -> Icons.Outlined.LightMode
+                        OrbitAppearanceMode.DARK -> Icons.Outlined.DarkMode
+                    }
+                    SegmentedButton(
+                        selected = selected,
+                        onClick = {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSelectAppearance(mode)
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(
+                            index = index,
+                            count = OrbitAppearanceMode.entries.size,
+                        ),
+                        colors = SegmentedButtonDefaults.colors(
+                            activeContainerColor = colors.elevated,
+                            activeContentColor = colors.fgPrimary,
+                            inactiveContainerColor = if (colors.isDark) colors.drawer else colors.subtleFill,
+                            inactiveContentColor = colors.fgSecondary,
+                            activeBorderColor = colors.hairline,
+                            inactiveBorderColor = colors.hairline,
+                        ),
+                        icon = {},
                     ) {
-                        rowModes.forEach { mode ->
-                            val active = appearanceMode == mode
-                            val cardShape = RoundedCornerShape(OrbitSpacing.md)
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = modeIcon,
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                            )
+                            Text(
+                                text = mode.label,
+                                style = if (selected) typography.subheadSemiBold else typography.subheadMedium,
+                                maxLines = 1,
+                                softWrap = false,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Hosts Fleet (Grouped List with Drill-Down)
+        Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs + 2.dp)) {
+            Text(
+                text = "Hosts",
+                style = typography.metaMedium,
+                color = colors.fgMuted,
+                modifier = Modifier.padding(horizontal = OrbitSpacing.xs),
+            )
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(colors.elevated, cardShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, cardShape),
+            ) {
+                if (hosts.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .padding(horizontal = OrbitSpacing.md),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        Text(
+                            text = "No hosts paired yet",
+                            style = typography.subhead,
+                            color = colors.fgMuted,
+                        )
+                    }
+                    HorizontalDivider(
+                        thickness = OrbitSpacing.hairline,
+                        color = colors.hairline,
+                        modifier = Modifier.padding(start = OrbitSpacing.md),
+                    )
+                } else {
+                    hosts.forEach { host ->
+                        val isActive = host.hostId == selectedHostId
+                        val statusColor = hostConnectionDotColor(host.connectionState, colors)
+                        val detailLine = buildString {
+                            append(OrbitFormatters.topBarConnectionLabel(host.connectionState, host.viaSshTunnel))
+                            host.lastPingMs?.let { append(" · ${it}ms") }
+                            host.daemonVersion?.takeIf { it.isNotBlank() }?.let { raw ->
+                                append(" · ")
+                                append(if (raw.startsWith("v")) raw else "v$raw")
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 54.dp)
+                                .clickable {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onInspectHost(host.hostId)
+                                }
+                                .padding(horizontal = OrbitSpacing.md, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier.size(20.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(statusColor),
+                                )
+                            }
+
                             Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .heightIn(min = OrbitSpacing.touchTarget)
-                                    .clip(cardShape)
-                                    .background(
-                                        if (active) colors.subtleFill else colors.code,
-                                        cardShape
-                                    )
-                                    .border(
-                                        if (active) 1.dp else OrbitSpacing.hairline,
-                                        if (active) colors.primary else colors.hairline,
-                                        cardShape
-                                    )
-                                    .clickable {
-                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onSelectAppearance(mode)
-                                    }
-                                    .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
-                                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs / 2),
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
                             ) {
                                 Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 ) {
                                     Text(
-                                        text = mode.label,
-                                        style = typography.subheadSemiBold,
-                                        color = if (active) colors.primary else colors.fgPrimary,
+                                        text = host.displayName,
+                                        style = typography.subheadMedium,
+                                        color = colors.fgPrimary,
                                         maxLines = 1,
-                                        softWrap = false,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false),
                                     )
-                                    if (active) {
+                                    if (isActive && hosts.size > 1) {
                                         Box(
                                             modifier = Modifier
-                                                .size(6.dp)
-                                                .background(colors.primary, CircleShape)
-                                        )
+                                                .background(colors.subtleFill, CircleShape)
+                                                .padding(horizontal = 6.dp, vertical = 1.dp),
+                                        ) {
+                                            Text(
+                                                text = "Active",
+                                                style = typography.meta,
+                                                color = colors.fgSecondary,
+                                            )
+                                        }
                                     }
                                 }
                                 Text(
-                                    text = mode.subtitle,
+                                    text = detailLine,
                                     style = typography.meta,
-                                    color = colors.fgSecondary,
+                                    color = colors.fgMuted,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+                                contentDescription = null,
+                                tint = colors.fgMuted,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+
+                        HorizontalDivider(
+                            thickness = OrbitSpacing.hairline,
+                            color = colors.hairline,
+                            modifier = Modifier.padding(start = 42.dp),
+                        )
+                    }
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = OrbitSpacing.touchTarget)
+                        .clickable {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onOpenPairHost()
+                        }
+                        .padding(horizontal = OrbitSpacing.md, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Box(
+                        modifier = Modifier.size(20.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.QrCodeScanner,
+                            contentDescription = null,
+                            tint = colors.primary,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                    Text(
+                        text = "Pair New Host",
+                        style = typography.subheadMedium,
+                        color = colors.primary,
+                    )
+                }
+            }
+        }
+
+        // 3. Usage & Quotas (shown when connected to a host)
+        if (selectedHostId != null) {
+            Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs + 2.dp)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = OrbitSpacing.xs),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "Usage & Quotas",
+                        style = typography.metaMedium,
+                        color = colors.fgMuted,
+                    )
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onRefreshQuotas()
+                            }
+                            .padding(horizontal = 6.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Refresh,
+                            contentDescription = "Refresh quotas",
+                            tint = colors.fgSecondary,
+                            modifier = Modifier.size(13.dp),
+                        )
+                        Text(
+                            text = "Refresh",
+                            style = typography.metaMedium,
+                            color = colors.fgSecondary,
+                        )
+                    }
+                }
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(cardShape)
+                        .background(colors.elevated, cardShape)
+                        .border(OrbitSpacing.hairline, colors.hairline, cardShape),
+                ) {
+                    if (quotas.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .padding(horizontal = OrbitSpacing.md),
+                            contentAlignment = Alignment.CenterStart,
+                        ) {
+                            Text(
+                                text = "No active rate-limit windows reported yet.",
+                                style = typography.subhead,
+                                color = colors.fgMuted,
+                            )
+                        }
+                    } else {
+                        quotas.forEachIndexed { idx, quota ->
+                            ProviderQuotaBlock(quota = quota)
+                            if (idx < quotas.lastIndex) {
+                                HorizontalDivider(
+                                    thickness = OrbitSpacing.hairline,
+                                    color = colors.hairline,
+                                    modifier = Modifier.padding(start = OrbitSpacing.md),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. About
+        Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs + 2.dp)) {
+            Text(
+                text = "About",
+                style = typography.metaMedium,
+                color = colors.fgMuted,
+                modifier = Modifier.padding(horizontal = OrbitSpacing.xs),
+            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(colors.elevated, cardShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, cardShape),
+            ) {
+                SettingsKeyValueRow(
+                    label = "Version",
+                    value = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                )
+                HorizontalDivider(
+                    thickness = OrbitSpacing.hairline,
+                    color = colors.hairline,
+                    modifier = Modifier.padding(start = OrbitSpacing.md),
+                )
+                SettingsKeyValueRow(
+                    label = "Encryption",
+                    value = "Noise NK · E2EE",
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(OrbitSpacing.md))
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HostDetailSettingsPane(
+    host: FfiHostCard,
+    isActiveHost: Boolean,
+    onReconnect: () -> Unit,
+    onSwitchHost: () -> Unit,
+    onSave: (
+        customName: String?,
+        routeMode: FfiHostRouteMode,
+        customDirectEndpoint: String?,
+        relayUrl: String?,
+    ) -> Unit,
+    onRemove: () -> Unit,
+    onShowToast: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val haptics = LocalHapticFeedback.current
+    val context = LocalContext.current
+    val cardShape = RoundedCornerShape(14.dp)
+
+    val selectableRouteModes = remember {
+        listOf(FfiHostRouteMode.AUTO, FfiHostRouteMode.DIRECT_ONLY, FfiHostRouteMode.RELAY_ONLY)
+    }
+
+    var customName by remember(host.hostId) { mutableStateOf(host.customName.orEmpty()) }
+    var routeMode by remember(host.hostId) {
+        mutableStateOf(if (host.routeMode == FfiHostRouteMode.SSH_TUNNEL) FfiHostRouteMode.AUTO else host.routeMode)
+    }
+    var directEndpoint by remember(host.hostId) { mutableStateOf(host.customDirectEndpoint.orEmpty()) }
+    var relayUrl by remember(host.hostId) { mutableStateOf(host.relayUrl.orEmpty()) }
+    var showRemoveConfirm by remember { mutableStateOf(false) }
+
+    val statusColor = hostConnectionDotColor(host.connectionState, colors)
+    val statusText = OrbitFormatters.connectionLabel(host.connectionState, host.viaSshTunnel)
+    val pingText = host.lastPingMs?.let { "$it ms" } ?: "—"
+    val daemonSummary = remember(host.daemonVersion, host.osArch) {
+        listOfNotNull(
+            host.daemonVersion?.takeIf { it.isNotBlank() }?.let { if (it.startsWith("v")) it else "v$it" },
+            host.osArch?.takeIf { it.isNotBlank() },
+        ).joinToString(" · ").ifEmpty { "—" }
+    }
+
+    if (showRemoveConfirm) {
+        AlertDialog(
+            onDismissRequest = { showRemoveConfirm = false },
+            containerColor = colors.elevated,
+            titleContentColor = colors.fgPrimary,
+            textContentColor = colors.fgSecondary,
+            title = { Text("Remove ${host.displayName}?", style = typography.title) },
+            text = {
+                Text(
+                    text = "Running remote agent sessions on this host will not be terminated.",
+                    style = typography.subhead,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showRemoveConfirm = false
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onRemove()
+                    },
+                ) {
+                    Text("Remove", color = colors.dangerRemoved, style = typography.subheadSemiBold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRemoveConfirm = false }) {
+                    Text("Cancel", color = colors.fgSecondary, style = typography.subheadMedium)
+                }
+            },
+        )
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.lg),
+        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xl),
+    ) {
+        // 1. Diagnostics Card
+        Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs + 2.dp)) {
+            Text(
+                text = "Diagnostics",
+                style = typography.metaMedium,
+                color = colors.fgMuted,
+                modifier = Modifier.padding(horizontal = OrbitSpacing.xs),
+            )
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(colors.elevated, cardShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, cardShape),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = OrbitSpacing.touchTarget)
+                        .padding(horizontal = OrbitSpacing.md),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .clip(CircleShape)
+                            .background(statusColor),
+                    )
+                    Text(
+                        text = statusText,
+                        style = typography.subheadMedium,
+                        color = colors.fgPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Row(
+                        modifier = Modifier
+                            .height(30.dp)
+                            .clip(CircleShape)
+                            .background(colors.subtleFill, CircleShape)
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onReconnect()
+                            }
+                            .padding(horizontal = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Refresh,
+                            contentDescription = "Reconnect",
+                            tint = colors.primary,
+                            modifier = Modifier.size(13.dp),
+                        )
+                        Text(
+                            text = "Reconnect",
+                            style = typography.metaSemiBold,
+                            color = colors.primary,
+                        )
+                    }
+                }
+
+                HorizontalDivider(
+                    thickness = OrbitSpacing.hairline,
+                    color = colors.hairline,
+                    modifier = Modifier.padding(start = OrbitSpacing.md),
+                )
+                SettingsKeyValueRow(label = "Latency", value = pingText)
+
+                HorizontalDivider(
+                    thickness = OrbitSpacing.hairline,
+                    color = colors.hairline,
+                    modifier = Modifier.padding(start = OrbitSpacing.md),
+                )
+                SettingsKeyValueRow(label = "Daemon", value = daemonSummary)
+
+                HorizontalDivider(
+                    thickness = OrbitSpacing.hairline,
+                    color = colors.hairline,
+                    modifier = Modifier.padding(start = OrbitSpacing.md),
+                )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = OrbitSpacing.touchTarget)
+                        .clickable {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("daemon_pubkey", host.daemonPubkeyB64))
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onShowToast("Copied public key")
+                        }
+                        .padding(horizontal = OrbitSpacing.md),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                ) {
+                    Text(
+                        text = "Public Key",
+                        style = typography.subhead,
+                        color = colors.fgPrimary,
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    Text(
+                        text = "${host.daemonPubkeyB64.take(16)}…",
+                        style = typography.code,
+                        color = colors.fgMuted,
+                        maxLines = 1,
+                    )
+                    Icon(
+                        imageVector = OrbitCopyIcon,
+                        contentDescription = "Copy public key",
+                        tint = colors.fgMuted,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+
+                host.lastError?.takeIf { it.isNotBlank() }?.let { err ->
+                    HorizontalDivider(
+                        thickness = OrbitSpacing.hairline,
+                        color = colors.hairline,
+                        modifier = Modifier.padding(start = OrbitSpacing.md),
+                    )
+                    Text(
+                        text = err,
+                        style = typography.code,
+                        color = colors.dangerRemoved,
+                        modifier = Modifier.padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+                    )
+                }
+
+                if (!isActiveHost) {
+                    HorizontalDivider(
+                        thickness = OrbitSpacing.hairline,
+                        color = colors.hairline,
+                        modifier = Modifier.padding(start = OrbitSpacing.md),
+                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = OrbitSpacing.touchTarget)
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                onSwitchHost()
+                            }
+                            .padding(horizontal = OrbitSpacing.md),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        Text(
+                            text = "Switch to This Host",
+                            style = typography.subheadMedium,
+                            color = colors.primary,
+                        )
+                    }
+                }
+            }
+        }
+
+        // 2. Connection Card
+        Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm)) {
+            Text(
+                text = "Connection",
+                style = typography.metaMedium,
+                color = colors.fgMuted,
+                modifier = Modifier.padding(horizontal = OrbitSpacing.xs),
+            )
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(cardShape)
+                    .background(colors.elevated, cardShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, cardShape),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.md),
+                    verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs + 2.dp),
+                ) {
+                    Text(
+                        text = "Route Mode",
+                        style = typography.metaMedium,
+                        color = colors.fgSecondary,
+                    )
+                    SingleChoiceSegmentedButtonRow(
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        selectableRouteModes.forEachIndexed { idx, mode ->
+                            val selected = routeMode == mode
+                            SegmentedButton(
+                                selected = selected,
+                                onClick = {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    routeMode = mode
+                                },
+                                shape = SegmentedButtonDefaults.itemShape(
+                                    index = idx,
+                                    count = selectableRouteModes.size,
+                                ),
+                                colors = SegmentedButtonDefaults.colors(
+                                    activeContainerColor = colors.subtleFill,
+                                    activeContentColor = colors.fgPrimary,
+                                    inactiveContainerColor = Color.Transparent,
+                                    inactiveContentColor = colors.fgSecondary,
+                                    activeBorderColor = colors.hairline,
+                                    inactiveBorderColor = colors.hairline,
+                                ),
+                                icon = {},
+                            ) {
+                                Text(
+                                    text = OrbitFormatters.routeModeLabel(mode),
+                                    style = if (selected) typography.metaSemiBold else typography.metaMedium,
                                     maxLines = 1,
                                     softWrap = false,
                                 )
@@ -180,258 +891,185 @@ fun SettingsSheet(
                         }
                     }
                 }
-            }
 
-            // 2. Active Host Diagnostics & Provider Quotas Section
-            if (selectedHost != null) {
-                HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
-
-                ActiveHostDiagnosticsCard(
-                    host = selectedHost,
-                    onReconnect = onReconnectHost,
+                HorizontalDivider(
+                    thickness = OrbitSpacing.hairline,
+                    color = colors.hairline,
+                    modifier = Modifier.padding(start = OrbitSpacing.md),
+                )
+                GroupedTextFieldRow(
+                    label = "Display Name",
+                    placeholder = host.hostname,
+                    value = customName,
+                    isMono = false,
+                    onValueChange = { customName = it },
                 )
 
-                HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+                HorizontalDivider(
+                    thickness = OrbitSpacing.hairline,
+                    color = colors.hairline,
+                    modifier = Modifier.padding(start = OrbitSpacing.md),
+                )
+                GroupedTextFieldRow(
+                    label = "Direct Endpoint",
+                    placeholder = host.directEndpoints.firstOrNull() ?: "ws://192.168.1.x:6868",
+                    value = directEndpoint,
+                    isMono = true,
+                    onValueChange = { directEndpoint = it },
+                )
 
-                Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "Provider Quotas (${selectedHost.displayName})",
-                            style = typography.subheadSemiBold,
-                            color = colors.fgSecondary,
-                        )
-                        Box(
-                            modifier = Modifier
-                                .size(44.dp)
-                                .clip(RoundedCornerShape(OrbitSpacing.sm))
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onRefreshQuotas()
-                                },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Refresh,
-                                contentDescription = "Refresh quotas",
-                                tint = colors.fgSecondary,
-                                modifier = Modifier.size(OrbitSpacing.iconSm),
-                            )
-                        }
-                    }
-
-                    if (quotas.isEmpty()) {
-                        Text(
-                            text = "No active rate-limit windows reported by installed providers.",
-                            style = typography.meta,
-                            color = colors.fgMuted,
-                        )
-                    } else {
-                        quotas.forEach { q ->
-                            ProviderQuotaCard(quota = q)
-                        }
-                    }
-                }
-
-                HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
-
-                // 3. Host Route Mode & E2EE Relay Config
-                HostRouteEditorSection(
-                    host = selectedHost,
-                    onSave = { customName, routeMode, endpoint, relay ->
-                        onSaveHostConfig(selectedHost.hostId, customName, routeMode, endpoint, relay)
-                    },
-                    onRemove = {
-                        onRemoveHost(selectedHost.hostId)
-                        onDismiss()
-                    },
+                HorizontalDivider(
+                    thickness = OrbitSpacing.hairline,
+                    color = colors.hairline,
+                    modifier = Modifier.padding(start = OrbitSpacing.md),
+                )
+                GroupedTextFieldRow(
+                    label = "Relay URL",
+                    placeholder = "wss://relay.orbit.dev",
+                    value = relayUrl,
+                    isMono = true,
+                    onValueChange = { relayUrl = it },
                 )
             }
 
-            Spacer(modifier = Modifier.height(OrbitSpacing.md))
+            val saveShape = RoundedCornerShape(12.dp)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(OrbitSpacing.touchTarget)
+                    .clip(saveShape)
+                    .background(colors.primary, saveShape)
+                    .clickable {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onSave(
+                            customName.trim().ifBlank { null },
+                            routeMode,
+                            directEndpoint.trim().ifBlank { null },
+                            relayUrl.trim().ifBlank { null },
+                        )
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "Save & Reconnect",
+                    style = typography.subheadSemiBold,
+                    color = colors.onPrimary,
+                )
+            }
         }
-    }
-}
 
-@Composable
-private fun ActiveHostDiagnosticsCard(
-    host: FfiHostCard,
-    onReconnect: () -> Unit,
-) {
-    val colors = OrbitTheme.colors
-    val typography = OrbitTheme.typography
-    val haptics = LocalHapticFeedback.current
-    val cardShape = RoundedCornerShape(OrbitSpacing.md)
-
-    val statusColor = when (host.connectionState) {
-        FfiConnectionState.ONLINE_DIRECT -> colors.directAdded
-        FfiConnectionState.ONLINE_RELAY -> colors.relay
-        FfiConnectionState.CONNECTING_DIRECT, FfiConnectionState.CONNECTING_RELAY -> colors.warning
-        FfiConnectionState.DISCONNECTED -> colors.dangerRemoved
-    }
-    val statusText = OrbitFormatters.connectionLabel(host.connectionState, host.viaSshTunnel)
-    val pingText = host.lastPingMs?.let { "${it} ms" } ?: "—"
-    val versionText = host.daemonVersion?.takeIf { it.isNotBlank() }?.let { raw ->
-        if (raw.startsWith("v")) raw else "v$raw"
-    } ?: "—"
-    val archText = host.osArch?.takeIf { it.isNotBlank() } ?: "remote"
-
-    Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm)) {
-        Text(
-            text = "Host Diagnostics",
-            style = typography.subheadSemiBold,
-            color = colors.fgSecondary,
-        )
-
-        Column(
+        // 3. Danger Zone
+        Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(colors.code, cardShape)
+                .height(OrbitSpacing.touchTarget)
+                .clip(cardShape)
+                .background(colors.elevated, cardShape)
                 .border(OrbitSpacing.hairline, colors.hairline, cardShape)
-                .padding(OrbitSpacing.md),
-            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                .clickable {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    showRemoveConfirm = true
+                },
+            contentAlignment = Alignment.Center,
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(6.dp)
-                            .background(statusColor, CircleShape)
-                    )
-                    Text(
-                        text = host.displayName,
-                        style = typography.bodySemiBold,
-                        color = colors.fgPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-
-                val btnShape = RoundedCornerShape(OrbitSpacing.sm)
-                Row(
-                    modifier = Modifier
-                        .heightIn(min = 36.dp)
-                        .clip(btnShape)
-                        .background(colors.subtleFill, btnShape)
-                        .border(OrbitSpacing.hairline, colors.primary.copy(alpha = 0.6f), btnShape)
-                        .clickable {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onReconnect()
-                        }
-                        .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.xs),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Refresh,
-                        contentDescription = "Reconnect host",
-                        tint = colors.primary,
-                        modifier = Modifier.size(OrbitSpacing.iconSm),
-                    )
-                    Text(
-                        text = "Reconnect",
-                        style = typography.subheadSemiBold,
-                        color = colors.primary,
-                        maxLines = 1,
-                        softWrap = false,
-                    )
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
-            ) {
-                DiagnosticMetricColumn(
-                    label = "State",
-                    value = statusText,
-                    valueColor = statusColor,
-                    modifier = Modifier.weight(1f),
-                )
-                DiagnosticMetricColumn(
-                    label = "Latency",
-                    value = pingText,
-                    valueColor = colors.fgPrimary,
-                    modifier = Modifier.weight(1f),
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
-            ) {
-                DiagnosticMetricColumn(
-                    label = "Daemon",
-                    value = versionText,
-                    valueColor = colors.fgPrimary,
-                    modifier = Modifier.weight(1f),
-                )
-                DiagnosticMetricColumn(
-                    label = "Platform",
-                    value = archText,
-                    valueColor = colors.fgPrimary,
-                    modifier = Modifier.weight(1f),
-                )
-            }
-
-            host.lastError?.takeIf { it.isNotBlank() }?.let { err ->
-                val errShape = RoundedCornerShape(OrbitSpacing.sm)
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(colors.diffRemovedBg, errShape)
-                        .border(OrbitSpacing.hairline, colors.dangerRemoved.copy(alpha = 0.45f), errShape)
-                        .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                ) {
-                    Text(
-                        text = err,
-                        style = typography.code,
-                        color = colors.dangerRemoved,
-                    )
-                }
-            }
+            Text(
+                text = "Remove Host",
+                style = typography.subheadMedium,
+                color = colors.dangerRemoved,
+            )
         }
+
+        Spacer(modifier = Modifier.height(OrbitSpacing.md))
     }
 }
 
+private fun hostConnectionDotColor(
+    state: FfiConnectionState,
+    colors: dev.orbit.android.ui.theme.OrbitColors,
+): Color = when (state) {
+    FfiConnectionState.ONLINE_DIRECT -> colors.directAdded
+    FfiConnectionState.ONLINE_RELAY -> colors.relay
+    FfiConnectionState.CONNECTING_DIRECT, FfiConnectionState.CONNECTING_RELAY -> colors.warning
+    FfiConnectionState.DISCONNECTED -> colors.dangerRemoved
+}
+
 @Composable
-private fun DiagnosticMetricColumn(
+private fun SettingsKeyValueRow(
     label: String,
     value: String,
-    valueColor: Color,
-    modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-
-    Column(
-        modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs / 2),
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = OrbitSpacing.touchTarget)
+            .padding(horizontal = OrbitSpacing.md),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text(
             text = label,
-            style = typography.meta,
-            color = colors.fgMuted,
-            maxLines = 1,
+            style = typography.subhead,
+            color = colors.fgPrimary,
         )
         Text(
             text = value,
-            style = typography.codeMedium,
-            color = valueColor,
+            style = typography.code,
+            color = colors.fgMuted,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
+    }
+}
+
+@Composable
+private fun GroupedTextFieldRow(
+    label: String,
+    placeholder: String,
+    value: String,
+    isMono: Boolean,
+    onValueChange: (String) -> Unit,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val textStyle = if (isMono) typography.code else typography.subhead
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = OrbitSpacing.md, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Text(
+            text = label,
+            style = typography.metaMedium,
+            color = colors.fgSecondary,
+        )
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 26.dp),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            if (value.isEmpty()) {
+                Text(
+                    text = placeholder,
+                    style = textStyle,
+                    color = colors.fgMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                singleLine = true,
+                textStyle = textStyle.copy(color = colors.fgPrimary),
+                cursorBrush = SolidColor(colors.primary),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 }
 
@@ -457,95 +1095,48 @@ private fun formatQuotaResetCountdown(rawRfc3339: String): String {
 }
 
 @Composable
-private fun ProviderQuotaCard(quota: FfiProviderQuota) {
+private fun ProviderQuotaBlock(quota: FfiProviderQuota) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val cardShape = RoundedCornerShape(OrbitSpacing.md)
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(colors.code, cardShape)
-            .border(OrbitSpacing.hairline, colors.hairline, cardShape)
             .padding(OrbitSpacing.md),
-        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm + 2.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
         ) {
+            OrbitProviderIcon(provider = quota.provider, size = 15.dp)
+
             Text(
                 text = quota.providerLabel,
-                style = typography.bodySemiBold,
+                style = typography.subheadSemiBold,
                 color = colors.fgPrimary,
             )
+
             quota.accountLabel?.takeIf { it.isNotBlank() }?.let { acct ->
                 Text(
                     text = acct,
                     style = typography.meta,
-                    color = colors.fgSecondary,
+                    color = colors.fgMuted,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
                 )
             }
-        }
 
-        quota.creditsRemaining?.let { credits ->
-            Text(
-                text = "Credits remaining: ${"%.2f".format(credits)}",
-                style = typography.metaMedium,
-                color = colors.directAdded,
-            )
-        }
+            Spacer(modifier = Modifier.weight(1f))
 
-        quota.windows.forEach { win ->
-            val pct = win.usedPercent.coerceIn(0f, 100f)
-            val barColor = when {
-                pct > 90f -> colors.dangerRemoved
-                pct >= 70f -> colors.warning
-                else -> colors.directAdded
-            }
-            val barShape = RoundedCornerShape(OrbitSpacing.xs / 2)
-
-            Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = win.label,
-                        style = typography.metaMedium,
-                        color = colors.fgSecondary,
-                    )
-                    Text(
-                        text = "${pct.roundToInt()}% used",
-                        style = typography.metaMedium,
-                        color = barColor,
-                    )
-                }
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(OrbitSpacing.xs)
-                        .clip(barShape)
-                        .background(colors.subtleFill, barShape),
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth(fraction = (pct / 100f).coerceIn(0.02f, 1f))
-                            .height(OrbitSpacing.xs)
-                            .background(barColor, barShape)
-                    )
-                }
-                win.resetsAtRfc3339?.takeIf { it.isNotBlank() }?.let { reset ->
-                    Text(
-                        text = formatQuotaResetCountdown(reset),
-                        style = typography.meta,
-                        color = colors.fgMuted,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
+            quota.creditsRemaining?.let { credits ->
+                Text(
+                    text = "${"$%.2f".format(credits)}",
+                    style = typography.codeMedium,
+                    color = colors.directAdded,
+                )
             }
         }
 
@@ -556,196 +1147,67 @@ private fun ProviderQuotaCard(quota: FfiProviderQuota) {
                 color = colors.warning,
             )
         }
-    }
-}
 
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun HostRouteEditorSection(
-    host: FfiHostCard,
-    onSave: (
-        customName: String?,
-        routeMode: FfiHostRouteMode,
-        customDirectEndpoint: String?,
-        relayUrl: String?,
-    ) -> Unit,
-    onRemove: () -> Unit,
-) {
-    val colors = OrbitTheme.colors
-    val typography = OrbitTheme.typography
-    val haptics = LocalHapticFeedback.current
+        if (quota.windows.isEmpty() && quota.error.isNullOrBlank()) {
+            Text(
+                text = "No active rate-limit windows",
+                style = typography.meta,
+                color = colors.fgMuted,
+            )
+        } else {
+            quota.windows.forEach { win ->
+                val pct = win.usedPercent.coerceIn(0f, 100f)
+                val barColor = when {
+                    pct > 90f -> colors.dangerRemoved
+                    pct >= 70f -> colors.warning
+                    else -> colors.directAdded
+                }
+                val barShape = CircleShape
 
-    var customName by remember(host.hostId) { mutableStateOf(host.customName.orEmpty()) }
-    var routeMode by remember(host.hostId) { mutableStateOf(host.routeMode) }
-    var directEndpoint by remember(host.hostId) { mutableStateOf(host.customDirectEndpoint.orEmpty()) }
-    var relayUrl by remember(host.hostId) { mutableStateOf(host.relayUrl.orEmpty()) }
-
-    Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md)) {
-        Text(
-            text = "Host Connection & Routing",
-            style = typography.subheadSemiBold,
-            color = colors.fgSecondary,
-        )
-
-        Text(
-            text = "${host.hostname} · ${host.osArch ?: "remote"} · Pubkey ${host.daemonPubkeyB64.take(12)}…",
-            style = typography.code,
-            color = colors.fgMuted,
-        )
-
-        // Route Mode Chips (quiet selection border; Save & Reconnect is sole primary filled CTA)
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-        ) {
-            FfiHostRouteMode.entries.forEach { mode ->
-                val selected = routeMode == mode
-                val chipShape = RoundedCornerShape(OrbitSpacing.md)
-                Box(
-                    modifier = Modifier
-                        .heightIn(min = 40.dp)
-                        .clip(chipShape)
-                        .background(if (selected) colors.subtleFill else colors.code, chipShape)
-                        .border(
-                            if (selected) 1.dp else OrbitSpacing.hairline,
-                            if (selected) colors.primary else colors.hairline,
-                            chipShape
+                Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                    ) {
+                        Text(
+                            text = win.label,
+                            style = typography.metaMedium,
+                            color = colors.fgSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
                         )
-                        .clickable {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            routeMode = mode
+                        win.resetsAtRfc3339?.takeIf { it.isNotBlank() }?.let { reset ->
+                            Text(
+                                text = formatQuotaResetCountdown(reset),
+                                style = typography.meta,
+                                color = colors.fgMuted,
+                                maxLines = 1,
+                            )
                         }
-                        .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = OrbitFormatters.routeModeLabel(mode),
-                        style = typography.subheadMedium,
-                        color = if (selected) colors.primary else colors.fgPrimary,
-                        maxLines = 1,
-                        softWrap = false,
-                    )
+                        Text(
+                            text = "${pct.roundToInt()}%",
+                            style = typography.codeMedium,
+                            color = barColor,
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .clip(barShape)
+                            .background(colors.subtleFill, barShape),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(fraction = (pct / 100f).coerceIn(0.02f, 1f))
+                                .height(4.dp)
+                                .background(barColor, barShape),
+                        )
+                    }
                 }
             }
-        }
-
-        LabeledConfigInput(
-            label = "Display Alias",
-            placeholder = host.hostname,
-            value = customName,
-            onValueChange = { customName = it },
-        )
-
-        LabeledConfigInput(
-            label = "Direct Endpoint Override",
-            placeholder = host.directEndpoints.firstOrNull() ?: "ws://192.168.1.10:9741",
-            value = directEndpoint,
-            onValueChange = { directEndpoint = it },
-        )
-
-        LabeledConfigInput(
-            label = "Zero-Knowledge Relay URL",
-            placeholder = "wss://relay.example.com",
-            value = relayUrl,
-            onValueChange = { relayUrl = it },
-        )
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-        ) {
-            val dangerShape = RoundedCornerShape(OrbitSpacing.md)
-            Row(
-                modifier = Modifier
-                    .heightIn(min = OrbitSpacing.touchTarget)
-                    .clip(dangerShape)
-                    .background(colors.subtleFill, dangerShape)
-                    .border(OrbitSpacing.hairline, colors.hairline, dangerShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                        onRemove()
-                    }
-                    .padding(horizontal = OrbitSpacing.md),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.DeleteOutline,
-                    contentDescription = "Remove host",
-                    tint = colors.dangerRemoved,
-                    modifier = Modifier.size(OrbitSpacing.iconSm),
-                )
-                Text(
-                    text = "Unpair",
-                    style = typography.subheadSemiBold,
-                    color = colors.dangerRemoved,
-                )
-            }
-
-            val saveShape = RoundedCornerShape(OrbitSpacing.md)
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .heightIn(min = OrbitSpacing.touchTarget)
-                    .clip(saveShape)
-                    .background(colors.primary, saveShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSave(customName, routeMode, directEndpoint, relayUrl)
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "Save & Reconnect",
-                    style = typography.bodySemiBold,
-                    color = Color.White,
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun LabeledConfigInput(
-    label: String,
-    placeholder: String,
-    value: String,
-    onValueChange: (String) -> Unit,
-) {
-    val colors = OrbitTheme.colors
-    val typography = OrbitTheme.typography
-    val shape = RoundedCornerShape(OrbitSpacing.md)
-
-    Column(verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs)) {
-        Text(
-            text = label,
-            style = typography.metaMedium,
-            color = colors.fgSecondary,
-        )
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = 44.dp)
-                .background(colors.code, shape)
-                .border(OrbitSpacing.hairline, colors.hairline, shape)
-                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
-            contentAlignment = Alignment.CenterStart,
-        ) {
-            if (value.isEmpty()) {
-                Text(
-                    text = placeholder,
-                    style = typography.code,
-                    color = colors.fgMuted,
-                )
-            }
-            BasicTextField(
-                value = value,
-                onValueChange = onValueChange,
-                textStyle = typography.code.copy(color = colors.fgPrimary),
-                cursorBrush = SolidColor(colors.primary),
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
         }
     }
 }

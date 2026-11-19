@@ -7,6 +7,7 @@ import {
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
 import { type ProviderKind, orbitIpc } from "@/lib/orbit-ipc";
+import { isLocalHostCard } from "@/lib/projects";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -18,13 +19,16 @@ const PROVIDERS: { id: ProviderKind; label: string; bin: string }[] = [
 ];
 
 export function HostAgentsSection({ hostId }: { hostId: string }) {
-  const hostCard = useOrbitSelector(
-    (s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null,
-  );
+  const fleet = useOrbitSelector((s) => s.fleet);
+  const hostCard = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
 
   const [refreshingModels, setRefreshingModels] = useState(false);
+
+  const showHostBadge =
+    Boolean(hostCard) &&
+    (fleet.hosts.length > 1 || (hostCard !== null && !isLocalHostCard(hostCard)));
 
   const available =
     hostDetail?.host.available_providers ?? hostCard?.available_providers ?? [];
@@ -46,7 +50,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
         title="Agents"
         description="Installed coding agents and available models on this host."
         badge={
-          hostCard ? (
+          showHostBadge && hostCard ? (
             <span className="bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-[11.5px] font-medium">
               {hostCard.display_name}
             </span>

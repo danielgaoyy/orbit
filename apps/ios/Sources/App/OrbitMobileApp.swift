@@ -9,7 +9,7 @@ struct OrbitMobileApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     private var appearanceMode: OrbitAppearanceMode {
-        debugAppearanceOverride ?? (OrbitAppearanceMode(rawValue: appearanceRaw) ?? .system)
+        debugAppearanceOverride ?? OrbitAppearanceMode.fromStorage(appearanceRaw)
     }
 
     private var appearanceBinding: Binding<String> {

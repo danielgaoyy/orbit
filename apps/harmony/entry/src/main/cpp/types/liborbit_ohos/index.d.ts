@@ -99,6 +99,12 @@ export class OrbitHarmonyCore {
   fetchGitDiff(hostId: string, cwd: string, path: string | null | undefined, staged: boolean): void;
   fetchWorkspaceFiles(hostId: string, cwd: string): void;
   workspaceFilesJson(hostId: string, cwd: string): string;
+  stageAttachmentJson(
+    hostId: string,
+    filename: string,
+    mimeType: string | null | undefined,
+    bytes: Uint8Array
+  ): Promise<string>;
   startTerminal(hostId: string, cwd: string, cols: number, rows: number): void;
   attachTerminal(hostId: string, terminalId: string, slot: number): void;
   killTerminal(hostId: string, terminalId: string): void;

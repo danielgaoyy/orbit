@@ -475,7 +475,9 @@ export function timelineItemLogicalKey(item: TimelineItemView): string {
     case "question_request":
       return `quest:${item.request_id}`;
     case "notice":
-      return `notice:${item.seq}`;
+      return item.seq > 0
+        ? `notice:${item.seq}`
+        : `notice:0:${item.timestamp_ms ?? 0}:${item.message}`;
   }
 }
 

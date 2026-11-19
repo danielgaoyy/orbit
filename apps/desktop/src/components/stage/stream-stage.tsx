@@ -50,6 +50,7 @@ import {
   classifySearchTool,
   describeToolStep,
   extractThinkingHeadline,
+  formatDurationCompact,
   formatThoughtSummaryLabel,
   processTimelineForStage,
   stripWorkspacePrefix,
@@ -63,13 +64,12 @@ import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 const USER_PROMPT_PREVIEW_MAX_PX = 240;
-const LIVE_STEP_AUTO_COLLAPSE_THRESHOLD = 5;
-const LIVE_STEP_VISIBLE_TAIL_COUNT = 3;
 
 interface TurnTimingRecord {
   startedAtMs: number;
   completedAtMs: number | null;
   durationMs: number | null;
+  workDurationMs: number | null;
 }
 
 type ViewportAnchorHoldFn = (
@@ -438,7 +438,7 @@ const StepItemRow = memo(function StepItemRow({
   }
 
   if (item.item_type === "permission_request") {
-    const denied = /deny|reject|decline/i.test(item.resolved_decision ?? "");
+    const denied = /deny|reject|decline|cancel/i.test(item.resolved_decision ?? "");
     return (
       <div className="text-muted-foreground flex items-center gap-2 py-0.5 text-[12.5px]">
         <span className="flex size-4 shrink-0 items-center justify-center">
@@ -681,14 +681,13 @@ const StepItemRow = memo(function StepItemRow({
   );
 });
 
-/** Vertical step connector rail for expanded or actively streaming steps. */
+/** Vertical step connector rail for expanded turn activity steps. */
 const StepTimelineRail = memo(function StepTimelineRail({
   items,
   cwd,
   holdViewport,
   indented = false,
   isLiveActive = false,
-  autoCollapseEarlierLiveSteps = false,
   autoExpandErrors = false,
   agentId,
   thinkingSignature: _thinkingSignature,
@@ -699,28 +698,12 @@ const StepTimelineRail = memo(function StepTimelineRail({
   holdViewport: ViewportAnchorHoldFn;
   indented?: boolean;
   isLiveActive?: boolean;
-  autoCollapseEarlierLiveSteps?: boolean;
   autoExpandErrors?: boolean;
   agentId: string;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
 }) {
-  const [showAllLiveSteps, setShowAllLiveSteps] = useState(false);
-  const collapseBtnRef = useRef<HTMLButtonElement | null>(null);
-
   if (items.length === 0) return null;
-
-  const canRollUpEarlier =
-    isLiveActive &&
-    autoCollapseEarlierLiveSteps &&
-    items.length >= LIVE_STEP_AUTO_COLLAPSE_THRESHOLD;
-  const hiddenCount = canRollUpEarlier
-    ? Math.max(0, items.length - LIVE_STEP_VISIBLE_TAIL_COUNT)
-    : 0;
-  const visibleItems =
-    canRollUpEarlier && !showAllLiveSteps
-      ? items.slice(items.length - LIVE_STEP_VISIBLE_TAIL_COUNT)
-      : items;
 
   const lastSeq = items[items.length - 1]?.seq;
 
@@ -731,31 +714,7 @@ const StepTimelineRail = memo(function StepTimelineRail({
         indented && "border-border mt-1 ml-[7px] border-l pl-3.5",
       )}
     >
-      {canRollUpEarlier && hiddenCount > 0 && (
-        <button
-          ref={collapseBtnRef}
-          type="button"
-          aria-expanded={showAllLiveSteps}
-          onClick={() =>
-            holdViewport(collapseBtnRef.current, () => setShowAllLiveSteps((v) => !v))
-          }
-          className="text-muted-foreground hover:text-foreground hover:bg-accent/55 -ml-1.5 inline-flex cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-1 text-[12.5px] transition-colors"
-        >
-          <ChevronRight
-            className={cn(
-              "size-3.5 stroke-[1.85] transition-transform duration-150",
-              showAllLiveSteps && "rotate-90",
-            )}
-          />
-          <span>
-            {showAllLiveSteps
-              ? "Hide steps"
-              : `${hiddenCount} ${hiddenCount === 1 ? "step" : "steps"}`}
-          </span>
-        </button>
-      )}
-
-      {visibleItems.map((sub, i) => {
+      {items.map((sub, i) => {
         const isLastInLiveGroup = isLiveActive && sub.seq === lastSeq;
         const thinkingKey =
           sub.item_type === "assistant_thinking"
@@ -782,20 +741,24 @@ const StepTimelineRail = memo(function StepTimelineRail({
 });
 
 /**
- * Collapsible Step Group Disclosure:
- * Renders settled work batches as a single concise 1-line summary button
- * (`Edited 2 files, ran a command`, `Read omni-composer.tsx`, `Thought for 6s`),
- * expanding on click to reveal the indented vertical step timeline.
+ * Unified All-or-Nothing Turn Activity Disclosure:
+ * - Folds ALL intermediate steps (thinking, tool calls, resolved gates, interim narration)
+ *   behind one clickable summary header (`Reading stream-stage.tsx… · 4 steps · 14s ›` ->
+ *   `Read 3 files, edited stream-stage.tsx · 14s ›`).
+ * - Strictly respects manual user toggle during and after streaming.
  */
-const CollapsibleStepGroup = memo(function CollapsibleStepGroup({
+const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   items,
-  summaryLabel,
+  isWorkActive,
+  liveLabel,
+  liveDetail,
+  settledLabel,
   summaryCounts,
   labelIncludesFailure,
-  shouldFold,
-  isLiveActive,
-  autoCollapseLiveOverflow,
-  showInlineDiffStat = false,
+  defaultCollapsed,
+  autoOpenForError,
+  liveStartedAtMs,
+  settledDurationMs,
   cwd,
   agentId,
   thinkingSignature,
@@ -803,104 +766,135 @@ const CollapsibleStepGroup = memo(function CollapsibleStepGroup({
   holdViewport,
 }: {
   items: TimelineItemView[];
-  summaryLabel: string;
+  isWorkActive: boolean;
+  liveLabel: string;
+  liveDetail: string | null;
+  settledLabel: string;
   summaryCounts: WorkSummaryResult["counts"];
   labelIncludesFailure: boolean;
-  shouldFold: boolean;
-  isLiveActive: boolean;
-  autoCollapseLiveOverflow: boolean;
-  showInlineDiffStat?: boolean;
+  defaultCollapsed: boolean;
+  autoOpenForError: boolean;
+  liveStartedAtMs: number | null;
+  settledDurationMs: number | null;
   cwd: string;
   agentId: string;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
 }) {
-  const [manualExpanded, setManualExpanded] = useState(false);
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
   const foldBtnRef = useRef<HTMLButtonElement | null>(null);
+  const fallbackStartRef = useRef<number>(Date.now());
+  const effectiveLiveStartedAtMs = liveStartedAtMs ?? fallbackStartRef.current;
 
-  if (items.length === 0) return null;
-
-  if (!shouldFold) {
+  if (items.length === 0) {
+    if (!isWorkActive) return null;
     return (
-      <StepTimelineRail
-        items={items}
-        cwd={cwd}
-        holdViewport={holdViewport}
-        indented={items.length > 1}
-        isLiveActive={isLiveActive}
-        autoCollapseEarlierLiveSteps={autoCollapseLiveOverflow}
-        autoExpandErrors={!isLiveActive && summaryCounts.unrecoveredFailureCount > 0}
-        agentId={agentId}
-        thinkingSignature={thinkingSignature}
-        getThinkingDurationMs={getThinkingDurationMs}
-      />
+      <div className="text-muted-foreground flex max-w-full items-center gap-1.5 py-0.5 text-[13.5px] font-normal">
+        <span className="agent-text-shimmer truncate">{liveLabel || "Working…"}</span>
+        <InlineLiveElapsed startedAtMs={effectiveLiveStartedAtMs} />
+      </div>
     );
   }
 
+  const defaultOpen = !defaultCollapsed || autoOpenForError;
+  const isExpanded = userExpanded !== null ? userExpanded : defaultOpen;
   const showFailureBadge =
-    summaryCounts.unrecoveredFailureCount > 0 && !labelIncludesFailure;
+    !isWorkActive && summaryCounts.unrecoveredFailureCount > 0 && !labelIncludesFailure;
   const showDiffNumbers =
-    showInlineDiffStat && (summaryCounts.additions > 0 || summaryCounts.deletions > 0);
+    isWorkActive && (summaryCounts.additions > 0 || summaryCounts.deletions > 0);
+  const showSettledDuration =
+    !isWorkActive &&
+    settledDurationMs !== null &&
+    settledDurationMs >= 1000 &&
+    !settledLabel.startsWith("Thought for ");
 
   return (
     <div>
       <button
         ref={foldBtnRef}
         type="button"
-        aria-expanded={manualExpanded}
+        aria-expanded={isExpanded}
         onClick={() =>
-          holdViewport(foldBtnRef.current, () => setManualExpanded((v) => !v))
+          holdViewport(foldBtnRef.current, () =>
+            setUserExpanded((prev) => !(prev !== null ? prev : defaultOpen)),
+          )
         }
         className="group/fold text-muted-foreground hover:text-foreground hover:bg-accent/55 -ml-1.5 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-md px-1.5 py-0.5 text-[13.5px] font-normal transition-colors"
       >
-        <span
-          className={cn(
-            "truncate",
-            labelIncludesFailure && "text-rose-600 dark:text-rose-400",
-          )}
-        >
-          {summaryLabel}
-        </span>
-
-        {showFailureBadge && (
-          <span className="shrink-0 text-[12.5px] text-rose-600 dark:text-rose-400">
-            · {summaryCounts.unrecoveredFailureCount} failed
-          </span>
-        )}
-
-        {showDiffNumbers && (
-          <span className="tabular-nums flex shrink-0 items-center gap-1 font-mono text-[11.5px]">
-            {summaryCounts.additions > 0 && (
-              <span className="text-emerald-600 dark:text-emerald-400">
-                +{summaryCounts.additions}
+        {isWorkActive ? (
+          <>
+            <span className={cn("agent-text-shimmer", liveDetail ? "shrink-0" : "truncate")}>
+              {liveLabel}
+            </span>
+            {liveDetail && (
+              <span className="agent-text-shimmer truncate text-[13px] opacity-85">
+                {liveDetail}
               </span>
             )}
-            {summaryCounts.deletions > 0 && (
-              <span className="text-rose-600 dark:text-rose-400">
-                -{summaryCounts.deletions}
+            {items.length >= 2 && (
+              <span className="text-muted-foreground/75 tabular-nums shrink-0 text-[12.5px]">
+                · {items.length} steps
               </span>
             )}
-          </span>
+            <InlineLiveElapsed startedAtMs={effectiveLiveStartedAtMs} />
+            {showDiffNumbers && (
+              <span className="tabular-nums flex shrink-0 items-center gap-1 font-mono text-[11.5px]">
+                {summaryCounts.additions > 0 && (
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    +{summaryCounts.additions}
+                  </span>
+                )}
+                {summaryCounts.deletions > 0 && (
+                  <span className="text-rose-600 dark:text-rose-400">
+                    -{summaryCounts.deletions}
+                  </span>
+                )}
+              </span>
+            )}
+          </>
+        ) : (
+          <>
+            <span
+              className={cn(
+                "truncate",
+                labelIncludesFailure && "text-rose-600 dark:text-rose-400",
+              )}
+            >
+              {settledLabel}
+            </span>
+            {showFailureBadge && (
+              <span className="shrink-0 text-[12.5px] text-rose-600 dark:text-rose-400">
+                · {summaryCounts.unrecoveredFailureCount} failed
+              </span>
+            )}
+            {showSettledDuration && (
+              <span className="text-muted-foreground/75 tabular-nums shrink-0 text-[12.5px]">
+                · {formatDurationCompact(settledDurationMs)}
+              </span>
+            )}
+          </>
         )}
 
         <ChevronRight
           className={cn(
             "size-3.5 shrink-0 opacity-70 transition-transform duration-150 group-hover/fold:opacity-100",
-            manualExpanded && "rotate-90",
+            isExpanded && "rotate-90",
           )}
         />
       </button>
 
-      {manualExpanded && (
+      {isExpanded && (
         <div className="orbit-stage-enter">
           <StepTimelineRail
             items={items}
             cwd={cwd}
             holdViewport={holdViewport}
             indented
-            isLiveActive={false}
-            autoExpandErrors={summaryCounts.failedCount > 0 || summaryCounts.deniedCount > 0}
+            isLiveActive={isWorkActive}
+            autoExpandErrors={
+              !isWorkActive && (summaryCounts.failedCount > 0 || summaryCounts.deniedCount > 0)
+            }
             agentId={agentId}
             thinkingSignature={thinkingSignature}
             getThinkingDurationMs={getThinkingDurationMs}
@@ -1113,93 +1107,96 @@ const UserPromptBubble = memo(function UserPromptBubble({
       : null;
 
   return (
-    <div className={cn("flex justify-end pt-2", animateEntrance && "orbit-bubble-enter")}>
-      <div className="group/user flex max-w-[82%] flex-col items-end">
-        <div className="prompt-bubble-surface text-foreground relative max-w-full rounded-[20px] px-4 py-2">
-          <div
-            ref={bodyRef}
-            style={
-              !expanded && overflowing
-                ? { maxHeight: `${USER_PROMPT_PREVIEW_MAX_PX}px`, overflow: "hidden" }
-                : undefined
-            }
-            className="relative space-y-1.5"
-          >
-            {attachmentBadges.length > 0 && (
-              <div className="flex flex-wrap items-center gap-1.5 select-none">
-                {attachmentBadges.map((badge, idx) => {
-                  const BadgeIcon = resolvePromptBadgeIcon(badge);
-                  const isMono = badge.kind === "file" || badge.kind === "quote";
-                  return (
-                    <span
-                      key={`${badge.kind}-${badge.label}-${idx}`}
-                      className="text-foreground/85 inline-flex items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] dark:border-white/[0.10] dark:bg-white/[0.055]"
-                    >
-                      <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
-                      <span className={cn("leading-normal font-medium", isMono && "font-mono")}>
-                        {badge.label}
-                      </span>
-                    </span>
-                  );
-                })}
-              </div>
-            )}
+    <div
+      className={cn(
+        "group/user flex items-end justify-end gap-1.5",
+        animateEntrance && "orbit-bubble-enter",
+      )}
+    >
+      <div className="flex shrink-0 items-center gap-1 pb-[9px] whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100">
+        {promptTimestampMs !== null && (
+          <RelativeTimestampPill timestampMs={promptTimestampMs} />
+        )}
+        <CopyActionButton
+          copied={copied}
+          label="Copy"
+          onClick={() => void handleCopy()}
+        />
+      </div>
 
-            {slashBadge && SlashIcon ? (
+      <div className="prompt-bubble-surface text-foreground relative min-w-0 max-w-[80%] rounded-[20px] px-4 py-2">
+        <div
+          ref={bodyRef}
+          style={
+            !expanded && overflowing
+              ? { maxHeight: `${USER_PROMPT_PREVIEW_MAX_PX}px`, overflow: "hidden" }
+              : undefined
+          }
+          className="relative space-y-1.5"
+        >
+          {attachmentBadges.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5 select-none">
+              {attachmentBadges.map((badge, idx) => {
+                const BadgeIcon = resolvePromptBadgeIcon(badge);
+                const isMono = badge.kind === "file" || badge.kind === "quote";
+                return (
+                  <span
+                    key={`${badge.kind}-${badge.label}-${idx}`}
+                    className="text-foreground/85 inline-flex items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] dark:border-white/[0.10] dark:bg-white/[0.055]"
+                  >
+                    <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
+                    <span className={cn("leading-normal font-medium", isMono && "font-mono")}>
+                      {badge.label}
+                    </span>
+                  </span>
+                );
+              })}
+            </div>
+          )}
+
+          {slashBadge && SlashIcon ? (
+            <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
+              <span className="mr-1.5 inline-flex items-center gap-1.5 align-baseline select-none">
+                <SlashIcon className="text-muted-foreground relative top-[2px] size-[14px] shrink-0 stroke-[1.75]" />
+                <span className="text-foreground font-medium">{slashLabel}</span>
+              </span>
+              {cleanText}
+            </p>
+          ) : (
+            cleanText.length > 0 &&
+            (sanitizedLegacy ? (
               <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
-                <span className="mr-1.5 inline-flex items-center gap-1.5 align-baseline select-none">
-                  <SlashIcon className="text-muted-foreground relative top-[2px] size-[14px] shrink-0 stroke-[1.75]" />
-                  <span className="text-foreground font-medium">{slashLabel}</span>
-                </span>
                 {cleanText}
               </p>
             ) : (
-              cleanText.length > 0 &&
-              (sanitizedLegacy ? (
-                <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
-                  {cleanText}
-                </p>
-              ) : (
-                <MarkdownBlocksView blocks={item.blocks} />
-              ))
-            )}
+              <MarkdownBlocksView blocks={item.blocks} />
+            ))
+          )}
 
-            {!expanded && overflowing && (
-              <div
-                aria-hidden="true"
-                className="pointer-events-none absolute inset-x-0 bottom-0 h-12"
-                style={{
-                  background:
-                    "linear-gradient(to top, var(--surface-elevated) 0%, transparent 100%)",
-                }}
-              />
-            )}
-          </div>
-
-          {overflowing && (
-            <button
-              ref={toggleBtnRef}
-              type="button"
-              onClick={() =>
-                holdViewport(toggleBtnRef.current, () => setExpanded((v) => !v), "bottom")
-              }
-              className="text-muted-foreground hover:text-foreground mt-1 inline-flex cursor-pointer items-center text-[12px] font-medium transition-colors"
-            >
-              {expanded ? "Show less" : "Show more"}
-            </button>
+          {!expanded && overflowing && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-12"
+              style={{
+                background:
+                  "linear-gradient(to top, var(--surface-elevated) 0%, transparent 100%)",
+              }}
+            />
           )}
         </div>
 
-        <div className="mt-1 flex h-[22px] items-center justify-end gap-1.5 pr-0.5 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100">
-          {promptTimestampMs !== null && (
-            <RelativeTimestampPill timestampMs={promptTimestampMs} />
-          )}
-          <CopyActionButton
-            copied={copied}
-            label="Copy"
-            onClick={() => void handleCopy()}
-          />
-        </div>
+        {overflowing && (
+          <button
+            ref={toggleBtnRef}
+            type="button"
+            onClick={() =>
+              holdViewport(toggleBtnRef.current, () => setExpanded((v) => !v), "bottom")
+            }
+            className="text-muted-foreground hover:text-foreground mt-1 inline-flex cursor-pointer items-center text-[12px] font-medium transition-colors"
+          >
+            {expanded ? "Show less" : "Show more"}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1332,31 +1329,32 @@ const RelativeTimestampPill = memo(function RelativeTimestampPill({
 });
 
 /** Isolated 1-second live elapsed ticker so parent rows never re-render on ticks. */
-const LiveTurnElapsed = memo(function LiveTurnElapsed({ startedAtMs }: { startedAtMs: number }) {
+const InlineLiveElapsed = memo(function InlineLiveElapsed({
+  startedAtMs,
+}: {
+  startedAtMs: number;
+}) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
+    setNowMs(Date.now());
     const id = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, [startedAtMs]);
 
-  const elapsedSec = Math.max(0, Math.floor((nowMs - startedAtMs) / 1000));
-  const mins = Math.floor(elapsedSec / 60);
-  const secs = elapsedSec % 60;
-  const formatted = `${mins}:${String(secs).padStart(2, "0")}`;
+  const elapsedMs = Math.max(0, nowMs - startedAtMs);
+  if (elapsedMs < 1000) return null;
 
   return (
-    <span className="text-muted-foreground tabular-nums flex items-center gap-2 text-[12.5px]">
-      <span className="bg-muted-foreground/70 size-1.5 animate-pulse rounded-full" />
-      <span>{formatted}</span>
+    <span className="text-muted-foreground/75 tabular-nums shrink-0 text-[12.5px]">
+      · {formatDurationCompact(elapsedMs)}
     </span>
   );
 });
 
 /**
- * Constant-height (`26px`) Turn Footer:
- * Swaps cleanly between running elapsed timer (`0:14`) and completed `[Copy · 2m ago]`
- * with full-timestamp pill tooltip on hover and `0px` vertical layout shift.
+ * Completed Turn Footer (`[Copy · 2m ago]`):
+ * Hidden while a turn is active since live elapsed duration lives inline in `TurnActivityDisclosure`.
  */
 const TurnFooter = memo(function TurnFooter({
   isTurnActive,
@@ -1373,7 +1371,7 @@ const TurnFooter = memo(function TurnFooter({
 
   const resolvedCompletedAtMs = timing?.completedAtMs ?? completedAtMs;
 
-  if (!isTurnActive && !replyText && resolvedCompletedAtMs === null) {
+  if (isTurnActive || (!replyText && resolvedCompletedAtMs === null)) {
     return null;
   }
 
@@ -1385,24 +1383,18 @@ const TurnFooter = memo(function TurnFooter({
   };
 
   return (
-    <div className="mt-1.5 flex h-[22px] items-center gap-1.5">
-      {isTurnActive ? (
-        <LiveTurnElapsed startedAtMs={timing?.startedAtMs ?? Date.now()} />
-      ) : (
-        <>
-          {replyText && (
-            <CopyActionButton
-              copied={copied}
-              label="Copy"
-              onClick={() => void handleCopy()}
-              className="-ml-1"
-            />
-          )}
+    <div className="mt-0.5 flex h-[22px] items-center gap-1.5">
+      {replyText && (
+        <CopyActionButton
+          copied={copied}
+          label="Copy"
+          onClick={() => void handleCopy()}
+          className="-ml-1"
+        />
+      )}
 
-          {resolvedCompletedAtMs !== null && (
-            <RelativeTimestampPill timestampMs={resolvedCompletedAtMs} />
-          )}
-        </>
+      {resolvedCompletedAtMs !== null && (
+        <RelativeTimestampPill timestampMs={resolvedCompletedAtMs} />
       )}
     </div>
   );
@@ -1410,7 +1402,7 @@ const TurnFooter = memo(function TurnFooter({
 
 const CompactionDivider = memo(function CompactionDivider({ label }: { label?: string }) {
   return (
-    <div className="text-muted-foreground flex items-center gap-3 px-[10px] py-3 text-[12px]">
+    <div className="text-muted-foreground flex items-center gap-3 px-[10px] py-2 text-[12px]">
       <div className="border-border flex-1 border-t" />
       <span className="inline-flex items-center gap-1.5">
         <Scissors className="size-3 opacity-75" />
@@ -1447,15 +1439,12 @@ function buildTurnThinkingSignature(
   thinkingTimings: Record<string, TurnTimingRecord>,
 ): string {
   let sig = "";
-  for (const seg of turn.liveSegments) {
-    if (seg.kind !== "step_group") continue;
-    for (const it of seg.items) {
-      if (it.item_type !== "assistant_thinking") continue;
-      const key = `${agentId}::think::${it.item_id || it.seq}`;
-      const dur = thinkingTimings[key]?.durationMs;
-      if (dur !== null && dur !== undefined) {
-        sig += `${it.seq}:${dur};`;
-      }
+  for (const it of turn.foldedSteps) {
+    if (it.item_type !== "assistant_thinking") continue;
+    const key = `${agentId}::think::${it.item_id || it.seq}`;
+    const dur = thinkingTimings[key]?.durationMs;
+    if (dur !== null && dur !== undefined) {
+      sig += `${it.seq}:${dur};`;
     }
   }
   return sig;
@@ -1463,11 +1452,10 @@ function buildTurnThinkingSignature(
 
 /**
  * Renders a complete Conversation Turn:
- * - Pre-reply steps fold automatically into a 1-line summary header (`Edited 2 files, ran a command ›`)
- *   the moment `terminalReply` begins, preventing any layout jump when streaming completes.
- * - During multi-phase runs (`[Steps 1] -> [Note] -> [Steps 2]`), settled earlier `step_group` batches
- *   auto-fold immediately while the trailing active `step_group` streams live at the bottom.
- * - Unrecovered tool failures without a final reply stay expanded so error output is immediately visible.
+ * - All pre-reply thinking, tool calls, resolved gates, and interim narration stay unified inside
+ *   `TurnActivityDisclosure` with live status + elapsed duration, with zero structural switches
+ *   between streaming and completion.
+ * - Unrecovered tool failures without a final reply stay expanded so error output is visible.
  */
 const TurnStageSection = memo(function TurnStageSection({
   turn,
@@ -1501,25 +1489,11 @@ const TurnStageSection = memo(function TurnStageSection({
     [registerTurnEl, turn.anchorSeq],
   );
 
-  if (turn.isCompactionCommand && turn.liveSegments.length === 0) {
-    return (
-      <div ref={setRef}>
-        <CompactionDivider label="Context compacted" />
-      </div>
-    );
-  }
-
-  // Fold pre-reply work as soon as `terminalReply` starts (all prior steps are already done)
-  const canFoldPreReplyWork =
-    autoFoldCompleted && turn.terminalReply !== null && turn.foldedSteps.length > 0;
-
-  const preReplySummaryLabel = useMemo(() => {
+  const settledLabel = useMemo(() => {
     if (turn.workCounts.actionSteps === 0 && turn.workCounts.thoughtCount > 0) {
-      const thoughtMs = computeTotalThinkingDurationMs(
-        turn.foldedSteps,
-        agentId,
-        getThinkingDurationMs,
-      );
+      const thoughtMs =
+        computeTotalThinkingDurationMs(turn.foldedSteps, agentId, getThinkingDurationMs) ??
+        turn.thoughtDurationMs;
       return formatThoughtSummaryLabel(thoughtMs, turn.workCounts.thoughtCount);
     }
     return turn.workSummaryLabel;
@@ -1528,16 +1502,45 @@ const TurnStageSection = memo(function TurnStageSection({
     thinkingSignature,
     getThinkingDurationMs,
     turn.foldedSteps,
+    turn.thoughtDurationMs,
     turn.workCounts.actionSteps,
     turn.workCounts.thoughtCount,
     turn.workSummaryLabel,
   ]);
 
+  if (
+    turn.isCompactionCommand &&
+    turn.foldedSteps.length === 0 &&
+    turn.terminalReply === null &&
+    turn.notices.length === 0
+  ) {
+    return (
+      <div ref={setRef}>
+        <CompactionDivider label={turn.compactions[0]?.label || "Context compacted"} />
+      </div>
+    );
+  }
+
+  const hasRunningFoldedTool = turn.foldedSteps.some(
+    (it) => it.item_type === "tool_call" && it.status === "running",
+  );
+  const isWorkActive = isTurnActive && (turn.terminalReply === null || hasRunningFoldedTool);
+  const showActivity = turn.foldedSteps.length > 0 || isWorkActive;
+  const hasBody =
+    showActivity ||
+    turn.terminalReply !== null ||
+    turn.notices.length > 0 ||
+    turn.compactions.length > 0;
+
+  const settledDurationMs =
+    timing?.workDurationMs ?? turn.workDurationMs ?? timing?.durationMs ?? null;
+  const liveStartedAtMs = timing?.startedAtMs ?? turn.startedAtMs ?? null;
+
   return (
     <div
       ref={setRef}
       style={!isTurnActive ? { contain: "layout style" } : undefined}
-      className="space-y-3"
+      className="space-y-4"
     >
       {turn.userPrompt && (
         <UserPromptBubble
@@ -1547,135 +1550,79 @@ const TurnStageSection = memo(function TurnStageSection({
         />
       )}
 
-      {(turn.liveSegments.length > 0 || isTurnActive) && (
+      {hasBody && (
         <div className="px-[10px]">
-          {canFoldPreReplyWork ? (
-            <div className="space-y-2">
-              <CollapsibleStepGroup
+          <div className="space-y-2.5">
+            {turn.compactions.map((c) => (
+              <CompactionDivider key={`compact-${c.seq}`} label={c.label} />
+            ))}
+
+            {showActivity && (
+              <TurnActivityDisclosure
                 items={turn.foldedSteps}
-                summaryLabel={preReplySummaryLabel}
+                isWorkActive={isWorkActive}
+                liveLabel={turn.workSummaryLiveLabel}
+                liveDetail={turn.workSummaryLiveDetail}
+                settledLabel={settledLabel}
                 summaryCounts={turn.workCounts}
                 labelIncludesFailure={turn.workSummaryIncludesFailure}
-                shouldFold
-                isLiveActive={false}
-                autoCollapseLiveOverflow={autoFoldCompleted}
+                defaultCollapsed={autoFoldCompleted}
+                autoOpenForError={
+                  !isWorkActive &&
+                  turn.terminalReply === null &&
+                  turn.workCounts.unrecoveredFailureCount > 0
+                }
+                liveStartedAtMs={liveStartedAtMs}
+                settledDurationMs={settledDurationMs}
                 cwd={cwd}
                 agentId={agentId}
                 thinkingSignature={thinkingSignature}
                 getThinkingDurationMs={getThinkingDurationMs}
                 holdViewport={holdViewport}
               />
+            )}
 
-              {turn.notices.map((n) => (
+            {turn.notices.map((n, idx) => {
+              const isError = n.level === "error";
+              return (
                 <div
-                  key={`notice-${n.seq}`}
-                  className="text-muted-foreground border-border bg-muted/50 flex items-center gap-2 rounded-xl border px-3.5 py-2 text-[13px]"
+                  key={`notice-${n.seq}-${n.timestamp_ms ?? 0}-${idx}`}
+                  className={cn(
+                    "flex items-center gap-2 rounded-xl border px-3.5 py-2 text-[13px]",
+                    isError
+                      ? "border-rose-500/30 bg-rose-500/[0.07] text-rose-700 dark:text-rose-300"
+                      : "text-muted-foreground border-border bg-muted/50",
+                  )}
                 >
-                  <AlertTriangle className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
+                  <AlertTriangle
+                    className={cn(
+                      "size-4 shrink-0",
+                      isError
+                        ? "text-rose-600 dark:text-rose-400"
+                        : "text-amber-600 dark:text-amber-400",
+                    )}
+                  />
                   <span className="selectable-text">{n.message}</span>
                 </div>
-              ))}
+              );
+            })}
 
-              {turn.terminalReply && (
-                <div className="pt-0.5">
-                  <MarkdownBlocksView
-                    blocks={turn.terminalReply.blocks}
-                    streaming={turn.terminalReply.streaming}
-                  />
-                </div>
-              )}
-
-              {!isTurnActive && <TurnChangesBar diffs={turn.turnDiffs} cwd={cwd} />}
-
-              <TurnFooter
-                isTurnActive={isTurnActive}
-                timing={timing}
-                completedAtMs={turn.completedAtMs}
-                replyText={!isTurnActive ? (turn.terminalReply?.text ?? null) : null}
+            {turn.terminalReply && (
+              <MarkdownBlocksView
+                blocks={turn.terminalReply.blocks}
+                streaming={turn.terminalReply.streaming}
               />
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {turn.liveSegments.map((seg, segIdx) => {
-                switch (seg.kind) {
-                  case "step_group": {
-                    const isTrailingSeg = segIdx === turn.liveSegments.length - 1;
-                    const isSegLiveActive =
-                      isTurnActive && isTrailingSeg && !seg.hasFollowingContent;
-                    const segSettled = !isSegLiveActive && !seg.hasRunningStep;
-                    // Keep an unrecovered trailing error open when there is no final reply after it
-                    const keepOpenForTrailingFailure =
-                      !seg.hasFollowingContent &&
-                      seg.summary.counts.unrecoveredFailureCount > 0;
-                    const shouldFoldSeg =
-                      autoFoldCompleted && segSettled && !keepOpenForTrailingFailure;
+            )}
 
-                    const segLabel =
-                      seg.summary.counts.actionSteps === 0 &&
-                      seg.summary.counts.thoughtCount > 0
-                        ? formatThoughtSummaryLabel(
-                            computeTotalThinkingDurationMs(
-                              seg.items,
-                              agentId,
-                              getThinkingDurationMs,
-                            ),
-                            seg.summary.counts.thoughtCount,
-                          )
-                        : seg.summary.label;
+            {!isTurnActive && <TurnChangesBar diffs={turn.turnDiffs} cwd={cwd} />}
 
-                    return (
-                      <CollapsibleStepGroup
-                        key={seg.key}
-                        items={seg.items}
-                        summaryLabel={segLabel}
-                        summaryCounts={seg.summary.counts}
-                        labelIncludesFailure={seg.summary.labelIncludesFailure}
-                        shouldFold={shouldFoldSeg}
-                        isLiveActive={isSegLiveActive}
-                        autoCollapseLiveOverflow={autoFoldCompleted}
-                        showInlineDiffStat={isTurnActive}
-                        cwd={cwd}
-                        agentId={agentId}
-                        thinkingSignature={thinkingSignature}
-                        getThinkingDurationMs={getThinkingDurationMs}
-                        holdViewport={holdViewport}
-                      />
-                    );
-                  }
-                  case "assistant_message":
-                    return (
-                      <div key={seg.key} className="py-0.5">
-                        <MarkdownBlocksView
-                          blocks={seg.item.blocks}
-                          streaming={seg.item.streaming}
-                        />
-                      </div>
-                    );
-                  case "compaction":
-                    return <CompactionDivider key={seg.key} label={seg.label} />;
-                  case "notice":
-                    return (
-                      <div
-                        key={seg.key}
-                        className="text-muted-foreground border-border bg-muted/50 flex items-center gap-2 rounded-xl border px-3.5 py-2 text-[13px]"
-                      >
-                        <AlertTriangle className="size-4 shrink-0 text-amber-600 dark:text-amber-400" />
-                        <span className="selectable-text">{seg.item.message}</span>
-                      </div>
-                    );
-                }
-              })}
-
-              {!isTurnActive && <TurnChangesBar diffs={turn.turnDiffs} cwd={cwd} />}
-
-              <TurnFooter
-                isTurnActive={isTurnActive}
-                timing={timing}
-                completedAtMs={turn.completedAtMs}
-                replyText={!isTurnActive ? (turn.terminalReply?.text ?? null) : null}
-              />
-            </div>
-          )}
+            <TurnFooter
+              isTurnActive={isTurnActive}
+              timing={timing}
+              completedAtMs={turn.completedAtMs}
+              replyText={!isTurnActive ? (turn.terminalReply?.text ?? null) : null}
+            />
+          </div>
         </div>
       )}
     </div>
@@ -1688,7 +1635,9 @@ const TurnStageSection = memo(function TurnStageSection({
   prev.cwd === next.cwd &&
   prev.agentId === next.agentId &&
   prev.thinkingSignature === next.thinkingSignature &&
+  prev.timing?.startedAtMs === next.timing?.startedAtMs &&
   prev.timing?.durationMs === next.timing?.durationMs &&
+  prev.timing?.workDurationMs === next.timing?.workDurationMs &&
   prev.timing?.completedAtMs === next.timing?.completedAtMs,
 );
 
@@ -1782,21 +1731,40 @@ export function StreamStage() {
 
     const timingKey = `${selectedAgentId}::${latestTurn.key}`;
     const existing = turnTimingsRef.current[timingKey];
+    const seededStartMs =
+      latestTurn.startedAtMs !== null && latestTurn.startedAtMs <= now
+        ? latestTurn.startedAtMs
+        : now;
 
     if (isLatestTurnActive) {
       if (!existing || existing.completedAtMs !== null) {
         turnTimingsRef.current[timingKey] = {
-          startedAtMs: now,
+          startedAtMs: seededStartMs,
           completedAtMs: null,
           durationMs: null,
+          workDurationMs: null,
+        };
+        changed = true;
+      } else if (latestTurn.terminalReply !== null && existing.workDurationMs === null) {
+        turnTimingsRef.current[timingKey] = {
+          ...existing,
+          workDurationMs: Math.max(0, now - existing.startedAtMs),
+        };
+        changed = true;
+      } else if (latestTurn.terminalReply === null && existing.workDurationMs !== null) {
+        turnTimingsRef.current[timingKey] = {
+          ...existing,
+          workDurationMs: null,
         };
         changed = true;
       }
     } else if (existing && existing.completedAtMs === null) {
+      const totalMs = Math.max(0, now - existing.startedAtMs);
       turnTimingsRef.current[timingKey] = {
         ...existing,
         completedAtMs: now,
-        durationMs: Math.max(0, now - existing.startedAtMs),
+        durationMs: totalMs,
+        workDurationMs: existing.workDurationMs ?? totalMs,
       };
       changed = true;
     }
@@ -1820,6 +1788,7 @@ export function StreamStage() {
             startedAtMs: now,
             completedAtMs: null,
             durationMs: null,
+            workDurationMs: null,
           };
           changed = true;
         }
@@ -1828,6 +1797,7 @@ export function StreamStage() {
           ...prevThink,
           completedAtMs: now,
           durationMs: Math.max(0, now - prevThink.startedAtMs),
+          workDurationMs: null,
         };
         changed = true;
       }
@@ -2203,12 +2173,12 @@ export function StreamStage() {
         className="min-h-0 flex-1"
         viewportRef={scrollRef}
         onViewportScroll={handleScroll}
-        viewportClassName="px-6 pt-5 pb-3"
+        viewportClassName="px-6 pt-6 pb-11"
       >
         <div
           key={selectedAgentId}
           ref={contentRef}
-          className="orbit-stage-enter mx-auto w-full max-w-[768px] space-y-6"
+          className="orbit-stage-enter mx-auto w-full max-w-[768px] space-y-8"
         >
           {stage.turns.map((turn, idx) => {
             const isLast = idx === stage.turns.length - 1;
@@ -2275,6 +2245,7 @@ export function StreamStage() {
         <StickyApprovalDock
           hostId={selectedHostId}
           agentId={selectedAgentId}
+          cwd={selectedCwd || currentAgent?.cwd || ""}
           permissions={stage.pendingPermissions}
           questions={stage.pendingQuestions}
         />

@@ -3,9 +3,11 @@ package dev.orbit.android.ui.stage
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.SystemClock
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
@@ -36,18 +38,31 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Build
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.ChevronRight
-import androidx.compose.material.icons.outlined.ContentCopy
-import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.ContentCut
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Difference
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.FormatQuote
+import androidx.compose.material.icons.outlined.Hub
+import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.Language
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Terminal
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -56,57 +71,67 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.orbit.android.store.OrbitFormatters
+import dev.orbit.android.ui.theme.OrbitCopyIcon
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
+import dev.orbit.android.ui.theme.orbitSemanticFileIcon
 import kotlinx.coroutines.delay
 import uniffi.orbit_ffi_uniffi.FfiDiffFile
 import uniffi.orbit_ffi_uniffi.FfiDiffLineKind
 import uniffi.orbit_ffi_uniffi.FfiPromptBadge
-import uniffi.orbit_ffi_uniffi.FfiRichBlock
 import uniffi.orbit_ffi_uniffi.FfiStageTurn
 import uniffi.orbit_ffi_uniffi.FfiTimelineItem
 import uniffi.orbit_ffi_uniffi.FfiToolCallDetail
 import uniffi.orbit_ffi_uniffi.FfiToolStatus
 import uniffi.orbit_ffi_uniffi.FfiToolStepDescriptor
+import uniffi.orbit_ffi_uniffi.FfiToolStepKind
 import uniffi.orbit_ffi_uniffi.FfiTurnFileDiffSummary
 import uniffi.orbit_ffi_uniffi.FfiTurnLiveSegment
 
 @Composable
 fun TurnItem(
     turn: FfiStageTurn,
+    isTurnActive: Boolean,
+    activeCwd: String,
     describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
     onCopyAssistantReply: (String) -> Unit,
-    onQuoteAssistantReply: (String) -> Unit,
+    onQuoteAssistantReply: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    val colors = OrbitTheme.colors
+    val active = isTurnActive || turn.hasActiveItem
+    val userPrompt = turn.userPrompt as? FfiTimelineItem.UserPrompt
+    val isCompactionOnly = turn.isCompactionCommand ||
+        (userPrompt != null && isBareCompactionPrompt(userPrompt))
 
     Column(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
     ) {
-        // 1. User Prompt Bubble (right-aligned, elevated surface, 18.dp radius, 0.5.dp hairline)
-        (turn.userPrompt as? FfiTimelineItem.UserPrompt)?.let { prompt ->
-            UserPromptBubble(prompt = prompt)
-        }
-
-        if (turn.isCompactionCommand) {
-            CompactionDividerRow(label = "Session context compacted")
+        // 1. User Prompt Bubble (or compact-only divider suppression)
+        if (isCompactionOnly) {
+            CompactionDividerRow(label = "Context compacted")
+        } else if (userPrompt != null) {
+            UserPromptBubble(prompt = userPrompt)
         }
 
         // 2. Live Running Trajectory OR Settled Collapsible Trajectory
-        if (turn.hasActiveItem) {
+        if (active) {
             LiveTurnSegments(
                 turn = turn,
+                activeCwd = activeCwd,
                 describeStep = describeStep,
                 onOpenDiffFile = onOpenDiffFile,
                 onQuoteDiffLine = onQuoteDiffLine,
@@ -115,142 +140,137 @@ fun TurnItem(
             if (turn.foldedSteps.isNotEmpty()) {
                 SettledWorkTrajectory(
                     turn = turn,
+                    activeCwd = activeCwd,
                     describeStep = describeStep,
                     onOpenDiffFile = onOpenDiffFile,
                     onQuoteDiffLine = onQuoteDiffLine,
                 )
             }
 
-            // 3. De-Carded Editorial Assistant Reply directly on bg.canvas + subtle Copy / Quote row
-            (turn.terminalReply as? FfiTimelineItem.AssistantMessage)?.let { reply ->
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                ) {
-                    MarkdownBlocks(
-                        blocks = reply.blocks,
-                        fallbackText = reply.text,
-                        textColor = colors.fgPrimary,
-                    )
-                    val fullPlainText = remember(reply.text, reply.blocks) {
-                        extractAssistantReplyText(reply)
-                    }
-                    if (fullPlainText.isNotBlank()) {
-                        AssistantTurnMicroActions(
-                            onCopy = { onCopyAssistantReply(fullPlainText) },
-                            onQuote = { onQuoteAssistantReply(fullPlainText) },
-                        )
-                    }
-                }
-            }
-
-            // 4. Turn File Diff Summary Chips
-            if (turn.turnDiffs.isNotEmpty()) {
-                TurnFileDiffStrip(
-                    diffs = turn.turnDiffs,
-                    onOpenDiffFile = onOpenDiffFile,
-                )
-            }
-
-        // 5. Turn Notices
             turn.notices.filterIsInstance<FfiTimelineItem.Notice>().forEach { notice ->
                 NoticeBannerRow(notice = notice)
             }
+
+            (turn.terminalReply as? FfiTimelineItem.AssistantMessage)?.let { reply ->
+                MarkdownBlocks(
+                    blocks = reply.blocks,
+                    fallbackText = reply.text,
+                )
+            }
+        }
+
+        // 3. Single TurnChangesBar (per-turn changed file summary)
+        if (turn.turnDiffs.isNotEmpty()) {
+            TurnChangesBar(
+                diffs = turn.turnDiffs,
+                activeCwd = activeCwd,
+                onOpenDiffFile = onOpenDiffFile,
+            )
+        }
+
+        // 4. Restrained TurnFooter (Live timer while running; icon-only Copy + relative time when settled)
+        val terminalReply = turn.terminalReply as? FfiTimelineItem.AssistantMessage
+        if (active || (!isCompactionOnly && (terminalReply != null || turn.foldedSteps.isNotEmpty() || turn.completedAtMs != null))) {
+            AssistantTurnFooter(
+                turn = turn,
+                isTurnActive = active,
+                replyText = terminalReply?.let { extractAssistantReplyText(it) },
+                onCopy = onCopyAssistantReply,
+            )
         }
     }
 }
 
-private fun extractAssistantReplyText(reply: FfiTimelineItem.AssistantMessage): String {
-    if (reply.text.isNotBlank()) return reply.text.trim()
-    return buildString {
-        reply.blocks.forEach { block ->
-            when (block) {
-                is FfiRichBlock.Heading -> appendLine(block.spans.joinToString("") { it.text })
-                is FfiRichBlock.Paragraph -> appendLine(block.spans.joinToString("") { it.text })
-                is FfiRichBlock.ListItem -> appendLine("• " + block.spans.joinToString("") { it.text })
-                is FfiRichBlock.BlockQuote -> appendLine("> " + block.spans.joinToString("") { it.text })
-                is FfiRichBlock.CodeBlock -> {
-                    appendLine("```${block.language}")
-                    appendLine(block.rawCode)
-                    appendLine("```")
-                }
-                FfiRichBlock.HorizontalRule -> appendLine("---")
-            }
+private fun isBareCompactionPrompt(prompt: FfiTimelineItem.UserPrompt): Boolean {
+    val cleaned = cleanLegacyPromptText(prompt.text).first
+    val hasCompactBadge = prompt.badges.any { it.kind == "slash" && it.label.equals("/compact", ignoreCase = true) }
+    if (hasCompactBadge && cleaned.isEmpty()) return true
+    return prompt.text.trim().equals("/compact", ignoreCase = true)
+}
+
+private val LEGACY_WORKFLOW_BLOCK_REGEX = Regex(
+    """<WORKFLOW_INSTRUCTION[^>]*>[\s\S]*?</WORKFLOW_INSTRUCTION>\s*""",
+    RegexOption.IGNORE_CASE,
+)
+private val LEADING_SLASH_REGEX = Regex("""^/(plan|review|compact)(?:\s+([\s\S]*))?$""", RegexOption.IGNORE_CASE)
+
+private fun cleanLegacyPromptText(rawText: String): Pair<String, String?> {
+    var working = rawText.replace(LEGACY_WORKFLOW_BLOCK_REGEX, "").trim()
+
+    val markers = listOf(
+        "Attached image file:",
+        "Referenced workspace files:",
+        "Working Tree Diff:",
+        "Staged Diff:",
+        "Active terminal output:",
+        "Reference `",
+        "Quoted diff lines:",
+        "Quoted assistant context:",
+    )
+    if (markers.any { working.startsWith(it) } && working.contains("\n\n")) {
+        // Legacy serialized wrappers placed metadata blocks before the final user message
+        val userTagStart = working.indexOf("<USER_REQUEST>")
+        working = if (userTagStart >= 0) {
+            working.substring(userTagStart)
+                .removePrefix("<USER_REQUEST>")
+                .removeSuffix("</USER_REQUEST>")
+                .trim()
+        } else {
+            val segments = working.split(Regex("""\n\n(?![`>-])"""))
+            segments.lastOrNull { seg ->
+                val s = seg.trim()
+                s.isNotEmpty() && markers.none { s.startsWith(it) } && !s.startsWith("```")
+            }?.trim().orEmpty()
         }
-    }.trim()
+    }
+
+    val match = LEADING_SLASH_REGEX.matchEntire(working)
+    return if (match != null) {
+        val slash = "/${match.groupValues[1].lowercase()}"
+        val body = match.groupValues[2].trim()
+        body to slash
+    } else {
+        working to null
+    }
 }
 
 @Composable
-private fun AssistantTurnMicroActions(
-    onCopy: () -> Unit,
-    onQuote: () -> Unit,
-) {
+private fun CompactionDividerRow(label: String) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val haptics = LocalHapticFeedback.current
-    var copied by remember { mutableStateOf(false) }
-
-    LaunchedEffect(copied) {
-        if (copied) {
-            delay(1600)
-            copied = false
-        }
-    }
-
-    val actionShape = RoundedCornerShape(OrbitSpacing.xs)
     Row(
-        modifier = Modifier.padding(top = OrbitSpacing.xs),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = OrbitSpacing.xs),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
+        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
     ) {
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            thickness = OrbitSpacing.hairline,
+            color = colors.hairline,
+        )
         Row(
-            modifier = Modifier
-                .clip(actionShape)
-                .clickable {
-                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    copied = true
-                    onCopy()
-                }
-                .padding(horizontal = OrbitSpacing.xs, vertical = OrbitSpacing.xs),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
         ) {
             Icon(
-                imageVector = if (copied) Icons.Outlined.Check else Icons.Outlined.ContentCopy,
-                contentDescription = "Copy assistant reply",
-                tint = if (copied) colors.directAdded else colors.fgMuted,
-                modifier = Modifier.size(OrbitSpacing.iconSm),
-            )
-            Text(
-                text = if (copied) "Copied" else "Copy",
-                style = typography.metaMedium,
-                color = if (copied) colors.directAdded else colors.fgMuted,
-            )
-        }
-
-        Row(
-            modifier = Modifier
-                .clip(actionShape)
-                .clickable {
-                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    onQuote()
-                }
-                .padding(horizontal = OrbitSpacing.xs, vertical = OrbitSpacing.xs),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-        ) {
-            Icon(
-                imageVector = Icons.Outlined.FormatQuote,
-                contentDescription = "Quote assistant reply",
+                imageVector = Icons.Outlined.ContentCut,
+                contentDescription = null,
                 tint = colors.fgMuted,
-                modifier = Modifier.size(OrbitSpacing.iconSm),
+                modifier = Modifier.size(13.dp),
             )
             Text(
-                text = "Quote",
-                style = typography.metaMedium,
+                text = label,
+                style = typography.meta,
                 color = colors.fgMuted,
             )
         }
+        HorizontalDivider(
+            modifier = Modifier.weight(1f),
+            thickness = OrbitSpacing.hairline,
+            color = colors.hairline,
+        )
     }
 }
 
@@ -258,36 +278,120 @@ private fun AssistantTurnMicroActions(
 @Composable
 private fun UserPromptBubble(prompt: FfiTimelineItem.UserPrompt) {
     val colors = OrbitTheme.colors
-    val shape = RoundedCornerShape(18.dp)
+    val typography = OrbitTheme.typography
+
+    val (cleanBody, inferredSlash) = remember(prompt.text) { cleanLegacyPromptText(prompt.text) }
+    val slashLabel = remember(prompt.badges, inferredSlash) {
+        prompt.badges.firstOrNull { it.kind == "slash" }?.label ?: inferredSlash
+    }
+    val contextBadges = remember(prompt.badges) {
+        prompt.badges.filterNot { it.kind == "slash" }
+    }
+
+    var expanded by rememberSaveable(prompt.messageId) { mutableStateOf(false) }
+    var exceedsMaxLines by remember(prompt.messageId, cleanBody) {
+        mutableStateOf(cleanBody.lines().size > 8)
+    }
+
+    val bubbleShape = RoundedCornerShape(20.dp)
+    val hairlineColor = if (colors.isDark) {
+        Color.White.copy(alpha = 0.09f)
+    } else {
+        Color.Black.copy(alpha = 0.075f)
+    }
 
     Box(
         modifier = Modifier.fillMaxWidth(),
         contentAlignment = Alignment.CenterEnd,
     ) {
-        Column(
+        Surface(
+            shape = bubbleShape,
+            color = colors.elevated,
+            tonalElevation = 0.dp,
+            shadowElevation = 1.dp,
             modifier = Modifier
-                .widthIn(max = 560.dp)
-                .clip(shape)
-                .background(colors.userBubble, shape)
-                .border(OrbitSpacing.hairline, colors.hairline, shape)
-                .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.md),
-            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                .widthIn(max = 320.dp)
+                .border(OrbitSpacing.hairline, hairlineColor, bubbleShape),
         ) {
-            if (prompt.badges.isNotEmpty()) {
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                    verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                ) {
-                    prompt.badges.forEach { badge ->
-                        PromptBadgePill(badge = badge)
+            Column(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+            ) {
+                if (contextBadges.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                    ) {
+                        contextBadges.forEach { badge ->
+                            PromptBadgePill(badge = badge)
+                        }
                     }
                 }
+
+                if (cleanBody.isNotEmpty() || slashLabel != null) {
+                    Box {
+                        SelectionContainer {
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.Top,
+                            ) {
+                                if (slashLabel != null) {
+                                    Text(
+                                        text = slashLabel,
+                                        style = typography.codeMedium,
+                                        color = colors.fgPrimary,
+                                        modifier = Modifier
+                                            .padding(top = 1.dp)
+                                            .background(colors.subtleFill, RoundedCornerShape(6.dp))
+                                            .border(OrbitSpacing.hairline, colors.hairline, RoundedCornerShape(6.dp))
+                                            .padding(horizontal = 6.dp, vertical = 1.dp),
+                                    )
+                                }
+                                if (cleanBody.isNotEmpty()) {
+                                    Text(
+                                        text = cleanBody,
+                                        style = typography.body,
+                                        color = colors.fgPrimary,
+                                        maxLines = if (expanded) Int.MAX_VALUE else 8,
+                                        overflow = TextOverflow.Clip,
+                                        onTextLayout = { result ->
+                                            if (!expanded && (result.hasVisualOverflow || result.lineCount > 8)) {
+                                                exceedsMaxLines = true
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        if (exceedsMaxLines && !expanded) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.BottomCenter)
+                                    .fillMaxWidth()
+                                    .height(22.dp)
+                                    .background(
+                                        Brush.verticalGradient(
+                                            listOf(Color.Transparent, colors.elevated)
+                                        )
+                                    )
+                            )
+                        }
+                    }
+                }
+
+                if (exceedsMaxLines) {
+                    Text(
+                        text = if (expanded) "Show less" else "Show more",
+                        style = typography.metaMedium,
+                        color = colors.fgSecondary,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable { expanded = !expanded }
+                            .padding(vertical = 2.dp),
+                    )
+                }
             }
-            MarkdownBlocks(
-                blocks = prompt.blocks,
-                fallbackText = prompt.text,
-                textColor = colors.fgPrimary,
-            )
         }
     }
 }
@@ -296,24 +400,33 @@ private fun UserPromptBubble(prompt: FfiTimelineItem.UserPrompt) {
 private fun PromptBadgePill(badge: FfiPromptBadge) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val accent = when (badge.kind) {
-        "git" -> colors.directAdded
-        "slash" -> colors.primary
-        "quote" -> colors.relay
-        "terminal" -> colors.warning
-        else -> colors.fgSecondary
+    val icon: ImageVector = when (badge.kind) {
+        "image" -> Icons.Outlined.Image
+        "git_diff", "git" -> Icons.Outlined.Difference
+        "terminal" -> Icons.Outlined.Terminal
+        "quote" -> Icons.Outlined.FormatQuote
+        "file" -> orbitSemanticFileIcon(badge.label.removePrefix("@"))
+        else -> Icons.Outlined.Description
     }
-    val pillShape = RoundedCornerShape(OrbitSpacing.sm)
-    Box(
+    val shape = RoundedCornerShape(7.dp)
+    Row(
         modifier = Modifier
-            .background(colors.subtleFill, pillShape)
-            .border(OrbitSpacing.hairline, colors.hairline, pillShape)
-            .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs / 2)
+            .background(colors.subtleFill, shape)
+            .border(OrbitSpacing.hairline, colors.hairline, shape)
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = colors.fgSecondary,
+            modifier = Modifier.size(12.dp),
+        )
         Text(
             text = badge.label,
             style = typography.metaMedium,
-            color = accent,
+            color = colors.fgSecondary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
@@ -321,8 +434,111 @@ private fun PromptBadgePill(badge: FfiPromptBadge) {
 }
 
 @Composable
+private fun AssistantTurnFooter(
+    turn: FfiStageTurn,
+    isTurnActive: Boolean,
+    replyText: String?,
+    onCopy: (String) -> Unit,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    val haptics = LocalHapticFeedback.current
+    var copied by remember(turn.key) { mutableStateOf(false) }
+
+    LaunchedEffect(copied) {
+        if (copied) {
+            delay(1500L)
+            copied = false
+        }
+    }
+
+    var nowMs by remember(turn.key) { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(isTurnActive, turn.key) {
+        while (isTurnActive) {
+            nowMs = System.currentTimeMillis()
+            delay(1000L)
+        }
+    }
+
+    val elapsedSeconds = remember(isTurnActive, nowMs, turn.startedAtMs, turn.turnDurationMs) {
+        if (isTurnActive) {
+            val start = turn.startedAtMs ?: nowMs
+            ((nowMs - start).coerceAtLeast(0L) / 1000L)
+        } else {
+            (turn.turnDurationMs ?: 0L) / 1000L
+        }
+    }
+
+    val timestampSecs = ((turn.completedAtMs ?: turn.startedAtMs ?: 0L) / 1000L)
+    val relTime = remember(timestampSecs) {
+        if (timestampSecs > 0L) OrbitFormatters.relativeTimeLabel(timestampSecs) else ""
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 2.dp),
+        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (isTurnActive) {
+            BreathingDot(color = colors.fgMuted)
+            val mins = elapsedSeconds / 60L
+            val secs = elapsedSeconds % 60L
+            Text(
+                text = String.format("%d:%02d", mins, secs),
+                style = typography.meta,
+                color = colors.fgMuted,
+            )
+        } else {
+            if (!replyText.isNullOrBlank()) {
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .clickable {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onCopy(replyText)
+                            copied = true
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = if (copied) Icons.Outlined.Check else OrbitCopyIcon,
+                        contentDescription = "Copy response",
+                        tint = if (copied) colors.directAdded else colors.fgMuted,
+                        modifier = Modifier.size(14.dp),
+                    )
+                }
+            }
+            if (relTime.isNotEmpty()) {
+                Text(
+                    text = relTime,
+                    style = typography.meta,
+                    color = colors.fgMuted,
+                )
+            }
+        }
+    }
+}
+
+private fun extractAssistantReplyText(reply: FfiTimelineItem.AssistantMessage): String =
+    reply.text.trim()
+
+private fun stepStableKey(item: FfiTimelineItem): String = when (item) {
+    is FfiTimelineItem.UserPrompt -> "user:${item.messageId}"
+    is FfiTimelineItem.AssistantThinking -> "think:${item.itemId}:${item.seq}"
+    is FfiTimelineItem.AssistantMessage -> "msg:${item.itemId}:${item.seq}"
+    is FfiTimelineItem.ToolCall -> "tool:${item.callId}:${item.seq}"
+    is FfiTimelineItem.PermissionRequest -> "perm:${item.requestId}"
+    is FfiTimelineItem.QuestionRequest -> "q:${item.requestId}"
+    is FfiTimelineItem.Notice -> "notice:${item.seq}"
+}
+
+@Composable
 private fun SettledWorkTrajectory(
     turn: FfiStageTurn,
+    activeCwd: String,
     describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
@@ -332,73 +548,60 @@ private fun SettledWorkTrajectory(
     val haptics = LocalHapticFeedback.current
     var expanded by rememberSaveable(turn.key) { mutableStateOf(false) }
 
-    val durationSec = ((turn.turnDurationMs ?: turn.thoughtDurationMs) ?: 0L) / 1000L
-    val baseSummary = turn.workSummaryLabel.ifBlank {
-        if (durationSec > 0L) "Thought for ${durationSec}s" else "Completed ${turn.foldedSteps.size} steps"
-    }
-    val summaryWithDuration = if (durationSec > 0L && !baseSummary.contains("${durationSec}s")) {
-        "$baseSummary · ${durationSec}s"
-    } else {
-        baseSummary
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (expanded) 90f else 0f,
+        animationSpec = tween(durationMillis = 180),
+        label = "settled_chevron",
+    )
+
+    val summaryText = buildString {
+        append(turn.workSummaryLabel.ifBlank { "${turn.foldedSteps.size} steps" })
+        turn.thoughtDurationMs?.takeIf { it >= 1000L }?.let { ms ->
+            append(" · Thought ${ms / 1000L}s")
+        }
     }
 
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = OrbitSpacing.xl + OrbitSpacing.md)
-                .clip(RoundedCornerShape(OrbitSpacing.sm))
+                .clip(RoundedCornerShape(8.dp))
                 .clickable {
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     expanded = !expanded
                 }
-                .padding(vertical = OrbitSpacing.xs),
+                .padding(vertical = 4.dp, horizontal = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
         ) {
             Icon(
-                imageVector = if (expanded) Icons.Outlined.ExpandMore else Icons.Outlined.ChevronRight,
+                imageVector = Icons.Outlined.ChevronRight,
                 contentDescription = if (expanded) "Collapse steps" else "Expand steps",
-                tint = colors.fgMuted,
-                modifier = Modifier.size(OrbitSpacing.iconSm),
+                tint = if (turn.workSummaryIncludesFailure) colors.dangerRemoved else colors.fgMuted,
+                modifier = Modifier
+                    .size(OrbitSpacing.iconSm)
+                    .rotate(chevronRotation),
             )
             Text(
-                text = summaryWithDuration,
+                text = summaryText,
                 style = typography.subheadMedium,
-                color = if (turn.hasUnrecoveredError) colors.dangerRemoved else colors.fgSecondary,
+                color = if (turn.workSummaryIncludesFailure) colors.dangerRemoved else colors.fgSecondary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f, fill = false),
             )
-            if (turn.workCounts.additions > 0u || turn.workCounts.deletions > 0u) {
-                Spacer(modifier = Modifier.width(OrbitSpacing.xs))
-                if (turn.workCounts.additions > 0u) {
-                    Text(
-                        text = "+${turn.workCounts.additions}",
-                        style = typography.metaMedium,
-                        color = colors.directAdded,
-                    )
-                }
-                if (turn.workCounts.deletions > 0u) {
-                    Text(
-                        text = "-${turn.workCounts.deletions}",
-                        style = typography.metaMedium,
-                        color = colors.dangerRemoved,
-                    )
-                }
-            }
         }
 
         AnimatedVisibility(
             visible = expanded,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut(),
+            enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(tween(150)),
+            exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(tween(120)),
         ) {
             HairlineStepRail(
-                items = turn.foldedSteps,
+                steps = turn.foldedSteps,
+                activeCwd = activeCwd,
                 describeStep = describeStep,
                 onOpenDiffFile = onOpenDiffFile,
                 onQuoteDiffLine = onQuoteDiffLine,
+                modifier = Modifier.padding(top = OrbitSpacing.xs),
             )
         }
     }
@@ -407,96 +610,121 @@ private fun SettledWorkTrajectory(
 @Composable
 private fun LiveTurnSegments(
     turn: FfiStageTurn,
+    activeCwd: String,
     describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-
-    if (turn.liveSegments.isEmpty()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = OrbitSpacing.xs),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-        ) {
-            BreathingDot(color = colors.primary)
-            Text(
-                text = turn.workSummaryLiveLabel.ifBlank { "Thinking..." },
-                style = typography.subheadMedium,
-                color = colors.fgSecondary,
-            )
-        }
-        return
-    }
+    val haptics = LocalHapticFeedback.current
 
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
+        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
     ) {
-        turn.liveSegments.forEach { segment ->
-            when (segment) {
+        turn.liveSegments.forEach { seg ->
+            when (seg) {
                 is FfiTurnLiveSegment.StepGroup -> {
-                    var expanded by rememberSaveable(segment.key) { mutableStateOf(segment.hasRunningStep) }
-                    val label = if (segment.hasRunningStep) {
-                        segment.summary.liveLabel.ifBlank { segment.summary.label.ifBlank { "Working..." } }
-                    } else {
-                        segment.summary.label.ifBlank { "Completed steps" }
+                    val rollUpThreshold = 5
+                    val shouldRollUp = seg.items.size >= rollUpThreshold
+                    var groupExpanded by rememberSaveable("${turn.key}:${seg.key}") {
+                        mutableStateOf(!shouldRollUp)
                     }
+                    val chevronRotation by animateFloatAsState(
+                        targetValue = if (groupExpanded) 90f else 0f,
+                        animationSpec = tween(durationMillis = 180),
+                        label = "live_chevron",
+                    )
+
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Row(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(OrbitSpacing.sm))
-                                .clickable { expanded = !expanded }
-                                .padding(vertical = OrbitSpacing.xs),
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    groupExpanded = !groupExpanded
+                                }
+                                .padding(vertical = 4.dp, horizontal = 2.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
                         ) {
-                            if (segment.hasRunningStep) {
-                                BreathingDot(color = colors.primary)
+                            if (seg.hasRunningStep) {
+                                BreathingDot(color = colors.fgSecondary)
                             } else {
                                 Icon(
-                                    imageVector = if (expanded) Icons.Outlined.ExpandMore else Icons.Outlined.ChevronRight,
+                                    imageVector = Icons.Outlined.ChevronRight,
                                     contentDescription = null,
                                     tint = colors.fgMuted,
-                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                    modifier = Modifier
+                                        .size(OrbitSpacing.iconSm)
+                                        .rotate(chevronRotation),
                                 )
                             }
                             Text(
-                                text = label,
+                                text = if (seg.hasRunningStep) {
+                                    seg.summary.liveLabel.ifBlank { seg.summary.label }
+                                } else {
+                                    seg.summary.label
+                                },
                                 style = typography.subheadMedium,
-                                color = colors.fgSecondary,
+                                color = if (seg.summary.labelIncludesFailure) colors.dangerRemoved else colors.fgSecondary,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
                         }
-                        AnimatedVisibility(visible = expanded) {
+
+                        AnimatedVisibility(
+                            visible = groupExpanded,
+                            enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(tween(150)),
+                            exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(tween(120)),
+                        ) {
+                            val displayedItems = if (!groupExpanded && shouldRollUp) {
+                                seg.items.takeLast(2)
+                            } else {
+                                seg.items
+                            }
                             HairlineStepRail(
-                                items = segment.items,
+                                steps = displayedItems,
+                                activeCwd = activeCwd,
                                 describeStep = describeStep,
                                 onOpenDiffFile = onOpenDiffFile,
                                 onQuoteDiffLine = onQuoteDiffLine,
+                                modifier = Modifier.padding(top = OrbitSpacing.xs),
+                            )
+                        }
+
+                        // When rolled up on >= 5 steps and collapsed, keep newest running/latest step visible below header
+                        if (shouldRollUp && !groupExpanded && seg.items.isNotEmpty()) {
+                            HairlineStepRail(
+                                steps = listOf(seg.items.last()),
+                                activeCwd = activeCwd,
+                                describeStep = describeStep,
+                                onOpenDiffFile = onOpenDiffFile,
+                                onQuoteDiffLine = onQuoteDiffLine,
+                                modifier = Modifier.padding(top = OrbitSpacing.xs),
                             )
                         }
                     }
                 }
+
                 is FfiTurnLiveSegment.AssistantMessage -> {
-                    (segment.item as? FfiTimelineItem.AssistantMessage)?.let { msg ->
+                    (seg.item as? FfiTimelineItem.AssistantMessage)?.let { msg ->
                         MarkdownBlocks(
                             blocks = msg.blocks,
                             fallbackText = msg.text,
-                            textColor = colors.fgPrimary,
                         )
                     }
                 }
+
                 is FfiTurnLiveSegment.Notice -> {
-                    (segment.item as? FfiTimelineItem.Notice)?.let { NoticeBannerRow(it) }
+                    (seg.item as? FfiTimelineItem.Notice)?.let { notice ->
+                        NoticeBannerRow(notice = notice)
+                    }
                 }
+
                 is FfiTurnLiveSegment.Compaction -> {
-                    CompactionDividerRow(label = segment.label)
+                    CompactionDividerRow(label = seg.label.ifBlank { "Context compacted" })
                 }
             }
         }
@@ -505,19 +733,20 @@ private fun LiveTurnSegments(
 
 @Composable
 private fun HairlineStepRail(
-    items: List<FfiTimelineItem>,
+    steps: List<FfiTimelineItem>,
+    activeCwd: String,
     describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
-
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .height(IntrinsicSize.Min)
-            .padding(start = OrbitSpacing.sm, top = OrbitSpacing.xs, bottom = OrbitSpacing.xs),
+            .height(IntrinsicSize.Min),
     ) {
+        Spacer(modifier = Modifier.width(6.dp))
         Box(
             modifier = Modifier
                 .width(1.dp)
@@ -527,119 +756,178 @@ private fun HairlineStepRail(
         Spacer(modifier = Modifier.width(OrbitSpacing.md))
         Column(
             modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
         ) {
-            items.forEach { item ->
-                StepRow(
-                    item = item,
-                    descriptor = describeStep(item),
-                    onOpenDiffFile = onOpenDiffFile,
-                    onQuoteDiffLine = onQuoteDiffLine,
-                )
+            steps.forEach { step ->
+                val stableKey = stepStableKey(step)
+                androidx.compose.runtime.key(stableKey) {
+                    StepRow(
+                        item = step,
+                        stableKey = stableKey,
+                        activeCwd = activeCwd,
+                        describeStep = describeStep,
+                        onOpenDiffFile = onOpenDiffFile,
+                        onQuoteDiffLine = onQuoteDiffLine,
+                    )
+                }
             }
         }
     }
 }
 
+private fun semanticStepIcon(
+    kind: FfiToolStepKind?,
+    target: String,
+): ImageVector = when (kind) {
+    FfiToolStepKind.FILE_READ -> orbitSemanticFileIcon(OrbitFormatters.shortPath(target))
+    FfiToolStepKind.FILE_CREATE,
+    FfiToolStepKind.FILE_EDIT -> Icons.Outlined.Edit
+    FfiToolStepKind.SHELL -> Icons.Outlined.Terminal
+    FfiToolStepKind.SEARCH -> {
+        val lower = target.lowercase()
+        if (lower.startsWith("http://") || lower.startsWith("https://") || lower.contains("web")) {
+            Icons.Outlined.Language
+        } else {
+            Icons.Outlined.Search
+        }
+    }
+    FfiToolStepKind.SUBAGENT -> Icons.Outlined.Hub
+    FfiToolStepKind.GENERIC, null -> Icons.Outlined.Build
+}
+
 @Composable
 private fun StepRow(
     item: FfiTimelineItem,
-    descriptor: FfiToolStepDescriptor?,
+    stableKey: String,
+    activeCwd: String,
+    describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
+    val haptics = LocalHapticFeedback.current
 
     when (item) {
         is FfiTimelineItem.AssistantThinking -> {
-            var open by remember { mutableStateOf(false) }
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(OrbitSpacing.xs))
-                    .clickable(enabled = item.text.isNotBlank()) { open = !open }
-            ) {
+            var expanded by rememberSaveable(stableKey) { mutableStateOf(false) }
+            val hasBody = item.text.isNotBlank()
+            Column(modifier = Modifier.fillMaxWidth()) {
                 Row(
-                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable(enabled = hasBody) {
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            expanded = !expanded
+                        }
+                        .padding(vertical = 3.dp),
                     horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    Icon(
+                        imageVector = Icons.Outlined.AutoAwesome,
+                        contentDescription = null,
+                        tint = colors.fgMuted,
+                        modifier = Modifier.size(14.dp),
+                    )
                     Text(
                         text = item.headline.ifBlank { "Thought" },
-                        style = typography.subhead,
-                        color = colors.fgMuted,
+                        style = typography.metaMedium,
+                        color = colors.fgSecondary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false),
+                        modifier = Modifier.weight(1f),
                     )
-                    if (item.text.isNotBlank()) {
+                    if (hasBody) {
+                        val rot by animateFloatAsState(
+                            targetValue = if (expanded) 90f else 0f,
+                            animationSpec = tween(160),
+                            label = "think_chevron",
+                        )
                         Icon(
-                            imageVector = if (open) Icons.Outlined.ExpandMore else Icons.Outlined.ChevronRight,
+                            imageVector = Icons.Outlined.ChevronRight,
                             contentDescription = null,
                             tint = colors.fgMuted,
-                            modifier = Modifier.size(OrbitSpacing.iconSm),
+                            modifier = Modifier
+                                .size(14.dp)
+                                .rotate(rot),
                         )
                     }
                 }
-                AnimatedVisibility(visible = open && item.text.isNotBlank()) {
-                    Text(
-                        text = item.text.trim(),
-                        style = typography.subhead,
-                        color = colors.fgSecondary,
-                        modifier = Modifier.padding(top = OrbitSpacing.xs),
-                    )
+
+                if (hasBody) {
+                    AnimatedVisibility(
+                        visible = expanded,
+                        enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(tween(140)),
+                        exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(tween(110)),
+                    ) {
+                        SelectionContainer {
+                            Text(
+                                text = item.text.trim(),
+                                style = typography.meta,
+                                color = colors.fgSecondary,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = OrbitSpacing.lg, top = 2.dp, bottom = OrbitSpacing.xs),
+                            )
+                        }
+                    }
                 }
             }
         }
-        is FfiTimelineItem.ToolCall -> {
-            val haptics = LocalHapticFeedback.current
-            var expanded by rememberSaveable(item.callId) { mutableStateOf(false) }
 
-            val dotColor = when (item.status) {
-                FfiToolStatus.RUNNING -> colors.primary
-                FfiToolStatus.COMPLETED -> colors.directAdded
-                FfiToolStatus.FAILED -> colors.dangerRemoved
-                FfiToolStatus.DENIED -> colors.warning
+        is FfiTimelineItem.ToolCall -> {
+            val descriptor = remember(item, activeCwd) { describeStep(item) }
+            val stepKind = descriptor?.kind
+            val verb = descriptor?.verb?.takeIf { it.isNotBlank() } ?: "Run"
+            val targetRaw = descriptor?.target?.takeIf { it.isNotBlank() } ?: item.summaryTitle
+            val targetDisplay = remember(targetRaw, activeCwd) {
+                OrbitFormatters.stripWorkspacePrefix(targetRaw, activeCwd)
             }
+            val failed = item.status == FfiToolStatus.FAILED || item.status == FfiToolStatus.DENIED
+            val running = item.status == FfiToolStatus.RUNNING
+
+            var expanded by rememberSaveable(stableKey) { mutableStateOf(false) }
+            val hasDetails = item.diffFiles.isNotEmpty() ||
+                !item.previewBody.isNullOrBlank() ||
+                item.detail !is FfiToolCallDetail.FileRead
 
             Column(modifier = Modifier.fillMaxWidth()) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(min = 36.dp)
-                        .clip(RoundedCornerShape(OrbitSpacing.xs))
-                        .clickable {
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable(enabled = hasDetails) {
                             haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                             expanded = !expanded
                         }
-                        .padding(vertical = OrbitSpacing.xs),
+                        .padding(vertical = 3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
                 ) {
-                    if (item.status == FfiToolStatus.RUNNING) {
-                        BreathingDot(color = dotColor)
+                    if (running) {
+                        BreathingDot(color = colors.fgSecondary)
                     } else {
-                        Box(
-                            modifier = Modifier
-                                .size(6.dp)
-                                .background(dotColor, CircleShape)
+                        Icon(
+                            imageVector = semanticStepIcon(stepKind, targetDisplay),
+                            contentDescription = null,
+                            tint = if (failed) colors.dangerRemoved else colors.fgMuted,
+                            modifier = Modifier.size(14.dp),
                         )
                     }
 
-                    val verb = descriptor?.verb?.takeIf { it.isNotBlank() }
-                    val target = descriptor?.target?.takeIf { it.isNotBlank() } ?: item.summaryTitle
-
-                    if (verb != null) {
-                        Text(
-                            text = verb,
-                            style = typography.subheadMedium,
-                            color = colors.fgSecondary,
-                        )
-                    }
                     Text(
-                        text = target,
+                        text = verb,
+                        style = typography.metaMedium,
+                        color = if (failed) colors.dangerRemoved else colors.fgSecondary,
+                        maxLines = 1,
+                    )
+
+                    Text(
+                        text = targetDisplay,
                         style = typography.code,
-                        color = colors.fgPrimary,
+                        color = if (failed) colors.dangerRemoved else colors.fgPrimary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
@@ -649,432 +937,317 @@ private fun StepRow(
                         if (descriptor.additions > 0u) {
                             Text(
                                 text = "+${descriptor.additions}",
-                                style = typography.metaMedium,
+                                style = typography.meta,
                                 color = colors.directAdded,
                             )
                         }
                         if (descriptor.deletions > 0u) {
                             Text(
                                 text = "-${descriptor.deletions}",
-                                style = typography.metaMedium,
+                                style = typography.meta,
                                 color = colors.dangerRemoved,
                             )
                         }
                     }
 
-                    descriptor?.exitCode?.takeIf { it != 0 }?.let { code ->
+                    descriptor?.secondaryMeta?.takeIf { it.isNotBlank() }?.let { meta ->
                         Text(
-                            text = "exit $code",
-                            style = typography.metaMedium,
-                            color = colors.dangerRemoved,
+                            text = meta,
+                            style = typography.meta,
+                            color = colors.fgMuted,
+                            maxLines = 1,
                         )
                     }
 
-                    Icon(
-                        imageVector = if (expanded) Icons.Outlined.ExpandMore else Icons.Outlined.ChevronRight,
-                        contentDescription = if (expanded) "Collapse step detail" else "Expand step detail",
-                        tint = colors.fgMuted,
-                        modifier = Modifier.size(OrbitSpacing.iconSm),
-                    )
+                    if (hasDetails) {
+                        val rot by animateFloatAsState(
+                            targetValue = if (expanded) 90f else 0f,
+                            animationSpec = tween(160),
+                            label = "tool_chevron",
+                        )
+                        Icon(
+                            imageVector = Icons.Outlined.ChevronRight,
+                            contentDescription = null,
+                            tint = colors.fgMuted,
+                            modifier = Modifier
+                                .size(14.dp)
+                                .rotate(rot),
+                        )
+                    }
                 }
 
-                AnimatedVisibility(
-                    visible = expanded,
-                    enter = expandVertically() + fadeIn(),
-                    exit = shrinkVertically() + fadeOut(),
-                ) {
-                    ToolStepDetailPanel(
-                        tool = item,
-                        descriptor = descriptor,
-                        onOpenDiffFile = onOpenDiffFile,
-                        onQuoteDiffLine = onQuoteDiffLine,
-                    )
+                if (hasDetails) {
+                    AnimatedVisibility(
+                        visible = expanded,
+                        enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(tween(150)),
+                        exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(tween(120)),
+                    ) {
+                        ToolStepDetailPanel(
+                            item = item,
+                            descriptor = descriptor,
+                            onOpenDiffFile = onOpenDiffFile,
+                            onQuoteDiffLine = onQuoteDiffLine,
+                            modifier = Modifier.padding(top = OrbitSpacing.xs, bottom = OrbitSpacing.xs),
+                        )
+                    }
                 }
             }
         }
+
+        is FfiTimelineItem.Notice -> NoticeBannerRow(notice = item)
         is FfiTimelineItem.AssistantMessage -> {
             MarkdownBlocks(
                 blocks = item.blocks,
                 fallbackText = item.text,
-                textColor = colors.fgSecondary,
             )
         }
-        is FfiTimelineItem.PermissionRequest -> {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(6.dp)
-                        .background(colors.warning, CircleShape)
-                )
-                Text(
-                    text = "${item.title}: ${item.commandOrPath}",
-                    style = typography.meta,
-                    color = colors.fgSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        is FfiTimelineItem.Notice -> NoticeBannerRow(item)
-        else -> Unit
+        is FfiTimelineItem.PermissionRequest,
+        is FfiTimelineItem.QuestionRequest,
+        is FfiTimelineItem.UserPrompt -> Unit
     }
 }
 
-private const val INLINE_STEP_DIFF_PREVIEW_LIMIT = 16
-private const val INLINE_STEP_SNIPPET_LINE_LIMIT = 14
-
-private fun buildToolStepSnippetAndCopyPayload(
-    tool: FfiTimelineItem.ToolCall,
+private fun buildToolSnippetAndCopyPayload(
+    item: FfiTimelineItem.ToolCall,
     descriptor: FfiToolStepDescriptor?,
-): Pair<List<String>, String> {
-    val lines = mutableListOf<String>()
-    val copyText: String
-    when (val det = tool.detail) {
-        is FfiToolCallDetail.Shell -> {
-            val cmdLine = "$ ${det.command.trim()}"
-            lines += cmdLine
-            det.cwd?.takeIf { it.isNotBlank() }?.let { lines += "cwd: $it" }
-            val out = (det.outputPreview ?: tool.previewBody)?.trimEnd().orEmpty()
-            if (out.isNotBlank()) {
-                out.lines().forEach { lines += it }
-            }
-            copyText = if (out.isNotBlank()) "${det.command.trim()}\n$out" else det.command.trim()
+): Pair<String, String> = when (val d = item.detail) {
+    is FfiToolCallDetail.Shell -> {
+        val header = buildString {
+            append("$ ${d.command}")
+            d.exitCode?.let { append("  (exit $it)") }
         }
-        is FfiToolCallDetail.FileRead -> {
-            val rangeSuffix = when {
-                det.startLine != null && det.endLine != null -> ":L${det.startLine}-L${det.endLine}"
-                det.startLine != null -> ":L${det.startLine}+"
-                else -> ""
-            }
-            val fullTarget = "${det.path}$rangeSuffix"
-            lines += fullTarget
-            val preview = tool.previewBody?.trimEnd().orEmpty()
-            if (preview.isNotBlank()) {
-                preview.lines().forEach { lines += it }
-            }
-            copyText = if (preview.isNotBlank()) "$fullTarget\n$preview" else det.path
-        }
-        is FfiToolCallDetail.Search -> {
-            lines += "query: ${det.query}"
-            det.scope?.takeIf { it.isNotBlank() }?.let { lines += "scope: $it" }
-            val preview = tool.previewBody?.trimEnd().orEmpty()
-            if (preview.isNotBlank()) {
-                preview.lines().forEach { lines += it }
-            }
-            copyText = if (preview.isNotBlank()) "${det.query}\n$preview" else det.query
-        }
-        is FfiToolCallDetail.FileEdit -> {
-            lines += det.path
-            val patch = (det.unifiedDiff ?: tool.previewBody)?.trimEnd().orEmpty()
-            if (patch.isNotBlank()) {
-                patch.lines().forEach { lines += it }
-            }
-            copyText = if (patch.isNotBlank()) patch else det.path
-        }
-        is FfiToolCallDetail.Subagent -> {
-            lines += "role: ${det.role}"
-            det.promptPreview.trimEnd().takeIf { it.isNotBlank() }?.lines()?.forEach { lines += it }
-            tool.previewBody?.trimEnd()?.takeIf { it.isNotBlank() }?.lines()?.forEach { lines += it }
-            copyText = lines.joinToString("\n")
-        }
-        is FfiToolCallDetail.Generic -> {
-            lines += det.toolName.ifBlank { tool.summaryTitle }
-            det.argumentsJson.trim().takeIf { it.isNotBlank() && it != "{}" }?.lines()?.forEach { lines += it }
-            tool.previewBody?.trimEnd()?.takeIf { it.isNotBlank() }?.lines()?.forEach { lines += it }
-            copyText = lines.joinToString("\n")
-        }
+        val body = d.outputPreview?.trim().orEmpty().ifEmpty { item.previewBody?.trim().orEmpty() }
+        val combined = if (body.isNotEmpty()) "$header\n$body" else header
+        combined to combined
     }
-
-    if (lines.isEmpty()) {
-        val fallback = descriptor?.openPath?.takeIf { it.isNotBlank() }
-            ?: descriptor?.target?.takeIf { it.isNotBlank() }
-            ?: tool.summaryTitle
-        lines += fallback
-        return lines to fallback
+    is FfiToolCallDetail.FileRead -> {
+        val loc = buildString {
+            append(d.path)
+            if (d.startLine != null && d.endLine != null) {
+                append(":${d.startLine}-${d.endLine}")
+            }
+        }
+        val body = item.previewBody?.trim().orEmpty()
+        val display = if (body.isNotEmpty()) "$loc\n$body" else loc
+        display to (body.ifEmpty { loc })
     }
-
-    return lines to copyText
+    is FfiToolCallDetail.FileEdit -> {
+        val patch = d.unifiedDiff?.trim().orEmpty().ifEmpty { item.previewBody?.trim().orEmpty() }
+        patch to (patch.ifEmpty { d.path })
+    }
+    is FfiToolCallDetail.Search -> {
+        val q = if (d.scope != null) "${d.query} (${d.scope})" else d.query
+        val body = item.previewBody?.trim().orEmpty()
+        val combined = if (body.isNotEmpty()) "$q\n$body" else q
+        combined to combined
+    }
+    is FfiToolCallDetail.Subagent -> {
+        val body = buildString {
+            if (d.role.isNotBlank()) appendLine(d.role)
+            if (d.promptPreview.isNotBlank()) appendLine(d.promptPreview)
+            item.previewBody?.trim()?.takeIf { it.isNotEmpty() }?.let { append(it) }
+        }.trim()
+        body to body
+    }
+    is FfiToolCallDetail.Generic -> {
+        val preview = item.previewBody?.trim().orEmpty().ifEmpty { d.argumentsJson.trim() }
+        preview to preview
+    }
 }
 
 @Composable
 private fun ToolStepDetailPanel(
-    tool: FfiTimelineItem.ToolCall,
+    item: FfiTimelineItem.ToolCall,
     descriptor: FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
     onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
     val context = LocalContext.current
     val haptics = LocalHapticFeedback.current
-    val shape = RoundedCornerShape(OrbitSpacing.sm)
+    val panelShape = RoundedCornerShape(10.dp)
+    val (snippetText, copyPayload) = remember(item, descriptor) {
+        buildToolSnippetAndCopyPayload(item, descriptor)
+    }
+    var copied by remember(item.callId) { mutableStateOf(false) }
 
-    var copied by remember { mutableStateOf(false) }
     LaunchedEffect(copied) {
         if (copied) {
-            delay(1500)
+            delay(1500L)
             copied = false
         }
     }
 
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .padding(top = OrbitSpacing.xs)
-            .clip(shape)
-            .background(colors.subtleFill, shape)
-            .border(OrbitSpacing.hairline, colors.hairline, shape)
+            .clip(panelShape)
+            .background(colors.code, panelShape)
+            .border(OrbitSpacing.hairline, colors.hairline, panelShape)
             .padding(OrbitSpacing.sm),
         verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
     ) {
-        if (tool.diffFiles.isNotEmpty()) {
-            tool.diffFiles.forEach { df ->
-                InlineDiffFileBlock(
-                    file = df,
-                    onInspectFullDiff = {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onOpenDiffFile(df.path)
-                    },
-                    onQuoteLine = { lineLabel, content ->
-                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                        onQuoteDiffLine(df.path, lineLabel, content)
-                    },
-                )
-            }
-        } else {
-            val (allLines, copyPayload) = remember(tool, descriptor) {
-                buildToolStepSnippetAndCopyPayload(tool, descriptor)
-            }
-            val displayedLines = remember(allLines) {
-                allLines.take(INLINE_STEP_SNIPPET_LINE_LIMIT)
-            }
-            val omittedCount = (allLines.size - displayedLines.size).coerceAtLeast(0)
-
+        if (snippetText.isNotEmpty()) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
+                verticalAlignment = Alignment.Top,
             ) {
-                Text(
-                    text = descriptor?.secondaryMeta?.takeIf { it.isNotBlank() }
-                        ?: when (tool.detail) {
-                            is FfiToolCallDetail.Shell -> "Shell command"
-                            is FfiToolCallDetail.FileRead -> "File path"
-                            is FfiToolCallDetail.Search -> "Search query"
-                            is FfiToolCallDetail.FileEdit -> "Edited file"
-                            is FfiToolCallDetail.Subagent -> "Subagent"
-                            is FfiToolCallDetail.Generic -> "Tool detail"
-                        },
-                    style = typography.metaMedium,
-                    color = colors.fgMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-
-                val copyBtnShape = RoundedCornerShape(OrbitSpacing.xs)
-                Row(
+                SelectionContainer(
                     modifier = Modifier
-                        .clip(copyBtnShape)
-                        .clickable {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            cm?.setPrimaryClip(ClipData.newPlainText("step_snippet", copyPayload))
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            copied = true
-                        }
-                        .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                ) {
-                    Icon(
-                        imageVector = if (copied) Icons.Outlined.Check else Icons.Outlined.ContentCopy,
-                        contentDescription = "Copy step snippet",
-                        tint = if (copied) colors.directAdded else colors.fgSecondary,
-                        modifier = Modifier.size(OrbitSpacing.iconSm),
-                    )
-                    Text(
-                        text = if (copied) "Copied" else "Copy",
-                        style = typography.metaMedium,
-                        color = if (copied) colors.directAdded else colors.fgSecondary,
-                        maxLines = 1,
-                        softWrap = false,
-                    )
-                }
-            }
-
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs / 2),
-            ) {
-                displayedLines.forEachIndexed { idx, ln ->
-                    Text(
-                        text = ln,
-                        style = if (idx == 0) typography.codeMedium else typography.code,
-                        color = if (idx == 0) colors.fgPrimary else colors.fgSecondary,
-                        maxLines = 1,
-                        softWrap = false,
-                    )
-                }
-            }
-
-            if (omittedCount > 0) {
-                Text(
-                    text = "… $omittedCount more ${if (omittedCount == 1) "line" else "lines"}",
-                    style = typography.meta,
-                    color = colors.fgMuted,
-                )
-            }
-
-            (tool.detail as? FfiToolCallDetail.FileEdit)?.path?.takeIf { it.isNotBlank() }?.let { editPath ->
-                val inspectShape = RoundedCornerShape(OrbitSpacing.sm)
-                Box(
-                    modifier = Modifier
-                        .heightIn(min = 36.dp)
-                        .clip(inspectShape)
-                        .background(colors.elevated, inspectShape)
-                        .border(OrbitSpacing.hairline, colors.primary.copy(alpha = 0.55f), inspectShape)
-                        .clickable {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onOpenDiffFile(editPath)
-                        }
-                        .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.xs),
-                    contentAlignment = Alignment.Center,
+                        .weight(1f)
+                        .horizontalScroll(rememberScrollState()),
                 ) {
                     Text(
-                        text = "Inspect Full Diff",
-                        style = typography.metaSemiBold,
-                        color = colors.primary,
-                        maxLines = 1,
-                        softWrap = false,
+                        text = snippetText,
+                        style = typography.code,
+                        color = if (colors.isDark) Color(0xFFE6E8EE) else colors.fgPrimary,
                     )
                 }
+                if (copyPayload.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .size(26.dp)
+                            .clip(CircleShape)
+                            .clickable {
+                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                cm?.setPrimaryClip(ClipData.newPlainText("step_output", copyPayload))
+                                copied = true
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = if (copied) Icons.Outlined.Check else OrbitCopyIcon,
+                            contentDescription = "Copy output",
+                            tint = if (copied) colors.directAdded else colors.fgMuted,
+                            modifier = Modifier.size(13.dp),
+                        )
+                    }
+                }
             }
+        }
+
+        item.diffFiles.forEach { diffFile ->
+            InlineDiffFileBlock(
+                diffFile = diffFile,
+                onOpenDiffFile = { onOpenDiffFile(diffFile.path) },
+                onQuoteDiffLine = onQuoteDiffLine,
+            )
         }
     }
 }
 
 @Composable
 private fun InlineDiffFileBlock(
-    file: FfiDiffFile,
-    onInspectFullDiff: () -> Unit,
-    onQuoteLine: (lineLabel: String, content: String) -> Unit,
+    diffFile: FfiDiffFile,
+    onOpenDiffFile: () -> Unit,
+    onQuoteDiffLine: (path: String, lineLabel: String, content: String) -> Unit,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val previewLines = remember(file.lines) { file.lines.take(INLINE_STEP_DIFF_PREVIEW_LIMIT) }
-    val hiddenLines = (file.lines.size - previewLines.size).coerceAtLeast(0)
+    val shape = RoundedCornerShape(8.dp)
 
     Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(colors.canvas, shape)
+            .border(OrbitSpacing.hairline, colors.hairline, shape),
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onOpenDiffFile)
+                .padding(horizontal = OrbitSpacing.sm, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            Icon(
+                imageVector = orbitSemanticFileIcon(OrbitFormatters.shortPath(diffFile.path)),
+                contentDescription = null,
+                tint = colors.fgSecondary,
+                modifier = Modifier.size(13.dp),
+            )
             Text(
-                text = file.path,
+                text = OrbitFormatters.shortPath(diffFile.path),
                 style = typography.codeMedium,
                 color = colors.fgPrimary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs)) {
-                if (file.additions > 0u) {
-                    Text("+${file.additions}", style = typography.metaMedium, color = colors.directAdded)
-                }
-                if (file.deletions > 0u) {
-                    Text("-${file.deletions}", style = typography.metaMedium, color = colors.dangerRemoved)
-                }
+            if (diffFile.additions > 0u) {
+                Text(
+                    text = "+${diffFile.additions}",
+                    style = typography.meta,
+                    color = colors.directAdded,
+                )
+            }
+            if (diffFile.deletions > 0u) {
+                Text(
+                    text = "-${diffFile.deletions}",
+                    style = typography.meta,
+                    color = colors.dangerRemoved,
+                )
             }
         }
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(OrbitSpacing.xs))
-                .background(colors.code, RoundedCornerShape(OrbitSpacing.xs))
-                .border(OrbitSpacing.hairline, colors.hairline, RoundedCornerShape(OrbitSpacing.xs))
-                .horizontalScroll(rememberScrollState()),
-        ) {
-            previewLines.forEach { ln ->
-                val bg = when (ln.kind) {
-                    FfiDiffLineKind.ADDED -> colors.diffAddedBg
-                    FfiDiffLineKind.REMOVED -> colors.diffRemovedBg
-                    FfiDiffLineKind.HUNK_HEADER -> colors.diffHunkBg
-                    else -> Color.Transparent
-                }
-                val fg = when (ln.kind) {
-                    FfiDiffLineKind.ADDED -> colors.directAdded
-                    FfiDiffLineKind.REMOVED -> colors.dangerRemoved
-                    FfiDiffLineKind.HUNK_HEADER -> colors.primary
-                    FfiDiffLineKind.META -> colors.fgMuted
-                    FfiDiffLineKind.CONTEXT -> colors.fgSecondary
-                }
-                val lineNum = ln.newLine ?: ln.oldLine
-                val gutterPrefix = when (ln.kind) {
-                    FfiDiffLineKind.ADDED -> "+ "
-                    FfiDiffLineKind.REMOVED -> "- "
-                    FfiDiffLineKind.CONTEXT -> "  "
-                    FfiDiffLineKind.HUNK_HEADER, FfiDiffLineKind.META -> ""
-                }
-                Text(
-                    text = "$gutterPrefix${ln.content}",
-                    style = typography.code,
-                    color = fg,
-                    maxLines = 1,
-                    softWrap = false,
+
+        if (diffFile.lines.isNotEmpty()) {
+            HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
+            SelectionContainer {
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(bg)
-                        .clickable(enabled = ln.kind != FfiDiffLineKind.META) {
-                            val label = lineNum?.let { "L$it" } ?: "hunk"
-                            onQuoteLine(label, ln.content)
+                        .horizontalScroll(rememberScrollState())
+                        .padding(vertical = 4.dp),
+                ) {
+                    diffFile.lines.take(30).forEach { line ->
+                        val bg = when (line.kind) {
+                            FfiDiffLineKind.ADDED -> colors.diffAddedBg
+                            FfiDiffLineKind.REMOVED -> colors.diffRemovedBg
+                            else -> Color.Transparent
                         }
-                        .padding(horizontal = OrbitSpacing.xs, vertical = OrbitSpacing.xs / 4),
-                )
-            }
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (hiddenLines > 0) {
-                Text(
-                    text = "… $hiddenLines more ${if (hiddenLines == 1) "line" else "lines"}",
-                    style = typography.meta,
-                    color = colors.fgMuted,
-                )
-            } else {
-                Spacer(modifier = Modifier.width(OrbitSpacing.xs))
-            }
-
-            val inspectShape = RoundedCornerShape(OrbitSpacing.sm)
-            Box(
-                modifier = Modifier
-                    .heightIn(min = 36.dp)
-                    .clip(inspectShape)
-                    .background(colors.elevated, inspectShape)
-                    .border(OrbitSpacing.hairline, colors.primary.copy(alpha = 0.55f), inspectShape)
-                    .clickable { onInspectFullDiff() }
-                    .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.xs),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "Inspect Full Diff",
-                    style = typography.metaSemiBold,
-                    color = colors.primary,
-                    maxLines = 1,
-                    softWrap = false,
-                )
+                        val fg = when (line.kind) {
+                            FfiDiffLineKind.ADDED -> colors.directAdded
+                            FfiDiffLineKind.REMOVED -> colors.dangerRemoved
+                            FfiDiffLineKind.HUNK_HEADER,
+                            FfiDiffLineKind.META -> colors.fgMuted
+                            FfiDiffLineKind.CONTEXT -> colors.fgSecondary
+                        }
+                        val prefix = when (line.kind) {
+                            FfiDiffLineKind.ADDED -> "+"
+                            FfiDiffLineKind.REMOVED -> "-"
+                            else -> " "
+                        }
+                        val lineNo = (line.newLine ?: line.oldLine)?.toString() ?: ""
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(bg)
+                                .clickable(
+                                    enabled = line.kind == FfiDiffLineKind.ADDED || line.kind == FfiDiffLineKind.REMOVED
+                                ) {
+                                    onQuoteDiffLine(diffFile.path, lineNo, line.content)
+                                }
+                                .padding(horizontal = OrbitSpacing.sm, vertical = 1.dp),
+                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                        ) {
+                            Text(
+                                text = lineNo.padStart(4),
+                                style = typography.code,
+                                color = colors.fgMuted,
+                            )
+                            Text(
+                                text = "$prefix${line.content}",
+                                style = typography.code,
+                                color = fg,
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -1082,40 +1255,136 @@ private fun InlineDiffFileBlock(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun TurnFileDiffStrip(
+private fun TurnChangesBar(
     diffs: List<FfiTurnFileDiffSummary>,
+    activeCwd: String,
     onOpenDiffFile: (String) -> Unit,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
+    val haptics = LocalHapticFeedback.current
+    var expanded by remember { mutableStateOf(false) }
 
-    FlowRow(
-        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+    val totalAdditions = remember(diffs) { diffs.sumOf { it.additions.toLong() } }
+    val totalDeletions = remember(diffs) { diffs.sumOf { it.deletions.toLong() } }
+    val shape = RoundedCornerShape(10.dp)
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(colors.subtleFill, shape)
+            .border(OrbitSpacing.hairline, colors.hairline, shape)
+            .padding(horizontal = OrbitSpacing.sm, vertical = 6.dp),
         verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-        modifier = Modifier.padding(top = OrbitSpacing.xs),
     ) {
-        diffs.forEach { d ->
-            val shape = RoundedCornerShape(OrbitSpacing.sm)
-            Row(
-                modifier = Modifier
-                    .clip(shape)
-                    .background(colors.subtleFill, shape)
-                    .border(OrbitSpacing.hairline, colors.hairline, shape)
-                    .clickable { onOpenDiffFile(d.path) }
-                    .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-            ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    if (diffs.size == 1) {
+                        onOpenDiffFile(diffs.first().path)
+                    } else {
+                        expanded = !expanded
+                    }
+                },
+            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Difference,
+                contentDescription = null,
+                tint = colors.fgSecondary,
+                modifier = Modifier.size(14.dp),
+            )
+            Text(
+                text = if (diffs.size == 1) {
+                    OrbitFormatters.stripWorkspacePrefix(diffs.first().path, activeCwd)
+                } else {
+                    "${diffs.size} files changed"
+                },
+                style = typography.metaMedium,
+                color = colors.fgPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (totalAdditions > 0L) {
                 Text(
-                    text = OrbitFormatters.shortPath(d.path),
-                    style = typography.code,
-                    color = colors.fgPrimary,
+                    text = "+$totalAdditions",
+                    style = typography.meta,
+                    color = colors.directAdded,
                 )
-                if (d.additions > 0u) {
-                    Text("+${d.additions}", style = typography.metaMedium, color = colors.directAdded)
-                }
-                if (d.deletions > 0u) {
-                    Text("-${d.deletions}", style = typography.metaMedium, color = colors.dangerRemoved)
+            }
+            if (totalDeletions > 0L) {
+                Text(
+                    text = "-$totalDeletions",
+                    style = typography.meta,
+                    color = colors.dangerRemoved,
+                )
+            }
+            if (diffs.size > 1) {
+                val rot by animateFloatAsState(
+                    targetValue = if (expanded) 90f else 0f,
+                    animationSpec = tween(160),
+                    label = "changes_chevron",
+                )
+                Icon(
+                    imageVector = Icons.Outlined.ChevronRight,
+                    contentDescription = null,
+                    tint = colors.fgMuted,
+                    modifier = Modifier
+                        .size(14.dp)
+                        .rotate(rot),
+                )
+            }
+        }
+
+        if (diffs.size > 1) {
+            AnimatedVisibility(
+                visible = expanded,
+                enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(tween(140)),
+                exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(tween(110)),
+            ) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                    verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                    modifier = Modifier.padding(top = 2.dp),
+                ) {
+                    diffs.forEach { d ->
+                        val pillShape = RoundedCornerShape(7.dp)
+                        Row(
+                            modifier = Modifier
+                                .clip(pillShape)
+                                .background(colors.canvas, pillShape)
+                                .border(OrbitSpacing.hairline, colors.hairline, pillShape)
+                                .clickable { onOpenDiffFile(d.path) }
+                                .padding(horizontal = 7.dp, vertical = 3.dp),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = OrbitFormatters.shortPath(d.path),
+                                style = typography.code,
+                                color = colors.fgPrimary,
+                            )
+                            if (d.additions > 0u) {
+                                Text(
+                                    text = "+${d.additions}",
+                                    style = typography.meta,
+                                    color = colors.directAdded,
+                                )
+                            }
+                            if (d.deletions > 0u) {
+                                Text(
+                                    text = "-${d.deletions}",
+                                    style = typography.meta,
+                                    color = colors.dangerRemoved,
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1126,49 +1395,35 @@ private fun TurnFileDiffStrip(
 private fun NoticeBannerRow(notice: FfiTimelineItem.Notice) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val isError = notice.level.equals("error", ignoreCase = true)
-    val isWarn = notice.level.equals("warn", ignoreCase = true) || notice.level.equals("warning", ignoreCase = true)
-    val fg = when {
-        isError -> colors.dangerRemoved
-        isWarn -> colors.warning
-        else -> colors.fgSecondary
-    }
-
+    val isErr = notice.level.equals("error", ignoreCase = true)
+    val shape = RoundedCornerShape(10.dp)
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(colors.subtleFill, RoundedCornerShape(OrbitSpacing.sm))
-            .border(OrbitSpacing.hairline, colors.hairline, RoundedCornerShape(OrbitSpacing.sm))
+            .clip(shape)
+            .background(if (isErr) colors.diffRemovedBg else colors.subtleFill, shape)
+            .border(
+                OrbitSpacing.hairline,
+                if (isErr) colors.dangerRemoved.copy(alpha = 0.45f) else colors.hairline,
+                shape,
+            )
             .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(
-            text = notice.message,
-            style = typography.subhead,
-            color = fg,
+        Icon(
+            imageVector = Icons.Outlined.ErrorOutline,
+            contentDescription = null,
+            tint = if (isErr) colors.dangerRemoved else colors.fgSecondary,
+            modifier = Modifier.size(15.dp),
         )
-    }
-}
-
-@Composable
-private fun CompactionDividerRow(label: String) {
-    val colors = OrbitTheme.colors
-    val typography = OrbitTheme.typography
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = OrbitSpacing.xs),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-    ) {
-        HorizontalDivider(modifier = Modifier.weight(1f), thickness = OrbitSpacing.hairline, color = colors.hairline)
-        Text(
-            text = label,
-            style = typography.meta,
-            color = colors.fgMuted,
-        )
-        HorizontalDivider(modifier = Modifier.weight(1f), thickness = OrbitSpacing.hairline, color = colors.hairline)
+        SelectionContainer {
+            Text(
+                text = notice.message,
+                style = typography.meta,
+                color = if (isErr) colors.dangerRemoved else colors.fgSecondary,
+            )
+        }
     }
 }
 

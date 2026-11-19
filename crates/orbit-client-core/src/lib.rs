@@ -144,6 +144,8 @@ pub enum ClientCoreError {
     ChannelClosed,
     #[error("lock poisoned")]
     LockPoisoned,
+    #[error("{0}")]
+    Transport(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ClientCoreError {

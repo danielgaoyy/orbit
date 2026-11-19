@@ -44,6 +44,7 @@ use crate::manager::{AgentOrchestrator, DaemonBroadcast, PtyBroadcast};
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
 const E2EE_FRAME_WIRE: u8 = 0x00;
 const E2EE_FRAME_TERMINAL: u8 = 0x01;
+const MAX_REMOTE_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonPersistedConfig {
@@ -835,6 +836,38 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::StageAttachment {
+            request_id,
+            filename,
+            mime_type: _,
+            data_b64,
+        } => {
+            let tx = out_tx.clone();
+            let home_dir = runtime.home_dir.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    stage_daemon_attachment(&home_dir, &filename, &data_b64)
+                })
+                .await
+                {
+                    Ok(Ok((path, clean_name, size_bytes))) => WireMessage::AttachmentStaged {
+                        request_id,
+                        path,
+                        filename: clean_name,
+                        size_bytes,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "stage_attachment_error", e),
+                    Err(e) => rpc_err(
+                        request_id,
+                        "stage_attachment_error",
+                        format!("attachment worker panicked: {e}"),
+                    ),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
 
         // Agents
         WireMessage::ListAgents {
@@ -1215,6 +1248,64 @@ fn rpc_err(request_id: uuid::Uuid, code: &str, message: impl ToString) -> WireMe
     }
 }
 
+fn stage_daemon_attachment(
+    home_dir: &Path,
+    raw_filename: &str,
+    data_b64: &str,
+) -> Result<(String, String, u64), String> {
+    use base64::Engine as _;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.trim())
+        .map_err(|e| format!("Invalid base64 payload: {e}"))?;
+
+    if bytes.is_empty() {
+        return Err("Attachment is empty".into());
+    }
+    if bytes.len() > MAX_REMOTE_ATTACHMENT_BYTES {
+        return Err("Attachment exceeds 10 MiB limit".into());
+    }
+
+    let leaf = raw_filename.rsplit(['/', '\\']).next().unwrap_or("");
+    let sanitized: String = leaf
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_start_matches(['.', '_']);
+    let clean_name = if trimmed.is_empty() || trimmed == ".." {
+        "attachment.bin".to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    let attachments_dir = home_dir.join("attachments");
+    std::fs::create_dir_all(&attachments_dir)
+        .map_err(|e| format!("Failed to create attachments directory: {e}"))?;
+
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let uid_hex = uuid::Uuid::new_v4().simple().to_string();
+    let short_id = uid_hex.get(..8).unwrap_or(&uid_hex);
+    let unique_name = format!("{ts_ms}_{short_id}_{clean_name}");
+    let dest = attachments_dir.join(unique_name);
+
+    std::fs::write(&dest, &bytes).map_err(|e| format!("Failed to write staged attachment: {e}"))?;
+
+    Ok((
+        dest.to_string_lossy().to_string(),
+        clean_name,
+        bytes.len() as u64,
+    ))
+}
+
 fn hostname_string() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -1225,4 +1316,45 @@ fn hostname_string() -> String {
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "orbit-host".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn stage_daemon_attachment_writes_sanitized_file_and_rejects_oversize() {
+        let dir =
+            std::env::temp_dir().join(format!("orbit_daemon_attach_{}", uuid::Uuid::new_v4()));
+        let payload = b"hello orbit attachment";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+
+        // Normal file write
+        let (path, name, size) =
+            stage_daemon_attachment(&dir, "screenshot 1.jpg", &b64).expect("stage normal");
+        assert_eq!(name, "screenshot_1.jpg");
+        assert_eq!(size, payload.len() as u64);
+        assert!(Path::new(&path).starts_with(dir.join("attachments")));
+        assert_eq!(std::fs::read(&path).expect("read back"), payload);
+
+        // Path traversal input is confined to home_dir/attachments
+        let (trav_path, trav_name, _) =
+            stage_daemon_attachment(&dir, "../../etc/passwd", &b64).expect("stage traversal");
+        assert_eq!(trav_name, "passwd");
+        assert!(Path::new(&trav_path).starts_with(dir.join("attachments")));
+
+        // Hidden / dot-only fallback
+        let (dot_path, dot_name, _) =
+            stage_daemon_attachment(&dir, "...", &b64).expect("stage dot");
+        assert_eq!(dot_name, "attachment.bin");
+        assert!(Path::new(&dot_path).starts_with(dir.join("attachments")));
+
+        // Oversize payload (> 10 MiB) is rejected
+        let too_big = vec![0x41u8; MAX_REMOTE_ATTACHMENT_BYTES + 1];
+        let big_b64 = base64::engine::general_purpose::STANDARD.encode(too_big);
+        assert!(stage_daemon_attachment(&dir, "big.bin", &big_b64).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

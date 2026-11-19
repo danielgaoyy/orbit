@@ -1,370 +1,461 @@
+import { SymbolGlyphModifier } from '@kit.ArkUI';
 import {
   AgentCardDto,
-  ClientProjectDto,
-  DirectoryEntryDto,
-  DirectoryListingDto,
-  DiscoveredProjectDto,
   HostCardDto,
   basenameOfPath,
   cwdPathsEquivalent,
-  formatAgentStatusLabel,
-  formatConnectionStateLabel
+  formatCompactRelativeTime,
+  formatCompactTopBarConnectionLabel
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
-  orbitButtonMeta,
   orbitButtonSubhead,
-  orbitInputSubhead,
-  orbitTextBody,
   orbitTextMeta,
-  orbitTextMono,
   orbitTextSubhead
 } from '../../theme/OrbitTokens';
-
-interface SidebarFilterChip {
-  key: string;
-  label: string;
-}
-
-const SIDEBAR_FILTERS: SidebarFilterChip[] = [
-  { key: 'all', label: 'All' },
-  { key: 'active', label: 'Active' },
-  { key: 'approvals', label: 'Approvals' }
-];
+import {
+  dismissHarmonyKeyboard,
+  resolveHostStatusColor,
+  resolveSelectedHost
+} from '../common/OrbitCommonControls';
+import {
+  MAX_VISIBLE_THREADS_PER_PROJECT,
+  SidebarProjectGroup,
+  buildSidebarNeedsAttention,
+  buildSidebarPinnedAgents,
+  buildSidebarUnifiedProjects
+} from './FleetProjectGrouping';
 
 @ComponentV2
 export struct FleetSidebar {
   @Local searchQuery: string = '';
-  @Local activeFilter: string = 'all';
+  @Local expandedMoreProjectIds: string[] = [];
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
-  private hostStatusDotColor(host: HostCardDto): string {
-    if (host.pending_approval_count > 0) {
-      return this.store.palette.statusWarning;
-    }
-    if (host.connection_state === 'online_direct') {
-      return this.store.palette.statusDirect;
-    }
-    if (host.connection_state === 'online_relay') {
-      return this.store.palette.statusRelay;
-    }
-    if (
-      host.connection_state === 'connecting_direct' ||
-      host.connection_state === 'connecting_relay'
-    ) {
-      return this.store.palette.accentPrimary;
-    }
-    return this.store.palette.fgMuted;
-  }
-
-  private normalizedQuery(): string {
+  @Computed
+  get normalizedQuery(): string {
     return this.searchQuery.trim().toLowerCase();
   }
 
-  private matchesAgentSearch(agent: AgentCardDto): boolean {
-    const q = this.normalizedQuery();
-    if (q.length === 0) {
-      return true;
-    }
-    const title = (agent.title.trim().length > 0 ? agent.title : 'Untitled Session').toLowerCase();
-    const cwd = agent.cwd.toLowerCase();
-    const cwdBase = basenameOfPath(agent.cwd).toLowerCase();
-    const provider = agent.provider.toLowerCase();
-    const providerLabel = agent.provider_label.toLowerCase();
-    return (
-      title.indexOf(q) >= 0 ||
-      cwd.indexOf(q) >= 0 ||
-      cwdBase.indexOf(q) >= 0 ||
-      provider.indexOf(q) >= 0 ||
-      providerLabel.indexOf(q) >= 0
-    );
+  @Computed
+  get selectedHostCard(): HostCardDto | null {
+    return resolveSelectedHost(this.store);
   }
 
-  private matchesProjectSearch(proj: ClientProjectDto): boolean {
-    const q = this.normalizedQuery();
-    if (q.length === 0) {
-      return true;
-    }
-    if (proj.name.toLowerCase().indexOf(q) >= 0) {
-      return true;
-    }
-    for (let i = 0; i < proj.directories.length; i++) {
-      const dir = proj.directories[i];
-      if (dir.toLowerCase().indexOf(q) >= 0) {
-        return true;
-      }
-      const liveBranch = this.store.resolveWorkspaceBranch(dir).toLowerCase();
-      if (liveBranch.length > 0 && liveBranch.indexOf(q) >= 0) {
-        return true;
-      }
-    }
-    return false;
+  @Computed
+  get needsAttentionList(): AgentCardDto[] {
+    return buildSidebarNeedsAttention(this.store.currentHostDetail, this.normalizedQuery);
   }
 
-  private matchesRepoSearch(repo: DiscoveredProjectDto): boolean {
-    const q = this.normalizedQuery();
-    if (q.length === 0) {
-      return true;
-    }
-    const name = repo.name.toLowerCase();
-    const path = repo.path.toLowerCase();
-    const liveBranch = this.store.resolveWorkspaceBranch(repo.path).toLowerCase();
-    const staticBranch = (repo.git_branch ?? '').toLowerCase();
-    return (
-      name.indexOf(q) >= 0 ||
-      path.indexOf(q) >= 0 ||
-      liveBranch.indexOf(q) >= 0 ||
-      staticBranch.indexOf(q) >= 0
-    );
-  }
-
-  private pinnedProjectsForHost(): ClientProjectDto[] {
-    const out: ClientProjectDto[] = [];
-    for (let i = 0; i < this.store.projects.length; i++) {
-      const p = this.store.projects[i];
-      if (p.host_id === this.store.selectedHostId && this.matchesProjectSearch(p)) {
-        out.push(p);
-      }
-    }
-    return out;
-  }
-
-  private discoveredRepos(): DiscoveredProjectDto[] {
-    const detail = this.store.currentHostDetail;
-    if (detail === null) {
+  @Computed
+  get pinnedList(): AgentCardDto[] {
+    const _seenRev = this.store.seenSeqRevision;
+    if (_seenRev < 0) {
       return [];
     }
-    const matched: DiscoveredProjectDto[] = [];
-    for (let i = 0; i < detail.discovered_projects.length; i++) {
-      const repo = detail.discovered_projects[i];
-      if (this.matchesRepoSearch(repo)) {
-        matched.push(repo);
-        if (matched.length >= 8) {
-          break;
-        }
-      }
+    return buildSidebarPinnedAgents(
+      this.store,
+      this.store.currentHostDetail,
+      this.store.selectedHostId,
+      this.normalizedQuery
+    );
+  }
+
+  @Computed
+  get unifiedProjects(): SidebarProjectGroup[] {
+    const _seenRev = this.store.seenSeqRevision;
+    if (_seenRev < 0) {
+      return [];
     }
-    return matched;
+    return buildSidebarUnifiedProjects(
+      this.store,
+      this.store.currentHostDetail,
+      this.store.selectedHostId,
+      this.normalizedQuery
+    );
   }
 
-  private directoryListing(): DirectoryListingDto | null {
-    const detail = this.store.currentHostDetail;
-    return detail !== null ? detail.directory_listing : null;
+  private isProjectMoreExpanded(projectId: string): boolean {
+    return this.expandedMoreProjectIds.indexOf(projectId) >= 0;
   }
 
-  private hasUnfilteredApprovals(): boolean {
-    const detail = this.store.currentHostDetail;
-    if (detail === null) {
+  private toggleProjectMoreExpanded(projectId: string): void {
+    if (this.isProjectMoreExpanded(projectId)) {
+      this.expandedMoreProjectIds = this.expandedMoreProjectIds.filter((id: string) => id !== projectId);
+    } else {
+      this.expandedMoreProjectIds = this.expandedMoreProjectIds.concat([projectId]);
+    }
+    this.store.triggerHaptic(6);
+  }
+
+  private hasCustomSortOrFilter(): boolean {
+    return (
+      this.store.sidebarProjectSort !== 'recent' ||
+      this.store.sidebarThreadFilter !== 'all'
+    );
+  }
+
+  private hostConnectionSummary(host: HostCardDto): string {
+    const conn = formatCompactTopBarConnectionLabel(host.connection_state, host.via_ssh_tunnel);
+    return host.last_ping_ms !== null ? `${conn} · ${host.last_ping_ms}ms` : conn;
+  }
+
+  private isAgentUnreadReactive(hostId: string, agent: AgentCardDto): boolean {
+    const rev = this.store.seenSeqRevision;
+    if (rev < 0 || hostId.length === 0) {
       return false;
     }
-    for (let i = 0; i < detail.agents.length; i++) {
-      const a = detail.agents[i];
-      if (
-        a.status.state !== 'closed' &&
-        (a.is_awaiting_permission || a.status.state === 'awaiting_permission')
-      ) {
-        return true;
-      }
-    }
-    return false;
+    return this.store.isThreadUnread(hostId, agent);
   }
 
-  private approvalAgents(): AgentCardDto[] {
-    const detail = this.store.currentHostDetail;
-    if (detail === null) {
-      return [];
+  private visibleThreadsForGroup(group: SidebarProjectGroup): AgentCardDto[] {
+    if (this.normalizedQuery.length > 0 || this.isProjectMoreExpanded(group.projectId)) {
+      return group.threads;
     }
-    const out: AgentCardDto[] = [];
-    for (let i = 0; i < detail.agents.length; i++) {
-      const a = detail.agents[i];
-      if (
-        a.status.state !== 'closed' &&
-        (a.is_awaiting_permission || a.status.state === 'awaiting_permission') &&
-        this.matchesAgentSearch(a)
-      ) {
-        out.push(a);
-      }
-    }
-    return out;
+    return group.threads.slice(0, MAX_VISIBLE_THREADS_PER_PROJECT);
   }
 
-  private activeAgents(): AgentCardDto[] {
-    const detail = this.store.currentHostDetail;
-    if (detail === null) {
-      return [];
-    }
-    const out: AgentCardDto[] = [];
-    for (let i = 0; i < detail.agents.length; i++) {
-      const a = detail.agents[i];
-      if (
-        a.status.state !== 'closed' &&
-        !a.is_awaiting_permission &&
-        a.status.state !== 'awaiting_permission' &&
-        a.is_running &&
-        this.matchesAgentSearch(a)
-      ) {
-        out.push(a);
+  @Builder
+  private renderFilterSortMenu() {
+    Menu() {
+      MenuItemGroup({ header: 'Sort by' }) {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.clock'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Recent',
+          symbolEndIcon: this.store.sidebarProjectSort === 'recent'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .onClick(() => {
+            this.store.setSidebarProjectSort('recent');
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.textformat'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Name',
+          symbolEndIcon: this.store.sidebarProjectSort === 'name'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .onClick(() => {
+            this.store.setSidebarProjectSort('name');
+          })
+      }
+
+      MenuItemGroup({ header: 'Show' }) {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.message'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'All Conversations',
+          symbolEndIcon: this.store.sidebarThreadFilter === 'all'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .onClick(() => {
+            this.store.setSidebarThreadFilter('all');
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.dot_circle'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Active & Unread',
+          symbolEndIcon: this.store.sidebarThreadFilter === 'active_unread'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .onClick(() => {
+            this.store.setSidebarThreadFilter('active_unread');
+          })
       }
     }
-    return out;
   }
 
-  private recentAgents(): AgentCardDto[] {
-    const detail = this.store.currentHostDetail;
-    if (detail === null) {
-      return [];
-    }
-    const out: AgentCardDto[] = [];
-    for (let i = 0; i < detail.agents.length; i++) {
-      const a = detail.agents[i];
-      if (
-        a.status.state !== 'closed' &&
-        !a.is_awaiting_permission &&
-        a.status.state !== 'awaiting_permission' &&
-        !a.is_running &&
-        this.matchesAgentSearch(a)
-      ) {
-        out.push(a);
+  @Builder
+  private renderHostSwitcherMenu() {
+    Menu() {
+      MenuItemGroup({ header: 'Hosts' }) {
+        ForEach(
+          this.store.hosts,
+          (host: HostCardDto) => {
+            MenuItem({
+              symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.dot_circle'))
+                .fontColor([resolveHostStatusColor(host, this.store)]),
+              content: host.display_name,
+              labelInfo: this.hostConnectionSummary(host),
+              symbolEndIcon: host.host_id === this.store.selectedHostId
+                ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+                : undefined
+            })
+              .labelFontColor(this.store.palette.fgMuted)
+              .onClick(() => {
+                this.store.selectHost(host.host_id);
+                this.store.triggerHaptic(8);
+              })
+          },
+          (host: HostCardDto) => `host_menu_${host.host_id}`
+        )
+      }
+
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.qrcode'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Pair New Host'
+        })
+          .onClick(() => {
+            this.store.openHostSettings();
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.bolt'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Connect Local Host'
+        })
+          .onClick(() => {
+            this.store.discoverAndPairLocalDaemon();
+          })
       }
     }
-    return out;
+  }
+
+  @Builder
+  private renderProjectContextMenu(group: SidebarProjectGroup) {
+    Menu() {
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.plus'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'New Session Here'
+        })
+          .onClick(() => {
+            this.store.startNewSessionDraft(group.primaryDir);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Select Workspace'
+        })
+          .onClick(() => {
+            this.store.startNewSessionDraft(group.primaryDir);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_left_arrow_right'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Diff Review'
+        })
+          .onClick(() => {
+            this.store.inspectGitDiffForCwd(group.primaryDir);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.code_square'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Terminal'
+        })
+          .onClick(() => {
+            this.store.openPtyTerminalInCwd(group.primaryDir);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier(
+            group.pinnedProjectId.length > 0 ? $r('sys.symbol.pin_slash') : $r('sys.symbol.pin')
+          ).fontColor([this.store.palette.iconPrimary]),
+          content: group.pinnedProjectId.length > 0 ? 'Unpin Project' : 'Pin Project'
+        })
+          .onClick(() => {
+            if (group.pinnedProjectId.length > 0) {
+              this.store.removePinnedProject(group.pinnedProjectId);
+            } else {
+              this.store.pinDirectoryAsProject(group.primaryDir);
+            }
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.square_and_square'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Copy Path'
+        })
+          .onClick(() => {
+            this.store.copyToClipboard(group.primaryDir, 'Copied path');
+          })
+      }
+    }
+  }
+
+  @Builder
+  private renderSessionContextMenu(agent: AgentCardDto) {
+    Menu() {
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier(
+            this.store.isThreadPinned(this.store.selectedHostId, agent.agent_id)
+              ? $r('sys.symbol.pin_slash')
+              : $r('sys.symbol.pin')
+          ).fontColor([this.store.palette.iconPrimary]),
+          content: this.store.isThreadPinned(this.store.selectedHostId, agent.agent_id)
+            ? 'Unpin Conversation'
+            : 'Pin Conversation'
+        })
+          .onClick(() => {
+            this.store.togglePinThread(this.store.selectedHostId, agent.agent_id);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.plus'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'New Session in Workspace'
+        })
+          .onClick(() => {
+            this.store.startNewSessionDraft(agent.cwd);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_left_arrow_right'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Diff Review'
+        })
+          .onClick(() => {
+            this.store.inspectGitDiffForCwd(agent.cwd);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.code_square'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Terminal'
+        })
+          .onClick(() => {
+            this.store.openPtyTerminalInCwd(agent.cwd);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.square_and_square'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Copy Workspace Path'
+        })
+          .onClick(() => {
+            this.store.copyToClipboard(agent.cwd, 'Copied path');
+          })
+      }
+
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
+            .fontColor([this.store.palette.statusDanger]),
+          content: 'Archive'
+        })
+          .contentFontColor(this.store.palette.statusDanger)
+          .onClick(() => {
+            this.store.archiveSession(agent.agent_id);
+          })
+      }
+    }
   }
 
   @Builder
   private renderSwipeArchiveButton(agentId: string) {
     Row() {
-      Button('Archive')
-        .attributeModifier(
-          orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.statusDanger)
-        )
-        .height('100%')
-        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-        .borderRadius(OrbitTokens.CARD_RADIUS)
-        .onClick(() => {
-          this.store.archiveAgent(agentId);
-        })
+      Button({ type: ButtonType.Normal, stateEffect: true }) {
+        SymbolGlyph($r('sys.symbol.archivebox'))
+          .fontSize(16)
+          .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+          .fontColor([$r('sys.color.font_on_primary')])
+      }
+      .height('100%')
+      .constraintSize({ minWidth: OrbitTokens.HIT_MIN })
+      .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+      .backgroundColor(this.store.palette.statusDanger)
+      .borderRadius(OrbitTokens.RADIUS_MD)
+      .accessibilityText('Archive session')
+      .onClick(() => {
+        this.store.archiveSession(agentId);
+      })
     }
     .height('100%')
     .padding({ left: OrbitTokens.SPACE_XS })
   }
 
   @Builder
-  private renderSessionContextMenu(agent: AgentCardDto) {
-    Menu() {
-      MenuItem({ content: 'New Session in Workspace' })
-        .onClick(() => {
-          this.store.startNewSessionDraft(agent.cwd);
-        })
-      MenuItem({ content: 'Open Terminal Here' })
-        .onClick(() => {
-          this.store.openPtyTerminalInCwd(agent.cwd);
-        })
-      MenuItem({ content: 'Copy Workspace Path' })
-        .onClick(() => {
-          this.store.copyToClipboard(agent.cwd, 'Copied workspace path');
-        })
-      MenuItem({ content: 'Archive Session' })
-        .contentFontColor(this.store.palette.statusDanger)
-        .onClick(() => {
-          this.store.archiveAgent(agent.agent_id);
-        })
-    }
-  }
-
-  @Builder
-  private renderWorkspaceContextMenu(cwd: string) {
-    Menu() {
-      MenuItem({ content: 'New Session Here' })
-        .onClick(() => {
-          this.store.startNewSessionDraft(cwd);
-        })
-      MenuItem({
-        content: this.store.findPinnedProjectIdForCwd(cwd).length > 0
-          ? 'Unpin Workspace'
-          : 'Pin Workspace'
-      })
-        .onClick(() => {
-          if (this.store.findPinnedProjectIdForCwd(cwd).length > 0) {
-            this.store.unpinWorkspaceByCwd(cwd);
-          } else {
-            this.store.pinDirectoryAsProject(cwd);
-          }
-        })
-      MenuItem({ content: 'Inspect Git Diff' })
-        .onClick(() => {
-          this.store.inspectGitDiffForCwd(cwd);
-        })
-      MenuItem({ content: 'Open Terminal Here' })
-        .onClick(() => {
-          this.store.openPtyTerminalInCwd(cwd);
-        })
-      MenuItem({ content: 'Copy Path' })
-        .onClick(() => {
-          this.store.copyToClipboard(cwd, 'Copied workspace path');
-        })
-    }
-  }
-
-  @Builder
-  private renderAgentRow(agent: AgentCardDto) {
+  private renderConversationRow(
+    agent: AgentCardDto,
+    showWorkspaceHint: boolean,
+    indentLeft: number
+  ) {
     ListItem() {
       Row({ space: OrbitTokens.SPACE_SM }) {
-        Row()
-          .width(OrbitTokens.DOT_SIZE)
-          .height(OrbitTokens.DOT_SIZE)
-          .borderRadius(3)
-          .backgroundColor(
-            agent.is_awaiting_permission || agent.status.state === 'awaiting_permission'
-              ? this.store.palette.statusWarning
-              : agent.is_running
-                ? this.store.palette.accentPrimary
-                : agent.status.state === 'error'
-                  ? this.store.palette.statusDanger
-                  : this.store.palette.statusDirect
-          )
-          .margin({ top: 7 })
+        Row() {
+          if (agent.is_awaiting_permission) {
+            SymbolGlyph($r('sys.symbol.exclamationmark_triangle_fill'))
+              .fontSize(14)
+              .fontColor([this.store.palette.statusWarning])
+          } else if (agent.is_running) {
+            LoadingProgress()
+              .width(16)
+              .height(16)
+              .color(this.store.palette.iconSecondary)
+          } else if (this.isAgentUnreadReactive(this.store.selectedHostId, agent)) {
+            Row()
+              .width(7)
+              .height(7)
+              .borderRadius(3.5)
+              .backgroundColor(this.store.palette.unreadBadge)
+          }
+        }
+        .width(20)
+        .justifyContent(FlexAlign.Center)
+        .alignItems(VerticalAlign.Center)
 
         Column({ space: 2 }) {
-          Text(agent.title.trim().length > 0 ? agent.title : 'Untitled Session')
-            .attributeModifier(orbitTextBody(this.store.palette.fgPrimary, FontWeight.Medium))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-
-          Text(
-            `${basenameOfPath(agent.cwd)} · ${agent.provider_label} · ${formatAgentStatusLabel(agent)}`
-          )
+          Text(agent.title.trim().length > 0 ? agent.title : agent.provider_label)
             .attributeModifier(
-              orbitTextMeta(
-                agent.is_awaiting_permission
-                  ? this.store.palette.statusWarning
-                  : this.store.palette.fgSecondary,
-                FontWeight.Normal
+              orbitTextSubhead(
+                this.store.palette.fgPrimary,
+                !this.store.isNewSessionDraft && this.store.selectedAgentId === agent.agent_id
+                  ? FontWeight.Medium
+                  : FontWeight.Normal
               )
             )
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+          if (showWorkspaceHint) {
+            Text(basenameOfPath(agent.cwd))
+              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
+
+        if (formatCompactRelativeTime(agent.updated_at_rfc3339).length > 0) {
+          Text(formatCompactRelativeTime(agent.updated_at_rfc3339))
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+            .maxLines(1)
+        }
       }
       .width('100%')
       .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
       .padding({
-        left: OrbitTokens.SPACE_MD,
+        left: indentLeft,
         right: OrbitTokens.SPACE_MD,
-        top: OrbitTokens.SPACE_SM,
-        bottom: OrbitTokens.SPACE_SM
+        top: 6,
+        bottom: 6
       })
       .backgroundColor(
-        this.store.selectedAgentId === agent.agent_id
+        !this.store.isNewSessionDraft && this.store.selectedAgentId === agent.agent_id
           ? this.store.palette.subtleSurface
           : Color.Transparent
       )
-      .borderRadius(OrbitTokens.CARD_RADIUS)
-      .alignItems(VerticalAlign.Top)
+      .borderRadius(OrbitTokens.RADIUS_MD)
+      .alignItems(VerticalAlign.Center)
       .onClick(() => {
+        dismissHarmonyKeyboard(this.getUIContext());
         this.store.selectAgent(agent.agent_id);
       })
       .bindContextMenu(
@@ -374,6 +465,7 @@ export struct FleetSidebar {
         ResponseType.LongPress
       )
     }
+    .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, top: 1, bottom: 1 })
     .swipeAction({
       end: {
         builder: () => {
@@ -384,582 +476,450 @@ export struct FleetSidebar {
   }
 
   @Builder
-  private renderDirectoryBrowserPanel() {
-    if (this.store.showDirBrowser) {
-      Column({ space: OrbitTokens.SPACE_XS }) {
-        Row({ space: OrbitTokens.SPACE_XS }) {
-          Text(this.directoryListing()?.current_path ?? this.store.activeCwd)
-            .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Medium))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
+  private renderProjectHeaderRow(group: SidebarProjectGroup) {
+    ListItem() {
+      Row({ space: 6 }) {
+        SymbolGlyph(
+          this.normalizedQuery.length === 0 && this.store.isProjectCollapsed(group.projectId)
+            ? $r('sys.symbol.chevron_right')
+            : $r('sys.symbol.chevron_down')
+        )
+          .fontSize(12)
+          .fontColor([this.store.palette.fgMuted])
 
-          Button('Pin')
-            .attributeModifier(
-              orbitButtonMeta(this.store.palette.accentPrimary, this.store.palette.accentPrimarySoft)
+        SymbolGlyph($r('sys.symbol.folder'))
+          .fontSize(16)
+          .fontColor([
+            this.store.isNewSessionDraft && cwdPathsEquivalent(group.primaryDir, this.store.activeCwd)
+              ? this.store.palette.accentPrimary
+              : this.store.palette.iconSecondary
+          ])
+
+        Text(group.name)
+          .attributeModifier(
+            orbitTextSubhead(
+              this.store.palette.fgPrimary,
+              this.store.isNewSessionDraft && cwdPathsEquivalent(group.primaryDir, this.store.activeCwd)
+                ? FontWeight.Bold
+                : FontWeight.Medium
             )
-            .height(28)
-            .borderRadius(OrbitTokens.PILL_RADIUS)
-            .onClick(() => {
-              const cur = this.directoryListing()?.current_path ?? this.store.activeCwd;
-              this.store.pinDirectoryAsProject(cur);
-              this.store.showDirBrowser = false;
-            })
-
-          Button('Use')
-            .attributeModifier(
-              orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
-            )
-            .height(28)
-            .borderRadius(OrbitTokens.PILL_RADIUS)
-            .onClick(() => {
-              const cur = this.directoryListing()?.current_path ?? this.store.activeCwd;
-              this.store.startNewSessionDraft(cur);
-              this.store.showDirBrowser = false;
-            })
-        }
-        .width('100%')
-
-        if (
-          this.directoryListing() !== null &&
-          this.directoryListing()?.parent_path !== null
-        ) {
-          Row({ space: OrbitTokens.SPACE_SM }) {
-            Text('..')
-              .attributeModifier(orbitTextMono(this.store.palette.accentPrimary, FontWeight.Bold))
-            Text('Parent Directory')
-              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
-          }
-          .width('100%')
-          .height(36)
-          .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-          .onClick(() => {
-            this.store.browseDirectory(this.directoryListing()?.parent_path ?? null);
-          })
-        }
-
-        if (this.directoryListing() !== null) {
-          ForEach(
-            (this.directoryListing()?.entries ?? []).slice(0, 14),
-            (entry: DirectoryEntryDto) => {
-              Row({ space: OrbitTokens.SPACE_SM }) {
-                Text(entry.is_git_repo ? '⎇' : '▸')
-                  .attributeModifier(
-                    orbitTextMono(
-                      entry.is_git_repo
-                        ? this.store.palette.statusDirect
-                        : this.store.palette.fgMuted
-                    )
-                  )
-                Text(entry.name)
-                  .attributeModifier(orbitTextMono(this.store.palette.fgPrimary))
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .layoutWeight(1)
-              }
-              .width('100%')
-              .height(36)
-              .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-              .borderRadius(OrbitTokens.PILL_RADIUS)
-              .onClick(() => {
-                this.store.browseDirectory(entry.path);
-              })
-            },
-            (entry: DirectoryEntryDto) => entry.path
           )
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.plus'))
+            .fontSize(16)
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+            .fontColor([this.store.palette.iconSecondary])
         }
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding(0)
+        .backgroundColor(Color.Transparent)
+        .accessibilityText(`New session in ${group.name}`)
+        .onClick(() => {
+          dismissHarmonyKeyboard(this.getUIContext());
+          this.store.startNewSessionDraft(group.primaryDir);
+        })
       }
       .width('100%')
-      .padding(OrbitTokens.SPACE_SM)
-      .backgroundColor(this.store.palette.code)
-      .borderRadius(OrbitTokens.CARD_RADIUS)
-      .border({
-        width: OrbitTokens.HAIRLINE,
-        color: this.store.palette.hairline
+      .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+      .padding({ left: 8, right: 4 })
+      .backgroundColor(
+        this.store.isNewSessionDraft && cwdPathsEquivalent(group.primaryDir, this.store.activeCwd)
+          ? this.store.palette.subtleSurface
+          : Color.Transparent
+      )
+      .borderRadius(OrbitTokens.RADIUS_MD)
+      .alignItems(VerticalAlign.Center)
+      .onClick(() => {
+        dismissHarmonyKeyboard(this.getUIContext());
+        this.store.toggleProjectCollapsed(group.projectId);
       })
+      .bindContextMenu(
+        () => {
+          this.renderProjectContextMenu(group);
+        },
+        ResponseType.LongPress
+      )
     }
+    .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM, top: 1, bottom: 1 })
+  }
+
+  @Builder
+  private renderHostSwitcherPillBody() {
+    Row()
+      .width(8)
+      .height(8)
+      .borderRadius(4)
+      .backgroundColor(resolveHostStatusColor(this.selectedHostCard, this.store))
+
+    Text(this.selectedHostCard?.display_name ?? 'No Host')
+      .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
+      .maxLines(1)
+      .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+    if (this.selectedHostCard !== null) {
+      Text(this.hostConnectionSummary(this.selectedHostCard))
+        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+    } else {
+      Text('Tap to pair host')
+        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+        .maxLines(1)
+        .layoutWeight(1)
+    }
+
+    if (this.store.otherHostsPendingApprovals() > 0) {
+      Text(`${this.store.otherHostsPendingApprovals()}`)
+        .attributeModifier(orbitTextMeta(this.store.palette.statusWarning, FontWeight.Bold))
+        .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+        .borderRadius(OrbitTokens.RADIUS_MD)
+        .backgroundColor(this.store.palette.statusWarningSoft)
+    }
+
+    SymbolGlyph($r('sys.symbol.chevron_down'))
+      .fontSize(12)
+      .fontColor([this.store.palette.fgMuted])
   }
 
   build() {
-    Column({ space: OrbitTokens.SPACE_MD }) {
-      Column({ space: OrbitTokens.SPACE_SM }) {
-        Row() {
-          Text('FLEET HOSTS')
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-          Blank()
-          if (this.store.hosts.length > 0) {
-            Button('+ Add')
-              .attributeModifier(
-                orbitButtonMeta(this.store.palette.accentPrimary, Color.Transparent)
-              )
-              .height(28)
-              .onClick(() => {
-                this.store.openHostSettings();
-              })
-          }
-        }
-        .width('100%')
-
-        if (this.store.hosts.length === 0) {
-          Text('No hosts paired yet.')
-            .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted, FontWeight.Normal))
-        } else {
-          Scroll() {
-            Row({ space: OrbitTokens.SPACE_SM }) {
-              ForEach(
-                this.store.hosts,
-                (host: HostCardDto) => {
-                  Column({ space: 2 }) {
-                    Row({ space: OrbitTokens.SPACE_XS }) {
-                      Row()
-                        .width(OrbitTokens.DOT_SIZE)
-                        .height(OrbitTokens.DOT_SIZE)
-                        .borderRadius(3)
-                        .backgroundColor(this.hostStatusDotColor(host))
-
-                      Text(host.display_name)
-                        .attributeModifier(
-                          orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold)
-                        )
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    }
-
-                    Row({ space: OrbitTokens.SPACE_XS }) {
-                      Text(formatConnectionStateLabel(host.connection_state, host.via_ssh_tunnel))
-                        .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
-                      if (host.last_ping_ms !== null) {
-                        Text(`${host.last_ping_ms}ms`)
-                          .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
-                      }
-                    }
-                  }
-                  .alignItems(HorizontalAlign.Start)
-                  .constraintSize({ minWidth: 124, maxWidth: 180, minHeight: OrbitTokens.HIT_MIN })
-                  .padding({
-                    left: OrbitTokens.SPACE_MD,
-                    right: OrbitTokens.SPACE_MD,
-                    top: OrbitTokens.SPACE_SM,
-                    bottom: OrbitTokens.SPACE_SM
-                  })
-                  .backgroundColor(
-                    this.store.selectedHostId === host.host_id
-                      ? this.store.palette.elevated
-                      : Color.Transparent
-                  )
-                  .borderRadius(OrbitTokens.CARD_RADIUS)
-                  .border({
-                    width: OrbitTokens.HAIRLINE,
-                    color: this.store.selectedHostId === host.host_id
-                      ? this.store.palette.accentPrimary
-                      : this.store.palette.hairline
-                  })
-                  .onClick(() => {
-                    this.store.selectHost(host.host_id);
-                    this.store.triggerHaptic(8);
-                  })
-                },
-                (host: HostCardDto) => host.host_id
-              )
-            }
-          }
-          .scrollable(ScrollDirection.Horizontal)
-          .scrollBar(BarState.Off)
-          .width('100%')
-        }
-      }
-      .width('100%')
-      .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-
-      if (this.store.hosts.length === 0) {
-        Column({ space: OrbitTokens.SPACE_XS }) {
-          Text('Pair a host below to browse workspaces and sessions.')
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-        .alignItems(HorizontalAlign.Start)
-      } else {
-        // Instant Session & Workspace Search + Filter Chips
-        Column({ space: OrbitTokens.SPACE_SM }) {
-          Row({ space: OrbitTokens.SPACE_XS }) {
-            Text('⌕')
-              .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted, FontWeight.Normal))
-
-            TextInput({
-              placeholder: 'Search sessions or repos…',
-              text: this.searchQuery
-            })
-              .attributeModifier(
-                orbitInputSubhead(
-                  this.store.palette.fgPrimary,
-                  this.store.palette.fgMuted,
-                  Color.Transparent
-                )
-              )
-              .layoutWeight(1)
-              .height(36)
-              .padding(0)
-              .onChange((val: string) => {
-                this.searchQuery = val;
-              })
-
-            if (this.searchQuery.length > 0) {
-              Stack({ alignContent: Alignment.Center }) {
-                Text('×')
-                  .attributeModifier(
-                    orbitTextSubhead(this.store.palette.fgMuted, FontWeight.Bold)
-                  )
-              }
-              .width(OrbitTokens.HIT_MIN)
-              .height(OrbitTokens.HIT_MIN)
-              .accessibilityText('Clear search query')
-              .onClick(() => {
-                this.searchQuery = '';
-                this.store.triggerHaptic(6);
-              })
-            }
-          }
-          .width('100%')
-          .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-          .padding({ left: OrbitTokens.SPACE_SM, right: 0 })
-          .backgroundColor(this.store.palette.elevated)
-          .borderRadius(OrbitTokens.PILL_RADIUS)
-          .border({
-            width: OrbitTokens.HAIRLINE,
-            color: this.store.palette.hairline
-          })
-          .alignItems(VerticalAlign.Center)
-
-          Row({ space: OrbitTokens.SPACE_XS }) {
-            ForEach(
-              SIDEBAR_FILTERS,
-              (chip: SidebarFilterChip) => {
-                Row({ space: OrbitTokens.SPACE_XS }) {
-                  if (chip.key === 'approvals' && this.hasUnfilteredApprovals()) {
-                    Row()
-                      .width(OrbitTokens.DOT_SIZE)
-                      .height(OrbitTokens.DOT_SIZE)
-                      .borderRadius(3)
-                      .backgroundColor(this.store.palette.statusWarning)
-                  }
-                  Text(chip.label)
-                    .attributeModifier(
-                      orbitTextMeta(
-                        this.activeFilter === chip.key
-                          ? this.store.palette.accentPrimary
-                          : this.store.palette.fgSecondary,
-                        FontWeight.Medium
-                      )
-                    )
-                    .maxLines(1)
-                }
-                .height(28)
-                .layoutWeight(1)
-                .justifyContent(FlexAlign.Center)
-                .alignItems(VerticalAlign.Center)
-                .backgroundColor(
-                  this.activeFilter === chip.key
-                    ? this.store.palette.accentPrimarySoft
-                    : this.store.palette.subtleSurface
-                )
-                .borderRadius(OrbitTokens.PILL_RADIUS)
-                .border({
-                  width: OrbitTokens.HAIRLINE,
-                  color: this.activeFilter === chip.key
-                    ? this.store.palette.accentPrimary
-                    : this.store.palette.hairline
-                })
-                .onClick(() => {
-                  this.activeFilter = chip.key;
-                  this.store.triggerHaptic(6);
-                })
-              },
-              (chip: SidebarFilterChip) => chip.key
-            )
-          }
-          .width('100%')
-        }
-        .width('100%')
-        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-
-        List({ space: OrbitTokens.SPACE_XS }) {
-          if (
-            this.activeFilter === 'all' &&
-            (this.normalizedQuery().length === 0 ||
-              this.pinnedProjectsForHost().length > 0 ||
-              this.discoveredRepos().length > 0 ||
-              this.store.showDirBrowser)
-          ) {
-            ListItem() {
-              Column({ space: OrbitTokens.SPACE_XS }) {
-                Row() {
-                  Text('WORKSPACES')
-                    .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-                  Blank()
-                  Button(this.store.showDirBrowser ? 'Close' : 'Browse')
-                    .attributeModifier(
-                      orbitButtonMeta(this.store.palette.accentPrimary, Color.Transparent)
-                    )
-                    .height(28)
-                    .onClick(() => {
-                      if (this.store.showDirBrowser) {
-                        this.store.showDirBrowser = false;
-                      } else {
-                        this.store.browseDirectory(
-                          this.store.activeCwd === '~' ? null : this.store.activeCwd
-                        );
-                      }
-                    })
-                }
-                .width('100%')
-
-                this.renderDirectoryBrowserPanel()
-
-                ForEach(
-                  this.pinnedProjectsForHost(),
-                  (proj: ClientProjectDto) => {
-                    Row({ space: OrbitTokens.SPACE_SM }) {
-                      Text('★')
-                        .attributeModifier(orbitTextMeta(this.store.palette.accentPrimary))
-                      Text(proj.name)
-                        .attributeModifier(
-                          orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium)
-                        )
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        .layoutWeight(1)
-                      if (
-                        proj.directories.length > 0 &&
-                        this.store.resolveWorkspaceBranch(proj.directories[0]).length > 0
-                      ) {
-                        Text(this.store.resolveWorkspaceBranch(proj.directories[0]))
-                          .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
-                          .maxLines(1)
-                      }
-                    }
-                    .width('100%')
-                    .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-                    .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-                    .backgroundColor(
-                      proj.directories.length > 0 &&
-                        cwdPathsEquivalent(proj.directories[0], this.store.activeCwd)
-                        ? this.store.palette.subtleSurface
-                        : Color.Transparent
-                    )
-                    .borderRadius(OrbitTokens.PILL_RADIUS)
-                    .alignItems(VerticalAlign.Center)
-                    .onClick(() => {
-                      if (proj.directories.length > 0) {
-                        this.store.startNewSessionDraft(proj.directories[0]);
-                      }
-                    })
-                    .bindContextMenu(
-                      () => {
-                        if (proj.directories.length > 0) {
-                          this.renderWorkspaceContextMenu(proj.directories[0]);
-                        }
-                      },
-                      ResponseType.LongPress
-                    )
-                  },
-                  (proj: ClientProjectDto) => proj.project_id
-                )
-
-                ForEach(
-                  this.discoveredRepos(),
-                  (repo: DiscoveredProjectDto) => {
-                    Row({ space: OrbitTokens.SPACE_SM }) {
-                      Text('⎇')
-                        .attributeModifier(orbitTextMono(this.store.palette.statusDirect))
-                      Text(repo.name)
-                        .attributeModifier(
-                          orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal)
-                        )
-                        .maxLines(1)
-                        .textOverflow({ overflow: TextOverflow.Ellipsis })
-                        .layoutWeight(1)
-                      if (this.store.resolveWorkspaceBranch(repo.path).length > 0) {
-                        Text(this.store.resolveWorkspaceBranch(repo.path))
-                          .attributeModifier(orbitTextMono(this.store.palette.fgMuted))
-                          .maxLines(1)
-                      }
-                    }
-                    .width('100%')
-                    .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
-                    .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-                    .backgroundColor(
-                      cwdPathsEquivalent(repo.path, this.store.activeCwd)
-                        ? this.store.palette.subtleSurface
-                        : Color.Transparent
-                    )
-                    .borderRadius(OrbitTokens.PILL_RADIUS)
-                    .alignItems(VerticalAlign.Center)
-                    .onClick(() => {
-                      this.store.startNewSessionDraft(repo.path);
-                    })
-                    .bindContextMenu(
-                      () => {
-                        this.renderWorkspaceContextMenu(repo.path);
-                      },
-                      ResponseType.LongPress
-                    )
-                  },
-                  (repo: DiscoveredProjectDto) => repo.path
-                )
-              }
-              .width('100%')
-              .padding({ bottom: OrbitTokens.SPACE_SM })
-            }
-          }
-
-          if (this.activeFilter === 'all' || this.activeFilter === 'approvals') {
-            if (this.approvalAgents().length > 0) {
-              ListItem() {
-                Text('NEEDS APPROVAL')
-                  .attributeModifier(
-                    orbitTextMeta(this.store.palette.statusWarning, FontWeight.Bold)
-                  )
-                  .padding({ top: OrbitTokens.SPACE_SM, bottom: OrbitTokens.SPACE_XS })
-              }
-              ForEach(
-                this.approvalAgents(),
-                (agent: AgentCardDto) => {
-                  this.renderAgentRow(agent)
-                },
-                (agent: AgentCardDto) => `appr_${agent.agent_id}_${agent.latest_seq}`
-              )
-            } else if (this.activeFilter === 'approvals') {
-              ListItem() {
-                Text('No sessions awaiting approval.')
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-                  .padding({ top: OrbitTokens.SPACE_SM, bottom: OrbitTokens.SPACE_MD })
-              }
-            }
-          }
-
-          if (this.activeFilter === 'all' || this.activeFilter === 'active') {
-            if (this.activeAgents().length > 0) {
-              ListItem() {
-                Text('ACTIVE')
-                  .attributeModifier(
-                    orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Bold)
-                  )
-                  .padding({ top: OrbitTokens.SPACE_SM, bottom: OrbitTokens.SPACE_XS })
-              }
-              ForEach(
-                this.activeAgents(),
-                (agent: AgentCardDto) => {
-                  this.renderAgentRow(agent)
-                },
-                (agent: AgentCardDto) => `act_${agent.agent_id}_${agent.latest_seq}`
-              )
-            } else if (this.activeFilter === 'active') {
-              ListItem() {
-                Text('No active sessions running.')
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-                  .padding({ top: OrbitTokens.SPACE_SM, bottom: OrbitTokens.SPACE_MD })
-              }
-            }
-          }
-
-          if (this.activeFilter === 'all') {
-            ListItem() {
-              Row() {
-                Text('RECENT SESSIONS')
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-                Blank()
-                Button('New Session')
-                  .attributeModifier(
-                    orbitButtonMeta(this.store.palette.accentPrimary, Color.Transparent)
-                  )
-                  .height(28)
-                  .onClick(() => {
-                    this.store.startNewSessionDraft();
-                  })
-              }
-              .width('100%')
-              .padding({ top: OrbitTokens.SPACE_SM, bottom: OrbitTokens.SPACE_XS })
-            }
-
-            if (
-              this.recentAgents().length === 0 &&
-              this.activeAgents().length === 0 &&
-              this.approvalAgents().length === 0
-            ) {
-              ListItem() {
-                Text(
-                  this.normalizedQuery().length > 0
-                    ? 'No matching sessions found.'
-                    : 'No sessions on this host yet.'
-                )
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-                  .padding({ top: OrbitTokens.SPACE_XS, bottom: OrbitTokens.SPACE_MD })
-              }
-            } else {
-              ForEach(
-                this.recentAgents(),
-                (agent: AgentCardDto) => {
-                  this.renderAgentRow(agent)
-                },
-                (agent: AgentCardDto) => `rec_${agent.agent_id}_${agent.latest_seq}`
-              )
-            }
-          }
-        }
-        .width('100%')
-        .layoutWeight(1)
-        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-        .scrollBar(BarState.Auto)
-      }
-
+    Column() {
+      // 1. Native HarmonyOS 7 Search + Compose Action Row
       Row({ space: OrbitTokens.SPACE_SM }) {
-        Button('Pair Host')
-          .attributeModifier(
-            orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.elevated)
-          )
-          .height(OrbitTokens.HIT_MIN)
-          .borderRadius(OrbitTokens.CARD_RADIUS)
-          .border({
-            width: OrbitTokens.HAIRLINE,
-            color: this.store.palette.hairline
-          })
+        Search({ value: this.searchQuery, placeholder: 'Search' })
           .layoutWeight(1)
-          .onClick(() => {
-            this.store.scanQrAndPair(this.getUIContext().getHostContext());
+          .height(OrbitTokens.HIT_COMPACT)
+          .backgroundColor(this.store.palette.subtleSurface)
+          .placeholderColor(this.store.palette.fgMuted)
+          .fontColor(this.store.palette.fgPrimary)
+          .textFont({ size: OrbitTokens.FONT_SUBHEAD_RES })
+          .placeholderFont({ size: OrbitTokens.FONT_SUBHEAD_RES })
+          .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
+          .onChange((val: string) => {
+            this.searchQuery = val;
           })
 
-        Button('Settings')
-          .attributeModifier(
-            orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.elevated)
-          )
-          .height(OrbitTokens.HIT_MIN)
-          .borderRadius(OrbitTokens.CARD_RADIUS)
-          .border({
-            width: OrbitTokens.HAIRLINE,
-            color: this.store.palette.hairline
-          })
-          .layoutWeight(1)
-          .onClick(() => {
-            this.store.openHostSettings();
-          })
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.square_and_pencil'))
+            .fontSize(19)
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+            .fontColor([
+              this.store.selectedHostId.length > 0
+                ? this.store.palette.iconPrimary
+                : this.store.palette.fgMuted
+            ])
+        }
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding(0)
+        .backgroundColor(this.store.palette.subtleSurface)
+        .enabled(this.store.selectedHostId.length > 0)
+        .accessibilityText('New session')
+        .onClick(() => {
+          dismissHarmonyKeyboard(this.getUIContext());
+          if (this.store.selectedHostId.length > 0) {
+            this.store.startNewSessionDraft();
+          }
+        })
       }
       .width('100%')
       .padding({
         left: OrbitTokens.SPACE_MD,
         right: OrbitTokens.SPACE_MD,
         top: OrbitTokens.SPACE_SM,
-        bottom: Math.max(OrbitTokens.SPACE_MD, this.store.safeBottomVp)
+        bottom: OrbitTokens.SPACE_SM
       })
-      .border({
-        width: { top: OrbitTokens.HAIRLINE },
-        color: this.store.palette.hairline
+      .alignItems(VerticalAlign.Center)
+
+      // 2. Unified Projects -> Conversations Scroll Area
+      if (this.store.hosts.length === 0) {
+        Column({ space: OrbitTokens.SPACE_MD }) {
+          Column({ space: OrbitTokens.SPACE_SM }) {
+            Text('No Hosts Paired')
+              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
+            Text('Pair a remote Orbit daemon or connect a local daemon to browse workspaces and sessions.')
+              .attributeModifier(orbitTextSubhead(this.store.palette.fgSecondary, FontWeight.Normal))
+
+            Button('Connect Local Daemon')
+              .attributeModifier(
+                orbitButtonSubhead(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
+              )
+              .width('100%')
+              .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .onClick(() => {
+                this.store.discoverAndPairLocalDaemon();
+              })
+
+            Button('Pair Remote Host (QR / URI)')
+              .attributeModifier(
+                orbitButtonSubhead(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
+              )
+              .width('100%')
+              .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
+              .borderRadius(OrbitTokens.RADIUS_MD)
+              .onClick(() => {
+                this.store.scanQrAndPair(this.getUIContext().getHostContext());
+              })
+          }
+          .width('100%')
+          .padding(OrbitTokens.SPACE_LG)
+          .backgroundColor(this.store.palette.listCard)
+          .borderRadius(OrbitTokens.RADIUS_LG)
+          .alignItems(HorizontalAlign.Start)
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD, top: OrbitTokens.SPACE_LG })
+      } else {
+        List() {
+          if (this.needsAttentionList.length > 0) {
+            ListItem() {
+              Text('Needs Attention')
+                .attributeModifier(orbitTextMeta(this.store.palette.statusWarning, FontWeight.Medium))
+                .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 6, bottom: 4 })
+            }
+
+            ForEach(
+              this.needsAttentionList,
+              (agent: AgentCardDto) => {
+                this.renderConversationRow(agent, true, 12)
+              },
+              (agent: AgentCardDto) => `attn_${agent.agent_id}`
+            )
+          }
+
+          if (this.pinnedList.length > 0) {
+            ListItem() {
+              Text('Pinned')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+                .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: 10, bottom: 4 })
+            }
+
+            ForEach(
+              this.pinnedList,
+              (agent: AgentCardDto) => {
+                this.renderConversationRow(agent, true, 12)
+              },
+              (agent: AgentCardDto) => `pin_${agent.agent_id}`
+            )
+          }
+
+          ListItem() {
+            Row({ space: 4 }) {
+              Text('Projects')
+                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Medium))
+                .layoutWeight(1)
+
+              Button({ type: ButtonType.Circle, stateEffect: true }) {
+                SymbolGlyph($r('sys.symbol.sort'))
+                  .fontSize(17)
+                  .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                  .fontColor([
+                    this.hasCustomSortOrFilter()
+                      ? this.store.palette.accentPrimary
+                      : this.store.palette.iconSecondary
+                  ])
+              }
+              .width(OrbitTokens.HIT_COMPACT)
+              .height(OrbitTokens.HIT_COMPACT)
+              .padding(0)
+              .backgroundColor(Color.Transparent)
+              .accessibilityText('Sort and filter conversations')
+              .bindMenu(this.renderFilterSortMenu())
+
+              Button({ type: ButtonType.Circle, stateEffect: true }) {
+                SymbolGlyph($r('sys.symbol.folder_badge_plus'))
+                  .fontSize(17)
+                  .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                  .fontColor([
+                    this.store.showDirBrowser
+                      ? this.store.palette.accentPrimary
+                      : this.store.palette.iconSecondary
+                  ])
+              }
+              .width(OrbitTokens.HIT_COMPACT)
+              .height(OrbitTokens.HIT_COMPACT)
+              .padding(0)
+              .backgroundColor(Color.Transparent)
+              .accessibilityText('Browse remote directory')
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                if (this.store.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
+                  this.store.sidebarOpen = false;
+                }
+                this.store.browseDirectory(
+                  this.store.activeCwd === '~' ? null : this.store.activeCwd
+                );
+              })
+            }
+            .width('100%')
+            .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_SM, top: 8, bottom: 2 })
+            .alignItems(VerticalAlign.Center)
+          }
+
+          if (this.unifiedProjects.length === 0) {
+            ListItem() {
+              Column({ space: OrbitTokens.SPACE_SM }) {
+                Text(
+                  this.normalizedQuery.length > 0
+                    ? 'No matching projects or conversations.'
+                    : this.store.sidebarThreadFilter === 'active_unread'
+                      ? 'No active or unread conversations.'
+                      : 'No repositories discovered yet.'
+                )
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted, FontWeight.Normal))
+
+                if (this.normalizedQuery.length > 0) {
+                  Button('Clear search', { type: ButtonType.Normal, stateEffect: true })
+                    .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
+                    .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+                    .padding({ left: 0, right: OrbitTokens.SPACE_SM })
+                    .onClick(() => {
+                      this.searchQuery = '';
+                    })
+                } else if (this.store.sidebarThreadFilter !== 'all') {
+                  Button('Show all conversations', { type: ButtonType.Normal, stateEffect: true })
+                    .attributeModifier(orbitButtonSubhead(this.store.palette.accentPrimary, Color.Transparent))
+                    .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+                    .padding({ left: 0, right: OrbitTokens.SPACE_SM })
+                    .onClick(() => {
+                      this.store.setSidebarThreadFilter('all');
+                    })
+                }
+              }
+              .width('100%')
+              .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG, top: OrbitTokens.SPACE_MD })
+              .alignItems(HorizontalAlign.Start)
+            }
+          } else {
+            ForEach(
+              this.unifiedProjects,
+              (group: SidebarProjectGroup) => {
+                ListItemGroup() {
+                  this.renderProjectHeaderRow(group)
+
+                  if (
+                    this.normalizedQuery.length > 0 ||
+                    !this.store.isProjectCollapsed(group.projectId)
+                  ) {
+                    ForEach(
+                      this.visibleThreadsForGroup(group),
+                      (agent: AgentCardDto) => {
+                        this.renderConversationRow(agent, false, 20)
+                      },
+                      (agent: AgentCardDto) => `t_${group.projectId}_${agent.agent_id}`
+                    )
+
+                    if (
+                      this.normalizedQuery.length === 0 &&
+                      group.threads.length > MAX_VISIBLE_THREADS_PER_PROJECT
+                    ) {
+                      ListItem() {
+                        Button(
+                          this.isProjectMoreExpanded(group.projectId)
+                            ? 'Show less'
+                            : `Show ${group.threads.length - MAX_VISIBLE_THREADS_PER_PROJECT} more…`,
+                          { type: ButtonType.Normal, stateEffect: true }
+                        )
+                          .attributeModifier(orbitButtonSubhead(this.store.palette.fgMuted, Color.Transparent))
+                          .width('100%')
+                          .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+                          .padding({ left: 46, right: OrbitTokens.SPACE_MD })
+                          .onClick(() => {
+                            this.toggleProjectMoreExpanded(group.projectId);
+                          })
+                      }
+                      .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
+                    }
+                  }
+                }
+              },
+              (group: SidebarProjectGroup) => `proj_${group.projectId}`
+            )
+          }
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .scrollBar(BarState.Auto)
+        .edgeEffect(EdgeEffect.Spring)
+        .padding({ bottom: OrbitTokens.SPACE_SM })
+        .onScrollStart(() => {
+          dismissHarmonyKeyboard(this.getUIContext());
+        })
+      }
+
+      // 3. Thumb-Zone Bottom Bar: [ Host Switcher Capsule ] [ Settings Circle ]
+      Row({ space: OrbitTokens.SPACE_SM }) {
+        if (this.store.hosts.length > 0) {
+          Button({ type: ButtonType.Capsule, stateEffect: true }) {
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              this.renderHostSwitcherPillBody()
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+          }
+          .layoutWeight(1)
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+          .backgroundColor(this.store.palette.subtleSurface)
+          .accessibilityText('Switch active host')
+          .bindMenu(this.renderHostSwitcherMenu())
+        } else {
+          Button({ type: ButtonType.Capsule, stateEffect: true }) {
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              this.renderHostSwitcherPillBody()
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+          }
+          .layoutWeight(1)
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+          .backgroundColor(this.store.palette.subtleSurface)
+          .accessibilityText('Pair host')
+          .onClick(() => {
+            this.store.openHostSettings();
+          })
+        }
+
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.gearshape'))
+            .fontSize(19)
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+            .fontColor([this.store.palette.iconPrimary])
+        }
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding(0)
+        .backgroundColor(this.store.palette.subtleSurface)
+        .accessibilityText('Settings and hosts')
+        .onClick(() => {
+          dismissHarmonyKeyboard(this.getUIContext());
+          this.store.openHostSettings();
+        })
+      }
+      .width('100%')
+      .padding({
+        left: OrbitTokens.SPACE_MD,
+        right: OrbitTokens.SPACE_MD,
+        top: OrbitTokens.SPACE_SM,
+        bottom: 4
       })
+      .alignItems(VerticalAlign.Center)
     }
     .width('100%')
     .height('100%')
-    .padding({ top: Math.max(OrbitTokens.SPACE_SM, this.store.safeTopVp) })
+    .padding({
+      top: this.store.safeTopVp,
+      bottom: Math.max(this.store.safeBottomVp, 8),
+      left: this.store.safeLeftVp
+    })
     .backgroundColor(this.store.palette.drawer)
   }
 }

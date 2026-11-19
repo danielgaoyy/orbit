@@ -26,9 +26,20 @@ export struct StickyDecisionDock {
   @Local activeQueueIndex: number = 0;
   @Local selectedMultiOptions: string[] = [];
   @Local customAnswersRevision: number = 0;
+  @Local isPreviewExpanded: boolean = false;
   private customAnswersMap: Map<string, string> = new Map<string, string>();
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+
+  @Computed
+  get decisionQueue(): QueuedDecisionCard[] {
+    return this.orderedDecisionQueue();
+  }
+
+  @Computed
+  get activeIndex(): number {
+    return this.safeIndex(this.decisionQueue.length);
+  }
 
   private orderedDecisionQueue(): QueuedDecisionCard[] {
     const combined: QueuedDecisionCard[] = [];
@@ -169,47 +180,43 @@ export struct StickyDecisionDock {
           Text(`${currentIdx + 1} of ${total}`)
             .attributeModifier(orbitTextMono(this.store.palette.fgSecondary, FontWeight.Medium))
         }
-        .height(24)
+        .constraintSize({ minHeight: 28 })
         .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
         .backgroundColor(this.store.palette.subtleSurface)
-        .borderRadius(OrbitTokens.PILL_RADIUS)
+        .borderRadius(OrbitTokens.RADIUS_SM)
         .alignItems(VerticalAlign.Center)
 
-        Stack({ alignContent: Alignment.Center }) {
-          Row() {
-            Text('<')
-              .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Bold))
-          }
-          .width(28)
-          .height(28)
-          .justifyContent(FlexAlign.Center)
-          .backgroundColor(this.store.palette.subtleSurface)
-          .borderRadius(OrbitTokens.PILL_RADIUS)
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.chevron_left'))
+            .fontSize(14)
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+            .fontColor([this.store.palette.iconPrimary])
         }
-        .width(OrbitTokens.HIT_MIN)
-        .height(OrbitTokens.HIT_MIN)
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding(0)
+        .backgroundColor(this.store.palette.subtleSurface)
         .accessibilityText('Previous pending decision')
         .onClick(() => {
           this.activeQueueIndex = (currentIdx - 1 + total) % total;
+          this.isPreviewExpanded = false;
           this.store.triggerHaptic(6);
         })
 
-        Stack({ alignContent: Alignment.Center }) {
-          Row() {
-            Text('>')
-              .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Bold))
-          }
-          .width(28)
-          .height(28)
-          .justifyContent(FlexAlign.Center)
-          .backgroundColor(this.store.palette.subtleSurface)
-          .borderRadius(OrbitTokens.PILL_RADIUS)
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.chevron_right'))
+            .fontSize(14)
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+            .fontColor([this.store.palette.iconPrimary])
         }
-        .width(OrbitTokens.HIT_MIN)
-        .height(OrbitTokens.HIT_MIN)
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding(0)
+        .backgroundColor(this.store.palette.subtleSurface)
         .accessibilityText('Next pending decision')
         .onClick(() => {
           this.activeQueueIndex = (currentIdx + 1) % total;
+          this.isPreviewExpanded = false;
           this.store.triggerHaptic(6);
         })
       }
@@ -223,36 +230,40 @@ export struct StickyDecisionDock {
       ForEach(
         q.options,
         (opt: string) => {
-          Row({ space: OrbitTokens.SPACE_SM }) {
-            Text(
-              q.is_multi_select || (qItem.questions?.length ?? 1) > 1
-                ? this.isOptionSelected(`${reqId}_${q.id}_${opt}`)
-                  ? '☑'
-                  : '☐'
-                : '○'
-            )
-              .attributeModifier(
-                orbitTextSubhead(
-                  this.isOptionSelected(`${reqId}_${q.id}_${opt}`)
-                    ? this.store.palette.accentPrimary
-                    : this.store.palette.fgMuted,
-                  FontWeight.Medium
-                )
-              )
+          Button({ type: ButtonType.Normal, stateEffect: true }) {
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              if (q.is_multi_select || (qItem.questions?.length ?? 1) > 1) {
+                Checkbox({ name: `${reqId}_${q.id}_${opt}` })
+                  .select(this.isOptionSelected(`${reqId}_${q.id}_${opt}`))
+                  .selectedColor(this.store.palette.accentPrimaryFill)
+                  .width(18)
+                  .height(18)
+                  .hitTestBehavior(HitTestMode.None)
+              } else {
+                Radio({ value: opt, group: `${reqId}_${q.id}` })
+                  .checked(this.isOptionSelected(`${reqId}_${q.id}_${opt}`))
+                  .width(18)
+                  .height(18)
+                  .hitTestBehavior(HitTestMode.None)
+              }
 
-            Text(opt)
-              .attributeModifier(
-                orbitTextSubhead(
-                  this.isOptionSelected(`${reqId}_${q.id}_${opt}`)
-                    ? this.store.palette.accentPrimary
-                    : this.store.palette.fgPrimary,
-                  FontWeight.Normal
+              Text(opt)
+                .attributeModifier(
+                  orbitTextSubhead(
+                    this.isOptionSelected(`${reqId}_${q.id}_${opt}`)
+                      ? this.store.palette.accentPrimary
+                      : this.store.palette.fgPrimary,
+                    FontWeight.Normal
+                  )
                 )
-              )
-              .layoutWeight(1)
+                .textAlign(TextAlign.Start)
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
           }
           .width('100%')
-          .constraintSize({ minHeight: 40 })
+          .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
           .padding({
             left: OrbitTokens.SPACE_MD,
             right: OrbitTokens.SPACE_MD,
@@ -264,14 +275,13 @@ export struct StickyDecisionDock {
               ? this.store.palette.accentPrimarySoft
               : this.store.palette.subtleSurface
           )
-          .borderRadius(OrbitTokens.PILL_RADIUS)
+          .borderRadius(OrbitTokens.RADIUS_MD)
           .border({
             width: OrbitTokens.HAIRLINE,
             color: this.isOptionSelected(`${reqId}_${q.id}_${opt}`)
               ? this.store.palette.accentPrimary
               : this.store.palette.hairline
           })
-          .alignItems(VerticalAlign.Center)
           .onClick(() => {
             if (reqId.length === 0) {
               return;
@@ -311,14 +321,29 @@ export struct StickyDecisionDock {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      Text(this.permissionTargetPreview(perm))
-        .attributeModifier(orbitTextMono(this.store.palette.fgPrimary))
-        .width('100%')
-        .maxLines(3)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .padding(OrbitTokens.SPACE_SM)
-        .backgroundColor(this.store.palette.code)
-        .borderRadius(OrbitTokens.PILL_RADIUS)
+      Column({ space: 4 }) {
+        Text(this.permissionTargetPreview(perm))
+          .attributeModifier(orbitTextMono(this.store.palette.fgPrimary))
+          .copyOption(CopyOptions.LocalDevice)
+          .width('100%')
+          .maxLines(this.isPreviewExpanded ? 24 : 3)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+
+        if (this.permissionTargetPreview(perm).length > 100) {
+          Text(this.isPreviewExpanded ? 'Show less' : 'Tap to inspect full command')
+            .attributeModifier(orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Medium))
+        }
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding(OrbitTokens.SPACE_SM)
+      .backgroundColor(this.store.palette.code)
+      .borderRadius(OrbitTokens.RADIUS_SM)
+      .onClick(() => {
+        if (this.permissionTargetPreview(perm).length > 100) {
+          this.isPreviewExpanded = !this.isPreviewExpanded;
+        }
+      })
 
       Row({ space: OrbitTokens.SPACE_SM }) {
         ForEach(
@@ -344,7 +369,7 @@ export struct StickyDecisionDock {
                 )
               )
               .height(OrbitTokens.HIT_MIN)
-              .borderRadius(OrbitTokens.PILL_RADIUS)
+              .borderRadius(OrbitTokens.RADIUS_MD)
               .layoutWeight(1)
               .onClick(() => {
                 if (perm.request_id !== undefined) {
@@ -359,8 +384,8 @@ export struct StickyDecisionDock {
     }
     .width('100%')
     .padding(OrbitTokens.SPACE_MD)
-    .backgroundColor(this.store.palette.elevated)
-    .borderRadius(OrbitTokens.CARD_RADIUS)
+    .backgroundColor(this.store.palette.listCard)
+    .borderRadius(OrbitTokens.RADIUS_LG)
     .border({
       width: OrbitTokens.HAIRLINE,
       color: this.store.palette.hairline
@@ -433,8 +458,8 @@ export struct StickyDecisionDock {
                     this.store.palette.code
                   )
                 )
-                .height(40)
-                .borderRadius(OrbitTokens.PILL_RADIUS)
+                .height(OrbitTokens.HIT_COMPACT)
+                .borderRadius(OrbitTokens.RADIUS_SM)
                 .border({
                   width: OrbitTokens.HAIRLINE,
                   color: this.store.palette.hairline
@@ -461,8 +486,8 @@ export struct StickyDecisionDock {
                         : this.store.palette.subtleSurface
                     )
                   )
-                  .height(40)
-                  .borderRadius(OrbitTokens.PILL_RADIUS)
+                  .height(OrbitTokens.HIT_COMPACT)
+                  .borderRadius(OrbitTokens.RADIUS_SM)
                   .onClick(() => {
                     this.submitSingleCustomAnswer(qItem.request_id ?? '', q.id);
                   })
@@ -477,7 +502,7 @@ export struct StickyDecisionDock {
                 )
                 .height(OrbitTokens.HIT_MIN)
                 .width('100%')
-                .borderRadius(OrbitTokens.PILL_RADIUS)
+                .borderRadius(OrbitTokens.RADIUS_MD)
                 .onClick(() => {
                   this.submitMultiQuestion(qItem);
                 })
@@ -496,7 +521,7 @@ export struct StickyDecisionDock {
           )
           .height(OrbitTokens.HIT_MIN)
           .width('100%')
-          .borderRadius(OrbitTokens.PILL_RADIUS)
+          .borderRadius(OrbitTokens.RADIUS_MD)
           .onClick(() => {
             this.submitMultiQuestion(qItem);
           })
@@ -504,8 +529,8 @@ export struct StickyDecisionDock {
     }
     .width('100%')
     .padding(OrbitTokens.SPACE_MD)
-    .backgroundColor(this.store.palette.elevated)
-    .borderRadius(OrbitTokens.CARD_RADIUS)
+    .backgroundColor(this.store.palette.listCard)
+    .borderRadius(OrbitTokens.RADIUS_LG)
     .border({
       width: OrbitTokens.HAIRLINE,
       color: this.store.palette.hairline
@@ -513,19 +538,19 @@ export struct StickyDecisionDock {
   }
 
   build() {
-    if (this.orderedDecisionQueue().length > 0) {
+    if (this.decisionQueue.length > 0) {
       Column() {
-        if (this.orderedDecisionQueue()[this.safeIndex(this.orderedDecisionQueue().length)].kind === 'permission') {
+        if (this.decisionQueue[this.activeIndex].kind === 'permission') {
           this.renderPermissionCard(
-            this.orderedDecisionQueue()[this.safeIndex(this.orderedDecisionQueue().length)].item,
-            this.safeIndex(this.orderedDecisionQueue().length),
-            this.orderedDecisionQueue().length
+            this.decisionQueue[this.activeIndex].item,
+            this.activeIndex,
+            this.decisionQueue.length
           )
         } else {
           this.renderQuestionCard(
-            this.orderedDecisionQueue()[this.safeIndex(this.orderedDecisionQueue().length)].item,
-            this.safeIndex(this.orderedDecisionQueue().length),
-            this.orderedDecisionQueue().length
+            this.decisionQueue[this.activeIndex].item,
+            this.activeIndex,
+            this.decisionQueue.length
           )
         }
       }

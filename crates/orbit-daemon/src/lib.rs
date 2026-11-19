@@ -4,6 +4,7 @@
 //! supervises detached Shims, serves direct WebSocket clients, and optionally registers outbound to Relay
 //! with full `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
 
+pub mod attachments;
 pub mod discovery;
 pub mod git;
 pub mod manager;
@@ -39,6 +40,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::{info, warn};
 
+use crate::attachments::AttachmentStagingManager;
 use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files};
 use crate::manager::{AgentOrchestrator, DaemonBroadcast, PtyBroadcast};
 
@@ -149,6 +151,7 @@ pub struct DaemonRuntime {
     pub keypair: HostIdentityKeypair,
     pub store: Arc<OrbitStore>,
     pub orchestrator: Arc<AgentOrchestrator>,
+    pub attachments: Arc<AttachmentStagingManager>,
     pub home_dir: PathBuf,
     provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
     catalog_refresh_lock: AsyncMutex<()>,
@@ -178,6 +181,7 @@ impl DaemonRuntime {
 
         let store = Arc::new(OrbitStore::open(home_dir.join("orbit.db"))?);
         let orchestrator = AgentOrchestrator::new(home_dir.to_path_buf(), store.clone()).await;
+        let attachments = Arc::new(AttachmentStagingManager::new(home_dir));
 
         let discovered = discover_installed_providers();
         let available_providers = discovered.into_iter().map(|d| d.kind).collect();
@@ -198,6 +202,7 @@ impl DaemonRuntime {
             keypair,
             store,
             orchestrator,
+            attachments,
             home_dir: home_dir.to_path_buf(),
             provider_catalogs: RwLock::new(None),
             catalog_refresh_lock: AsyncMutex::new(()),
@@ -1148,6 +1153,38 @@ async fn handle_wire_rpc(
                         zstd,
                     })
                     .await;
+            });
+            None
+        }
+        WireMessage::StageAttachmentChunk {
+            request_id,
+            upload_id,
+            filename,
+            chunk_index,
+            total_chunks,
+            data_b64,
+        } => {
+            let rt = Arc::clone(runtime);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match rt
+                    .attachments
+                    .ingest_chunk(upload_id, filename, chunk_index, total_chunks, data_b64)
+                    .await
+                {
+                    Ok(res) => WireMessage::AttachmentStaged {
+                        request_id,
+                        upload_id: res.upload_id,
+                        chunk_index: res.chunk_index,
+                        completed: res.completed,
+                        path: res.path,
+                        filename: res.filename,
+                        size_bytes: res.size_bytes,
+                    },
+                    Err(e) => rpc_err(request_id, "stage_attachment_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
             None
         }

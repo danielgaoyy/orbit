@@ -1,7 +1,7 @@
 import { memo, useState } from "react";
 import { Check, Copy } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { InlineSpanView, RichBlockView } from "@/lib/orbit-ipc";
+import type { InlineSpanView, RichBlockView, TableAlignmentView } from "@/lib/orbit-ipc";
 import { usePacedRichBlocks } from "@/lib/text-reveal";
 import { useOrbitSelector } from "@/state/orbit-store";
 
@@ -179,18 +179,94 @@ const HighlightedCodeBlock = memo(
     prev.lines.length === next.lines.length,
 );
 
+function tableAlignClass(alignment: TableAlignmentView | undefined): string {
+  switch (alignment) {
+    case "center":
+      return "text-center";
+    case "right":
+      return "text-right";
+    default:
+      return "text-left";
+  }
+}
+
+const MarkdownTableBlock = memo(function MarkdownTableBlock({
+  alignments,
+  headers,
+  rows,
+}: Extract<RichBlockView, { kind: "table" }>) {
+  const colCount = Math.max(
+    headers.length,
+    rows.reduce((max, row) => Math.max(max, row.cells.length), 0),
+    1,
+  );
+  const colIndices = Array.from({ length: colCount }, (_, i) => i);
+
+  return (
+    <div className="border-border my-3 overflow-hidden rounded-xl border bg-black/[0.015] dark:bg-white/[0.02]">
+      <ScrollArea orientation="horizontal" viewportClassName="w-full">
+        <table className="w-full border-collapse text-[13.5px] leading-[1.55]">
+          {headers.length > 0 && (
+            <thead className="border-border border-b bg-black/[0.035] dark:bg-white/[0.045]">
+              <tr>
+                {colIndices.map((colIdx) => (
+                  <th
+                    key={colIdx}
+                    className={`border-border/70 text-foreground border-r px-3.5 py-2 font-semibold whitespace-pre-wrap last:border-r-0 ${tableAlignClass(
+                      alignments[colIdx],
+                    )}`}
+                  >
+                    <InlineSpans spans={headers[colIdx]?.spans ?? []} />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+          )}
+          <tbody>
+            {rows.map((row, rowIdx) => (
+              <tr
+                key={rowIdx}
+                className="border-border/65 border-b last:border-b-0 even:bg-black/[0.015] dark:even:bg-white/[0.018]"
+              >
+                {colIndices.map((colIdx) => (
+                  <td
+                    key={colIdx}
+                    className={`border-border/60 text-foreground/90 border-r px-3.5 py-2 align-top whitespace-pre-wrap last:border-r-0 ${tableAlignClass(
+                      alignments[colIdx],
+                    )}`}
+                  >
+                    <InlineSpans spans={row.cells[colIdx]?.spans ?? []} />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </ScrollArea>
+    </div>
+  );
+});
+
 export const MarkdownBlocksView = memo(function MarkdownBlocksView({
   blocks,
   streaming = false,
+  compact = false,
 }: {
   blocks: RichBlockView[];
   streaming?: boolean;
+  compact?: boolean;
 }) {
   const isDark = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const visibleBlocks = usePacedRichBlocks(blocks, streaming);
 
   return (
-    <div className="selectable-text text-foreground/95 space-y-3 text-[14.5px] leading-[1.72] break-words">
+    <div
+      className={
+        compact
+          ? "selectable-text text-foreground/78 space-y-1 text-[13px] leading-[1.5] break-words"
+          : "selectable-text text-foreground/95 space-y-3 text-[14.5px] leading-[1.72] break-words"
+      }
+    >
       {visibleBlocks.map((block, idx) => {
         switch (block.kind) {
           case "heading": {
@@ -239,6 +315,16 @@ export const MarkdownBlocksView = memo(function MarkdownBlocksView({
               >
                 <InlineSpans spans={block.spans} />
               </blockquote>
+            );
+          case "table":
+            return (
+              <MarkdownTableBlock
+                key={idx}
+                kind="table"
+                alignments={block.alignments}
+                headers={block.headers}
+                rows={block.rows}
+              />
             );
           case "horizontal_rule":
             return <hr key={idx} className="border-border my-3.5 select-none" />;

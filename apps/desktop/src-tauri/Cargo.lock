@@ -3002,7 +3002,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orbit-client-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-crypto"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -3037,7 +3037,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-desktop"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "futures-util",
  "orbit-client-core",
@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-protocol"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "serde",
@@ -3064,7 +3064,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-relay-transport"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -3077,7 +3077,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-store"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "chrono",
  "orbit-protocol",

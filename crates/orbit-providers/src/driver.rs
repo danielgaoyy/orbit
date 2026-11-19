@@ -18,6 +18,7 @@ pub struct SessionLaunchConfig {
     pub shim_socket: PathBuf,
     pub cwd: PathBuf,
     pub extra_dirs: Vec<PathBuf>,
+    pub attachments_dir: Option<PathBuf>,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
     pub mode: SessionMode,

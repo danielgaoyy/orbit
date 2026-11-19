@@ -3,6 +3,7 @@ import {
   FileDiff,
   FileText,
   GitCompareArrows,
+  Loader2,
   Quote,
   SquareTerminal,
   X,
@@ -54,7 +55,7 @@ export const ContextTray = memo(function ContextTray({
       {images.map((img) => (
         <div
           key={img.id}
-          title={`${img.filename} (${Math.max(1, Math.round(img.sizeBytes / 1024))} KB)`}
+          title={`${img.filename} (${Math.max(1, Math.round(img.sizeBytes / 1024))} KB)${img.uploading ? " · Uploading…" : ""}`}
           className="orbit-pill-enter group border-border bg-muted/50 relative size-12 shrink-0 overflow-hidden rounded-xl border"
         >
           <img
@@ -62,6 +63,11 @@ export const ContextTray = memo(function ContextTray({
             alt={img.filename}
             className="size-full object-cover"
           />
+          {img.uploading && (
+            <div className="absolute inset-0 flex items-center justify-center bg-black/45">
+              <Loader2 className="size-4 animate-spin text-white" />
+            </div>
+          )}
           <button
             type="button"
             onClick={() => orbitActions.removeContextMention(img.id)}
@@ -76,15 +82,20 @@ export const ContextTray = memo(function ContextTray({
       {/* 2. Structured Context Pills (@file, @diff, @terminal) */}
       {nonImages.map((item) => {
         if (item.kind === "file") {
-          const { basename, dirHint } = splitPathDisplay(item.path);
+          const displayTarget = item.path || item.filename || "Attachment";
+          const { basename, dirHint } = splitPathDisplay(displayTarget);
           const FileIcon = resolveSemanticFileIcon(basename);
           return (
             <span
               key={item.id}
-              title={item.path}
+              title={item.uploading ? `Uploading ${basename}…` : displayTarget}
               className="orbit-pill-enter border-border bg-muted/65 text-foreground inline-flex max-w-68 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors"
             >
-              <FileIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
+              {item.uploading ? (
+                <Loader2 className="text-muted-foreground size-3.5 shrink-0 animate-spin stroke-[1.75]" />
+              ) : (
+                <FileIcon className="text-foreground/65 size-3.5 shrink-0 stroke-[1.75]" />
+              )}
               <span className="truncate font-mono font-medium">{basename}</span>
               {dirHint && (
                 <span className="text-muted-foreground hidden truncate font-mono text-[11px] sm:inline">

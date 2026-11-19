@@ -6,7 +6,7 @@
 
 use std::sync::OnceLock;
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use syntect::easy::HighlightLines;
@@ -22,6 +22,25 @@ pub struct InlineSpanView {
     pub strikethrough: bool,
     pub inline_code: bool,
     pub link_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TableAlignmentView {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableCellView {
+    pub spans: Vec<InlineSpanView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableRowView {
+    pub cells: Vec<TableCellView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +80,11 @@ pub enum RichBlockView {
     },
     BlockQuote {
         spans: Vec<InlineSpanView>,
+    },
+    Table {
+        alignments: Vec<TableAlignmentView>,
+        headers: Vec<TableCellView>,
+        rows: Vec<TableRowView>,
     },
     HorizontalRule,
 }
@@ -188,6 +212,118 @@ pub fn highlight_code_lines(language: &str, code: &str) -> Vec<HighlightedLineVi
     out
 }
 
+fn map_table_alignment(align: Alignment) -> TableAlignmentView {
+    match align {
+        Alignment::None => TableAlignmentView::None,
+        Alignment::Left => TableAlignmentView::Left,
+        Alignment::Center => TableAlignmentView::Center,
+        Alignment::Right => TableAlignmentView::Right,
+    }
+}
+
+fn is_self_closing_html_tag(tag_lower: &str, name: &str) -> bool {
+    let Some(rest) = tag_lower
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let rest = rest.trim();
+    if !rest.starts_with(name) {
+        return false;
+    }
+    let after_name = &rest[name.len()..];
+    after_name.is_empty()
+        || after_name
+            .chars()
+            .all(|c| c.is_ascii_whitespace() || c == '/')
+}
+
+fn matches_open_html_tag(tag_lower: &str, name: &str) -> bool {
+    let Some(rest) = tag_lower
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let rest = rest.trim();
+    if !rest.starts_with(name) || rest.ends_with('/') {
+        return false;
+    }
+    let after = &rest[name.len()..];
+    after.is_empty() || after.starts_with(|c: char| c.is_ascii_whitespace())
+}
+
+fn matches_close_html_tag(tag_lower: &str, name: &str) -> bool {
+    let Some(rest) = tag_lower
+        .strip_prefix("</")
+        .and_then(|s| s.strip_suffix('>'))
+    else {
+        return false;
+    };
+    rest.trim() == name
+}
+
+fn push_inline_span(
+    spans: &mut Vec<InlineSpanView>,
+    text: &str,
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    inline_code: bool,
+    link_url: &Option<String>,
+) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut()
+        && last.bold == bold
+        && last.italic == italic
+        && last.strikethrough == strikethrough
+        && last.inline_code == inline_code
+        && &last.link_url == link_url
+    {
+        last.text.push_str(text);
+        return;
+    }
+    spans.push(InlineSpanView {
+        text: text.to_string(),
+        bold,
+        italic,
+        strikethrough,
+        inline_code,
+        link_url: link_url.clone(),
+    });
+}
+
+fn flush_active_list_item_prefix(
+    blocks: &mut Vec<RichBlockView>,
+    cur_spans: &mut Vec<InlineSpanView>,
+    list_stack: &mut [Option<u64>],
+    list_item_stack: &mut [(Option<bool>, bool)],
+) {
+    if let Some((checked, already_flushed)) = list_item_stack.last_mut()
+        && !*already_flushed
+        && !cur_spans.is_empty()
+    {
+        let (ordered, idx) = match list_stack.last_mut() {
+            Some(Some(counter)) => {
+                let cur = *counter as u32;
+                *counter += 1;
+                (true, cur)
+            }
+            _ => (false, 0),
+        };
+        blocks.push(RichBlockView::ListItem {
+            ordered,
+            index: idx,
+            checked: checked.take(),
+            spans: std::mem::take(cur_spans),
+        });
+        *already_flushed = true;
+    }
+}
+
 /// Parse streaming or completed Markdown into platform-agnostic native render blocks.
 pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockView> {
     let normalized = if streaming {
@@ -206,46 +342,24 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
     let mut bold_depth: u32 = 0;
     let mut italic_depth: u32 = 0;
     let mut strike_depth: u32 = 0;
+    let mut html_code_depth: u32 = 0;
     let mut current_link: Option<String> = None;
 
     let mut in_heading: Option<u8> = None;
     let mut in_blockquote = false;
     let mut list_stack: Vec<Option<u64>> = Vec::new();
-    let mut in_list_item = false;
-    let mut item_checked: Option<bool> = None;
+    let mut list_item_stack: Vec<(Option<bool>, bool)> = Vec::new();
+
+    let mut in_table = false;
+    let mut in_table_head = false;
+    let mut in_table_cell = false;
+    let mut table_alignments: Vec<TableAlignmentView> = Vec::new();
+    let mut table_headers: Vec<TableCellView> = Vec::new();
+    let mut table_rows: Vec<TableRowView> = Vec::new();
+    let mut cur_table_row: Vec<TableCellView> = Vec::new();
 
     let mut in_code_block: Option<String> = None;
     let mut code_buf = String::new();
-
-    let push_span = |spans: &mut Vec<InlineSpanView>,
-                     text: &str,
-                     bold: bool,
-                     italic: bool,
-                     strikethrough: bool,
-                     inline_code: bool,
-                     link_url: &Option<String>| {
-        if text.is_empty() {
-            return;
-        }
-        if let Some(last) = spans.last_mut()
-            && last.bold == bold
-            && last.italic == italic
-            && last.strikethrough == strikethrough
-            && last.inline_code == inline_code
-            && &last.link_url == link_url
-        {
-            last.text.push_str(text);
-            return;
-        }
-        spans.push(InlineSpanView {
-            text: text.to_string(),
-            bold,
-            italic,
-            strikethrough,
-            inline_code,
-            link_url: link_url.clone(),
-        });
-    };
 
     for event in parser {
         match event {
@@ -255,13 +369,19 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                     in_heading = Some(heading_level_u8(level));
                 }
                 Tag::Paragraph => {
-                    if !in_list_item && !in_blockquote {
+                    if list_item_stack.is_empty() && !in_blockquote && !in_table_cell {
                         cur_spans.clear();
                     } else if !cur_spans.is_empty() {
-                        push_span(&mut cur_spans, "\n", false, false, false, false, &None);
+                        push_inline_span(&mut cur_spans, "\n", false, false, false, false, &None);
                     }
                 }
                 Tag::CodeBlock(kind) => {
+                    flush_active_list_item_prefix(
+                        &mut blocks,
+                        &mut cur_spans,
+                        &mut list_stack,
+                        &mut list_item_stack,
+                    );
                     let lang = match kind {
                         CodeBlockKind::Fenced(info) => info
                             .split_whitespace()
@@ -274,16 +394,58 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                     code_buf.clear();
                 }
                 Tag::List(start_idx) => {
+                    flush_active_list_item_prefix(
+                        &mut blocks,
+                        &mut cur_spans,
+                        &mut list_stack,
+                        &mut list_item_stack,
+                    );
                     list_stack.push(start_idx);
                 }
                 Tag::Item => {
                     cur_spans.clear();
-                    in_list_item = true;
-                    item_checked = None;
+                    list_item_stack.push((None, false));
                 }
                 Tag::BlockQuote(_) => {
+                    flush_active_list_item_prefix(
+                        &mut blocks,
+                        &mut cur_spans,
+                        &mut list_stack,
+                        &mut list_item_stack,
+                    );
                     cur_spans.clear();
                     in_blockquote = true;
+                }
+                Tag::Table(aligns) => {
+                    flush_active_list_item_prefix(
+                        &mut blocks,
+                        &mut cur_spans,
+                        &mut list_stack,
+                        &mut list_item_stack,
+                    );
+                    if !cur_spans.is_empty() {
+                        blocks.push(RichBlockView::Paragraph {
+                            spans: std::mem::take(&mut cur_spans),
+                        });
+                    }
+                    in_table = true;
+                    in_table_head = false;
+                    in_table_cell = false;
+                    table_alignments = aligns.into_iter().map(map_table_alignment).collect();
+                    table_headers.clear();
+                    table_rows.clear();
+                    cur_table_row.clear();
+                }
+                Tag::TableHead => {
+                    in_table_head = true;
+                    cur_table_row.clear();
+                }
+                Tag::TableRow => {
+                    cur_table_row.clear();
+                }
+                Tag::TableCell => {
+                    in_table_cell = true;
+                    cur_spans.clear();
                 }
                 Tag::Strong => bold_depth += 1,
                 Tag::Emphasis => italic_depth += 1,
@@ -304,7 +466,11 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                     }
                 }
                 TagEnd::Paragraph => {
-                    if !in_list_item && !in_blockquote && !cur_spans.is_empty() {
+                    if list_item_stack.is_empty()
+                        && !in_blockquote
+                        && !in_table_cell
+                        && !cur_spans.is_empty()
+                    {
                         blocks.push(RichBlockView::Paragraph {
                             spans: std::mem::take(&mut cur_spans),
                         });
@@ -322,22 +488,29 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                     code_buf.clear();
                 }
                 TagEnd::Item => {
-                    in_list_item = false;
-                    let (ordered, idx) = match list_stack.last_mut() {
-                        Some(Some(counter)) => {
-                            let cur = *counter as u32;
-                            *counter += 1;
-                            (true, cur)
+                    if let Some((checked, already_flushed)) = list_item_stack.pop() {
+                        if !already_flushed {
+                            let (ordered, idx) = match list_stack.last_mut() {
+                                Some(Some(counter)) => {
+                                    let cur = *counter as u32;
+                                    *counter += 1;
+                                    (true, cur)
+                                }
+                                _ => (false, 0),
+                            };
+                            if !cur_spans.is_empty() {
+                                blocks.push(RichBlockView::ListItem {
+                                    ordered,
+                                    index: idx,
+                                    checked,
+                                    spans: std::mem::take(&mut cur_spans),
+                                });
+                            }
+                        } else if !cur_spans.is_empty() {
+                            blocks.push(RichBlockView::Paragraph {
+                                spans: std::mem::take(&mut cur_spans),
+                            });
                         }
-                        _ => (false, 0),
-                    };
-                    if !cur_spans.is_empty() {
-                        blocks.push(RichBlockView::ListItem {
-                            ordered,
-                            index: idx,
-                            checked: item_checked.take(),
-                            spans: std::mem::take(&mut cur_spans),
-                        });
                     }
                 }
                 TagEnd::List(_) => {
@@ -355,15 +528,32 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                 TagEnd::Emphasis => italic_depth = italic_depth.saturating_sub(1),
                 TagEnd::Strikethrough => strike_depth = strike_depth.saturating_sub(1),
                 TagEnd::Link => current_link = None,
+                TagEnd::TableCell => {
+                    in_table_cell = false;
+                    cur_table_row.push(TableCellView {
+                        spans: std::mem::take(&mut cur_spans),
+                    });
+                }
+                TagEnd::TableHead => {
+                    in_table_head = false;
+                    table_headers = std::mem::take(&mut cur_table_row);
+                }
                 TagEnd::TableRow => {
-                    if !cur_spans.is_empty() {
-                        blocks.push(RichBlockView::Paragraph {
-                            spans: std::mem::take(&mut cur_spans),
+                    table_rows.push(TableRowView {
+                        cells: std::mem::take(&mut cur_table_row),
+                    });
+                }
+                TagEnd::Table => {
+                    in_table = false;
+                    in_table_head = false;
+                    in_table_cell = false;
+                    if !table_headers.is_empty() || !table_rows.is_empty() {
+                        blocks.push(RichBlockView::Table {
+                            alignments: std::mem::take(&mut table_alignments),
+                            headers: std::mem::take(&mut table_headers),
+                            rows: std::mem::take(&mut table_rows),
                         });
                     }
-                }
-                TagEnd::TableCell => {
-                    push_span(&mut cur_spans, "  │  ", false, false, false, false, &None);
                 }
                 _ => {}
             },
@@ -371,19 +561,19 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                 if in_code_block.is_some() {
                     code_buf.push_str(&text);
                 } else {
-                    push_span(
+                    push_inline_span(
                         &mut cur_spans,
                         &text,
                         bold_depth > 0,
                         italic_depth > 0,
                         strike_depth > 0,
-                        false,
+                        html_code_depth > 0,
                         &current_link,
                     );
                 }
             }
             Event::Code(code) => {
-                push_span(
+                push_inline_span(
                     &mut cur_spans,
                     &code,
                     bold_depth > 0,
@@ -393,15 +583,80 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                     &current_link,
                 );
             }
+            Event::InlineHtml(html) | Event::Html(html) => {
+                if in_code_block.is_some() {
+                    code_buf.push_str(&html);
+                } else {
+                    let lower = html.trim().to_ascii_lowercase();
+                    if is_self_closing_html_tag(&lower, "br") {
+                        push_inline_span(&mut cur_spans, "\n", false, false, false, false, &None);
+                    } else if is_self_closing_html_tag(&lower, "hr") {
+                        if in_table_cell {
+                            push_inline_span(
+                                &mut cur_spans,
+                                "\n",
+                                false,
+                                false,
+                                false,
+                                false,
+                                &None,
+                            );
+                        } else {
+                            if !cur_spans.is_empty()
+                                && in_heading.is_none()
+                                && !in_blockquote
+                                && list_item_stack.is_empty()
+                            {
+                                blocks.push(RichBlockView::Paragraph {
+                                    spans: std::mem::take(&mut cur_spans),
+                                });
+                            }
+                            blocks.push(RichBlockView::HorizontalRule);
+                        }
+                    } else if matches_open_html_tag(&lower, "b")
+                        || matches_open_html_tag(&lower, "strong")
+                    {
+                        bold_depth += 1;
+                    } else if matches_close_html_tag(&lower, "b")
+                        || matches_close_html_tag(&lower, "strong")
+                    {
+                        bold_depth = bold_depth.saturating_sub(1);
+                    } else if matches_open_html_tag(&lower, "i")
+                        || matches_open_html_tag(&lower, "em")
+                    {
+                        italic_depth += 1;
+                    } else if matches_close_html_tag(&lower, "i")
+                        || matches_close_html_tag(&lower, "em")
+                    {
+                        italic_depth = italic_depth.saturating_sub(1);
+                    } else if matches_open_html_tag(&lower, "s")
+                        || matches_open_html_tag(&lower, "del")
+                        || matches_open_html_tag(&lower, "strike")
+                    {
+                        strike_depth += 1;
+                    } else if matches_close_html_tag(&lower, "s")
+                        || matches_close_html_tag(&lower, "del")
+                        || matches_close_html_tag(&lower, "strike")
+                    {
+                        strike_depth = strike_depth.saturating_sub(1);
+                    } else if matches_open_html_tag(&lower, "code") {
+                        html_code_depth += 1;
+                    } else if matches_close_html_tag(&lower, "code") {
+                        html_code_depth = html_code_depth.saturating_sub(1);
+                    }
+                }
+            }
             Event::SoftBreak | Event::HardBreak => {
                 if in_code_block.is_some() {
                     code_buf.push('\n');
                 } else {
-                    push_span(&mut cur_spans, "\n", false, false, false, false, &None);
+                    push_inline_span(&mut cur_spans, "\n", false, false, false, false, &None);
                 }
             }
             Event::TaskListMarker(checked) => {
-                item_checked = Some(checked);
+                if let Some((chk, _)) = list_item_stack.last_mut() {
+                    *chk = Some(checked);
+                }
             }
             Event::Rule => {
                 blocks.push(RichBlockView::HorizontalRule);
@@ -410,7 +665,29 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
         }
     }
 
-    if !cur_spans.is_empty() {
+    if in_table {
+        if in_table_cell {
+            cur_table_row.push(TableCellView {
+                spans: std::mem::take(&mut cur_spans),
+            });
+        }
+        if !cur_table_row.is_empty() {
+            if in_table_head && table_headers.is_empty() {
+                table_headers = std::mem::take(&mut cur_table_row);
+            } else {
+                table_rows.push(TableRowView {
+                    cells: std::mem::take(&mut cur_table_row),
+                });
+            }
+        }
+        if !table_headers.is_empty() || !table_rows.is_empty() {
+            blocks.push(RichBlockView::Table {
+                alignments: table_alignments,
+                headers: table_headers,
+                rows: table_rows,
+            });
+        }
+    } else if !cur_spans.is_empty() {
         blocks.push(RichBlockView::Paragraph { spans: cur_spans });
     }
 
@@ -1002,5 +1279,134 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert!(!snap.rows_data[0].spans[0].inverse);
         assert_eq!(snap.rows_data[0].spans[2].text, "SEL");
         assert!(snap.rows_data[0].spans[2].inverse);
+    }
+
+    #[test]
+    fn gfm_table_parses_alignments_headers_rows_and_inline_html_br() {
+        let md = "\
+| 模块 | 状态 | 说明 |
+| :--- | :---: | ---: |
+| **Markdown** | `fixed` | 第一行<br>第二行<BR />[文档](https://example.com) |
+| <b>附件</b> | <em>OK</em> | <del>旧路径</del> |";
+        let blocks = parse_markdown_blocks(md, false);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            RichBlockView::Table {
+                alignments,
+                headers,
+                rows,
+            } => {
+                assert_eq!(
+                    alignments,
+                    &vec![
+                        TableAlignmentView::Left,
+                        TableAlignmentView::Center,
+                        TableAlignmentView::Right
+                    ]
+                );
+                assert_eq!(headers.len(), 3);
+                assert_eq!(headers[0].spans[0].text, "模块");
+                assert_eq!(headers[1].spans[0].text, "状态");
+                assert_eq!(headers[2].spans[0].text, "说明");
+
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].cells[0].spans[0].text, "Markdown");
+                assert!(rows[0].cells[0].spans[0].bold);
+                assert_eq!(rows[0].cells[1].spans[0].text, "fixed");
+                assert!(rows[0].cells[1].spans[0].inline_code);
+                let cell_text: String = rows[0].cells[2]
+                    .spans
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect();
+                assert_eq!(cell_text, "第一行\n第二行\n文档");
+                assert_eq!(
+                    rows[0].cells[2]
+                        .spans
+                        .last()
+                        .and_then(|s| s.link_url.as_deref()),
+                    Some("https://example.com")
+                );
+
+                assert_eq!(rows[1].cells[0].spans[0].text, "附件");
+                assert!(rows[1].cells[0].spans[0].bold);
+                assert_eq!(rows[1].cells[1].spans[0].text, "OK");
+                assert!(rows[1].cells[1].spans[0].italic);
+                assert_eq!(rows[1].cells[2].spans[0].text, "旧路径");
+                assert!(rows[1].cells[2].spans[0].strikethrough);
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_unclosed_table_and_inline_html_tags() {
+        let md = "Line1<br/>Line2\n\n<hr />\n\n| ColA | ColB |\n| --- | --- |\n| Val1 | Val2";
+        let blocks = parse_markdown_blocks(md, true);
+        assert!(blocks.len() >= 3);
+        match &blocks[0] {
+            RichBlockView::Paragraph { spans } => {
+                let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+                assert_eq!(joined, "Line1\nLine2");
+            }
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+        assert!(matches!(blocks[1], RichBlockView::HorizontalRule));
+        match &blocks[2] {
+            RichBlockView::Table { headers, rows, .. } => {
+                assert_eq!(headers.len(), 2);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].cells[0].spans[0].text, "Val1");
+                assert_eq!(rows[0].cells[1].spans[0].text, "Val2");
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_item_with_code_block_and_nested_list_preserves_parent_text() {
+        let md = "\
+1. Parent step
+   ```bash
+   echo hi
+   ```
+2. Second step
+   - Nested child";
+        let blocks = parse_markdown_blocks(md, false);
+        assert_eq!(blocks.len(), 4);
+        match &blocks[0] {
+            RichBlockView::ListItem {
+                ordered,
+                index,
+                spans,
+                ..
+            } => {
+                assert!(*ordered);
+                assert_eq!(*index, 1);
+                assert_eq!(spans[0].text, "Parent step");
+            }
+            other => panic!("expected ListItem 1, got {other:?}"),
+        }
+        assert!(matches!(blocks[1], RichBlockView::CodeBlock { .. }));
+        match &blocks[2] {
+            RichBlockView::ListItem {
+                ordered,
+                index,
+                spans,
+                ..
+            } => {
+                assert!(*ordered);
+                assert_eq!(*index, 2);
+                assert_eq!(spans[0].text, "Second step");
+            }
+            other => panic!("expected ListItem 2, got {other:?}"),
+        }
+        match &blocks[3] {
+            RichBlockView::ListItem { ordered, spans, .. } => {
+                assert!(!*ordered);
+                assert_eq!(spans[0].text, "Nested child");
+            }
+            other => panic!("expected nested ListItem, got {other:?}"),
+        }
     }
 }

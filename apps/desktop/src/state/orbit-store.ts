@@ -64,7 +64,16 @@ export interface DiffQuoteSnippet {
 }
 
 export type ContextMentionItem =
-  | { id: string; kind: "file"; path: string }
+  | {
+      id: string;
+      kind: "file";
+      path: string;
+      filename?: string;
+      sizeBytes?: number;
+      stagedHostId?: string;
+      localFile?: File;
+      uploading?: boolean;
+    }
   | { id: string; kind: "git_diff"; staged: boolean; label: string }
   | { id: string; kind: "terminal_output"; label: string; lineCount: number; content: string }
   | {
@@ -74,6 +83,9 @@ export type ContextMentionItem =
       path: string;
       previewUrl: string;
       sizeBytes: number;
+      stagedHostId?: string;
+      localFile?: File;
+      uploading?: boolean;
     };
 
 export interface CachedTimelineEntry {
@@ -783,6 +795,125 @@ function resolveSettingsSectionTarget(
     return targetHostId ? `host:${targetHostId}:agents` : "general";
   }
   return section ?? s.settingsSection;
+}
+
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const inflightAttachmentUploads = new Map<string, Promise<void>>();
+
+function bytesToBase64(bytes: Uint8Array): string {
+  const CHUNK = 32 * 1024;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
+    binary += String.fromCharCode(...slice);
+  }
+  return btoa(binary);
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  return bytesToBase64(new Uint8Array(buf));
+}
+
+function isLikelyTextFile(file: File, bytes: Uint8Array): boolean {
+  if (file.size > 64 * 1024) return false;
+  const mime = (file.type || "").toLowerCase();
+  if (
+    mime === "application/pdf" ||
+    mime === "application/zip" ||
+    mime.startsWith("audio/") ||
+    mime.startsWith("video/") ||
+    mime.startsWith("image/")
+  ) {
+    return false;
+  }
+  const probeLen = Math.min(bytes.length, 4096);
+  for (let i = 0; i < probeLen; i += 1) {
+    if (bytes[i] === 0) return false;
+  }
+  return true;
+}
+
+function updateContextMentionItem(
+  scopeKey: string,
+  id: string,
+  updater: (item: ContextMentionItem) => ContextMentionItem,
+): void {
+  setState((s) => ({
+    ...s,
+    contextItems: {
+      ...s.contextItems,
+      [scopeKey]: (s.contextItems[scopeKey] ?? []).map((item) =>
+        item.id === id ? updater(item) : item,
+      ),
+    },
+  }));
+}
+
+function isOfflineUploadError(errText: string): boolean {
+  return /disconnected|reconnect|offline/i.test(errText);
+}
+
+async function uploadContextAttachmentToHost(
+  scopeKey: string,
+  itemId: string,
+  file: File,
+  filename: string,
+  hostId: string,
+  throwOnError: boolean,
+): Promise<void> {
+  updateContextMentionItem(scopeKey, itemId, (cur) =>
+    cur.kind === "image" || cur.kind === "file" ? { ...cur, uploading: true } : cur,
+  );
+
+  const task = (async () => {
+    try {
+      const dataB64 = await fileToBase64(file);
+      const staged = await orbitIpc.stageHostAttachment(hostId, filename, dataB64);
+      updateContextMentionItem(scopeKey, itemId, (cur) => {
+        if (cur.kind === "image") {
+          return {
+            ...cur,
+            filename: staged.filename,
+            path: staged.path,
+            sizeBytes: staged.size_bytes,
+            stagedHostId: hostId,
+            uploading: false,
+          };
+        }
+        if (cur.kind === "file") {
+          return {
+            ...cur,
+            path: staged.path,
+            filename: staged.filename,
+            sizeBytes: staged.size_bytes,
+            stagedHostId: hostId,
+            uploading: false,
+          };
+        }
+        return cur;
+      });
+    } catch (err) {
+      const msg = String(err);
+      updateContextMentionItem(scopeKey, itemId, (cur) =>
+        cur.kind === "image" || cur.kind === "file" ? { ...cur, uploading: false } : cur,
+      );
+      if (throwOnError) {
+        throw err;
+      }
+      if (isOfflineUploadError(msg)) {
+        notifyToast("Host is offline; attachment will upload when reconnected before sending");
+      } else {
+        orbitActions.removeContextMention(itemId);
+        notifyToast(`Attachment upload failed: ${msg}`);
+      }
+    } finally {
+      inflightAttachmentUploads.delete(itemId);
+    }
+  })();
+
+  inflightAttachmentUploads.set(itemId, task);
+  await task;
 }
 
 export const orbitActions = {
@@ -1536,7 +1667,9 @@ export const orbitActions = {
     const existing = state.contextItems[key] ?? [];
     // Prevent duplicate file or git_diff mentions
     const duplicate = existing.some((x) => {
-      if (x.kind === "file" && item.kind === "file") return x.path === item.path;
+      if (x.kind === "file" && item.kind === "file") {
+        return x.path.length > 0 && x.path === item.path;
+      }
       if (x.kind === "git_diff" && item.kind === "git_diff") return x.staged === item.staged;
       return false;
     });
@@ -1630,39 +1763,50 @@ export const orbitActions = {
   },
 
   async stageAndAttachFile(file: File): Promise<void> {
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      notifyToast(`Attachment "${file.name}" exceeds 25 MiB limit`);
+      return;
+    }
+
+    const scopeKey = composerScopeKey(state);
+    const hostId = state.selectedHostId;
     const isImage = file.type.startsWith("image/");
+
     if (isImage) {
-      const buf = await file.arrayBuffer();
-      const bytes = Array.from(new Uint8Array(buf));
       const previewUrl = URL.createObjectURL(file);
       const name = file.name || `screenshot-${Date.now()}.png`;
-      try {
-        const staged = await orbitIpc.stageAttachment(name, bytes);
-        orbitActions.addContextMention({
-          id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          kind: "image",
-          filename: staged.filename,
-          path: staged.path,
-          previewUrl,
-          sizeBytes: staged.size_bytes,
-        });
-      } catch (err) {
-        notifyToast(`Image attach failed: ${String(err)}`);
+      const id = `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      orbitActions.addContextMention({
+        id,
+        kind: "image",
+        filename: name,
+        path: "",
+        previewUrl,
+        sizeBytes: file.size,
+        localFile: file,
+        uploading: Boolean(hostId),
+      });
+      if (hostId) {
+        await uploadContextAttachmentToHost(scopeKey, id, file, name, hostId, false);
+      } else {
+        notifyToast("Select a host before sending to upload attached image");
       }
       return;
     }
 
-    // Text / code files: inline if <= 64 KiB, otherwise stage on disk and mention path
-    if (file.size <= 64 * 1024) {
-      const text = await file.text();
-      const key = composerScopeKey(state);
+    const buf = await file.arrayBuffer();
+    const rawBytes = new Uint8Array(buf);
+
+    // Text / code files <= 64 KiB without NUL bytes: inline into pastedAttachments
+    if (isLikelyTextFile(file, rawBytes)) {
+      const text = new TextDecoder().decode(rawBytes);
       const lineCount = text.split("\n").length;
       setState((s) => ({
         ...s,
         pastedAttachments: {
           ...s.pastedAttachments,
-          [key]: [
-            ...(s.pastedAttachments[key] ?? []),
+          [scopeKey]: [
+            ...(s.pastedAttachments[scopeKey] ?? []),
             {
               id: `file_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
               label: `${file.name} · ${lineCount} lines`,
@@ -1673,14 +1817,24 @@ export const orbitActions = {
           ],
         },
       }));
+      return;
+    }
+
+    const name = file.name || `attachment-${Date.now()}.bin`;
+    const id = `fref_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    orbitActions.addContextMention({
+      id,
+      kind: "file",
+      path: "",
+      filename: name,
+      sizeBytes: file.size,
+      localFile: file,
+      uploading: Boolean(hostId),
+    });
+    if (hostId) {
+      await uploadContextAttachmentToHost(scopeKey, id, file, name, hostId, false);
     } else {
-      const buf = await file.arrayBuffer();
-      const staged = await orbitIpc.stageAttachment(file.name, Array.from(new Uint8Array(buf)));
-      orbitActions.addContextMention({
-        id: `fref_${Date.now()}`,
-        kind: "file",
-        path: staged.path,
-      });
+      notifyToast("Select a host before sending to upload attached file");
     }
   },
 
@@ -1725,10 +1879,42 @@ export const orbitActions = {
       storedDirective ?? inlineParsed.directive;
     const cleanUserText = storedDirective ? rawDraft : inlineParsed.rest;
 
-    const existingContexts = state.contextItems[key] ?? [];
+    const initialContexts = state.contextItems[key] ?? [];
     const registeredInline = state.inlineMentions[key] ?? [];
     const pastes = state.pastedAttachments[key] ?? [];
     const quotes = state.diffQuotes[key] ?? [];
+
+    // Ensure every attached image/file has completed uploading to the target `hostId`
+    // BEFORE assembling the wire prompt or clearing the composer draft.
+    try {
+      const pendingPromises: Promise<void>[] = [];
+      for (const ctx of initialContexts) {
+        const inflight = inflightAttachmentUploads.get(ctx.id);
+        if (inflight) {
+          pendingPromises.push(inflight);
+        }
+      }
+      if (pendingPromises.length > 0) {
+        await Promise.all(pendingPromises);
+      }
+
+      const refreshedContexts = state.contextItems[key] ?? [];
+      for (const ctx of refreshedContexts) {
+        if (
+          (ctx.kind === "image" || ctx.kind === "file") &&
+          ctx.localFile &&
+          (ctx.stagedHostId !== hostId || !ctx.path)
+        ) {
+          const fname = ctx.filename || ctx.localFile.name || "attachment.bin";
+          await uploadContextAttachmentToHost(key, ctx.id, ctx.localFile, fname, hostId, true);
+        }
+      }
+    } catch (err) {
+      notifyToast(`Attachment upload failed: ${String(err)}`);
+      return;
+    }
+
+    const existingContexts = state.contextItems[key] ?? [];
 
     // Resolve any inline `@tokens` still present in `cleanUserText` without showing attachment boxes
     const resolvedInlineContexts: ContextMentionItem[] = [];
@@ -1828,7 +2014,7 @@ export const orbitActions = {
       badges.push({ kind: "image", label: img.filename });
     }
     for (const f of fileItems) {
-      const base = basenameFromPath(f.path);
+      const base = basenameFromPath(f.path || f.filename || "file");
       if (!cleanUserText.includes(`@${base}`)) {
         badges.push({ kind: "file", label: base });
       }
@@ -1868,9 +2054,16 @@ export const orbitActions = {
         imageItems.map((img) => `Attached image file: \`${img.path}\``).join("\n"),
       );
     }
-    if (fileItems.length > 0) {
+    const stagedFileItems = fileItems.filter((f) => Boolean(f.stagedHostId));
+    const workspaceFileItems = fileItems.filter((f) => !f.stagedHostId);
+    if (stagedFileItems.length > 0) {
       contextBlocks.push(
-        `Referenced workspace files: ${fileItems.map((f) => `\`@${f.path}\``).join(", ")}`,
+        stagedFileItems.map((f) => `Attached file: \`${f.path}\``).join("\n"),
+      );
+    }
+    if (workspaceFileItems.length > 0) {
+      contextBlocks.push(
+        `Referenced workspace files: ${workspaceFileItems.map((f) => `\`@${f.path}\``).join(", ")}`,
       );
     }
     for (const gd of gitDiffItems) {

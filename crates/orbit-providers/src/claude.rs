@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::attachments::build_claude_content_blocks;
 use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 
 pub async fn spawn_claude_session(
@@ -178,6 +179,8 @@ async fn run_claude_actor(
                             None
                         };
 
+                        let content_blocks =
+                            build_claude_content_blocks(&prompt, cfg.attachments_dir.as_deref());
                         let mut user_frame = json!({
                             "type": "user",
                             "session_id": session_id,
@@ -185,9 +188,7 @@ async fn run_claude_actor(
                             "uuid": Uuid::new_v4().to_string(),
                             "message": {
                                 "role": "user",
-                                "content": [
-                                    { "type": "text", "text": prompt }
-                                ]
+                                "content": content_blocks
                             }
                         });
                         if let Some(p) = priority {

@@ -1,6 +1,7 @@
 //! First-class native Rust drivers for Antigravity (`agy`), Codex (`codex`), and Claude Code (`claude`).
 
 pub mod antigravity;
+pub mod attachments;
 pub mod claude;
 pub mod codex;
 pub mod driver;

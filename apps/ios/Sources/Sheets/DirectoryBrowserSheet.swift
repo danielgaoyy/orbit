@@ -121,7 +121,7 @@ struct DirectoryBrowserSheet: View {
                         Text("Open Session Here")
                             .font(OrbitTypography.subhead(.semibold))
                     }
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(palette.onPrimary)
                     .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
                     .background(palette.primary)
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))

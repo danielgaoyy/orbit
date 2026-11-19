@@ -37,6 +37,14 @@ public enum OrbitAppearanceMode: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
+    public var userInterfaceStyle: UIUserInterfaceStyle {
+        switch self {
+        case .system: return .unspecified
+        case .light: return .light
+        case .dark, .oled: return .dark
+        }
+    }
+
     public func resolvedPalette(systemScheme: ColorScheme) -> OrbitPalette {
         switch self {
         case .light:
@@ -66,8 +74,9 @@ public struct OrbitPalette: Equatable, Sendable {
     public let subtleFill: Color
     public let activeRowFill: Color
 
-    // Semantic Accents
+    // Semantic Accents (aligned with Desktop monochrome primary + restrained semantic palette)
     public let primary: Color
+    public let onPrimary: Color
     public let direct: Color
     public let added: Color
     public let relay: Color
@@ -78,43 +87,45 @@ public struct OrbitPalette: Equatable, Sendable {
     public static let light = OrbitPalette(
         isDark: false,
         canvas: Color(hex: "#FFFFFF"),
-        drawer: Color(hex: "#F6F7F9"),
+        drawer: Color(hex: "#F4F4F6"),
         elevated: Color(hex: "#FFFFFF"),
-        code: Color(hex: "#F8F9FB"),
-        fgPrimary: Color(hex: "#18191D"),
-        fgSecondary: Color(hex: "#686B75"),
-        fgMuted: Color(hex: "#9CA0AB"),
-        hairline: Color.black.opacity(0.075),
-        subtleFill: Color.black.opacity(0.045),
-        activeRowFill: Color(hex: "#2B5CE6").opacity(0.09),
-        primary: Color(hex: "#2B5CE6"),
-        direct: Color(hex: "#16A34A"),
-        added: Color(hex: "#16A34A"),
+        code: Color(hex: "#F4F4F6"),
+        fgPrimary: Color(hex: "#121314"),
+        fgSecondary: Color(hex: "#5A5C60"),
+        fgMuted: Color(hex: "#8B8E94"),
+        hairline: Color.black.opacity(0.072),
+        subtleFill: Color.black.opacity(0.055),
+        activeRowFill: Color(hex: "#ECEDEF"),
+        primary: Color(hex: "#141416"),
+        onPrimary: Color(hex: "#FFFFFF"),
+        direct: Color(hex: "#059669"),
+        added: Color(hex: "#059669"),
         relay: Color(hex: "#7C3AED"),
         warning: Color(hex: "#D97706"),
-        danger: Color(hex: "#DC2626"),
-        removed: Color(hex: "#DC2626")
+        danger: Color(hex: "#EF4444"),
+        removed: Color(hex: "#E11D48")
     )
 
     public static let graphiteDark = OrbitPalette(
         isDark: true,
-        canvas: Color(hex: "#17181C"),
-        drawer: Color(hex: "#111216"),
-        elevated: Color(hex: "#202227"),
-        code: Color(hex: "#121418"),
-        fgPrimary: Color(hex: "#EFEFF2"),
-        fgSecondary: Color(hex: "#969AA6"),
-        fgMuted: Color(hex: "#636773"),
-        hairline: Color.white.opacity(0.08),
-        subtleFill: Color.white.opacity(0.055),
-        activeRowFill: Color(hex: "#6B93F6").opacity(0.14),
-        primary: Color(hex: "#6B93F6"),
+        canvas: Color(hex: "#191A1C"),
+        drawer: Color(hex: "#111214"),
+        elevated: Color(hex: "#212326"),
+        code: Color(hex: "#131416"),
+        fgPrimary: Color(hex: "#ECEDEF"),
+        fgSecondary: Color(hex: "#989A9D"),
+        fgMuted: Color(hex: "#686B70"),
+        hairline: Color.white.opacity(0.075),
+        subtleFill: Color.white.opacity(0.08),
+        activeRowFill: Color(hex: "#2A2C2F"),
+        primary: Color(hex: "#F4F4F6"),
+        onPrimary: Color(hex: "#141416"),
         direct: Color(hex: "#34D399"),
         added: Color(hex: "#34D399"),
         relay: Color(hex: "#A78BFA"),
         warning: Color(hex: "#FBBF24"),
         danger: Color(hex: "#F87171"),
-        removed: Color(hex: "#F87171")
+        removed: Color(hex: "#FB7185")
     )
 
     public static let oledPure = OrbitPalette(
@@ -124,18 +135,19 @@ public struct OrbitPalette: Equatable, Sendable {
         elevated: Color(hex: "#121317"),
         code: Color(hex: "#0A0B0E"),
         fgPrimary: Color(hex: "#F4F4F6"),
-        fgSecondary: Color(hex: "#8E929E"),
-        fgMuted: Color(hex: "#5C606B"),
+        fgSecondary: Color(hex: "#989A9D"),
+        fgMuted: Color(hex: "#63666B"),
         hairline: Color.white.opacity(0.11),
-        subtleFill: Color.white.opacity(0.065),
-        activeRowFill: Color(hex: "#6B93F6").opacity(0.16),
-        primary: Color(hex: "#6B93F6"),
+        subtleFill: Color.white.opacity(0.085),
+        activeRowFill: Color.white.opacity(0.10),
+        primary: Color(hex: "#F4F4F6"),
+        onPrimary: Color(hex: "#000000"),
         direct: Color(hex: "#34D399"),
         added: Color(hex: "#34D399"),
         relay: Color(hex: "#A78BFA"),
         warning: Color(hex: "#FBBF24"),
         danger: Color(hex: "#F87171"),
-        removed: Color(hex: "#F87171")
+        removed: Color(hex: "#FB7185")
     )
 
     public func connectionColor(_ state: FfiConnectionState) -> Color {
@@ -154,17 +166,17 @@ public struct OrbitPalette: Equatable, Sendable {
     public func providerAccent(_ provider: FfiProviderKind) -> Color {
         switch provider {
         case .antigravity:
-            return primary
+            return Color(hex: "#3186FF")
         case .codex:
-            return direct
+            return Color(hex: "#6B8CFF")
         case .claudeCode:
-            return warning
+            return Color(hex: "#D97757")
         }
     }
 }
 
 private struct OrbitPaletteKey: EnvironmentKey {
-    static let defaultValue: OrbitPalette = .graphiteDark
+    static let defaultValue: OrbitPalette = .light
 }
 
 public extension EnvironmentValues {
@@ -278,6 +290,71 @@ public extension View {
     func orbitHitTarget() -> some View {
         self.frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
             .contentShape(Rectangle())
+    }
+
+    /// Floating iOS 26+ Liquid Glass surface with an elevated hairline fallback on iOS 16.4–18.
+    @ViewBuilder
+    func orbitGlassSurface<S: InsettableShape>(
+        in shape: S,
+        tint: Color? = nil,
+        interactive: Bool = false,
+        fallbackFill: Color,
+        fallbackBorder: Color,
+        fallbackShadowOpacity: Double = 0
+    ) -> some View {
+        if #available(iOS 26.0, *) {
+            let glass: Glass = {
+                var value = Glass.regular
+                if let tint {
+                    value = value.tint(tint)
+                }
+                if interactive {
+                    value = value.interactive()
+                }
+                return value
+            }()
+            self.glassEffect(glass, in: shape)
+        } else {
+            self
+                .background(fallbackFill)
+                .clipShape(shape)
+                .overlay(shape.strokeBorder(fallbackBorder, lineWidth: 0.5))
+                .shadow(
+                    color: fallbackShadowOpacity > 0 ? Color.black.opacity(fallbackShadowOpacity) : .clear,
+                    radius: fallbackShadowOpacity > 0 ? 10 : 0,
+                    y: fallbackShadowOpacity > 0 ? 2 : 0
+                )
+        }
+    }
+
+    /// Soft edge effect on iOS 26+ so scrolled content dissolves smoothly under floating Liquid Glass chrome.
+    @ViewBuilder
+    func orbitSoftScrollEdgeEffect() -> some View {
+        if #available(iOS 26.0, *) {
+            self.scrollEdgeEffectStyle(.soft, for: .all)
+        } else {
+            self
+        }
+    }
+}
+
+public struct OrbitGlassContainer<Content: View>: View {
+    private let spacing: CGFloat
+    private let content: Content
+
+    public init(spacing: CGFloat = OrbitSpacing.sm, @ViewBuilder content: () -> Content) {
+        self.spacing = spacing
+        self.content = content()
+    }
+
+    public var body: some View {
+        if #available(iOS 26.0, *) {
+            GlassEffectContainer(spacing: spacing) {
+                content
+            }
+        } else {
+            content
+        }
     }
 }
 
@@ -399,33 +476,34 @@ public enum OrbitFormatters {
         }
     }
 
+    public static func normalizePermissionMode(_ mode: FfiSessionMode) -> FfiSessionMode {
+        if case .plan = mode {
+            return .default
+        }
+        return mode
+    }
+
     public static func sessionModeLabel(_ mode: FfiSessionMode) -> String {
-        switch mode {
-        case .default:
+        switch normalizePermissionMode(mode) {
+        case .default, .plan:
             return "Always Ask"
         case .acceptEdits:
             return "Accept Edits"
         case .fullAccess:
             return "Full Access"
-        case .plan:
-            return "Plan Mode"
         case let .custom(name):
             return name
         }
     }
 
     public static func sessionModeIcon(_ mode: FfiSessionMode) -> String {
-        switch mode {
-        case .default:
+        switch normalizePermissionMode(mode) {
+        case .default, .plan, .custom:
             return "shield"
         case .acceptEdits:
             return "checkmark.shield"
         case .fullAccess:
-            return "bolt.shield"
-        case .plan:
-            return "list.bullet.clipboard"
-        case .custom:
-            return "shield.lefthalf.filled"
+            return "shield.slash"
         }
     }
 

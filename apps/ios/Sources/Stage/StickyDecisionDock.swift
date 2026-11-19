@@ -77,7 +77,7 @@ struct StickyDecisionDock: View {
                     EmptyView()
                 }
             }
-            .padding(.horizontal, OrbitSpacing.lg)
+            .padding(.horizontal, OrbitSpacing.md)
             .padding(.top, OrbitSpacing.sm)
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .onChange(of: combinedQueue.count) { newCount in
@@ -226,13 +226,13 @@ private struct PermissionApprovalCard: View {
             }
         }
         .padding(OrbitSpacing.md)
-        .background(palette.elevated)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(palette.warning.opacity(0.4), lineWidth: 0.5)
+        .orbitGlassSurface(
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous),
+            tint: palette.warning.opacity(0.08),
+            fallbackFill: palette.elevated,
+            fallbackBorder: palette.warning.opacity(0.4),
+            fallbackShadowOpacity: 0.08
         )
-        .shadow(color: Color.black.opacity(0.08), radius: 8, y: 2)
     }
 
     private func decisionButton(_ decision: String) -> some View {
@@ -248,7 +248,7 @@ private struct PermissionApprovalCard: View {
                 .font(OrbitTypography.subhead(.semibold))
                 .foregroundStyle(
                     isDeny ? palette.danger :
-                    isPrimaryAllow ? Color.white :
+                    isPrimaryAllow ? palette.onPrimary :
                     palette.fgPrimary
                 )
                 .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
@@ -342,7 +342,7 @@ private struct QuestionDecisionCard: View {
             } label: {
                 Text("Submit Answer")
                     .font(OrbitTypography.subhead(.semibold))
-                    .foregroundStyle(canSubmit ? Color.white : palette.fgMuted)
+                    .foregroundStyle(canSubmit ? palette.onPrimary : palette.fgMuted)
                     .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
                     .background(canSubmit ? palette.primary : palette.subtleFill)
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -352,13 +352,13 @@ private struct QuestionDecisionCard: View {
             .disabled(!canSubmit)
         }
         .padding(OrbitSpacing.md)
-        .background(palette.elevated)
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(palette.primary.opacity(0.35), lineWidth: 0.5)
+        .orbitGlassSurface(
+            in: RoundedRectangle(cornerRadius: 18, style: .continuous),
+            tint: palette.primary.opacity(0.06),
+            fallbackFill: palette.elevated,
+            fallbackBorder: palette.primary.opacity(0.35),
+            fallbackShadowOpacity: 0.08
         )
-        .shadow(color: Color.black.opacity(0.08), radius: 8, y: 2)
         .onChange(of: requestId) { _ in
             selectedByQuestion = [:]
             customInputByQuestion = [:]

@@ -37,7 +37,7 @@ import {
   normalizeModeSlug
 } from './OrbitTypes';
 import {
-  GRAPHITE_DARK_PALETTE,
+  LIGHT_PALETTE,
   OrbitThemePalette,
   OrbitTokens,
   resolveOrbitPalette
@@ -79,9 +79,9 @@ export class OrbitHarmonyStore {
   private isNewSessionDraft: boolean = false;
 
   // Theme & Window Safe Area State
-  @Trace public themeMode: string = 'dark';
-  @Trace public systemIsDark: boolean = true;
-  @Trace public palette: OrbitThemePalette = GRAPHITE_DARK_PALETTE;
+  @Trace public themeMode: string = 'system';
+  @Trace public systemIsDark: boolean = false;
+  @Trace public palette: OrbitThemePalette = LIGHT_PALETTE;
   @Trace public safeTopVp: number = 0;
   @Trace public safeBottomVp: number = 0;
   @Trace public keyboardHeightVp: number = 0;

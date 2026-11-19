@@ -61,7 +61,16 @@ struct FleetDrawerView: View {
             OrbitHairline()
             drawerFooterBar
         }
-        .background(palette.drawer.ignoresSafeArea())
+        .background(drawerSurfaceBackground)
+    }
+
+    @ViewBuilder
+    private var drawerSurfaceBackground: some View {
+        if #available(iOS 26.0, *), isCompactOverlay {
+            Color.clear
+        } else {
+            palette.drawer.ignoresSafeArea()
+        }
     }
 
     // MARK: - Search & Filter Helpers
@@ -199,7 +208,7 @@ struct FleetDrawerView: View {
                             Text("Connect Local Host")
                                 .font(OrbitTypography.subhead(.medium))
                         }
-                        .foregroundStyle(Color.white)
+                        .foregroundStyle(palette.onPrimary)
                         .padding(.horizontal, OrbitSpacing.md)
                         .frame(minHeight: OrbitSpacing.hitTarget)
                         .background(palette.primary)

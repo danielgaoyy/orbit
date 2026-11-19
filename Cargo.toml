@@ -8,6 +8,7 @@ members = [
     "crates/orbit-providers",
     "crates/orbit-daemon",
     "crates/orbit-relay",
+    "crates/orbit-relay-transport",
     "crates/orbit-client-core",
     "crates/orbit-ffi-uniffi",
     "crates/orbit-ffi-ohos",
@@ -18,7 +19,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -31,6 +32,7 @@ orbit-shim = { path = "crates/orbit-shim" }
 orbit-providers = { path = "crates/orbit-providers" }
 orbit-daemon = { path = "crates/orbit-daemon" }
 orbit-relay = { path = "crates/orbit-relay" }
+orbit-relay-transport = { path = "crates/orbit-relay-transport" }
 orbit-client-core = { path = "crates/orbit-client-core" }
 
 # Async & Networking
@@ -39,6 +41,7 @@ axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
 
 # Serialization & Compression
 serde = { version = "1.0", features = ["derive"] }

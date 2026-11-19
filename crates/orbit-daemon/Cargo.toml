@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 orbit-protocol.workspace = true
 orbit-crypto.workspace = true
+orbit-relay-transport.workspace = true
 orbit-store.workspace = true
 orbit-providers.workspace = true
 orbit-shim.workspace = true

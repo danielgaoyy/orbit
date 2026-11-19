@@ -32,10 +32,11 @@ use orbit_providers::{
     catalogs_to_model_map, discover_installed_providers, probe_all_provider_models,
     probe_all_provider_quotas,
 };
+use orbit_relay_transport::{RelayConnector, is_ssh_relay_url, redact_relay_url};
 use orbit_store::OrbitStore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message as TungMsg};
+use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::{info, warn};
 
 use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files};
@@ -62,7 +63,14 @@ impl DaemonPersistedConfig {
     pub fn save(&self, home_dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(home_dir)?;
         let raw = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(home_dir.join("config.json"), raw)
+        let config_path = home_dir.join("config.json");
+        std::fs::write(&config_path, raw)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
     }
 }
 
@@ -275,16 +283,19 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         vec![format!("ws://{bound_addr}/ws")]
     };
     let offer = runtime.build_pairing_offer(direct_eps, effective_relay.clone());
+    let redacted_relay = effective_relay.as_deref().map(redact_relay_url);
 
     info!(
         host_id = %runtime.host_info.host_id,
         hostname = %runtime.host_info.hostname,
         providers = ?runtime.host_info.available_providers,
         listen = %bound_addr,
-        relay = ?effective_relay,
+        relay = ?redacted_relay,
         "Orbit Daemon ready"
     );
-    if let Ok(uri) = offer.to_qr_uri() {
+    if effective_relay.as_deref().is_some_and(is_ssh_relay_url) {
+        info!("Run 'orbit pair' to print Multi-Host pairing URI");
+    } else if let Ok(uri) = offer.to_qr_uri() {
         info!(pairing_uri = %uri, "Scan or import this Multi-Host pairing URI on Orbit Mobile");
     }
 
@@ -344,42 +355,54 @@ async fn healthz_handler(State(runtime): State<Arc<DaemonRuntime>>) -> impl Into
 // --- Outbound Relay Control & Noise NK E2EE Tunnel Spawner ---
 
 async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
-    let base = relay_base.trim_end_matches('/').to_string();
+    let display_relay = redact_relay_url(&relay_base);
     let pubkey = runtime.keypair.public_key_b64.clone();
-    let ctrl_url = format!("{base}/v1/daemon/control?pubkey={pubkey}");
+    let ctrl_path = format!("/v1/daemon/control?pubkey={pubkey}");
 
     loop {
-        match connect_async(&ctrl_url).await {
-            Ok((ws, _)) => {
-                info!(relay = %base, "Connected outbound to Orbit Relay");
-                let (mut sink, mut stream) = ws.split();
-                while let Some(Ok(msg)) = stream.next().await {
-                    match msg {
-                        TungMsg::Text(txt) => {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
-                                && v.get("op").and_then(|x| x.as_str()) == Some("open_tunnel")
-                                && let Some(tid) = v.get("tunnel_id").and_then(|x| x.as_str())
-                            {
-                                let rt_tun = runtime.clone();
-                                let base_tun = base.clone();
-                                let tid_owned = tid.to_string();
-                                tokio::spawn(async move {
-                                    let _ = serve_e2ee_relay_tunnel(rt_tun, &base_tun, &tid_owned)
-                                        .await;
-                                });
+        match RelayConnector::connect(&relay_base).await {
+            Ok(connector) => {
+                let connector = Arc::new(connector);
+                match connector.open_ws(&ctrl_path).await {
+                    Ok(ws) => {
+                        info!(relay = %display_relay, "Connected outbound to Orbit Relay");
+                        let (mut sink, mut stream) = ws.split();
+                        while let Some(Ok(msg)) = stream.next().await {
+                            match msg {
+                                TungMsg::Text(txt) => {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt)
+                                        && v.get("op").and_then(|x| x.as_str())
+                                            == Some("open_tunnel")
+                                        && let Some(tid) =
+                                            v.get("tunnel_id").and_then(|x| x.as_str())
+                                    {
+                                        let rt_tun = runtime.clone();
+                                        let conn_tun = Arc::clone(&connector);
+                                        let tid_owned = tid.to_string();
+                                        tokio::spawn(async move {
+                                            let _ = serve_e2ee_relay_tunnel(
+                                                rt_tun, &conn_tun, &tid_owned,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                }
+                                TungMsg::Ping(p) => {
+                                    let _ = sink.send(TungMsg::Pong(p)).await;
+                                }
+                                TungMsg::Close(_) => break,
+                                _ => {}
                             }
                         }
-                        TungMsg::Ping(p) => {
-                            let _ = sink.send(TungMsg::Pong(p)).await;
-                        }
-                        TungMsg::Close(_) => break,
-                        _ => {}
+                        warn!(relay = %display_relay, "Disconnected from Relay, reconnecting in 2s...");
+                    }
+                    Err(e) => {
+                        warn!(relay = %display_relay, error = %e, "Relay control stream failed, retrying in 2s...");
                     }
                 }
-                warn!(relay = %base, "Disconnected from Relay, reconnecting in 2s...");
             }
             Err(e) => {
-                warn!(relay = %base, error = %e, "Relay connection failed, retrying in 2s...");
+                warn!(relay = %display_relay, error = %e, "Relay connection failed, retrying in 2s...");
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -388,14 +411,14 @@ async fn outbound_relay_loop(runtime: Arc<DaemonRuntime>, relay_base: String) {
 
 async fn serve_e2ee_relay_tunnel(
     runtime: Arc<DaemonRuntime>,
-    relay_base: &str,
+    connector: &Arc<RelayConnector>,
     tunnel_id: &str,
 ) -> anyhow::Result<()> {
     let pubkey = &runtime.keypair.public_key_b64;
     let priv_bytes = runtime.keypair.private_bytes()?;
-    let tun_url = format!("{relay_base}/v1/daemon/tunnel?tunnel_id={tunnel_id}&pubkey={pubkey}");
+    let tun_path = format!("/v1/daemon/tunnel?tunnel_id={tunnel_id}&pubkey={pubkey}");
 
-    let (ws, _) = connect_async(&tun_url).await?;
+    let ws = connector.open_ws(&tun_path).await?;
     let (mut sink, mut stream) = ws.split();
 
     // Receive Noise NK Message 1 from Client

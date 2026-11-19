@@ -13,10 +13,12 @@ workspace = true
 
 [dependencies]
 orbit-protocol.workspace = true
+orbit-crypto.workspace = true
 orbit-shim.workspace = true
 orbit-providers.workspace = true
 orbit-daemon.workspace = true
 orbit-relay.workspace = true
+orbit-relay-transport.workspace = true
 orbit-client-core.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -30,4 +32,4 @@ futures-util.workspace = true
 reqwest.workspace = true
 
 [dev-dependencies]
-orbit-crypto.workspace = true
+russh.workspace = true

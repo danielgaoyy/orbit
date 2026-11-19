@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use orbit_crypto::{ClientHandshake, PairingOffer, SecureChannel, decode_key_32};
 use orbit_protocol::{HostInfo, PROTOCOL_VERSION, TerminalBinaryFrame, WireMessage};
+use orbit_relay_transport::connect_relay_ws;
 use orbit_store::{OrbitStore, StoreError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -134,6 +135,8 @@ pub enum ClientCoreError {
     Store(#[from] StoreError),
     #[error("websocket error: {0}")]
     Ws(Box<tokio_tungstenite::tungstenite::Error>),
+    #[error("relay transport error: {0}")]
+    RelayTransport(#[from] orbit_relay_transport::RelayTransportError),
     #[error("connection handshake failed: {0}")]
     Handshake(String),
     #[error("host identity mismatch (expected {expected}, got {actual})")]
@@ -407,13 +410,9 @@ async fn connect_via_relay_with_host_id(
     replica: Option<Arc<OrbitStore>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
     let pubkey_bytes = decode_key_32(daemon_pubkey_b64)?;
-    let url = format!(
-        "{}/v1/client/{}",
-        relay_base_url.trim_end_matches('/'),
-        daemon_pubkey_b64
-    );
+    let path_and_query = format!("/v1/client/{daemon_pubkey_b64}");
 
-    let (ws_stream, _) = connect_async(&url).await?;
+    let ws_stream = connect_relay_ws(relay_base_url, &path_and_query).await?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let (hs, msg1) = ClientHandshake::new(&pubkey_bytes)?;

@@ -469,6 +469,9 @@ impl OrbitAppCore {
                 if existing.profile.daemon_pubkey_b64 == offer.daemon_pubkey_b64 {
                     existing.profile.direct_endpoints = endpoints;
                     existing.profile.remote_daemon_port = local_port;
+                    if offer.relay_url.is_some() {
+                        existing.profile.relay_url = offer.relay_url;
+                    }
                     let _ = store.upsert_client_host(&existing.to_stored_host());
                 }
             } else {

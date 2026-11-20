@@ -42,10 +42,13 @@ import {
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
+  type ClipboardImagePayload,
   type GitFileEntry,
   type MentionCandidateView,
   type SessionMode,
   type SlashCommandView,
+  isMacDesktop,
+  isTauriRuntime,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
@@ -75,6 +78,38 @@ const EMPTY_QUEUED: readonly QueuedPromptItem[] = [];
 const EMPTY_FILES: readonly string[] = [];
 const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
 const EMPTY_MENTIONS: MentionCandidateView[] = [];
+
+const IMAGE_URI_EXT_RE = /\.(png|jpe?g|webp|gif|bmp|svg|avif|ico)(?:[?#].*)?$/i;
+
+function clipboardPayloadToFile(payload: ClipboardImagePayload): File {
+  const binary = window.atob(payload.data_b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new File([bytes], payload.filename || `screenshot-${Date.now()}.png`, {
+    type: payload.mime_type || "image/png",
+  });
+}
+
+function uriListContainsImageFile(uriList: string): boolean {
+  for (const rawLine of uriList.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (line.startsWith("file://") && IMAGE_URI_EXT_RE.test(line)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isStandaloneHtmlImageCopy(html: string): boolean {
+  const stripped = html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<\/?(?:html|head|body|meta)\b[^>]*>/gi, "")
+    .trim();
+  return /^<img\b[^>]*\/?>$/i.test(stripped);
+}
 
 export interface OmniComposerProps {
   variant?: "hero" | "docked";
@@ -173,6 +208,8 @@ export const OmniComposer = memo(function OmniComposer({
   const directivePrefixRef = useRef<HTMLSpanElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const savedDraftBeforeHistoryRef = useRef<string>("");
+  const pasteHandledForCtrlVRef = useRef<boolean>(false);
+  const nativeClipboardInFlightRef = useRef<boolean>(false);
 
   const [cursorOffset, setCursorOffset] = useState<number>(0);
   const [directiveIndentPx, setDirectiveIndentPx] = useState<number>(0);
@@ -543,13 +580,62 @@ export const OmniComposer = memo(function OmniComposer({
     });
   }, []);
 
+  const insertPastedTextAtCursor = useCallback((text: string) => {
+    if (!text) return;
+    const lineCount = text.split("\n").length;
+    if (lineCount >= 60 || text.length >= 4800) {
+      orbitActions.addPastedAttachment(text);
+      return;
+    }
+    const cur = draftTextRef.current;
+    const el = textareaRef.current;
+    const start = el?.selectionStart ?? cur.length;
+    const end = el?.selectionEnd ?? start;
+    const next = `${cur.slice(0, start)}${text}${cur.slice(end)}`;
+    const nextPos = start + text.length;
+    orbitActions.setComposerDraft(next);
+    setCursorOffset(nextPos);
+    requestAnimationFrame(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.setSelectionRange(nextPos, nextPos);
+      }
+    });
+  }, []);
+
+  const tryAttachNativeClipboardImages = useCallback(async (): Promise<boolean> => {
+    if (!isTauriRuntime() || isMacDesktop()) return false;
+    if (nativeClipboardInFlightRef.current) return false;
+    nativeClipboardInFlightRef.current = true;
+    try {
+      const payloads = await orbitIpc.readClipboardImages();
+      if (payloads.length === 0) return false;
+      for (const payload of payloads) {
+        void orbitActions.stageAndAttachFile(clipboardPayloadToFile(payload));
+      }
+      return true;
+    } catch {
+      return false;
+    } finally {
+      nativeClipboardInFlightRef.current = false;
+    }
+  }, []);
+
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    pasteHandledForCtrlVRef.current = true;
     const items = Array.from(e.clipboardData.items ?? []);
     const imageFiles: File[] = [];
     for (const it of items) {
       if (it.kind === "file" && it.type.startsWith("image/")) {
         const f = it.getAsFile();
         if (f) imageFiles.push(f);
+      }
+    }
+    if (imageFiles.length === 0) {
+      for (const f of Array.from(e.clipboardData.files ?? [])) {
+        if (f.type.startsWith("image/")) {
+          imageFiles.push(f);
+        }
       }
     }
     if (imageFiles.length > 0) {
@@ -561,6 +647,28 @@ export const OmniComposer = memo(function OmniComposer({
     }
 
     const text = e.clipboardData.getData("text/plain");
+    // On Linux WebKitGTK (CVE-2025-13947 / DataTransfer::allowsFileAccess() == false),
+    // `e.clipboardData.items` & `.files` drop pasted images completely. Fall back to Tauri's
+    // native GTK clipboard reader when pasting raw images, browser "Copy Image", or file-manager
+    // copied image URIs.
+    if (isTauriRuntime() && !isMacDesktop()) {
+      const uriList = e.clipboardData.getData("text/uri-list");
+      const html = e.clipboardData.getData("text/html");
+      const likelyImageCopy =
+        !text ||
+        uriListContainsImageFile(uriList) ||
+        isStandaloneHtmlImageCopy(html);
+      if (likelyImageCopy) {
+        e.preventDefault();
+        void tryAttachNativeClipboardImages().then((attached) => {
+          if (!attached && text) {
+            insertPastedTextAtCursor(text);
+          }
+        });
+        return;
+      }
+    }
+
     if (!text) return;
     const lineCount = text.split("\n").length;
     if (lineCount >= 60 || text.length >= 4800) {
@@ -581,6 +689,25 @@ export const OmniComposer = memo(function OmniComposer({
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (ime.shouldIgnoreKeyDown(e)) return;
+
+    // Fallback for Linux WebKitGTK builds where `Ctrl+V` into a plain-text `<textarea>`
+    // with an image-only clipboard suppresses the DOM `paste` event completely.
+    if (
+      isTauriRuntime() &&
+      !isMacDesktop() &&
+      e.ctrlKey &&
+      !e.metaKey &&
+      !e.altKey &&
+      !e.shiftKey &&
+      e.key.toLowerCase() === "v"
+    ) {
+      pasteHandledForCtrlVRef.current = false;
+      window.setTimeout(() => {
+        if (!pasteHandledForCtrlVRef.current) {
+          void tryAttachNativeClipboardImages();
+        }
+      }, 40);
+    }
 
     if (slashTrigger) {
       const len = slashTrigger.items.length;

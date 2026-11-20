@@ -974,6 +974,7 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
           startedAtMs={effectiveLiveStartedAtMs}
           lastActivityMs={latestActivityMs}
           isNetworkOffline={isNetworkOffline}
+          stallLabel={isBackgroundWait ? null : undefined}
         />
       </div>
     );
@@ -2147,7 +2148,7 @@ const InlineLiveElapsed = memo(function InlineLiveElapsed({
   startedAtMs: number;
   lastActivityMs?: number | null;
   isNetworkOffline?: boolean;
-  stallLabel?: string;
+  stallLabel?: string | null;
 }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -2159,7 +2160,7 @@ const InlineLiveElapsed = memo(function InlineLiveElapsed({
 
   const elapsedMs = Math.max(0, nowMs - startedAtMs);
   const silentMs = Math.max(0, nowMs - (lastActivityMs ?? startedAtMs));
-  const isStalled = !isNetworkOffline && silentMs >= 45_000;
+  const isStalled = !isNetworkOffline && stallLabel !== null && silentMs >= 45_000;
 
   if (elapsedMs < 1000 && !isNetworkOffline) return null;
 
@@ -2499,13 +2500,16 @@ export const TurnStageSection = memo(function TurnStageSection({
                   it.status === "running" &&
                   !it.background_task,
               );
-              const isBackgroundWait =
-                hasRunningBgTask && (seg.has_following_content || !hasRunningNonBgTool);
+              const isBackgroundWait = hasRunningBgTask && !hasRunningNonBgTool;
+              // Once prose, a notice, or a wakeup divider follows a step group, settle the
+              // pre-reply disclosure cleanly into its concise summary instead of keeping an
+              // extra shimmering `Running ... · running in background` line hovering above
+              // the reply (active background tasks stay visible in the trailing wait status
+              // and the Overview `Background Tasks` list).
               const isGroupActive =
                 isTurnActive &&
-                (seg.has_following_content
-                  ? hasRunningBgTask
-                  : seg.has_running_step || (isLastSeg && !isTrailingFailedGroup));
+                !seg.has_following_content &&
+                (seg.has_running_step || (isLastSeg && !isTrailingFailedGroup));
               const groupThoughtMs =
                 computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
                 seg.thought_duration_ms ??
@@ -2551,40 +2555,44 @@ export const TurnStageSection = memo(function TurnStageSection({
               );
             })}
 
-            {needsTrailingActivity && (
-              <TurnActivityDisclosure
-                items={EMPTY_TIMELINE_ITEMS}
-                isWorkActive
-                liveLabel={
-                  lastSeg === null
-                    ? "Working…"
-                    : lastSeg.kind === "wakeup" && lastSeg.label.trim()
-                      ? lastSeg.label.trim().endsWith("…")
-                        ? lastSeg.label.trim()
-                        : `${lastSeg.label.trim()}…`
-                      : agentStatusLabel && /background task|waking/i.test(agentStatusLabel)
-                        ? agentStatusLabel.trim().endsWith("…")
-                          ? agentStatusLabel.trim()
-                          : `${agentStatusLabel.trim()}…`
-                        : "Thinking…"
-                }
-                liveDetail={null}
-                settledLabel=""
-                summaryCounts={EMPTY_WORK_COUNTS}
-                labelIncludesFailure={false}
-                defaultCollapsed={autoFoldCompleted}
-                autoOpenForError={false}
-                liveStartedAtMs={liveStartedAtMs}
-                latestActivityMs={turn.completed_at_ms ?? liveStartedAtMs}
-                isNetworkOffline={isNetworkOffline}
-                settledDurationMs={null}
-                cwd={cwd}
-                agentId={agentId}
-                thinkingSignature={_thinkingSignature}
-                getThinkingDurationMs={getThinkingDurationMs}
-                holdViewport={holdViewport}
-              />
-            )}
+            {needsTrailingActivity && (() => {
+              const trailingLabel =
+                lastSeg === null
+                  ? "Working…"
+                  : lastSeg.kind === "wakeup" && lastSeg.label.trim()
+                    ? lastSeg.label.trim().endsWith("…")
+                      ? lastSeg.label.trim()
+                      : `${lastSeg.label.trim()}…`
+                    : agentStatusLabel && /background task|waking/i.test(agentStatusLabel)
+                      ? agentStatusLabel.trim().endsWith("…")
+                        ? agentStatusLabel.trim()
+                        : `${agentStatusLabel.trim()}…`
+                      : "Thinking…";
+              const isTrailingBackgroundWait = /background task/i.test(trailingLabel);
+              return (
+                <TurnActivityDisclosure
+                  items={EMPTY_TIMELINE_ITEMS}
+                  isWorkActive
+                  liveLabel={trailingLabel}
+                  liveDetail={null}
+                  settledLabel=""
+                  summaryCounts={EMPTY_WORK_COUNTS}
+                  labelIncludesFailure={false}
+                  defaultCollapsed={autoFoldCompleted}
+                  autoOpenForError={false}
+                  liveStartedAtMs={liveStartedAtMs}
+                  latestActivityMs={turn.completed_at_ms ?? liveStartedAtMs}
+                  isNetworkOffline={isNetworkOffline}
+                  isBackgroundWait={isTrailingBackgroundWait}
+                  settledDurationMs={null}
+                  cwd={cwd}
+                  agentId={agentId}
+                  thinkingSignature={_thinkingSignature}
+                  getThinkingDurationMs={getThinkingDurationMs}
+                  holdViewport={holdViewport}
+                />
+              );
+            })()}
 
             {!isTurnActive && <TurnChangesBar diffs={turn.turn_diffs} cwd={cwd} />}
 

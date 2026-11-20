@@ -3181,7 +3181,10 @@ dependencies = [
 name = "orbit-desktop"
 version = "0.6.0"
 dependencies = [
+ "base64 0.22.1",
  "futures-util",
+ "gdk",
+ "gtk",
  "orbit-client-core",
  "orbit-protocol",
  "orbit-providers",

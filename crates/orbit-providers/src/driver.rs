@@ -20,6 +20,16 @@ pub struct OrbitMcpLaunchSpec {
     pub stdio_args: Vec<String>,
 }
 
+/// Persisted still-`Running` background task tool call from SQLite `timeline_events`,
+/// passed into drivers on reattach/resume so historical finished tasks are reconciled cleanly
+/// and genuinely still-running tasks retain their canonical `call_id` mapping across restarts.
+#[derive(Debug, Clone)]
+pub struct PersistedBackgroundTask {
+    pub call_id: String,
+    pub detail: ToolCallDetail,
+    pub info: BackgroundTaskInfo,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionLaunchConfig {
     pub agent_id: String,
@@ -39,6 +49,10 @@ pub struct SessionLaunchConfig {
     pub extra_env: HashMap<String, String>,
     /// When `true`, attempt to reattach to an already-running `orbit shim` UDS before spawning.
     pub reattach_existing_shim: bool,
+    /// Previously persisted `Running` background task tool calls for reconciliation on startup.
+    pub persisted_running_bg_tasks: Vec<PersistedBackgroundTask>,
+    /// True when the persisted `AgentStatus` in SQLite was `AutonomousWakeup { source: "waiting:..." }`.
+    pub persisted_bg_wait: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +124,9 @@ pub enum DriverEvent {
         subagent_id: String,
         payload: TimelinePayload,
     },
+    /// Settle stale historical `Running` background-task tool calls in place without appending
+    /// out-of-order cards to the latest turn.
+    ReconcileBackgroundTasks(Vec<(String, ToolCallStatus)>),
     Exited {
         code: Option<i32>,
     },

@@ -842,6 +842,12 @@ export interface StagedAttachmentInfo {
   size_bytes: number;
 }
 
+export interface ClipboardImagePayload {
+  filename: string;
+  mime_type: string;
+  data_b64: string;
+}
+
 export type ToolStepKind =
   | "file_read"
   | "file_create"
@@ -2396,6 +2402,11 @@ export const orbitIpc = {
       filename,
       dataB64,
     });
+  },
+
+  readClipboardImages: async (): Promise<ClipboardImagePayload[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ClipboardImagePayload[]>("read_clipboard_images");
   },
 
   provisionSshRelay: async (params: {

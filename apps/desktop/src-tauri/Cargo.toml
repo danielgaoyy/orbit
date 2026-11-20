@@ -25,6 +25,11 @@ futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+base64 = "0.22"
+gtk = "0.18"
+gdk = "0.18"
+
 [lints.rust]
 unsafe_code = "deny"
 

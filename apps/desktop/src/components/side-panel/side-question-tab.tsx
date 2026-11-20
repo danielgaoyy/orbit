@@ -40,33 +40,41 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
   const draft = useOrbitSelector((s) => s.sideQuestionDrafts[scope] ?? "");
   const focusNonce = useOrbitSelector((s) => s.sideQuestionFocusNonce);
 
-  const activeProviderMeta = useOrbitSelector((s) => {
-    if (!s.selectedHostId) {
-      return { provider: s.draftProvider, label: "Assistant", model: null as string | null };
-    }
+  const activeProvider = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return s.draftProvider;
     if (!s.isDraftNewSession && s.selectedAgentId) {
       const ag = s.hostDetails[s.selectedHostId]?.agents.find(
         (a) => a.agent_id === s.selectedAgentId,
       );
-      if (ag) {
-        return {
-          provider: ag.provider,
-          label: ag.provider_label,
-          model: ag.model ?? null,
-        };
-      }
+      if (ag) return ag.provider;
     }
-    const label =
-      s.draftProvider === "claude_code"
-        ? "Claude Code"
-        : s.draftProvider === "antigravity"
-          ? "Antigravity"
-          : "Codex";
-    return {
-      provider: s.draftProvider,
-      label,
-      model: s.draftModels[s.draftProvider] ?? null,
-    };
+    return s.draftProvider;
+  });
+
+  const activeProviderLabel = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return "Assistant";
+    if (!s.isDraftNewSession && s.selectedAgentId) {
+      const ag = s.hostDetails[s.selectedHostId]?.agents.find(
+        (a) => a.agent_id === s.selectedAgentId,
+      );
+      if (ag?.provider_label) return ag.provider_label;
+    }
+    return s.draftProvider === "claude_code"
+      ? "Claude Code"
+      : s.draftProvider === "antigravity"
+        ? "Antigravity"
+        : "Codex";
+  });
+
+  const activeModel = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return null;
+    if (!s.isDraftNewSession && s.selectedAgentId) {
+      const ag = s.hostDetails[s.selectedHostId]?.agents.find(
+        (a) => a.agent_id === s.selectedAgentId,
+      );
+      if (ag) return ag.model ?? null;
+    }
+    return s.draftModels[s.draftProvider] ?? null;
   });
 
   const isStreaming = entries.some((e) => e.status === "streaming");
@@ -194,7 +202,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         enterToSend={enterToSend}
         focusNonce={focusNonce}
         promptHistory={promptHistory}
-        placeholder={`Ask ${activeProviderMeta.label} on the side…`}
+        placeholder={`Ask ${activeProviderLabel} on the side…`}
         leftControlsSlot={
           <div className="flex min-w-0 items-center gap-0.5">
             <button
@@ -208,13 +216,11 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
             <button
               type="button"
               disabled
-              title={`Inherits active session engine (${activeProviderMeta.label})`}
+              title={`Inherits active session engine (${activeProviderLabel})`}
               className="text-foreground/65 inline-flex h-8.5 min-w-0 cursor-not-allowed items-center gap-1.5 rounded-full px-2 text-[13.5px] font-normal"
             >
-              <ProviderIcon provider={activeProviderMeta.provider} className="size-4 shrink-0" />
-              <span className="truncate">
-                {activeProviderMeta.model || activeProviderMeta.label}
-              </span>
+              <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
+              <span className="truncate">{activeModel || activeProviderLabel}</span>
               <ChevronDown className="text-foreground/30 size-3.5 shrink-0 stroke-[1.75]" />
             </button>
           </div>

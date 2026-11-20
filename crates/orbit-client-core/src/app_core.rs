@@ -1552,52 +1552,56 @@ impl OrbitAppCore {
 
     pub fn git_review(&self, host_id: &str, cwd: &str, path: Option<&str>) -> GitReviewView {
         let rev = self.revision.load(Ordering::SeqCst);
-        let Ok(guard) = self.hosts.read() else {
-            return GitReviewView {
-                revision: rev,
-                host_id: host_id.to_string(),
-                cwd: cwd.to_string(),
-                status: None,
-                selected_path: path.map(ToOwned::to_owned),
-                raw_diff: String::new(),
-                diff_files: Vec::new(),
+        let (raw_diff, status) = {
+            let Ok(guard) = self.hosts.read() else {
+                return GitReviewView {
+                    revision: rev,
+                    host_id: host_id.to_string(),
+                    cwd: cwd.to_string(),
+                    status: None,
+                    selected_path: path.map(ToOwned::to_owned),
+                    raw_diff: String::new(),
+                    diff_files: Vec::new(),
+                };
             };
-        };
-        let Some(host_state) = guard.get(host_id) else {
-            return GitReviewView {
-                revision: rev,
-                host_id: host_id.to_string(),
-                cwd: cwd.to_string(),
-                status: None,
-                selected_path: path.map(ToOwned::to_owned),
-                raw_diff: String::new(),
-                diff_files: Vec::new(),
+            let Some(host_state) = guard.get(host_id) else {
+                return GitReviewView {
+                    revision: rev,
+                    host_id: host_id.to_string(),
+                    cwd: cwd.to_string(),
+                    status: None,
+                    selected_path: path.map(ToOwned::to_owned),
+                    raw_diff: String::new(),
+                    diff_files: Vec::new(),
+                };
             };
-        };
 
-        let path_suffix = format!("::{}", path.unwrap_or("__all__"));
-        let exact_key = format!("{cwd}{path_suffix}");
-        let raw_diff = host_state
-            .git_diffs
-            .get(&exact_key)
-            .or_else(|| {
-                host_state.git_diffs.iter().find_map(|(k, v)| {
-                    let stored_cwd = k.strip_suffix(&path_suffix)?;
-                    cwd_paths_equivalent(stored_cwd, cwd).then_some(v)
+            let path_suffix = format!("::{}", path.unwrap_or("__all__"));
+            let exact_key = format!("{cwd}{path_suffix}");
+            let raw_diff = host_state
+                .git_diffs
+                .get(&exact_key)
+                .or_else(|| {
+                    host_state.git_diffs.iter().find_map(|(k, v)| {
+                        let stored_cwd = k.strip_suffix(&path_suffix)?;
+                        cwd_paths_equivalent(stored_cwd, cwd).then_some(v)
+                    })
                 })
-            })
-            .cloned()
-            .unwrap_or_default();
-        let status = host_state
-            .git_statuses
-            .get(cwd)
-            .or_else(|| {
-                host_state
-                    .git_statuses
-                    .iter()
-                    .find_map(|(k, v)| cwd_paths_equivalent(k, cwd).then_some(v))
-            })
-            .cloned();
+                .cloned()
+                .unwrap_or_default();
+            let status = host_state
+                .git_statuses
+                .get(cwd)
+                .or_else(|| {
+                    host_state
+                        .git_statuses
+                        .iter()
+                        .find_map(|(k, v)| cwd_paths_equivalent(k, cwd).then_some(v))
+                })
+                .cloned();
+            (raw_diff, status)
+        };
+        // Parse & syntax-highlight diff outside `self.hosts` read lock so inbound WS/PTY never stalls.
         let diff_files = parse_unified_diff(&raw_diff);
         let capped_raw_diff = truncate_utf8_prefix(&raw_diff, 32_768);
         GitReviewView {

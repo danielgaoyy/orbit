@@ -462,24 +462,23 @@ export const ReviewTab = memo(function ReviewTab({
         </div>
       )}
 
-      {/* Diff Stream Body */}
-      <ScrollArea className="min-h-0 flex-1" viewportClassName="p-3">
-        <DiffFilesViewer
-          files={displayedDiffFiles}
-          layout={diffLayout}
-          wrapLines={wrapLines}
-          emptyMessage={emptyMessage}
-          collapsedPaths={collapsedPaths}
-          viewedPaths={viewedPaths}
-          comments={draftComments}
-          onToggleCollapse={handleToggleCollapse}
-          onToggleViewed={handleToggleViewed}
-          onQuoteLine={handleQuoteLine}
-          onAddComment={handleAddComment}
-          onDeleteComment={handleDeleteComment}
-          onOpenFile={handleOpenFile}
-        />
-      </ScrollArea>
+      {/* Virtualized Diff Stream Body (O(1) DOM nodes regardless of file/line count) */}
+      <DiffFilesViewer
+        virtualized
+        files={displayedDiffFiles}
+        layout={diffLayout}
+        wrapLines={wrapLines}
+        emptyMessage={emptyMessage}
+        collapsedPaths={collapsedPaths}
+        viewedPaths={viewedPaths}
+        comments={draftComments}
+        onToggleCollapse={handleToggleCollapse}
+        onToggleViewed={handleToggleViewed}
+        onQuoteLine={handleQuoteLine}
+        onAddComment={handleAddComment}
+        onDeleteComment={handleDeleteComment}
+        onOpenFile={handleOpenFile}
+      />
     </div>
   );
 });

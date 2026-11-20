@@ -4157,6 +4157,21 @@ export const orbitActions = {
       state.selectedHostId &&
       state.selectedWorkspaceCwd
     ) {
+      const rKey = `${state.selectedHostId}::${state.selectedWorkspaceCwd}`;
+      const cached = state.gitReviews[rKey];
+      // Fast-path: if we already have the full diff cached and the requested file is present
+      // (or user clicked "All"), filter client-side in 0ms without spawning git subprocesses.
+      if (path === null && cached && cached.selected_path === null && cached.diff_files.length > 0) {
+        return;
+      }
+      if (
+        path !== null &&
+        cached &&
+        cached.selected_path === null &&
+        cached.diff_files.some((f) => f.path === path)
+      ) {
+        return;
+      }
       void orbitActions.refreshGit(
         state.selectedHostId,
         state.selectedWorkspaceCwd,

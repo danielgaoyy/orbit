@@ -112,6 +112,8 @@ impl OrbitStore {
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
+            PRAGMA wal_autocheckpoint = 1000;
+            PRAGMA journal_size_limit = 16777216;
 
             CREATE TABLE IF NOT EXISTS workspaces (
                 workspace_id TEXT PRIMARY KEY,

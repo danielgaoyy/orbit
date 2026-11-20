@@ -226,6 +226,65 @@ export interface WorkspaceEventRecord {
   created_at: string;
 }
 
+export type WorkspaceOrganizePhase = "running" | "completed" | "failed";
+
+export interface WorkspaceOrganizeEvent {
+  request_id?: string | null;
+  project_root: string;
+  phase: WorkspaceOrganizePhase;
+  message: string;
+  created_workspaces: number;
+  grouped_agents: number;
+  summarized_agents: number;
+}
+
+const GENERIC_HARNESS_HANDLES = new Set([
+  "peer",
+  "lead",
+  "agy",
+  "codex",
+  "claude",
+  "claude-code",
+  "claude_code",
+  "antigravity",
+  "agent",
+  "assistant",
+  "chat",
+  "session",
+  "task",
+  "default",
+  "worker",
+]);
+
+/** Returns true when a handle is just a bare harness/placeholder name (e.g. `agy`, `claude-2`, `peer`). */
+export function isGenericHarnessHandle(handle: string | null | undefined): boolean {
+  if (!handle) return true;
+  const norm = handle.trim().replace(/^@+/, "").toLowerCase();
+  if (!norm) return true;
+  if (GENERIC_HARNESS_HANDLES.has(norm)) return true;
+  const match = /^(.+)-\d+$/.exec(norm);
+  return Boolean(match && GENERIC_HARNESS_HANDLES.has(match[1]));
+}
+
+/**
+ * Derive a clean, human-meaningful top-bar tab label for an agent.
+ * Never falls back to bare harness names (`agy`/`claude`/`codex`/`peer`) when a thread title exists.
+ */
+export function semanticAgentTabLabel(
+  agent: Pick<AgentCardView, "handle" | "title" | "provider">,
+  customTitle?: string | null,
+): string {
+  const rawHandle = agent.handle?.trim().replace(/^@+/, "") ?? "";
+  if (rawHandle && !isGenericHarnessHandle(rawHandle)) {
+    return rawHandle;
+  }
+  const titleSource = (customTitle?.trim() || agent.title?.trim() || "").replace(/\s+/g, " ");
+  if (titleSource && !isGenericHarnessHandle(titleSource)) {
+    return titleSource.length > 18 ? `${titleSource.slice(0, 17)}…` : titleSource;
+  }
+  return "新会话";
+}
+
 export interface SpawnWorkspacePeerRequest {
   host_id: string;
   workspace_id: string;
@@ -409,6 +468,7 @@ export interface WorkspaceSummary {
   board_revision?: number;
   title_locked?: boolean;
   auto_clustered?: boolean;
+  is_curated?: boolean;
   updated_at: string;
 }
 
@@ -446,6 +506,7 @@ export interface AgentCardView {
   handle?: string | null;
   cluster_suggestion?: WorkspaceClusterSuggestion | null;
   worktree_branch?: string | null;
+  task_summary?: string | null;
   updated_at_rfc3339: string;
   is_pinned: boolean;
   seen_seq: number;
@@ -565,6 +626,7 @@ export interface HostDetailView {
   git_repos_by_cwd?: Record<string, GitReposInspectionView>;
   workspace_boards?: Record<string, WorkspaceBoardSnapshot>;
   workspace_events?: Record<string, WorkspaceEventRecord[]>;
+  workspace_organize_status?: Record<string, WorkspaceOrganizeEvent>;
   host_sync_state?: HostSyncState | null;
 }
 
@@ -1141,6 +1203,7 @@ export interface SidebarWorkspaceGroupView {
   running_count: number;
   unread_count: number;
   is_multi_agent: boolean;
+  is_curated?: boolean;
   conversations: SidebarConversationView[];
 }
 
@@ -1159,6 +1222,7 @@ export interface SidebarProjectGroupView {
   sort_order_key?: string;
   conversations: SidebarConversationView[];
   workspaces?: SidebarWorkspaceGroupView[];
+  unclassified_conversations?: SidebarConversationView[];
 }
 
 export interface LaunchpadProjectView {
@@ -1983,12 +2047,77 @@ export const orbitIpc = {
     hostId: string,
     agentId: string,
     targetWorkspaceId?: string | null,
+    opts?: { newWorkspaceTitle?: string | null; makeUnclassified?: boolean },
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
-    await invoke<void>("move_agent_to_workspace", {
+    await invoke<void>("move_agent_to_workspace_v2", {
       hostId,
       agentId,
       targetWorkspaceId: targetWorkspaceId ?? null,
+      newWorkspaceTitle: opts?.newWorkspaceTitle ?? null,
+      makeUnclassified: Boolean(opts?.makeUnclassified),
+    });
+  },
+
+  organizeProjectWorkspaces: async (
+    hostId: string,
+    projectRoot: string,
+    agentIds: string[] = [],
+    autoApply = true,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("organize_project_workspaces", {
+      hostId,
+      projectRoot,
+      agentIds,
+      autoApply,
+    });
+  },
+
+  summarizeAgent: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("summarize_agent", { hostId, agentId });
+  },
+
+  updateAgentIdentity: async (params: {
+    hostId: string;
+    agentId: string;
+    handle?: string | null;
+    title?: string | null;
+    taskSummary?: string | null;
+    lockHandle?: boolean;
+    lockTitle?: boolean;
+  }): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_agent_identity", {
+      hostId: params.hostId,
+      agentId: params.agentId,
+      handle: params.handle ?? null,
+      title: params.title ?? null,
+      taskSummary: params.taskSummary ?? null,
+      lockHandle: Boolean(params.lockHandle),
+      lockTitle: Boolean(params.lockTitle),
+    });
+  },
+
+  createMissionWorkspace: async (params: {
+    hostId: string;
+    sourceCwd: string;
+    title: string;
+    missionGoal?: string | null;
+    isolation?: WorkspaceIsolation;
+    worktreeBranch?: string | null;
+    baseRef?: string | null;
+  }): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("create_mission_workspace", {
+      hostId: params.hostId,
+      sourceCwd: params.sourceCwd,
+      title: params.title,
+      missionGoal: params.missionGoal ?? null,
+      isolation: params.isolation ?? "local",
+      worktreeBranch: params.worktreeBranch ?? null,
+      baseRef: params.baseRef ?? null,
     });
   },
 
@@ -2043,9 +2172,17 @@ export const orbitIpc = {
     await invoke<void>("rename_workspace", { hostId, workspaceId, title });
   },
 
-  archiveWorkspace: async (hostId: string, workspaceId: string): Promise<void> => {
+  archiveWorkspace: async (
+    hostId: string,
+    workspaceId: string,
+    keepAgentsUnclassified = false,
+  ): Promise<void> => {
     if (!isTauriRuntime()) return;
-    await invoke<void>("archive_workspace", { hostId, workspaceId });
+    await invoke<void>("archive_workspace_v2", {
+      hostId,
+      workspaceId,
+      keepAgentsUnclassified,
+    });
   },
 
   unarchiveWorkspace: async (hostId: string, workspaceId: string): Promise<void> => {
@@ -2535,7 +2672,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.6.2";
+    if (!isTauriRuntime()) return "0.7.0";
     return invoke<string>("get_app_version");
   },
 

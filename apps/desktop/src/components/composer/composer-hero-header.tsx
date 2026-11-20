@@ -6,7 +6,9 @@ import {
   FolderGit2,
   FolderPlus,
   GitBranch,
+  Inbox,
   Laptop,
+  Layers,
   Server,
 } from "lucide-react";
 import { basenameOfCwd } from "@/components/composer/composer-constants";
@@ -38,6 +40,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
   const draftWorktreeRepoPath = useOrbitSelector((s) => s.draftWorktreeRepoPath);
+  const draftWorkspaceId = useOrbitSelector((s) => s.draftWorkspaceId);
   const gitReposCache = useOrbitSelector((s) => s.gitReposCache);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const hiddenProjectKeys = useOrbitSelector((s) => s.hiddenProjectKeys);
@@ -187,6 +190,23 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
   }, [selectedNestedRepo, cachedInspection, activeHeroProject, hostDetail, selectedCwd]);
 
   const activeProjectLabel = activeHeroProject?.name || basenameOfCwd(selectedCwd);
+  const curatedWorkspacesForProject = useMemo(() => {
+    const sidebarProj = sidebarView?.projects.find(
+      (p) =>
+        p.host_id === selectedHostId &&
+        matchesProjectDirectory(p.directories, cleanSelectedCwd),
+    );
+    return (sidebarProj?.workspaces ?? []).filter((w) => w.is_curated !== false);
+  }, [sidebarView, selectedHostId, cleanSelectedCwd]);
+  const selectedDraftWs = useMemo(
+    () =>
+      draftWorkspaceId
+        ? curatedWorkspacesForProject.find((w) => w.workspace_id === draftWorkspaceId) ??
+          hostDetail?.workspaces.find((w) => w.workspace_id === draftWorkspaceId) ??
+          null
+        : null,
+    [draftWorkspaceId, curatedWorkspacesForProject, hostDetail],
+  );
   const multiHost = fleet.hosts.length > 1;
   const activeHostLabel =
     hostDetail?.host.display_name ??
@@ -268,6 +288,68 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
+
+        {/* Optional Curated Mission Workspace Selector (defaults to 待归类) */}
+        {(curatedWorkspacesForProject.length > 0 || selectedDraftWs) && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="text-foreground/72 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+              >
+                {selectedDraftWs ? (
+                  <Layers className="size-3.5 shrink-0 stroke-[1.75] text-sky-500" />
+                ) : (
+                  <Inbox className="size-3.5 shrink-0 stroke-[1.75] opacity-70" />
+                )}
+                <span className="max-w-36 truncate">
+                  {selectedDraftWs ? selectedDraftWs.title : "待归类"}
+                </span>
+                <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              side="bottom"
+              finalFocus={false}
+              className="w-60 p-1.5"
+            >
+              <DropdownMenuLabel>归属 Workspace</DropdownMenuLabel>
+              <DropdownMenuItem
+                onSelect={() => orbitActions.setDraftConfig({ workspaceId: null })}
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  <Inbox className="text-muted-foreground size-3.5 shrink-0" />
+                  <span className="truncate">待归类（自动识别）</span>
+                </span>
+                {!selectedDraftWs && <Check className="size-3.5 shrink-0" />}
+              </DropdownMenuItem>
+              {curatedWorkspacesForProject.length > 0 && <DropdownMenuSeparator />}
+              {curatedWorkspacesForProject.map((ws) => {
+                const active = draftWorkspaceId === ws.workspace_id;
+                return (
+                  <DropdownMenuItem
+                    key={ws.workspace_id}
+                    onSelect={() =>
+                      orbitActions.setDraftConfig({ workspaceId: ws.workspace_id })
+                    }
+                  >
+                    <span className="flex min-w-0 flex-1 items-center gap-2">
+                      <Layers className="text-muted-foreground size-3.5 shrink-0" />
+                      <span className="truncate">{ws.title}</span>
+                    </span>
+                    <span className="flex shrink-0 items-center gap-1.5">
+                      <span className="text-muted-foreground text-[11px] tabular-nums">
+                        {ws.peer_count}
+                      </span>
+                      {active && <Check className="size-3.5 shrink-0" />}
+                    </span>
+                  </DropdownMenuItem>
+                );
+              })}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
 
         {/* Optional Multi-Host Fleet Target Selector (when >1 host paired) */}
         {multiHost && (

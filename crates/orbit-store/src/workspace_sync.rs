@@ -14,6 +14,15 @@ use crate::{
     map_workspace_row, parse_ts,
 };
 
+/// Compact context extracted from an agent's timeline for AI semantic summarization and triage.
+#[derive(Debug, Clone, Default)]
+pub struct AgentContextSnippet {
+    pub first_user_prompt: Option<String>,
+    pub latest_user_prompt: Option<String>,
+    pub latest_assistant_message: Option<String>,
+    pub edited_files: Vec<String>,
+}
+
 pub(crate) fn migrate_sync_and_mission_schema(
     conn: &rusqlite::Connection,
 ) -> Result<(), StoreError> {
@@ -23,11 +32,13 @@ pub(crate) fn migrate_sync_and_mission_schema(
         "ALTER TABLE workspaces ADD COLUMN board_revision INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workspaces ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE workspaces ADD COLUMN auto_clustered INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE workspaces ADD COLUMN is_curated INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN read_seq INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN pinned_order INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE agents ADD COLUMN handle TEXT",
         "ALTER TABLE agents ADD COLUMN cluster_suggestion_json TEXT",
+        "ALTER TABLE agents ADD COLUMN task_summary TEXT",
         "ALTER TABLE client_projects ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
     ] {
         let _ = conn.execute(stmt, []);
@@ -303,11 +314,165 @@ impl OrbitStore {
             params![now, source_workspace_id],
         )?;
         tx.execute(
-            "UPDATE workspaces SET updated_at = ?1 WHERE workspace_id = ?2",
+            "UPDATE workspaces SET is_curated = 1, updated_at = ?1 WHERE workspace_id = ?2",
             params![now, target_workspace_id],
         )?;
         tx.commit()?;
         Ok(moved)
+    }
+
+    /// Explicitly mark a workspace as curated (`true`) or unclassified (`false`).
+    pub fn set_workspace_curated(
+        &self,
+        workspace_id: &str,
+        is_curated: bool,
+    ) -> Result<Option<WorkspaceSummary>, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE workspaces SET is_curated = ?1, updated_at = ?2 WHERE workspace_id = ?3",
+            params![i32::from(is_curated), now, workspace_id],
+        )?;
+        let select_sql =
+            format!("SELECT {WORKSPACE_SELECT_COLS} FROM workspaces WHERE workspace_id = ?1");
+        let updated = tx
+            .query_row(&select_sql, params![workspace_id], map_workspace_row)
+            .optional()?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Apply AI-derived semantic handle, title, and/or live `task_summary` while strictly
+    /// respecting user locks (`labels["orbit.handle_locked"] == "1"` and `labels["orbit.title_locked"] == "1"`).
+    pub fn set_agent_semantic_identity(
+        &self,
+        agent_id: &str,
+        handle: Option<&str>,
+        title: Option<&str>,
+        task_summary: Option<&str>,
+    ) -> Result<Option<AgentSummary>, StoreError> {
+        let Some(mut current) = self.get_agent(agent_id)? else {
+            return Ok(None);
+        };
+        let handle_locked = current
+            .labels
+            .get("orbit.handle_locked")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let title_locked = current
+            .labels
+            .get("orbit.title_locked")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let mut changed = false;
+        if !handle_locked
+            && let Some(h) = handle.map(str::trim).filter(|s| !s.is_empty())
+            && current.handle.as_deref() != Some(h)
+        {
+            current.handle = Some(h.to_string());
+            changed = true;
+        }
+        if !title_locked
+            && let Some(t) = title.map(str::trim).filter(|s| !s.is_empty())
+            && current.title != t
+        {
+            current.title = t.to_string();
+            changed = true;
+        }
+        if let Some(ts) = task_summary.map(str::trim).filter(|s| !s.is_empty())
+            && current.task_summary.as_deref() != Some(ts)
+        {
+            current.task_summary = Some(ts.to_string());
+            changed = true;
+        }
+        if changed {
+            current.updated_at = Utc::now();
+            self.upsert_agent(&current, None)?;
+        }
+        Ok(Some(current))
+    }
+
+    /// Extract a compact conversation context snippet (first user prompt, latest user prompt,
+    /// latest assistant reply, and recently edited file paths) for fast AI summarization & triage.
+    pub fn agent_context_snippet(&self, agent_id: &str) -> Result<AgentContextSnippet, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut snippet = AgentContextSnippet::default();
+
+        // First user prompt
+        if let Ok(Some(raw)) = conn
+            .query_row(
+                "SELECT payload_json FROM timeline_events
+                 WHERE agent_id = ?1 AND event_type = 'user_prompt'
+                 ORDER BY seq ASC LIMIT 1",
+                params![agent_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            && let Ok(orbit_protocol::TimelinePayload::UserPrompt { text, .. }) =
+                serde_json::from_str::<orbit_protocol::TimelinePayload>(&raw)
+        {
+            snippet.first_user_prompt = Some(text);
+        }
+
+        // Latest user prompt
+        if let Ok(Some(raw)) = conn
+            .query_row(
+                "SELECT payload_json FROM timeline_events
+                 WHERE agent_id = ?1 AND event_type = 'user_prompt'
+                 ORDER BY seq DESC LIMIT 1",
+                params![agent_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            && let Ok(orbit_protocol::TimelinePayload::UserPrompt { text, .. }) =
+                serde_json::from_str::<orbit_protocol::TimelinePayload>(&raw)
+        {
+            snippet.latest_user_prompt = Some(text);
+        }
+
+        // Latest assistant reply
+        if let Ok(Some(raw)) = conn
+            .query_row(
+                "SELECT payload_json FROM timeline_events
+                 WHERE agent_id = ?1 AND event_type = 'assistant_message'
+                 ORDER BY seq DESC LIMIT 1",
+                params![agent_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            && let Ok(orbit_protocol::TimelinePayload::AssistantMessage { text, .. }) =
+                serde_json::from_str::<orbit_protocol::TimelinePayload>(&raw)
+        {
+            snippet.latest_assistant_message = Some(text);
+        }
+
+        // Recently edited files (deduplicated, up to 8)
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT payload_json FROM timeline_events
+             WHERE agent_id = ?1 AND event_type = 'tool_call'
+             ORDER BY seq DESC LIMIT 40",
+        ) && let Ok(rows) = stmt.query_map(params![agent_id], |r| r.get::<_, String>(0))
+        {
+            let mut seen = std::collections::HashSet::new();
+            for raw in rows.flatten() {
+                if let Ok(orbit_protocol::TimelinePayload::ToolCall {
+                    detail: orbit_protocol::ToolCallDetail::FileEdit { path, .. },
+                    ..
+                }) = serde_json::from_str::<orbit_protocol::TimelinePayload>(&raw)
+                    && !path.trim().is_empty()
+                    && seen.insert(path.clone())
+                {
+                    snippet.edited_files.push(path);
+                    if snippet.edited_files.len() >= 8 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(snippet)
     }
 
     /// Update Mission Workspace title, goal, and optional `title_locked` flag.
@@ -324,7 +489,7 @@ impl OrbitStore {
         let now = Utc::now().to_rfc3339();
         if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
             tx.execute(
-                "UPDATE workspaces SET title = ?1, updated_at = ?2 WHERE workspace_id = ?3",
+                "UPDATE workspaces SET title = ?1, is_curated = 1, updated_at = ?2 WHERE workspace_id = ?3",
                 params![t, now, workspace_id],
             )?;
         }
@@ -332,7 +497,7 @@ impl OrbitStore {
             let clean = g.trim();
             let val = (!clean.is_empty()).then_some(clean);
             tx.execute(
-                "UPDATE workspaces SET mission_goal = ?1, updated_at = ?2 WHERE workspace_id = ?3",
+                "UPDATE workspaces SET mission_goal = ?1, is_curated = 1, updated_at = ?2 WHERE workspace_id = ?3",
                 params![val, now, workspace_id],
             )?;
         }
@@ -831,6 +996,7 @@ mod tests {
             board_revision: 0,
             title_locked: false,
             auto_clustered: false,
+            is_curated: true,
         }
     }
 
@@ -865,6 +1031,7 @@ mod tests {
             pinned_order: 0,
             handle: Some("lead".into()),
             cluster_suggestion: None,
+            task_summary: None,
         }
     }
 

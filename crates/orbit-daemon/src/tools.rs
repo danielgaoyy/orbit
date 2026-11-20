@@ -669,6 +669,7 @@ async fn execute_tool_inner(
                             mode,
                             labels,
                             handle: opt_str(args, "handle"),
+                            task_summary: opt_str(args, "task_summary"),
                         },
                         Duration::from_secs(15),
                     )
@@ -685,6 +686,7 @@ async fn execute_tool_inner(
                     mode,
                     labels,
                     opt_str(args, "handle"),
+                    opt_str(args, "task_summary"),
                 )
                 .await?;
             Ok(json!({ "agent": updated }))
@@ -773,6 +775,9 @@ async fn execute_tool_inner(
                             parent_workspace_id: None,
                             background,
                             idempotency_key: opt_str(args, "idempotency_key"),
+                            is_curated: Some(true),
+                            mission_goal: opt_str(args, "mission_goal"),
+                            project_root: opt_str(args, "project_root"),
                         },
                         Duration::from_secs(30),
                     )
@@ -796,7 +801,8 @@ async fn execute_tool_inner(
                         background,
                         project_root: opt_str(args, "project_root"),
                         mission_goal: opt_str(args, "mission_goal"),
-                        allow_reuse_existing: true,
+                        allow_reuse_existing: false,
+                        is_curated: true,
                     })
                     .await?
             };
@@ -869,6 +875,7 @@ async fn execute_tool_inner(
                         WireMessage::ArchiveWorkspace {
                             request_id: req_id,
                             workspace_id: workspace_id.clone(),
+                            keep_agents_unclassified: false,
                         },
                         Duration::from_secs(20),
                     )

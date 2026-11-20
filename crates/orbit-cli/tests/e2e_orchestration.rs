@@ -1099,6 +1099,7 @@ async fn scenario_07_worktree_lifecycle_includes_setup_service_proxy_and_teardow
             mission_goal: None,
             project_root: None,
             allow_reuse_existing: false,
+            is_curated: true,
         })
         .await
         .expect("create worktree");
@@ -1432,6 +1433,9 @@ async fn scenario_09_cross_host_fleet_mesh_delegation_and_idempotency() {
                 parent_workspace_id: None,
                 background: false,
                 idempotency_key: Some("idem-key-1".into()),
+                is_curated: None,
+                mission_goal: None,
+                project_root: None,
             },
             Duration::from_secs(10),
             |w| matches!(w, WireMessage::WorkspaceCreated { request_id, .. } if *request_id == idem_req1),
@@ -1458,6 +1462,9 @@ async fn scenario_09_cross_host_fleet_mesh_delegation_and_idempotency() {
                 parent_workspace_id: None,
                 background: false,
                 idempotency_key: Some("idem-key-1".into()),
+                is_curated: None,
+                mission_goal: None,
+                project_root: None,
             },
             Duration::from_secs(10),
             |w| matches!(w, WireMessage::WorkspaceCreated { request_id, .. } if *request_id == idem_req2),
@@ -1489,6 +1496,9 @@ async fn scenario_09_cross_host_fleet_mesh_delegation_and_idempotency() {
                 parent_workspace_id: None,
                 background: false,
                 idempotency_key: Some("idem-key-1".into()),
+                is_curated: None,
+                mission_goal: None,
+                project_root: None,
             },
             Duration::from_secs(10),
             |w| matches!(w, WireMessage::RpcError { request_id: Some(r), .. } if *r == conflict_req),

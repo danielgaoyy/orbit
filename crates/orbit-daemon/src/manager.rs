@@ -13,8 +13,8 @@ use orbit_protocol::{
     ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec,
     SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
     WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus, WorkspaceSetupProgress,
-    WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
+    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus,
+    WorkspaceSetupProgress, WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, SessionLaunchConfig,
@@ -76,6 +76,7 @@ pub enum DaemonBroadcast {
     HostSyncStateUpdated(HostSyncState),
     WorkspaceBoardUpdated(WorkspaceBoardSnapshot),
     WorkspaceEventRecorded(WorkspaceEventRecord),
+    WorkspaceOrganizeProgress(WorkspaceOrganizeEvent),
 }
 
 struct LiveAgentEntry {
@@ -118,6 +119,7 @@ pub struct CreateWorkspaceSpec {
     pub project_root: Option<String>,
     pub mission_goal: Option<String>,
     pub allow_reuse_existing: bool,
+    pub is_curated: bool,
 }
 
 pub struct CreateAgentSpec {
@@ -168,6 +170,8 @@ pub struct AgentOrchestrator {
     /// Agents whose next idle transition was caused by explicit interrupt or flush-now,
     /// suppressing automatic queue drain for that transition.
     suppress_auto_drain: RwLock<std::collections::HashSet<String>>,
+    /// In-flight AI organizer / summarizer locks keyed by `sum:<agent_id>` or `org:<project_root>`.
+    organizing_locks: RwLock<std::collections::HashSet<String>>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
 
@@ -200,8 +204,25 @@ impl AgentOrchestrator {
             roster_fingerprints: RwLock::new(HashMap::new()),
             conflict_cooldowns: RwLock::new(HashMap::new()),
             suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
+            organizing_locks: RwLock::new(std::collections::HashSet::new()),
             broadcast_tx,
         })
+    }
+
+    pub(crate) fn store(&self) -> &OrbitStore {
+        &self.store
+    }
+
+    pub(crate) async fn try_acquire_organizer_lock(&self, key: &str) -> bool {
+        self.organizing_locks.write().await.insert(key.to_string())
+    }
+
+    pub(crate) async fn release_organizer_lock(&self, key: &str) {
+        self.organizing_locks.write().await.remove(key);
+    }
+
+    pub(crate) async fn invalidate_roster_fingerprint(&self, agent_id: &str) {
+        self.roster_fingerprints.write().await.remove(agent_id);
     }
 
     async fn current_generation(&self, agent_id: &str) -> u64 {
@@ -408,6 +429,7 @@ impl AgentOrchestrator {
             project_root: None,
             mission_goal: None,
             allow_reuse_existing: true,
+            is_curated: false,
         })
         .await
     }
@@ -507,6 +529,7 @@ impl AgentOrchestrator {
             board_revision: 0,
             title_locked,
             auto_clustered: false,
+            is_curated: spec.is_curated,
         };
         self.store.upsert_workspace(&ws)?;
         let _ = self
@@ -564,6 +587,15 @@ impl AgentOrchestrator {
     }
 
     pub async fn archive_workspace(self: &Arc<Self>, workspace_id: &str) -> anyhow::Result<()> {
+        self.archive_workspace_with_options(workspace_id, false)
+            .await
+    }
+
+    pub async fn archive_workspace_with_options(
+        self: &Arc<Self>,
+        workspace_id: &str,
+        keep_agents_unclassified: bool,
+    ) -> anyhow::Result<()> {
         let ws = self
             .store
             .get_workspace(workspace_id)?
@@ -586,12 +618,24 @@ impl AgentOrchestrator {
                 .send(DaemonBroadcast::WorkspaceScriptUpdated(updated));
         }
 
-        // 2. Soft-archive all active agents belonging to this workspace
+        // 2. Either disband (move active conversations to `待归类`) or soft-archive all active agents
         let agents = self
             .store
             .list_agents_filtered(Some(workspace_id), false, true, None)?;
-        for ag in agents {
-            let _ = self.archive_agent(&ag.agent_id).await;
+        if keep_agents_unclassified {
+            for ag in agents {
+                if ag.background {
+                    let _ = self.archive_agent(&ag.agent_id).await;
+                } else {
+                    let _ = self
+                        .move_agent_to_workspace_v2(&ag.agent_id, None, None, true)
+                        .await;
+                }
+            }
+        } else {
+            for ag in agents {
+                let _ = self.archive_agent(&ag.agent_id).await;
+            }
         }
 
         // 3. Mark workspace archived
@@ -941,7 +985,19 @@ impl AgentOrchestrator {
                 }
                 agent_cwd_override = Some(wt_str);
             }
-            existing_ws
+            // Promoting an unclassified container to a curated Mission Workspace when explicitly targeted
+            if !existing_ws.is_curated && !effective_background {
+                let promoted = self
+                    .store
+                    .set_workspace_curated(&existing_ws.workspace_id, true)?
+                    .unwrap_or(existing_ws);
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceUpdated(promoted.clone()));
+                promoted
+            } else {
+                existing_ws
+            }
         } else if spec.worktree {
             let auto_branch = spec
                 .branch
@@ -960,6 +1016,7 @@ impl AgentOrchestrator {
                 project_root: Some(inferred_project_root.clone()),
                 mission_goal: None,
                 allow_reuse_existing: false,
+                is_curated: false,
             })
             .await?
         } else if let Some(ref parent) = parent_agent
@@ -1022,6 +1079,7 @@ impl AgentOrchestrator {
                     project_root: Some(inferred_project_root.clone()),
                     mission_goal: None,
                     allow_reuse_existing: false,
+                    is_curated: false,
                 })
                 .await?
             }
@@ -1035,10 +1093,17 @@ impl AgentOrchestrator {
             .store
             .list_agents_filtered(Some(&ws.workspace_id), false, false, None)
             .unwrap_or_default();
+        if spec.handle.as_deref().is_some_and(|h| !h.trim().is_empty()) {
+            agent_labels.insert("orbit.handle_locked".into(), "1".into());
+        }
+        if spec.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+            agent_labels.insert("orbit.title_locked".into(), "1".into());
+        }
         let allocated_handle = allocate_unique_handle(
             spec.handle.as_deref(),
             provider,
             profile.as_ref().map(|p| p.name.as_str()),
+            Some(&human_seed),
             &existing_peers,
         );
 
@@ -1080,6 +1145,7 @@ impl AgentOrchestrator {
             pinned_order: 0,
             handle: Some(allocated_handle.clone()),
             cluster_suggestion,
+            task_summary: None,
         };
         self.store.upsert_agent(&summary, None)?;
         if !extra_strs.is_empty() {
@@ -1699,6 +1765,7 @@ impl AgentOrchestrator {
         mode: Option<SessionMode>,
         labels: Option<HashMap<String, String>>,
         handle: Option<String>,
+        task_summary: Option<String>,
     ) -> anyhow::Result<AgentSummary> {
         let clean_handle = handle.map(|h| sanitize_handle(&h));
         self.store.update_agent_fields(
@@ -1709,6 +1776,7 @@ impl AgentOrchestrator {
             mode.as_ref(),
             labels.as_ref(),
             clean_handle.as_deref(),
+            task_summary.as_deref(),
         )?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             if let Some(md) = mode {
@@ -2198,45 +2266,94 @@ impl AgentOrchestrator {
         target_workspace_id: Option<String>,
         new_workspace_title: Option<String>,
     ) -> anyhow::Result<AgentSummary> {
+        self.move_agent_to_workspace_v2(agent_id, target_workspace_id, new_workspace_title, false)
+            .await
+    }
+
+    pub async fn move_agent_to_workspace_v2(
+        &self,
+        agent_id: &str,
+        target_workspace_id: Option<String>,
+        new_workspace_title: Option<String>,
+        make_unclassified: bool,
+    ) -> anyhow::Result<AgentSummary> {
         let agent = self
             .store
             .get_agent(agent_id)?
             .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
-        let target_ws = match target_workspace_id {
-            Some(ref ws_id) if !ws_id.trim().is_empty() => self
-                .store
-                .get_workspace(ws_id)?
-                .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?,
-            _ => {
-                let old_ws = self.store.get_workspace(&agent.workspace_id).ok().flatten();
-                let title = new_workspace_title
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| agent.title.clone());
-                self.create_workspace_v2(CreateWorkspaceSpec {
-                    source_cwd: agent.cwd.clone(),
-                    title: Some(title),
-                    worktree_branch: None,
-                    base_ref: None,
-                    isolation: WorkspaceIsolation::Local,
-                    worktree_mode: WorktreeCreateMode::BranchOff,
-                    pr_number: None,
-                    parent_workspace_id: None,
-                    background: agent.background,
-                    project_root: old_ws.and_then(|w| w.project_root),
-                    mission_goal: None,
-                    allow_reuse_existing: false,
-                })
-                .await?
+        let target_ws = if make_unclassified {
+            let old_ws = self.store.get_workspace(&agent.workspace_id).ok().flatten();
+            self.create_workspace_v2(CreateWorkspaceSpec {
+                source_cwd: agent.cwd.clone(),
+                title: Some(agent.title.clone()),
+                worktree_branch: None,
+                base_ref: None,
+                isolation: WorkspaceIsolation::Local,
+                worktree_mode: WorktreeCreateMode::BranchOff,
+                pr_number: None,
+                parent_workspace_id: None,
+                background: agent.background,
+                project_root: old_ws.and_then(|w| w.project_root),
+                mission_goal: None,
+                allow_reuse_existing: false,
+                is_curated: false,
+            })
+            .await?
+        } else {
+            match target_workspace_id {
+                Some(ref ws_id) if !ws_id.trim().is_empty() => {
+                    let ws = self
+                        .store
+                        .get_workspace(ws_id)?
+                        .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?;
+                    if !ws.is_curated {
+                        self.store
+                            .set_workspace_curated(&ws.workspace_id, true)?
+                            .unwrap_or(ws)
+                    } else {
+                        ws
+                    }
+                }
+                _ => {
+                    let old_ws = self.store.get_workspace(&agent.workspace_id).ok().flatten();
+                    let title = new_workspace_title
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| agent.title.clone());
+                    self.create_workspace_v2(CreateWorkspaceSpec {
+                        source_cwd: agent.cwd.clone(),
+                        title: Some(title),
+                        worktree_branch: None,
+                        base_ref: None,
+                        isolation: WorkspaceIsolation::Local,
+                        worktree_mode: WorktreeCreateMode::BranchOff,
+                        pr_number: None,
+                        parent_workspace_id: None,
+                        background: agent.background,
+                        project_root: old_ws.and_then(|w| w.project_root),
+                        mission_goal: None,
+                        allow_reuse_existing: false,
+                        is_curated: true,
+                    })
+                    .await?
+                }
             }
         };
 
         // Ensure unique handle in the destination workspace
-        let dest_peers = self
+        let dest_peers: Vec<AgentSummary> = self
             .store
             .list_agents_filtered(Some(&target_ws.workspace_id), false, false, None)
-            .unwrap_or_default();
-        let next_handle =
-            allocate_unique_handle(agent.handle.as_deref(), agent.provider, None, &dest_peers);
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.agent_id != agent_id)
+            .collect();
+        let next_handle = allocate_unique_handle(
+            agent.handle.as_deref(),
+            agent.provider,
+            None,
+            Some(&agent.title),
+            &dest_peers,
+        );
         let _ = self.store.set_agent_handle(agent_id, Some(&next_handle));
         let updated = self
             .store
@@ -2247,14 +2364,16 @@ impl AgentOrchestrator {
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::AgentUpdated(updated.clone()));
-        if let Ok(ev) = self.store.append_workspace_event(
-            &target_ws.workspace_id,
-            Some(agent_id),
-            Some(&next_handle),
-            WorkspaceEventKind::PeerJoined,
-            &format!("@{} joined workspace `{}`", next_handle, target_ws.title),
-            None,
-        ) {
+        if target_ws.is_curated
+            && let Ok(ev) = self.store.append_workspace_event(
+                &target_ws.workspace_id,
+                Some(agent_id),
+                Some(&next_handle),
+                WorkspaceEventKind::PeerJoined,
+                &format!("@{} joined workspace `{}`", next_handle, target_ws.title),
+                None,
+            )
+        {
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
@@ -2265,6 +2384,27 @@ impl AgentOrchestrator {
                 .send(DaemonBroadcast::WorkspaceUpdated(refreshed_ws));
         }
         Ok(updated)
+    }
+
+    pub async fn organize_project_workspaces(
+        self: &Arc<Self>,
+        request_id: Option<Uuid>,
+        project_root: &str,
+        agent_ids: Vec<String>,
+        auto_apply: bool,
+    ) -> anyhow::Result<WorkspaceOrganizeEvent> {
+        crate::workspace_organizer::organize_project_workspaces(
+            self,
+            request_id,
+            project_root,
+            agent_ids,
+            auto_apply,
+        )
+        .await
+    }
+
+    pub async fn summarize_agent(self: &Arc<Self>, agent_id: &str) -> anyhow::Result<AgentSummary> {
+        crate::workspace_organizer::summarize_agent_context(self, agent_id).await
     }
 
     pub async fn merge_workspaces(
@@ -2287,8 +2427,13 @@ impl AgentOrchestrator {
             self.store
                 .list_agents_filtered(Some(target_workspace_id), false, false, None)?;
         for ag in &src_agents {
-            let unique_handle =
-                allocate_unique_handle(ag.handle.as_deref(), ag.provider, None, &dst_peers);
+            let unique_handle = allocate_unique_handle(
+                ag.handle.as_deref(),
+                ag.provider,
+                None,
+                Some(&ag.title),
+                &dst_peers,
+            );
             let _ = self
                 .store
                 .set_agent_handle(&ag.agent_id, Some(&unique_handle));
@@ -3198,15 +3343,19 @@ impl AgentOrchestrator {
             let finished_idle = should_check_auto_archive && matches!(ag.status, AgentStatus::Idle);
             let ag_handle = ag.handle.clone();
             let ag_bg = ag.background;
+            let ag_needs_summary = ag.task_summary.is_none();
+            let ag_cwd = ag.cwd.clone();
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
             if finished_idle && !ag_bg {
+                let ws_opt = self.store.get_workspace(&ws_id).ok().flatten();
+                let is_curated_ws = ws_opt.as_ref().is_some_and(|w| w.is_curated);
                 let peer_count = self
                     .store
                     .list_agents_filtered(Some(&ws_id), false, false, None)
                     .map(|p| p.len())
                     .unwrap_or(0);
-                if peer_count >= 2 {
+                if is_curated_ws && peer_count >= 2 {
                     let who = ag_handle.as_deref().unwrap_or("peer");
                     let snippet = self
                         .store
@@ -3231,6 +3380,31 @@ impl AgentOrchestrator {
                             .broadcast_tx
                             .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
                     }
+                }
+
+                // Non-blocking Turn-1 AI semantic summary + background auto-triage for unclassified sessions
+                if ag_needs_summary && drained_prompt.is_none() && !auto_arch {
+                    let mgr_bg = Arc::clone(self);
+                    let aid_bg = agent_id.to_string();
+                    let project_root_bg = ws_opt
+                        .as_ref()
+                        .and_then(|w| w.project_root.clone().or_else(|| w.source_cwd.clone()))
+                        .unwrap_or(ag_cwd);
+                    tokio::spawn(async move {
+                        let auto_cluster = mgr_bg.orch_config.read().await.auto_cluster_enabled;
+                        if !is_curated_ws && auto_cluster {
+                            let _ = mgr_bg
+                                .organize_project_workspaces(
+                                    None,
+                                    &project_root_bg,
+                                    vec![aid_bg],
+                                    false,
+                                )
+                                .await;
+                        } else {
+                            let _ = mgr_bg.summarize_agent(&aid_bg).await;
+                        }
+                    });
                 }
             }
 

@@ -31,24 +31,183 @@ const STOP_WORDS: &[&str] = &[
     "not", "but", "all", "new", "use", "run", "test", "tests", "using", "should", "would", "could",
 ];
 
-/// Sanitize a requested collaborative handle into a concise lowercase `[a-z0-9_-]` slug.
+const GENERIC_HARNESS_HANDLES: &[&str] = &[
+    "peer",
+    "lead",
+    "agy",
+    "codex",
+    "claude",
+    "claude-code",
+    "claude_code",
+    "antigravity",
+    "agent",
+    "assistant",
+    "chat",
+    "session",
+    "task",
+    "default",
+    "worker",
+];
+
+/// Returns `true` when `handle` is just a bare harness/placeholder name (e.g. `agy`, `claude`, `codex-2`, `peer`).
+pub fn is_generic_harness_handle(handle: &str) -> bool {
+    let norm = handle.trim().trim_start_matches('@').to_ascii_lowercase();
+    if norm.is_empty() {
+        return true;
+    }
+    if GENERIC_HARNESS_HANDLES.contains(&norm.as_str()) {
+        return true;
+    }
+    if let Some((prefix, suffix)) = norm.rsplit_once('-')
+        && suffix.chars().all(|c| c.is_ascii_digit())
+        && GENERIC_HARNESS_HANDLES.contains(&prefix)
+    {
+        return true;
+    }
+    false
+}
+
+/// Sanitize a requested collaborative handle into a concise Unicode/CJK-friendly slug
+/// (up to 18 characters; lowercases ASCII, preserves CJK/Unicode letters & digits, collapses whitespace to `-`).
 pub fn sanitize_handle(raw: &str) -> String {
     let trimmed = raw.trim().trim_start_matches('@');
-    let mut out = String::with_capacity(trimmed.len().min(20));
+    let mut out = String::new();
+    let mut char_count: usize = 0;
     let mut prev_sep = false;
     for ch in trimmed.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
+            char_count += 1;
             prev_sep = false;
-        } else if (ch == '-' || ch == '_' || ch.is_whitespace()) && !out.is_empty() && !prev_sep {
+        } else if ch.is_alphanumeric() {
+            out.push(ch);
+            char_count += 1;
+            prev_sep = false;
+        } else if (ch == '-' || ch == '_' || ch.is_whitespace() || ch == '/')
+            && !out.is_empty()
+            && !prev_sep
+        {
             out.push('-');
+            char_count += 1;
             prev_sep = true;
         }
-        if out.len() >= 20 {
+        if char_count >= 18 {
             break;
         }
     }
     out.trim_matches('-').to_string()
+}
+
+/// Derive a concise, human-meaningful semantic tab label directly from a conversation's prompt/title
+/// so new sessions never start as bare harness names (`@agy`/`@claude`/`@codex`) even before LLM summary completes.
+pub fn derive_semantic_handle_from_prompt(prompt: &str) -> Option<String> {
+    let first_line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('<') && !l.starts_with("```"))?;
+    let stripped = first_line
+        .trim_start_matches(['#', '-', '*', '>', '1', '2', '3', '4', '5', '.', ' '])
+        .trim();
+    if stripped.is_empty() {
+        return None;
+    }
+
+    // If the prompt contains CJK, extract a concise clean phrase (up to 8 chars, stopping at punctuation).
+    let has_cjk = stripped.chars().any(is_cjk);
+    if has_cjk {
+        let mut phrase = String::new();
+        let mut count = 0usize;
+        // Skip common Chinese filler prefixes
+        let mut candidate = stripped;
+        for prefix in [
+            "请帮我",
+            "帮我",
+            "请你",
+            "请",
+            "帮忙",
+            "我想让你",
+            "我想",
+            "需要你",
+            "需要",
+            "能不能",
+            "可以",
+            "麻烦",
+            "说几个需求",
+            "问一下",
+            "看一下",
+            "看看",
+        ] {
+            if let Some(rest) = candidate.strip_prefix(prefix) {
+                let r = rest.trim_start_matches(['：', ':', '，', ',', '、', ' ']);
+                if !r.is_empty() {
+                    candidate = r;
+                    break;
+                }
+            }
+        }
+        for ch in candidate.chars() {
+            if matches!(
+                ch,
+                '，' | '。'
+                    | '？'
+                    | '！'
+                    | '；'
+                    | '：'
+                    | ','
+                    | '.'
+                    | '?'
+                    | '!'
+                    | ';'
+                    | ':'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '\n'
+            ) {
+                if count >= 2 {
+                    break;
+                }
+                continue;
+            }
+            if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+                phrase.push(ch);
+                count += 1;
+                if count >= 9 {
+                    break;
+                }
+            }
+        }
+        let cleaned = sanitize_handle(&phrase);
+        if cleaned.chars().count() >= 2 && !is_generic_harness_handle(&cleaned) {
+            return Some(cleaned);
+        }
+    }
+
+    // English / code-centric prompt: pick up to 2 highest-signal non-stopword tokens
+    let mut picked: Vec<String> = Vec::new();
+    for raw_tok in stripped.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
+        let lower = raw_tok.trim_matches(['_', '-']).to_ascii_lowercase();
+        if lower.len() < 3 || STOP_WORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        if GENERIC_HARNESS_HANDLES.contains(&lower.as_str()) {
+            continue;
+        }
+        if !picked.contains(&lower) {
+            picked.push(lower);
+        }
+        if picked.len() >= 2 {
+            break;
+        }
+    }
+    if !picked.is_empty() {
+        let joined = sanitize_handle(&picked.join("-"));
+        if !joined.is_empty() && !is_generic_harness_handle(&joined) {
+            return Some(joined);
+        }
+    }
+    None
 }
 
 /// Allocate a short, human-readable handle that is unique among active peers in a workspace.
@@ -56,19 +215,21 @@ pub fn allocate_unique_handle(
     requested: Option<&str>,
     provider: ProviderKind,
     profile_name: Option<&str>,
+    prompt_seed: Option<&str>,
     existing_peers: &[AgentSummary],
 ) -> String {
     let taken: HashSet<String> = existing_peers
         .iter()
         .filter(|a| a.archived_at.is_none())
         .filter_map(|a| a.handle.as_deref())
-        .map(|h| h.to_ascii_lowercase())
+        .map(|h| h.to_lowercase())
         .collect();
 
     let base = requested
         .map(sanitize_handle)
         .filter(|s| !s.is_empty())
         .or_else(|| profile_name.map(sanitize_handle).filter(|s| !s.is_empty()))
+        .or_else(|| prompt_seed.and_then(derive_semantic_handle_from_prompt))
         .unwrap_or_else(|| {
             if taken.is_empty() {
                 "lead".to_string()
@@ -81,12 +242,13 @@ pub fn allocate_unique_handle(
             }
         });
 
-    if !taken.contains(&base) {
+    let base_lower = base.to_lowercase();
+    if !taken.contains(&base_lower) {
         return base;
     }
     for n in 2..=99 {
         let candidate = format!("{base}-{n}");
-        if !taken.contains(&candidate) {
+        if !taken.contains(&candidate.to_lowercase()) {
             return candidate;
         }
     }
@@ -145,7 +307,7 @@ fn extract_mentioned_paths(prompt: &str, badges: &[PromptBadge]) -> HashSet<Stri
 }
 
 /// Extract normalized English/code tokens + CJK bigrams for fast zero-dependency semantic matching.
-fn extract_semantic_tokens(text: &str) -> HashSet<String> {
+pub(crate) fn extract_semantic_tokens(text: &str) -> HashSet<String> {
     let mut tokens = HashSet::new();
     let mut cur_ascii = String::new();
     let mut cjk_run: Vec<char> = Vec::new();
@@ -234,6 +396,9 @@ pub fn evaluate_auto_cluster(
         .ok()?
         .into_iter()
         .filter(|ws| {
+            if !ws.is_curated {
+                return false;
+            }
             if exclude_workspace_id == Some(ws.workspace_id.as_str()) {
                 return false;
             }
@@ -430,6 +595,7 @@ mod tests {
             board_revision: 0,
             title_locked: false,
             auto_clustered: false,
+            is_curated: true,
         }
     }
 
@@ -464,6 +630,7 @@ mod tests {
             pinned_order: 0,
             handle: Some(handle.into()),
             cluster_suggestion: None,
+            task_summary: None,
         }
     }
 
@@ -471,12 +638,24 @@ mod tests {
     fn allocates_unique_sanitized_handles() {
         let a1 = mk_agent("ag_1", "ws_1", "/repo", "lead");
         assert_eq!(
-            allocate_unique_handle(None, ProviderKind::Codex, None, std::slice::from_ref(&a1)),
+            allocate_unique_handle(
+                None,
+                ProviderKind::Codex,
+                None,
+                None,
+                std::slice::from_ref(&a1)
+            ),
             "codex"
         );
         let a2 = mk_agent("ag_2", "ws_1", "/repo", "codex");
         assert_eq!(
-            allocate_unique_handle(None, ProviderKind::Codex, None, &[a1.clone(), a2.clone()]),
+            allocate_unique_handle(
+                None,
+                ProviderKind::Codex,
+                None,
+                None,
+                &[a1.clone(), a2.clone()]
+            ),
             "codex-2"
         );
         assert_eq!(
@@ -484,10 +663,25 @@ mod tests {
                 Some("@Code Reviewer!"),
                 ProviderKind::Antigravity,
                 None,
-                &[a1]
+                None,
+                std::slice::from_ref(&a1)
             ),
             "code-reviewer"
         );
+        // Semantic prompt derivation avoids bare harness names and supports CJK
+        assert_eq!(
+            allocate_unique_handle(
+                None,
+                ProviderKind::ClaudeCode,
+                None,
+                Some("请帮我修复跨端已读状态同步问题"),
+                std::slice::from_ref(&a1)
+            ),
+            "修复跨端已读状态同"
+        );
+        assert!(is_generic_harness_handle("agy"));
+        assert!(is_generic_harness_handle("codex-2"));
+        assert!(!is_generic_harness_handle("sync-core"));
     }
 
     #[test]

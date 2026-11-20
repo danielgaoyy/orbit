@@ -19,6 +19,7 @@ import {
   type RichBlockView,
   type WorkspaceEventRecord,
   orbitIpc,
+  semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { ProviderIcon } from "@/components/ui/provider-icons";
@@ -86,6 +87,8 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   const [savingBoard, setSavingBoard] = useState(false);
   const [goalDraft, setGoalDraft] = useState(workspace?.mission_goal ?? "");
   const [editingGoal, setEditingGoal] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(workspace?.title ?? "");
+  const [editingTitle, setEditingTitle] = useState(false);
   const [previewBlocks, setPreviewBlocks] = useState<RichBlockView[]>([]);
 
   useEffect(() => {
@@ -136,6 +139,22 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
     }
   };
 
+  useEffect(() => {
+    if (!editingTitle) {
+      setTitleDraft(workspace?.title ?? "");
+    }
+  }, [workspace?.title, editingTitle]);
+
+  const handleSaveTitle = async () => {
+    const clean = titleDraft.trim();
+    if (!hostId || !workspaceId || !clean) {
+      setEditingTitle(false);
+      return;
+    }
+    await orbitActions.renameWorkspace(hostId, workspaceId, clean);
+    setEditingTitle(false);
+  };
+
   const handleSaveGoal = async () => {
     if (!hostId || !workspaceId) return;
     await orbitActions.updateWorkspaceGoal(hostId, workspaceId, goalDraft.trim());
@@ -146,10 +165,33 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       {/* Header */}
       <div className="border-border/70 flex items-center justify-between gap-2 border-b px-3.5 py-2.5">
-        <div className="min-w-0">
-          <div className="text-foreground truncate text-[13.5px] font-semibold">
-            {workspace?.title || "Mission Workspace"}
-          </div>
+        <div className="min-w-0 flex-1">
+          {editingTitle ? (
+            <input
+              autoFocus
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onBlur={() => void handleSaveTitle()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void handleSaveTitle();
+                if (e.key === "Escape") {
+                  setTitleDraft(workspace?.title ?? "");
+                  setEditingTitle(false);
+                }
+              }}
+              className="border-border bg-canvas text-foreground h-[24px] w-full max-w-64 rounded-md border px-2 text-[13.5px] font-semibold outline-none"
+            />
+          ) : (
+            <button
+              type="button"
+              title="点击重命名 Workspace"
+              onClick={() => setEditingTitle(true)}
+              className="text-foreground hover:text-primary flex max-w-full cursor-pointer items-center gap-1.5 truncate text-left text-[13.5px] font-semibold transition-colors"
+            >
+              <span className="truncate">{workspace?.title || "Mission Workspace"}</span>
+              <Edit3 className="text-muted-foreground/70 h-[11.5px] w-[11.5px] shrink-0" />
+            </button>
+          )}
           <div className="text-muted-foreground flex items-center gap-2 text-[11.5px]">
             <span>
               {peers.length} {peers.length === 1 ? "peer" : "peers"}
@@ -257,7 +299,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
             <div className="space-y-1">
               {peers.map((peer) => {
                 const isFocused = peer.agent_id === selectedAgentId;
-                const handle = peer.handle ? `@${peer.handle}` : peer.title;
+                const handle = semanticAgentTabLabel(peer);
                 return (
                   <div
                     key={peer.agent_id}
@@ -269,26 +311,35 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                     <button
                       type="button"
                       onClick={() => orbitActions.selectAgent(hostId, peer.agent_id)}
-                      className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+                      className="flex min-w-0 flex-1 cursor-pointer items-start gap-2 text-left"
                     >
                       {peer.is_running ? (
-                        <Loader2 className="h-[12px] w-[12px] shrink-0 animate-spin text-sky-500" />
+                        <Loader2 className="mt-0.5 h-[12px] w-[12px] shrink-0 animate-spin text-sky-500" />
                       ) : (
                         <ProviderIcon
                           provider={peer.provider}
-                          className="h-[13px] w-[13px] shrink-0 opacity-80"
+                          className="mt-0.5 h-[13px] w-[13px] shrink-0 opacity-80"
                         />
                       )}
-                      <span className="text-foreground truncate font-medium">{handle}</span>
-                      <span className="text-muted-foreground truncate text-[11.5px]">
-                        {peer.provider_label}
-                      </span>
-                      {peer.worktree_branch && (
-                        <span className="bg-muted text-muted-foreground inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 font-mono text-[10.5px]">
-                          <GitBranch className="h-[10px] w-[10px]" />
-                          {peer.worktree_branch}
-                        </span>
-                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-foreground truncate font-medium">{handle}</span>
+                          <span className="text-muted-foreground shrink-0 text-[11px]">
+                            {peer.provider_label}
+                          </span>
+                          {peer.worktree_branch && (
+                            <span className="bg-muted text-muted-foreground inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 font-mono text-[10.5px]">
+                              <GitBranch className="h-[10px] w-[10px]" />
+                              {peer.worktree_branch}
+                            </span>
+                          )}
+                        </div>
+                        {peer.task_summary && (
+                          <div className="text-muted-foreground/85 truncate text-[11px]">
+                            {peer.task_summary}
+                          </div>
+                        )}
+                      </div>
                     </button>
                     <button
                       type="button"

@@ -242,7 +242,7 @@ impl OrbitStore {
     pub fn rename_workspace(&self, workspace_id: &str, title: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute(
-            "UPDATE workspaces SET title = ?1, title_locked = 1, updated_at = ?2 WHERE workspace_id = ?3",
+            "UPDATE workspaces SET title = ?1, title_locked = 1, is_curated = 1, updated_at = ?2 WHERE workspace_id = ?3",
             params![title, Utc::now().to_rfc3339(), workspace_id],
         )?;
         Ok(())
@@ -505,6 +505,7 @@ impl OrbitStore {
         mode: Option<&SessionMode>,
         labels: Option<&HashMap<String, String>>,
         handle: Option<&str>,
+        task_summary: Option<&str>,
     ) -> Result<(), StoreError> {
         let mut current = match self.get_agent(agent_id)? {
             Some(a) => a,
@@ -534,6 +535,14 @@ impl OrbitStore {
         if let Some(h) = handle {
             let trimmed = h.trim();
             current.handle = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Some(ts) = task_summary {
+            let trimmed = ts.trim();
+            current.task_summary = if trimmed.is_empty() {
                 None
             } else {
                 Some(trimmed.to_string())

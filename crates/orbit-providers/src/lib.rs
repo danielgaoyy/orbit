@@ -77,7 +77,7 @@ pub use driver::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, ProviderSessionHandle,
     SessionLaunchConfig,
 };
-pub use side_question::{SideQuestionSpec, run_side_question};
+pub use side_question::{SideQuestionSpec, run_ephemeral_text_prompt, run_side_question};
 
 static PROVIDER_EXECUTABLE_OVERRIDES: OnceLock<RwLock<HashMap<ProviderKind, PathBuf>>> =
     OnceLock::new();
@@ -88,6 +88,35 @@ pub fn set_provider_executable_override(kind: ProviderKind, path: PathBuf) {
     if let Ok(mut guard) = lock.write() {
         guard.insert(kind, path);
     }
+}
+
+/// Returns `true` when ANY provider executable override is registered in-process (e.g. mock E2E tests).
+pub fn has_any_provider_override() -> bool {
+    if let Some(lock) = PROVIDER_EXECUTABLE_OVERRIDES.get()
+        && let Ok(guard) = lock.read()
+        && !guard.is_empty()
+    {
+        return true;
+    }
+    false
+}
+
+/// Returns `true` when `kind` is pointed at a test override binary (via in-process override or env var).
+pub fn is_provider_overridden(kind: ProviderKind) -> bool {
+    if let Some(lock) = PROVIDER_EXECUTABLE_OVERRIDES.get()
+        && let Ok(guard) = lock.read()
+        && guard.contains_key(&kind)
+    {
+        return true;
+    }
+    let env_key = match kind {
+        ProviderKind::Antigravity => "ORBIT_AGY_BIN",
+        ProviderKind::Codex => "ORBIT_CODEX_BIN",
+        ProviderKind::ClaudeCode => "ORBIT_CLAUDE_BIN",
+    };
+    env::var(env_key)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -6,6 +6,8 @@ import {
   FolderOpen,
   GitBranch,
   GitCompareArrows,
+  LayoutList,
+  PanelRight,
   SquareTerminal,
 } from "lucide-react";
 import { type ExternalEditorKind, type TimelineItemView, isMacDesktop } from "@/lib/orbit-ipc";
@@ -57,12 +59,35 @@ function EditorItemIcon({ kind }: { kind: ExternalEditorKind }) {
 export const TopBar = memo(function TopBar() {
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
-  const inspectorOpen = useOrbitSelector((s) => s.inspectorOpen);
-  const terminalOpen = useOrbitSelector((s) => s.terminalOpen);
+  const sidePanelOpen = useOrbitSelector((s) => s.sidePanelOpen);
+  const activeSidePanelTabKind = useOrbitSelector((s) => {
+    if (!s.sidePanelOpen || !s.activeSidePanelTabId) return null;
+    return s.sidePanelTabs.find((t) => t.id === s.activeSidePanelTabId)?.kind ?? null;
+  });
+  const overviewVisible = useOrbitSelector((s) =>
+    s.stageCanDockOverview ? s.overviewDesktopOpenPref : s.overviewPopoverOpen,
+  );
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const externalEditors = useOrbitSelector((s) => s.externalEditors);
+  const hasActiveSession = workspacePanel === "conversation" && !isDraft && Boolean(selectedAgentId);
+  const hasRunningBackgroundActivity = useOrbitSelector((s) => {
+    if (!s.selectedHostId || !s.selectedAgentId || s.isDraftNewSession) return false;
+    const tl = s.timelines[`${s.selectedHostId}::${s.selectedAgentId}`];
+    if (!tl) return false;
+    for (let i = tl.items.length - 1; i >= 0; i -= 1) {
+      const it = tl.items[i];
+      if (
+        it.item_type === "tool_call" &&
+        it.status === "running" &&
+        (it.detail.kind === "shell" || it.detail.kind === "subagent")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  });
 
   // Primitive selectors prevent `TopBar` from re-rendering on streaming tokens or background host ticks
   const headerTitle = useOrbitSelector((s) => {
@@ -213,15 +238,37 @@ export const TopBar = memo(function TopBar() {
           </DropdownMenuContent>
         </DropdownMenu>
 
+        {hasActiveSession && (
+          <SimpleTooltip label={overviewVisible ? "Hide overview" : "Show overview"} shortcut={`${mod}⌥O`}>
+            <button
+              type="button"
+              data-overview-trigger
+              aria-label={overviewVisible ? "Hide overview" : "Show overview"}
+              onClick={() => orbitActions.toggleOverviewPanel()}
+              className={cn(
+                "relative inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
+                overviewVisible
+                  ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
+                  : "text-foreground/65 hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
+              )}
+            >
+              <LayoutList className="h-[15.5px] w-[15.5px] stroke-[1.75]" />
+              {!overviewVisible && hasRunningBackgroundActivity && (
+                <span className="bg-primary absolute top-1.5 right-1.5 h-1.5 w-1.5 animate-pulse rounded-full" />
+              )}
+            </button>
+          </SimpleTooltip>
+        )}
+
         <SimpleTooltip label="Diff Review" shortcut={`${mod}D`}>
           <button
             type="button"
             aria-label="Diff Review"
-            onClick={() => orbitActions.toggleInspector()}
+            onClick={() => orbitActions.toggleReviewTab()}
             className={cn(
               "inline-flex h-[28px] cursor-pointer items-center justify-center gap-1.5 rounded-[7px] transition-colors",
               changedBadgeCount > 0 ? "px-2" : "w-[28px]",
-              inspectorOpen
+              activeSidePanelTabKind === "review"
                 ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
                 : "text-foreground/65 hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
             )}
@@ -239,15 +286,34 @@ export const TopBar = memo(function TopBar() {
           <button
             type="button"
             aria-label="Terminal"
-            onClick={() => orbitActions.toggleTerminalDock()}
+            onClick={() => orbitActions.toggleTerminalTab()}
             className={cn(
               "inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
-              terminalOpen
+              activeSidePanelTabKind === "terminal"
                 ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
                 : "text-foreground/65 hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
             )}
           >
             <SquareTerminal className="h-[16px] w-[16px] stroke-[1.75]" />
+          </button>
+        </SimpleTooltip>
+
+        <SimpleTooltip
+          label={sidePanelOpen ? "Hide side panel" : "Show side panel"}
+          shortcut={`${mod}\\`}
+        >
+          <button
+            type="button"
+            aria-label={sidePanelOpen ? "Hide side panel" : "Show side panel"}
+            onClick={() => orbitActions.toggleSidePanel()}
+            className={cn(
+              "inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
+              sidePanelOpen
+                ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
+                : "text-foreground/65 hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
+            )}
+          >
+            <PanelRight className="h-[16px] w-[16px] stroke-[1.75]" />
           </button>
         </SimpleTooltip>
       </div>

@@ -30,8 +30,8 @@ use orbit_protocol::{
     HostInfo, PROTOCOL_VERSION, ProviderModelCatalog, TerminalBinaryFrame, WireMessage,
 };
 use orbit_providers::{
-    catalogs_to_model_map, discover_installed_providers, probe_all_provider_models,
-    probe_all_provider_quotas,
+    SideQuestionSpec, catalogs_to_model_map, discover_installed_providers,
+    probe_all_provider_models, probe_all_provider_quotas, run_side_question,
 };
 use orbit_relay_transport::{RelayConnector, is_ssh_relay_url, redact_relay_url};
 use orbit_store::OrbitStore;
@@ -39,9 +39,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::attachments::AttachmentStagingManager;
-use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files};
+use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files, read_workspace_file};
 use crate::manager::{AgentOrchestrator, DaemonBroadcast, PtyBroadcast};
 
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
@@ -611,9 +612,11 @@ async fn run_client_session_loop(
     mut in_rx: mpsc::Receiver<SessionFrame>,
     out_tx: mpsc::Sender<SessionFrame>,
 ) {
+    let session_id = Uuid::new_v4();
     let mut use_zstd = false;
     let mut subscribed_agents: HashSet<String> = HashSet::new();
     let mut slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)> = HashMap::new();
+    let mut active_side_questions: Vec<tokio::task::AbortHandle> = Vec::new();
     let mut bcast_rx = runtime.orchestrator.broadcast_tx.subscribe();
 
     loop {
@@ -640,12 +643,15 @@ async fn run_client_session_loop(
                         if zstd {
                             use_zstd = true;
                         }
+                        active_side_questions.retain(|h| !h.is_finished());
                         if let Some(reply) = handle_wire_rpc(
                             &runtime,
+                            session_id,
                             msg,
                             &mut use_zstd,
                             &mut subscribed_agents,
                             &mut slot_to_terminal,
+                            &mut active_side_questions,
                             &out_tx,
                         )
                         .await
@@ -690,6 +696,31 @@ async fn run_client_session_loop(
                             break;
                         }
                     }
+                    DaemonBroadcast::AgentRewound {
+                        origin_session_id,
+                        outcome,
+                    } => {
+                        if origin_session_id != session_id
+                            && subscribed_agents.contains(&outcome.agent.agent_id)
+                            && out_tx
+                                .send(SessionFrame::Wire {
+                                    msg: WireMessage::AgentRewound {
+                                        request_id: None,
+                                        agent: outcome.agent,
+                                        to_before_seq: outcome.to_before_seq,
+                                        events: outcome.events,
+                                        restored_files: outcome.restored_files,
+                                        restored_prompt: outcome.restored_prompt,
+                                        notice: outcome.notice,
+                                    },
+                                    zstd: use_zstd,
+                                })
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -698,14 +729,20 @@ async fn run_client_session_loop(
     for (_, (_, abort_handle)) in slot_to_terminal.drain() {
         abort_handle.abort();
     }
+    for abort_handle in active_side_questions.drain(..) {
+        abort_handle.abort();
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_wire_rpc(
     runtime: &Arc<DaemonRuntime>,
+    session_id: Uuid,
     req: WireMessage,
     use_zstd: &mut bool,
     subscribed_agents: &mut HashSet<String>,
     slot_to_terminal: &mut HashMap<u8, (String, tokio::task::AbortHandle)>,
+    active_side_questions: &mut Vec<tokio::task::AbortHandle>,
     out_tx: &mpsc::Sender<SessionFrame>,
 ) -> Option<WireMessage> {
     match req {
@@ -863,6 +900,34 @@ async fn handle_wire_rpc(
             });
             None
         }
+        WireMessage::ReadWorkspaceFile {
+            request_id,
+            cwd,
+            path,
+            max_bytes,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let reply = match read_workspace_file(&resolved_cwd, &path, max_bytes).await {
+                    Ok(file_data) => WireMessage::WorkspaceFileContentResponse {
+                        request_id,
+                        cwd,
+                        path,
+                        resolved_path: file_data.resolved_path,
+                        content_kind: file_data.content_kind,
+                        mime_type: file_data.mime_type,
+                        content: file_data.content,
+                        size_bytes: file_data.size_bytes,
+                        truncated: file_data.truncated,
+                    },
+                    Err(e) => rpc_err(request_id, "read_file_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
 
         // Agents
         WireMessage::ListAgents {
@@ -987,6 +1052,27 @@ async fn handle_wire_rpc(
                 Err(e) => Some(rpc_err(request_id, "archive_failed", e)),
             }
         }
+        WireMessage::RewindAgent {
+            request_id,
+            agent_id,
+            to_before_seq,
+            restore_files,
+        } => match runtime
+            .orchestrator
+            .rewind_agent(&agent_id, to_before_seq, restore_files, session_id)
+            .await
+        {
+            Ok(outcome) => Some(WireMessage::AgentRewound {
+                request_id: Some(request_id),
+                agent: outcome.agent,
+                to_before_seq: outcome.to_before_seq,
+                events: outcome.events,
+                restored_files: outcome.restored_files,
+                restored_prompt: outcome.restored_prompt,
+                notice: outcome.notice,
+            }),
+            Err(e) => Some(rpc_err(request_id, "rewind_failed", e)),
+        },
         WireMessage::ResolvePermission {
             request_id,
             agent_id,
@@ -1186,6 +1272,75 @@ async fn handle_wire_rpc(
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });
+            None
+        }
+        WireMessage::AskSideQuestion {
+            request_id,
+            agent_id: _,
+            cwd,
+            provider,
+            model,
+            question,
+            context_summary,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let handle = tokio::spawn(async move {
+                let resolved_cwd = expand_host_path(&cwd);
+                let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
+                let forward_tx = tx.clone();
+                let forward_task = tokio::spawn(async move {
+                    while let Some(chunk) = delta_rx.recv().await {
+                        if forward_tx
+                            .send(SessionFrame::Wire {
+                                msg: WireMessage::SideQuestionDelta {
+                                    request_id,
+                                    text_delta: chunk,
+                                },
+                                zstd,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+
+                let result = run_side_question(
+                    SideQuestionSpec {
+                        provider,
+                        cwd: resolved_cwd,
+                        model,
+                        question,
+                        context_summary,
+                    },
+                    delta_tx,
+                )
+                .await;
+
+                let _ = forward_task.await;
+
+                let done_msg = match result {
+                    Ok(full_text) => WireMessage::SideQuestionDone {
+                        request_id,
+                        full_text,
+                        error: None,
+                    },
+                    Err(err) => WireMessage::SideQuestionDone {
+                        request_id,
+                        full_text: String::new(),
+                        error: Some(err),
+                    },
+                };
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: done_msg,
+                        zstd,
+                    })
+                    .await;
+            });
+            active_side_questions.push(handle.abort_handle());
             None
         }
         _ => None,

@@ -29,8 +29,12 @@ export function ShortcutsSection() {
       { group: "Navigation", action: "Switch Conversation 1–9", keys: `${mod}1 .. ${mod}9` },
 
       { group: "Panels", action: "Toggle Sidebar", keys: `${mod}B` },
+      { group: "Panels", action: "Toggle Right Side Panel", keys: `${mod}\\` },
+      { group: "Panels", action: "Toggle Stage Overview", keys: `${mod}⌥O` },
+      { group: "Panels", action: "Quick Open File", keys: `${mod}P` },
       { group: "Panels", action: "Toggle Diff Review", keys: `${mod}D` },
       { group: "Panels", action: "Toggle Terminal", keys: `${mod}J / ⌃\`` },
+      { group: "Panels", action: "Side Question (/btw)", keys: `${mod};` },
       { group: "Panels", action: "Open in External Editor", keys: `${mod}O` },
 
       {

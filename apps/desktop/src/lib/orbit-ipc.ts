@@ -411,6 +411,14 @@ export interface AgentTimelineDeltaView {
   upserted_items: TimelineItemView[];
   resolved_permissions: Record<string, string>;
   resolved_questions: Record<string, string[][]>;
+  reset?: boolean;
+}
+
+export interface RewindAgentResultView {
+  agent: AgentCardView;
+  restored_files: number;
+  restored_prompt: string | null;
+  notice: string | null;
 }
 
 export interface GitFileEntry {
@@ -439,6 +447,34 @@ export interface GitReviewView {
   raw_diff: string;
   diff_files: DiffFileView[];
 }
+
+export interface WorkspaceFileView {
+  host_id: string;
+  cwd: string;
+  path: string;
+  resolved_path: string;
+  language: string;
+  content_kind: "text" | "image" | "binary" | string;
+  mime_type: string | null;
+  content: string;
+  size_bytes: number;
+  truncated: boolean;
+  highlighted_lines: HighlightedLineView[];
+  markdown_blocks: RichBlockView[];
+}
+
+export type SideQuestionStreamEvent =
+  | {
+      kind: "delta";
+      request_id: string;
+      text_delta: string;
+    }
+  | {
+      kind: "done";
+      request_id: string;
+      full_text: string;
+      error: string | null;
+    };
 
 export interface SshHostItem {
   alias: string;
@@ -747,6 +783,23 @@ export const orbitIpc = {
     await invoke<void>("archive_agent", { hostId, agentId });
   },
 
+  rewindAgent: async (
+    hostId: string,
+    agentId: string,
+    toBeforeSeq: number,
+    restoreFiles: boolean,
+  ): Promise<RewindAgentResultView> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Rewind is unavailable outside the desktop runtime");
+    }
+    return invoke<RewindAgentResultView>("rewind_agent", {
+      hostId,
+      agentId,
+      toBeforeSeq,
+      restoreFiles,
+    });
+  },
+
   resolvePermission: async (
     hostId: string,
     agentId: string,
@@ -874,6 +927,107 @@ export const orbitIpc = {
     return invoke<string[]>("get_workspace_files", { hostId, cwd });
   },
 
+  readWorkspaceFile: async (
+    hostId: string,
+    cwd: string,
+    path: string,
+  ): Promise<WorkspaceFileView> => {
+    if (!isTauriRuntime()) {
+      return {
+        host_id: hostId,
+        cwd,
+        path,
+        resolved_path: path,
+        language: "text",
+        content_kind: "text",
+        mime_type: "text/plain",
+        content: "// Desktop runtime required to read host files.",
+        size_bytes: 0,
+        truncated: false,
+        highlighted_lines: [
+          {
+            line_number: 1,
+            tokens: [
+              {
+                text: "// Desktop runtime required to read host files.",
+                fg_hex: "#94A3B8",
+                bold: false,
+                italic: false,
+              },
+            ],
+          },
+        ],
+        markdown_blocks: [],
+      };
+    }
+    return invoke<WorkspaceFileView>("read_workspace_file", { hostId, cwd, path });
+  },
+
+  askSideQuestion: async (
+    params: {
+      hostId: string;
+      agentId: string | null;
+      cwd: string;
+      provider: ProviderKind;
+      model: string | null;
+      question: string;
+      contextSummary: string;
+    },
+    onEvent: (ev: SideQuestionStreamEvent) => void,
+  ): Promise<string> => {
+    if (!isTauriRuntime()) {
+      const id = `mock_${Date.now()}`;
+      setTimeout(() => {
+        onEvent({
+          kind: "done",
+          request_id: id,
+          full_text: "Side questions require the Orbit desktop runtime.",
+          error: null,
+        });
+      }, 150);
+      return id;
+    }
+    const ch = new Channel<SideQuestionStreamEvent>();
+    ch.onmessage = onEvent;
+    return invoke<string>("ask_side_question", {
+      hostId: params.hostId,
+      agentId: params.agentId,
+      cwd: params.cwd,
+      provider: params.provider,
+      model: params.model,
+      question: params.question,
+      contextSummary: params.contextSummary,
+      onEvent: ch,
+    });
+  },
+
+  parseMarkdownPreview: async (
+    markdown: string,
+    streaming: boolean,
+  ): Promise<RichBlockView[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<RichBlockView[]>("parse_markdown_preview", { markdown, streaming });
+  },
+
+  openBrowserPopoutWindow: async (url: string, title?: string | null): Promise<void> => {
+    if (!isTauriRuntime()) {
+      window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    await invoke<void>("open_browser_popout_window", {
+      url,
+      title: title ?? null,
+    });
+  },
+
+  openExternalBrowserUrl: async (url: string): Promise<void> => {
+    if (!isTauriRuntime()) {
+      window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    await invoke<void>("open_external_browser_url", { url });
+  },
+
   stageAttachment: async (
     filename: string,
     bytes: number[],
@@ -910,7 +1064,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.3.5";
+    if (!isTauriRuntime()) return "0.3.6";
     return invoke<string>("get_app_version");
   },
 

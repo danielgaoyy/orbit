@@ -47,14 +47,14 @@ export function useGlobalErgonomicKeybindings(): void {
         }
       }
 
-      // 2. Toggle Terminal Dock (`⌘J` / `Ctrl+J` or `Ctrl+\``) — works even inside terminal to toggle focus/visibility
+      // 2. Toggle Terminal Tab in Side Panel (`⌘J` / `Ctrl+J` or `Ctrl+\``) — works even inside terminal
       if (
         (mod && !e.shiftKey && !e.altKey && keyLower === "j") ||
         (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === "`")
       ) {
         e.preventDefault();
         if (e.repeat) return;
-        orbitActions.toggleTerminalDock();
+        orbitActions.toggleTerminalTab();
         return;
       }
 
@@ -67,9 +67,11 @@ export function useGlobalErgonomicKeybindings(): void {
       const isModalOverlayOpen =
         snap.activeView === "settings" ||
         snap.commandPaletteOpen ||
+        snap.quickOpenFilesOpen ||
         snap.pairDialogOpen ||
         snap.relayDialogOpen ||
-        snap.remoteFolderPickerHostId !== null;
+        snap.remoteFolderPickerHostId !== null ||
+        Boolean(document.querySelector('[data-slot="dialog-content"]'));
 
       if (isModalOverlayOpen) {
         return;
@@ -99,11 +101,43 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
-      // 6. Toggle Right Diff Review Inspector (`⌘D` / `Ctrl+D`)
+      // 5b. Toggle Unified Right Side Panel (`⌘\` / `Ctrl+\`)
+      if (mod && !e.shiftKey && !e.altKey && e.key === "\\") {
+        e.preventDefault();
+        if (e.repeat) return;
+        orbitActions.toggleSidePanel();
+        return;
+      }
+
+      // 5c. Toggle Main Stage Overview Panel (`⌘⌥O` / `Ctrl+Alt+O`)
+      if (mod && e.altKey && !e.shiftKey && (keyLower === "o" || e.code === "KeyO")) {
+        e.preventDefault();
+        if (e.repeat) return;
+        orbitActions.toggleOverviewPanel();
+        return;
+      }
+
+      // 6. Toggle Diff Review Tab (`⌘D` / `Ctrl+D`)
       if (mod && !e.shiftKey && !e.altKey && keyLower === "d") {
         e.preventDefault();
         if (e.repeat) return;
-        orbitActions.toggleInspector();
+        orbitActions.toggleReviewTab();
+        return;
+      }
+
+      // 6b. Quick Open Workspace File (`⌘P` / `Ctrl+P`)
+      if (mod && !e.shiftKey && !e.altKey && keyLower === "p") {
+        e.preventDefault();
+        if (e.repeat) return;
+        orbitActions.setQuickOpenFilesOpen(true);
+        return;
+      }
+
+      // 6c. Toggle Side Question (`/btw`) Tab (`⌘;` / `Ctrl+;`)
+      if (mod && !e.shiftKey && !e.altKey && e.key === ";") {
+        e.preventDefault();
+        if (e.repeat) return;
+        orbitActions.toggleSideQuestionTab();
         return;
       }
 

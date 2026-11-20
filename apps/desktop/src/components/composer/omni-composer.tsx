@@ -292,6 +292,9 @@ export const OmniComposer = memo(function OmniComposer({
     setMenuHighlightIdx(0);
 
     switch (cmd.id) {
+      case "btw":
+        orbitActions.openSideQuestionTab();
+        return;
       case "plan":
         orbitActions.setSlashDirective("plan");
         break;
@@ -308,8 +311,14 @@ export const OmniComposer = memo(function OmniComposer({
         orbitActions.setSlashDirective("review");
         break;
       case "diff":
-        orbitActions.toggleInspector();
+        orbitActions.toggleReviewTab();
         break;
+      case "files":
+        orbitActions.openFilesExplorerTab();
+        return;
+      case "browser":
+        orbitActions.openBrowserTab();
+        return;
       case "compact":
         if (!isDraft && hasCurrentAgent) {
           orbitActions.setSlashDirective("compact");
@@ -318,14 +327,14 @@ export const OmniComposer = memo(function OmniComposer({
         }
         break;
       case "terminal":
-        orbitActions.toggleTerminalDock();
-        break;
+        orbitActions.toggleTerminalTab();
+        return;
       case "new":
         orbitActions.startNewThreadDraft();
         break;
       case "settings":
         orbitActions.openSettings();
-        break;
+        return;
     }
 
     requestAnimationFrame(() => {

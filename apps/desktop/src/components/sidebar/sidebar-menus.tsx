@@ -13,8 +13,13 @@ import {
   Trash2,
   Unlink,
 } from "lucide-react";
-import { type AgentCardView, type HostCardView, orbitIpc } from "@/lib/orbit-ipc";
-import { type UnifiedProjectEntry, isLocalHostCard } from "@/lib/projects";
+import {
+  type AgentCardView,
+  type HostCardView,
+  type SidebarProjectGroupView,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
+import { isLocalHostCard } from "@/lib/projects";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -53,7 +58,8 @@ export interface ActiveConversationMenuState {
 }
 
 export interface ActiveProjectMenuState {
-  project: UnifiedProjectEntry;
+  project: SidebarProjectGroupView;
+  host: HostCardView;
   anchor: MenuAnchorBox;
 }
 
@@ -221,11 +227,11 @@ export function SharedProjectMenu({
   target: ActiveProjectMenuState | null;
   isMac: boolean;
   onClose: () => void;
-  onRequestDelete: (project: UnifiedProjectEntry) => void;
+  onRequestDelete: (project: SidebarProjectGroupView) => void;
 }) {
   if (!target) return null;
-  const { project: proj, anchor } = target;
-  const isLocal = isLocalHostCard(proj.host);
+  const { project: proj, host, anchor } = target;
+  const isLocal = isLocalHostCard(host);
 
   return (
     <DropdownMenu
@@ -257,7 +263,7 @@ export function SharedProjectMenu({
       >
         <DropdownMenuItem
           onSelect={() => {
-            void navigator.clipboard.writeText(proj.primaryCwd);
+            void navigator.clipboard.writeText(proj.primary_cwd);
             orbitActions.showToast("Copied project path");
           }}
         >
@@ -270,7 +276,7 @@ export function SharedProjectMenu({
         {isLocal && (
           <DropdownMenuItem
             onSelect={() => {
-              void orbitIpc.openInEditor("file_manager", proj.primaryCwd, null);
+              void orbitIpc.openInEditor("file_manager", proj.primary_cwd, null);
             }}
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
@@ -323,7 +329,7 @@ export function DeleteProjectDialog({
   archivedThreads,
   onClose,
 }: {
-  project: UnifiedProjectEntry | null;
+  project: SidebarProjectGroupView | null;
   archivedThreads: Record<string, ArchivedThreadEntry>;
   onClose: () => void;
 }) {
@@ -335,7 +341,7 @@ export function DeleteProjectDialog({
   if (project) {
     for (const { agent } of project.conversations) {
       const isArchived = Boolean(
-        archivedThreads[threadScopeKey(project.host.host_id, agent.agent_id)],
+        archivedThreads[threadScopeKey(project.host_id, agent.agent_id)],
       );
       if (isArchived) {
         archivedCount += 1;

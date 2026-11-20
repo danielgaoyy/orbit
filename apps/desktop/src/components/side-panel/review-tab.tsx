@@ -1,6 +1,6 @@
 import { memo, useMemo } from "react";
 import { Columns2, GitBranch, RefreshCw, Rows3 } from "lucide-react";
-import { processTimelineForStage } from "@/lib/timeline-coalesce";
+import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
 import { DiffFilesViewer } from "@/components/diff-viewer";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -22,24 +22,29 @@ export const ReviewTab = memo(function ReviewTab({
       ? (s.gitReviews[`${s.selectedHostId}::${s.selectedWorkspaceCwd}`] ?? null)
       : null,
   );
-  const activeTimeline = useOrbitSelector((s) =>
+  const activeStage = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
-      ? (s.timelines[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
+      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
       : null,
   );
 
-  const sessionTurnDiffs = useMemo(() => {
-    if (!activeTimeline) return [];
-    return processTimelineForStage(activeTimeline.items).sessionTurnDiffs;
-  }, [activeTimeline]);
+  const sessionTurnDiffs = useMemo(
+    () => activeStage?.session_turn_diffs ?? [],
+    [activeStage],
+  );
 
   const displayedDiffFiles = useMemo(() => {
     if (reviewScope === "session_turns") {
       if (!selectedDiffPath) return sessionTurnDiffs;
-      return sessionTurnDiffs.filter((f) => f.path === selectedDiffPath);
+      const targetNorm = stripWorkspacePrefix(selectedDiffPath, selectedCwd).replace(/^\.\//, "");
+      return sessionTurnDiffs.filter(
+        (f) =>
+          f.path === selectedDiffPath ||
+          stripWorkspacePrefix(f.path, selectedCwd).replace(/^\.\//, "") === targetNorm,
+      );
     }
     return gitReview?.diff_files ?? [];
-  }, [reviewScope, sessionTurnDiffs, selectedDiffPath, gitReview]);
+  }, [reviewScope, sessionTurnDiffs, selectedDiffPath, selectedCwd, gitReview]);
 
   const fileSelectorItems = useMemo(() => {
     if (reviewScope === "session_turns") {
@@ -204,7 +209,11 @@ export const ReviewTab = memo(function ReviewTab({
                 </button>
                 {fileSelectorItems.map((f) => {
                   const shortName = f.path.split("/").pop() || f.path;
-                  const active = selectedDiffPath === f.path;
+                  const active =
+                    selectedDiffPath === f.path ||
+                    (selectedDiffPath !== null &&
+                      stripWorkspacePrefix(selectedDiffPath, selectedCwd).replace(/^\.\//, "") ===
+                        stripWorkspacePrefix(f.path, selectedCwd).replace(/^\.\//, ""));
                   return (
                     <button
                       key={f.path}
@@ -235,10 +244,11 @@ export const ReviewTab = memo(function ReviewTab({
           files={displayedDiffFiles}
           layout={diffLayout}
           onQuoteLine={(path, ln, code) => orbitActions.quoteDiffLineToComposer(path, ln, code)}
-          onOpenFile={(path) =>
+          onOpenFile={(path, focusLine) =>
             orbitActions.openFileInSidePanel(path, {
               hostId: selectedHostId,
               cwd: selectedCwd,
+              focusLine,
             })
           }
         />

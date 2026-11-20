@@ -100,7 +100,7 @@ function TabsTrigger({ className, ...props }: React.ComponentProps<typeof BaseTa
   return (
     <BaseTabs.Tab
       className={cn(
-        "data-[active]:bg-background data-[active]:text-foreground inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-[7px] px-3 py-1 text-[12.5px] font-medium whitespace-nowrap transition-all data-[active]:shadow-2xs",
+        "data-[active]:bg-background data-[active]:text-foreground inline-flex cursor-pointer items-center justify-center gap-1.5 rounded-[7px] px-3 py-1 text-[12.5px] font-medium whitespace-nowrap transition-colors data-[active]:shadow-2xs",
         className,
       )}
       {...props}

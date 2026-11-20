@@ -14,7 +14,11 @@ import {
   Search,
   X,
 } from "lucide-react";
-import { MarkdownBlocksView } from "@/components/markdown-blocks";
+import {
+  MarkdownBlocksView,
+  MarkdownLinkProvider,
+} from "@/components/markdown-blocks";
+import { formatLineRangeLabel, normalizeLineRange } from "@/lib/file-links";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { formatFileSizeCompact } from "@/lib/session-insights";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
@@ -94,12 +98,21 @@ export const FileViewerTab = memo(function FileViewerTab({
   const relPath = useMemo(() => stripWorkspacePrefix(path, cwd), [path, cwd]);
   const isMarkdown = data?.language === "markdown" && (data?.markdown_blocks?.length ?? 0) > 0;
 
-  // Automatically switch Markdown tabs to Source view when jumping to a specific line number
+  const focusRange = useMemo(
+    () => normalizeLineRange(tab.focusLine, tab.focusEndLine),
+    [tab.focusLine, tab.focusEndLine],
+  );
+  const focusLabel = useMemo(
+    () => formatLineRangeLabel(focusRange.startLine, focusRange.endLine),
+    [focusRange.startLine, focusRange.endLine],
+  );
+
+  // Automatically switch Markdown tabs to Source view when jumping to a specific line or range
   useEffect(() => {
-    if (tab.focusLine != null && isMarkdown) {
+    if (focusRange.startLine != null && isMarkdown) {
       setMarkdownMode("source");
     }
-  }, [tab.focusLine, isMarkdown]);
+  }, [focusRange.startLine, tab.focusNonce, isMarkdown]);
 
   const hasGitDiff = useMemo(() => {
     if (!gitStatusFiles) return false;
@@ -130,23 +143,37 @@ export const FileViewerTab = memo(function FileViewerTab({
   const activeTargetLine =
     matchLineNumbers.length > 0
       ? matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)]
-      : (tab.focusLine ?? null);
+      : focusRange.startLine;
 
-  // Ensure line window expands automatically to reach any requested focusLine or find match
+  const requiredMaxLine =
+    matchLineNumbers.length > 0
+      ? activeTargetLine
+      : (focusRange.endLine ?? focusRange.startLine);
+
+  // Ensure line window expands automatically to reach any requested focus range or find match
   useEffect(() => {
-    if (activeTargetLine && activeTargetLine > renderedLineCap) {
-      setRenderedLineCap(activeTargetLine + 200);
+    if (requiredMaxLine && requiredMaxLine > renderedLineCap) {
+      setRenderedLineCap(requiredMaxLine + 200);
     }
-  }, [activeTargetLine, renderedLineCap]);
+  }, [requiredMaxLine, renderedLineCap]);
 
-  // Scroll to requested line or active find match
+  // Scroll to requested line or active find match once DOM nodes finish layout
   useEffect(() => {
     if (!activeTargetLine) return;
-    const node = lineRefs.current.get(activeTargetLine);
-    if (node) {
-      node.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
-  }, [activeTargetLine, data?.resolved_path, markdownMode, renderedLineCap]);
+    const rafId = window.requestAnimationFrame(() => {
+      const node = lineRefs.current.get(activeTargetLine);
+      if (node) {
+        node.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [
+    activeTargetLine,
+    tab.focusNonce,
+    data?.resolved_path,
+    markdownMode,
+    renderedLineCap,
+  ]);
 
   const handleCopyContent = async () => {
     if (!data?.content) return;
@@ -198,6 +225,26 @@ export const FileViewerTab = memo(function FileViewerTab({
             <span className="text-muted-foreground tabular-nums shrink-0 text-[11px]">
               {formatFileSizeCompact(data.size_bytes)}
             </span>
+          )}
+          {focusLabel && focusRange.startLine != null && (
+            <button
+              type="button"
+              title="Jump to focused line range"
+              onClick={() => {
+                if (isMarkdown && markdownMode !== "source") {
+                  setMarkdownMode("source");
+                }
+                const targetLine = focusRange.startLine;
+                if (targetLine == null) return;
+                window.requestAnimationFrame(() => {
+                  const node = lineRefs.current.get(targetLine);
+                  node?.scrollIntoView({ block: "center", behavior: "smooth" });
+                });
+              }}
+              className="bg-primary/[0.12] text-primary hover:bg-primary/[0.18] tabular-nums shrink-0 cursor-pointer rounded px-1.5 py-0.5 font-mono text-[11px] font-medium transition-colors"
+            >
+              {focusLabel}
+            </button>
           )}
         </div>
 
@@ -384,7 +431,9 @@ export const FileViewerTab = memo(function FileViewerTab({
         </div>
       ) : isMarkdown && markdownMode === "preview" ? (
         <ScrollArea className="min-h-0 flex-1" viewportClassName="px-5 py-4">
-          <MarkdownBlocksView blocks={data.markdown_blocks} streaming={false} />
+          <MarkdownLinkProvider hostId={hostId} cwd={cwd} baseFilePath={relPath}>
+            <MarkdownBlocksView blocks={data.markdown_blocks} streaming={false} />
+          </MarkdownLinkProvider>
         </ScrollArea>
       ) : (
         <ScrollArea
@@ -400,11 +449,16 @@ export const FileViewerTab = memo(function FileViewerTab({
 
           {data.highlighted_lines.slice(0, renderedLineCap).map((line) => {
             const isMatched = matchLineSet.has(line.line_number);
+            const isRangeFocused =
+              matchLineNumbers.length === 0 &&
+              focusRange.startLine != null &&
+              line.line_number >= focusRange.startLine &&
+              line.line_number <= (focusRange.endLine ?? focusRange.startLine);
             const isFocused =
               (matchLineNumbers.length > 0 &&
                 matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)] ===
                   line.line_number) ||
-              (matchLineNumbers.length === 0 && tab.focusLine === line.line_number);
+              isRangeFocused;
             const rawLineText = line.tokens.map((t) => t.text).join("");
 
             return (
@@ -416,7 +470,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                 }}
                 className={cn(
                   "group/fln flex min-w-fit items-start px-2 transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.035]",
-                  isFocused && "bg-primary/[0.12]",
+                  isFocused && "bg-primary/[0.12] shadow-[inset_2px_0_0_0_var(--color-primary)]",
                   !isFocused && isMatched && "bg-amber-500/[0.12]",
                 )}
               >

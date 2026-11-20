@@ -19,6 +19,7 @@ import {
   orbitTextSubhead
 } from '../../theme/OrbitTokens';
 import { OrbitCopyIconButton } from '../common/OrbitCommonControls';
+import { DiagramBlockView } from './DiagramBlockView';
 
 const QUOTE_MENU_ID: string = 'orbit_quote';
 
@@ -980,11 +981,29 @@ export struct RichMarkdownView {
             .editMenuOptions(this.buildEditMenuOptions(entry.plainText))
           } else if (entry.block !== null) {
             if (entry.block.kind === 'code_block') {
-              CodeHighlightBox({
-                language: entry.block.language ?? '',
-                rawCode: entry.block.raw_code ?? '',
-                lines: entry.block.lines ?? []
-              })
+              if (
+                this.store.detectDiagramKind(
+                  entry.block.language ?? '',
+                  entry.block.raw_code ?? ''
+                ) !== null
+              ) {
+                DiagramBlockView({
+                  diagramKind:
+                    this.store.detectDiagramKind(
+                      entry.block.language ?? '',
+                      entry.block.raw_code ?? ''
+                    ) ?? 'mermaid',
+                  diagramLanguage: entry.block.language ?? '',
+                  diagramSource: entry.block.raw_code ?? '',
+                  diagramLines: entry.block.lines ?? []
+                })
+              } else {
+                CodeHighlightBox({
+                  language: entry.block.language ?? '',
+                  rawCode: entry.block.raw_code ?? '',
+                  lines: entry.block.lines ?? []
+                })
+              }
             } else if (entry.kind === 'task_item' && entry.block.spans !== undefined) {
               Row({ space: OrbitTokens.SPACE_SM }) {
                 Stack({ alignContent: Alignment.Center }) {

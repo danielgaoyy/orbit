@@ -4,7 +4,8 @@
 //! - Unified & inline Git diff structural model (`similar`)
 //! - Run-length coalesced VT100/ANSI terminal grid (`vt100`) for native mobile/desktop canvases
 
-use std::sync::OnceLock;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
@@ -192,14 +193,134 @@ pub fn highlight_code_lines(language: &str, code: &str) -> Vec<HighlightedLineVi
     highlight_code_lines_capped(language, code, usize::MAX)
 }
 
+const CODE_HIGHLIGHT_CACHE_CAP: usize = 512;
+const CODE_HIGHLIGHT_MAX_CACHE_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CodeHighlightCacheKey {
+    lang_token: String,
+    content_hash: u64,
+    content_len: usize,
+    max_highlighted_lines: usize,
+}
+
+struct CodeHighlightBucketEntry {
+    raw_code: Arc<str>,
+    lines: Arc<Vec<HighlightedLineView>>,
+}
+
+struct CodeHighlightLruCache {
+    order: VecDeque<(CodeHighlightCacheKey, u64)>,
+    entries: HashMap<CodeHighlightCacheKey, Vec<CodeHighlightBucketEntry>>,
+    total_entries: usize,
+}
+
+impl CodeHighlightLruCache {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+            total_entries: 0,
+        }
+    }
+
+    fn get(&mut self, key: &CodeHighlightCacheKey, code: &str) -> Option<Vec<HighlightedLineView>> {
+        let bucket = self.entries.get(key)?;
+        let hit = bucket
+            .iter()
+            .find(|entry| entry.raw_code.as_ref() == code)?;
+        Some((*hit.lines).clone())
+    }
+
+    fn insert(&mut self, key: CodeHighlightCacheKey, code: &str, lines: Vec<HighlightedLineView>) {
+        if let Some(bucket) = self.entries.get_mut(&key) {
+            if let Some(existing) = bucket.iter_mut().find(|e| e.raw_code.as_ref() == code) {
+                existing.lines = Arc::new(lines);
+                return;
+            }
+            bucket.push(CodeHighlightBucketEntry {
+                raw_code: Arc::from(code),
+                lines: Arc::new(lines),
+            });
+            self.order.push_back((key, fnv1a_64(code.as_bytes())));
+            self.total_entries += 1;
+        } else {
+            self.entries.insert(
+                key.clone(),
+                vec![CodeHighlightBucketEntry {
+                    raw_code: Arc::from(code),
+                    lines: Arc::new(lines),
+                }],
+            );
+            self.order.push_back((key, fnv1a_64(code.as_bytes())));
+            self.total_entries += 1;
+        }
+
+        while self.total_entries > CODE_HIGHLIGHT_CACHE_CAP {
+            let Some((old_key, _)) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(mut bucket) = self.entries.remove(&old_key) {
+                if !bucket.is_empty() {
+                    bucket.remove(0);
+                    self.total_entries = self.total_entries.saturating_sub(1);
+                }
+                if !bucket.is_empty() {
+                    self.entries.insert(old_key, bucket);
+                }
+            }
+        }
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn code_highlight_cache() -> &'static Mutex<CodeHighlightLruCache> {
+    static CACHE: OnceLock<Mutex<CodeHighlightLruCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(CodeHighlightLruCache::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn code_highlight_cache_len() -> usize {
+    code_highlight_cache()
+        .lock()
+        .map(|g| g.total_entries)
+        .unwrap_or(0)
+}
+
 /// Highlight up to `max_highlighted_lines` with `syntect`, emitting fast plain-styled lines beyond the cap.
 pub fn highlight_code_lines_capped(
     language: &str,
     code: &str,
     max_highlighted_lines: usize,
 ) -> Vec<HighlightedLineView> {
-    let ps = syntax_set();
     let lang_token = language.trim();
+    let cacheable = code.len() <= CODE_HIGHLIGHT_MAX_CACHE_BYTES;
+    let cache_key = if cacheable {
+        let key = CodeHighlightCacheKey {
+            lang_token: lang_token.to_string(),
+            content_hash: fnv1a_64(code.as_bytes()),
+            content_len: code.len(),
+            max_highlighted_lines,
+        };
+        if let Ok(mut guard) = code_highlight_cache().lock()
+            && let Some(cached) = guard.get(&key, code)
+        {
+            return cached;
+        }
+        Some(key)
+    } else {
+        None
+    };
+
+    let ps = syntax_set();
     let syntax = if lang_token.is_empty() {
         ps.find_syntax_plain_text()
     } else {
@@ -282,6 +403,12 @@ pub fn highlight_code_lines_capped(
                 italic: false,
             }],
         });
+    }
+
+    if let Some(key) = cache_key
+        && let Ok(mut guard) = code_highlight_cache().lock()
+    {
+        guard.insert(key, code, out.clone());
     }
 
     out
@@ -1483,5 +1610,19 @@ diff --git a/src/lib.rs b/src/lib.rs
             }
             other => panic!("expected nested ListItem, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn highlight_code_lines_cache_hits_and_stays_bounded() {
+        let snippet = "fn orbit_fast(x: i32) -> i32 { x + 1 }\n";
+        let first = highlight_code_lines_capped("rust", snippet, 200);
+        let second = highlight_code_lines_capped("rust", snippet, 200);
+        assert_eq!(first, second);
+
+        for idx in 0..600 {
+            let s = format!("let unique_cache_var_{idx} = {idx};");
+            let _ = highlight_code_lines_capped("rust", &s, 50);
+        }
+        assert!(code_highlight_cache_len() <= CODE_HIGHLIGHT_CACHE_CAP);
     }
 }

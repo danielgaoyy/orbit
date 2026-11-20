@@ -6,17 +6,14 @@ import { KeyCode } from '@kit.InputKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import {
   ComposerAttachmentItem,
-  ComposerMentionCandidate,
-  GitFileEntryDto,
-  OrbitSlashCommand,
+  MentionCandidateDto,
   PromptBadgeDto,
   QueuedPromptItem,
   QuotedDiffSnippet,
-  basenameOfPath,
-  filterOrbitSlashCommands,
+  SlashCommandDto,
   formatModeLabel,
   normalizeModeSlug,
-  stripWorkspacePrefix
+  slashCommandSymbol
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import { orbitLogWarn } from '../../model/OrbitLogger';
@@ -33,11 +30,6 @@ import {
 } from '../../theme/OrbitTokens';
 import { dismissHarmonyKeyboard } from '../common/OrbitCommonControls';
 import { ModelPickerSheet, OrbitProviderBrandIcon } from './ModelPickerSheet';
-
-interface ScoredFileCandidate {
-  score: number;
-  item: ComposerMentionCandidate;
-}
 
 interface AutocompleteTriggerState {
   kind: string; // 'slash' | 'mention'
@@ -59,21 +51,21 @@ export struct OmniComposer {
   }
 
   @Computed
-  get slashCandidates(): OrbitSlashCommand[] {
+  get slashCandidates(): SlashCommandDto[] {
     const trig = this.activeTrigger;
     if (trig === null || trig.kind !== 'slash') {
       return [];
     }
-    return this.filteredSlashCommands(trig);
+    return this.store.filterSlashCommands(trig.query);
   }
 
   @Computed
-  get mentionCandidates(): ComposerMentionCandidate[] {
+  get mentionCandidates(): MentionCandidateDto[] {
     const trig = this.activeTrigger;
     if (trig === null || trig.kind !== 'mention') {
       return [];
     }
-    return this.filteredMentionCandidates(trig);
+    return this.store.rankMentionCandidates(trig.query, 40);
   }
 
   private permissionModeIcon(mode: string): Resource {
@@ -169,130 +161,6 @@ export struct OmniComposer {
     return atTrigger !== null ? atTrigger : slashTrigger;
   }
 
-  private filteredSlashCommands(trig: AutocompleteTriggerState): OrbitSlashCommand[] {
-    return filterOrbitSlashCommands(trig.query);
-  }
-
-  private fileMatchScore(relPath: string, base: string, q: string): number {
-    if (q.length === 0) {
-      return 10;
-    }
-    const baseLower = base.toLowerCase();
-    const fullLower = relPath.toLowerCase();
-    if (baseLower === q) {
-      return 120;
-    }
-    if (baseLower.startsWith(q)) {
-      return 100;
-    }
-    if (baseLower.indexOf(q) >= 0) {
-      return 82;
-    }
-    if (fullLower.indexOf(q) >= 0) {
-      return 64;
-    }
-    let qi = 0;
-    for (let i = 0; i < fullLower.length && qi < q.length; i++) {
-      if (fullLower.charAt(i) === q.charAt(qi)) {
-        qi++;
-      }
-    }
-    return qi === q.length ? 36 : -1;
-  }
-
-  private filteredMentionCandidates(trig: AutocompleteTriggerState): ComposerMentionCandidate[] {
-    const q = trig.query;
-    const out: ComposerMentionCandidate[] = [];
-
-    const workingItem: ComposerMentionCandidate = {
-      key: 'builtin_working_diff',
-      kind: 'git_diff',
-      tokenLabel: '@working-diff',
-      title: '@working-diff',
-      subtitle: 'Working Tree Diff',
-      filePath: '',
-      gitStatus: ''
-    };
-    const stagedItem: ComposerMentionCandidate = {
-      key: 'builtin_staged_diff',
-      kind: 'staged',
-      tokenLabel: '@staged-diff',
-      title: '@staged-diff',
-      subtitle: 'Staged Diff',
-      filePath: '',
-      gitStatus: ''
-    };
-    const termItem: ComposerMentionCandidate = {
-      key: 'builtin_terminal',
-      kind: 'terminal',
-      tokenLabel: '@terminal',
-      title: '@terminal',
-      subtitle: 'Active Terminal Output',
-      filePath: '',
-      gitStatus: ''
-    };
-
-    if (q.length === 0 || 'working-diff'.indexOf(q) >= 0 || 'diff'.indexOf(q) >= 0) {
-      out.push(workingItem);
-    }
-    if (q.length === 0 || 'staged-diff'.indexOf(q) >= 0 || 'diff'.indexOf(q) >= 0) {
-      out.push(stagedItem);
-    }
-    if (q.length === 0 || 'terminal'.indexOf(q) >= 0 || 'pty'.indexOf(q) >= 0) {
-      out.push(termItem);
-    }
-
-    const gitStatusMap: Map<string, string> = new Map<string, string>();
-    if (this.store.gitStatus !== null) {
-      const entries: GitFileEntryDto[] = this.store.gitStatus.files;
-      for (let i = 0; i < entries.length; i++) {
-        gitStatusMap.set(entries[i].path, entries[i].status);
-      }
-    }
-
-    const scored: ScoredFileCandidate[] = [];
-    const seen: Map<string, boolean> = new Map<string, boolean>();
-    const files: string[] = this.store.workspaceFiles;
-    for (let i = 0; i < files.length; i++) {
-      const rawPath = files[i];
-      if (rawPath.length === 0 || seen.has(rawPath)) {
-        continue;
-      }
-      seen.set(rawPath, true);
-      const relPath = stripWorkspacePrefix(rawPath, this.store.activeCwd);
-      const base = basenameOfPath(rawPath);
-      const score = this.fileMatchScore(relPath, base, q);
-      if (score > 0) {
-        const gitSt = gitStatusMap.get(rawPath) ?? gitStatusMap.get(relPath) ?? '';
-        scored.push({
-          score: score + (gitSt.length > 0 ? 12 : 0),
-          item: {
-            key: `file_${rawPath}`,
-            kind: 'file',
-            tokenLabel: `@${base}`,
-            title: base,
-            subtitle: relPath,
-            filePath: rawPath,
-            gitStatus: gitSt
-          }
-        });
-      }
-    }
-
-    scored.sort((a: ScoredFileCandidate, b: ScoredFileCandidate) => {
-      if (b.score !== a.score) {
-        return b.score - a.score;
-      }
-      return a.item.title.localeCompare(b.item.title);
-    });
-
-    const maxFiles = Math.min(40, scored.length);
-    for (let i = 0; i < maxFiles; i++) {
-      out.push(scored[i].item);
-    }
-    return out;
-  }
-
   private async pickPhotos(): Promise<void> {
     try {
       const opts = new photoAccessHelper.PhotoSelectOptions();
@@ -339,7 +207,7 @@ export struct OmniComposer {
     }
   }
 
-  private candidateSymbol(candidate: ComposerMentionCandidate): Resource {
+  private candidateSymbol(candidate: MentionCandidateDto): Resource {
     if (candidate.kind === 'git_diff' || candidate.kind === 'staged') {
       return $r('sys.symbol.arrow_left_arrow_right');
     }
@@ -349,7 +217,7 @@ export struct OmniComposer {
     return resolveSemanticFileSymbol(candidate.title);
   }
 
-  private selectSlashCommand(cmd: OrbitSlashCommand, trig: AutocompleteTriggerState): void {
+  private selectSlashCommand(cmd: SlashCommandDto, trig: AutocompleteTriggerState): void {
     const text = this.store.composerText;
     const before = text.substring(0, trig.startIndex);
     const after = text.substring(trig.endIndex).trimStart();
@@ -360,13 +228,13 @@ export struct OmniComposer {
   }
 
   private selectMentionCandidate(
-    candidate: ComposerMentionCandidate,
+    candidate: MentionCandidateDto,
     trig: AutocompleteTriggerState
   ): void {
     const text = this.store.composerText;
     const before = text.substring(0, trig.startIndex);
     const after = text.substring(trig.endIndex);
-    const token = candidate.tokenLabel;
+    const token = candidate.token_label;
     this.store.composerText = `${before}${token} ${after}`;
     this.dismissedTriggerToken = '';
     if (candidate.kind === 'git_diff') {
@@ -376,7 +244,7 @@ export struct OmniComposer {
     } else if (candidate.kind === 'terminal') {
       this.store.registerInlineMention(token, 'terminal', '', false, 'Terminal');
     } else if (candidate.kind === 'file') {
-      this.store.registerInlineMention(token, 'file', candidate.filePath, false, candidate.title);
+      this.store.registerInlineMention(token, 'file', candidate.file_path, false, candidate.title);
     }
   }
 
@@ -483,11 +351,11 @@ export struct OmniComposer {
           List({ space: 0 }) {
             ForEach(
               this.slashCandidates,
-              (cmd: OrbitSlashCommand) => {
+              (cmd: SlashCommandDto) => {
                 ListItem() {
                   Button({ type: ButtonType.Normal, stateEffect: true }) {
                     Row({ space: OrbitTokens.SPACE_SM }) {
-                      SymbolGlyph(cmd.symbol)
+                      SymbolGlyph(slashCommandSymbol(cmd.id))
                         .fontSize(16)
                         .fontColor([this.store.palette.iconSecondary])
                       Text(cmd.command)
@@ -513,7 +381,7 @@ export struct OmniComposer {
                   })
                 }
               },
-              (cmd: OrbitSlashCommand) => `slash_${cmd.id}`
+              (cmd: SlashCommandDto) => `slash_${cmd.id}`
             )
           }
           .width('100%')
@@ -536,7 +404,7 @@ export struct OmniComposer {
           List({ space: 0 }) {
             ForEach(
               this.mentionCandidates,
-              (cand: ComposerMentionCandidate) => {
+              (cand: MentionCandidateDto) => {
                 ListItem() {
                   Button({ type: ButtonType.Normal, stateEffect: true }) {
                     Row({ space: OrbitTokens.SPACE_SM }) {
@@ -567,7 +435,7 @@ export struct OmniComposer {
                   })
                 }
               },
-              (cand: ComposerMentionCandidate) => cand.key
+              (cand: MentionCandidateDto) => cand.key
             )
           }
           .width('100%')

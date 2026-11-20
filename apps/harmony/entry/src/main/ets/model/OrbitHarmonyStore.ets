@@ -2,40 +2,52 @@ import { OrbitHarmonyCore } from 'liborbit_ohos.so';
 import { ConfigurationConstant, common } from '@kit.AbilityKit';
 import {
   AgentCardDto,
-  AgentStageDto,
+  AgentStageDeltaDto,
+  AskSideQuestionRequestDto,
   ClientProjectDto,
+  ComposePromptRequestDto,
+  ComposedPromptDto,
   ComposerAttachmentItem,
-  ComposerMentionCandidate,
+  ComposerContextInputDto,
+  ComposerQuoteInputDto,
   CoreNotificationDto,
   DiffFileDto,
   DiffLineDto,
   FleetOverviewDto,
+  FleetSidebarDto,
+  FleetSidebarRequestDto,
   GitReviewDto,
   GitStatusSnapshotDto,
   HostCardDto,
   HostDetailDto,
   InlineMentionRegistration,
   LaunchpadProjectDto,
+  MentionCandidateDto,
+  MentionRankRequestDto,
   ModelOptionDto,
-  OrbitSlashCommand,
+  ModelSelectionRequestDto,
   PromptBadgeDto,
   ProviderModelCatalogDto,
   ProviderModelSpecDto,
   QueuedPromptItem,
   QuotedDiffSnippet,
+  RenderDiagramRequestDto,
+  RenderDiagramViewDto,
+  ResolvedModelSelectionDto,
+  RewindAgentResultDto,
+  SlashCommandDto,
   StageTurnDto,
   StagedAttachmentDto,
   TerminalRowDto,
   TerminalScreenDto,
-  ThinkingOptionSpecDto,
+  ThreadPrefSeedDto,
   TimelineItemDto,
   ToolStepDescriptorDto,
+  WorkspaceFileViewDto,
   basenameOfPath,
   cwdPathsEquivalent,
-  filterOrbitSlashCommands,
   formatEffortLabel,
   formatModeLabel,
-  getOrbitSlashCommands,
   normalizeModeSlug
 } from './OrbitTypes';
 import {
@@ -59,16 +71,23 @@ interface DraftModelSelection {
   effort: string;
 }
 
-interface ParsedLeadingSlash {
-  directive: string;
-  rest: string;
+interface SideQuestionDeltaBody {
+  request_id?: string;
+  text_delta?: string;
 }
 
-interface BuiltPromptPayload {
-  wirePrompt: string;
-  displayPrompt: string;
-  badges: PromptBadgeDto[];
-  badgesJson: string | null;
+interface SideQuestionDoneBody {
+  request_id?: string;
+  full_text?: string;
+  error?: string | null;
+}
+
+interface SideQuestionEnvelopeDto {
+  Delta?: SideQuestionDeltaBody;
+  Done?: SideQuestionDoneBody;
+  text_delta?: string;
+  full_text?: string;
+  error?: string | null;
 }
 
 @ObservedV2
@@ -106,13 +125,22 @@ export class OrbitHarmonyStore {
   @Trace public showDirBrowser: boolean = false;
   @Trace public sidebarProjectSort: string = 'recent';
   @Trace public sidebarThreadFilter: string = 'all';
+  @Trace public sidebarSearchQuery: string = '';
   @Trace public collapsedProjectIds: string[] = [];
-  @Trace public pinnedThreadKeys: string[] = [];
-  @Trace public seenSeqRevision: number = 0;
-  private seenSeqByThreadKey: Map<string, number> = new Map<string, number>();
+  @Trace public sidebarView: FleetSidebarDto | null = null;
+  @Trace public slashCommands: SlashCommandDto[] = [];
+  private cachedFallbackCatalogs: ProviderModelCatalogDto[] = [];
+  private diagramRenderCache: Map<string, RenderDiagramViewDto> = new Map<string, RenderDiagramViewDto>();
+  private diagramRenderOrder: string[] = [];
   private pinnedThreadsFilePath: string = '';
   private draftPrefsFilePath: string = '';
+  private stageHostId: string = '';
+  private stageAgentId: string = '';
   @Trace public draftUseWorktree: boolean = false;
+  @Trace public sideQuestionActive: boolean = false;
+  @Trace public sideQuestionPrompt: string = '';
+  @Trace public sideQuestionAnswer: string = '';
+  @Trace public sideQuestionError: string = '';
 
   // Multi-Host Fleet & Workspace State
   @Trace public nativeAvailable: boolean = false;
@@ -183,7 +211,6 @@ export class OrbitHarmonyStore {
   public initialize(dbPath: string): void {
     if (this.pinnedThreadsFilePath.length === 0 && dbPath.length > 0) {
       this.pinnedThreadsFilePath = `${dbPath}.pinned_threads.json`;
-      this.loadPinnedThreadsFromDisk();
     }
     if (this.draftPrefsFilePath.length === 0 && dbPath.length > 0) {
       this.draftPrefsFilePath = `${dbPath}.draft_prefs.json`;
@@ -200,6 +227,48 @@ export class OrbitHarmonyStore {
     try {
       this.core = new OrbitHarmonyCore(dbPath, true);
       this.nativeAvailable = true;
+
+      if (!this.prefsStore.hasMigratedThreadPrefsV1()) {
+        const legacyPinned = this.prefsStore.loadPinnedThreads(this.pinnedThreadsFilePath);
+        if (legacyPinned.length > 0) {
+          const nowMs = Date.now();
+          const seeds: ThreadPrefSeedDto[] = [];
+          for (let i = 0; i < legacyPinned.length; i++) {
+            const composite = legacyPinned[i];
+            const sep = composite.indexOf('::');
+            if (sep > 0 && sep + 2 < composite.length) {
+              seeds.push({
+                host_id: composite.substring(0, sep),
+                agent_id: composite.substring(sep + 2),
+                seen_seq: 0,
+                is_pinned: true,
+                pinned_order: i,
+                updated_at_ms: nowMs
+              });
+            }
+          }
+          if (seeds.length > 0) {
+            this.core.seedThreadPrefsJson(JSON.stringify(seeds));
+          }
+        }
+        this.prefsStore.markMigratedThreadPrefsV1();
+      }
+
+      try {
+        this.cachedFallbackCatalogs = JSON.parse(
+          this.core.fallbackProviderCatalogsJson()
+        ) as ProviderModelCatalogDto[];
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'Failed to parse fallback catalogs', err as Object);
+      }
+      try {
+        this.slashCommands = JSON.parse(
+          this.core.slashCommandsJson('harmony', null)
+        ) as SlashCommandDto[];
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'Failed to parse slash commands', err as Object);
+      }
+
       this.core.subscribeEvents((err: Error | null, payloadJson: string) => {
         if (err !== null || payloadJson.length === 0) {
           return;
@@ -207,6 +276,7 @@ export class OrbitHarmonyStore {
         this.handleCoreEvent(payloadJson);
       });
       this.reloadFleet();
+      this.refreshSidebar();
       this.core.connectAllHosts();
       if (this.pendingDeepLink.length > 0) {
         const uri = this.pendingDeepLink;
@@ -344,14 +414,6 @@ export class OrbitHarmonyStore {
     this.triggerHaptic(8);
   }
 
-  private loadPinnedThreadsFromDisk(): void {
-    this.pinnedThreadKeys = this.prefsStore.loadPinnedThreads(this.pinnedThreadsFilePath);
-  }
-
-  private savePinnedThreadsToDisk(): void {
-    this.prefsStore.savePinnedThreads(this.pinnedThreadKeys);
-  }
-
   public threadKey(hostId: string, agentId: string): string {
     return `${hostId}::${agentId}`;
   }
@@ -366,15 +428,47 @@ export class OrbitHarmonyStore {
     return total;
   }
 
+  public refreshSidebar(): void {
+    if (this.core === null) {
+      return;
+    }
+    try {
+      const req: FleetSidebarRequestDto = {
+        sort: (this.sidebarProjectSort === 'name' || this.sidebarProjectSort === 'alphabetical')
+          ? 'alphabetical'
+          : 'recent',
+        filter: this.sidebarThreadFilter === 'active_unread' ? 'active_unread' : 'all',
+        query: this.sidebarSearchQuery,
+        active_host_id: this.selectedHostId.length > 0 ? this.selectedHostId : null,
+        active_agent_id: (!this.isNewSessionDraft && this.selectedAgentId.length > 0)
+          ? this.selectedAgentId
+          : null,
+        active_cwd: this.activeCwd.length > 0 ? this.activeCwd : null
+      };
+      this.sidebarView = JSON.parse(
+        this.core.fleetSidebarByRequestJson(JSON.stringify(req))
+      ) as FleetSidebarDto;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'refreshSidebar failed', err as Object);
+    }
+  }
+
+  public setSidebarSearchQuery(query: string): void {
+    this.sidebarSearchQuery = query;
+    this.refreshSidebar();
+  }
+
   public setSidebarProjectSort(sort: string): void {
     this.sidebarProjectSort = sort;
     this.saveDraftPrefsToDisk();
+    this.refreshSidebar();
     this.triggerHaptic(6);
   }
 
   public setSidebarThreadFilter(filter: string): void {
     this.sidebarThreadFilter = filter;
     this.saveDraftPrefsToDisk();
+    this.refreshSidebar();
     this.triggerHaptic(6);
   }
 
@@ -415,100 +509,19 @@ export class OrbitHarmonyStore {
     return this.resolveWorkspaceBranch(this.activeCwd);
   }
 
-  private isBareHomePath(rawPath: string): boolean {
-    let clean = rawPath.trim();
-    while (clean.length > 1 && clean.endsWith('/')) {
-      clean = clean.substring(0, clean.length - 1);
-    }
-    if (clean.length === 0 || clean === '~' || clean === '/root') {
-      return true;
-    }
-    const parts = clean.split('/').filter((seg: string) => seg.length > 0);
-    return parts.length === 2 && (parts[0] === 'Users' || parts[0] === 'home');
-  }
-
   public launchpadProjects(): LaunchpadProjectDto[] {
     const hid = this.selectedHostId;
-    if (hid.length === 0) {
+    if (hid.length === 0 || this.sidebarView === null) {
       return [];
     }
-    const detail = this.currentHostDetail;
     const results: LaunchpadProjectDto[] = [];
-
-    const appendIfUnique = (id: string, name: string, path: string, branch: string): void => {
-      const clean = path.trim();
-      if (clean.length === 0) {
-        return;
-      }
-      for (let i = 0; i < results.length; i++) {
-        if (cwdPathsEquivalent(results[i].path, clean)) {
-          return;
-        }
-      }
-      const resolvedName = name.trim().length > 0 ? name.trim() : basenameOfPath(clean);
-      const resolvedBranch = branch.trim().length > 0
-        ? branch.trim()
-        : this.resolveWorkspaceBranch(clean);
-      results.push({
-        id: id,
-        name: resolvedName,
-        path: clean,
-        branch: resolvedBranch
-      });
-    };
-
-    for (let i = 0; i < this.projects.length; i++) {
-      const proj = this.projects[i];
-      if (proj.host_id === hid && proj.directories.length > 0) {
-        appendIfUnique(proj.project_id, proj.name, proj.directories[0], '');
+    const list = this.sidebarView.launchpad_projects;
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      if (item.host_id === undefined || item.host_id === hid) {
+        results.push(item);
       }
     }
-
-    if (detail !== null) {
-      for (let i = 0; i < detail.workspaces.length; i++) {
-        const ws = detail.workspaces[i];
-        if (!ws.is_worktree && !this.isBareHomePath(ws.cwd)) {
-          appendIfUnique(
-            `${hid}::ws::${ws.workspace_id}`,
-            ws.title.trim().length > 0 ? ws.title : basenameOfPath(ws.cwd),
-            ws.cwd,
-            ws.git_branch ?? ''
-          );
-        }
-      }
-
-      for (let i = 0; i < detail.discovered_projects.length; i++) {
-        const dp = detail.discovered_projects[i];
-        if (!this.isBareHomePath(dp.path) && dp.path.indexOf('/worktrees/') < 0) {
-          appendIfUnique(
-            `${hid}::dp::${dp.path}`,
-            dp.name,
-            dp.path,
-            dp.git_branch ?? ''
-          );
-        }
-      }
-    }
-
-    if (this.activeCwd.trim().length > 0 && !this.isBareHomePath(this.activeCwd)) {
-      appendIfUnique(
-        `${hid}::active::${this.activeCwd}`,
-        basenameOfPath(this.activeCwd),
-        this.activeCwd,
-        this.activeGitBranch()
-      );
-    }
-
-    if (results.length === 0 && detail !== null && detail.discovered_projects.length > 0) {
-      const firstDp = detail.discovered_projects[0];
-      appendIfUnique(
-        `${hid}::dp::${firstDp.path}`,
-        firstDp.name,
-        firstDp.path,
-        firstDp.git_branch ?? ''
-      );
-    }
-
     return results;
   }
 
@@ -526,25 +539,37 @@ export class OrbitHarmonyStore {
   }
 
   public isThreadPinned(hostId: string, agentId: string): boolean {
-    return this.pinnedThreadKeys.indexOf(this.threadKey(hostId, agentId)) >= 0;
+    if (this.sidebarView === null || hostId.length === 0 || agentId.length === 0) {
+      return false;
+    }
+    const pinned = this.sidebarView.pinned_conversations;
+    for (let i = 0; i < pinned.length; i++) {
+      if (pinned[i].host_id === hostId && pinned[i].agent.agent_id === agentId) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public togglePinThread(hostId: string, agentId: string): void {
-    const key = this.threadKey(hostId, agentId);
-    if (this.pinnedThreadKeys.indexOf(key) >= 0) {
-      this.pinnedThreadKeys = this.pinnedThreadKeys.filter((k: string) => k !== key);
-    } else {
-      this.pinnedThreadKeys = this.pinnedThreadKeys.concat([key]);
+    if (this.core === null || hostId.length === 0 || agentId.length === 0) {
+      return;
     }
-    this.savePinnedThreadsToDisk();
+    this.core.togglePinAgent(hostId, agentId);
+    this.refreshSidebar();
+    this.triggerHaptic(8);
+  }
+
+  public markAgentUnread(hostId: string, agentId: string): void {
+    if (this.core === null || hostId.length === 0 || agentId.length === 0) {
+      return;
+    }
+    this.core.markAgentUnread(hostId, agentId);
+    this.refreshSidebar();
     this.triggerHaptic(8);
   }
 
   public isThreadUnread(hostId: string, agent: AgentCardDto): boolean {
-    const rev = this.seenSeqRevision;
-    if (rev < 0) {
-      return false;
-    }
     if (
       this.selectedHostId === hostId &&
       !this.isNewSessionDraft &&
@@ -555,11 +580,27 @@ export class OrbitHarmonyStore {
     if (agent.is_running || agent.is_awaiting_permission) {
       return false;
     }
-    const seen = this.seenSeqByThreadKey.get(this.threadKey(hostId, agent.agent_id));
-    if (seen === undefined) {
+    if (this.sidebarView === null) {
       return false;
     }
-    return agent.latest_seq > seen;
+    for (let i = 0; i < this.sidebarView.pinned_conversations.length; i++) {
+      const conv = this.sidebarView.pinned_conversations[i];
+      if (conv.host_id === hostId && conv.agent.agent_id === agent.agent_id) {
+        return conv.is_unread;
+      }
+    }
+    for (let i = 0; i < this.sidebarView.projects.length; i++) {
+      const grp = this.sidebarView.projects[i];
+      if (grp.host_id !== hostId) {
+        continue;
+      }
+      for (let j = 0; j < grp.conversations.length; j++) {
+        if (grp.conversations[j].agent.agent_id === agent.agent_id) {
+          return grp.conversations[j].is_unread;
+        }
+      }
+    }
+    return false;
   }
 
   public updateWindowSize(widthVp: number, heightVp: number): void {
@@ -775,6 +816,8 @@ export class OrbitHarmonyStore {
       this.totalPendingApprovals = snap.total_pending_approvals;
       if (this.selectedHostId.length === 0 && snap.hosts.length > 0) {
         this.selectHost(snap.hosts[0].host_id);
+      } else {
+        this.refreshSidebar();
       }
     } catch (e) {
       this.lastError = (e as Error).message;
@@ -904,6 +947,9 @@ export class OrbitHarmonyStore {
     if (changed) {
       this.selectedAgentId = '';
       this.currentAgent = null;
+      this.stageRevision = 0;
+      this.stageHostId = '';
+      this.stageAgentId = '';
       this.stageTurns = [];
       this.pendingPermissions = [];
       this.pendingQuestions = [];
@@ -911,6 +957,7 @@ export class OrbitHarmonyStore {
       this.syncActiveQueuedPrompts();
     }
     this.reloadHost(hostId);
+    this.refreshSidebar();
     if (this.core !== null) {
       this.core.connectHost(hostId);
       this.core.refreshHost(hostId);
@@ -991,59 +1038,15 @@ export class OrbitHarmonyStore {
         this.syncDefaultModelAndEffort(targetProvider);
       }
 
-      const remappedMap = detail.replaced_optimistic_agents;
-      let seenChanged = false;
-      if (remappedMap !== undefined) {
-        const optIds = Object.keys(remappedMap);
-        let pinnedChanged = false;
-        let nextPinned = this.pinnedThreadKeys;
-        for (let i = 0; i < optIds.length; i++) {
-          const optId = optIds[i];
-          const confirmedId = remappedMap[optId];
-          if (confirmedId.length === 0 || optId === confirmedId) {
-            continue;
-          }
-          const oldKey = this.threadKey(hostId, optId);
-          const newKey = this.threadKey(hostId, confirmedId);
-          if (nextPinned.indexOf(oldKey) >= 0) {
-            nextPinned = nextPinned.filter((k: string) => k !== oldKey);
-            if (nextPinned.indexOf(newKey) < 0) {
-              nextPinned = nextPinned.concat([newKey]);
-            }
-            pinnedChanged = true;
-          }
-          const prevOptSeen = this.seenSeqByThreadKey.get(oldKey);
-          if (prevOptSeen !== undefined) {
-            this.seenSeqByThreadKey.delete(oldKey);
-            const curNewSeen = this.seenSeqByThreadKey.get(newKey) ?? 0;
-            this.seenSeqByThreadKey.set(newKey, Math.max(curNewSeen, prevOptSeen));
-            seenChanged = true;
+      if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
+        for (let i = 0; i < detail.agents.length; i++) {
+          if (detail.agents[i].agent_id === this.selectedAgentId) {
+            this.core.markAgentSeen(hostId, this.selectedAgentId, detail.agents[i].latest_seq);
+            break;
           }
         }
-        if (pinnedChanged) {
-          this.pinnedThreadKeys = nextPinned;
-          this.savePinnedThreadsToDisk();
-        }
       }
-
-      for (let i = 0; i < detail.agents.length; i++) {
-        const ag = detail.agents[i];
-        const key = this.threadKey(hostId, ag.agent_id);
-        const prevSeen = this.seenSeqByThreadKey.get(key);
-        if (!this.isNewSessionDraft && ag.agent_id === this.selectedAgentId) {
-          const nextSeen = prevSeen !== undefined ? Math.max(prevSeen, ag.latest_seq) : ag.latest_seq;
-          if (prevSeen !== nextSeen) {
-            this.seenSeqByThreadKey.set(key, nextSeen);
-            seenChanged = true;
-          }
-        } else if (prevSeen === undefined) {
-          this.seenSeqByThreadKey.set(key, ag.latest_seq);
-          seenChanged = true;
-        }
-      }
-      if (seenChanged) {
-        this.seenSeqRevision += 1;
-      }
+      this.refreshSidebar();
 
       for (let i = 0; i < detail.agents.length; i++) {
         this.drainQueuedPromptsForAgentIfIdle(hostId, detail.agents[i]);
@@ -1057,7 +1060,11 @@ export class OrbitHarmonyStore {
     if (cwd.length === 0) {
       return;
     }
+    const changed = this.activeCwd !== cwd;
     this.activeCwd = cwd;
+    if (changed) {
+      this.refreshSidebar();
+    }
     if (this.core !== null && this.selectedHostId.length > 0) {
       try {
         this.core.fetchGitStatus(this.selectedHostId, cwd);
@@ -1075,6 +1082,9 @@ export class OrbitHarmonyStore {
     this.isNewSessionDraft = true;
     this.selectedAgentId = '';
     this.currentAgent = null;
+    this.stageRevision = 0;
+    this.stageHostId = '';
+    this.stageAgentId = '';
     this.stageTurns = [];
     this.pendingPermissions = [];
     this.pendingQuestions = [];
@@ -1086,6 +1096,7 @@ export class OrbitHarmonyStore {
     if (cwd !== undefined && cwd.length > 0) {
       this.setActiveCwd(cwd);
     }
+    this.refreshSidebar();
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
     }
@@ -1100,19 +1111,16 @@ export class OrbitHarmonyStore {
     this.selectedAgentId = agentId;
     this.expandedTurnKeys = [];
     this.expandedToolIds = [];
-    if (this.selectedHostId.length > 0) {
-      const key = this.threadKey(this.selectedHostId, agentId);
-      const prevSeen = this.seenSeqByThreadKey.get(key) ?? 0;
-      let matchedSeq = prevSeen;
+    if (this.core !== null && this.selectedHostId.length > 0) {
       const agents = this.currentHostDetail?.agents ?? [];
+      let matchedSeq = 0;
       for (let i = 0; i < agents.length; i++) {
         if (agents[i].agent_id === agentId) {
-          matchedSeq = Math.max(matchedSeq, agents[i].latest_seq);
+          matchedSeq = agents[i].latest_seq;
           break;
         }
       }
-      this.seenSeqByThreadKey.set(key, matchedSeq);
-      this.seenSeqRevision += 1;
+      this.core.markAgentSeen(this.selectedHostId, agentId, matchedSeq);
     }
     this.syncActiveQueuedPrompts();
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
@@ -1121,6 +1129,7 @@ export class OrbitHarmonyStore {
     if (this.core !== null && this.selectedHostId.length > 0) {
       this.core.openAgentTimeline(this.selectedHostId, agentId);
       this.reloadStage();
+      this.refreshSidebar();
     }
     this.triggerHaptic(8);
   }
@@ -1130,39 +1139,75 @@ export class OrbitHarmonyStore {
       return;
     }
     try {
-      const stage = JSON.parse(
-        this.core.agentStageJson(this.selectedHostId, this.selectedAgentId)
-      ) as AgentStageDto;
-      this.stageRevision = stage.revision;
-      this.stageTurns = stage.turns;
-      this.pendingPermissions = stage.pending_permissions;
-      this.pendingQuestions = stage.pending_questions;
-      this.sessionDiffs = stage.session_turn_diffs;
-      if (stage.agent !== null) {
-        this.currentAgent = stage.agent;
-        this.activeCwd = stage.agent.cwd;
-        this.composerProvider = stage.agent.provider;
+      const sameStage =
+        this.stageHostId === this.selectedHostId &&
+        this.stageAgentId === this.selectedAgentId;
+      const sinceRev = sameStage ? this.stageRevision : 0;
+      let delta = JSON.parse(
+        this.core.agentStageDeltaJson(this.selectedHostId, this.selectedAgentId, sinceRev)
+      ) as AgentStageDeltaDto;
+      if (
+        !delta.reset &&
+        sinceRev > 0 &&
+        delta.replace_from_turn_index > this.stageTurns.length
+      ) {
+        delta = JSON.parse(
+          this.core.agentStageDeltaJson(this.selectedHostId, this.selectedAgentId, 0)
+        ) as AgentStageDeltaDto;
+      }
+
+      if (delta.reset || !sameStage || delta.replace_from_turn_index === 0) {
+        this.stageTurns = delta.changed_turns;
+      } else {
+        const prefix = this.stageTurns.slice(0, delta.replace_from_turn_index);
+        this.stageTurns = prefix.concat(delta.changed_turns);
+      }
+
+      this.stageHostId = delta.host_id;
+      this.stageAgentId = delta.agent !== null ? delta.agent.agent_id : this.selectedAgentId;
+      this.stageRevision = delta.revision;
+      this.pendingPermissions = delta.pending_permissions;
+      this.pendingQuestions = delta.pending_questions;
+      this.sessionDiffs = delta.session_turn_diffs;
+
+      if (delta.agent !== null) {
+        this.currentAgent = delta.agent;
+        this.activeCwd = delta.agent.cwd;
+        this.composerProvider = delta.agent.provider;
         const resolved = this.resolveDefaultModelAndEffort(
-          stage.agent.provider,
-          stage.agent.model ?? '',
-          stage.agent.effort ?? ''
+          delta.agent.provider,
+          delta.agent.model ?? '',
+          delta.agent.effort ?? ''
         );
-        this.composerModel = (stage.agent.model !== null && stage.agent.model !== undefined && stage.agent.model.trim().length > 0)
-          ? stage.agent.model
+        this.composerModel = (
+          delta.agent.model !== null &&
+          delta.agent.model !== undefined &&
+          delta.agent.model.trim().length > 0 &&
+          resolved.model.length === 0
+        )
+          ? delta.agent.model
           : resolved.model;
-        this.composerEffort = (stage.agent.effort !== null && stage.agent.effort !== undefined && stage.agent.effort.trim().length > 0)
-          ? stage.agent.effort
+        this.composerEffort = (
+          delta.agent.effort !== null &&
+          delta.agent.effort !== undefined &&
+          delta.agent.effort.trim().length > 0 &&
+          resolved.effort.length === 0
+        )
+          ? delta.agent.effort
           : resolved.effort;
-        this.composerMode = normalizeModeSlug(stage.agent.mode);
-        if (!this.isNewSessionDraft && this.selectedAgentId === stage.agent.agent_id) {
-          const key = this.threadKey(this.selectedHostId, stage.agent.agent_id);
-          const prevSeen = this.seenSeqByThreadKey.get(key);
-          if (prevSeen === undefined || stage.agent.latest_seq > prevSeen) {
-            this.seenSeqByThreadKey.set(key, stage.agent.latest_seq);
-            this.seenSeqRevision += 1;
-          }
+        this.composerMode = normalizeModeSlug(delta.agent.mode);
+        if (!this.isNewSessionDraft && this.selectedAgentId === delta.agent.agent_id) {
+          this.core.markAgentSeen(
+            this.selectedHostId,
+            delta.agent.agent_id,
+            Math.max(delta.agent.latest_seq, delta.latest_seq)
+          );
+          this.refreshSidebar();
         }
-        this.drainQueuedPromptsForAgentIfIdle(this.selectedHostId, stage.agent);
+        this.drainQueuedPromptsForAgentIfIdle(this.selectedHostId, delta.agent);
+      } else if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
+        this.core.markAgentSeen(this.selectedHostId, this.selectedAgentId, delta.latest_seq);
+        this.refreshSidebar();
       }
     } catch (e) {
       orbitLogWarn('OrbitStore', 'reloadStage failed', e as Object);
@@ -1485,16 +1530,53 @@ export class OrbitHarmonyStore {
     this.triggerHaptic(8);
   }
 
-  public attachInlineMention(candidate: ComposerMentionCandidate, strippedText: string): void {
+  public filterSlashCommands(query: string): SlashCommandDto[] {
+    const clean = query.trim();
+    if (clean.length === 0 && this.slashCommands.length > 0) {
+      return this.slashCommands;
+    }
+    if (this.core !== null) {
+      try {
+        return JSON.parse(
+          this.core.slashCommandsJson('harmony', clean.length > 0 ? clean : null)
+        ) as SlashCommandDto[];
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'filterSlashCommands failed', err as Object);
+      }
+    }
+    return this.slashCommands;
+  }
+
+  public rankMentionCandidates(query: string, limit: number = 11): MentionCandidateDto[] {
+    if (this.core === null || this.selectedHostId.length === 0) {
+      return [];
+    }
+    try {
+      const req: MentionRankRequestDto = {
+        host_id: this.selectedHostId,
+        cwd: this.activeCwd,
+        query: query,
+        limit: limit
+      };
+      return JSON.parse(
+        this.core.rankMentionCandidatesJson(JSON.stringify(req))
+      ) as MentionCandidateDto[];
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'rankMentionCandidates failed', err as Object);
+      return [];
+    }
+  }
+
+  public attachInlineMention(candidate: MentionCandidateDto, strippedText: string): void {
     this.composerText = strippedText;
-    if (candidate.kind === 'diff') {
+    if (candidate.kind === 'git_diff' || candidate.kind === 'diff') {
       this.attachWorkingTreeDiffBadge();
     } else if (candidate.kind === 'staged') {
       this.attachStagedDiffBadge();
     } else if (candidate.kind === 'terminal') {
       this.attachTerminalOutputBadge();
-    } else if (candidate.kind === 'file' && candidate.filePath.length > 0) {
-      this.attachFileBadge(candidate.filePath);
+    } else if (candidate.kind === 'file' && candidate.file_path.length > 0) {
+      this.attachFileBadge(candidate.file_path);
     }
   }
 
@@ -1550,7 +1632,7 @@ export class OrbitHarmonyStore {
   }
 
   public executeSlashCommand(
-    cmd: OrbitSlashCommand,
+    cmd: SlashCommandDto,
     onOpenTerminal?: () => void,
     onOpenSettings?: () => void
   ): void {
@@ -1570,12 +1652,17 @@ export class OrbitHarmonyStore {
       this.submitSlashCompact('');
       return;
     }
-    if (cmd.id === 'supervised') {
+    if (cmd.id === 'btw') {
+      this.composerText = '/btw ';
+      this.triggerHaptic(6);
+      return;
+    }
+    if (cmd.id === 'ask' || cmd.id === 'supervised') {
       this.setSessionMode('default');
       this.showToast('Permissions: Always Ask', false);
       return;
     }
-    if (cmd.id === 'auto') {
+    if (cmd.id === 'edits' || cmd.id === 'auto') {
       this.setSessionMode('accept_edits');
       this.showToast('Permissions: Accept Edits', false);
       return;
@@ -1761,15 +1848,65 @@ export class OrbitHarmonyStore {
 
   public catalogForProvider(provider: string): ProviderModelCatalogDto | null {
     const detail = this.currentHostDetail;
-    if (detail === null) {
-      return null;
+    if (detail !== null) {
+      for (let i = 0; i < detail.provider_catalogs.length; i++) {
+        if (detail.provider_catalogs[i].provider === provider && detail.provider_catalogs[i].models.length > 0) {
+          return detail.provider_catalogs[i];
+        }
+      }
     }
-    for (let i = 0; i < detail.provider_catalogs.length; i++) {
-      if (detail.provider_catalogs[i].provider === provider) {
-        return detail.provider_catalogs[i];
+    for (let i = 0; i < this.cachedFallbackCatalogs.length; i++) {
+      if (this.cachedFallbackCatalogs[i].provider === provider) {
+        return this.cachedFallbackCatalogs[i];
+      }
+    }
+    if (this.core !== null) {
+      try {
+        return JSON.parse(
+          this.core.fallbackProviderCatalogJson(provider)
+        ) as ProviderModelCatalogDto;
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'fallbackProviderCatalogJson failed', err as Object);
       }
     }
     return null;
+  }
+
+  public resolveModelSelectionFromCore(
+    provider: string,
+    desiredModel: string,
+    desiredEffort: string
+  ): ResolvedModelSelectionDto | null {
+    if (this.core === null) {
+      return null;
+    }
+    try {
+      const cleanModel = desiredModel.trim();
+      const cleanEffort = desiredEffort.trim();
+      const req: ModelSelectionRequestDto = {
+        host_id: this.selectedHostId.length > 0 ? this.selectedHostId : null,
+        provider: provider,
+        desired_model: cleanModel.length > 0 ? cleanModel : null,
+        desired_effort: cleanEffort.length > 0 ? cleanEffort : null
+      };
+      return JSON.parse(
+        this.core.resolveModelSelectionJson(JSON.stringify(req))
+      ) as ResolvedModelSelectionDto;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'resolveModelSelectionJson failed', err as Object);
+      return null;
+    }
+  }
+
+  public effortDescriptionText(effort: string): string {
+    if (this.core !== null && effort.trim().length > 0) {
+      try {
+        return this.core.defaultEffortDescription(effort);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'defaultEffortDescription failed', err as Object);
+      }
+    }
+    return effort.length > 0 ? formatEffortLabel(effort) : '';
   }
 
   public resolveDefaultModelAndEffort(
@@ -1777,6 +1914,14 @@ export class OrbitHarmonyStore {
     desiredModel: string,
     desiredEffort: string
   ): DraftModelSelection {
+    const fromCore = this.resolveModelSelectionFromCore(provider, desiredModel, desiredEffort);
+    if (fromCore !== null) {
+      return {
+        model: fromCore.selected_model_id ?? '',
+        effort: fromCore.selected_effort ?? ''
+      };
+    }
+
     const models = this.modelsForProvider(provider);
     const catalog = this.catalogForProvider(provider);
 
@@ -1815,37 +1960,11 @@ export class OrbitHarmonyStore {
     }
 
     const options = spec !== null ? spec.thinking_options : [];
-    let resolvedEffort = '';
     if (options.length === 0) {
-      resolvedEffort = (spec !== null && spec.default_effort !== undefined && spec.default_effort !== null)
+      const fallbackEff = (spec !== null && spec.default_effort !== undefined && spec.default_effort !== null)
         ? spec.default_effort
         : '';
-      return { model: resolvedModel, effort: resolvedEffort };
-    }
-
-    // Match Desktop & iOS resolution priority:
-    // 1. Explicit desiredEffort
-    // 2. Model spec default_effort
-    // 3. Catalog configured_default_effort
-    // 4. Option marked is_default
-    // 5. First supported option
-    const candidates: string[] = [];
-    if (desiredEffort.trim().length > 0) {
-      candidates.push(desiredEffort.trim().toLowerCase());
-    }
-    if (spec !== null && spec.default_effort !== undefined && spec.default_effort !== null && spec.default_effort.trim().length > 0) {
-      candidates.push(spec.default_effort.trim().toLowerCase());
-    }
-    if (catalog !== null && catalog.configured_default_effort !== undefined && catalog.configured_default_effort !== null && catalog.configured_default_effort.trim().length > 0) {
-      candidates.push(catalog.configured_default_effort.trim().toLowerCase());
-    }
-
-    for (let c = 0; c < candidates.length; c++) {
-      for (let o = 0; o < options.length; o++) {
-        if (options[o].effort.trim().toLowerCase() === candidates[c]) {
-          return { model: resolvedModel, effort: options[o].effort };
-        }
-      }
+      return { model: resolvedModel, effort: fallbackEff };
     }
     for (let o = 0; o < options.length; o++) {
       if (options[o].is_default) {
@@ -1927,24 +2046,17 @@ export class OrbitHarmonyStore {
   }
 
   public currentModelDisplayLabel(): string {
-    let modelLabel = this.composerModel.trim();
-    const specs = this.modelsForProvider(this.composerProvider);
+    const resolved = this.resolveModelSelectionFromCore(
+      this.composerProvider,
+      this.composerModel,
+      this.composerEffort
+    );
+    let modelLabel = resolved !== null
+      ? resolved.selected_model_label
+      : this.composerModel.trim();
     if (modelLabel.length === 0) {
-      let defaultLabel = specs.length > 0 ? specs[0].label : 'Default';
-      for (let i = 0; i < specs.length; i++) {
-        if (specs[i].is_default) {
-          defaultLabel = specs[i].label;
-          break;
-        }
-      }
-      modelLabel = defaultLabel;
-    } else {
-      for (let i = 0; i < specs.length; i++) {
-        if (specs[i].id === modelLabel) {
-          modelLabel = specs[i].label;
-          break;
-        }
-      }
+      const specs = this.modelsForProvider(this.composerProvider);
+      modelLabel = specs.length > 0 ? specs[0].label : 'Default';
     }
     if (this.composerProvider === 'claude_code' && modelLabel.startsWith('Claude ')) {
       modelLabel = modelLabel.substring('Claude '.length).trim();
@@ -1953,36 +2065,15 @@ export class OrbitHarmonyStore {
   }
 
   public currentEffortDisplayLabel(): string {
-    const specs = this.modelsForProvider(this.composerProvider);
-    let activeSpec: ProviderModelSpecDto | null = null;
-    const rawModel = this.composerModel.trim();
-    if (rawModel.length > 0) {
-      for (let i = 0; i < specs.length; i++) {
-        if (specs[i].id === rawModel) {
-          activeSpec = specs[i];
-          break;
-        }
-      }
-    } else {
-      for (let i = 0; i < specs.length; i++) {
-        if (specs[i].is_default) {
-          activeSpec = specs[i];
-          break;
-        }
-      }
-      if (activeSpec === null && specs.length > 0) {
-        activeSpec = specs[0];
-      }
-    }
-    if (activeSpec !== null && activeSpec.thinking_options.length === 0) {
-      return '';
-    }
-    const resolved = this.resolveDefaultModelAndEffort(
+    const resolved = this.resolveModelSelectionFromCore(
       this.composerProvider,
       this.composerModel,
       this.composerEffort
     );
-    return formatEffortLabel(resolved.effort);
+    if (resolved !== null) {
+      return resolved.selected_effort_label ?? '';
+    }
+    return '';
   }
 
   public currentModelPillLabel(): string {
@@ -1996,14 +2087,12 @@ export class OrbitHarmonyStore {
   }
 
   public modelsForProvider(provider: string): ProviderModelSpecDto[] {
+    const cat = this.catalogForProvider(provider);
+    if (cat !== null && cat.models.length > 0) {
+      return cat.models;
+    }
     const detail = this.currentHostDetail;
     if (detail !== null) {
-      for (let i = 0; i < detail.provider_catalogs.length; i++) {
-        const cat: ProviderModelCatalogDto = detail.provider_catalogs[i];
-        if (cat.provider === provider && cat.models.length > 0) {
-          return cat.models;
-        }
-      }
       let legacy: ModelOptionDto[] | undefined = undefined;
       if (provider === 'antigravity') {
         legacy = detail.models_by_provider.antigravity;
@@ -2029,67 +2118,7 @@ export class OrbitHarmonyStore {
         return mapped;
       }
     }
-
-    // Built-in catalog fallback for offline/previewer rendering
-    const defaultThinking: ThinkingOptionSpecDto[] = [
-      { effort: 'low', label: 'Low', is_default: false },
-      { effort: 'medium', label: 'Medium', is_default: false },
-      { effort: 'high', label: 'High', is_default: true },
-      { effort: 'xhigh', label: 'Extra High', is_default: false }
-    ];
-    if (provider === 'codex') {
-      const codexModels: ProviderModelSpecDto[] = [
-        {
-          id: 'gpt-5-codex',
-          label: 'GPT-5 Codex',
-          description: 'Flagship autonomous software engineering model',
-          is_default: true,
-          default_effort: 'high',
-          thinking_options: defaultThinking
-        },
-        {
-          id: 'o3',
-          label: 'o3',
-          description: 'Deep reasoning for architecture and tough bugs',
-          is_default: false,
-          default_effort: 'high',
-          thinking_options: defaultThinking
-        }
-      ];
-      return codexModels;
-    }
-    if (provider === 'claude_code') {
-      const claudeModels: ProviderModelSpecDto[] = [
-        {
-          id: 'claude-sonnet-4-5',
-          label: 'Claude Sonnet 4.5',
-          description: 'Balanced speed and coding accuracy',
-          is_default: true,
-          default_effort: 'high',
-          thinking_options: defaultThinking
-        },
-        {
-          id: 'claude-opus-4-1',
-          label: 'Claude Opus 4.1',
-          description: 'Maximum depth for multi-file refactors',
-          is_default: false,
-          default_effort: 'max',
-          thinking_options: defaultThinking
-        }
-      ];
-      return claudeModels;
-    }
-    const agyModels: ProviderModelSpecDto[] = [
-      {
-        id: 'gemini-2.5-pro',
-        label: 'Gemini 2.5 Pro',
-        description: 'Long-context agentic synthesis and code navigation',
-        is_default: true,
-        default_effort: 'high',
-        thinking_options: defaultThinking
-      }
-    ];
-    return agyModels;
+    return [];
   }
 
   public isActiveAgentRunning(): boolean {
@@ -2143,55 +2172,145 @@ export class OrbitHarmonyStore {
     return tail.join('\n');
   }
 
-  private parseLeadingSlashDirective(rawText: string): ParsedLeadingSlash {
-    const trimmed = rawText.trim();
-    const candidates: string[] = ['/plan', '/review', '/compact'];
-    const lower = trimmed.toLowerCase();
-    for (let i = 0; i < candidates.length; i++) {
-      const cmd = candidates[i];
-      if (lower === cmd) {
-        return { directive: cmd, rest: '' };
-      }
-      if (lower.startsWith(`${cmd} `) || lower.startsWith(`${cmd}\n`) || lower.startsWith(`${cmd}\t`)) {
-        return {
-          directive: cmd,
-          rest: trimmed.substring(cmd.length).trim()
-        };
-      }
+  private parseSlashDirectiveEnum(rawDirective: string): string | null {
+    const clean = rawDirective.trim().toLowerCase().replace(/^\//, '');
+    if (
+      clean === 'plan' ||
+      clean === 'review' ||
+      clean === 'compact' ||
+      clean === 'orbit' ||
+      clean === 'orbit-handoff' ||
+      clean === 'orbit-committee' ||
+      clean === 'orbit-advisor'
+    ) {
+      return clean;
     }
-    return { directive: '', rest: trimmed };
+    return null;
   }
 
-  private buildHiddenWorkflowInstruction(directive: string): string {
-    const clean = directive.toLowerCase();
-    if (clean === '/plan') {
-      return [
-        '<WORKFLOW_INSTRUCTION command="/plan">',
-        'You are invoked with the /plan workflow.',
-        'First inspect and verify the relevant codebase files, architecture, and constraints.',
-        'Clarify any critical ambiguities if needed, then present a concise, structured, step-by-step implementation plan.',
-        'Do NOT modify files or run mutating commands until the user approves the plan.',
-        '</WORKFLOW_INSTRUCTION>'
-      ].join('\n');
+  private parseQuoteLineNumber(lineLabel: string): number | null {
+    const marker = lineLabel.lastIndexOf(':L');
+    if (marker < 0) {
+      return null;
     }
-    if (clean === '/review') {
-      return [
-        '<WORKFLOW_INSTRUCTION command="/review">',
-        'You are invoked with the /review workflow.',
-        'Perform a thorough engineering code review of the attached changes.',
-        'Focus on correctness bugs, regressions, edge cases, concurrency/state hazards, security, and adherence to project conventions.',
-        'Cite exact file paths and line numbers, prioritize findings by severity, and do NOT modify files unless asked.',
-        '</WORKFLOW_INSTRUCTION>'
-      ].join('\n');
+    const num = Number.parseInt(lineLabel.substring(marker + 2), 10);
+    return Number.isFinite(num) && num > 0 ? num : null;
+  }
+
+  private composePromptViaCore(
+    rawInput: string,
+    explicitDirectiveRaw: string,
+    sourceBadges: PromptBadgeDto[],
+    sourceQuotes: QuotedDiffSnippet[],
+    sourceAttachments: ComposerAttachmentItem[],
+    sourceInlineMentions: InlineMentionRegistration[]
+  ): ComposedPromptDto | null {
+    if (this.core === null) {
+      return null;
     }
-    return [
-      '<WORKFLOW_INSTRUCTION command="/compact">',
-      'Summarize and compact our conversation context into a concise, high-signal checkpoint:',
-      '1. Core goal & user preferences',
-      '2. Key architectural decisions & completed changes (with file paths)',
-      '3. Open issues & immediate next steps',
-      '</WORKFLOW_INSTRUCTION>'
-    ].join('\n');
+    const contexts: ComposerContextInputDto[] = [];
+    const quotes: ComposerQuoteInputDto[] = [];
+    let effectiveExplicit = this.parseSlashDirectiveEnum(explicitDirectiveRaw);
+
+    for (let i = 0; i < sourceAttachments.length; i++) {
+      const att = sourceAttachments[i];
+      if (att.isImage) {
+        contexts.push({ kind: 'image', path: att.path, filename: att.filename });
+      } else {
+        contexts.push({ kind: 'staged_file', path: att.path, filename: att.filename });
+      }
+    }
+
+    const termSnap = this.extractRecentTerminalText();
+    for (let i = 0; i < sourceBadges.length; i++) {
+      const b = sourceBadges[i];
+      if (b.kind === 'file') {
+        const cleanPath = b.label.startsWith('@') ? b.label.substring(1) : b.label;
+        if (cleanPath.length > 0) {
+          contexts.push({ kind: 'workspace_file', path: cleanPath });
+        }
+      } else if (b.kind === 'diff') {
+        contexts.push({
+          kind: 'git_diff',
+          staged: false,
+          label: 'Working Tree Diff',
+          diff_text: null
+        });
+      } else if (b.kind === 'staged') {
+        contexts.push({
+          kind: 'git_diff',
+          staged: true,
+          label: 'Staged Diff',
+          diff_text: null
+        });
+      } else if (b.kind === 'terminal') {
+        contexts.push({
+          kind: 'terminal_output',
+          label: 'Terminal',
+          content: termSnap
+        });
+      } else if (b.kind === 'command' && effectiveExplicit === null) {
+        effectiveExplicit = this.parseSlashDirectiveEnum(b.label);
+      }
+    }
+
+    for (let i = 0; i < sourceInlineMentions.length; i++) {
+      const m = sourceInlineMentions[i];
+      if (!rawInput.includes(m.token)) {
+        continue;
+      }
+      if (m.kind === 'file' && m.path.length > 0) {
+        contexts.push({ kind: 'workspace_file', path: m.path });
+      } else if (m.kind === 'git_diff') {
+        contexts.push({
+          kind: 'git_diff',
+          staged: m.staged,
+          label: m.staged ? 'Staged Diff' : 'Working Tree Diff',
+          diff_text: null
+        });
+      } else if (m.kind === 'terminal') {
+        contexts.push({
+          kind: 'terminal_output',
+          label: 'Terminal',
+          content: termSnap
+        });
+      }
+    }
+
+    for (let i = 0; i < sourceQuotes.length; i++) {
+      const snip = sourceQuotes[i];
+      if (snip.kind === 'reply') {
+        contexts.push({
+          kind: 'assistant_quote',
+          label: snip.lineLabel,
+          content: snip.content
+        });
+      } else {
+        const prefix = snip.kind === 'added' ? '+' : snip.kind === 'removed' ? '-' : ' ';
+        quotes.push({
+          path: snip.path.length > 0 ? snip.path : snip.lineLabel,
+          line_number: this.parseQuoteLineNumber(snip.lineLabel),
+          code: `${prefix}${snip.content}`
+        });
+      }
+    }
+
+    const req: ComposePromptRequestDto = {
+      provider: this.composerProvider,
+      raw_text: rawInput,
+      explicit_directive: effectiveExplicit,
+      host_id: this.selectedHostId.length > 0 ? this.selectedHostId : null,
+      cwd: this.activeCwd.length > 0 ? this.activeCwd : null,
+      contexts: contexts,
+      quotes: quotes,
+      pastes: []
+    };
+    try {
+      return JSON.parse(this.core.composePromptJson(JSON.stringify(req))) as ComposedPromptDto;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'composePromptJson failed', err as Object);
+      return null;
+    }
   }
 
   public submitSlashCompact(extraFocus: string = ''): void {
@@ -2200,23 +2319,25 @@ export class OrbitHarmonyStore {
       return;
     }
     const provider = this.currentAgent !== null ? this.currentAgent.provider : this.composerProvider;
-    const cleanFocus = extraFocus.trim();
-    const badges: PromptBadgeDto[] = [{ kind: 'slash', label: '/compact' }];
-    let wirePrompt = '';
-    if (provider === 'claude_code' || provider === 'antigravity') {
-      wirePrompt = cleanFocus.length > 0 ? `/compact ${cleanFocus}` : '/compact';
-    } else {
-      wirePrompt = cleanFocus.length > 0
-        ? `${this.buildHiddenWorkflowInstruction('/compact')}\n\n<USER_REQUEST>\n${cleanFocus}\n</USER_REQUEST>`
-        : this.buildHiddenWorkflowInstruction('/compact');
-    }
+    const req: ComposePromptRequestDto = {
+      provider: provider,
+      raw_text: extraFocus.trim(),
+      explicit_directive: 'compact',
+      host_id: this.selectedHostId,
+      cwd: this.activeCwd.length > 0 ? this.activeCwd : null,
+      contexts: [],
+      quotes: [],
+      pastes: []
+    };
     try {
+      const composed = JSON.parse(this.core.composePromptJson(JSON.stringify(req))) as ComposedPromptDto;
+      const badgesJson = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
       this.core.sendPromptWithMeta(
         this.selectedHostId,
         this.selectedAgentId,
-        wirePrompt,
-        cleanFocus,
-        JSON.stringify(badges)
+        composed.wire_prompt,
+        composed.display_prompt,
+        badgesJson
       );
       this.reloadStage();
       this.triggerHaptic(12);
@@ -2225,192 +2346,35 @@ export class OrbitHarmonyStore {
     }
   }
 
-  private buildPromptPayload(
-    rawInput: string,
-    sourceBadges: PromptBadgeDto[],
-    sourceQuotes: QuotedDiffSnippet[],
-    sourceAttachments: ComposerAttachmentItem[] = [],
-    sourceInlineMentions: InlineMentionRegistration[] = [],
-    explicitSlashDirective: string = ''
-  ): BuiltPromptPayload {
-    const rawTrimmed = rawInput.trim();
-    let effectiveDirective = explicitSlashDirective.trim();
-    let cleanUserText = rawTrimmed;
-    if (effectiveDirective.length === 0) {
-      const parsed = this.parseLeadingSlashDirective(rawTrimmed);
-      effectiveDirective = parsed.directive;
-      cleanUserText = parsed.rest;
-    }
-
-    const filePaths: string[] = [];
-    let includeWorkingDiff = false;
-    let includeStagedDiff = false;
-    let includeTerminal = false;
-
-    for (let i = 0; i < sourceBadges.length; i++) {
-      const b = sourceBadges[i];
-      if (b.kind === 'file') {
-        const cleanPath = b.label.startsWith('@') ? b.label.substring(1) : b.label;
-        if (!filePaths.includes(cleanPath)) {
-          filePaths.push(cleanPath);
-        }
-      } else if (b.kind === 'diff') {
-        includeWorkingDiff = true;
-      } else if (b.kind === 'staged') {
-        includeStagedDiff = true;
-      } else if (b.kind === 'terminal') {
-        includeTerminal = true;
-      } else if (b.kind === 'command' && effectiveDirective.length === 0) {
-        effectiveDirective = b.label;
-      }
-    }
-
-    for (let i = 0; i < sourceInlineMentions.length; i++) {
-      const m = sourceInlineMentions[i];
-      if (!cleanUserText.includes(m.token)) {
-        continue;
-      }
-      if (m.kind === 'file' && m.path.length > 0) {
-        if (!filePaths.includes(m.path)) {
-          filePaths.push(m.path);
-        }
-      } else if (m.kind === 'git_diff') {
-        if (m.staged) {
-          includeStagedDiff = true;
-        } else {
-          includeWorkingDiff = true;
-        }
-      } else if (m.kind === 'terminal') {
-        includeTerminal = true;
-      }
-    }
-
-    const autoReviewDiff = effectiveDirective === '/review' && !includeWorkingDiff && !includeStagedDiff;
-    if (autoReviewDiff) {
-      includeWorkingDiff = true;
-    }
-
-    const badges: PromptBadgeDto[] = [];
-    if (effectiveDirective.length > 0) {
-      badges.push({ kind: 'slash', label: effectiveDirective });
-    }
-    for (let i = 0; i < sourceAttachments.length; i++) {
-      const att = sourceAttachments[i];
-      badges.push({
-        kind: att.isImage ? 'image' : 'file',
-        label: att.filename
-      });
-    }
-    for (let i = 0; i < filePaths.length; i++) {
-      const shortName = basenameOfPath(filePaths[i]);
-      if (!cleanUserText.includes(`@${shortName}`)) {
-        badges.push({ kind: 'file', label: `@${shortName}` });
-      }
-    }
-    if (includeWorkingDiff && !autoReviewDiff && !cleanUserText.includes('@working-diff')) {
-      badges.push({ kind: 'git_diff', label: 'Working Tree Diff' });
-    }
-    if (includeStagedDiff && !cleanUserText.includes('@staged-diff')) {
-      badges.push({ kind: 'git_diff', label: 'Staged Diff' });
-    }
-    if (includeTerminal && !cleanUserText.includes('@terminal')) {
-      badges.push({ kind: 'terminal', label: 'Terminal' });
-    }
-    for (let i = 0; i < sourceQuotes.length; i++) {
-      badges.push({
-        kind: 'quote',
-        label: sourceQuotes[i].lineLabel
-      });
-    }
-
-    const wireParts: string[] = [];
-    if (effectiveDirective.length > 0) {
-      wireParts.push(this.buildHiddenWorkflowInstruction(effectiveDirective));
-    }
-
-    const imagePaths: string[] = [];
-    const attachedFilePaths: string[] = [];
-    for (let i = 0; i < sourceAttachments.length; i++) {
-      if (sourceAttachments[i].isImage) {
-        imagePaths.push(sourceAttachments[i].path);
-      } else {
-        attachedFilePaths.push(sourceAttachments[i].path);
-      }
-    }
-    if (imagePaths.length > 0) {
-      const imgLines: string[] = [];
-      for (let i = 0; i < imagePaths.length; i++) {
-        imgLines.push(`Attached image file: \`${imagePaths[i]}\``);
-      }
-      wireParts.push(imgLines.join('\n'));
-    }
-
-    const allFiles: string[] = [];
-    for (let i = 0; i < filePaths.length; i++) {
-      allFiles.push(filePaths[i]);
-    }
-    for (let i = 0; i < attachedFilePaths.length; i++) {
-      allFiles.push(attachedFilePaths[i]);
-    }
-    if (allFiles.length > 0) {
-      const refs: string[] = [];
-      for (let i = 0; i < allFiles.length; i++) {
-        refs.push(`\`@${allFiles[i]}\``);
-      }
-      wireParts.push(`Referenced workspace files: ${refs.join(', ')}`);
-    }
-
-    if (includeWorkingDiff) {
-      wireParts.push(`Context: Inspect working tree git changes in ${this.activeCwd}.`);
-    }
-    if (includeStagedDiff) {
-      wireParts.push(`Context: Inspect staged git changes in ${this.activeCwd}.`);
-    }
-    if (includeTerminal) {
-      const termSnap = this.extractRecentTerminalText();
-      if (termSnap.length > 0) {
-        wireParts.push(`Active terminal output:\n\`\`\`text\n${termSnap}\n\`\`\``);
-      } else {
-        wireParts.push(`Please inspect the active PTY terminal session context in ${this.activeCwd}.`);
-      }
-    }
-
-    for (let i = 0; i < sourceQuotes.length; i++) {
-      const snip = sourceQuotes[i];
-      if (snip.kind === 'reply') {
-        const quotedLines = snip.content.split('\n').join('\n> ');
-        wireParts.push(`Quoted assistant context (${snip.lineLabel}):\n> ${quotedLines}`);
-      } else {
-        const prefix = snip.kind === 'added' ? '+' : snip.kind === 'removed' ? '-' : ' ';
-        wireParts.push(`Reference \`${snip.lineLabel}\`:\n\`\`\`diff\n${prefix}${snip.content}\n\`\`\``);
-      }
-    }
-
-    if (cleanUserText.length > 0) {
-      wireParts.push(cleanUserText);
-    }
-
-    return {
-      wirePrompt: wireParts.join('\n\n').trim(),
-      displayPrompt: cleanUserText,
-      badges: badges,
-      badgesJson: badges.length > 0 ? JSON.stringify(badges) : null
-    };
-  }
-
   public enqueueCurrentDraft(): void {
     const rawInput = this.composerText.trim();
     if (!this.hasComposerDraftContent()) {
       return;
     }
-    const explicitSlash: ParsedLeadingSlash = { directive: this.activeSlashDirective, rest: rawInput };
-    const parsed: ParsedLeadingSlash = this.activeSlashDirective.length === 0
-      ? this.parseLeadingSlashDirective(rawInput)
-      : explicitSlash;
-    if (parsed.directive === '/compact') {
+    const composed = this.composePromptViaCore(
+      rawInput,
+      this.activeSlashDirective,
+      this.composerBadges,
+      this.quotedSnippets,
+      this.stagedAttachments,
+      this.inlineMentions
+    );
+    if (composed === null || composed.is_empty) {
+      return;
+    }
+    if (composed.is_btw) {
+      const q = (composed.btw_question ?? '').trim();
       this.composerText = '';
       this.activeSlashDirective = '';
-      this.submitSlashCompact(parsed.rest);
+      if (q.length > 0) {
+        this.askSideQuestion(q);
+      }
+      return;
+    }
+    if (composed.is_compact) {
+      this.composerText = '';
+      this.activeSlashDirective = '';
+      this.submitSlashCompact(composed.display_prompt);
       return;
     }
     if (this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
@@ -2418,8 +2382,8 @@ export class OrbitHarmonyStore {
     }
 
     const copiedBadges: PromptBadgeDto[] = [];
-    for (let i = 0; i < this.composerBadges.length; i++) {
-      copiedBadges.push(this.composerBadges[i]);
+    for (let i = 0; i < composed.badges.length; i++) {
+      copiedBadges.push(composed.badges[i]);
     }
     const copiedQuotes: QuotedDiffSnippet[] = [];
     for (let i = 0; i < this.quotedSnippets.length; i++) {
@@ -2434,14 +2398,6 @@ export class OrbitHarmonyStore {
       copiedMentions.push(this.inlineMentions[i]);
     }
 
-    const payload = this.buildPromptPayload(
-      rawInput,
-      copiedBadges,
-      copiedQuotes,
-      copiedAttachments,
-      copiedMentions,
-      this.activeSlashDirective
-    );
     const key = this.agentQueueKey(this.selectedHostId, this.selectedAgentId);
     const existing = this.queuedPromptsByAgent.get(key);
     const nextList: QueuedPromptItem[] = [];
@@ -2455,10 +2411,10 @@ export class OrbitHarmonyStore {
       id: `q_${nowMs}_${nextList.length}`,
       hostKey: key,
       rawText: rawInput,
-      displayPrompt: payload.displayPrompt,
-      wirePrompt: payload.wirePrompt,
-      badgesJson: payload.badgesJson,
-      badges: payload.badges,
+      displayPrompt: composed.display_prompt,
+      wirePrompt: composed.wire_prompt,
+      badgesJson: copiedBadges.length > 0 ? JSON.stringify(copiedBadges) : null,
+      badges: copiedBadges,
       quotedSnippets: copiedQuotes,
       stagedAttachments: copiedAttachments,
       inlineMentions: copiedMentions,
@@ -2654,14 +2610,30 @@ export class OrbitHarmonyStore {
       return;
     }
 
-    const explicitSlash: ParsedLeadingSlash = { directive: this.activeSlashDirective, rest: rawInput };
-    const parsed: ParsedLeadingSlash = this.activeSlashDirective.length === 0
-      ? this.parseLeadingSlashDirective(rawInput)
-      : explicitSlash;
-    if (overridePrompt === undefined && parsed.directive === '/compact') {
+    const composed = this.composePromptViaCore(
+      rawInput,
+      overridePrompt === undefined ? this.activeSlashDirective : '',
+      overridePrompt === undefined ? this.composerBadges : [],
+      overridePrompt === undefined ? this.quotedSnippets : [],
+      overridePrompt === undefined ? this.stagedAttachments : [],
+      overridePrompt === undefined ? this.inlineMentions : []
+    );
+    if (composed === null || composed.is_empty) {
+      return;
+    }
+    if (overridePrompt === undefined && composed.is_btw) {
+      const q = (composed.btw_question ?? '').trim();
       this.composerText = '';
       this.activeSlashDirective = '';
-      this.submitSlashCompact(parsed.rest);
+      if (q.length > 0) {
+        this.askSideQuestion(q);
+      }
+      return;
+    }
+    if (overridePrompt === undefined && composed.is_compact) {
+      this.composerText = '';
+      this.activeSlashDirective = '';
+      this.submitSlashCompact(composed.display_prompt);
       return;
     }
 
@@ -2670,23 +2642,16 @@ export class OrbitHarmonyStore {
       return;
     }
 
-    const payload = this.buildPromptPayload(
-      rawInput,
-      overridePrompt === undefined ? this.composerBadges : [],
-      overridePrompt === undefined ? this.quotedSnippets : [],
-      overridePrompt === undefined ? this.stagedAttachments : [],
-      overridePrompt === undefined ? this.inlineMentions : [],
-      overridePrompt === undefined ? this.activeSlashDirective : ''
-    );
+    const badgesJson = composed.badges.length > 0 ? JSON.stringify(composed.badges) : null;
 
     try {
       if (this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
         this.core.sendPromptWithMeta(
           this.selectedHostId,
           this.selectedAgentId,
-          payload.wirePrompt,
-          payload.displayPrompt,
-          payload.badgesJson
+          composed.wire_prompt,
+          composed.display_prompt,
+          badgesJson
         );
         this.reloadStage();
       } else {
@@ -2703,9 +2668,9 @@ export class OrbitHarmonyStore {
           modelOpt,
           effortOpt,
           normalizeModeSlug(this.composerMode),
-          payload.wirePrompt,
-          payload.displayPrompt,
-          payload.badgesJson,
+          composed.wire_prompt,
+          composed.display_prompt,
+          badgesJson,
           wtOpt
         );
         this.selectedAgentId = optId;
@@ -3135,6 +3100,178 @@ export class OrbitHarmonyStore {
       this.core.sendTerminalKeys(this.selectedHostId, out);
     } catch (err) {
       orbitLogWarn('OrbitStore', 'sendTerminalKeys failed', err as Object);
+    }
+  }
+
+  // Client Bridge Contract v2 Wrappers
+
+  public async rewindAgent(toBeforeSeq: number, restoreFiles: boolean): Promise<RewindAgentResultDto | null> {
+    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+      return null;
+    }
+    try {
+      const json = await this.core.rewindAgentJson(
+        this.selectedHostId,
+        this.selectedAgentId,
+        toBeforeSeq,
+        restoreFiles
+      );
+      const result = JSON.parse(json) as RewindAgentResultDto;
+      this.reloadHost(this.selectedHostId);
+      this.reloadStage();
+      if (result.restored_prompt !== null && result.restored_prompt.length > 0) {
+        this.composerText = result.restored_prompt;
+      }
+      if (result.notice !== null && result.notice.length > 0) {
+        this.showToast(result.notice, false);
+      }
+      return result;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'rewindAgentJson failed', err as Object);
+      this.showToast((err as Error).message, true);
+      return null;
+    }
+  }
+
+  public async readWorkspaceFile(path: string, cwdOverride?: string): Promise<WorkspaceFileViewDto | null> {
+    if (this.core === null || this.selectedHostId.length === 0 || path.trim().length === 0) {
+      return null;
+    }
+    const targetCwd = cwdOverride !== undefined && cwdOverride.length > 0 ? cwdOverride : this.activeCwd;
+    try {
+      const json = await this.core.readWorkspaceFileJson(this.selectedHostId, targetCwd, path);
+      return JSON.parse(json) as WorkspaceFileViewDto;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'readWorkspaceFileJson failed', err as Object);
+      this.showToast((err as Error).message, true);
+      return null;
+    }
+  }
+
+  public buildSideQuestionContext(maxChars: number = 4000): string {
+    if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
+      return '';
+    }
+    try {
+      return this.core.buildSideQuestionContext(this.selectedHostId, this.selectedAgentId, maxChars);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'buildSideQuestionContext failed', err as Object);
+      return '';
+    }
+  }
+
+  public askSideQuestion(question: string, contextSummary?: string): string {
+    const cleanQ = question.trim();
+    if (this.core === null || this.selectedHostId.length === 0 || cleanQ.length === 0) {
+      return '';
+    }
+    this.sideQuestionActive = true;
+    this.sideQuestionPrompt = cleanQ;
+    this.sideQuestionAnswer = '';
+    this.sideQuestionError = '';
+
+    const resolvedContext = contextSummary !== undefined
+      ? contextSummary
+      : (this.selectedAgentId.length > 0 ? this.buildSideQuestionContext(4000) : '');
+    const req: AskSideQuestionRequestDto = {
+      host_id: this.selectedHostId,
+      agent_id: this.selectedAgentId.length > 0 ? this.selectedAgentId : null,
+      cwd: this.activeCwd,
+      provider: this.composerProvider,
+      model: this.composerModel.trim().length > 0 ? this.composerModel.trim() : null,
+      question: cleanQ,
+      context_summary: resolvedContext.length > 0 ? resolvedContext : null
+    };
+    try {
+      return this.core.askSideQuestion(JSON.stringify(req), (err: Error | null, eventJson: string) => {
+        if (err !== null && err !== undefined) {
+          this.sideQuestionError = err.message;
+          return;
+        }
+        if (eventJson === undefined || eventJson === null || eventJson.length === 0) {
+          return;
+        }
+        try {
+          const ev = JSON.parse(eventJson) as SideQuestionEnvelopeDto;
+          if (ev.Delta !== undefined) {
+            this.sideQuestionAnswer += ev.Delta.text_delta ?? '';
+          } else if (ev.Done !== undefined) {
+            const full = ev.Done.full_text ?? '';
+            if (full.length > 0) {
+              this.sideQuestionAnswer = full;
+            }
+            const errMsg = ev.Done.error ?? '';
+            if (errMsg.length > 0) {
+              this.sideQuestionError = errMsg;
+            }
+          } else {
+            if (ev.text_delta !== undefined && ev.text_delta.length > 0) {
+              this.sideQuestionAnswer += ev.text_delta;
+            }
+            if (ev.full_text !== undefined && ev.full_text.length > 0) {
+              this.sideQuestionAnswer = ev.full_text;
+            }
+            if (ev.error !== undefined && ev.error !== null && ev.error.length > 0) {
+              this.sideQuestionError = ev.error;
+            }
+          }
+        } catch (parseErr) {
+          orbitLogWarn('OrbitStore', 'askSideQuestion event parse failed', parseErr as Object);
+        }
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'askSideQuestion failed', err as Object);
+      this.sideQuestionError = (err as Error).message;
+      return '';
+    }
+  }
+
+  public detectDiagramKind(language: string, source: string): string | null {
+    if (this.core === null) {
+      return null;
+    }
+    try {
+      return this.core.detectDiagramKind(language, source);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'detectDiagramKind failed', err as Object);
+      return null;
+    }
+  }
+
+  public async renderDiagram(
+    kind: string,
+    source: string,
+    isDark: boolean
+  ): Promise<RenderDiagramViewDto | null> {
+    if (this.core === null || kind.length === 0) {
+      return null;
+    }
+    const themeStr = isDark ? 'dark' : 'light';
+    const cacheKey = `${kind}::${themeStr}::${source}`;
+    const hit = this.diagramRenderCache.get(cacheKey);
+    if (hit !== undefined) {
+      return hit;
+    }
+    const req: RenderDiagramRequestDto = {
+      kind: kind,
+      source: source,
+      theme: themeStr
+    };
+    try {
+      const json = await this.core.renderDiagramJson(JSON.stringify(req));
+      const view = JSON.parse(json) as RenderDiagramViewDto;
+      if (this.diagramRenderOrder.length >= 96) {
+        const oldest = this.diagramRenderOrder.shift();
+        if (oldest !== undefined) {
+          this.diagramRenderCache.delete(oldest);
+        }
+      }
+      this.diagramRenderCache.set(cacheKey, view);
+      this.diagramRenderOrder.push(cacheKey);
+      return view;
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'renderDiagramJson failed', err as Object);
+      return null;
     }
   }
 }

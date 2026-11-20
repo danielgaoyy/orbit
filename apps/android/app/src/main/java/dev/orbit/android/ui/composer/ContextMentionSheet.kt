@@ -48,16 +48,7 @@ import androidx.compose.ui.unit.dp
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 
-private data class SlashWorkflowSpec(
-    val command: String,
-    val description: String,
-)
-
-private val BuiltinSlashWorkflows = listOf(
-    SlashWorkflowSpec("/plan", "Draft step-by-step plan first"),
-    SlashWorkflowSpec("/review", "Audit working tree changes"),
-    SlashWorkflowSpec("/compact", "Compress session context"),
-)
+import uniffi.orbit_ffi_uniffi.FfiSlashCommand
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +59,7 @@ fun ContextMentionSheet(
     includeStagedDiff: Boolean,
     includeTerminal: Boolean,
     activeSlashCommand: String?,
+    slashCommands: List<FfiSlashCommand> = emptyList(),
     onRequestRefreshFiles: () -> Unit,
     onAddFileMention: (String) -> Unit,
     onToggleGitDiff: () -> Unit,
@@ -229,7 +221,11 @@ fun ContextMentionSheet(
                     )
                 }
 
-                items(BuiltinSlashWorkflows, key = { it.command }) { wf ->
+                val workflowCommands = remember(slashCommands) {
+                    slashCommands.filter { it.id == "plan" || it.id == "review" || it.id == "compact" }
+                }
+
+                items(workflowCommands, key = { it.command }) { wf ->
                     val isSelected = activeSlashCommand == wf.command
                     val rowShape = RoundedCornerShape(OrbitSpacing.md)
                     Row(

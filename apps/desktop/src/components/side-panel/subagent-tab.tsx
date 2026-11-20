@@ -1,8 +1,7 @@
-import { memo, useMemo } from "react";
+import { memo } from "react";
 import { ArrowUpRight, Check, Layers, Loader2, AlertTriangle } from "lucide-react";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { processTimelineForStage } from "@/lib/timeline-coalesce";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -13,28 +12,16 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       ? (s.hostDetails[hostId]?.agents.find((a) => a.agent_id === tab.childAgentId) ?? null)
       : null,
   );
-  const childTimeline = useOrbitSelector((s) =>
+  const childStage = useOrbitSelector((s) =>
     hostId && tab.childAgentId
-      ? (s.timelines[`${hostId}::${tab.childAgentId}`] ?? null)
+      ? (s.stages[`${hostId}::${tab.childAgentId}`] ?? null)
       : null,
   );
-  const parentToolCall = useOrbitSelector((s) => {
+  const parentSubagent = useOrbitSelector((s) => {
     if (!s.selectedHostId || !s.selectedAgentId || !tab.subagentCallId) return null;
-    const items = s.timelines[`${s.selectedHostId}::${s.selectedAgentId}`]?.items;
-    if (!items) return null;
-    for (let i = items.length - 1; i >= 0; i -= 1) {
-      const it = items[i];
-      if (it.item_type === "tool_call" && it.call_id === tab.subagentCallId) {
-        return it;
-      }
-    }
-    return null;
+    const parentStage = s.stages[`${s.selectedHostId}::${s.selectedAgentId}`];
+    return parentStage?.insights.subagents.find((sa) => sa.id === tab.subagentCallId) ?? null;
   });
-
-  const childStage = useMemo(() => {
-    if (!childTimeline) return null;
-    return processTimelineForStage(childTimeline.items, true);
-  }, [childTimeline]);
 
   const status = childAgent
     ? childAgent.is_running
@@ -42,7 +29,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       : childAgent.status_label.toLowerCase().includes("error")
         ? "failed"
         : "completed"
-    : parentToolCall?.status ?? "completed";
+    : (parentSubagent?.status ?? "completed");
 
   return (
     <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -105,16 +92,16 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
             </div>
             {childStage.turns.map((turn) => (
               <div key={turn.key} className="border-border space-y-2 border-l-2 pl-3">
-                {turn.workSummaryLabel && (
+                {turn.work_summary_label && (
                   <div className="text-muted-foreground text-[12px]">
-                    {turn.workSummaryLabel}
+                    {turn.work_summary_label}
                   </div>
                 )}
-                {turn.terminalReply && (
+                {turn.terminal_reply?.item_type === "assistant_message" && (
                   <div className="text-[12.5px]">
                     <MarkdownBlocksView
-                      blocks={turn.terminalReply.blocks}
-                      streaming={turn.terminalReply.streaming}
+                      blocks={turn.terminal_reply.blocks}
+                      streaming={turn.terminal_reply.streaming}
                       compact
                     />
                   </div>

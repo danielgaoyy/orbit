@@ -410,6 +410,9 @@ fun StreamStageScreen(
                 onRegisterInlineMention = { token, kind, path, staged, label ->
                     store.registerInlineMention(token, kind, path, staged, label)
                 },
+                slashCommands = ui.slashCommands,
+                onFilterSlashCommands = { store.filterSlashCommands(it) },
+                onRankMentions = { store.rankMentionCandidates(it) },
                 onExecuteSlashCommand = { cmd ->
                     store.executeSlashCommand(
                         cmd = cmd,
@@ -508,7 +511,7 @@ private fun NewSessionZenCanvas(
     val typography = OrbitTheme.typography
     val haptics = LocalHapticFeedback.current
 
-    val projects = remember(ui.selectedHostId, ui.projects, ui.hostDetail, ui.activeCwd, ui.gitReview) {
+    val projects = remember(ui.selectedHostId, ui.sidebarView) {
         ui.launchpadProjects
     }
     val activeProjectLabel = remember(projects, ui.activeCwd) {

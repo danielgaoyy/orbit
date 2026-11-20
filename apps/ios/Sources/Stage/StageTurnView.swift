@@ -246,7 +246,7 @@ struct StageTurnView: View {
         VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
             ForEach(Array(turn.liveSegments.enumerated()), id: \.element.segmentKey) { segIdx, segment in
                 switch segment {
-                case let .stepGroup(_, _, items, summary, hasFollowingContent, hasRunningStep):
+                case let .stepGroup(_, _, items, summary, _, _, _, _, hasFollowingContent, hasRunningStep):
                     let isTrailingSeg = segIdx == turn.liveSegments.count - 1
                     let isSegLiveActive = isTurnActive && isTrailingSeg && !hasFollowingContent
                     let segSettled = !isSegLiveActive && !hasRunningStep
@@ -275,6 +275,9 @@ struct StageTurnView: View {
 
                 case let .compaction(_, label):
                     compactionDivider(label: label.isEmpty ? "Context compacted" : label)
+
+                case let .wakeup(_, label):
+                    compactionDivider(label: label.isEmpty ? "Resumed" : label, icon: "arrow.trianglehead.2.clockwise")
                 }
             }
         }
@@ -282,11 +285,11 @@ struct StageTurnView: View {
 
     // MARK: - Compaction Divider
 
-    private func compactionDivider(label: String) -> some View {
+    private func compactionDivider(label: String, icon: String = "scissors") -> some View {
         HStack(spacing: 10) {
             OrbitHairline()
             HStack(spacing: 5) {
-                Image(systemName: "scissors")
+                Image(systemName: icon)
                     .font(.system(size: 11, weight: .medium))
                     .opacity(0.75)
                 Text(label.isEmpty ? "Context compacted" : label)
@@ -352,10 +355,11 @@ struct StageTurnView: View {
 private extension FfiTurnLiveSegment {
     var segmentKey: String {
         switch self {
-        case let .stepGroup(key, _, _, _, _, _): return key
+        case let .stepGroup(key, _, _, _, _, _, _, _, _, _): return key
         case let .assistantMessage(key, _): return key
         case let .notice(key, _): return key
         case let .compaction(key, _): return key
+        case let .wakeup(key, _): return key
         }
     }
 }
@@ -605,7 +609,7 @@ private func extractUserPromptPresentation(
     stripRegex(#"^Attached image file:\s*`([^`]+)`\s*$"#) { groups in
         if let raw = groups.first {
             let name = raw.split(separator: "/").last.map(String.init) ?? raw
-            inferred.append(FfiPromptBadge(kind: "image", label: name))
+            inferred.append(FfiPromptBadge(kind: "image", label: name, path: raw))
         }
     }
 
@@ -617,7 +621,7 @@ private func extractUserPromptPresentation(
                 if let r = Range(match.range(at: 1), in: listStr) {
                     let raw = String(listStr[r])
                     let name = raw.split(separator: "/").last.map(String.init) ?? raw
-                    inferred.append(FfiPromptBadge(kind: "file", label: name))
+                    inferred.append(FfiPromptBadge(kind: "file", label: name, path: raw))
                 }
             }
         }
@@ -625,25 +629,25 @@ private func extractUserPromptPresentation(
 
     stripRegex(#"^>\s*(Working Tree Diff|Staged Diff):\r?\n```diff\r?\n[\s\S]*?\r?\n```\s*$"#) { groups in
         if let label = groups.first {
-            inferred.append(FfiPromptBadge(kind: "git_diff", label: label))
+            inferred.append(FfiPromptBadge(kind: "git_diff", label: label, path: nil))
         }
     }
 
     stripRegex(#"^>\s*Context:\s*Inspect (staged|working tree) git changes\.\s*$"#, options: [.anchorsMatchLines, .caseInsensitive]) { groups in
         let isStaged = groups.first?.lowercased() == "staged"
-        inferred.append(FfiPromptBadge(kind: "git_diff", label: isStaged ? "Staged Diff" : "Working Tree Diff"))
+        inferred.append(FfiPromptBadge(kind: "git_diff", label: isStaged ? "Staged Diff" : "Working Tree Diff", path: nil))
     }
 
     stripRegex(#"^>\s*([^:\r\n]*lines):\r?\n```text\r?\n[\s\S]*?\r?\n```\s*$"#) { groups in
         if let label = groups.first {
-            inferred.append(FfiPromptBadge(kind: "terminal", label: label.trimmingCharacters(in: .whitespaces)))
+            inferred.append(FfiPromptBadge(kind: "terminal", label: label.trimmingCharacters(in: .whitespaces), path: nil))
         }
     }
 
     stripRegex(#"^>\s*Reference\s*`([^`]+)`:\r?\n```[\s\S]*?\r?\n```\s*$"#) { groups in
         if let loc = groups.first {
             let shortLoc = loc.split(separator: "/").last.map(String.init) ?? loc
-            inferred.append(FfiPromptBadge(kind: "quote", label: shortLoc))
+            inferred.append(FfiPromptBadge(kind: "quote", label: shortLoc, path: loc))
         }
     }
 
@@ -651,11 +655,11 @@ private func extractUserPromptPresentation(
 
     if working.hasPrefix(legacyPlanPrefix) {
         sanitized = true
-        inferred.insert(FfiPromptBadge(kind: "slash", label: "/plan"), at: 0)
+        inferred.insert(FfiPromptBadge(kind: "slash", label: "/plan", path: nil), at: 0)
         working = String(working.dropFirst(legacyPlanPrefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
     } else if working == legacyReviewPrompt {
         sanitized = true
-        inferred.insert(FfiPromptBadge(kind: "slash", label: "/review"), at: 0)
+        inferred.insert(FfiPromptBadge(kind: "slash", label: "/review", path: nil), at: 0)
         working = ""
     }
 
@@ -1215,17 +1219,17 @@ struct StepRailListView: View {
     private func stepRowKey(_ item: FfiTimelineItem, fallbackIndex: Int) -> String {
         switch item {
         case let .userPrompt(seq, id, _, _, _, _):
-            return "prompt-\(seq)-\(id)"
+            return id.isEmpty ? "prompt-seq-\(seq)" : "prompt-\(id)"
         case let .assistantThinking(seq, id, _, _, _):
-            return "think-\(seq)-\(id)"
+            return id.isEmpty ? "think-seq-\(seq)" : "think-\(id)"
         case let .assistantMessage(seq, id, _, _, _, _):
-            return "msg-\(seq)-\(id)"
+            return id.isEmpty ? "msg-seq-\(seq)" : "msg-\(id)"
         case let .toolCall(seq, callId, _, _, _, _, _, _, _):
-            return "tool-\(seq)-\(callId)"
+            return callId.isEmpty ? "tool-seq-\(seq)" : "tool-\(callId)"
         case let .permissionRequest(seq, id, _, _, _, _, _, _):
-            return "perm-\(seq)-\(id)"
+            return id.isEmpty ? "perm-seq-\(seq)" : "perm-\(id)"
         case let .questionRequest(seq, id, _, _, _):
-            return "q-\(seq)-\(id)"
+            return id.isEmpty ? "q-seq-\(seq)" : "q-\(id)"
         case let .notice(seq, _, _, _):
             return "notice-\(seq)-\(fallbackIndex)"
         }

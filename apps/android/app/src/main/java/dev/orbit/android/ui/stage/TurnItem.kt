@@ -752,6 +752,10 @@ private fun LiveTurnSegments(
                 is FfiTurnLiveSegment.Compaction -> {
                     CompactionDividerRow(label = seg.label.ifBlank { "Context compacted" })
                 }
+
+                is FfiTurnLiveSegment.Wakeup -> {
+                    CompactionDividerRow(label = seg.label.ifBlank { "Resumed" })
+                }
             }
         }
     }

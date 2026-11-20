@@ -25,21 +25,32 @@ use crate::updater::{
 use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
     AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest, ClientProjectView,
-    CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView, GitReviewView,
-    HostCardView, HostDetailView, OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent,
-    WorkspaceFileView,
+    ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView,
+    GitReviewView, HostCardView, HostDetailView, OrbitAppCore, RewindAgentResultView,
+    SideQuestionStreamEvent, SubscribeOptions, WorkspaceFileView,
+};
+use orbit_client_core::catalog::ResolvedModelSelectionView;
+use orbit_client_core::composer::{
+    ClientPlatform, ComposePromptRequest, ComposedPromptView, MentionCandidateView,
+    SlashCommandView,
+};
+use orbit_client_core::contract::{
+    BridgeInfoView, FleetSidebarRequest, MentionRankRequest, ModelSelectionRequest,
+    RenderDiagramRequest, RenderDiagramView,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
     open_external_url, open_in_external_editor, pick_local_directory, provision_relay_over_ssh,
-    resolve_user_home, stage_local_attachment, upgrade_remote_daemon_over_ssh,
+    resolve_user_home, upgrade_remote_daemon_over_ssh,
 };
 use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
+use orbit_client_core::sidebar::FleetSidebarView;
+use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentProfile, OrchestrationConfig, PromptBadge, ProviderKind,
-    ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode,
-    WorkspaceIsolation, WorktreeCreateMode,
+    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
+    ScheduleTarget, SessionMode, WorkspaceIsolation, WorktreeCreateMode,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -69,9 +80,18 @@ fn default_desktop_db_path() -> PathBuf {
 
 #[tauri::command]
 fn subscribe_core_events(state: State<'_, DesktopAppState>, on_event: Channel<CoreNotification>) {
-    state
-        .core
-        .subscribe(Arc::new(TauriChannelSubscriber { channel: on_event }));
+    state.core.subscribe_with_options(
+        SubscribeOptions {
+            min_interval_ms: 28,
+            include_terminal_raw_bytes: true,
+        },
+        Arc::new(TauriChannelSubscriber { channel: on_event }),
+    );
+}
+
+#[tauri::command]
+fn get_bridge_info(state: State<'_, DesktopAppState>) -> BridgeInfoView {
+    state.core.bridge_info()
 }
 
 #[tauri::command]
@@ -80,8 +100,156 @@ fn get_fleet_overview(state: State<'_, DesktopAppState>) -> FleetOverviewView {
 }
 
 #[tauri::command]
+fn get_fleet_sidebar(
+    state: State<'_, DesktopAppState>,
+    req: FleetSidebarRequest,
+) -> FleetSidebarView {
+    state.core.fleet_sidebar_by_request(&req)
+}
+
+#[tauri::command]
 fn get_host_detail(state: State<'_, DesktopAppState>, host_id: String) -> Option<HostDetailView> {
     state.core.host_detail(&host_id)
+}
+
+#[tauri::command]
+fn get_agent_stage(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> AgentStageView {
+    state.core.agent_stage(&host_id, &agent_id)
+}
+
+#[tauri::command]
+fn get_agent_stage_delta(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    since_revision: u64,
+    since_aux_revision: Option<u64>,
+) -> AgentStageDeltaView {
+    state
+        .core
+        .agent_stage_delta_with_aux(&host_id, &agent_id, since_revision, since_aux_revision)
+}
+
+#[tauri::command]
+fn get_fallback_provider_catalogs(state: State<'_, DesktopAppState>) -> Vec<ProviderModelCatalog> {
+    state.core.fallback_provider_catalogs()
+}
+
+#[tauri::command]
+fn resolve_model_selection(
+    state: State<'_, DesktopAppState>,
+    req: ModelSelectionRequest,
+) -> ResolvedModelSelectionView {
+    state.core.resolve_model_selection(&req)
+}
+
+#[tauri::command]
+fn get_slash_commands(
+    state: State<'_, DesktopAppState>,
+    platform: Option<ClientPlatform>,
+    query: Option<String>,
+) -> Vec<SlashCommandView> {
+    state.core.slash_commands(
+        platform.unwrap_or(ClientPlatform::Desktop),
+        query.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn compose_prompt(
+    state: State<'_, DesktopAppState>,
+    req: ComposePromptRequest,
+) -> ComposedPromptView {
+    state.core.compose_prompt_for_host(&req)
+}
+
+#[tauri::command]
+fn rank_mention_candidates(
+    state: State<'_, DesktopAppState>,
+    req: MentionRankRequest,
+) -> Vec<MentionCandidateView> {
+    state.core.rank_mention_candidates(&req)
+}
+
+#[tauri::command]
+fn build_side_question_context(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    max_chars: Option<usize>,
+) -> String {
+    state
+        .core
+        .build_side_question_context(&host_id, &agent_id, max_chars)
+}
+
+#[tauri::command]
+async fn render_diagram(req: RenderDiagramRequest) -> RenderDiagramView {
+    let kind = req.kind;
+    let theme = req.theme;
+    match tokio::task::spawn_blocking(move || orbit_client_core::diagram::render_diagram(&req))
+        .await
+    {
+        Ok(view) => view,
+        Err(err) => RenderDiagramView {
+            kind,
+            theme,
+            svg: None,
+            width: 0.0,
+            height: 0.0,
+            error: Some(err.to_string()),
+            diagram_type_label: None,
+        },
+    }
+}
+
+#[tauri::command]
+fn mark_agent_seen(state: State<'_, DesktopAppState>, host_id: String, agent_id: String, seq: u64) {
+    state.core.mark_agent_seen(&host_id, &agent_id, seq);
+}
+
+#[tauri::command]
+fn mark_agent_unread(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
+    state.core.mark_agent_unread(&host_id, &agent_id);
+}
+
+#[tauri::command]
+fn set_agent_pinned(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    pinned: bool,
+) {
+    state.core.set_agent_pinned(&host_id, &agent_id, pinned);
+}
+
+#[tauri::command]
+fn toggle_pin_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) -> bool {
+    state.core.toggle_pin_agent(&host_id, &agent_id)
+}
+
+#[tauri::command]
+fn seed_thread_prefs(state: State<'_, DesktopAppState>, seeds: Vec<ClientThreadPref>) {
+    state.core.seed_thread_prefs(seeds);
+}
+
+#[tauri::command]
+fn on_app_foreground(state: State<'_, DesktopAppState>) {
+    state.core.on_app_foreground();
+}
+
+#[tauri::command]
+fn on_app_background(state: State<'_, DesktopAppState>) {
+    state.core.on_app_background();
+}
+
+#[tauri::command]
+fn on_network_changed(state: State<'_, DesktopAppState>) {
+    state.core.on_network_changed();
 }
 
 #[tauri::command]
@@ -849,7 +1017,11 @@ fn get_workspace_files(
         return cached;
     }
     state.core.fetch_workspace_files(&host_id, &cwd);
-    list_local_workspace_files(&cwd, 2500).unwrap_or_default()
+    if state.core.is_local_host(&host_id) {
+        list_local_workspace_files(&cwd, 2500).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
 }
 
 #[tauri::command]
@@ -878,68 +1050,18 @@ async fn ask_side_question(
     context_summary: String,
     on_event: Channel<SideQuestionStreamEvent>,
 ) -> Result<String, String> {
-    if state.core.is_local_host(&host_id) {
-        let req_id = next_unique_local_tag("sq");
-        let resolved_cwd = if cwd.trim().is_empty() || cwd.trim() == "~" {
-            resolve_user_home().unwrap_or_else(|| PathBuf::from("."))
-        } else if let Some(rest) = cwd.trim().strip_prefix("~/") {
-            resolve_user_home()
-                .map(|h| h.join(rest))
-                .unwrap_or_else(|| PathBuf::from(cwd.trim()))
-        } else {
-            PathBuf::from(cwd.trim())
-        };
-        let req_id_bg = req_id.clone();
-        tauri::async_runtime::spawn(async move {
-            let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let ch_delta = on_event.clone();
-            let req_for_delta = req_id_bg.clone();
-            let forward = tokio::spawn(async move {
-                while let Some(text_delta) = delta_rx.recv().await {
-                    if ch_delta
-                        .send(SideQuestionStreamEvent::Delta {
-                            request_id: req_for_delta.clone(),
-                            text_delta,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            let result = run_side_question(
-                SideQuestionSpec {
-                    provider,
-                    cwd: resolved_cwd,
-                    model,
-                    question,
-                    context_summary,
-                },
-                delta_tx,
-            )
-            .await;
-
-            let _ = forward.await;
-            let done_ev = match result {
-                Ok(full_text) => SideQuestionStreamEvent::Done {
-                    request_id: req_id_bg,
-                    full_text,
-                    error: None,
-                },
-                Err(err) => SideQuestionStreamEvent::Done {
-                    request_id: req_id_bg,
-                    full_text: String::new(),
-                    error: Some(err),
-                },
-            };
-            let _ = on_event.send(done_ev);
-        });
-        return Ok(req_id);
-    }
+    let is_local = state.core.is_local_host(&host_id);
+    let fallback_payload = is_local.then(|| {
+        (
+            cwd.clone(),
+            model.clone(),
+            question.clone(),
+            context_summary.clone(),
+        )
+    });
 
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SideQuestionStreamEvent>();
-    let req_id = state
+    match state
         .core
         .ask_side_question_on_host(
             AskSideQuestionRequest {
@@ -953,19 +1075,83 @@ async fn ask_side_question(
             },
             ev_tx,
         )
-        .await?;
-
-    tauri::async_runtime::spawn(async move {
-        while let Some(ev) = ev_rx.recv().await {
-            let is_done = matches!(ev, SideQuestionStreamEvent::Done { .. });
-            let _ = on_event.send(ev);
-            if is_done {
-                break;
-            }
+        .await
+    {
+        Ok(req_id) => {
+            tauri::async_runtime::spawn(async move {
+                while let Some(ev) = ev_rx.recv().await {
+                    let is_done = matches!(ev, SideQuestionStreamEvent::Done { .. });
+                    let _ = on_event.send(ev);
+                    if is_done {
+                        break;
+                    }
+                }
+            });
+            Ok(req_id)
         }
-    });
+        Err(daemon_err) => {
+            let Some((fb_cwd, fb_model, fb_question, fb_context)) = fallback_payload else {
+                return Err(daemon_err);
+            };
+            let req_id = next_unique_local_tag("sq");
+            let resolved_cwd = if fb_cwd.trim().is_empty() || fb_cwd.trim() == "~" {
+                resolve_user_home().unwrap_or_else(|| PathBuf::from("."))
+            } else if let Some(rest) = fb_cwd.trim().strip_prefix("~/") {
+                resolve_user_home()
+                    .map(|h| h.join(rest))
+                    .unwrap_or_else(|| PathBuf::from(fb_cwd.trim()))
+            } else {
+                PathBuf::from(fb_cwd.trim())
+            };
+            let req_id_bg = req_id.clone();
+            tauri::async_runtime::spawn(async move {
+                let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                let ch_delta = on_event.clone();
+                let req_for_delta = req_id_bg.clone();
+                let forward = tokio::spawn(async move {
+                    while let Some(text_delta) = delta_rx.recv().await {
+                        if ch_delta
+                            .send(SideQuestionStreamEvent::Delta {
+                                request_id: req_for_delta.clone(),
+                                text_delta,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
 
-    Ok(req_id)
+                let result = run_side_question(
+                    SideQuestionSpec {
+                        provider,
+                        cwd: resolved_cwd,
+                        model: fb_model,
+                        question: fb_question,
+                        context_summary: fb_context,
+                    },
+                    delta_tx,
+                )
+                .await;
+
+                let _ = forward.await;
+                let done_ev = match result {
+                    Ok(full_text) => SideQuestionStreamEvent::Done {
+                        request_id: req_id_bg,
+                        full_text,
+                        error: None,
+                    },
+                    Err(err) => SideQuestionStreamEvent::Done {
+                        request_id: req_id_bg,
+                        full_text: String::new(),
+                        error: Some(err),
+                    },
+                };
+                let _ = on_event.send(done_ev);
+            });
+            Ok(req_id)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1013,9 +1199,26 @@ fn open_external_browser_url(url: String) -> Result<(), String> {
     open_external_url(parsed.as_str())
 }
 
-#[tauri::command]
-fn stage_attachment(filename: String, bytes: Vec<u8>) -> Result<StagedAttachmentInfo, String> {
-    stage_local_attachment(&filename, &bytes)
+fn decode_percent_utf8(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (
+                char::from(bytes[i + 1]).to_digit(16),
+                char::from(bytes[i + 2]).to_digit(16),
+            )
+        {
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 #[tauri::command]
@@ -1028,6 +1231,39 @@ async fn stage_host_attachment(
     state
         .core
         .stage_attachment_b64_on_host(&host_id, &filename, &data_b64)
+        .await
+}
+
+#[tauri::command]
+async fn stage_host_attachment_bytes(
+    request: tauri::ipc::Request<'_>,
+    state: State<'_, DesktopAppState>,
+) -> Result<StagedAttachmentInfo, String> {
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(raw) => raw.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("Expected raw binary body for attachment upload".into());
+        }
+    };
+    let host_id = request
+        .headers()
+        .get("x-orbit-host-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Missing x-orbit-host-id header".to_string())?
+        .to_string();
+    let filename = request
+        .headers()
+        .get("x-orbit-filename")
+        .and_then(|v| v.to_str().ok())
+        .map(decode_percent_utf8)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "attachment.bin".to_string());
+    state
+        .core
+        .stage_attachment_on_host(&host_id, &filename, bytes)
         .await
 }
 
@@ -1125,8 +1361,26 @@ pub fn run() {
         .manage(DesktopAppState { core })
         .invoke_handler(tauri::generate_handler![
             subscribe_core_events,
+            get_bridge_info,
             get_fleet_overview,
+            get_fleet_sidebar,
             get_host_detail,
+            get_agent_stage,
+            get_agent_stage_delta,
+            get_fallback_provider_catalogs,
+            resolve_model_selection,
+            get_slash_commands,
+            compose_prompt,
+            rank_mention_candidates,
+            build_side_question_context,
+            mark_agent_seen,
+            mark_agent_unread,
+            set_agent_pinned,
+            toggle_pin_agent,
+            seed_thread_prefs,
+            on_app_foreground,
+            on_app_background,
+            on_network_changed,
             get_agent_timeline,
             get_agent_timeline_delta,
             get_git_review,
@@ -1204,11 +1458,12 @@ pub fn run() {
             get_workspace_files,
             read_workspace_file,
             ask_side_question,
+            render_diagram,
             parse_markdown_preview,
             open_browser_popout_window,
             open_external_browser_url,
-            stage_attachment,
             stage_host_attachment,
+            stage_host_attachment_bytes,
             provision_ssh_relay,
             get_app_version,
             check_app_update,

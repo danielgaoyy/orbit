@@ -1019,6 +1019,8 @@ export struct StageTurnView {
             })
           } else if (seg.kind === 'compaction') {
             this.renderCompactionDivider(seg.label ?? 'Context compacted')
+          } else if (seg.kind === 'wakeup') {
+            this.renderCompactionDivider(seg.label ?? 'Resumed')
           }
         },
         (seg: TurnLiveSegmentDto) => `${seg.key}_${seg.has_running_step ? '1' : '0'}_${seg.items?.length ?? 0}`

@@ -1,25 +1,6 @@
 import SwiftUI
 import UIKit
 
-private struct ProjectConversationItem: Identifiable {
-    let agent: FfiAgentCard
-    let isWorktree: Bool
-
-    var id: String { agent.agentId }
-}
-
-private struct UnifiedMobileProject: Identifiable {
-    let id: String
-    let name: String
-    let primaryCwd: String
-    let extraDirs: [String]
-    let directories: [String]
-    let gitBranch: String?
-    let pinnedProject: FfiClientProject?
-    var conversations: [ProjectConversationItem]
-    var sortWeight: TimeInterval
-}
-
 struct FleetDrawerView: View {
     private static let maxVisibleConversationsPerProject = 5
 
@@ -30,10 +11,6 @@ struct FleetDrawerView: View {
     @State private var expandedMoreProjectIds: Set<String> = []
     @State private var isSortFilterPopoverPresented: Bool = false
     @State private var isHostPickerPresented: Bool = false
-
-    private var allAgents: [FfiAgentCard] {
-        store.currentHostDetail?.agents ?? []
-    }
 
     private var trimmedSearchQuery: String {
         store.drawerSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -55,273 +32,72 @@ struct FleetDrawerView: View {
         store.sidebarThreadFilter == .activeUnread
     }
 
-    // MARK: - Unified Projects Builder (1:1 Desktop `buildUnifiedProjects`)
+    // MARK: - Rust-Authoritative Sidebar Projection
 
-    private var unifiedProjects: [UnifiedMobileProject] {
+    private var hostProjects: [FfiSidebarProjectGroup] {
         guard let hostId = store.selectedHostId else { return [] }
-        let detail = store.currentHostDetail
-        var entries: [UnifiedMobileProject] = []
-        var indexById: [String: Int] = [:]
-
-        // 1. User-pinned projects first
-        for proj in store.hostPinnedProjects {
-            let primary = normalizeProjectPath(proj.directories.first ?? "~")
-            let normalizedDirs = proj.directories.isEmpty
-                ? [primary]
-                : proj.directories.map(normalizeProjectPath)
-            let extra = Array(proj.directories.dropFirst())
-            let entry = UnifiedMobileProject(
-                id: proj.projectId,
-                name: proj.name.isEmpty ? OrbitFormatters.shortPath(primary) : proj.name,
-                primaryCwd: primary,
-                extraDirs: extra,
-                directories: normalizedDirs,
-                gitBranch: branchForDirectory(primary),
-                pinnedProject: proj,
-                conversations: [],
-                sortWeight: TimeInterval(proj.updatedAtMs) / 1000.0
-            )
-            indexById[entry.id] = entries.count
-            entries.append(entry)
-        }
-
-        // 2. Group active/recent agents under their parent Project (nesting worktrees back into base repo)
-        let wsWorktreeByCwd: [String: Bool] = {
-            var map: [String: Bool] = [:]
-            for ws in detail?.workspaces ?? [] {
-                map[normalizeProjectPath(ws.cwd)] = ws.isWorktree
-            }
-            return map
-        }()
-
-        for ag in allAgents {
-            let cleanCwd = normalizeProjectPath(ag.cwd)
-            let isWt = wsWorktreeByCwd[cleanCwd] ?? cleanCwd.contains("/worktrees/")
-            var matchedIndex = entries.firstIndex {
-                matchesProjectDirectory($0.directories, cwd: cleanCwd)
-            }
-
-            if matchedIndex == nil && isWt {
-                let candidateRepo = detail?.workspaces.first {
-                    !$0.isWorktree && matchesProjectDirectory([$0.cwd], cwd: cleanCwd)
-                }?.cwd
-                    ?? detail?.discoveredProjects.first {
-                        matchesProjectDirectory([$0.path], cwd: cleanCwd)
-                    }?.path
-
-                if let rawRepo = candidateRepo {
-                    let cleanRepo = normalizeProjectPath(rawRepo)
-                    let projId = "\(hostId)::\(cleanRepo)"
-                    if let existingIdx = indexById[projId] {
-                        matchedIndex = existingIdx
-                    } else {
-                        let newEntry = UnifiedMobileProject(
-                            id: projId,
-                            name: OrbitFormatters.shortPath(cleanRepo),
-                            primaryCwd: cleanRepo,
-                            extraDirs: [],
-                            directories: [cleanRepo],
-                            gitBranch: branchForDirectory(cleanRepo),
-                            pinnedProject: nil,
-                            conversations: [],
-                            sortWeight: 0
-                        )
-                        indexById[projId] = entries.count
-                        entries.append(newEntry)
-                        matchedIndex = entries.count - 1
-                    }
-                }
-            }
-
-            if matchedIndex == nil {
-                let projId = "\(hostId)::\(cleanCwd)"
-                if let existingIdx = indexById[projId] {
-                    matchedIndex = existingIdx
-                } else {
-                    let newEntry = UnifiedMobileProject(
-                        id: projId,
-                        name: OrbitFormatters.shortPath(cleanCwd),
-                        primaryCwd: cleanCwd,
-                        extraDirs: [],
-                        directories: [cleanCwd],
-                        gitBranch: branchForDirectory(cleanCwd),
-                        pinnedProject: nil,
-                        conversations: [],
-                        sortWeight: 0
-                    )
-                    indexById[projId] = entries.count
-                    entries.append(newEntry)
-                    matchedIndex = entries.count - 1
-                }
-            }
-
-            if let idx = matchedIndex {
-                entries[idx].conversations.append(ProjectConversationItem(agent: ag, isWorktree: isWt))
-                let ts = parseUpdatedTimestamp(ag.updatedAtRfc3339)
-                if ts > entries[idx].sortWeight {
-                    entries[idx].sortWeight = ts
-                }
-            }
-        }
-
-        // 3. If host has neither pinned projects nor conversations yet, surface top 4 discovered repos
-        if entries.isEmpty, let detail = detail {
-            var count = 0
-            for dp in detail.discoveredProjects where count < 4 {
-                let cleanPath = normalizeProjectPath(dp.path)
-                if isBareHomeDir(cleanPath) && detail.discoveredProjects.count > 1 {
-                    continue
-                }
-                let projId = "\(hostId)::\(cleanPath)"
-                guard indexById[projId] == nil else { continue }
-                let entry = UnifiedMobileProject(
-                    id: projId,
-                    name: dp.name.isEmpty ? OrbitFormatters.shortPath(cleanPath) : dp.name,
-                    primaryCwd: cleanPath,
-                    extraDirs: [],
-                    directories: [cleanPath],
-                    gitBranch: dp.gitBranch,
-                    pinnedProject: nil,
-                    conversations: [],
-                    sortWeight: TimeInterval(dp.lastModifiedUnix)
-                )
-                indexById[projId] = entries.count
-                entries.append(entry)
-                count += 1
-            }
-        }
-
-        // Keep conversations within each project newest-first
-        for i in entries.indices {
-            entries[i].conversations.sort { lhs, rhs in
-                let lTs = parseUpdatedTimestamp(lhs.agent.updatedAtRfc3339)
-                let rTs = parseUpdatedTimestamp(rhs.agent.updatedAtRfc3339)
-                if lTs != rTs { return lTs > rTs }
-                return lhs.agent.latestSeq > rhs.agent.latestSeq
-            }
-        }
-
-        switch store.sidebarProjectSort {
-        case .alphabetical:
-            entries.sort { lhs, rhs in
-                lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-            }
-        case .recent:
-            entries.sort { lhs, rhs in
-                let lHome = isBareHomeDir(lhs.primaryCwd) ? 1 : 0
-                let rHome = isBareHomeDir(rhs.primaryCwd) ? 1 : 0
-                if lHome != rHome { return lHome < rHome }
-                let lHas = lhs.conversations.isEmpty ? 0 : 1
-                let rHas = rhs.conversations.isEmpty ? 0 : 1
-                if lHas != rHas { return lHas > rHas }
-                if lhs.sortWeight != rhs.sortWeight { return lhs.sortWeight > rhs.sortWeight }
-                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-            }
-        }
-
-        return entries
+        return (store.sidebarView?.projects ?? []).filter { $0.hostId == hostId }
     }
 
-    private var needsAttentionItems: [(agent: FfiAgentCard, projectName: String)] {
-        allAgents
-            .filter(\.isAwaitingPermission)
-            .map { ag in
-                (agent: ag, projectName: projectDisplayName(forCwd: ag.cwd))
-            }
-    }
-
-    private var pinnedItems: [(key: String, agent: FfiAgentCard, isWorktree: Bool)] {
-        guard let hostId = store.selectedHostId, !store.pinnedThreadKeys.isEmpty else { return [] }
-        var lookup: [String: ProjectConversationItem] = [:]
-        for proj in unifiedProjects {
-            for conv in proj.conversations {
-                let k = store.threadKey(hostId: hostId, agentId: conv.agent.agentId)
-                lookup[k] = conv
-            }
-        }
-        return store.pinnedThreadKeys.compactMap { key in
-            guard let item = lookup[key] else { return nil }
-            if isFilterActive {
-                let unread = store.isThreadUnread(hostId: hostId, agent: item.agent)
-                guard item.agent.isRunning || item.agent.isAwaitingPermission || unread else {
-                    return nil
-                }
-            }
-            return (key: key, agent: item.agent, isWorktree: item.isWorktree)
-        }
-    }
-
-    private var displayProjects: [(project: UnifiedMobileProject, conversations: [ProjectConversationItem])] {
+    private var needsAttentionItems: [(conv: FfiSidebarConversation, projectName: String)] {
         guard let hostId = store.selectedHostId else { return [] }
-        return unifiedProjects.compactMap { proj in
-            let visible = proj.conversations.filter { conv in
-                if store.isThreadPinned(hostId: hostId, agentId: conv.agent.agentId) {
-                    return false
-                }
-                if isFilterActive {
-                    let unread = store.isThreadUnread(hostId: hostId, agent: conv.agent)
-                    return conv.agent.isRunning || conv.agent.isAwaitingPermission || unread
-                }
-                return true
+        return (store.sidebarView?.needsAttention ?? [])
+            .filter { $0.hostId == hostId }
+            .map { conv in
+                (conv: conv, projectName: projectDisplayName(forCwd: conv.agent.cwd))
             }
+    }
 
-            let isActiveTarget = matchesProjectDirectory(proj.directories, cwd: store.activeCwd)
-            if isFilterActive && visible.isEmpty && proj.pinnedProject == nil && !isActiveTarget {
-                return nil
-            }
-            return (project: proj, conversations: visible)
-        }
+    private var pinnedItems: [FfiSidebarConversation] {
+        guard let hostId = store.selectedHostId else { return [] }
+        return (store.sidebarView?.pinnedConversations ?? []).filter { $0.hostId == hostId }
+    }
+
+    private var displayProjects: [FfiSidebarProjectGroup] {
+        hostProjects
     }
 
     // MARK: - Search Mode Matches
 
-    private var searchMatchedConversations: [(agent: FfiAgentCard, projectName: String, isWorktree: Bool)] {
+    private var searchMatchedConversations: [(conv: FfiSidebarConversation, projectName: String)] {
         guard !trimmedSearchQuery.isEmpty else { return [] }
-        let q = trimmedSearchQuery.lowercased()
-        let wsMap = Dictionary(
-            (store.currentHostDetail?.workspaces ?? []).map { (normalizeProjectPath($0.cwd), $0.isWorktree) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        return allAgents.compactMap { ag in
-            let projName = projectDisplayName(forCwd: ag.cwd)
-            let displayTitle = ag.title.isEmpty ? "New Conversation" : ag.title
-            let matches = displayTitle.localizedCaseInsensitiveContains(q)
-                || projName.localizedCaseInsensitiveContains(q)
-                || OrbitFormatters.shortPath(ag.cwd).localizedCaseInsensitiveContains(q)
-                || (branchForAgent(ag)?.localizedCaseInsensitiveContains(q) ?? false)
-            guard matches else { return nil }
-            let clean = normalizeProjectPath(ag.cwd)
-            let isWt = wsMap[clean] ?? clean.contains("/worktrees/")
-            return (agent: ag, projectName: projName, isWorktree: isWt)
+        var seen = Set<String>()
+        var results: [(conv: FfiSidebarConversation, projectName: String)] = []
+        for conv in pinnedItems where seen.insert(conv.agent.agentId).inserted {
+            results.append((conv: conv, projectName: projectDisplayName(forCwd: conv.agent.cwd)))
         }
+        for grp in hostProjects {
+            for conv in grp.conversations where seen.insert(conv.agent.agentId).inserted {
+                results.append((conv: conv, projectName: grp.name))
+            }
+        }
+        return results
     }
 
-    private var searchMatchedProjects: [(id: String, name: String, cwd: String, branch: String?, isPinned: Bool)] {
+    private var searchMatchedProjects: [(id: String, name: String, cwd: String, branch: String?)] {
         guard !trimmedSearchQuery.isEmpty else { return [] }
         let q = trimmedSearchQuery.lowercased()
-        var results: [(id: String, name: String, cwd: String, branch: String?, isPinned: Bool)] = []
+        var results: [(id: String, name: String, cwd: String, branch: String?)] = []
         var seenCwds: Set<String> = []
 
-        for proj in unifiedProjects {
-            let branch = proj.gitBranch
+        for proj in hostProjects {
             let matched = proj.name.localizedCaseInsensitiveContains(q)
                 || proj.primaryCwd.localizedCaseInsensitiveContains(q)
-                || (branch?.localizedCaseInsensitiveContains(q) ?? false)
+                || (proj.gitBranch?.localizedCaseInsensitiveContains(q) ?? false)
             if matched {
                 seenCwds.insert(proj.primaryCwd)
                 results.append((
                     id: proj.id,
                     name: proj.name,
                     cwd: proj.primaryCwd,
-                    branch: branch,
-                    isPinned: proj.pinnedProject != nil
+                    branch: proj.gitBranch
                 ))
             }
         }
 
         for dp in store.currentHostDetail?.discoveredProjects ?? [] {
-            let clean = normalizeProjectPath(dp.path)
-            guard !seenCwds.contains(clean) else { continue }
+            let clean = dp.path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !clean.isEmpty, !seenCwds.contains(clean) else { continue }
             let matched = dp.name.localizedCaseInsensitiveContains(q)
                 || clean.localizedCaseInsensitiveContains(q)
                 || (dp.gitBranch?.localizedCaseInsensitiveContains(q) ?? false)
@@ -331,8 +107,7 @@ struct FleetDrawerView: View {
                     id: "repo::\(clean)",
                     name: dp.name.isEmpty ? OrbitFormatters.shortPath(clean) : dp.name,
                     cwd: clean,
-                    branch: dp.gitBranch,
-                    isPinned: false
+                    branch: dp.gitBranch
                 ))
             }
         }
@@ -514,10 +289,9 @@ struct FleetDrawerView: View {
         } else {
             if !searchMatchedConversations.isEmpty {
                 sectionHeaderRow("Conversations")
-                ForEach(searchMatchedConversations, id: \.agent.agentId) { entry in
+                ForEach(searchMatchedConversations, id: \.conv.id) { entry in
                     sessionRow(
-                        agent: entry.agent,
-                        isWorktree: entry.isWorktree,
+                        conv: entry.conv,
                         trailingTag: entry.projectName
                     )
                 }
@@ -572,8 +346,8 @@ struct FleetDrawerView: View {
                 accentColor: palette.warning,
                 topPadding: 4
             )
-            ForEach(needsAttentionItems, id: \.agent.agentId) { item in
-                attentionRow(agent: item.agent, projectName: item.projectName)
+            ForEach(needsAttentionItems, id: \.conv.id) { item in
+                attentionRow(agent: item.conv.agent, projectName: item.projectName)
             }
         }
 
@@ -583,8 +357,8 @@ struct FleetDrawerView: View {
                 "Pinned",
                 topPadding: needsAttentionItems.isEmpty ? 4 : 14
             )
-            ForEach(pinnedItems, id: \.key) { item in
-                sessionRow(agent: item.agent, isWorktree: item.isWorktree)
+            ForEach(pinnedItems) { conv in
+                sessionRow(conv: conv)
             }
         }
 
@@ -618,9 +392,8 @@ struct FleetDrawerView: View {
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
         } else {
-            ForEach(displayProjects, id: \.project.id) { entry in
-                let project = entry.project
-                let conversations = entry.conversations
+            ForEach(displayProjects) { project in
+                let conversations = project.conversations
                 let isCollapsed = store.collapsedProjectIds.contains(project.id)
                 let hostId = store.selectedHostId ?? ""
                 let selectedIdx = conversations.firstIndex {
@@ -635,14 +408,13 @@ struct FleetDrawerView: View {
 
                 projectHeaderRow(
                     project: project,
-                    conversations: conversations,
                     isCollapsed: isCollapsed,
                     hostId: hostId
                 )
 
                 if !isCollapsed && !sliced.isEmpty {
-                    ForEach(sliced, id: \.agent.agentId) { conv in
-                        sessionRow(agent: conv.agent, isWorktree: conv.isWorktree)
+                    ForEach(sliced) { conv in
+                        sessionRow(conv: conv)
                     }
 
                     if hiddenCount > 0 {
@@ -782,18 +554,21 @@ struct FleetDrawerView: View {
     }
 
     private func projectHeaderRow(
-        project: UnifiedMobileProject,
-        conversations: [ProjectConversationItem],
+        project: FfiSidebarProjectGroup,
         isCollapsed: Bool,
         hostId: String
     ) -> some View {
+        let conversations = project.conversations
+        let extraDirs = Array(project.directories.dropFirst())
         let hasCollapsedApproval = isCollapsed && conversations.contains { $0.agent.isAwaitingPermission }
         let hasCollapsedRunning = isCollapsed && !hasCollapsedApproval && conversations.contains { $0.agent.isRunning }
         let hasCollapsedUnread = isCollapsed
             && !hasCollapsedApproval
             && !hasCollapsedRunning
-            && conversations.contains { store.isThreadUnread(hostId: hostId, agent: $0.agent) }
-        let isActiveDraft = store.isDraftNewSession && matchesProjectDirectory(project.directories, cwd: store.activeCwd)
+            && conversations.contains { $0.isUnread }
+        let isActiveDraft = store.isDraftNewSession && project.directories.contains {
+            OrbitFormatters.arePathsEquivalent($0, store.activeCwd)
+        }
 
         return HStack(spacing: 4) {
             Button {
@@ -837,7 +612,7 @@ struct FleetDrawerView: View {
             }
 
             Button {
-                store.startNewSessionDraft(cwd: project.primaryCwd, extraDirs: project.extraDirs)
+                store.startNewSessionDraft(cwd: project.primaryCwd, extraDirs: extraDirs)
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 13.5, weight: .medium))
@@ -855,14 +630,14 @@ struct FleetDrawerView: View {
         )
         .contextMenu {
             Button {
-                store.startNewSessionDraft(cwd: project.primaryCwd, extraDirs: project.extraDirs)
+                store.startNewSessionDraft(cwd: project.primaryCwd, extraDirs: extraDirs)
             } label: {
                 Label("New Conversation", systemImage: "square.and.pencil")
             }
 
-            if let pinned = project.pinnedProject {
+            if let pinnedId = project.pinnedProjectId {
                 Button {
-                    store.unpinProject(pinned.projectId)
+                    store.unpinProject(pinnedId)
                 } label: {
                     Label("Unpin Project", systemImage: "pin.slash")
                 }
@@ -938,14 +713,15 @@ struct FleetDrawerView: View {
     }
 
     private func sessionRow(
-        agent: FfiAgentCard,
-        isWorktree: Bool,
+        conv: FfiSidebarConversation,
         trailingTag: String? = nil
     ) -> some View {
-        let hostId = store.selectedHostId ?? ""
+        let hostId = conv.hostId
+        let agent = conv.agent
+        let isWorktree = conv.isWorktree
         let isSelected = !store.isDraftNewSession && store.selectedAgentId == agent.agentId
-        let isPinned = store.isThreadPinned(hostId: hostId, agentId: agent.agentId)
-        let isUnread = store.isThreadUnread(hostId: hostId, agent: agent)
+        let isPinned = conv.isPinned || store.isThreadPinned(hostId: hostId, agentId: agent.agentId)
+        let isUnread = conv.isUnread && !isSelected && !agent.isRunning
         let titleWeight: Font.Weight = (isSelected || isUnread) ? .medium : .regular
         let titleColor = (isSelected || isUnread) ? palette.fgPrimary : mutedRowForeground
         let rightLabel = trailingTag
@@ -987,6 +763,14 @@ struct FleetDrawerView: View {
                     store.togglePinThread(hostId: hostId, agentId: agent.agentId)
                 } label: {
                     Label(isPinned ? "Unpin" : "Pin", systemImage: isPinned ? "pin.slash" : "pin")
+                }
+
+                if !isUnread && !isSelected {
+                    Button {
+                        store.markAgentUnread(hostId: hostId, agentId: agent.agentId)
+                    } label: {
+                        Label("Mark Unread", systemImage: "envelope.badge")
+                    }
                 }
             }
 
@@ -1215,92 +999,16 @@ struct FleetDrawerView: View {
         return route
     }
 
-    // MARK: - Path, Branch & Timestamp Helpers
-
-    private func normalizeProjectPath(_ raw: String) -> String {
-        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty || trimmed == "~" { return "~" }
-        while trimmed.count > 1 && trimmed.hasSuffix("/") {
-            trimmed.removeLast()
-        }
-        return trimmed
-    }
-
-    private func isBareHomeDir(_ path: String) -> Bool {
-        let clean = normalizeProjectPath(path)
-        if clean == "~" || clean == "/" { return true }
-        let parts = clean.split(separator: "/")
-        return parts.count == 2 && (parts[0] == "Users" || parts[0] == "home")
-    }
-
-    private func matchesProjectDirectory(_ directories: [String], cwd: String) -> Bool {
-        let cleanCwd = normalizeProjectPath(cwd)
-        for dir in directories {
-            if OrbitFormatters.arePathsEquivalent(dir, cleanCwd) {
-                return true
-            }
-            let repoBase = OrbitFormatters.shortPath(dir)
-            if !repoBase.isEmpty && repoBase != "~" && repoBase != "/"
-                && cleanCwd.contains("/worktrees/\(repoBase)-") {
-                return true
-            }
-        }
-        return false
-    }
-
-    private func branchForDirectory(_ dir: String) -> String? {
-        if OrbitFormatters.arePathsEquivalent(dir, store.activeCwd),
-           let reviewBranch = store.gitReview?.branch,
-           !reviewBranch.isEmpty {
-            return reviewBranch
-        }
-        if let repoBranch = store.currentHostDetail?.discoveredProjects.first(where: {
-            OrbitFormatters.arePathsEquivalent($0.path, dir)
-        })?.gitBranch, !repoBranch.isEmpty {
-            return repoBranch
-        }
-        if let wsBranch = store.currentHostDetail?.workspaces.first(where: {
-            !$0.isWorktree && OrbitFormatters.arePathsEquivalent($0.cwd, dir)
-        })?.gitBranch, !wsBranch.isEmpty {
-            return wsBranch
-        }
-        return nil
-    }
-
-    private func branchForAgent(_ agent: FfiAgentCard) -> String? {
-        if let dirBranch = branchForDirectory(agent.cwd) {
-            return dirBranch
-        }
-        if let wsBranch = store.currentHostDetail?.workspaces.first(where: {
-            $0.workspaceId == agent.workspaceId
-        })?.gitBranch, !wsBranch.isEmpty {
-            return wsBranch
-        }
-        return nil
-    }
+    // MARK: - Sidebar Helpers
 
     private func projectDisplayName(forCwd cwd: String) -> String {
-        let clean = normalizeProjectPath(cwd)
-        if let matched = unifiedProjects.first(where: {
-            matchesProjectDirectory($0.directories, cwd: clean)
+        if let matched = hostProjects.first(where: { grp in
+            grp.directories.contains { OrbitFormatters.arePathsEquivalent($0, cwd) }
+                || OrbitFormatters.arePathsEquivalent(grp.primaryCwd, cwd)
         }) {
             return matched.name
         }
-        return OrbitFormatters.shortPath(clean)
-    }
-
-    private func parseUpdatedTimestamp(_ rfc3339: String) -> TimeInterval {
-        guard !rfc3339.isEmpty else { return 0 }
-        let f1 = ISO8601DateFormatter()
-        f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f1.date(from: rfc3339) {
-            return d.timeIntervalSince1970
-        }
-        let f2 = ISO8601DateFormatter()
-        if let d = f2.date(from: rfc3339) {
-            return d.timeIntervalSince1970
-        }
-        return 0
+        return OrbitFormatters.shortPath(cwd)
     }
 }
 

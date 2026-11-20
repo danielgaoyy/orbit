@@ -13,10 +13,14 @@ import {
   Clock,
   FileSearch,
   FoldVertical,
+  Layers,
   ListTodo,
   Paperclip,
   Plus,
+  Send,
+  Sparkles,
   SquareSlash,
+  Users,
   X,
   Zap,
 } from "lucide-react";
@@ -29,19 +33,18 @@ import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
 import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
 import { ContextTray } from "@/components/composer/context-tray";
 import {
-  type MentionCandidate,
   MentionMenu,
-  buildMentionCandidates,
 } from "@/components/composer/mention-menu";
 import {
-  type SlashCommandDef,
   SlashCommandMenu,
   filterSlashCommands,
 } from "@/components/composer/slash-menu";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type GitFileEntry,
+  type MentionCandidateView,
   type SessionMode,
+  type SlashCommandView,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
@@ -70,6 +73,7 @@ const EMPTY_QUOTES: readonly DiffQuoteSnippet[] = [];
 const EMPTY_QUEUED: readonly QueuedPromptItem[] = [];
 const EMPTY_FILES: readonly string[] = [];
 const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
+const EMPTY_MENTIONS: MentionCandidateView[] = [];
 
 export interface OmniComposerProps {
   variant?: "hero" | "docked";
@@ -87,6 +91,7 @@ export const OmniComposer = memo(function OmniComposer({
   const draftMode = useOrbitSelector((s) => s.draftMode);
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const promptHistory = useOrbitSelector((s) => s.promptHistory);
+  const slashCommands = useOrbitSelector((s) => s.slashCommands);
 
   // Primitive/narrow selectors instead of subscribing to full `HostDetailView`
   const hasCurrentAgent = useOrbitSelector((s) =>
@@ -165,6 +170,8 @@ export const OmniComposer = memo(function OmniComposer({
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
   const [historyCursor, setHistoryCursor] = useState<number | null>(null);
+  const [rankedMentions, setRankedMentions] = useState<MentionCandidateView[]>(EMPTY_MENTIONS);
+  const mentionReqSeqRef = useRef<number>(0);
 
   const activeMode: SessionMode = normalizePermissionMode(
     !isDraft && activeAgentMode ? activeAgentMode : draftMode,
@@ -240,10 +247,10 @@ export const OmniComposer = memo(function OmniComposer({
     const query = match[1];
     const tokenKey = `slash:${slashIndex}:${query}`;
     if (dismissedToken === tokenKey) return null;
-    const items = filterSlashCommands(query);
+    const items = filterSlashCommands(slashCommands, query);
     if (items.length === 0) return null;
     return { slashIndex, endIndex: safeOffset, query, tokenKey, items };
-  }, [draftText, cursorOffset, dismissedToken]);
+  }, [draftText, cursorOffset, dismissedToken, slashCommands]);
 
   const mentionTrigger = useMemo(() => {
     if (slashTrigger || !draftText.includes("@")) return null;
@@ -255,10 +262,33 @@ export const OmniComposer = memo(function OmniComposer({
     const query = match[1];
     const tokenKey = `at:${atIndex}:${query}`;
     if (dismissedToken === tokenKey) return null;
-    const items = buildMentionCandidates(query, workspaceFiles, gitFiles);
-    if (items.length === 0) return null;
-    return { atIndex, endIndex: safeOffset, query, tokenKey, items };
-  }, [slashTrigger, draftText, cursorOffset, dismissedToken, workspaceFiles, gitFiles]);
+    return { atIndex, endIndex: safeOffset, query, tokenKey };
+  }, [slashTrigger, draftText, cursorOffset, dismissedToken]);
+
+  useEffect(() => {
+    if (!mentionTrigger || !selectedHostId) {
+      mentionReqSeqRef.current += 1;
+      setRankedMentions(EMPTY_MENTIONS);
+      return;
+    }
+    const reqId = mentionReqSeqRef.current + 1;
+    mentionReqSeqRef.current = reqId;
+    const hostId = selectedHostId;
+    const cwd = selectedCwd || "~";
+    const query = mentionTrigger.query;
+    void orbitIpc
+      .rankMentionCandidates({ host_id: hostId, cwd, query, limit: 12 })
+      .then((items) => {
+        if (mentionReqSeqRef.current === reqId) {
+          setRankedMentions(items);
+        }
+      })
+      .catch(() => {
+        if (mentionReqSeqRef.current === reqId) {
+          setRankedMentions(EMPTY_MENTIONS);
+        }
+      });
+  }, [mentionTrigger, selectedHostId, selectedCwd, workspaceFiles, gitFiles]);
 
   const hasSubstantiveInput =
     draftText.trim().length > 0 ||
@@ -279,7 +309,7 @@ export const OmniComposer = memo(function OmniComposer({
     [isDraft, hasCurrentAgent, selectedHostId, selectedAgentId],
   );
 
-  const executeSlashCommand = (cmd: SlashCommandDef) => {
+  const executeSlashCommand = (cmd: SlashCommandView) => {
     const joined = slashTrigger
       ? collapseStrippedToken(
           draftText.slice(0, slashTrigger.slashIndex),
@@ -354,7 +384,7 @@ export const OmniComposer = memo(function OmniComposer({
     });
   };
 
-  const executeMentionSelect = (candidate: MentionCandidate) => {
+  const executeMentionSelect = (candidate: MentionCandidateView) => {
     if (!mentionTrigger) return;
     const beforeAt = draftText.slice(0, mentionTrigger.atIndex);
     const afterToken = draftText.slice(mentionTrigger.endIndex);
@@ -377,26 +407,30 @@ export const OmniComposer = memo(function OmniComposer({
     };
 
     if (candidate.kind === "file") {
-      const token = `@${candidate.basename}`;
+      const filePath = candidate.file_path || candidate.title;
+      const slashIdx = filePath.lastIndexOf("/");
+      const basename = slashIdx >= 0 ? filePath.slice(slashIdx + 1) : filePath;
+      const token = candidate.token_label || `@${basename}`;
       orbitActions.registerInlineMention({
         token,
         kind: "file",
-        path: candidate.path,
+        path: filePath,
       });
       insertInlineToken(token);
     } else if (candidate.kind === "git_diff") {
-      const token = candidate.staged ? "@staged-diff" : "@working-diff";
+      const staged = candidate.key.includes("staged");
+      const token = candidate.token_label || (staged ? "@staged-diff" : "@working-diff");
       orbitActions.registerInlineMention({
         token,
         kind: "git_diff",
-        staged: candidate.staged,
-        label: candidate.label,
+        staged,
+        label: candidate.title,
       });
       insertInlineToken(token);
     } else if (candidate.kind === "terminal_output") {
       const snap = orbitActions.captureActiveTerminalTail();
       if (snap) {
-        const token = "@terminal";
+        const token = candidate.token_label || "@terminal";
         orbitActions.registerInlineMention({
           token,
           kind: "terminal_output",
@@ -524,7 +558,13 @@ export const OmniComposer = memo(function OmniComposer({
       if (e.key === " ") {
         const exactCmd = slashTrigger.items.find(
           (c) =>
-            (c.id === "plan" || c.id === "review" || c.id === "compact") &&
+            (c.id === "plan" ||
+              c.id === "review" ||
+              c.id === "compact" ||
+              c.id === "orbit" ||
+              c.id === "orbit-handoff" ||
+              c.id === "orbit-committee" ||
+              c.id === "orbit-advisor") &&
             c.command.slice(1).toLowerCase() === slashTrigger.query.toLowerCase(),
         );
         if (exactCmd) {
@@ -551,8 +591,8 @@ export const OmniComposer = memo(function OmniComposer({
       return;
     }
 
-    if (mentionTrigger) {
-      const len = mentionTrigger.items.length;
+    if (mentionTrigger && rankedMentions.length > 0) {
+      const len = rankedMentions.length;
       const safeIdx = Math.min(menuHighlightIdx, len - 1);
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -566,7 +606,7 @@ export const OmniComposer = memo(function OmniComposer({
       }
       if (e.key === "Enter" || e.key === "Tab") {
         e.preventDefault();
-        executeMentionSelect(mentionTrigger.items[safeIdx]);
+        executeMentionSelect(rankedMentions[safeIdx]);
         return;
       }
       if (e.key === "Escape") {
@@ -653,7 +693,7 @@ export const OmniComposer = memo(function OmniComposer({
         variant === "docked" ? "shrink-0 px-[24px] pt-0 pb-4" : "px-0",
       )}
     >
-      <div className="mx-auto flex w-full max-w-[768px] flex-col gap-2">
+      <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] flex-col gap-2">
         <input
           ref={fileInputRef}
           type="file"
@@ -740,10 +780,10 @@ export const OmniComposer = memo(function OmniComposer({
             />
           )}
 
-          {mentionTrigger && (
+          {mentionTrigger && rankedMentions.length > 0 && (
             <MentionMenu
-              items={mentionTrigger.items}
-              activeIndex={Math.min(menuHighlightIdx, mentionTrigger.items.length - 1)}
+              items={rankedMentions}
+              activeIndex={Math.min(menuHighlightIdx, rankedMentions.length - 1)}
               onHoverIndex={setMenuHighlightIdx}
               onSelect={executeMentionSelect}
             />
@@ -782,6 +822,14 @@ export const OmniComposer = memo(function OmniComposer({
                     <ListTodo className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
                   ) : slashDirective === "review" ? (
                     <FileSearch className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
+                  ) : slashDirective === "orbit" ? (
+                    <Layers className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
+                  ) : slashDirective === "orbit-handoff" ? (
+                    <Send className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
+                  ) : slashDirective === "orbit-committee" ? (
+                    <Users className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
+                  ) : slashDirective === "orbit-advisor" ? (
+                    <Sparkles className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
                   ) : (
                     <FoldVertical className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
                   )}

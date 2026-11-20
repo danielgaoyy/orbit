@@ -6,27 +6,46 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use orbit_client_core::app_core::{
-    AgentCardView, AgentTimelineDeltaView, AgentTimelineView, ClientProjectView,
-    CoreEventSubscriber, CoreNotification, CreateAgentRequest, DirectoryListingView,
-    FleetOverviewView, GitReviewView, HostCardView, HostDetailView, OrbitAppCore,
-    StagedAttachmentView, TimelineItemView,
+    AgentCardView, AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest,
+    ClientProjectView, ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest,
+    DirectoryListingView, FleetOverviewView, GitReviewView, HostCardView, HostDetailView,
+    OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent, StagedAttachmentView,
+    TimelineItemView, WorkspaceFileView,
 };
 use orbit_client_core::catalog::{
-    default_effort_description as core_default_effort_description,
+    ResolvedModelSelectionView, default_effort_description as core_default_effort_description,
     fallback_provider_catalog as core_fallback_provider_catalog,
     format_catalog_model_label as core_format_catalog_model_label,
     format_effort_label as core_format_effort_label,
     resolve_supported_effort_for_model as core_resolve_supported_effort_for_model,
+};
+use orbit_client_core::composer::{
+    ClientPlatform, ComposePromptRequest, ComposedPromptView, ComposerContextInput,
+    ComposerPasteInput, ComposerQuoteInput, MentionCandidateView, SlashCommandView, SlashDirective,
+};
+use orbit_client_core::contract::{
+    AgentStageDeltaRequest, BridgeInfoView, CreateSessionRequest, FleetSidebarRequest,
+    MentionRankRequest, ModelSelectionRequest, ReadWorkspaceFileRequest, RenderDiagramRequest,
+    RenderDiagramView, RewindAgentRequest, SendPromptRequest, UpdateHostConfigRequest,
+};
+use orbit_client_core::diagram::{
+    DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
 };
 use orbit_client_core::render::{
     DiffFileView, DiffLineKind, DiffLineView, HighlightedLineView, HighlightedTokenView,
     InlineSpanView, RichBlockView, TableAlignmentView, TableCellView, TableRowView,
     TerminalRowView, TerminalScreenView, TerminalSpanView,
 };
+use orbit_client_core::sidebar::{
+    FleetSidebarView, LaunchpadProjectView, SidebarConversationView, SidebarProjectGroupView,
+    SidebarProjectSort, SidebarThreadFilter,
+};
 use orbit_client_core::stage::{
-    AgentStageView, StageTurnView, ToolStepDescriptorView, ToolStepKind, TurnFileDiffSummaryView,
-    TurnLiveSegmentView, TurnWorkCountsView, WorkSummaryResultView, describe_tool_detail,
-    extract_thinking_headline,
+    AgentStageDeltaView, AgentStageView, SessionBackgroundTaskKind, SessionBackgroundTaskStatus,
+    SessionBackgroundTaskView, SessionInsightsView, SessionSubagentEntryView,
+    SessionTouchedFileAction, SessionTouchedFileView, StageTurnView, ToolStepDescriptorView,
+    ToolStepKind, TurnCompactionItemView, TurnFileDiffSummaryView, TurnLiveSegmentView,
+    TurnWorkCountsView, WorkSummaryResultView, describe_tool_detail, extract_thinking_headline,
 };
 use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
@@ -574,6 +593,9 @@ pub struct FfiAgentCard {
     pub parent_agent_id: Option<String>,
     pub latest_seq: u64,
     pub updated_at_rfc3339: String,
+    pub is_pinned: bool,
+    pub seen_seq: u64,
+    pub is_unread: bool,
 }
 
 impl From<AgentCardView> for FfiAgentCard {
@@ -594,6 +616,9 @@ impl From<AgentCardView> for FfiAgentCard {
             parent_agent_id: v.parent_agent_id,
             latest_seq: v.latest_seq,
             updated_at_rfc3339: v.updated_at_rfc3339,
+            is_pinned: v.is_pinned,
+            seen_seq: v.seen_seq,
+            is_unread: v.is_unread,
         }
     }
 }
@@ -692,6 +717,7 @@ impl From<HostDetailView> for FfiHostDetail {
 pub struct FfiPromptBadge {
     pub kind: String,
     pub label: String,
+    pub path: Option<String>,
 }
 
 impl From<PromptBadge> for FfiPromptBadge {
@@ -699,6 +725,7 @@ impl From<PromptBadge> for FfiPromptBadge {
         Self {
             kind: v.kind,
             label: v.label,
+            path: v.path,
         }
     }
 }
@@ -708,6 +735,7 @@ impl From<FfiPromptBadge> for PromptBadge {
         Self {
             kind: v.kind,
             label: v.label,
+            path: v.path,
         }
     }
 }
@@ -1575,6 +1603,7 @@ pub struct FfiWorkSummaryResult {
     pub counts: FfiTurnWorkCounts,
     pub label: String,
     pub live_label: String,
+    pub live_detail: Option<String>,
     pub label_includes_failure: bool,
 }
 
@@ -1584,7 +1613,23 @@ impl From<WorkSummaryResultView> for FfiWorkSummaryResult {
             counts: v.counts.into(),
             label: v.label,
             live_label: v.live_label,
+            live_detail: v.live_detail,
             label_includes_failure: v.label_includes_failure,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiTurnCompactionItem {
+    pub seq: u64,
+    pub label: String,
+}
+
+impl From<TurnCompactionItemView> for FfiTurnCompactionItem {
+    fn from(v: TurnCompactionItemView) -> Self {
+        Self {
+            seq: v.seq,
+            label: v.label,
         }
     }
 }
@@ -1596,6 +1641,10 @@ pub enum FfiTurnLiveSegment {
         first_seq: u64,
         items: Vec<FfiTimelineItem>,
         summary: FfiWorkSummaryResult,
+        thought_duration_ms: Option<i64>,
+        work_duration_ms: Option<i64>,
+        started_at_ms: Option<i64>,
+        latest_activity_ms: Option<i64>,
         has_following_content: bool,
         has_running_step: bool,
     },
@@ -1611,6 +1660,10 @@ pub enum FfiTurnLiveSegment {
         key: String,
         label: String,
     },
+    Wakeup {
+        key: String,
+        label: String,
+    },
 }
 
 impl From<TurnLiveSegmentView> for FfiTurnLiveSegment {
@@ -1621,6 +1674,10 @@ impl From<TurnLiveSegmentView> for FfiTurnLiveSegment {
                 first_seq,
                 items,
                 summary,
+                thought_duration_ms,
+                work_duration_ms,
+                started_at_ms,
+                latest_activity_ms,
                 has_following_content,
                 has_running_step,
             } => Self::StepGroup {
@@ -1628,6 +1685,10 @@ impl From<TurnLiveSegmentView> for FfiTurnLiveSegment {
                 first_seq,
                 items: items.into_iter().map(Into::into).collect(),
                 summary: summary.into(),
+                thought_duration_ms,
+                work_duration_ms,
+                started_at_ms,
+                latest_activity_ms,
                 has_following_content,
                 has_running_step,
             },
@@ -1640,6 +1701,7 @@ impl From<TurnLiveSegmentView> for FfiTurnLiveSegment {
                 item: item.into(),
             },
             TurnLiveSegmentView::Compaction { key, label } => Self::Compaction { key, label },
+            TurnLiveSegmentView::Wakeup { key, label } => Self::Wakeup { key, label },
         }
     }
 }
@@ -1650,16 +1712,21 @@ pub struct FfiStageTurn {
     pub turn_index: u32,
     pub anchor_seq: u64,
     pub user_prompt: Option<FfiTimelineItem>,
+    pub agent_message: Option<FfiTimelineItem>,
     pub is_compaction_command: bool,
     pub folded_steps: Vec<FfiTimelineItem>,
     pub work_counts: FfiTurnWorkCounts,
     pub work_summary_label: String,
     pub work_summary_live_label: String,
+    pub work_summary_live_detail: Option<String>,
     pub work_summary_includes_failure: bool,
     pub thought_duration_ms: Option<i64>,
+    pub work_duration_ms: Option<i64>,
     pub turn_duration_ms: Option<i64>,
     pub terminal_reply: Option<FfiTimelineItem>,
+    pub last_assistant_reply: Option<FfiTimelineItem>,
     pub notices: Vec<FfiTimelineItem>,
+    pub compactions: Vec<FfiTurnCompactionItem>,
     pub live_segments: Vec<FfiTurnLiveSegment>,
     pub turn_diffs: Vec<FfiTurnFileDiffSummary>,
     pub has_error: bool,
@@ -1676,16 +1743,21 @@ impl From<StageTurnView> for FfiStageTurn {
             turn_index: v.turn_index,
             anchor_seq: v.anchor_seq,
             user_prompt: v.user_prompt.map(Into::into),
+            agent_message: v.agent_message.map(Into::into),
             is_compaction_command: v.is_compaction_command,
             folded_steps: v.folded_steps.into_iter().map(Into::into).collect(),
             work_counts: v.work_counts.into(),
             work_summary_label: v.work_summary_label,
             work_summary_live_label: v.work_summary_live_label,
+            work_summary_live_detail: v.work_summary_live_detail,
             work_summary_includes_failure: v.work_summary_includes_failure,
             thought_duration_ms: v.thought_duration_ms,
+            work_duration_ms: v.work_duration_ms,
             turn_duration_ms: v.turn_duration_ms,
             terminal_reply: v.terminal_reply.map(Into::into),
+            last_assistant_reply: v.last_assistant_reply.map(Into::into),
             notices: v.notices.into_iter().map(Into::into).collect(),
+            compactions: v.compactions.into_iter().map(Into::into).collect(),
             live_segments: v.live_segments.into_iter().map(Into::into).collect(),
             turn_diffs: v.turn_diffs.into_iter().map(Into::into).collect(),
             has_error: v.has_error,
@@ -1693,6 +1765,147 @@ impl From<StageTurnView> for FfiStageTurn {
             has_active_item: v.has_active_item,
             started_at_ms: v.started_at_ms,
             completed_at_ms: v.completed_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSessionTouchedFileAction {
+    Created,
+    Edited,
+    Read,
+}
+
+impl From<SessionTouchedFileAction> for FfiSessionTouchedFileAction {
+    fn from(v: SessionTouchedFileAction) -> Self {
+        match v {
+            SessionTouchedFileAction::Created => Self::Created,
+            SessionTouchedFileAction::Edited => Self::Edited,
+            SessionTouchedFileAction::Read => Self::Read,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSessionTouchedFile {
+    pub path: String,
+    pub display_path: String,
+    pub action: FfiSessionTouchedFileAction,
+    pub additions: u32,
+    pub deletions: u32,
+    pub last_seq: u64,
+}
+
+impl From<SessionTouchedFileView> for FfiSessionTouchedFile {
+    fn from(v: SessionTouchedFileView) -> Self {
+        Self {
+            path: v.path,
+            display_path: v.display_path,
+            action: v.action.into(),
+            additions: v.additions,
+            deletions: v.deletions,
+            last_seq: v.last_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSessionBackgroundTaskKind {
+    Shell,
+    Wakeup,
+    Queued,
+}
+
+impl From<SessionBackgroundTaskKind> for FfiSessionBackgroundTaskKind {
+    fn from(v: SessionBackgroundTaskKind) -> Self {
+        match v {
+            SessionBackgroundTaskKind::Shell => Self::Shell,
+            SessionBackgroundTaskKind::Wakeup => Self::Wakeup,
+            SessionBackgroundTaskKind::Queued => Self::Queued,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSessionBackgroundTaskStatus {
+    Running,
+    Queued,
+}
+
+impl From<SessionBackgroundTaskStatus> for FfiSessionBackgroundTaskStatus {
+    fn from(v: SessionBackgroundTaskStatus) -> Self {
+        match v {
+            SessionBackgroundTaskStatus::Running => Self::Running,
+            SessionBackgroundTaskStatus::Queued => Self::Queued,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSessionBackgroundTask {
+    pub id: String,
+    pub kind: FfiSessionBackgroundTaskKind,
+    pub title: String,
+    pub subtitle: String,
+    pub status: FfiSessionBackgroundTaskStatus,
+    pub started_at_ms: Option<i64>,
+    pub command: Option<String>,
+    pub output_preview: Option<String>,
+}
+
+impl From<SessionBackgroundTaskView> for FfiSessionBackgroundTask {
+    fn from(v: SessionBackgroundTaskView) -> Self {
+        Self {
+            id: v.id,
+            kind: v.kind.into(),
+            title: v.title,
+            subtitle: v.subtitle,
+            status: v.status.into(),
+            started_at_ms: v.started_at_ms,
+            command: v.command,
+            output_preview: v.output_preview,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSessionSubagentEntry {
+    pub id: String,
+    pub role: String,
+    pub prompt_preview: String,
+    pub status: FfiToolStatus,
+    pub child_agent_id: Option<String>,
+    pub last_seq: u64,
+}
+
+impl From<SessionSubagentEntryView> for FfiSessionSubagentEntry {
+    fn from(v: SessionSubagentEntryView) -> Self {
+        Self {
+            id: v.id,
+            role: v.role,
+            prompt_preview: v.prompt_preview,
+            status: v.status.into(),
+            child_agent_id: v.child_agent_id,
+            last_seq: v.last_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSessionInsights {
+    pub touched_files: Vec<FfiSessionTouchedFile>,
+    pub background_tasks: Vec<FfiSessionBackgroundTask>,
+    pub subagents: Vec<FfiSessionSubagentEntry>,
+    pub detected_local_urls: Vec<String>,
+}
+
+impl From<SessionInsightsView> for FfiSessionInsights {
+    fn from(v: SessionInsightsView) -> Self {
+        Self {
+            touched_files: v.touched_files.into_iter().map(Into::into).collect(),
+            background_tasks: v.background_tasks.into_iter().map(Into::into).collect(),
+            subagents: v.subagents.into_iter().map(Into::into).collect(),
+            detected_local_urls: v.detected_local_urls,
         }
     }
 }
@@ -1706,6 +1919,7 @@ pub struct FfiAgentStage {
     pub pending_permissions: Vec<FfiTimelineItem>,
     pub pending_questions: Vec<FfiTimelineItem>,
     pub session_turn_diffs: Vec<FfiDiffFile>,
+    pub insights: FfiSessionInsights,
     pub latest_seq: u64,
 }
 
@@ -1719,7 +1933,892 @@ impl From<AgentStageView> for FfiAgentStage {
             pending_permissions: v.pending_permissions.into_iter().map(Into::into).collect(),
             pending_questions: v.pending_questions.into_iter().map(Into::into).collect(),
             session_turn_diffs: v.session_turn_diffs.into_iter().map(Into::into).collect(),
+            insights: v.insights.into(),
             latest_seq: v.latest_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAgentStageDelta {
+    pub revision: u64,
+    pub host_id: String,
+    pub agent: Option<FfiAgentCard>,
+    pub replace_from_turn_index: u32,
+    pub changed_turns: Vec<FfiStageTurn>,
+    pub total_turn_count: u32,
+    pub pending_permissions: Vec<FfiTimelineItem>,
+    pub pending_questions: Vec<FfiTimelineItem>,
+    pub session_turn_diffs: Vec<FfiDiffFile>,
+    pub insights: FfiSessionInsights,
+    pub latest_seq: u64,
+    pub reset: bool,
+}
+
+impl From<AgentStageDeltaView> for FfiAgentStageDelta {
+    fn from(v: AgentStageDeltaView) -> Self {
+        Self {
+            revision: v.revision,
+            host_id: v.host_id,
+            agent: v.agent.map(Into::into),
+            replace_from_turn_index: v.replace_from_turn_index,
+            changed_turns: v.changed_turns.into_iter().map(Into::into).collect(),
+            total_turn_count: v.total_turn_count,
+            pending_permissions: v.pending_permissions.into_iter().map(Into::into).collect(),
+            pending_questions: v.pending_questions.into_iter().map(Into::into).collect(),
+            session_turn_diffs: v.session_turn_diffs.into_iter().map(Into::into).collect(),
+            insights: v.insights.into(),
+            latest_seq: v.latest_seq,
+            reset: v.reset,
+        }
+    }
+}
+
+// --- Unified Fleet Sidebar, Thread Prefs & Cross-Platform RPC FFI Types ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSidebarProjectSort {
+    Recent,
+    Alphabetical,
+}
+
+impl From<FfiSidebarProjectSort> for SidebarProjectSort {
+    fn from(v: FfiSidebarProjectSort) -> Self {
+        match v {
+            FfiSidebarProjectSort::Recent => Self::Recent,
+            FfiSidebarProjectSort::Alphabetical => Self::Alphabetical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSidebarThreadFilter {
+    All,
+    ActiveUnread,
+}
+
+impl From<FfiSidebarThreadFilter> for SidebarThreadFilter {
+    fn from(v: FfiSidebarThreadFilter) -> Self {
+        match v {
+            FfiSidebarThreadFilter::All => Self::All,
+            FfiSidebarThreadFilter::ActiveUnread => Self::ActiveUnread,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSidebarConversation {
+    pub host_id: String,
+    pub agent: FfiAgentCard,
+    pub is_worktree: bool,
+    pub is_pinned: bool,
+    pub is_unread: bool,
+    pub seen_seq: u64,
+}
+
+impl From<SidebarConversationView> for FfiSidebarConversation {
+    fn from(v: SidebarConversationView) -> Self {
+        Self {
+            host_id: v.host_id,
+            agent: v.agent.into(),
+            is_worktree: v.is_worktree,
+            is_pinned: v.is_pinned,
+            is_unread: v.is_unread,
+            seen_seq: v.seen_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSidebarProjectGroup {
+    pub id: String,
+    pub host_id: String,
+    pub name: String,
+    pub primary_cwd: String,
+    pub directories: Vec<String>,
+    pub git_branch: Option<String>,
+    pub pinned_project_id: Option<String>,
+    pub is_home_workspace: bool,
+    pub sort_weight_ms: i64,
+    pub conversations: Vec<FfiSidebarConversation>,
+}
+
+impl From<SidebarProjectGroupView> for FfiSidebarProjectGroup {
+    fn from(v: SidebarProjectGroupView) -> Self {
+        Self {
+            id: v.id,
+            host_id: v.host_id,
+            name: v.name,
+            primary_cwd: v.primary_cwd,
+            directories: v.directories,
+            git_branch: v.git_branch,
+            pinned_project_id: v.pinned_project_id,
+            is_home_workspace: v.is_home_workspace,
+            sort_weight_ms: v.sort_weight_ms,
+            conversations: v.conversations.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiLaunchpadProject {
+    pub id: String,
+    pub host_id: String,
+    pub name: String,
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+impl From<LaunchpadProjectView> for FfiLaunchpadProject {
+    fn from(v: LaunchpadProjectView) -> Self {
+        Self {
+            id: v.id,
+            host_id: v.host_id,
+            name: v.name,
+            path: v.path,
+            branch: v.branch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiFleetSidebar {
+    pub revision: u64,
+    pub projects: Vec<FfiSidebarProjectGroup>,
+    pub launchpad_projects: Vec<FfiLaunchpadProject>,
+    pub needs_attention: Vec<FfiSidebarConversation>,
+    pub pinned_conversations: Vec<FfiSidebarConversation>,
+}
+
+impl From<FleetSidebarView> for FfiFleetSidebar {
+    fn from(v: FleetSidebarView) -> Self {
+        Self {
+            revision: v.revision,
+            projects: v.projects.into_iter().map(Into::into).collect(),
+            launchpad_projects: v.launchpad_projects.into_iter().map(Into::into).collect(),
+            needs_attention: v.needs_attention.into_iter().map(Into::into).collect(),
+            pinned_conversations: v.pinned_conversations.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiThreadPrefSeed {
+    pub host_id: String,
+    pub agent_id: String,
+    pub seen_seq: u64,
+    pub is_pinned: bool,
+    pub pinned_order: i64,
+    pub updated_at_ms: i64,
+}
+
+impl From<FfiThreadPrefSeed> for ClientThreadPref {
+    fn from(v: FfiThreadPrefSeed) -> Self {
+        Self {
+            host_id: v.host_id,
+            agent_id: v.agent_id,
+            seen_seq: v.seen_seq,
+            is_pinned: v.is_pinned,
+            pinned_order: v.pinned_order,
+            updated_at_ms: v.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRewindAgentResult {
+    pub agent: FfiAgentCard,
+    pub restored_files: u32,
+    pub restored_prompt: Option<String>,
+    pub notice: Option<String>,
+}
+
+impl From<RewindAgentResultView> for FfiRewindAgentResult {
+    fn from(v: RewindAgentResultView) -> Self {
+        Self {
+            agent: v.agent.into(),
+            restored_files: v.restored_files,
+            restored_prompt: v.restored_prompt,
+            notice: v.notice,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceFile {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub resolved_path: String,
+    pub language: String,
+    pub content_kind: String,
+    pub mime_type: Option<String>,
+    pub content: String,
+    pub size_bytes: u64,
+    pub truncated: bool,
+    pub highlighted_lines: Vec<FfiHighlightedLine>,
+    pub markdown_blocks: Vec<FfiRichBlock>,
+}
+
+impl From<WorkspaceFileView> for FfiWorkspaceFile {
+    fn from(v: WorkspaceFileView) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
+            resolved_path: v.resolved_path,
+            language: v.language,
+            content_kind: v.content_kind,
+            mime_type: v.mime_type,
+            content: v.content,
+            size_bytes: v.size_bytes,
+            truncated: v.truncated,
+            highlighted_lines: v.highlighted_lines.into_iter().map(Into::into).collect(),
+            markdown_blocks: v.markdown_blocks.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiDiagramKind {
+    Mermaid,
+    Svg,
+    Graphviz,
+}
+
+impl From<DiagramKind> for FfiDiagramKind {
+    fn from(v: DiagramKind) -> Self {
+        match v {
+            DiagramKind::Mermaid => Self::Mermaid,
+            DiagramKind::Svg => Self::Svg,
+            DiagramKind::Graphviz => Self::Graphviz,
+        }
+    }
+}
+
+impl From<FfiDiagramKind> for DiagramKind {
+    fn from(v: FfiDiagramKind) -> Self {
+        match v {
+            FfiDiagramKind::Mermaid => Self::Mermaid,
+            FfiDiagramKind::Svg => Self::Svg,
+            FfiDiagramKind::Graphviz => Self::Graphviz,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiDiagramTheme {
+    Light,
+    Dark,
+}
+
+impl From<DiagramTheme> for FfiDiagramTheme {
+    fn from(v: DiagramTheme) -> Self {
+        match v {
+            DiagramTheme::Light => Self::Light,
+            DiagramTheme::Dark => Self::Dark,
+        }
+    }
+}
+
+impl From<FfiDiagramTheme> for DiagramTheme {
+    fn from(v: FfiDiagramTheme) -> Self {
+        match v {
+            FfiDiagramTheme::Light => Self::Light,
+            FfiDiagramTheme::Dark => Self::Dark,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRenderDiagramRequest {
+    pub kind: FfiDiagramKind,
+    pub source: String,
+    pub theme: FfiDiagramTheme,
+}
+
+impl From<FfiRenderDiagramRequest> for RenderDiagramRequest {
+    fn from(v: FfiRenderDiagramRequest) -> Self {
+        Self {
+            kind: v.kind.into(),
+            source: v.source,
+            theme: v.theme.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRenderDiagramView {
+    pub kind: FfiDiagramKind,
+    pub theme: FfiDiagramTheme,
+    pub svg: Option<String>,
+    pub width: f32,
+    pub height: f32,
+    pub error: Option<String>,
+    pub diagram_type_label: Option<String>,
+}
+
+impl From<RenderDiagramView> for FfiRenderDiagramView {
+    fn from(v: RenderDiagramView) -> Self {
+        Self {
+            kind: v.kind.into(),
+            theme: v.theme.into(),
+            svg: v.svg,
+            width: v.width,
+            height: v.height,
+            error: v.error,
+            diagram_type_label: v.diagram_type_label,
+        }
+    }
+}
+
+#[uniffi::export]
+pub fn detect_diagram_kind(language: String, source: String) -> Option<FfiDiagramKind> {
+    core_detect_diagram_kind(&language, &source).map(Into::into)
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAskSideQuestionRequest {
+    pub host_id: String,
+    pub agent_id: Option<String>,
+    pub cwd: String,
+    pub provider: FfiProviderKind,
+    pub model: Option<String>,
+    pub question: String,
+    pub context_summary: String,
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiSideQuestionEvent {
+    Delta {
+        request_id: String,
+        text_delta: String,
+    },
+    Done {
+        request_id: String,
+        full_text: String,
+        error: Option<String>,
+    },
+}
+
+impl From<SideQuestionStreamEvent> for FfiSideQuestionEvent {
+    fn from(v: SideQuestionStreamEvent) -> Self {
+        match v {
+            SideQuestionStreamEvent::Delta {
+                request_id,
+                text_delta,
+            } => Self::Delta {
+                request_id,
+                text_delta,
+            },
+            SideQuestionStreamEvent::Done {
+                request_id,
+                full_text,
+                error,
+            } => Self::Done {
+                request_id,
+                full_text,
+                error,
+            },
+        }
+    }
+}
+
+#[uniffi::export(with_foreign)]
+pub trait SideQuestionListener: Send + Sync {
+    fn on_side_question_event(&self, event: FfiSideQuestionEvent);
+}
+
+// --- Client Bridge Protocol v2 Canonical Records & Requests ---
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiBridgeInfo {
+    pub protocol_version: u32,
+    pub core_version: String,
+    pub capabilities: Vec<String>,
+}
+
+impl From<BridgeInfoView> for FfiBridgeInfo {
+    fn from(v: BridgeInfoView) -> Self {
+        Self {
+            protocol_version: v.protocol_version,
+            core_version: v.core_version,
+            capabilities: v.capabilities,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiClientPlatform {
+    Desktop,
+    Ios,
+    Android,
+    Harmony,
+}
+
+impl From<FfiClientPlatform> for ClientPlatform {
+    fn from(v: FfiClientPlatform) -> Self {
+        match v {
+            FfiClientPlatform::Desktop => Self::Desktop,
+            FfiClientPlatform::Ios => Self::Ios,
+            FfiClientPlatform::Android => Self::Android,
+            FfiClientPlatform::Harmony => Self::Harmony,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSlashDirective {
+    Plan,
+    Review,
+    Compact,
+    Orbit,
+    OrbitHandoff,
+    OrbitCommittee,
+    OrbitAdvisor,
+}
+
+impl From<SlashDirective> for FfiSlashDirective {
+    fn from(v: SlashDirective) -> Self {
+        match v {
+            SlashDirective::Plan => Self::Plan,
+            SlashDirective::Review => Self::Review,
+            SlashDirective::Compact => Self::Compact,
+            SlashDirective::Orbit => Self::Orbit,
+            SlashDirective::OrbitHandoff => Self::OrbitHandoff,
+            SlashDirective::OrbitCommittee => Self::OrbitCommittee,
+            SlashDirective::OrbitAdvisor => Self::OrbitAdvisor,
+        }
+    }
+}
+
+impl From<FfiSlashDirective> for SlashDirective {
+    fn from(v: FfiSlashDirective) -> Self {
+        match v {
+            FfiSlashDirective::Plan => Self::Plan,
+            FfiSlashDirective::Review => Self::Review,
+            FfiSlashDirective::Compact => Self::Compact,
+            FfiSlashDirective::Orbit => Self::Orbit,
+            FfiSlashDirective::OrbitHandoff => Self::OrbitHandoff,
+            FfiSlashDirective::OrbitCommittee => Self::OrbitCommittee,
+            FfiSlashDirective::OrbitAdvisor => Self::OrbitAdvisor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSlashCommand {
+    pub id: String,
+    pub command: String,
+    pub label: String,
+    pub description: String,
+    pub shortcut_key: Option<String>,
+    pub icon_key: String,
+    pub keywords: Vec<String>,
+    pub desktop_only: bool,
+}
+
+impl From<SlashCommandView> for FfiSlashCommand {
+    fn from(v: SlashCommandView) -> Self {
+        Self {
+            id: v.id,
+            command: v.command,
+            label: v.label,
+            description: v.description,
+            shortcut_key: v.shortcut_key,
+            icon_key: v.icon_key,
+            keywords: v.keywords,
+            desktop_only: v.desktop_only,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiComposerContextInput {
+    Image {
+        path: String,
+        filename: String,
+    },
+    StagedFile {
+        path: String,
+        filename: String,
+    },
+    WorkspaceFile {
+        path: String,
+    },
+    GitDiff {
+        staged: bool,
+        label: String,
+        diff_text: Option<String>,
+    },
+    TerminalOutput {
+        label: String,
+        content: String,
+    },
+    AssistantQuote {
+        label: String,
+        content: String,
+    },
+}
+
+impl From<FfiComposerContextInput> for ComposerContextInput {
+    fn from(v: FfiComposerContextInput) -> Self {
+        match v {
+            FfiComposerContextInput::Image { path, filename } => Self::Image { path, filename },
+            FfiComposerContextInput::StagedFile { path, filename } => {
+                Self::StagedFile { path, filename }
+            }
+            FfiComposerContextInput::WorkspaceFile { path } => Self::WorkspaceFile { path },
+            FfiComposerContextInput::GitDiff {
+                staged,
+                label,
+                diff_text,
+            } => Self::GitDiff {
+                staged,
+                label,
+                diff_text,
+            },
+            FfiComposerContextInput::TerminalOutput { label, content } => {
+                Self::TerminalOutput { label, content }
+            }
+            FfiComposerContextInput::AssistantQuote { label, content } => {
+                Self::AssistantQuote { label, content }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiComposerQuoteInput {
+    pub path: String,
+    pub line_number: Option<u32>,
+    pub code: String,
+}
+
+impl From<FfiComposerQuoteInput> for ComposerQuoteInput {
+    fn from(v: FfiComposerQuoteInput) -> Self {
+        Self {
+            path: v.path,
+            line_number: v.line_number,
+            code: v.code,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiComposerPasteInput {
+    pub label: String,
+    pub filename: Option<String>,
+    pub content: String,
+}
+
+impl From<FfiComposerPasteInput> for ComposerPasteInput {
+    fn from(v: FfiComposerPasteInput) -> Self {
+        Self {
+            label: v.label,
+            filename: v.filename,
+            content: v.content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiComposePromptRequest {
+    pub provider: FfiProviderKind,
+    pub raw_text: String,
+    pub explicit_directive: Option<FfiSlashDirective>,
+    pub host_id: Option<String>,
+    pub cwd: Option<String>,
+    pub contexts: Vec<FfiComposerContextInput>,
+    pub quotes: Vec<FfiComposerQuoteInput>,
+    pub pastes: Vec<FfiComposerPasteInput>,
+}
+
+impl From<FfiComposePromptRequest> for ComposePromptRequest {
+    fn from(v: FfiComposePromptRequest) -> Self {
+        Self {
+            provider: v.provider.into(),
+            raw_text: v.raw_text,
+            explicit_directive: v.explicit_directive.map(Into::into),
+            host_id: v.host_id,
+            cwd: v.cwd,
+            contexts: v.contexts.into_iter().map(Into::into).collect(),
+            quotes: v.quotes.into_iter().map(Into::into).collect(),
+            pastes: v.pastes.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiComposedPrompt {
+    pub wire_prompt: String,
+    pub display_prompt: String,
+    pub badges: Vec<FfiPromptBadge>,
+    pub effective_directive: Option<FfiSlashDirective>,
+    pub is_compact: bool,
+    pub is_btw: bool,
+    pub btw_question: Option<String>,
+    pub is_empty: bool,
+}
+
+impl From<ComposedPromptView> for FfiComposedPrompt {
+    fn from(v: ComposedPromptView) -> Self {
+        Self {
+            wire_prompt: v.wire_prompt,
+            display_prompt: v.display_prompt,
+            badges: v.badges.into_iter().map(Into::into).collect(),
+            effective_directive: v.effective_directive.map(Into::into),
+            is_compact: v.is_compact,
+            is_btw: v.is_btw,
+            btw_question: v.btw_question,
+            is_empty: v.is_empty,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMentionCandidate {
+    pub key: String,
+    pub kind: String,
+    pub token_label: String,
+    pub title: String,
+    pub subtitle: String,
+    pub file_path: String,
+    pub git_status: String,
+    pub score: i32,
+}
+
+impl From<MentionCandidateView> for FfiMentionCandidate {
+    fn from(v: MentionCandidateView) -> Self {
+        Self {
+            key: v.key,
+            kind: v.kind,
+            token_label: v.token_label,
+            title: v.title,
+            subtitle: v.subtitle,
+            file_path: v.file_path,
+            git_status: v.git_status,
+            score: v.score,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiMentionRankRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub query: String,
+    pub limit: u32,
+}
+
+impl From<FfiMentionRankRequest> for MentionRankRequest {
+    fn from(v: FfiMentionRankRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            query: v.query,
+            limit: v.limit as usize,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiModelSelectionRequest {
+    pub host_id: Option<String>,
+    pub provider: FfiProviderKind,
+    pub desired_model: Option<String>,
+    pub desired_effort: Option<FfiReasoningEffort>,
+}
+
+impl From<FfiModelSelectionRequest> for ModelSelectionRequest {
+    fn from(v: FfiModelSelectionRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            provider: v.provider.into(),
+            desired_model: v.desired_model,
+            desired_effort: v.desired_effort.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiResolvedModelSelection {
+    pub provider: FfiProviderKind,
+    pub catalog: FfiProviderModelCatalog,
+    pub selected_model_id: Option<String>,
+    pub selected_model_label: String,
+    pub selected_effort: Option<FfiReasoningEffort>,
+    pub selected_effort_label: Option<String>,
+    pub thinking_options: Vec<FfiThinkingOptionSpec>,
+}
+
+impl From<ResolvedModelSelectionView> for FfiResolvedModelSelection {
+    fn from(v: ResolvedModelSelectionView) -> Self {
+        Self {
+            provider: v.provider.into(),
+            catalog: v.catalog.into(),
+            selected_model_id: v.selected_model_id,
+            selected_model_label: v.selected_model_label,
+            selected_effort: v.selected_effort.map(Into::into),
+            selected_effort_label: v.selected_effort_label,
+            thinking_options: v.thinking_options.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCreateSessionRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub extra_dirs: Vec<String>,
+    pub provider: FfiProviderKind,
+    pub model: Option<String>,
+    pub effort: Option<FfiReasoningEffort>,
+    pub mode: FfiSessionMode,
+    pub initial_prompt: String,
+    pub initial_display_prompt: Option<String>,
+    pub initial_badges: Vec<FfiPromptBadge>,
+    pub worktree_branch: Option<String>,
+}
+
+impl From<FfiCreateSessionRequest> for CreateSessionRequest {
+    fn from(v: FfiCreateSessionRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            extra_dirs: v.extra_dirs,
+            provider: v.provider.into(),
+            model: v.model,
+            effort: v.effort.map(Into::into),
+            mode: v.mode.into(),
+            initial_prompt: v.initial_prompt,
+            initial_display_prompt: v.initial_display_prompt,
+            initial_badges: v.initial_badges.into_iter().map(Into::into).collect(),
+            worktree_branch: v.worktree_branch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSendPromptRequest {
+    pub host_id: String,
+    pub agent_id: String,
+    pub prompt: String,
+    pub display_prompt: Option<String>,
+    pub badges: Vec<FfiPromptBadge>,
+}
+
+impl From<FfiSendPromptRequest> for SendPromptRequest {
+    fn from(v: FfiSendPromptRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            agent_id: v.agent_id,
+            prompt: v.prompt,
+            display_prompt: v.display_prompt,
+            badges: v.badges.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiUpdateHostConfigRequest {
+    pub host_id: String,
+    pub custom_name: Option<String>,
+    pub route_mode: Option<FfiHostRouteMode>,
+    pub ssh_alias: Option<String>,
+    pub remote_daemon_port: Option<u16>,
+    pub custom_direct_endpoint: Option<String>,
+    pub relay_url: Option<String>,
+    pub reconnect: bool,
+}
+
+impl From<FfiUpdateHostConfigRequest> for UpdateHostConfigRequest {
+    fn from(v: FfiUpdateHostConfigRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            custom_name: v.custom_name,
+            route_mode: v.route_mode.map(Into::into),
+            ssh_alias: v.ssh_alias,
+            remote_daemon_port: v.remote_daemon_port,
+            custom_direct_endpoint: v.custom_direct_endpoint,
+            relay_url: v.relay_url,
+            reconnect: v.reconnect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiFleetSidebarRequest {
+    pub sort: FfiSidebarProjectSort,
+    pub filter: FfiSidebarThreadFilter,
+    pub query: String,
+    pub active_host_id: Option<String>,
+    pub active_agent_id: Option<String>,
+    pub active_cwd: Option<String>,
+}
+
+impl From<FfiFleetSidebarRequest> for FleetSidebarRequest {
+    fn from(v: FfiFleetSidebarRequest) -> Self {
+        Self {
+            sort: v.sort.into(),
+            filter: v.filter.into(),
+            query: v.query,
+            active_host_id: v.active_host_id,
+            active_agent_id: v.active_agent_id,
+            active_cwd: v.active_cwd,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAgentStageDeltaRequest {
+    pub host_id: String,
+    pub agent_id: String,
+    pub since_revision: u64,
+}
+
+impl From<FfiAgentStageDeltaRequest> for AgentStageDeltaRequest {
+    fn from(v: FfiAgentStageDeltaRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            agent_id: v.agent_id,
+            since_revision: v.since_revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiRewindAgentRequest {
+    pub host_id: String,
+    pub agent_id: String,
+    pub to_before_seq: u64,
+    pub restore_files: bool,
+}
+
+impl From<FfiRewindAgentRequest> for RewindAgentRequest {
+    fn from(v: FfiRewindAgentRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            agent_id: v.agent_id,
+            to_before_seq: v.to_before_seq,
+            restore_files: v.restore_files,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiReadWorkspaceFileRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+impl From<FfiReadWorkspaceFileRequest> for ReadWorkspaceFileRequest {
+    fn from(v: FfiReadWorkspaceFileRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            cwd: v.cwd,
+            path: v.path,
         }
     }
 }
@@ -1872,6 +2971,15 @@ pub fn fallback_provider_catalog(provider: FfiProviderKind) -> FfiProviderModelC
 }
 
 #[uniffi::export]
+pub fn fallback_provider_catalogs() -> Vec<FfiProviderModelCatalog> {
+    vec![
+        core_fallback_provider_catalog(ProviderKind::Antigravity).into(),
+        core_fallback_provider_catalog(ProviderKind::Codex).into(),
+        core_fallback_provider_catalog(ProviderKind::ClaudeCode).into(),
+    ]
+}
+
+#[uniffi::export]
 pub fn format_effort_label(effort: FfiReasoningEffort) -> String {
     core_format_effort_label(effort.into()).to_string()
 }
@@ -1960,6 +3068,93 @@ impl OrbitMobileCore {
         self.inner.fleet_overview().into()
     }
 
+    pub fn bridge_info(&self) -> FfiBridgeInfo {
+        self.inner.bridge_info().into()
+    }
+
+    pub fn fleet_sidebar_request(&self, req: FfiFleetSidebarRequest) -> FfiFleetSidebar {
+        let core_req: FleetSidebarRequest = req.into();
+        self.inner.fleet_sidebar_by_request(&core_req).into()
+    }
+
+    pub fn agent_stage_delta_request(&self, req: FfiAgentStageDeltaRequest) -> FfiAgentStageDelta {
+        let core_req: AgentStageDeltaRequest = req.into();
+        self.inner.agent_stage_delta_by_request(&core_req).into()
+    }
+
+    pub fn create_session(&self, req: FfiCreateSessionRequest) -> String {
+        self.inner.create_session(req.into())
+    }
+
+    pub fn send_prompt_request(&self, req: FfiSendPromptRequest) {
+        self.inner.send_prompt_request(req.into());
+    }
+
+    pub fn update_host_config_request(
+        &self,
+        req: FfiUpdateHostConfigRequest,
+    ) -> Result<FfiHostCard, FfiOrbitError> {
+        self.inner
+            .update_host_config_request(req.into())
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn rewind_agent_request(
+        &self,
+        req: FfiRewindAgentRequest,
+    ) -> Result<FfiRewindAgentResult, FfiOrbitError> {
+        self.rewind_agent(
+            req.host_id,
+            req.agent_id,
+            req.to_before_seq,
+            req.restore_files,
+        )
+    }
+
+    pub fn read_workspace_file_request(
+        &self,
+        req: FfiReadWorkspaceFileRequest,
+    ) -> Result<FfiWorkspaceFile, FfiOrbitError> {
+        self.read_workspace_file(req.host_id, req.cwd, req.path)
+    }
+
+    pub fn resolve_model_selection(
+        &self,
+        req: FfiModelSelectionRequest,
+    ) -> FfiResolvedModelSelection {
+        let core_req: ModelSelectionRequest = req.into();
+        self.inner.resolve_model_selection(&core_req).into()
+    }
+
+    pub fn slash_commands(
+        &self,
+        platform: FfiClientPlatform,
+        query: Option<String>,
+    ) -> Vec<FfiSlashCommand> {
+        self.inner
+            .slash_commands(platform.into(), query.as_deref())
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn compose_prompt(&self, req: FfiComposePromptRequest) -> FfiComposedPrompt {
+        let core_req: ComposePromptRequest = req.into();
+        self.inner.compose_prompt_for_host(&core_req).into()
+    }
+
+    pub fn rank_mention_candidates(&self, req: FfiMentionRankRequest) -> Vec<FfiMentionCandidate> {
+        let core_req: MentionRankRequest = req.into();
+        self.inner
+            .rank_mention_candidates(&core_req)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
     pub fn host_detail(&self, host_id: String) -> Option<FfiHostDetail> {
         self.inner.host_detail(&host_id).map(Into::into)
     }
@@ -1981,6 +3176,68 @@ impl OrbitMobileCore {
 
     pub fn agent_stage(&self, host_id: String, agent_id: String) -> FfiAgentStage {
         self.inner.agent_stage(&host_id, &agent_id).into()
+    }
+
+    pub fn agent_stage_delta(
+        &self,
+        host_id: String,
+        agent_id: String,
+        since_revision: u64,
+    ) -> FfiAgentStageDelta {
+        self.inner
+            .agent_stage_delta(&host_id, &agent_id, since_revision)
+            .into()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fleet_sidebar(
+        &self,
+        sort: FfiSidebarProjectSort,
+        filter: FfiSidebarThreadFilter,
+        query: String,
+        active_host_id: Option<String>,
+        active_agent_id: Option<String>,
+        active_cwd: Option<String>,
+    ) -> FfiFleetSidebar {
+        self.inner
+            .fleet_sidebar(
+                sort.into(),
+                filter.into(),
+                &query,
+                active_host_id.as_deref(),
+                active_agent_id.as_deref(),
+                active_cwd.as_deref(),
+            )
+            .into()
+    }
+
+    pub fn mark_agent_seen(&self, host_id: String, agent_id: String, seq: u64) {
+        self.inner.mark_agent_seen(&host_id, &agent_id, seq);
+    }
+
+    pub fn mark_agent_unread(&self, host_id: String, agent_id: String) {
+        self.inner.mark_agent_unread(&host_id, &agent_id);
+    }
+
+    pub fn set_agent_pinned(&self, host_id: String, agent_id: String, pinned: bool) {
+        self.inner.set_agent_pinned(&host_id, &agent_id, pinned);
+    }
+
+    pub fn toggle_pin_agent(&self, host_id: String, agent_id: String) -> bool {
+        self.inner.toggle_pin_agent(&host_id, &agent_id)
+    }
+
+    pub fn seed_thread_prefs(&self, seeds: Vec<FfiThreadPrefSeed>) {
+        self.inner
+            .seed_thread_prefs(seeds.into_iter().map(Into::into).collect());
+    }
+
+    pub fn fallback_provider_catalogs(&self) -> Vec<FfiProviderModelCatalog> {
+        self.inner
+            .fallback_provider_catalogs()
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     pub fn describe_tool_item(
@@ -2022,6 +3279,12 @@ impl OrbitMobileCore {
 
     pub fn terminal_screen(&self, host_id: String) -> Option<FfiTerminalScreen> {
         self.inner.terminal_screen(&host_id).map(Into::into)
+    }
+
+    pub fn terminal_screen_slot(&self, host_id: String, slot: u8) -> Option<FfiTerminalScreen> {
+        self.inner
+            .terminal_screen_slot(&host_id, slot)
+            .map(Into::into)
     }
 
     pub fn pair_host(&self, pairing_uri: String) -> Result<FfiHostCard, FfiOrbitError> {
@@ -2314,12 +3577,90 @@ impl OrbitMobileCore {
         self.inner.send_terminal_input(&host_id, keys.into_bytes());
     }
 
+    pub fn send_terminal_keys_slot(&self, host_id: String, slot: u8, keys: String) {
+        self.inner
+            .send_terminal_input_slot(&host_id, slot, keys.into_bytes());
+    }
+
     pub fn send_terminal_bytes(&self, host_id: String, slot: u8, bytes: Vec<u8>) {
         self.inner.send_terminal_input_slot(&host_id, slot, bytes);
     }
 
     pub fn resize_terminal(&self, host_id: String, cols: u16, rows: u16) {
         self.inner.resize_terminal(&host_id, cols, rows);
+    }
+
+    pub fn resize_terminal_slot(&self, host_id: String, slot: u8, cols: u16, rows: u16) {
+        self.inner.resize_terminal_slot(&host_id, slot, cols, rows);
+    }
+
+    pub fn rewind_agent(
+        &self,
+        host_id: String,
+        agent_id: String,
+        to_before_seq: u64,
+        restore_files: bool,
+    ) -> Result<FfiRewindAgentResult, FfiOrbitError> {
+        self.inner
+            .rewind_agent_blocking(&host_id, &agent_id, to_before_seq, restore_files)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn read_workspace_file(
+        &self,
+        host_id: String,
+        cwd: String,
+        path: String,
+    ) -> Result<FfiWorkspaceFile, FfiOrbitError> {
+        self.inner
+            .read_workspace_file_blocking(&host_id, &cwd, &path)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn build_side_question_context(
+        &self,
+        host_id: String,
+        agent_id: String,
+        max_chars: Option<u32>,
+    ) -> String {
+        self.inner
+            .build_side_question_context(&host_id, &agent_id, max_chars.map(|v| v as usize))
+    }
+
+    pub fn ask_side_question(
+        &self,
+        req: FfiAskSideQuestionRequest,
+        listener: Arc<dyn SideQuestionListener>,
+    ) -> Result<String, FfiOrbitError> {
+        let context_summary = if req.context_summary.trim().is_empty() {
+            req.agent_id
+                .as_deref()
+                .map(|ag_id| {
+                    self.inner
+                        .build_side_question_context(&req.host_id, ag_id, Some(3000))
+                })
+                .unwrap_or_default()
+        } else {
+            req.context_summary
+        };
+        self.inner
+            .ask_side_question_with_callback(
+                AskSideQuestionRequest {
+                    host_id: req.host_id,
+                    agent_id: req.agent_id,
+                    cwd: req.cwd,
+                    provider: req.provider.into(),
+                    model: req.model,
+                    question: req.question,
+                    context_summary,
+                },
+                move |ev| {
+                    listener.on_side_question_event(ev.into());
+                },
+            )
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     pub fn on_app_foreground(&self) {
@@ -2332,6 +3673,10 @@ impl OrbitMobileCore {
 
     pub fn on_network_changed(&self) {
         self.inner.on_network_changed();
+    }
+
+    pub fn render_diagram(&self, req: FfiRenderDiagramRequest) -> FfiRenderDiagramView {
+        self.inner.render_diagram(req.into()).into()
     }
 }
 
@@ -2348,6 +3693,23 @@ mod tests {
             format_catalog_model_label(cat, Some("claude-opus-5-5".into())),
             "Opus 5.5"
         );
+        assert_eq!(core.fallback_provider_catalogs().len(), 3);
+
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = orbit_crypto::PairingOffer {
+            host_id: "host_1".into(),
+            hostname: "orbit-dev".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "secret".into(),
+        };
+        core.pair_host(offer.to_qr_uri().expect("uri"))
+            .expect("pair host");
+
+        let info = core.bridge_info();
+        assert_eq!(info.protocol_version, 2);
+        assert!(info.capabilities.contains(&"composer_v2".to_string()));
 
         let proj = core
             .upsert_project(
@@ -2359,6 +3721,97 @@ mod tests {
             .expect("upsert project");
         assert_eq!(proj.name, "orbit");
         assert_eq!(core.fleet_overview().projects.len(), 1);
+
+        let opt_id = core.create_session(FfiCreateSessionRequest {
+            host_id: "host_1".into(),
+            cwd: "/Users/jess/Code/orbit".into(),
+            extra_dirs: Vec::new(),
+            provider: FfiProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            mode: FfiSessionMode::Default,
+            initial_prompt: "Verify sidebar & stage delta".into(),
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch: None,
+        });
+        let delta0 = core.agent_stage_delta_request(FfiAgentStageDeltaRequest {
+            host_id: "host_1".into(),
+            agent_id: opt_id.clone(),
+            since_revision: 0,
+        });
+        assert_eq!(delta0.host_id, "host_1");
+        assert_eq!(delta0.total_turn_count, 1);
+
+        assert!(core.toggle_pin_agent("host_1".into(), "ag_seed".into()));
+        core.mark_agent_seen("host_1".into(), "ag_seed".into(), 5);
+        core.seed_thread_prefs(vec![FfiThreadPrefSeed {
+            host_id: "host_1".into(),
+            agent_id: "ag_seed_2".into(),
+            seen_seq: 9,
+            is_pinned: true,
+            pinned_order: 2,
+            updated_at_ms: 1000,
+        }]);
+
+        let sidebar = core.fleet_sidebar_request(FfiFleetSidebarRequest {
+            sort: FfiSidebarProjectSort::Recent,
+            filter: FfiSidebarThreadFilter::All,
+            query: String::new(),
+            active_host_id: Some("host_1".into()),
+            active_agent_id: Some(opt_id),
+            active_cwd: Some("/Users/jess/Code/orbit".into()),
+        });
+        assert_eq!(sidebar.projects.len(), 1);
+        assert!(!sidebar.launchpad_projects.is_empty());
+
+        let sel = core.resolve_model_selection(FfiModelSelectionRequest {
+            host_id: Some("host_1".into()),
+            provider: FfiProviderKind::ClaudeCode,
+            desired_model: Some("sonnet".into()),
+            desired_effort: None,
+        });
+        assert_eq!(sel.selected_model_id.as_deref(), Some("claude-opus-5-5"));
+
+        let cmds = core.slash_commands(FfiClientPlatform::Ios, None);
+        assert!(cmds.iter().any(|c| c.id == "btw"));
+        assert!(!cmds.iter().any(|c| c.id == "files"));
+
+        let composed = core.compose_prompt(FfiComposePromptRequest {
+            provider: FfiProviderKind::Codex,
+            raw_text: "/plan ship contract v2".into(),
+            explicit_directive: None,
+            host_id: Some("host_1".into()),
+            cwd: Some("/Users/jess/Code/orbit".into()),
+            contexts: Vec::new(),
+            quotes: Vec::new(),
+            pastes: Vec::new(),
+        });
+        assert!(
+            composed
+                .wire_prompt
+                .contains("<WORKFLOW_INSTRUCTION command=\"/plan\">")
+        );
+
+        let mentions = core.rank_mention_candidates(FfiMentionRankRequest {
+            host_id: "host_1".into(),
+            cwd: "/Users/jess/Code/orbit".into(),
+            query: "diff".into(),
+            limit: 10,
+        });
+        assert!(mentions.iter().any(|m| m.token_label == "@working-diff"));
+
+        assert_eq!(
+            detect_diagram_kind("mermaid".into(), "flowchart LR; A-->B".into()),
+            Some(FfiDiagramKind::Mermaid)
+        );
+        let diag = core.render_diagram(FfiRenderDiagramRequest {
+            kind: FfiDiagramKind::Mermaid,
+            source: "flowchart LR\n  A-->B".into(),
+            theme: FfiDiagramTheme::Dark,
+        });
+        assert!(diag.error.is_none());
+        assert!(diag.svg.as_deref().is_some_and(|s| s.contains("<svg")));
 
         core.on_app_background();
         core.on_app_foreground();

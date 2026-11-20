@@ -1,4 +1,4 @@
-import { OrbitSlashCommand, getOrbitSlashCommands } from '../../model/OrbitTypes';
+import { SlashCommandDto, slashCommandSymbol } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
 import {
   OrbitTokens,
@@ -19,8 +19,8 @@ export struct ContextPickerSheet {
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
   @Computed
-  get slashCommands(): OrbitSlashCommand[] {
-    return getOrbitSlashCommands();
+  get slashCommands(): SlashCommandDto[] {
+    return this.store.slashCommands;
   }
 
   @Computed
@@ -171,11 +171,11 @@ export struct ContextPickerSheet {
         ListItemGroup() {
           ForEach(
             this.slashCommands,
-            (cmd: OrbitSlashCommand) => {
+            (cmd: SlashCommandDto) => {
               ListItem() {
                 Button({ type: ButtonType.Normal, stateEffect: true }) {
                   Row({ space: OrbitTokens.SPACE_MD }) {
-                    SymbolGlyph(cmd.symbol)
+                    SymbolGlyph(slashCommandSymbol(cmd.id))
                       .fontSize(16)
                       .fontColor([this.store.palette.accentPrimary])
                     Column({ space: 2 }) {
@@ -208,7 +208,7 @@ export struct ContextPickerSheet {
                 })
               }
             },
-            (cmd: OrbitSlashCommand) => cmd.id
+            (cmd: SlashCommandDto) => cmd.id
           )
         }
         .backgroundColor(this.store.palette.listCard)

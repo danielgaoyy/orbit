@@ -9,9 +9,13 @@
 
 pub mod app_core;
 pub mod catalog;
+pub mod composer;
+pub mod contract;
 pub mod desktop_ops;
+pub mod diagram;
 pub mod logging;
 pub mod render;
+pub mod sidebar;
 pub mod stage;
 
 use std::collections::HashMap;

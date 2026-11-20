@@ -30,11 +30,11 @@
   /* Global Motion System Tokens (Critically Damped, Natural Deceleration) */
   --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
-  --ease-panel: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-panel: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-panel-out: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-exit: cubic-bezier(0.4, 0, 0.2, 1);
-  --duration-panel-in: 260ms;
-  --duration-panel-out: 225ms;
+  --duration-panel-in: 280ms;
+  --duration-panel-out: 240ms;
 }
 
 .dark {
@@ -143,9 +143,7 @@
   box-shadow:
     0 0 18px 0 oklch(0 0 0 / 3.4%),
     0 1px 4px 0 oklch(0 0 0 / 2%);
-  transition:
-    border-color 150ms cubic-bezier(0.16, 1, 0.3, 1),
-    box-shadow 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  transition: border-color 150ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .composer-surface:focus-within {
@@ -269,43 +267,45 @@
     0 0 8px 0 oklch(0 0 0 / 18%);
 }
 
-/* Hide native scrollbars strictly inside Base UI ScrollArea viewports */
-[data-slot="scroll-area-viewport"] {
-  scrollbar-width: none;
+/*
+ * Native Composited Scrollbars:
+ * - On macOS (html.orbit-mac), leave scrollbars untouched so WebKit uses 120Hz compositor-thread overlay NSScroller.
+ * - On non-macOS platforms, apply subtle standard CSS thin scrollbars without breaking compositor scrolling.
+ * - Settled heavy blocks keep CSS layout/style/paint containment so streaming tails never trigger full-subtree layout,
+ *   while avoiding `content-visibility: auto` blank-tile raster flashes during fast WKWebView flicks.
+ */
+html:not(.orbit-mac) .orbit-native-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: oklch(0 0 0 / 18%) transparent;
 }
 
-[data-slot="scroll-area-viewport"]::-webkit-scrollbar {
-  display: none;
+html:not(.orbit-mac).dark .orbit-native-scroll {
+  scrollbar-color: oklch(1 0 0 / 22%) transparent;
+}
+
+.orbit-heavy-block-settled {
+  contain: layout style paint;
 }
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
 }
 
-/* Subtle text shimmer for active running step labels */
-@keyframes orbit-text-shimmer {
-  0% {
-    background-position: 120% 50%;
-  }
+/* Subtle GPU opacity pulse for active running step labels */
+@keyframes orbit-status-pulse {
+  0%,
   100% {
-    background-position: -20% 50%;
+    opacity: 0.92;
+  }
+  50% {
+    opacity: 0.44;
   }
 }
 
 .agent-text-shimmer {
-  background-image: linear-gradient(
-    90deg,
-    color-mix(in oklab, var(--foreground) 56%, transparent) 0%,
-    color-mix(in oklab, var(--foreground) 56%, transparent) 36%,
-    var(--foreground) 50%,
-    color-mix(in oklab, var(--foreground) 56%, transparent) 64%,
-    color-mix(in oklab, var(--foreground) 56%, transparent) 100%
-  );
-  background-size: 220% 100%;
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  animation: orbit-text-shimmer 1.85s linear infinite;
+  color: var(--foreground);
+  will-change: opacity;
+  animation: orbit-status-pulse 1.8s ease-in-out infinite;
 }
 
 /* ============================================================================
@@ -313,47 +313,15 @@
  * ============================================================================ */
 
 /* Structural Shell Sidebars (Left Fleet Rail & Right Workspace Panel) */
-.orbit-panel-left[data-ready="true"]:not([data-resizing="true"]) {
-  will-change: margin-left, opacity;
-  transition:
-    margin-left var(--duration-panel-out) var(--ease-panel-out),
-    opacity 175ms var(--ease-exit);
+.orbit-panel-left,
+.orbit-panel-right {
+  transform: translateZ(0);
+  backface-visibility: hidden;
 }
 
-.orbit-panel-left[data-ready="true"][data-open="true"]:not([data-resizing="true"]) {
-  transition:
-    margin-left var(--duration-panel-in) var(--ease-panel),
-    opacity 210ms var(--ease-out-quart);
-}
-
-.orbit-panel-right[data-ready="true"]:not([data-resizing="true"]) {
-  will-change: margin-right, opacity;
-  transition:
-    margin-right var(--duration-panel-out) var(--ease-panel-out),
-    opacity 175ms var(--ease-exit);
-}
-
-.orbit-panel-right[data-ready="true"][data-open="true"]:not([data-resizing="true"]) {
-  transition:
-    margin-right var(--duration-panel-in) var(--ease-panel),
-    opacity 200ms var(--ease-out-quart);
-}
-
-.orbit-panel-right-inner {
-  transform: translate3d(0, 0, 0);
-}
-
-.orbit-panel-right-inner[data-open="false"] {
-  transform: translate3d(10px, 0, 0);
-}
-
-.orbit-panel-right-inner[data-ready="true"]:not([data-resizing="true"]) {
+.orbit-panel-left[data-animating="true"],
+.orbit-panel-right[data-animating="true"] {
   will-change: transform;
-  transition: transform var(--duration-panel-out) var(--ease-panel-out);
-}
-
-.orbit-panel-right-inner[data-ready="true"][data-open="true"]:not([data-resizing="true"]) {
-  transition: transform var(--duration-panel-in) var(--ease-panel);
 }
 
 @keyframes orbit-floating-in {

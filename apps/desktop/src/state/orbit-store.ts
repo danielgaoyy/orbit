@@ -1,23 +1,35 @@
 import { useSyncExternalStore } from "react";
 import {
+  normalizeLineRange,
+  normalizeWorkspacePathCandidate,
+  registerOrbitLinkOpener,
+  resolveUniqueWorkspaceFileSuffix,
+} from "@/lib/file-links";
+import {
+  recordRecentSentTurnImages,
+  seedPromptImagePreview,
+  type SentImagePreviewMeta,
+} from "@/lib/prompt-image-cache";
+import {
   getCatalogForProvider,
   resolveActiveModelSpec,
   resolveSupportedEffortForModel,
+  seedFallbackProviderCatalogs,
 } from "@/lib/model-catalog";
 import {
-  type UnifiedProjectEntry,
-  buildUnifiedProjects,
   isLocalHostCard,
   matchesProjectDirectory,
   projectPathScopeKey,
 } from "@/lib/projects";
 import {
-  type AgentCardView,
-  type AgentTimelineDeltaView,
+  type AgentStageView,
+  type ClientThreadPrefSeed,
+  type ComposerContextInput,
   type CoreNotification,
   type ExternalEditorInfo,
   type ExternalEditorKind,
   type FleetOverviewView,
+  type FleetSidebarView,
   type GitReviewView,
   type HostDetailView,
   type PromptBadge,
@@ -25,22 +37,16 @@ import {
   type ReasoningEffort,
   type RichBlockView,
   type SessionMode,
+  type SidebarProjectGroupView,
+  type SlashCommandView,
+  type SlashDirective,
   type SshHostItem,
-  type TimelineItemView,
   type WorkspaceFileView,
+  isMacDesktop,
   orbitIpc,
-  timelineItemLogicalKey,
 } from "@/lib/orbit-ipc";
-import { buildSideQuestionContextSummary } from "@/lib/session-insights";
 
-export type SlashDirective =
-  | "plan"
-  | "review"
-  | "compact"
-  | "orbit"
-  | "orbit-handoff"
-  | "orbit-committee"
-  | "orbit-advisor";
+export type { SlashDirective };
 
 export interface UndoArchiveEntry {
   hostId: string;
@@ -110,12 +116,6 @@ export type ContextMentionItem =
       uploading?: boolean;
     };
 
-export interface CachedTimelineEntry {
-  latestSeq: number;
-  agent: AgentCardView | null;
-  items: TimelineItemView[];
-}
-
 export interface TerminalTabSession {
   key: string;
   hostId: string;
@@ -142,6 +142,8 @@ export interface SidePanelTab {
   hostId?: string;
   cwd?: string;
   focusLine?: number | null;
+  focusEndLine?: number | null;
+  focusNonce?: number;
   url?: string;
   subagentCallId?: string;
   subagentRole?: string;
@@ -238,8 +240,10 @@ export interface OrbitUiState {
   workspaceFilesCache: Record<string, string[]>;
   promptHistory: string[];
 
-  // Incremental timelines keyed by `hostId::agentId`
-  timelines: Record<string, CachedTimelineEntry>;
+  // Incremental stage projections keyed by `hostId::agentId` + Rust sidebar tree + slash commands
+  stages: Record<string, AgentStageView>;
+  sidebarView: FleetSidebarView | null;
+  slashCommands: SlashCommandView[];
   rewoundSessions: Record<string, true>;
 
   // Unified Right Side Panel (Multi-Tab Workbench: Review, Open File, Files, Terminal, Browser, Side Question, Subagent)
@@ -251,6 +255,7 @@ export interface OrbitUiState {
   sideQuestionsByScope: Record<string, SideQuestionEntry[]>;
   sideQuestionDrafts: Record<string, string>;
   sideQuestionFocusNonce: number;
+  sidePanelLaunchpadFocusNonce: number;
 
   // Git & Review State (rendered inside Review tab)
   reviewScope: ReviewScope;
@@ -276,10 +281,8 @@ export interface OrbitUiState {
   collapsedHostIds: Record<string, boolean>;
   collapsedProjectIds: Record<string, boolean>;
   hiddenProjectKeys: Record<string, boolean>;
-  pinnedThreadKeys: string[];
   threadCustomTitles: Record<string, string>;
   archivedThreads: Record<string, ArchivedThreadEntry>;
-  seenAgentSeqs: Record<string, number>;
   sidebarProjectSort: SidebarProjectSort;
   sidebarThreadFilter: SidebarThreadFilter;
 
@@ -389,10 +392,8 @@ function writePrefsNow(snap: OrbitUiState): void {
       sidebarOpen: snap.sidebarDesktopOpenPref,
       sidebarWidth: snap.sidebarWidth,
       hiddenProjectKeys: snap.hiddenProjectKeys,
-      pinnedThreadKeys: snap.pinnedThreadKeys,
       threadCustomTitles: snap.threadCustomTitles,
       archivedThreads: snap.archivedThreads,
-      seenAgentSeqs: snap.seenAgentSeqs,
       sidebarProjectSort: snap.sidebarProjectSort,
       sidebarThreadFilter: snap.sidebarThreadFilter,
       sidePanelWidth: snap.sidePanelWidth,
@@ -457,6 +458,9 @@ const initialPrefs = loadPrefs();
 const initialTheme: ThemeMode = initialPrefs.theme ?? "system";
 const initialResolvedTheme: ResolvedTheme = resolveTheme(initialTheme);
 applyDocumentTheme(initialResolvedTheme);
+if (typeof document !== "undefined" && isMacDesktop()) {
+  document.documentElement.classList.add("orbit-mac");
+}
 
 if (typeof window !== "undefined" && window.matchMedia) {
   const mql = window.matchMedia("(prefers-color-scheme: dark)");
@@ -469,26 +473,7 @@ if (typeof window !== "undefined" && window.matchMedia) {
   });
 }
 
-const LEGACY_RETIRED_MODEL_SLUGS = new Set([
-  "gpt-5.4",
-  "gpt-5.3-codex",
-  "gpt-5.2-codex",
-  "gpt-5.4-mini",
-  "gemini-3.1-pro",
-  "gemini-3-flash",
-  "opusplan",
-  "opus",
-  "sonnet",
-  "haiku",
-]);
-
-function sanitizeSavedModel(slug: string | null | undefined): string | null {
-  if (!slug || LEGACY_RETIRED_MODEL_SLUGS.has(slug)) {
-    return null;
-  }
-  return slug;
-}
-
+const THREAD_PREF_MIGRATION_KEY = "orbit.desktop.prefs.migrated_v2";
 const COMPACT_VIEWPORT_COLLAPSE_PX = 800;
 const COMPACT_VIEWPORT_EXPAND_PX = 824;
 const DUAL_SIDEBAR_YIELD_PX = 1040;
@@ -511,9 +496,9 @@ let state: OrbitUiState = {
 
   draftProvider: initialPrefs.draftProvider ?? "codex",
   draftModels: {
-    claude_code: sanitizeSavedModel(initialPrefs.draftModels?.claude_code),
-    codex: sanitizeSavedModel(initialPrefs.draftModels?.codex),
-    antigravity: sanitizeSavedModel(initialPrefs.draftModels?.antigravity),
+    claude_code: initialPrefs.draftModels?.claude_code ?? null,
+    codex: initialPrefs.draftModels?.codex ?? null,
+    antigravity: initialPrefs.draftModels?.antigravity ?? null,
   },
   draftEffort: initialPrefs.draftEffort ?? "medium",
   draftMode:
@@ -534,7 +519,9 @@ let state: OrbitUiState = {
   workspaceFilesCache: {},
   promptHistory: initialPrefs.promptHistory ?? [],
 
-  timelines: {},
+  stages: {},
+  sidebarView: null,
+  slashCommands: [],
   rewoundSessions: {},
 
   sidePanelOpen: false,
@@ -545,6 +532,7 @@ let state: OrbitUiState = {
   sideQuestionsByScope: {},
   sideQuestionDrafts: {},
   sideQuestionFocusNonce: 0,
+  sidePanelLaunchpadFocusNonce: 0,
 
   reviewScope: "working_tree",
   diffStaged: false,
@@ -579,10 +567,8 @@ let state: OrbitUiState = {
   collapsedHostIds: {},
   collapsedProjectIds: {},
   hiddenProjectKeys: initialPrefs.hiddenProjectKeys ?? {},
-  pinnedThreadKeys: initialPrefs.pinnedThreadKeys ?? [],
   threadCustomTitles: initialPrefs.threadCustomTitles ?? {},
   archivedThreads: initialPrefs.archivedThreads ?? {},
-  seenAgentSeqs: initialPrefs.seenAgentSeqs ?? {},
   sidebarProjectSort: initialPrefs.sidebarProjectSort ?? "recent",
   sidebarThreadFilter: initialPrefs.sidebarThreadFilter ?? "all",
 
@@ -626,20 +612,29 @@ const composerDraftListeners = new Set<() => void>();
 const composerFocusListeners = new Set<() => void>();
 
 // Coalesced single-flight gates so daemon bursts never pile up overlapping IPC roundtrips or duplicate renders
-interface TimelinePullGate {
+interface StagePullGate {
   inFlight: boolean;
   queued: boolean;
   forceFull: boolean;
-  rafId: number | null;
 }
 interface SimpleSyncGate {
   inFlight: boolean;
   queued: boolean;
   rafId: number | null;
 }
-const timelinePullGates = new Map<string, TimelinePullGate>();
+const stagePullGates = new Map<string, StagePullGate>();
 const hostSyncGates = new Map<string, SimpleSyncGate>();
 const fleetSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
+const sidebarSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
+const lastReportedSeenSeq = new Map<string, number>();
+
+function markThreadSeenInCore(hostId: string, agentId: string, seq: number): void {
+  const key = threadScopeKey(hostId, agentId);
+  const prev = lastReportedSeenSeq.get(key) ?? -1;
+  if (seq <= prev) return;
+  lastReportedSeenSeq.set(key, seq);
+  void orbitIpc.markAgentSeen(hostId, agentId, seq);
+}
 
 function scheduleCoalescedGate(gate: SimpleSyncGate, run: () => Promise<void>): void {
   if (gate.inFlight) {
@@ -715,78 +710,6 @@ export function composerScopeKey(s: OrbitUiState): string {
   return `${s.selectedHostId ?? "none"}::${s.selectedAgentId}`;
 }
 
-function mergeTimelineDelta(
-  existing: CachedTimelineEntry | undefined,
-  delta: AgentTimelineDeltaView,
-  fullReset: boolean,
-): CachedTimelineEntry {
-  const baseItems = fullReset || !existing ? [] : [...existing.items];
-  const indexByKey = new Map<string, number>();
-  baseItems.forEach((it, idx) => {
-    indexByKey.set(timelineItemLogicalKey(it), idx);
-  });
-
-  // Apply newly resolved permission/question states onto historical items in O(n) only when present
-  const resolvedPermIds = Object.keys(delta.resolved_permissions);
-  const resolvedQuestIds = Object.keys(delta.resolved_questions);
-  if (resolvedPermIds.length > 0 || resolvedQuestIds.length > 0) {
-    for (let i = 0; i < baseItems.length; i += 1) {
-      const it = baseItems[i];
-      if (it.item_type === "permission_request" && delta.resolved_permissions[it.request_id]) {
-        baseItems[i] = {
-          ...it,
-          resolved_decision: delta.resolved_permissions[it.request_id],
-        };
-      } else if (it.item_type === "question_request" && delta.resolved_questions[it.request_id]) {
-        baseItems[i] = {
-          ...it,
-          resolved_answers: delta.resolved_questions[it.request_id],
-        };
-      }
-    }
-  }
-
-  for (const incoming of delta.upserted_items) {
-    const key = timelineItemLogicalKey(incoming);
-    const existingIdx = indexByKey.get(key);
-    let canUpdateInPlace = existingIdx !== undefined;
-
-    if (
-      canUpdateInPlace &&
-      existingIdx !== undefined &&
-      incoming.item_type !== "user_prompt" &&
-      incoming.item_type !== "agent_message" &&
-      incoming.seq > 0
-    ) {
-      // Never allow an assistant/tool update to overwrite an item belonging to an earlier turn
-      for (let j = existingIdx + 1; j < baseItems.length; j += 1) {
-        const between = baseItems[j];
-        if (
-          (between.item_type === "user_prompt" || between.item_type === "agent_message") &&
-          between.seq > 0 &&
-          between.seq < incoming.seq
-        ) {
-          canUpdateInPlace = false;
-          break;
-        }
-      }
-    }
-
-    if (canUpdateInPlace && existingIdx !== undefined) {
-      baseItems[existingIdx] = incoming;
-    } else {
-      indexByKey.set(key, baseItems.length);
-      baseItems.push(incoming);
-    }
-  }
-
-  return {
-    latestSeq: fullReset ? delta.latest_seq : Math.max(existing?.latestSeq ?? 0, delta.latest_seq),
-    agent: delta.agent ?? existing?.agent ?? null,
-    items: baseItems,
-  };
-}
-
 let initialized = false;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const notifiedApprovalAgents = new Set<string>();
@@ -854,89 +777,6 @@ function basenameFromPath(rawPath: string): string {
   return idx >= 0 ? clean.slice(idx + 1) : clean;
 }
 
-function parseLeadingSlashDirective(rawText: string): {
-  directive: SlashDirective | null;
-  rest: string;
-} {
-  const m = /^\/(plan|review|compact)(?:\s+([\s\S]*))?$/i.exec(rawText.trim());
-  if (!m) {
-    return { directive: null, rest: rawText.trim() };
-  }
-  return {
-    directive: m[1].toLowerCase() as SlashDirective,
-    rest: (m[2] ?? "").trim(),
-  };
-}
-
-function buildHiddenWorkflowInstruction(directive: SlashDirective): string {
-  switch (directive) {
-    case "plan":
-      return [
-        '<WORKFLOW_INSTRUCTION command="/plan">',
-        "You are invoked with the /plan workflow.",
-        "First inspect and verify the relevant codebase files, architecture, and constraints.",
-        "Clarify any critical ambiguities if needed, then present a concise, structured, step-by-step implementation plan.",
-        "Do NOT modify files or run mutating commands until the user approves the plan.",
-        "</WORKFLOW_INSTRUCTION>",
-      ].join("\n");
-    case "review":
-      return [
-        '<WORKFLOW_INSTRUCTION command="/review">',
-        "You are invoked with the /review workflow.",
-        "Perform a thorough engineering code review of the attached changes.",
-        "Focus on correctness bugs, regressions, edge cases, concurrency/state hazards, security, and adherence to project conventions.",
-        "Cite exact file paths and line numbers, prioritize findings by severity, and do NOT modify files unless asked.",
-        "</WORKFLOW_INSTRUCTION>",
-      ].join("\n");
-    case "compact":
-      return [
-        '<WORKFLOW_INSTRUCTION command="/compact">',
-        "Summarize and compact our conversation context into a concise, high-signal checkpoint:",
-        "1. Core goal & user preferences",
-        "2. Key architectural decisions & completed changes (with file paths)",
-        "3. Open issues & immediate next steps",
-        "</WORKFLOW_INSTRUCTION>",
-      ].join("\n");
-    case "orbit":
-      return [
-        '<WORKFLOW_INSTRUCTION command="/orbit">',
-        "You are using Orbit Multi-Agent Orchestration.",
-        "Use your built-in Orbit MCP tools (`list_profiles`, `list_hosts`, `create_workspace`, `create_agent`, `send_agent_prompt`, `get_agent_status`, `create_heartbeat`, `delete_heartbeat`) to coordinate specialist agents.",
-        "Always create isolated worktrees via `create_workspace(isolation='worktree')` for parallel edits, and rely on automatic finish notifications rather than polling loops.",
-        "</WORKFLOW_INSTRUCTION>",
-      ].join("\n");
-    case "orbit-handoff":
-      return [
-        '<WORKFLOW_INSTRUCTION command="/orbit-handoff">',
-        "Hand off this task cleanly to a specialist Orbit agent.",
-        "1. Call `list_profiles` to choose the best-fit specialist profile.",
-        "2. Create an isolated worktree if file edits are needed.",
-        "3. Spawn the specialist with `create_agent` using a concise, self-contained briefing (goal, exact file paths, constraints, acceptance criteria).",
-        "4. Rely on automatic finish notification unless the user explicitly asks to detach.",
-        "</WORKFLOW_INSTRUCTION>",
-      ].join("\n");
-    case "orbit-committee":
-      return [
-        '<WORKFLOW_INSTRUCTION command="/orbit-committee">',
-        "Run the Orbit Committee Planning & Cross-Provider Review workflow:",
-        "1. Call `list_profiles` and spawn 2 independent planning/architect agents from distinct model families in read-only/plan mode.",
-        "2. End your turn and wait for their automatic finish notifications.",
-        "3. Synthesize the strongest unified plan, then delegate implementation to a dedicated worktree agent.",
-        "4. After implementation finishes, spawn an independent reviewer agent from another model family to audit the diff before reporting final results.",
-        "</WORKFLOW_INSTRUCTION>",
-      ].join("\n");
-    case "orbit-advisor":
-      return [
-        '<WORKFLOW_INSTRUCTION command="/orbit-advisor">',
-        "Consult an independent read-only Advisor agent from a different model family.",
-        "1. Call `list_profiles` and spawn a `plan`-mode reviewer agent with the focused question, relevant file paths, and constraints.",
-        "2. Instruct the advisor NOT to edit any files.",
-        "3. Wait for its automatic finish notification and critically evaluate its feedback before replying.",
-        "</WORKFLOW_INSTRUCTION>",
-      ].join("\n");
-  }
-}
-
 async function drainPromptQueueIfIdle(hostId: string, detail: HostDetailView): Promise<void> {
   for (const ag of detail.agents) {
     const key = `${hostId}::${ag.agent_id}`;
@@ -992,21 +832,6 @@ function resolveSettingsSectionTarget(
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const inflightAttachmentUploads = new Map<string, Promise<void>>();
 
-function bytesToBase64(bytes: Uint8Array): string {
-  const CHUNK = 32 * 1024;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
-    binary += String.fromCharCode(...slice);
-  }
-  return btoa(binary);
-}
-
-async function fileToBase64(file: File): Promise<string> {
-  const buf = await file.arrayBuffer();
-  return bytesToBase64(new Uint8Array(buf));
-}
-
 function isLikelyTextFile(file: File, bytes: Uint8Array): boolean {
   if (file.size > 64 * 1024) return false;
   const mime = (file.type || "").toLowerCase();
@@ -1060,8 +885,12 @@ async function uploadContextAttachmentToHost(
 
   const task = (async () => {
     try {
-      const dataB64 = await fileToBase64(file);
-      const staged = await orbitIpc.stageHostAttachment(hostId, filename, dataB64);
+      const buf = await file.arrayBuffer();
+      const staged = await orbitIpc.stageHostAttachmentBytes(
+        hostId,
+        filename,
+        new Uint8Array(buf),
+      );
       updateContextMentionItem(scopeKey, itemId, (cur) => {
         if (cur.kind === "image") {
           return {
@@ -1113,19 +942,99 @@ export const orbitActions = {
     if (initialized) return;
     initialized = true;
 
-    const [editors, sshList, version] = await Promise.all([
+    const [editors, sshList, version, fallbackCatalogs, slashCommands] = await Promise.all([
       orbitIpc.listExternalEditors(),
       orbitIpc.listSshHosts(),
       orbitIpc.getAppVersion().catch(() => null),
+      orbitIpc.getFallbackProviderCatalogs().catch(() => []),
+      orbitIpc.getSlashCommands("desktop").catch(() => []),
     ]);
+    seedFallbackProviderCatalogs(fallbackCatalogs);
     setState((s) => ({
       ...s,
       externalEditors: editors,
       sshHosts: sshList,
       appVersion: version,
+      slashCommands,
     }));
 
+    // Sanitize persisted draft models against Rust catalog & retired-slug table
+    const providers: ProviderKind[] = ["claude_code", "codex", "antigravity"];
+    const sanitizedEntries = await Promise.all(
+      providers.map(async (provider) => {
+        const current = state.draftModels[provider] ?? null;
+        if (!current) return [provider, null] as const;
+        const resolved = await orbitIpc
+          .resolveModelSelection({
+            host_id: null,
+            provider,
+            desired_model: current,
+            desired_effort: state.draftEffort,
+          })
+          .catch(() => null);
+        return [provider, resolved ? resolved.selected_model_id : current] as const;
+      }),
+    );
+    const nextDraftModels = { ...state.draftModels };
+    let modelsChanged = false;
+    for (const [provider, nextModel] of sanitizedEntries) {
+      if (nextDraftModels[provider] !== nextModel) {
+        nextDraftModels[provider] = nextModel;
+        modelsChanged = true;
+      }
+    }
+    if (modelsChanged) {
+      setState((s) => ({ ...s, draftModels: nextDraftModels }), true);
+    }
+
+    // One-time migration of legacy localStorage pin/seen prefs into Rust SQLite
+    if (typeof window !== "undefined") {
+      try {
+        if (window.localStorage.getItem(THREAD_PREF_MIGRATION_KEY) !== "1") {
+          const seedsByKey = new Map<string, ClientThreadPrefSeed>();
+          const pinnedKeys = initialPrefs.pinnedThreadKeys ?? [];
+          const seenMap = initialPrefs.seenAgentSeqs ?? {};
+          const nowMs = Date.now();
+          pinnedKeys.forEach((rawKey, idx) => {
+            const sep = rawKey.indexOf("::");
+            if (sep <= 0) return;
+            const hostId = rawKey.slice(0, sep);
+            const agentId = rawKey.slice(sep + 2);
+            seedsByKey.set(rawKey, {
+              host_id: hostId,
+              agent_id: agentId,
+              seen_seq: seenMap[rawKey] ?? 0,
+              is_pinned: true,
+              pinned_order: idx + 1,
+              updated_at_ms: nowMs,
+            });
+          });
+          for (const [rawKey, seq] of Object.entries(seenMap)) {
+            if (seedsByKey.has(rawKey)) continue;
+            const sep = rawKey.indexOf("::");
+            if (sep <= 0) continue;
+            seedsByKey.set(rawKey, {
+              host_id: rawKey.slice(0, sep),
+              agent_id: rawKey.slice(sep + 2),
+              seen_seq: seq,
+              is_pinned: false,
+              pinned_order: 0,
+              updated_at_ms: nowMs,
+            });
+          }
+          if (seedsByKey.size > 0) {
+            await orbitIpc.seedThreadPrefs(Array.from(seedsByKey.values())).catch(() => undefined);
+          }
+          window.localStorage.setItem(THREAD_PREF_MIGRATION_KEY, "1");
+          scheduleSavePrefs();
+        }
+      } catch {
+        // Ignore storage access errors
+      }
+    }
+
     await orbitActions.reloadFleetAndHosts(true);
+    orbitActions.refreshSidebarView();
 
     await orbitIpc.subscribe((ev: CoreNotification) => {
       if (ev.kind === "fleet_changed") {
@@ -1139,34 +1048,13 @@ export const orbitActions = {
         const hostId = ev.host_id;
         scheduleCoalescedGate(gate, () => orbitActions.reloadHostDetail(hostId, true));
       } else if (ev.kind === "timeline_changed") {
-        // Only stream live timeline deltas for the actively viewed session;
-        // background sessions catch up cleanly from `latestSeq` when selected.
+        // Only stream live stage deltas for the actively viewed session (Rust already coalesces at 16ms).
         if (
           !state.isDraftNewSession &&
           ev.host_id === state.selectedHostId &&
           ev.agent_id === state.selectedAgentId
         ) {
-          const tlKey = `${ev.host_id}::${ev.agent_id}`;
-          let gate = timelinePullGates.get(tlKey);
-          if (!gate) {
-            gate = { inFlight: false, queued: false, forceFull: false, rafId: null };
-            timelinePullGates.set(tlKey, gate);
-          }
-          if (gate.inFlight) {
-            gate.queued = true;
-          } else if (gate.rafId === null) {
-            const hid = ev.host_id;
-            const aid = ev.agent_id;
-            if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-              gate.rafId = window.requestAnimationFrame(() => {
-                const curGate = timelinePullGates.get(tlKey);
-                if (curGate) curGate.rafId = null;
-                void orbitActions.pullTimelineDelta(hid, aid);
-              });
-            } else {
-              void orbitActions.pullTimelineDelta(hid, aid);
-            }
-          }
+          void orbitActions.pullStageDelta(ev.host_id, ev.agent_id);
         }
       } else if (ev.kind === "git_changed") {
         if (ev.host_id === state.selectedHostId && ev.cwd === state.selectedWorkspaceCwd) {
@@ -1192,6 +1080,20 @@ export const orbitActions = {
     });
   },
 
+  refreshSidebarView(): void {
+    scheduleCoalescedGate(sidebarSyncGate, async () => {
+      const view = await orbitIpc.getFleetSidebar({
+        sort: state.sidebarProjectSort,
+        filter: state.sidebarThreadFilter,
+        query: "",
+        active_host_id: state.selectedHostId,
+        active_agent_id: state.isDraftNewSession ? null : state.selectedAgentId,
+        active_cwd: state.selectedWorkspaceCwd || null,
+      });
+      setState((s) => ({ ...s, sidebarView: view }));
+    });
+  },
+
   async reloadFleetOnly(): Promise<void> {
     const snap = await orbitIpc.getFleetOverview();
     setState((s) => {
@@ -1203,6 +1105,7 @@ export const orbitActions = {
       };
     });
     syncAttentionIndicators(state.fleet, state.hostDetails);
+    orbitActions.refreshSidebarView();
   },
 
   setBrowserOffline(offline: boolean): void {
@@ -1277,19 +1180,6 @@ export const orbitActions = {
         }
       }
 
-      const nextSeenSeqs: Record<string, number> = { ...s.seenAgentSeqs };
-      for (const [hid, det] of Object.entries(nextDetails)) {
-        for (const ag of det.agents) {
-          const k = threadScopeKey(hid, ag.agent_id);
-          if (nextSeenSeqs[k] === undefined) {
-            nextSeenSeqs[k] = ag.latest_seq;
-          }
-          if (!nextDraft && hid === activeHostId && ag.agent_id === nextAgentId) {
-            nextSeenSeqs[k] = Math.max(nextSeenSeqs[k] ?? 0, ag.latest_seq);
-          }
-        }
-      }
-
       const activeAgent = activeDetail?.agents.find((a) => a.agent_id === nextAgentId);
       const nextCwd =
         activeAgent?.cwd ||
@@ -1311,11 +1201,11 @@ export const orbitActions = {
         selectedWorkspaceCwd: nextCwd,
         isDraftNewSession: nextDraft,
         draftProvider: nextDraftProvider,
-        seenAgentSeqs: nextSeenSeqs,
       };
     }, true);
 
     syncAttentionIndicators(state.fleet, state.hostDetails);
+    orbitActions.refreshSidebarView();
 
     if (state.selectedHostId) {
       if (initialBootstrap) {
@@ -1331,9 +1221,15 @@ export const orbitActions = {
       }
       if (state.selectedAgentId && !state.isDraftNewSession) {
         const tlKey = `${state.selectedHostId}::${state.selectedAgentId}`;
-        if (initialBootstrap || !state.timelines[tlKey]) {
+        const activeAg = state.hostDetails[state.selectedHostId]?.agents.find(
+          (a) => a.agent_id === state.selectedAgentId,
+        );
+        if (activeAg) {
+          markThreadSeenInCore(state.selectedHostId, state.selectedAgentId, activeAg.latest_seq);
+        }
+        if (initialBootstrap || !state.stages[tlKey]) {
           void orbitIpc.openAgentTimeline(state.selectedHostId, state.selectedAgentId);
-          void orbitActions.pullTimelineDelta(state.selectedHostId, state.selectedAgentId, true);
+          void orbitActions.pullStageDelta(state.selectedHostId, state.selectedAgentId, true);
         }
       }
     }
@@ -1345,7 +1241,6 @@ export const orbitActions = {
       : [await orbitIpc.getHostDetail(hostId), null];
     if (!detail) return;
 
-    const hadPrevDetail = Boolean(state.hostDetails[hostId]);
     const prevAgents = state.hostDetails[hostId]?.agents ?? [];
     const newestCreated =
       state.selectedHostId === hostId && state.isDraftNewSession
@@ -1369,7 +1264,9 @@ export const orbitActions = {
       }
     }
 
-    let seenMutated = false;
+    let viewedAgentLatestSeq: number | null = null;
+    let viewedAgentIdToMark: string | null = null;
+
     setState((s) => {
       const nextDetails = { ...s.hostDetails, [hostId]: detail };
       let nextAgentId = s.selectedAgentId;
@@ -1394,30 +1291,11 @@ export const orbitActions = {
         }
       }
 
-      let nextSeenSeqs = s.seenAgentSeqs;
-      for (const ag of detail.agents) {
-        const k = threadScopeKey(hostId, ag.agent_id);
-        const isCurrentlyViewing =
-          s.workspacePanel === "conversation" &&
-          !nextDraft &&
-          s.selectedHostId === hostId &&
-          nextAgentId === ag.agent_id;
-        if (isCurrentlyViewing) {
-          const prevSeen = nextSeenSeqs[k] ?? 0;
-          if (ag.latest_seq > prevSeen || nextSeenSeqs[k] === undefined) {
-            if (!seenMutated) {
-              nextSeenSeqs = { ...nextSeenSeqs };
-              seenMutated = true;
-            }
-            nextSeenSeqs[k] = Math.max(prevSeen, ag.latest_seq);
-          }
-        } else if (nextSeenSeqs[k] === undefined) {
-          if (!seenMutated) {
-            nextSeenSeqs = { ...nextSeenSeqs };
-            seenMutated = true;
-          }
-          // Seed pre-existing historical agents as seen on initial hydration; mark newly spawned background agents as unseen (`0`)
-          nextSeenSeqs[k] = hadPrevDetail ? 0 : ag.latest_seq;
+      if (s.workspacePanel === "conversation" && !nextDraft && s.selectedHostId === hostId && nextAgentId) {
+        const viewed = detail.agents.find((a) => a.agent_id === nextAgentId);
+        if (viewed) {
+          viewedAgentIdToMark = viewed.agent_id;
+          viewedAgentLatestSeq = viewed.latest_seq;
         }
       }
 
@@ -1465,29 +1343,29 @@ export const orbitActions = {
         draftProvider: nextDraftProvider,
         terminalTabs: nextTabs,
         activeTerminalTabKey: nextActiveTab,
-        seenAgentSeqs: nextSeenSeqs,
       };
-    }, seenMutated);
+    });
+
+    if (viewedAgentIdToMark !== null && viewedAgentLatestSeq !== null) {
+      markThreadSeenInCore(hostId, viewedAgentIdToMark, viewedAgentLatestSeq);
+    }
 
     syncAttentionIndicators(state.fleet, state.hostDetails);
+    orbitActions.refreshSidebarView();
     void drainPromptQueueIfIdle(hostId, detail);
 
     if (newestCreated) {
       void orbitIpc.openAgentTimeline(hostId, newestCreated.agent_id);
-      void orbitActions.pullTimelineDelta(hostId, newestCreated.agent_id, true);
+      void orbitActions.pullStageDelta(hostId, newestCreated.agent_id, true);
     }
   },
 
-  async pullTimelineDelta(hostId: string, agentId: string, forceFull = false): Promise<void> {
+  async pullStageDelta(hostId: string, agentId: string, forceFull = false): Promise<void> {
     const tlKey = `${hostId}::${agentId}`;
-    let gate = timelinePullGates.get(tlKey);
+    let gate = stagePullGates.get(tlKey);
     if (!gate) {
-      gate = { inFlight: false, queued: false, forceFull: false, rafId: null };
-      timelinePullGates.set(tlKey, gate);
-    }
-    if (gate.rafId !== null && typeof window !== "undefined") {
-      window.cancelAnimationFrame(gate.rafId);
-      gate.rafId = null;
+      gate = { inFlight: false, queued: false, forceFull: false };
+      stagePullGates.set(tlKey, gate);
     }
     if (gate.inFlight) {
       gate.queued = true;
@@ -1503,9 +1381,16 @@ export const orbitActions = {
         gate.queued = false;
         gate.forceFull = false;
 
-        const existing = state.timelines[tlKey];
-        const sinceSeq = nextForceFull || !existing ? 0 : existing.latestSeq;
-        const delta = await orbitIpc.getAgentTimelineDelta(hostId, agentId, sinceSeq);
+        const existing = state.stages[tlKey];
+        const sinceRevision = nextForceFull || !existing ? 0 : existing.revision;
+        const sinceAuxRevision =
+          nextForceFull || !existing ? null : (existing.aux_revision ?? null);
+        const delta = await orbitIpc.getAgentStageDelta(
+          hostId,
+          agentId,
+          sinceRevision,
+          sinceAuxRevision,
+        );
 
         const prevAgent = existing?.agent ?? null;
         const nextAgent = delta.agent;
@@ -1523,36 +1408,66 @@ export const orbitActions = {
             prevAgent.updated_at_rfc3339 !== nextAgent.updated_at_rfc3339 ||
             JSON.stringify(prevAgent.mode) !== JSON.stringify(nextAgent.mode));
 
-        const isReset = sinceSeq === 0 || Boolean(delta.reset);
+        const isReset = delta.reset || sinceRevision === 0 || !existing;
+        const auxChanged =
+          !delta.aux_unchanged &&
+          (delta.aux_revision ?? 0) !== (existing?.aux_revision ?? -1);
         const hasChanges =
           isReset ||
-          delta.upserted_items.length > 0 ||
-          Object.keys(delta.resolved_permissions).length > 0 ||
-          Object.keys(delta.resolved_questions).length > 0 ||
-          agentChanged;
+          delta.revision !== existing.revision ||
+          delta.changed_turns.length > 0 ||
+          agentChanged ||
+          auxChanged;
 
         if (hasChanges) {
+          let latestSeqToMark: number | null = null;
           setState((s) => {
-            const merged = mergeTimelineDelta(s.timelines[tlKey], delta, isReset);
+            const prev = s.stages[tlKey];
+            const resetTurns = delta.reset || sinceRevision === 0 || !prev;
+            const turns = resetTurns
+              ? delta.changed_turns
+              : [
+                  ...prev.turns.slice(0, delta.replace_from_turn_index),
+                  ...delta.changed_turns,
+                ];
+            const reusePrevAux = Boolean(delta.aux_unchanged && !resetTurns && prev);
+            const mergedStage: AgentStageView = {
+              revision: delta.revision,
+              host_id: delta.host_id,
+              agent: delta.agent ?? prev?.agent ?? null,
+              turns,
+              pending_permissions: reusePrevAux
+                ? prev.pending_permissions
+                : delta.pending_permissions,
+              pending_questions: reusePrevAux
+                ? prev.pending_questions
+                : delta.pending_questions,
+              session_turn_diffs: reusePrevAux
+                ? prev.session_turn_diffs
+                : delta.session_turn_diffs,
+              insights: reusePrevAux ? prev.insights : delta.insights,
+              latest_seq: delta.latest_seq,
+              aux_revision: delta.aux_revision ?? prev?.aux_revision ?? 0,
+            };
             const isViewing =
               s.workspacePanel === "conversation" &&
               !s.isDraftNewSession &&
               s.selectedHostId === hostId &&
               s.selectedAgentId === agentId;
-            const prevSeen = s.seenAgentSeqs[tlKey] ?? 0;
-            const nextSeenSeqs =
-              isViewing && (isReset || merged.latestSeq > prevSeen)
-                ? { ...s.seenAgentSeqs, [tlKey]: merged.latestSeq }
-                : s.seenAgentSeqs;
+            if (isViewing) {
+              latestSeqToMark = Math.max(mergedStage.latest_seq, mergedStage.agent?.latest_seq ?? 0);
+            }
             return {
               ...s,
-              timelines: {
-                ...s.timelines,
-                [tlKey]: merged,
+              stages: {
+                ...s.stages,
+                [tlKey]: mergedStage,
               },
-              seenAgentSeqs: nextSeenSeqs,
             };
           });
+          if (latestSeqToMark !== null) {
+            markThreadSeenInCore(hostId, agentId, latestSeqToMark);
+          }
         }
 
         if (!gate.queued) break;
@@ -1577,38 +1492,27 @@ export const orbitActions = {
     const avail = detail?.host.available_providers ?? [];
 
     setState(
-      (s) => {
-        const nextSeenSeqs = firstAgent
-          ? {
-              ...s.seenAgentSeqs,
-              [threadScopeKey(hostId, firstAgent.agent_id)]: Math.max(
-                s.seenAgentSeqs[threadScopeKey(hostId, firstAgent.agent_id)] ?? 0,
-                firstAgent.latest_seq,
-              ),
-            }
-          : s.seenAgentSeqs;
-        return {
-          ...s,
-          activeView: "workspace",
-          workspacePanel: "conversation",
-          selectedHostId: hostId,
-          selectedAgentId: firstAgent?.agent_id ?? null,
-          isDraftNewSession: firstAgent === null,
-          sessionScrollNonce: s.sessionScrollNonce + 1,
-          selectedWorkspaceCwd: nextCwd,
-          selectedDiffPath: null,
-          seenAgentSeqs: nextSeenSeqs,
-          draftProvider:
-            avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
-        };
-      },
-      Boolean(firstAgent),
+      (s) => ({
+        ...s,
+        activeView: "workspace",
+        workspacePanel: "conversation",
+        selectedHostId: hostId,
+        selectedAgentId: firstAgent?.agent_id ?? null,
+        isDraftNewSession: firstAgent === null,
+        sessionScrollNonce: s.sessionScrollNonce + 1,
+        selectedWorkspaceCwd: nextCwd,
+        selectedDiffPath: null,
+        draftProvider:
+          avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
+      }),
     );
 
+    orbitActions.refreshSidebarView();
     void orbitIpc.refreshQuotas(hostId);
     if (firstAgent) {
+      markThreadSeenInCore(hostId, firstAgent.agent_id, firstAgent.latest_seq);
       void orbitIpc.openAgentTimeline(hostId, firstAgent.agent_id);
-      void orbitActions.pullTimelineDelta(hostId, firstAgent.agent_id, false);
+      void orbitActions.pullStageDelta(hostId, firstAgent.agent_id, false);
     }
     if (nextCwd && nextCwd !== "~") {
       void orbitActions.refreshGit(hostId, nextCwd, null, state.diffStaged);
@@ -1620,14 +1524,10 @@ export const orbitActions = {
     const ag = detail?.agents.find((a) => a.agent_id === agentId);
     const nextCwd = ag?.cwd ?? state.selectedWorkspaceCwd;
     const tKey = threadScopeKey(hostId, agentId);
+    const seenSeq = Math.max(ag?.latest_seq ?? 0, state.stages[tKey]?.latest_seq ?? 0);
 
     setState(
       (s) => {
-        const latestSeq = Math.max(
-          s.seenAgentSeqs[tKey] ?? 0,
-          ag?.latest_seq ?? 0,
-          s.timelines[tKey]?.latestSeq ?? 0,
-        );
         let nextArchived = s.archivedThreads;
         if (nextArchived[tKey]) {
           nextArchived = { ...nextArchived };
@@ -1644,19 +1544,17 @@ export const orbitActions = {
           selectedWorkspaceCwd: nextCwd,
           selectedDiffPath: null,
           archivedThreads: nextArchived,
-          seenAgentSeqs: {
-            ...s.seenAgentSeqs,
-            [tKey]: latestSeq,
-          },
         };
       },
       true,
     );
 
+    markThreadSeenInCore(hostId, agentId, seenSeq);
+    orbitActions.refreshSidebarView();
     void orbitIpc.openAgentTimeline(hostId, agentId);
     void orbitIpc.markAgentRead(hostId, agentId);
     void orbitIpc.listProviderSubagents(hostId, agentId);
-    void orbitActions.pullTimelineDelta(hostId, agentId, false);
+    void orbitActions.pullStageDelta(hostId, agentId, false);
     if (nextCwd && nextCwd !== "~") {
       void orbitActions.refreshGit(hostId, nextCwd, null, state.diffStaged);
     }
@@ -1711,6 +1609,7 @@ export const orbitActions = {
         : {}),
     }));
 
+    orbitActions.refreshSidebarView();
     orbitActions.focusComposer();
   },
 
@@ -1881,6 +1780,7 @@ export const orbitActions = {
         [key]: [...(s.diffQuotes[key] ?? []), item],
       },
     }));
+    orbitActions.refreshSidebarView();
     orbitActions.focusComposer();
   },
 
@@ -2097,20 +1997,21 @@ export const orbitActions = {
     const detail = state.hostDetails[hostId];
     const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
     const provider = activeAgent?.provider ?? state.draftProvider;
-    const cleanFocus = extraFocus.trim();
-    const badges: PromptBadge[] = [{ kind: "slash", label: "/compact" }];
-    const wirePrompt =
-      provider === "claude_code" || provider === "antigravity"
-        ? cleanFocus
-          ? `/compact ${cleanFocus}`
-          : "/compact"
-        : cleanFocus
-          ? `${buildHiddenWorkflowInstruction("compact")}\n\n<USER_REQUEST>\n${cleanFocus}\n</USER_REQUEST>`
-          : buildHiddenWorkflowInstruction("compact");
+    const cwd = activeAgent?.cwd || state.selectedWorkspaceCwd || "~";
+    const composed = await orbitIpc.composePrompt({
+      provider,
+      raw_text: extraFocus.trim(),
+      explicit_directive: "compact",
+      host_id: hostId,
+      cwd,
+      contexts: [],
+      quotes: [],
+      pastes: [],
+    });
 
-    await orbitIpc.sendPrompt(hostId, agentId, wirePrompt, {
-      displayPrompt: cleanFocus,
-      badges,
+    await orbitIpc.sendPrompt(hostId, agentId, composed.wire_prompt, {
+      displayPrompt: composed.display_prompt,
+      badges: composed.badges,
     });
   },
 
@@ -2122,73 +2023,49 @@ export const orbitActions = {
     const rawDraft = (state.composerDrafts[key] ?? "").trim();
     const storedDirective = state.slashDirectives[key] ?? null;
 
-    // Intercept `/btw` side questions before touching main conversation state or in-flight turns
-    if (!storedDirective) {
-      const btwMatch = /^\/btw(?:\s+([\s\S]*))?$/i.exec(rawDraft);
-      if (btwMatch) {
-        const sideQ = (btwMatch[1] ?? "").trim();
-        setState((s) => ({
-          ...s,
-          composerDrafts: { ...s.composerDrafts, [key]: "" },
-        }));
-        if (sideQ) {
-          orbitActions.openSideQuestionTab();
-          void orbitActions.submitSideQuestion(sideQ);
-        } else {
-          orbitActions.openSideQuestionTab();
-        }
-        return;
-      }
-    }
-
-    const inlineParsed = storedDirective
-      ? { directive: null, rest: rawDraft }
-      : parseLeadingSlashDirective(rawDraft);
-    const effectiveDirective: SlashDirective | null =
-      storedDirective ?? inlineParsed.directive;
-    const cleanUserText = storedDirective ? rawDraft : inlineParsed.rest;
-
     const initialContexts = state.contextItems[key] ?? [];
     const registeredInline = state.inlineMentions[key] ?? [];
     const pastes = state.pastedAttachments[key] ?? [];
     const quotes = state.diffQuotes[key] ?? [];
 
     // Ensure every attached image/file has completed uploading to the target `hostId`
-    // BEFORE assembling the wire prompt or clearing the composer draft.
-    try {
-      const pendingPromises: Promise<void>[] = [];
-      for (const ctx of initialContexts) {
-        const inflight = inflightAttachmentUploads.get(ctx.id);
-        if (inflight) {
-          pendingPromises.push(inflight);
+    // BEFORE composing the wire prompt or clearing the composer draft.
+    if (initialContexts.some((ctx) => ctx.kind === "image" || ctx.kind === "file")) {
+      try {
+        const pendingPromises: Promise<void>[] = [];
+        for (const ctx of initialContexts) {
+          const inflight = inflightAttachmentUploads.get(ctx.id);
+          if (inflight) {
+            pendingPromises.push(inflight);
+          }
         }
-      }
-      if (pendingPromises.length > 0) {
-        await Promise.all(pendingPromises);
-      }
+        if (pendingPromises.length > 0) {
+          await Promise.all(pendingPromises);
+        }
 
-      const refreshedContexts = state.contextItems[key] ?? [];
-      for (const ctx of refreshedContexts) {
-        if (
-          (ctx.kind === "image" || ctx.kind === "file") &&
-          ctx.localFile &&
-          (ctx.stagedHostId !== hostId || !ctx.path)
-        ) {
-          const fname = ctx.filename || ctx.localFile.name || "attachment.bin";
-          await uploadContextAttachmentToHost(key, ctx.id, ctx.localFile, fname, hostId, true);
+        const refreshedContexts = state.contextItems[key] ?? [];
+        for (const ctx of refreshedContexts) {
+          if (
+            (ctx.kind === "image" || ctx.kind === "file") &&
+            ctx.localFile &&
+            (ctx.stagedHostId !== hostId || !ctx.path)
+          ) {
+            const fname = ctx.filename || ctx.localFile.name || "attachment.bin";
+            await uploadContextAttachmentToHost(key, ctx.id, ctx.localFile, fname, hostId, true);
+          }
         }
+      } catch (err) {
+        notifyToast(`Attachment upload failed: ${String(err)}`);
+        return;
       }
-    } catch (err) {
-      notifyToast(`Attachment upload failed: ${String(err)}`);
-      return;
     }
 
     const existingContexts = state.contextItems[key] ?? [];
 
-    // Resolve any inline `@tokens` still present in `cleanUserText` without showing attachment boxes
+    // Resolve any inline `@tokens` still present in `rawDraft` without showing attachment boxes
     const resolvedInlineContexts: ContextMentionItem[] = [];
     for (const m of registeredInline) {
-      if (!cleanUserText.includes(m.token)) continue;
+      if (!rawDraft.includes(m.token)) continue;
       if (m.kind === "file") {
         resolvedInlineContexts.push({ id: `inl_${m.path}`, kind: "file", path: m.path });
       } else if (m.kind === "git_diff") {
@@ -2220,22 +2097,98 @@ export const orbitActions = {
       if (!dup) mergedContexts.push(rc);
     }
 
-    // Ensure `/review` automatically includes working tree diff invisibly
-    const contexts: ContextMentionItem[] =
-      effectiveDirective === "review" &&
-      !mergedContexts.some((c) => c.kind === "git_diff")
-        ? [
-            ...mergedContexts,
-            {
-              id: `diff_work_${Date.now()}`,
-              kind: "git_diff",
-              staged: false,
-              label: "Working Tree Diff",
-            },
-          ]
-        : mergedContexts;
+    const cwd = state.selectedWorkspaceCwd || "~";
+    const needsWorkingDiff =
+      storedDirective === "review" ||
+      (!storedDirective && /^\/review(?:\s|$)/i.test(rawDraft)) ||
+      mergedContexts.some((c) => c.kind === "git_diff" && !c.staged);
+    const needsStagedDiff = mergedContexts.some((c) => c.kind === "git_diff" && c.staged);
 
-    if (effectiveDirective === "compact") {
+    let workingDiffText: string | null = null;
+    let stagedDiffText: string | null = null;
+    if (needsWorkingDiff) {
+      await orbitIpc.fetchGitDiff(hostId, cwd, null, false);
+      const gr = await orbitIpc.getGitReview(hostId, cwd, null);
+      if (gr.raw_diff.trim()) workingDiffText = gr.raw_diff;
+    }
+    if (needsStagedDiff) {
+      await orbitIpc.fetchGitDiff(hostId, cwd, null, true);
+      const gr = await orbitIpc.getGitReview(hostId, cwd, null);
+      if (gr.raw_diff.trim()) stagedDiffText = gr.raw_diff;
+    }
+
+    const detailForCompose = state.hostDetails[hostId];
+    const installedForCompose = detailForCompose?.host.available_providers ?? [];
+    const activeForCompose =
+      !state.isDraftNewSession && state.selectedAgentId
+        ? detailForCompose?.agents.find((a) => a.agent_id === state.selectedAgentId) ?? null
+        : null;
+    const providerForCompose: ProviderKind = activeForCompose
+      ? activeForCompose.provider
+      : installedForCompose.length > 0 && !installedForCompose.includes(state.draftProvider)
+        ? installedForCompose[0]
+        : state.draftProvider;
+
+    const contextInputs: ComposerContextInput[] = mergedContexts.map((ctx) => {
+      switch (ctx.kind) {
+        case "image":
+          return { kind: "image", path: ctx.path, filename: ctx.filename };
+        case "file":
+          return ctx.stagedHostId
+            ? {
+                kind: "staged_file",
+                path: ctx.path,
+                filename: ctx.filename || ctx.path,
+              }
+            : { kind: "workspace_file", path: ctx.path };
+        case "git_diff":
+          return {
+            kind: "git_diff",
+            staged: ctx.staged,
+            label: ctx.label,
+            diff_text: ctx.staged ? stagedDiffText : workingDiffText,
+          };
+        case "terminal_output":
+          return {
+            kind: "terminal_output",
+            label: ctx.label,
+            content: ctx.content,
+          };
+      }
+    });
+
+    const composed = await orbitIpc.composePrompt({
+      provider: providerForCompose,
+      raw_text: rawDraft,
+      explicit_directive: storedDirective,
+      host_id: hostId,
+      cwd,
+      contexts: contextInputs,
+      quotes: quotes.map((q) => ({
+        path: q.path,
+        line_number: q.lineNumber,
+        code: q.code,
+      })),
+      pastes: pastes.map((p) => ({
+        label: p.label,
+        filename: p.filename ?? null,
+        content: p.content,
+      })),
+    });
+
+    if (composed.is_btw) {
+      setState((s) => ({
+        ...s,
+        composerDrafts: { ...s.composerDrafts, [key]: "" },
+      }));
+      orbitActions.openSideQuestionTab();
+      if (composed.btw_question) {
+        void orbitActions.submitSideQuestion(composed.btw_question);
+      }
+      return;
+    }
+
+    if (composed.is_compact) {
       if (state.isDraftNewSession || !state.selectedAgentId) {
         notifyToast("Start an active session first to compact context");
         return;
@@ -2245,137 +2198,60 @@ export const orbitActions = {
         composerDrafts: { ...s.composerDrafts, [key]: "" },
         slashDirectives: { ...s.slashDirectives, [key]: null },
       }));
-      await orbitActions.submitSlashCompact(cleanUserText);
-      return;
-    }
-
-    const hasSubstantiveTarget =
-      cleanUserText.length > 0 ||
-      contexts.length > 0 ||
-      pastes.length > 0 ||
-      quotes.length > 0;
-
-    if (!hasSubstantiveTarget && effectiveDirective !== "review") {
-      return;
-    }
-
-    // 1. Build clean user-facing badges (never exposing hidden boilerplate or raw diffs)
-    const badges: PromptBadge[] = [];
-    if (effectiveDirective) {
-      badges.push({ kind: "slash", label: `/${effectiveDirective}` });
-    }
-
-    const imageItems = contexts.filter(
-      (c): c is Extract<ContextMentionItem, { kind: "image" }> => c.kind === "image",
-    );
-    const fileItems = contexts.filter(
-      (c): c is Extract<ContextMentionItem, { kind: "file" }> => c.kind === "file",
-    );
-    const gitDiffItems = contexts.filter(
-      (c): c is Extract<ContextMentionItem, { kind: "git_diff" }> => c.kind === "git_diff",
-    );
-    const termItems = contexts.filter(
-      (c): c is Extract<ContextMentionItem, { kind: "terminal_output" }> =>
-        c.kind === "terminal_output",
-    );
-
-    for (const img of imageItems) {
-      badges.push({ kind: "image", label: img.filename });
-    }
-    for (const f of fileItems) {
-      const base = basenameFromPath(f.path || f.filename || "file");
-      if (!cleanUserText.includes(`@${base}`)) {
-        badges.push({ kind: "file", label: base });
-      }
-    }
-    for (const gd of gitDiffItems) {
-      const inlineAlias = gd.staged ? "@staged-diff" : "@working-diff";
-      if (!cleanUserText.includes(inlineAlias) && effectiveDirective !== "review") {
-        badges.push({ kind: "git_diff", label: gd.label });
-      }
-    }
-    for (const tm of termItems) {
-      if (!cleanUserText.includes("@terminal")) {
-        badges.push({ kind: "terminal", label: tm.label });
-      }
-    }
-    for (const q of quotes) {
-      const shortFile = basenameFromPath(q.path);
-      badges.push({
-        kind: "quote",
-        label: q.lineNumber !== null ? `${shortFile}:${q.lineNumber}` : shortFile,
+      await orbitIpc.sendPrompt(hostId, state.selectedAgentId, composed.wire_prompt, {
+        displayPrompt: composed.display_prompt,
+        badges: composed.badges,
       });
-    }
-    for (const p of pastes) {
-      badges.push({ kind: "paste", label: p.filename ?? p.label });
+      return;
     }
 
-    // 2. Build hidden structured `wirePrompt` strictly for the Agent CLI
-    const wireSections: string[] = [];
-
-    if (effectiveDirective) {
-      wireSections.push(buildHiddenWorkflowInstruction(effectiveDirective));
+    if (composed.is_empty) {
+      return;
     }
 
-    const contextBlocks: string[] = [];
-    if (imageItems.length > 0) {
-      contextBlocks.push(
-        imageItems.map((img) => `Attached image file: \`${img.path}\``).join("\n"),
-      );
-    }
-    const stagedFileItems = fileItems.filter((f) => Boolean(f.stagedHostId));
-    const workspaceFileItems = fileItems.filter((f) => !f.stagedHostId);
-    if (stagedFileItems.length > 0) {
-      contextBlocks.push(
-        stagedFileItems.map((f) => `Attached file: \`${f.path}\``).join("\n"),
-      );
-    }
-    if (workspaceFileItems.length > 0) {
-      contextBlocks.push(
-        `Referenced workspace files: ${workspaceFileItems.map((f) => `\`@${f.path}\``).join(", ")}`,
-      );
-    }
-    for (const gd of gitDiffItems) {
-      const cwd = state.selectedWorkspaceCwd || "~";
-      await orbitIpc.fetchGitDiff(hostId, cwd, null, gd.staged);
-      const gr = await orbitIpc.getGitReview(hostId, cwd, null);
-      if (gr.raw_diff.trim()) {
-        const clipped = gr.raw_diff.slice(0, 14000);
-        contextBlocks.push(`${gd.label}:\n\`\`\`diff\n${clipped}\n\`\`\``);
-      } else {
-        contextBlocks.push(
-          `Context: Inspect ${gd.staged ? "staged" : "working tree"} git changes in workspace.`,
-        );
+    const effectiveDirective = composed.effective_directive;
+    const cleanUserText = composed.display_prompt;
+    const imagePathQueueByLabel = new Map<string, string[]>();
+    const filePathQueueByLabel = new Map<string, string[]>();
+    const sentImages: SentImagePreviewMeta[] = [];
+    const targetAgentId = state.isDraftNewSession ? null : state.selectedAgentId;
+    for (const ctx of mergedContexts) {
+      if (ctx.kind === "image") {
+        if (ctx.path && ctx.previewUrl) {
+          seedPromptImagePreview(hostId, ctx.path, ctx.previewUrl);
+        }
+        sentImages.push({
+          label: ctx.filename,
+          path: ctx.path || null,
+          previewUrl: ctx.previewUrl || null,
+        });
+        if (ctx.path) {
+          const queue = imagePathQueueByLabel.get(ctx.filename);
+          if (queue) queue.push(ctx.path);
+          else imagePathQueueByLabel.set(ctx.filename, [ctx.path]);
+        }
+      } else if (ctx.kind === "file" && ctx.path) {
+        const label = ctx.filename || basenameFromPath(ctx.path);
+        const queue = filePathQueueByLabel.get(label);
+        if (queue) queue.push(ctx.path);
+        else filePathQueueByLabel.set(label, [ctx.path]);
       }
     }
-    for (const tm of termItems) {
-      contextBlocks.push(`${tm.label}:\n\`\`\`text\n${tm.content}\n\`\`\``);
+    if (sentImages.length > 0) {
+      recordRecentSentTurnImages(hostId, targetAgentId, cleanUserText, sentImages);
     }
-    for (const q of quotes) {
-      const loc = q.lineNumber !== null ? `${q.path}:${q.lineNumber}` : q.path;
-      contextBlocks.push(`Reference \`${loc}\`:\n\`\`\`\n${q.code}\n\`\`\``);
-    }
-    for (const p of pastes) {
-      contextBlocks.push(`${p.label}:\n\`\`\`text\n${p.content}\n\`\`\``);
-    }
-
-    if (contextBlocks.length > 0) {
-      wireSections.push(`<ATTACHED_CONTEXT>\n${contextBlocks.join("\n\n")}\n</ATTACHED_CONTEXT>`);
-    }
-
-    if (cleanUserText) {
-      if (wireSections.length > 0) {
-        wireSections.push(`<USER_REQUEST>\n${cleanUserText}\n</USER_REQUEST>`);
-      } else {
-        wireSections.push(cleanUserText);
+    const badges: PromptBadge[] = composed.badges.map((b) => {
+      if (b.path) return b;
+      if (b.kind === "image") {
+        const fallbackPath = imagePathQueueByLabel.get(b.label)?.shift();
+        if (fallbackPath) return { ...b, path: fallbackPath };
+      } else if (b.kind === "file") {
+        const fallbackPath = filePathQueueByLabel.get(b.label)?.shift();
+        if (fallbackPath) return { ...b, path: fallbackPath };
       }
-    } else if (effectiveDirective === "review") {
-      wireSections.push(
-        "<USER_REQUEST>\nReview the attached workspace changes thoroughly.\n</USER_REQUEST>",
-      );
-    }
-
-    const assembledWirePrompt = wireSections.join("\n\n");
+      return b;
+    });
+    const assembledWirePrompt = composed.wire_prompt;
 
     const nextHistory =
       cleanUserText && state.promptHistory[state.promptHistory.length - 1] !== cleanUserText
@@ -2430,18 +2306,29 @@ export const orbitActions = {
           worktreeBranch = "auto";
         }
       }
+      const resolvedSel = await orbitIpc
+        .resolveModelSelection({
+          host_id: hostId,
+          provider: effectiveProvider,
+          desired_model: state.draftModels[effectiveProvider] ?? null,
+          desired_effort: state.draftEffort,
+        })
+        .catch(() => null);
       const cat = getCatalogForProvider(
         hostDetailForCreate?.provider_catalogs,
         effectiveProvider,
       );
       const explicitDraftModel = state.draftModels[effectiveProvider] ?? null;
       const spec = resolveActiveModelSpec(cat, explicitDraftModel);
-      const resolvedModel = explicitDraftModel ?? spec?.id ?? null;
-      const resolvedEffort = resolveSupportedEffortForModel(
-        spec,
-        state.draftEffort,
-        cat.configured_default_effort,
-      );
+      const resolvedModel =
+        resolvedSel?.selected_model_id ?? explicitDraftModel ?? spec?.id ?? null;
+      const resolvedEffort =
+        resolvedSel?.selected_effort ??
+        resolveSupportedEffortForModel(
+          spec,
+          state.draftEffort,
+          cat.configured_default_effort,
+        );
 
       await orbitIpc.createAgent({
         hostId,
@@ -2482,7 +2369,7 @@ export const orbitActions = {
           displayText: cleanUserText,
           badges,
           slashDirective: effectiveDirective,
-          contexts,
+          contexts: mergedContexts,
           pastes,
           quotes,
         };
@@ -2550,6 +2437,7 @@ export const orbitActions = {
         [key]: list.filter((_, idx) => idx !== index),
       },
     }));
+    orbitActions.refreshSidebarView();
     orbitActions.focusComposer();
   },
 
@@ -2611,19 +2499,9 @@ export const orbitActions = {
   },
 
   togglePinThread(hostId: string, agentId: string): void {
-    const tKey = threadScopeKey(hostId, agentId);
-    setState(
-      (s) => {
-        const exists = s.pinnedThreadKeys.includes(tKey);
-        return {
-          ...s,
-          pinnedThreadKeys: exists
-            ? s.pinnedThreadKeys.filter((k) => k !== tKey)
-            : [tKey, ...s.pinnedThreadKeys],
-        };
-      },
-      true,
-    );
+    void orbitIpc.togglePinAgent(hostId, agentId).then(() => {
+      orbitActions.refreshSidebarView();
+    });
   },
 
   renameThread(hostId: string, agentId: string, newTitle: string): void {
@@ -2652,17 +2530,20 @@ export const orbitActions = {
       state.selectedHostId === hostId &&
       state.selectedAgentId === agentId;
 
-    setState(
-      (s) => ({
-        ...s,
-        seenAgentSeqs: {
-          ...s.seenAgentSeqs,
-          [tKey]: 0,
-        },
-        ...(isCurrentlySelected ? { isDraftNewSession: true, selectedAgentId: null } : {}),
-      }),
-      true,
-    );
+    lastReportedSeenSeq.delete(tKey);
+    if (isCurrentlySelected) {
+      setState(
+        (s) => ({
+          ...s,
+          isDraftNewSession: true,
+          selectedAgentId: null,
+        }),
+        true,
+      );
+    }
+    void orbitIpc.markAgentUnread(hostId, agentId).then(() => {
+      orbitActions.refreshSidebarView();
+    });
   },
 
   markThreadRead(hostId: string, agentId: string): void {
@@ -2670,45 +2551,52 @@ export const orbitActions = {
     const detail = state.hostDetails[hostId];
     const ag =
       detail?.agents.find((a) => a.agent_id === agentId) ??
-      state.timelines[tKey]?.agent ??
+      state.stages[tKey]?.agent ??
       null;
     const targetSeq = Math.max(
       ag?.latest_seq ?? 0,
-      state.timelines[tKey]?.latestSeq ?? 0,
+      state.stages[tKey]?.latest_seq ?? 0,
       1,
     );
-    setState(
-      (s) => ({
-        ...s,
-        seenAgentSeqs: {
-          ...s.seenAgentSeqs,
-          [tKey]: targetSeq,
-        },
-      }),
-      true,
-    );
+    lastReportedSeenSeq.set(tKey, targetSeq);
+    void orbitIpc.markAgentSeen(hostId, agentId, targetSeq).then(() => {
+      orbitActions.refreshSidebarView();
+    });
   },
 
   async copyThread(hostId: string, agentId: string): Promise<void> {
     const tKey = threadScopeKey(hostId, agentId);
-    let items = state.timelines[tKey]?.items;
-    if (!items || items.length === 0) {
+    const sections: string[] = [];
+    const cachedStage = state.stages[tKey];
+    if (cachedStage && cachedStage.turns.length > 0) {
+      for (const turn of cachedStage.turns) {
+        if (turn.user_prompt?.item_type === "user_prompt") {
+          const txt = turn.user_prompt.text.trim();
+          if (txt) sections.push(`## User\n\n${txt}`);
+        }
+        for (const seg of turn.live_segments) {
+          if (seg.kind === "assistant_message" && seg.item.item_type === "assistant_message") {
+            const txt = seg.item.text.trim();
+            if (txt) sections.push(`## Assistant\n\n${txt}`);
+          }
+        }
+      }
+    } else {
+      let items: Awaited<ReturnType<typeof orbitIpc.getAgentTimeline>>["items"];
       try {
         const full = await orbitIpc.getAgentTimeline(hostId, agentId);
         items = full.items;
       } catch {
         items = [];
       }
-    }
-
-    const sections: string[] = [];
-    for (const item of items) {
-      if (item.item_type === "user_prompt") {
-        const txt = item.text.trim();
-        if (txt) sections.push(`## User\n\n${txt}`);
-      } else if (item.item_type === "assistant_message") {
-        const txt = item.text.trim();
-        if (txt) sections.push(`## Assistant\n\n${txt}`);
+      for (const item of items) {
+        if (item.item_type === "user_prompt") {
+          const txt = item.text.trim();
+          if (txt) sections.push(`## User\n\n${txt}`);
+        } else if (item.item_type === "assistant_message") {
+          const txt = item.text.trim();
+          if (txt) sections.push(`## Assistant\n\n${txt}`);
+        }
       }
     }
 
@@ -2778,7 +2666,7 @@ export const orbitActions = {
       });
 
       await Promise.all([
-        orbitActions.pullTimelineDelta(hostId, agentId, true),
+        orbitActions.pullStageDelta(hostId, agentId, true),
         orbitActions.reloadHostDetail(hostId, true),
       ]);
 
@@ -2856,6 +2744,7 @@ export const orbitActions = {
     );
 
     void orbitIpc.archiveAgent(hostId, agentId);
+    orbitActions.refreshSidebarView();
     if (wasSelected && fallbackAgentId) {
       orbitActions.selectAgent(hostId, fallbackAgentId);
     }
@@ -2881,6 +2770,7 @@ export const orbitActions = {
       true,
     );
     void orbitIpc.unarchiveAgent(hostId, agentId);
+    orbitActions.refreshSidebarView();
     orbitActions.selectAgent(hostId, agentId);
     notifyToast("Conversation restored");
   },
@@ -2893,6 +2783,7 @@ export const orbitActions = {
 
   async detachAgent(hostId: string, agentId: string): Promise<void> {
     await orbitIpc.detachAgent(hostId, agentId);
+    orbitActions.refreshSidebarView();
     notifyToast("Detached subagent to standalone thread");
   },
 
@@ -2909,21 +2800,19 @@ export const orbitActions = {
         delete nextArchived[tKey];
         const nextTitles = { ...s.threadCustomTitles };
         delete nextTitles[tKey];
-        const nextSeen = { ...s.seenAgentSeqs };
-        delete nextSeen[tKey];
         return {
           ...s,
           archivedThreads: nextArchived,
           threadCustomTitles: nextTitles,
-          seenAgentSeqs: nextSeen,
-          pinnedThreadKeys: s.pinnedThreadKeys.filter((k) => k !== tKey),
           ...(wasSelected ? { selectedAgentId: null, isDraftNewSession: true } : {}),
         };
       },
       true,
     );
 
+    lastReportedSeenSeq.delete(tKey);
     await orbitIpc.deleteAgent(hostId, agentId);
+    orbitActions.refreshSidebarView();
     notifyToast("Conversation deleted");
   },
 
@@ -2939,6 +2828,7 @@ export const orbitActions = {
       }),
       true,
     );
+    orbitActions.refreshSidebarView();
   },
 
   toggleSidebar(): void {
@@ -3105,8 +2995,8 @@ export const orbitActions = {
     }
   },
 
-  async deleteProject(project: UnifiedProjectEntry): Promise<void> {
-    const hostId = project.host.host_id;
+  async deleteProject(project: SidebarProjectGroupView): Promise<void> {
+    const hostId = project.host_id;
     try {
       const running = project.conversations.filter(
         ({ agent }) => agent.is_running || agent.is_awaiting_permission,
@@ -3119,13 +3009,13 @@ export const orbitActions = {
 
       if (project.conversations.length > 0) {
         await Promise.allSettled(
-          project.conversations.map(({ agent }) => orbitIpc.archiveAgent(hostId, agent.agent_id)),
+          project.conversations.map(({ agent }) => orbitIpc.deleteAgent(hostId, agent.agent_id)),
         );
       }
 
       const removedPinnedIds = new Set<string>();
-      if (project.pinnedProject?.project_id) {
-        removedPinnedIds.add(project.pinnedProject.project_id);
+      if (project.pinned_project_id) {
+        removedPinnedIds.add(project.pinned_project_id);
       }
       for (const pinned of state.fleet.projects ?? []) {
         if (
@@ -3148,7 +3038,7 @@ export const orbitActions = {
 
       setState((s) => {
         const nextHidden = { ...s.hiddenProjectKeys };
-        nextHidden[projectPathScopeKey(hostId, project.primaryCwd)] = true;
+        nextHidden[projectPathScopeKey(hostId, project.primary_cwd)] = true;
         for (const dir of project.directories) {
           nextHidden[projectPathScopeKey(hostId, dir)] = true;
         }
@@ -3171,38 +3061,20 @@ export const orbitActions = {
         let nextDraft = s.isDraftNewSession;
 
         if (wasSelectedAgent || wasSelectedProjectCwd) {
-          const remainingPinned = (s.fleet.projects ?? []).filter(
-            (p) => !removedPinnedIds.has(p.project_id),
-          );
-          const hostDetail = s.hostDetails[hostId];
-          const remainingHostDetails = hostDetail
-            ? {
-                ...s.hostDetails,
-                [hostId]: {
-                  ...hostDetail,
-                  agents: hostDetail.agents.filter((a) => !deletedAgentIds.has(a.agent_id)),
-                },
-              }
-            : s.hostDetails;
-          const remainingProjects = buildUnifiedProjects(
-            s.fleet.hosts,
-            remainingPinned,
-            remainingHostDetails,
-            nextHidden,
-          );
           const nextProject =
-            remainingProjects.find(
+            (s.sidebarView?.projects ?? []).find(
               (p) =>
                 p.id !== project.id &&
+                !nextHidden[projectPathScopeKey(p.host_id, p.primary_cwd)] &&
                 !(
-                  p.host.host_id === hostId &&
-                  matchesProjectDirectory(project.directories, p.primaryCwd)
+                  p.host_id === hostId &&
+                  matchesProjectDirectory(project.directories, p.primary_cwd)
                 ),
             ) ?? null;
 
           if (nextProject) {
-            nextHostId = nextProject.host.host_id;
-            nextCwd = nextProject.primaryCwd;
+            nextHostId = nextProject.host_id;
+            nextCwd = nextProject.primary_cwd;
             nextAgentId = null;
             nextDraft = true;
           } else {
@@ -3220,14 +3092,9 @@ export const orbitActions = {
           isDraftNewSession: nextDraft,
           hiddenProjectKeys: nextHidden,
           collapsedProjectIds: nextCollapsed,
-          pinnedThreadKeys:
-            deletedThreadKeys.size > 0
-              ? s.pinnedThreadKeys.filter((k) => !deletedThreadKeys.has(k))
-              : s.pinnedThreadKeys,
           archivedThreads: omitRecordKeys(s.archivedThreads, deletedThreadKeys),
           threadCustomTitles: omitRecordKeys(s.threadCustomTitles, deletedThreadKeys),
-          seenAgentSeqs: omitRecordKeys(s.seenAgentSeqs, deletedThreadKeys),
-          timelines: omitRecordKeys(s.timelines, deletedThreadKeys),
+          stages: omitRecordKeys(s.stages, deletedThreadKeys),
           composerDrafts: omitRecordKeys(s.composerDrafts, deletedThreadKeys),
           slashDirectives: omitRecordKeys(s.slashDirectives, deletedThreadKeys),
           inlineMentions: omitRecordKeys(s.inlineMentions, deletedThreadKeys),
@@ -3240,6 +3107,7 @@ export const orbitActions = {
 
       await orbitActions.reloadFleetOnly();
       await orbitActions.reloadHostDetail(hostId, false);
+      orbitActions.refreshSidebarView();
       notifyToast("Project deleted");
     } catch (err) {
       notifyToast(`Failed to delete project: ${String(err)}`);
@@ -3253,10 +3121,6 @@ export const orbitActions = {
 
   toggleSidePanel(openOverride?: boolean): void {
     const nextOpen = openOverride ?? !state.sidePanelOpen;
-    if (nextOpen && state.sidePanelTabs.length === 0) {
-      orbitActions.openReviewTab();
-      return;
-    }
 
     setState((s) => {
       let nextSidebarOpen = s.sidebarOpen;
@@ -3272,18 +3136,43 @@ export const orbitActions = {
         nextYielded = false;
       }
 
+      const willShowLaunchpad =
+        nextOpen && (s.sidePanelTabs.length === 0 || !s.activeSidePanelTabId);
+
       return {
         ...s,
         sidePanelOpen: nextOpen,
         overviewPopoverOpen: nextOpen ? false : s.overviewPopoverOpen,
         sidebarOpen: nextSidebarOpen,
         sidebarAutoYieldedForSidePanel: nextYielded,
-        activeSidePanelTabId:
-          nextOpen && !s.activeSidePanelTabId
-            ? (s.sidePanelTabs[0]?.id ?? null)
-            : s.activeSidePanelTabId,
+        sidePanelLaunchpadFocusNonce: willShowLaunchpad
+          ? s.sidePanelLaunchpadFocusNonce + 1
+          : s.sidePanelLaunchpadFocusNonce,
       };
     });
+
+    if (nextOpen && state.selectedHostId && state.selectedWorkspaceCwd) {
+      void orbitActions.ensureWorkspaceFiles(state.selectedHostId, state.selectedWorkspaceCwd);
+    }
+  },
+
+  openSidePanelNewTab(): void {
+    setState((s) => {
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        activeSidePanelTabId: null,
+        sidePanelLaunchpadFocusNonce: s.sidePanelLaunchpadFocusNonce + 1,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+
+    if (state.selectedHostId && state.selectedWorkspaceCwd) {
+      void orbitActions.ensureWorkspaceFiles(state.selectedHostId, state.selectedWorkspaceCwd);
+    }
   },
 
   setSidePanelWidth(w: number): void {
@@ -3333,20 +3222,20 @@ export const orbitActions = {
         s.activeSidePanelTabId === tabId
           ? (remaining[Math.min(idx, remaining.length - 1)]?.id ?? null)
           : s.activeSidePanelTabId;
-      const nextOpen = remaining.length === 0 ? false : s.sidePanelOpen;
-      const restoreSidebar =
-        !nextOpen && s.sidebarAutoYieldedForSidePanel && !s.isCompactViewport;
+      const showingLaunchpad = remaining.length === 0 || nextActive === null;
       return {
         ...s,
         sidePanelTabs: remaining,
         activeSidePanelTabId: nextActive,
-        sidePanelOpen: nextOpen,
-        sidebarOpen: restoreSidebar ? s.sidebarDesktopOpenPref : s.sidebarOpen,
-        sidebarAutoYieldedForSidePanel: restoreSidebar
-          ? false
-          : s.sidebarAutoYieldedForSidePanel,
+        sidePanelLaunchpadFocusNonce: showingLaunchpad
+          ? s.sidePanelLaunchpadFocusNonce + 1
+          : s.sidePanelLaunchpadFocusNonce,
       };
     });
+
+    if (state.selectedHostId && state.selectedWorkspaceCwd) {
+      void orbitActions.ensureWorkspaceFiles(state.selectedHostId, state.selectedWorkspaceCwd);
+    }
   },
 
   openReviewTab(opts?: { path?: string | null; scope?: ReviewScope }): void {
@@ -3432,12 +3321,29 @@ export const orbitActions = {
 
   openFileInSidePanel(
     rawPath: string,
-    opts?: { focusLine?: number | null; hostId?: string; cwd?: string },
+    opts?: {
+      focusLine?: number | null;
+      focusEndLine?: number | null;
+      hostId?: string;
+      cwd?: string;
+      fallbackPath?: string;
+    },
   ): void {
     const hostId = opts?.hostId ?? state.selectedHostId;
     const cwd = opts?.cwd ?? state.selectedWorkspaceCwd ?? "~";
-    const cleanPath = rawPath.trim();
-    if (!hostId || !cleanPath) return;
+    const normalizedCandidate = normalizeWorkspacePathCandidate(rawPath, cwd);
+    if (!hostId || !normalizedCandidate) return;
+
+    const cachedFiles = state.workspaceFilesCache[`${hostId}::${cwd}`];
+    const resolvedFromCache =
+      !normalizedCandidate.startsWith("/") && !normalizedCandidate.startsWith("~/")
+        ? resolveUniqueWorkspaceFileSuffix(normalizedCandidate, cachedFiles)
+        : null;
+    const cleanPath = resolvedFromCache ?? normalizedCandidate;
+
+    const focusRange = normalizeLineRange(opts?.focusLine, opts?.focusEndLine);
+    const hasExplicitFocus = opts?.focusLine !== undefined || opts?.focusEndLine !== undefined;
+    const focusNonce = focusRange.startLine != null ? nextFileFocusNonce++ : undefined;
 
     const tabId = `tab:file:${hostId}::${cwd}::${cleanPath}`;
     const title = basenameFromPath(cleanPath) || cleanPath;
@@ -3446,11 +3352,13 @@ export const orbitActions = {
       const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
       let nextTabs = s.sidePanelTabs;
       if (existingIdx >= 0) {
-        if (opts?.focusLine !== undefined) {
+        if (hasExplicitFocus) {
           nextTabs = [...s.sidePanelTabs];
           nextTabs[existingIdx] = {
             ...nextTabs[existingIdx],
-            focusLine: opts.focusLine,
+            focusLine: focusRange.startLine,
+            focusEndLine: focusRange.endLine,
+            ...(focusNonce !== undefined ? { focusNonce } : {}),
           };
         }
       } else {
@@ -3463,7 +3371,9 @@ export const orbitActions = {
             filePath: cleanPath,
             hostId,
             cwd,
-            focusLine: opts?.focusLine ?? null,
+            focusLine: focusRange.startLine,
+            focusEndLine: focusRange.endLine,
+            focusNonce,
           },
         ];
       }
@@ -3480,7 +3390,95 @@ export const orbitActions = {
       };
     });
 
-    void orbitActions.loadWorkspaceFile(hostId, cwd, cleanPath, false);
+    const replaceFailedFileTab = (resolvedAltPath: string) => {
+      const nextTabId = `tab:file:${hostId}::${cwd}::${resolvedAltPath}`;
+      const nextTitle = basenameFromPath(resolvedAltPath) || resolvedAltPath;
+      setState((s) => {
+        if (!s.sidePanelTabs.some((t) => t.id === tabId)) return s;
+        const alreadyHasNext = s.sidePanelTabs.some((t) => t.id === nextTabId);
+        const nextTabs = alreadyHasNext
+          ? s.sidePanelTabs
+              .filter((t) => t.id !== tabId)
+              .map((t) =>
+                t.id === nextTabId
+                  ? {
+                      ...t,
+                      focusLine: focusRange.startLine ?? t.focusLine ?? null,
+                      focusEndLine: focusRange.endLine ?? t.focusEndLine ?? null,
+                      ...(focusNonce !== undefined ? { focusNonce } : {}),
+                    }
+                  : t,
+              )
+          : s.sidePanelTabs.map((t) =>
+              t.id === tabId
+                ? {
+                    ...t,
+                    id: nextTabId,
+                    title: nextTitle,
+                    filePath: resolvedAltPath,
+                  }
+                : t,
+            );
+        return {
+          ...s,
+          sidePanelTabs: nextTabs,
+          activeSidePanelTabId:
+            s.activeSidePanelTabId === tabId ? nextTabId : s.activeSidePanelTabId,
+        };
+      });
+    };
+
+    void (async () => {
+      await orbitActions.loadWorkspaceFile(hostId, cwd, cleanPath, false);
+      const primaryKey = `${hostId}::${cwd}::${cleanPath}`;
+      if (state.fileViewCache[primaryKey]?.status !== "error") return;
+
+      const trySuffixResolve = async (candidate: string): Promise<string | null> => {
+        if (!cwd || cwd === "~" || candidate.startsWith("/") || candidate.startsWith("~/")) {
+          return null;
+        }
+        await orbitActions.ensureWorkspaceFiles(hostId, cwd);
+        const cacheFiles = state.workspaceFilesCache[`${hostId}::${cwd}`];
+        const match = resolveUniqueWorkspaceFileSuffix(candidate, cacheFiles);
+        return match && match !== cleanPath ? match : null;
+      };
+
+      const fallbackCandidate = opts?.fallbackPath
+        ? normalizeWorkspacePathCandidate(opts.fallbackPath, cwd)
+        : null;
+      if (fallbackCandidate && fallbackCandidate !== cleanPath) {
+        const fallbackFromCache =
+          !fallbackCandidate.startsWith("/") && !fallbackCandidate.startsWith("~/")
+            ? resolveUniqueWorkspaceFileSuffix(
+                fallbackCandidate,
+                state.workspaceFilesCache[`${hostId}::${cwd}`],
+              )
+            : null;
+        const directAlt = fallbackFromCache ?? fallbackCandidate;
+        await orbitActions.loadWorkspaceFile(hostId, cwd, directAlt, false);
+        const altKey = `${hostId}::${cwd}::${directAlt}`;
+        if (state.fileViewCache[altKey]?.status === "ready") {
+          replaceFailedFileTab(directAlt);
+          return;
+        }
+        const suffixFromFallback = await trySuffixResolve(fallbackCandidate);
+        if (suffixFromFallback) {
+          await orbitActions.loadWorkspaceFile(hostId, cwd, suffixFromFallback, false);
+          if (state.fileViewCache[`${hostId}::${cwd}::${suffixFromFallback}`]?.status === "ready") {
+            replaceFailedFileTab(suffixFromFallback);
+          }
+        }
+        return;
+      }
+
+      const suffixMatch = await trySuffixResolve(cleanPath);
+      if (suffixMatch) {
+        await orbitActions.loadWorkspaceFile(hostId, cwd, suffixMatch, false);
+        if (state.fileViewCache[`${hostId}::${cwd}::${suffixMatch}`]?.status === "ready") {
+          replaceFailedFileTab(suffixMatch);
+        }
+      }
+    })();
   },
 
   async loadWorkspaceFile(
@@ -3719,7 +3717,7 @@ export const orbitActions = {
     const currentAgent =
       !state.isDraftNewSession && state.selectedAgentId
         ? detail?.agents.find((a) => a.agent_id === state.selectedAgentId) ??
-          state.timelines[`${hostId}::${state.selectedAgentId}`]?.agent ??
+          state.stages[`${hostId}::${state.selectedAgentId}`]?.agent ??
           null
         : null;
 
@@ -3739,17 +3737,14 @@ export const orbitActions = {
       gitReview?.status?.branch ??
       detail?.workspaces.find((w) => w.cwd === cwd)?.git_branch ??
       null;
-    const items =
+    const rustContext =
       !state.isDraftNewSession && state.selectedAgentId
-        ? (state.timelines[`${hostId}::${state.selectedAgentId}`]?.items ?? [])
-        : [];
-
-    const contextSummary = buildSideQuestionContextSummary({
-      cwd,
-      branchName,
-      items,
-      gitReview,
-    });
+        ? await orbitIpc
+            .buildSideQuestionContext(hostId, state.selectedAgentId, 3000)
+            .catch(() => "")
+        : "";
+    const contextSummary =
+      rustContext || `Workspace: ${cwd || "~"}${branchName ? ` (branch: ${branchName})` : ""}`;
 
     const entryId = `sq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const newEntry: SideQuestionEntry = {
@@ -3900,7 +3895,7 @@ export const orbitActions = {
 
     if (hostId && params.childAgentId) {
       void orbitIpc.openAgentTimeline(hostId, params.childAgentId);
-      void orbitActions.pullTimelineDelta(hostId, params.childAgentId, false);
+      void orbitActions.pullStageDelta(hostId, params.childAgentId, false);
     }
   },
 
@@ -4261,6 +4256,20 @@ export const orbitActions = {
     return state;
   },
 };
+
+let nextFileFocusNonce = 1;
+
+registerOrbitLinkOpener({
+  openFile(rawPath, opts) {
+    orbitActions.openFileInSidePanel(rawPath, opts);
+  },
+  openBrowser(url) {
+    orbitActions.openBrowserTab(url);
+  },
+  openExternal(url) {
+    void orbitIpc.openExternalBrowserUrl(url);
+  },
+});
 
 function subscribeStore(onStoreChange: () => void): () => void {
   listeners.add(onStoreChange);

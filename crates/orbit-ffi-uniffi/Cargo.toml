@@ -20,3 +20,6 @@ orbit-client-core.workspace = true
 orbit-protocol.workspace = true
 thiserror.workspace = true
 uniffi = { workspace = true, features = ["cli"] }
+
+[dev-dependencies]
+orbit-crypto.workspace = true

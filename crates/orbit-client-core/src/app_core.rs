@@ -4,7 +4,7 @@
 //! - Android (minSdk 29 / targetSdk 36): Kotlin + Jetpack Compose (via `orbit-ffi-uniffi`)
 //! - HarmonyOS 7+ (API 26): ArkTS + ArkUI V2 (via `orbit-ffi-ohos`)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -23,6 +23,7 @@ use orbit_protocol::{
     TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
     WorkspaceIsolation, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
 };
+pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -36,10 +37,26 @@ use crate::render::{
     detect_language_for_path, highlight_code_lines_capped, parse_markdown_blocks,
     parse_unified_diff,
 };
+use crate::stage::{self, SessionInsightsView, StageTurnView};
 use crate::{
     ClientCoreError, ClientInboundEvent, HostConnectionState, HostRouteMode, HostSessionHandle,
     SavedHostProfile, connect_smart,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeOptions {
+    pub min_interval_ms: u64,
+    pub include_terminal_raw_bytes: bool,
+}
+
+impl Default for SubscribeOptions {
+    fn default() -> Self {
+        Self {
+            min_interval_ms: 0,
+            include_terminal_raw_bytes: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -161,6 +178,12 @@ pub struct AgentCardView {
     pub labels: HashMap<String, String>,
     pub latest_seq: u64,
     pub updated_at_rfc3339: String,
+    #[serde(default)]
+    pub is_pinned: bool,
+    #[serde(default)]
+    pub seen_seq: u64,
+    #[serde(default)]
+    pub is_unread: bool,
 }
 
 pub struct CreateAgentRequest<'a> {
@@ -372,14 +395,17 @@ pub enum SideQuestionStreamEvent {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AskSideQuestionRequest {
     pub host_id: String,
+    #[serde(default)]
     pub agent_id: Option<String>,
     pub cwd: String,
     pub provider: ProviderKind,
+    #[serde(default)]
     pub model: Option<String>,
     pub question: String,
+    #[serde(default)]
     pub context_summary: String,
 }
 
@@ -399,6 +425,32 @@ struct AttachmentStageAck {
     path: Option<String>,
     filename: Option<String>,
     size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StageDirtyState {
+    dirty_from_event_idx: Option<usize>,
+    force_full: bool,
+    meta_dirty: bool,
+    aux_dirty: bool,
+}
+
+struct CachedAgentStage {
+    rendered_by_event: Vec<Option<TimelineItemView>>,
+    items: Vec<TimelineItemView>,
+    event_to_item_idx: Vec<usize>,
+    turns: Vec<StageTurnView>,
+    turn_item_starts: Vec<usize>,
+    pending_permissions: Vec<TimelineItemView>,
+    pending_questions: Vec<TimelineItemView>,
+    session_turn_diffs: Vec<DiffFileView>,
+    insights: SessionInsightsView,
+    stage_revision: u64,
+    aux_revision: u64,
+    last_reset_revision: u64,
+    history_floor_revision: u64,
+    delta_history: VecDeque<(u64, usize)>,
+    latest_seq: u64,
 }
 
 struct HostMemoryState {
@@ -429,19 +481,24 @@ struct HostMemoryState {
     agent_req_by_req_id: HashMap<Uuid, String>,
     replaced_optimistic_agents: HashMap<String, String>,
     last_created_agent_id: Option<String>,
+    initial_agents_hydrated: bool,
     discovered_projects: Vec<DiscoveredProject>,
     directory_listing: Option<DirectoryListingView>,
     models_by_provider: HashMap<ProviderKind, Vec<ModelOption>>,
     workspaces: Vec<WorkspaceSummary>,
     agents: HashMap<String, AgentSummary>,
     timelines: HashMap<String, Vec<TimelineEvent>>,
-    markdown_cache: HashMap<(String, u64, usize, bool), Vec<RichBlockView>>,
+    stage_cache: HashMap<String, CachedAgentStage>,
+    stage_dirty: HashMap<String, StageDirtyState>,
+    markdown_cache: HashMap<(String, u64, usize), Vec<RichBlockView>>,
+    streaming_markdown_cache: HashMap<(String, String), (usize, Vec<RichBlockView>)>,
     quotas: Vec<ProviderQuotaSnapshot>,
     provider_catalogs: Vec<ProviderModelCatalog>,
     terminals: Vec<TerminalSummary>,
     active_terminal_id: Option<String>,
     active_terminal_slot: u8,
-    terminal_emulator: TerminalGridEmulator,
+    slot_terminal_ids: HashMap<u8, String>,
+    terminal_emulators: HashMap<u8, TerminalGridEmulator>,
     git_statuses: HashMap<String, GitStatusSnapshot>,
     git_diffs: HashMap<String, String>,
     workspace_files: HashMap<String, Vec<String>>,
@@ -459,6 +516,8 @@ struct HostMemoryState {
 
 impl HostMemoryState {
     fn new(profile: SavedHostProfile) -> Self {
+        let mut terminal_emulators = HashMap::new();
+        terminal_emulators.insert(1, TerminalGridEmulator::new(100, 30));
         Self {
             profile,
             is_local: false,
@@ -487,19 +546,24 @@ impl HostMemoryState {
             agent_req_by_req_id: HashMap::new(),
             replaced_optimistic_agents: HashMap::new(),
             last_created_agent_id: None,
+            initial_agents_hydrated: false,
             discovered_projects: Vec::new(),
             directory_listing: None,
             models_by_provider: default_client_models_map(),
             workspaces: Vec::new(),
             agents: HashMap::new(),
             timelines: HashMap::new(),
+            stage_cache: HashMap::new(),
+            stage_dirty: HashMap::new(),
             markdown_cache: HashMap::new(),
+            streaming_markdown_cache: HashMap::new(),
             quotas: Vec::new(),
             provider_catalogs: Vec::new(),
             terminals: Vec::new(),
             active_terminal_id: None,
             active_terminal_slot: 1,
-            terminal_emulator: TerminalGridEmulator::new(100, 30),
+            slot_terminal_ids: HashMap::new(),
+            terminal_emulators,
             git_statuses: HashMap::new(),
             git_diffs: HashMap::new(),
             workspace_files: HashMap::new(),
@@ -514,6 +578,39 @@ impl HostMemoryState {
             provider_subagents: HashMap::new(),
             provider_subagent_timelines: HashMap::new(),
         }
+    }
+
+    fn mark_stage_dirty(&mut self, agent_id: &str, event_idx: usize, force_full: bool) {
+        self.mark_stage_dirty_with_aux(agent_id, event_idx, force_full, true);
+    }
+
+    fn mark_stage_dirty_with_aux(
+        &mut self,
+        agent_id: &str,
+        event_idx: usize,
+        force_full: bool,
+        aux_dirty: bool,
+    ) {
+        let entry = self.stage_dirty.entry(agent_id.to_string()).or_default();
+        entry.force_full |= force_full;
+        entry.aux_dirty |= force_full || aux_dirty;
+        entry.dirty_from_event_idx = Some(match entry.dirty_from_event_idx {
+            Some(prev) => prev.min(event_idx),
+            None => event_idx,
+        });
+    }
+
+    fn mark_stage_meta_dirty(&mut self, agent_id: &str) {
+        self.stage_dirty
+            .entry(agent_id.to_string())
+            .or_default()
+            .meta_dirty = true;
+    }
+
+    fn emulator_slot_mut(&mut self, slot: u8) -> &mut TerminalGridEmulator {
+        self.terminal_emulators
+            .entry(slot)
+            .or_insert_with(|| TerminalGridEmulator::new(100, 30))
     }
 
     fn to_stored_host(&self) -> StoredHostProfile {
@@ -584,6 +681,8 @@ pub struct OrbitAppCore {
     store: Arc<OrbitStore>,
     hosts: Arc<RwLock<HashMap<String, HostMemoryState>>>,
     projects: Arc<RwLock<HashMap<String, ClientProjectView>>>,
+    thread_prefs: Arc<RwLock<HashMap<(String, String), ClientThreadPref>>>,
+    pin_order_seq: Arc<AtomicU64>,
     subscribers: Arc<Mutex<Vec<Arc<dyn CoreEventSubscriber>>>>,
     revision: Arc<AtomicU64>,
 }
@@ -620,6 +719,17 @@ impl OrbitAppCore {
             .build()
             .map_err(|e| ClientCoreError::Handshake(format!("tokio init failed: {e}")))?;
 
+        let mut initial_prefs: HashMap<(String, String), ClientThreadPref> = HashMap::new();
+        let mut max_pin_order = unix_ms_now();
+        if let Ok(saved_prefs) = store.list_client_thread_prefs() {
+            for pref in saved_prefs {
+                if pref.pinned_order > 0 {
+                    max_pin_order = max_pin_order.max(pref.pinned_order as u64);
+                }
+                initial_prefs.insert((pref.host_id.clone(), pref.agent_id.clone()), pref);
+            }
+        }
+
         let mut initial_hosts = HashMap::new();
         if let Ok(saved) = store.list_client_hosts() {
             for h in saved {
@@ -641,7 +751,20 @@ impl OrbitAppCore {
                     mem.workspaces = ws_list;
                 }
                 if let Ok(ag_list) = store.list_replica_agents(&h.host_id) {
+                    if !ag_list.is_empty() {
+                        mem.initial_agents_hydrated = true;
+                    }
                     for ag in ag_list {
+                        initial_prefs
+                            .entry((h.host_id.clone(), ag.agent_id.clone()))
+                            .or_insert_with(|| ClientThreadPref {
+                                host_id: h.host_id.clone(),
+                                agent_id: ag.agent_id.clone(),
+                                seen_seq: ag.latest_seq,
+                                is_pinned: false,
+                                pinned_order: 0,
+                                updated_at_ms: 0,
+                            });
                         mem.agents.insert(ag.agent_id.clone(), ag);
                     }
                 }
@@ -710,28 +833,49 @@ impl OrbitAppCore {
             store,
             hosts: Arc::new(RwLock::new(initial_hosts)),
             projects: Arc::new(RwLock::new(initial_projects)),
+            thread_prefs: Arc::new(RwLock::new(initial_prefs)),
+            pin_order_seq: Arc::new(AtomicU64::new(max_pin_order.saturating_add(1))),
             subscribers: Arc::new(Mutex::new(Vec::new())),
             revision: Arc::new(AtomicU64::new(1)),
         }))
     }
 
     pub fn subscribe(&self, sub: Arc<dyn CoreEventSubscriber>) {
-        if let Ok(mut guard) = self.subscribers.lock() {
-            guard.push(sub);
-        }
+        self.subscribe_with_options(SubscribeOptions::default(), sub);
     }
 
     pub fn subscribe_coalesced(&self, min_interval_ms: u64, sub: Arc<dyn CoreEventSubscriber>) {
-        if min_interval_ms == 0 {
-            self.subscribe(sub);
-            return;
-        }
-        let coalesced = Arc::new(CoalescingSubscriber::new(
+        self.subscribe_with_options(
+            SubscribeOptions {
+                min_interval_ms,
+                include_terminal_raw_bytes: false,
+            },
             sub,
-            self.runtime.handle().clone(),
-            Duration::from_millis(min_interval_ms),
-        ));
-        self.subscribe(coalesced);
+        );
+    }
+
+    pub fn subscribe_with_options(
+        &self,
+        options: SubscribeOptions,
+        sub: Arc<dyn CoreEventSubscriber>,
+    ) {
+        let wrapped: Arc<dyn CoreEventSubscriber> = if options.min_interval_ms == 0 {
+            if options.include_terminal_raw_bytes {
+                sub
+            } else {
+                Arc::new(StripTerminalBytesSubscriber { downstream: sub })
+            }
+        } else {
+            Arc::new(CoalescingSubscriber::new(
+                sub,
+                self.runtime.handle().clone(),
+                Duration::from_millis(options.min_interval_ms),
+                options.include_terminal_raw_bytes,
+            ))
+        };
+        if let Ok(mut guard) = self.subscribers.lock() {
+            guard.push(wrapped);
+        }
     }
 
     pub fn discover_local_daemon_uri(&self) -> Option<String> {
@@ -787,8 +931,17 @@ impl OrbitAppCore {
         let rev = self.revision.load(Ordering::SeqCst);
         let guard = self.hosts.read().ok()?;
         let state = guard.get(host_id)?;
-        let mut agents: Vec<AgentCardView> =
-            state.agents.values().map(agent_to_card_view).collect();
+        let prefs_guard = self.thread_prefs.read().ok();
+        let mut agents: Vec<AgentCardView> = state
+            .agents
+            .values()
+            .map(|a| {
+                let pref = prefs_guard
+                    .as_ref()
+                    .and_then(|p| p.get(&(host_id.to_string(), a.agent_id.clone())));
+                agent_to_card_view(a, pref)
+            })
+            .collect();
         agents.sort_by(|a, b| b.updated_at_rfc3339.cmp(&a.updated_at_rfc3339));
         Some(HostDetailView {
             revision: rev,
@@ -818,27 +971,393 @@ impl OrbitAppCore {
         })
     }
 
-    pub fn agent_stage(&self, host_id: &str, agent_id: &str) -> crate::stage::AgentStageView {
-        let tl = self.agent_timeline(host_id, agent_id);
-        let cwd = tl.agent.as_ref().map(|a| a.cwd.as_str());
-        let latest_seq = tl
-            .items
-            .iter()
-            .map(crate::stage::timeline_item_seq)
-            .max()
-            .unwrap_or_else(|| tl.agent.as_ref().map(|a| a.latest_seq).unwrap_or(0));
-        let (turns, pending_permissions, pending_questions, session_turn_diffs) =
-            crate::stage::process_timeline_for_stage(&tl.items, cwd);
-        crate::stage::AgentStageView {
-            revision: tl.revision,
-            host_id: tl.host_id,
-            agent: tl.agent,
-            turns,
-            pending_permissions,
-            pending_questions,
-            session_turn_diffs,
-            latest_seq,
+    fn hydrate_timeline_if_missing(
+        &self,
+        host_state: &mut HostMemoryState,
+        agent_id: &str,
+    ) -> bool {
+        if !host_state.timelines.contains_key(agent_id)
+            && !agent_id.starts_with("opt_")
+            && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 50_000)
+            && !cached.is_empty()
+        {
+            let mut coalesced = Vec::with_capacity(cached.len());
+            for ev in cached {
+                coalesce_or_push_timeline(&mut coalesced, ev);
+            }
+            host_state.timelines.insert(agent_id.to_string(), coalesced);
+            host_state.mark_stage_dirty(agent_id, 0, true);
+            return true;
         }
+        false
+    }
+
+    fn ensure_stage_fresh_and_read<R>(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        reader: impl FnOnce(Option<&AgentCardView>, Option<&CachedAgentStage>) -> R,
+    ) -> R {
+        let Ok(mut guard) = self.hosts.write() else {
+            return reader(None, None);
+        };
+        let Some(host_state) = guard.get_mut(host_id) else {
+            return reader(None, None);
+        };
+
+        self.hydrate_timeline_if_missing(host_state, agent_id);
+
+        let prefs_guard = self.thread_prefs.read().ok();
+        let card_for = |ag: &AgentSummary| -> AgentCardView {
+            let pref = prefs_guard
+                .as_ref()
+                .and_then(|p| p.get(&(host_id.to_string(), ag.agent_id.clone())));
+            agent_to_card_view(ag, pref)
+        };
+
+        let current_agent_card = host_state.agents.get(agent_id).map(&card_for);
+        let dirty = host_state.stage_dirty.remove(agent_id);
+        let needs_build = !host_state.stage_cache.contains_key(agent_id);
+
+        if needs_build || dirty.is_some() {
+            let host_agent_cards: Vec<AgentCardView> =
+                host_state.agents.values().map(&card_for).collect();
+            let raw_events: &[TimelineEvent] = host_state
+                .timelines
+                .get(agent_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let cwd_owned = current_agent_card.as_ref().map(|a| a.cwd.clone());
+            let cwd = cwd_owned.as_deref();
+            let latest_seq = raw_events
+                .iter()
+                .map(|e| e.seq)
+                .max()
+                .filter(|&s| s > 0)
+                .unwrap_or_else(|| {
+                    current_agent_card
+                        .as_ref()
+                        .map(|a| a.latest_seq)
+                        .unwrap_or(0)
+                });
+
+            let dirty_state = dirty.unwrap_or(StageDirtyState {
+                dirty_from_event_idx: Some(0),
+                force_full: true,
+                meta_dirty: true,
+                aux_dirty: true,
+            });
+            let (all_resolved_perms, all_resolved_questions) = collect_resolved_gates(raw_events);
+
+            let force_full = needs_build
+                || dirty_state.force_full
+                || dirty_state.dirty_from_event_idx == Some(0)
+                || host_state
+                    .stage_cache
+                    .get(agent_id)
+                    .is_some_and(|c| raw_events.len() < c.rendered_by_event.len());
+
+            if force_full {
+                let (prev_rev, prev_aux_rev) = host_state
+                    .stage_cache
+                    .get(agent_id)
+                    .map(|c| (c.stage_revision, c.aux_revision))
+                    .unwrap_or((0, 0));
+                let next_rev = prev_rev.saturating_add(1).max(1);
+                let next_aux_rev = prev_aux_rev.saturating_add(1).max(1);
+
+                let mut rendered_by_event = Vec::with_capacity(raw_events.len());
+                let mut items = Vec::with_capacity(raw_events.len());
+                let mut event_to_item_idx = Vec::with_capacity(raw_events.len());
+                for ev in raw_events {
+                    event_to_item_idx.push(items.len());
+                    let rendered = render_timeline_event_view(
+                        agent_id,
+                        cwd,
+                        ev,
+                        &all_resolved_perms,
+                        &all_resolved_questions,
+                        &mut host_state.markdown_cache,
+                        &mut host_state.streaming_markdown_cache,
+                    );
+                    if let Some(ref item) = rendered {
+                        items.push(item.clone());
+                    }
+                    rendered_by_event.push(rendered);
+                }
+
+                let sliced = stage::process_timeline_turns_slice(&items, 0, 0, cwd);
+                let (pending_permissions, pending_questions, session_turn_diffs, insights) =
+                    stage::collect_stage_auxiliary_state(
+                        &items,
+                        cwd,
+                        current_agent_card.as_ref(),
+                        &host_agent_cards,
+                    );
+
+                host_state.stage_cache.insert(
+                    agent_id.to_string(),
+                    CachedAgentStage {
+                        rendered_by_event,
+                        items,
+                        event_to_item_idx,
+                        turns: sliced.turns,
+                        turn_item_starts: sliced.turn_item_starts,
+                        pending_permissions,
+                        pending_questions,
+                        session_turn_diffs,
+                        insights,
+                        stage_revision: next_rev,
+                        aux_revision: next_aux_rev,
+                        last_reset_revision: next_rev,
+                        history_floor_revision: next_rev,
+                        delta_history: VecDeque::new(),
+                        latest_seq,
+                    },
+                );
+            } else if let Some(cached) = host_state.stage_cache.get_mut(agent_id) {
+                let mut replace_from_turn_idx = cached.turns.len();
+                if let Some(dirty_idx) = dirty_state.dirty_from_event_idx {
+                    let clamped_idx = dirty_idx.min(cached.rendered_by_event.len());
+                    let base_item_idx = if clamped_idx < cached.event_to_item_idx.len() {
+                        cached.event_to_item_idx[clamped_idx]
+                    } else {
+                        cached.items.len()
+                    };
+                    cached.rendered_by_event.truncate(clamped_idx);
+                    cached.event_to_item_idx.truncate(clamped_idx);
+                    cached.items.truncate(base_item_idx);
+
+                    for ev in raw_events.iter().skip(clamped_idx) {
+                        cached.event_to_item_idx.push(cached.items.len());
+                        let rendered = render_timeline_event_view(
+                            agent_id,
+                            cwd,
+                            ev,
+                            &all_resolved_perms,
+                            &all_resolved_questions,
+                            &mut host_state.markdown_cache,
+                            &mut host_state.streaming_markdown_cache,
+                        );
+                        if let Some(ref item) = rendered {
+                            cached.items.push(item.clone());
+                        }
+                        cached.rendered_by_event.push(rendered);
+                    }
+
+                    replace_from_turn_idx = if cached.turn_item_starts.is_empty() {
+                        0
+                    } else {
+                        cached
+                            .turn_item_starts
+                            .partition_point(|&start| start <= base_item_idx)
+                            .saturating_sub(1)
+                    };
+                    let start_item_idx = if replace_from_turn_idx == 0 {
+                        0
+                    } else {
+                        cached.turn_item_starts[replace_from_turn_idx]
+                    };
+                    cached.turns.truncate(replace_from_turn_idx);
+                    cached.turn_item_starts.truncate(replace_from_turn_idx);
+
+                    let sliced = stage::process_timeline_turns_slice(
+                        &cached.items,
+                        start_item_idx,
+                        replace_from_turn_idx as u32,
+                        cwd,
+                    );
+                    cached.turns.extend(sliced.turns);
+                    cached.turn_item_starts.extend(sliced.turn_item_starts);
+                }
+
+                if dirty_state.aux_dirty || dirty_state.meta_dirty {
+                    let (pending_permissions, pending_questions, session_turn_diffs, insights) =
+                        stage::collect_stage_auxiliary_state(
+                            &cached.items,
+                            cwd,
+                            current_agent_card.as_ref(),
+                            &host_agent_cards,
+                        );
+                    cached.pending_permissions = pending_permissions;
+                    cached.pending_questions = pending_questions;
+                    cached.session_turn_diffs = session_turn_diffs;
+                    cached.insights = insights;
+                    cached.aux_revision = cached.aux_revision.saturating_add(1);
+                }
+                cached.latest_seq = latest_seq;
+                cached.stage_revision = cached.stage_revision.saturating_add(1);
+                cached.delta_history.push_back((
+                    cached.stage_revision,
+                    replace_from_turn_idx.min(cached.turns.len()),
+                ));
+                while cached.delta_history.len() > 64 {
+                    if let Some((evicted_rev, _)) = cached.delta_history.pop_front() {
+                        cached.history_floor_revision =
+                            cached.history_floor_revision.max(evicted_rev);
+                    }
+                }
+            }
+        }
+
+        let cached_ref = host_state.stage_cache.get(agent_id);
+        reader(current_agent_card.as_ref(), cached_ref)
+    }
+
+    pub fn agent_stage(&self, host_id: &str, agent_id: &str) -> crate::stage::AgentStageView {
+        self.ensure_stage_fresh_and_read(host_id, agent_id, |agent, cached| match cached {
+            Some(c) => crate::stage::AgentStageView {
+                revision: c.stage_revision,
+                host_id: host_id.to_string(),
+                agent: agent.cloned(),
+                turns: c.turns.clone(),
+                pending_permissions: c.pending_permissions.clone(),
+                pending_questions: c.pending_questions.clone(),
+                session_turn_diffs: c.session_turn_diffs.clone(),
+                insights: c.insights.clone(),
+                latest_seq: c.latest_seq,
+            },
+            None => crate::stage::AgentStageView {
+                revision: 0,
+                host_id: host_id.to_string(),
+                agent: agent.cloned(),
+                turns: Vec::new(),
+                pending_permissions: Vec::new(),
+                pending_questions: Vec::new(),
+                session_turn_diffs: Vec::new(),
+                insights: crate::stage::SessionInsightsView::default(),
+                latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
+            },
+        })
+    }
+
+    pub fn agent_stage_delta(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        since_revision: u64,
+    ) -> crate::stage::AgentStageDeltaView {
+        self.agent_stage_delta_with_aux(host_id, agent_id, since_revision, None)
+    }
+
+    pub fn agent_stage_delta_with_aux(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        since_revision: u64,
+        since_aux_revision: Option<u64>,
+    ) -> crate::stage::AgentStageDeltaView {
+        self.ensure_stage_fresh_and_read(host_id, agent_id, |agent, cached| {
+            let Some(c) = cached else {
+                return crate::stage::AgentStageDeltaView {
+                    revision: 0,
+                    host_id: host_id.to_string(),
+                    agent: agent.cloned(),
+                    replace_from_turn_index: 0,
+                    changed_turns: Vec::new(),
+                    total_turn_count: 0,
+                    pending_permissions: Vec::new(),
+                    pending_questions: Vec::new(),
+                    session_turn_diffs: Vec::new(),
+                    insights: crate::stage::SessionInsightsView::default(),
+                    latest_seq: agent.map(|a| a.latest_seq).unwrap_or(0),
+                    reset: since_revision > 0,
+                    aux_revision: 0,
+                    aux_unchanged: false,
+                };
+            };
+
+            let total_turns = c.turns.len();
+            if since_revision == c.stage_revision {
+                let aux_unchanged =
+                    matches!(since_aux_revision, Some(prev_aux) if prev_aux == c.aux_revision);
+                return crate::stage::AgentStageDeltaView {
+                    revision: c.stage_revision,
+                    host_id: host_id.to_string(),
+                    agent: agent.cloned(),
+                    replace_from_turn_index: total_turns as u32,
+                    changed_turns: Vec::new(),
+                    total_turn_count: total_turns as u32,
+                    pending_permissions: if aux_unchanged {
+                        Vec::new()
+                    } else {
+                        c.pending_permissions.clone()
+                    },
+                    pending_questions: if aux_unchanged {
+                        Vec::new()
+                    } else {
+                        c.pending_questions.clone()
+                    },
+                    session_turn_diffs: if aux_unchanged {
+                        Vec::new()
+                    } else {
+                        c.session_turn_diffs.clone()
+                    },
+                    insights: if aux_unchanged {
+                        crate::stage::SessionInsightsView::default()
+                    } else {
+                        c.insights.clone()
+                    },
+                    latest_seq: c.latest_seq,
+                    reset: false,
+                    aux_revision: c.aux_revision,
+                    aux_unchanged,
+                };
+            }
+
+            let needs_reset = since_revision == 0
+                || since_revision > c.stage_revision
+                || since_revision < c.last_reset_revision
+                || since_revision < c.history_floor_revision;
+
+            let replace_from = if needs_reset {
+                0
+            } else {
+                c.delta_history
+                    .iter()
+                    .filter(|(rev, _)| *rev > since_revision)
+                    .map(|(_, idx)| *idx)
+                    .min()
+                    .unwrap_or(total_turns)
+                    .min(total_turns)
+            };
+
+            let aux_unchanged = !needs_reset
+                && matches!(since_aux_revision, Some(prev_aux) if prev_aux == c.aux_revision);
+
+            crate::stage::AgentStageDeltaView {
+                revision: c.stage_revision,
+                host_id: host_id.to_string(),
+                agent: agent.cloned(),
+                replace_from_turn_index: replace_from as u32,
+                changed_turns: c.turns[replace_from..].to_vec(),
+                total_turn_count: total_turns as u32,
+                pending_permissions: if aux_unchanged {
+                    Vec::new()
+                } else {
+                    c.pending_permissions.clone()
+                },
+                pending_questions: if aux_unchanged {
+                    Vec::new()
+                } else {
+                    c.pending_questions.clone()
+                },
+                session_turn_diffs: if aux_unchanged {
+                    Vec::new()
+                } else {
+                    c.session_turn_diffs.clone()
+                },
+                insights: if aux_unchanged {
+                    crate::stage::SessionInsightsView::default()
+                } else {
+                    c.insights.clone()
+                },
+                latest_seq: c.latest_seq,
+                reset: needs_reset,
+                aux_revision: c.aux_revision,
+                aux_unchanged,
+            }
+        })
     }
 
     pub fn agent_timeline(&self, host_id: &str, agent_id: &str) -> AgentTimelineView {
@@ -884,19 +1403,17 @@ impl OrbitAppCore {
         };
 
         // Hydrate from local SQLite replica on first open for 0ms offline-first rendering
-        if !host_state.timelines.contains_key(agent_id)
-            && !agent_id.starts_with("opt_")
-            && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 50_000)
-            && !cached.is_empty()
-        {
-            let mut coalesced = Vec::with_capacity(cached.len());
-            for ev in cached {
-                coalesce_or_push_timeline(&mut coalesced, ev);
-            }
-            host_state.timelines.insert(agent_id.to_string(), coalesced);
-        }
+        self.hydrate_timeline_if_missing(host_state, agent_id);
 
-        let agent_card = host_state.agents.get(agent_id).map(agent_to_card_view);
+        let agent_card = {
+            let prefs_guard = self.thread_prefs.read().ok();
+            host_state.agents.get(agent_id).map(|a| {
+                let pref = prefs_guard
+                    .as_ref()
+                    .and_then(|p| p.get(&(host_id.to_string(), a.agent_id.clone())));
+                agent_to_card_view(a, pref)
+            })
+        };
         let agent_cwd = agent_card.as_ref().map(|a| a.cwd.clone());
         let events = host_state
             .timelines
@@ -952,190 +1469,16 @@ impl OrbitAppCore {
             if effective_since_seq > 0 && ev.seq <= effective_since_seq && !is_local_notice {
                 continue;
             }
-            let ts_ms = Some(ev.timestamp.timestamp_millis());
-            match &ev.payload {
-                TimelinePayload::UserPrompt {
-                    message_id,
-                    text,
-                    badges,
-                } => {
-                    let key = (agent_id.to_string(), ev.seq, text.len(), false);
-                    if host_state.markdown_cache.len() > 2048 {
-                        host_state.markdown_cache.clear();
-                    }
-                    let blocks = host_state
-                        .markdown_cache
-                        .entry(key)
-                        .or_insert_with(|| parse_markdown_blocks(text, false))
-                        .clone();
-                    upserted_items.push(TimelineItemView::UserPrompt {
-                        seq: ev.seq,
-                        message_id: message_id.clone(),
-                        text: text.clone(),
-                        badges: badges.clone(),
-                        blocks,
-                        timestamp_ms: ts_ms,
-                    });
-                }
-                TimelinePayload::AssistantThinking { item_id, text } => {
-                    upserted_items.push(TimelineItemView::AssistantThinking {
-                        seq: ev.seq,
-                        item_id: item_id.clone(),
-                        text: text.trim().to_string(),
-                        timestamp_ms: ts_ms,
-                    });
-                }
-                TimelinePayload::AssistantMessage {
-                    item_id,
-                    text,
-                    streaming,
-                } => {
-                    if let Some(warning_msg) = extract_legacy_provider_warning_text(text) {
-                        upserted_items.push(TimelineItemView::Notice {
-                            seq: ev.seq,
-                            level: "warning".into(),
-                            message: warning_msg,
-                            timestamp_ms: ts_ms,
-                        });
-                    } else {
-                        let key = (agent_id.to_string(), ev.seq, text.len(), *streaming);
-                        if host_state.markdown_cache.len() > 2048 {
-                            host_state.markdown_cache.clear();
-                        }
-                        let blocks = host_state
-                            .markdown_cache
-                            .entry(key)
-                            .or_insert_with(|| parse_markdown_blocks(text, *streaming))
-                            .clone();
-                        upserted_items.push(TimelineItemView::AssistantMessage {
-                            seq: ev.seq,
-                            item_id: item_id.clone(),
-                            text: text.clone(),
-                            streaming: *streaming,
-                            blocks,
-                            timestamp_ms: ts_ms,
-                        });
-                    }
-                }
-                TimelinePayload::ToolCall {
-                    call_id,
-                    status,
-                    detail,
-                } => {
-                    let (summary_title, diff_files) = summarize_tool_detail(detail);
-                    let step_descriptor = Some(crate::stage::describe_tool_detail(
-                        *status,
-                        &summary_title,
-                        detail,
-                        &diff_files,
-                        agent_cwd.as_deref(),
-                    ));
-                    upserted_items.push(TimelineItemView::ToolCall {
-                        seq: ev.seq,
-                        call_id: call_id.clone(),
-                        status: *status,
-                        summary_title,
-                        detail: detail.clone(),
-                        step_descriptor,
-                        diff_files,
-                        timestamp_ms: ts_ms,
-                    });
-                }
-                TimelinePayload::PermissionRequest {
-                    request_id,
-                    title,
-                    detail,
-                    allowed_decisions,
-                } => {
-                    upserted_items.push(TimelineItemView::PermissionRequest {
-                        seq: ev.seq,
-                        request_id: request_id.clone(),
-                        title: title.clone(),
-                        detail: detail.clone(),
-                        allowed_decisions: allowed_decisions.clone(),
-                        resolved_decision: all_resolved_perms.get(request_id).cloned(),
-                        timestamp_ms: ts_ms,
-                    });
-                }
-                TimelinePayload::QuestionRequest {
-                    request_id,
-                    questions,
-                } => {
-                    upserted_items.push(TimelineItemView::QuestionRequest {
-                        seq: ev.seq,
-                        request_id: request_id.clone(),
-                        questions: questions.clone(),
-                        resolved_answers: all_resolved_questions.get(request_id).cloned(),
-                        timestamp_ms: ts_ms,
-                    });
-                }
-                TimelinePayload::Notice { level, message } => {
-                    upserted_items.push(TimelineItemView::Notice {
-                        seq: ev.seq,
-                        level: level.clone(),
-                        message: message.clone(),
-                        timestamp_ms: ts_ms,
-                    });
-                }
-                TimelinePayload::AgentMessage {
-                    message_id,
-                    kind,
-                    source_agent_id,
-                    source_host_id,
-                    source_title,
-                    event,
-                    text,
-                    permission_context,
-                } => {
-                    let key = (agent_id.to_string(), ev.seq, text.len(), false);
-                    if host_state.markdown_cache.len() > 2048 {
-                        host_state.markdown_cache.clear();
-                    }
-                    let blocks = host_state
-                        .markdown_cache
-                        .entry(key)
-                        .or_insert_with(|| parse_markdown_blocks(text, false))
-                        .clone();
-                    upserted_items.push(TimelineItemView::AgentMessage {
-                        seq: ev.seq,
-                        message_id: message_id.clone(),
-                        kind: *kind,
-                        source_agent_id: source_agent_id.clone(),
-                        source_host_id: source_host_id.clone(),
-                        source_title: source_title.clone(),
-                        event: event.clone(),
-                        text: text.clone(),
-                        permission_context: permission_context.clone(),
-                        blocks,
-                        timestamp_ms: ts_ms,
-                    });
-                }
-                TimelinePayload::StatusChanged {
-                    status: AgentStatus::Error { message, .. },
-                } => {
-                    if !message.trim().is_empty() {
-                        upserted_items.push(TimelineItemView::Notice {
-                            seq: ev.seq,
-                            level: "error".into(),
-                            message: message.clone(),
-                            timestamp_ms: ts_ms,
-                        });
-                    }
-                }
-                TimelinePayload::StatusChanged {
-                    status: AgentStatus::AutonomousWakeup { source, .. },
-                } => {
-                    let label = format_autonomous_wakeup_notice(source);
-                    upserted_items.push(TimelineItemView::Notice {
-                        seq: ev.seq,
-                        level: "wakeup".into(),
-                        message: label,
-                        timestamp_ms: ts_ms,
-                    });
-                }
-                TimelinePayload::PermissionResolved { .. }
-                | TimelinePayload::QuestionResolved { .. }
-                | TimelinePayload::StatusChanged { .. } => {}
+            if let Some(item) = render_timeline_event_view(
+                agent_id,
+                agent_cwd.as_deref(),
+                ev,
+                &all_resolved_perms,
+                &all_resolved_questions,
+                &mut host_state.markdown_cache,
+                &mut host_state.streaming_markdown_cache,
+            ) {
+                upserted_items.push(item);
             }
         }
 
@@ -1215,7 +1558,541 @@ impl OrbitAppCore {
     pub fn terminal_screen(&self, host_id: &str) -> Option<TerminalScreenView> {
         let guard = self.hosts.read().ok()?;
         let state = guard.get(host_id)?;
-        Some(state.terminal_emulator.snapshot())
+        let slot = state.active_terminal_slot;
+        Some(
+            state
+                .terminal_emulators
+                .get(&slot)
+                .map(TerminalGridEmulator::snapshot)
+                .unwrap_or_else(|| TerminalGridEmulator::new(100, 30).snapshot()),
+        )
+    }
+
+    pub fn terminal_screen_slot(&self, host_id: &str, slot: u8) -> Option<TerminalScreenView> {
+        let guard = self.hosts.read().ok()?;
+        let state = guard.get(host_id)?;
+        Some(
+            state
+                .terminal_emulators
+                .get(&slot.max(1))
+                .map(TerminalGridEmulator::snapshot)
+                .unwrap_or_else(|| TerminalGridEmulator::new(100, 30).snapshot()),
+        )
+    }
+
+    /// Unified sidebar + Launchpad snapshot computed centrally in Rust so Desktop, iOS,
+    /// Android, and HarmonyOS share identical project grouping, worktree deduplication,
+    /// unread/attention triage, pinned threads, and active git branch resolution.
+    pub fn fleet_sidebar(
+        &self,
+        sort: crate::sidebar::SidebarProjectSort,
+        filter: crate::sidebar::SidebarThreadFilter,
+        query: &str,
+        active_host_id: Option<&str>,
+        active_agent_id: Option<&str>,
+        active_cwd: Option<&str>,
+    ) -> crate::sidebar::FleetSidebarView {
+        let rev = self.revision.load(Ordering::SeqCst);
+        let hosts_guard = self.hosts.read().ok();
+        let projs_guard = self.projects.read().ok();
+        let prefs_guard = self.thread_prefs.read().ok();
+
+        let pinned_projects: Vec<ClientProjectView> = projs_guard
+            .as_ref()
+            .map(|g| g.values().cloned().collect())
+            .unwrap_or_default();
+
+        struct OwnedSidebarHostData {
+            host_id: String,
+            workspaces: Vec<WorkspaceSummary>,
+            discovered_projects: Vec<DiscoveredProject>,
+            agents: Vec<(AgentCardView, i64)>,
+            active_git_branch: Option<String>,
+        }
+        let mut host_inputs_owned: Vec<OwnedSidebarHostData> = Vec::new();
+
+        if let Some(ref hg) = hosts_guard {
+            for (hid, state) in hg.iter() {
+                let agents_with_order: Vec<(AgentCardView, i64)> = state
+                    .agents
+                    .values()
+                    .map(|a| {
+                        let pref = prefs_guard
+                            .as_ref()
+                            .and_then(|p| p.get(&(hid.clone(), a.agent_id.clone())));
+                        let order = pref.map(|p| p.pinned_order).unwrap_or(0);
+                        (agent_to_card_view(a, pref), order)
+                    })
+                    .collect();
+
+                let active_branch = if active_host_id == Some(hid.as_str()) {
+                    active_cwd.and_then(|cwd| {
+                        let gs = state.git_statuses.get(cwd).or_else(|| {
+                            state
+                                .git_statuses
+                                .iter()
+                                .find(|(k, _)| cwd_paths_equivalent(k, cwd))
+                                .map(|(_, v)| v)
+                        });
+                        crate::sidebar::active_git_branch_from_state(
+                            gs,
+                            &state.workspaces,
+                            &state.discovered_projects,
+                            cwd,
+                        )
+                    })
+                } else {
+                    None
+                };
+
+                host_inputs_owned.push(OwnedSidebarHostData {
+                    host_id: hid.clone(),
+                    workspaces: state.workspaces.clone(),
+                    discovered_projects: state.discovered_projects.clone(),
+                    agents: agents_with_order,
+                    active_git_branch: active_branch,
+                });
+            }
+        }
+
+        let host_inputs: Vec<crate::sidebar::SidebarHostInput<'_>> = host_inputs_owned
+            .iter()
+            .map(|item| crate::sidebar::SidebarHostInput {
+                host_id: item.host_id.as_str(),
+                workspaces: item.workspaces.as_slice(),
+                discovered_projects: item.discovered_projects.as_slice(),
+                agents: item.agents.clone(),
+                active_git_branch: item.active_git_branch.clone(),
+            })
+            .collect();
+
+        crate::sidebar::build_fleet_sidebar(crate::sidebar::FleetSidebarParams {
+            revision: rev,
+            hosts: host_inputs,
+            pinned_projects: &pinned_projects,
+            sort,
+            filter,
+            query,
+            active_host_id,
+            active_agent_id,
+            active_cwd,
+        })
+    }
+
+    pub fn fallback_provider_catalogs(&self) -> Vec<ProviderModelCatalog> {
+        vec![
+            crate::catalog::fallback_provider_catalog(ProviderKind::Antigravity),
+            crate::catalog::fallback_provider_catalog(ProviderKind::Codex),
+            crate::catalog::fallback_provider_catalog(ProviderKind::ClaudeCode),
+        ]
+    }
+
+    pub fn bridge_info(&self) -> crate::contract::BridgeInfoView {
+        crate::contract::BridgeInfoView {
+            protocol_version: crate::contract::CLIENT_BRIDGE_PROTOCOL_VERSION,
+            core_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: vec![
+                "agent_stage_delta".into(),
+                "fleet_sidebar".into(),
+                "thread_prefs".into(),
+                "model_selection".into(),
+                "composer_v2".into(),
+                "mention_ranking".into(),
+                "multislot_terminal".into(),
+                "side_question".into(),
+                "rewind".into(),
+                "native_diagrams".into(),
+            ],
+        }
+    }
+
+    pub fn render_diagram(
+        &self,
+        req: crate::diagram::RenderDiagramRequest,
+    ) -> crate::diagram::RenderDiagramView {
+        crate::diagram::render_diagram(&req)
+    }
+
+    pub fn fleet_sidebar_by_request(
+        &self,
+        req: &crate::contract::FleetSidebarRequest,
+    ) -> crate::sidebar::FleetSidebarView {
+        self.fleet_sidebar(
+            req.sort,
+            req.filter,
+            &req.query,
+            req.active_host_id.as_deref(),
+            req.active_agent_id.as_deref(),
+            req.active_cwd.as_deref(),
+        )
+    }
+
+    pub fn agent_stage_delta_by_request(
+        &self,
+        req: &crate::contract::AgentStageDeltaRequest,
+    ) -> crate::stage::AgentStageDeltaView {
+        self.agent_stage_delta(&req.host_id, &req.agent_id, req.since_revision)
+    }
+
+    pub fn create_session(self: &Arc<Self>, req: crate::contract::CreateSessionRequest) -> String {
+        self.create_agent_with_config(CreateAgentRequest {
+            host_id: &req.host_id,
+            cwd: &req.cwd,
+            extra_dirs: req.extra_dirs,
+            provider: req.provider,
+            model: req.model,
+            effort: req.effort,
+            mode: req.mode,
+            initial_prompt: &req.initial_prompt,
+            initial_display_prompt: req.initial_display_prompt,
+            initial_badges: req.initial_badges,
+            worktree_branch: req.worktree_branch.as_deref(),
+        })
+    }
+
+    pub fn send_prompt_request(self: &Arc<Self>, req: crate::contract::SendPromptRequest) {
+        self.send_prompt_with_meta(
+            &req.host_id,
+            &req.agent_id,
+            &req.prompt,
+            req.display_prompt,
+            req.badges,
+        );
+    }
+
+    pub fn update_host_config_request(
+        self: &Arc<Self>,
+        req: crate::contract::UpdateHostConfigRequest,
+    ) -> Result<HostCardView, ClientCoreError> {
+        self.update_host_config(
+            &req.host_id,
+            req.custom_name,
+            req.route_mode,
+            req.ssh_alias,
+            req.remote_daemon_port,
+            req.custom_direct_endpoint,
+            req.relay_url,
+            req.reconnect,
+        )
+    }
+
+    pub fn resolve_model_selection(
+        &self,
+        req: &crate::contract::ModelSelectionRequest,
+    ) -> crate::catalog::ResolvedModelSelectionView {
+        let live_catalogs = req
+            .host_id
+            .as_deref()
+            .and_then(|hid| {
+                self.hosts
+                    .read()
+                    .ok()
+                    .and_then(|g| g.get(hid).map(|h| h.provider_catalogs.clone()))
+            })
+            .unwrap_or_default();
+        let effective = crate::catalog::effective_provider_catalogs(&live_catalogs);
+        crate::catalog::resolve_model_selection(
+            &effective,
+            req.provider,
+            req.desired_model.as_deref(),
+            req.desired_effort,
+        )
+    }
+
+    pub fn slash_commands(
+        &self,
+        platform: crate::composer::ClientPlatform,
+        query: Option<&str>,
+    ) -> Vec<crate::composer::SlashCommandView> {
+        match query {
+            Some(q) if !q.trim().is_empty() => crate::composer::filter_slash_commands(q, platform),
+            _ => crate::composer::slash_commands(platform),
+        }
+    }
+
+    pub fn compose_prompt_for_host(
+        &self,
+        req: &crate::composer::ComposePromptRequest,
+    ) -> crate::composer::ComposedPromptView {
+        let fallback_diff = match (req.host_id.as_deref(), req.cwd.as_deref()) {
+            (Some(hid), Some(cwd)) if !hid.is_empty() && !cwd.trim().is_empty() => {
+                let raw = self.git_review(hid, cwd, None).raw_diff;
+                (!raw.trim().is_empty()).then_some(raw)
+            }
+            _ => None,
+        };
+
+        crate::composer::compose_prompt(req, fallback_diff.as_deref(), fallback_diff.as_deref())
+    }
+
+    pub fn rank_mention_candidates(
+        &self,
+        req: &crate::contract::MentionRankRequest,
+    ) -> Vec<crate::composer::MentionCandidateView> {
+        let files = self.workspace_files(&req.host_id, &req.cwd);
+        let git_files: Vec<(String, String)> = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|g| {
+                g.get(&req.host_id).and_then(|h| {
+                    h.git_statuses
+                        .get(&req.cwd)
+                        .or_else(|| {
+                            h.git_statuses
+                                .iter()
+                                .find(|(k, _)| cwd_paths_equivalent(k, &req.cwd))
+                                .map(|(_, v)| v)
+                        })
+                        .map(|st| {
+                            st.files
+                                .iter()
+                                .map(|f| (f.path.clone(), f.status.clone()))
+                                .collect::<Vec<_>>()
+                        })
+                })
+            })
+            .unwrap_or_default();
+
+        crate::composer::rank_mention_candidates(&req.query, &files, &git_files, req.limit)
+    }
+
+    pub fn build_side_question_context(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        max_chars: Option<usize>,
+    ) -> String {
+        let mut items: Vec<TimelineItemView> = Vec::new();
+        let mut cwd = String::new();
+        self.ensure_stage_fresh_and_read(host_id, agent_id, |agent, cached| {
+            if let Some(a) = agent {
+                cwd = a.cwd.clone();
+            }
+            if let Some(c) = cached {
+                items = c.items.clone();
+            }
+        });
+
+        let (branch_name, git_status) = if let Ok(guard) = self.hosts.read()
+            && let Some(state) = guard.get(host_id)
+        {
+            let gs = if cwd.is_empty() {
+                None
+            } else {
+                state.git_statuses.get(&cwd).or_else(|| {
+                    state
+                        .git_statuses
+                        .iter()
+                        .find(|(k, _)| cwd_paths_equivalent(k, &cwd))
+                        .map(|(_, v)| v)
+                })
+            };
+            let branch = if cwd.is_empty() {
+                None
+            } else {
+                crate::sidebar::active_git_branch_from_state(
+                    gs,
+                    &state.workspaces,
+                    &state.discovered_projects,
+                    &cwd,
+                )
+            };
+            (branch, gs.cloned())
+        } else {
+            (None, None)
+        };
+
+        let summary = crate::stage::build_side_question_context_summary(
+            &cwd,
+            branch_name.as_deref(),
+            &items,
+            git_status.as_ref(),
+        );
+        match max_chars {
+            Some(limit) if summary.len() > limit => truncate_utf8_prefix(&summary, limit),
+            _ => summary,
+        }
+    }
+
+    pub fn mark_agent_seen(&self, host_id: &str, agent_id: &str, seq: u64) {
+        if agent_id.is_empty() || agent_id.starts_with("opt_") {
+            return;
+        }
+        let host_latest = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|g| {
+                g.get(host_id)
+                    .and_then(|h| h.agents.get(agent_id).map(|a| a.latest_seq))
+            })
+            .unwrap_or(0);
+        let effective_seq = if seq == 0 {
+            host_latest
+        } else {
+            seq.max(host_latest)
+        };
+        if effective_seq == 0 {
+            return;
+        }
+
+        let mut changed = false;
+        let now_ms = unix_ms_now() as i64;
+        if let Ok(mut prefs) = self.thread_prefs.write() {
+            let key = (host_id.to_string(), agent_id.to_string());
+            let prev = prefs.get(&key).map(|p| p.seen_seq).unwrap_or(0);
+            if effective_seq > prev {
+                changed = true;
+                let _ = self.store.set_client_thread_seen_seq(
+                    host_id,
+                    agent_id,
+                    effective_seq,
+                    false,
+                    now_ms,
+                );
+                let entry = prefs.entry(key).or_insert_with(|| ClientThreadPref {
+                    host_id: host_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    seen_seq: effective_seq,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    updated_at_ms: now_ms,
+                });
+                entry.seen_seq = entry.seen_seq.max(effective_seq);
+                entry.updated_at_ms = entry.updated_at_ms.max(now_ms);
+            }
+        }
+        if changed {
+            self.emit(|revision| CoreNotification::FleetChanged { revision });
+            self.emit(|revision| CoreNotification::HostChanged {
+                revision,
+                host_id: host_id.to_string(),
+            });
+        }
+    }
+
+    pub fn mark_agent_unread(&self, host_id: &str, agent_id: &str) {
+        if agent_id.is_empty() || agent_id.starts_with("opt_") {
+            return;
+        }
+        let now_ms = unix_ms_now() as i64;
+        let _ = self
+            .store
+            .set_client_thread_seen_seq(host_id, agent_id, 0, true, now_ms);
+        if let Ok(mut prefs) = self.thread_prefs.write() {
+            let key = (host_id.to_string(), agent_id.to_string());
+            if let Some(entry) = prefs.get_mut(&key) {
+                entry.seen_seq = 0;
+                entry.updated_at_ms = now_ms;
+            }
+        }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn set_agent_pinned(&self, host_id: &str, agent_id: &str, pinned: bool) {
+        if agent_id.is_empty() {
+            return;
+        }
+        let next_order = if pinned {
+            self.pin_order_seq.fetch_add(1, Ordering::SeqCst) as i64
+        } else {
+            0
+        };
+        let mut changed = false;
+        let now_ms = unix_ms_now() as i64;
+        if let Ok(mut prefs) = self.thread_prefs.write() {
+            let key = (host_id.to_string(), agent_id.to_string());
+            let prev_pinned = prefs.get(&key).is_some_and(|p| p.is_pinned);
+            if prev_pinned != pinned {
+                changed = true;
+                let _ = self
+                    .store
+                    .set_client_thread_pinned(host_id, agent_id, pinned, next_order, now_ms);
+                let entry = prefs.entry(key).or_insert_with(|| ClientThreadPref {
+                    host_id: host_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    seen_seq: 0,
+                    is_pinned: pinned,
+                    pinned_order: next_order,
+                    updated_at_ms: now_ms,
+                });
+                entry.is_pinned = pinned;
+                entry.pinned_order = if pinned { next_order } else { 0 };
+                entry.updated_at_ms = now_ms;
+            }
+        }
+        if changed {
+            self.emit(|revision| CoreNotification::FleetChanged { revision });
+            self.emit(|revision| CoreNotification::HostChanged {
+                revision,
+                host_id: host_id.to_string(),
+            });
+        }
+    }
+
+    pub fn toggle_pin_agent(&self, host_id: &str, agent_id: &str) -> bool {
+        let next_pinned = {
+            let prefs = self.thread_prefs.read().ok();
+            let was_pinned = prefs
+                .as_ref()
+                .and_then(|p| p.get(&(host_id.to_string(), agent_id.to_string())))
+                .is_some_and(|p| p.is_pinned);
+            !was_pinned
+        };
+        self.set_agent_pinned(host_id, agent_id, next_pinned);
+        next_pinned
+    }
+
+    pub fn seed_thread_prefs(&self, seeds: Vec<ClientThreadPref>) {
+        if seeds.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        if let Ok(mut prefs) = self.thread_prefs.write() {
+            for seed in seeds {
+                if seed.host_id.is_empty() || seed.agent_id.is_empty() {
+                    continue;
+                }
+                let key = (seed.host_id.clone(), seed.agent_id.clone());
+                if let Some(existing) = prefs.get_mut(&key) {
+                    let mut dirty = false;
+                    if seed.seen_seq > existing.seen_seq {
+                        existing.seen_seq = seed.seen_seq;
+                        dirty = true;
+                    }
+                    if seed.is_pinned && !existing.is_pinned {
+                        existing.is_pinned = true;
+                        existing.pinned_order = if seed.pinned_order > 0 {
+                            seed.pinned_order
+                        } else {
+                            self.pin_order_seq.fetch_add(1, Ordering::SeqCst) as i64
+                        };
+                        dirty = true;
+                    }
+                    if dirty {
+                        let _ = self.store.upsert_client_thread_pref(existing);
+                        changed = true;
+                    }
+                } else {
+                    let mut normalized = seed;
+                    if normalized.is_pinned && normalized.pinned_order <= 0 {
+                        normalized.pinned_order =
+                            self.pin_order_seq.fetch_add(1, Ordering::SeqCst) as i64;
+                    }
+                    let _ = self.store.upsert_client_thread_pref(&normalized);
+                    prefs.insert(key, normalized);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.emit(|revision| CoreNotification::FleetChanged { revision });
+        }
     }
 
     // --- Paseo-Style Multi-Directory Project Management ---
@@ -1379,6 +2256,9 @@ impl OrbitAppCore {
         }
         if let Ok(mut projs) = self.projects.write() {
             projs.retain(|_, p| p.host_id != host_id);
+        }
+        if let Ok(mut prefs) = self.thread_prefs.write() {
+            prefs.retain(|(h, _), _| h != host_id);
         }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         Ok(())
@@ -1695,6 +2575,8 @@ impl OrbitAppCore {
                         h.agents.clear();
                         h.discovered_projects.clear();
                         h.timelines.clear();
+                        h.stage_cache.clear();
+                        h.stage_dirty.clear();
                     }
 
                     if !h.ssh_heal_attempted
@@ -1821,6 +2703,9 @@ impl OrbitAppCore {
         let mut host_to_persist: Option<StoredHostProfile> = None;
         let mut rewound_to_persist: Option<(AgentSummary, Vec<TimelineEvent>, bool, bool)> = None;
         let mut stale_replica_agents: Vec<(String, bool)> = Vec::new();
+        let mut initial_seen_seeds: Vec<(String, u64)> = Vec::new();
+        let mut migrated_opt_pref: Option<(String, String)> = None;
+        let mut rewound_seen_reset: Option<(String, u64)> = None;
 
         if let Ok(mut guard) = self.hosts.write()
             && let Some(state) = guard.get_mut(host_id)
@@ -1914,6 +2799,8 @@ impl OrbitAppCore {
                         .iter()
                         .map(|(k, v)| (k.clone(), (v.timeline_epoch, v.latest_seq)))
                         .collect();
+                    let is_initial_hydration = !state.initial_agents_hydrated;
+                    state.initial_agents_hydrated = true;
                     state.agents.retain(|k, _| k.starts_with("opt_"));
                     for a in agents {
                         let ag_id = a.agent_id.clone();
@@ -1927,9 +2814,16 @@ impl OrbitAppCore {
                         let seq_regressed = local_max_seq > 0 && a.latest_seq < local_max_seq;
                         if epoch_advanced || seq_regressed {
                             let had_mem = state.timelines.remove(&ag_id).is_some();
+                            state.stage_cache.remove(&ag_id);
+                            state.mark_stage_dirty(&ag_id, 0, true);
                             state.rewound_agents.insert(ag_id.clone());
                             stale_replica_agents.push((ag_id.clone(), had_mem));
                             notify_timeline_agent = Some(ag_id.clone());
+                        } else if state.stage_cache.contains_key(&ag_id) {
+                            state.mark_stage_meta_dirty(&ag_id);
+                        }
+                        if is_initial_hydration && a.latest_seq > 0 {
+                            initial_seen_seeds.push((ag_id.clone(), a.latest_seq));
                         }
                         state.agents.insert(ag_id, a);
                     }
@@ -1945,9 +2839,24 @@ impl OrbitAppCore {
                         {
                             state.timelines.insert(ag_id.clone(), opt_tl);
                         }
+                        if let Some(opt_cache) = state.stage_cache.remove(&opt_id)
+                            && !state.stage_cache.contains_key(&ag_id)
+                        {
+                            state.stage_cache.insert(ag_id.clone(), opt_cache);
+                        }
+                        if let Some(opt_dirty) = state.stage_dirty.remove(&opt_id) {
+                            state.stage_dirty.entry(ag_id.clone()).or_insert(opt_dirty);
+                        }
+                        state.mark_stage_meta_dirty(&ag_id);
                         state
                             .replaced_optimistic_agents
-                            .insert(opt_id, ag_id.clone());
+                            .insert(opt_id.clone(), ag_id.clone());
+                        migrated_opt_pref = Some((opt_id, ag_id.clone()));
+                    } else {
+                        state.mark_stage_dirty(&ag_id, 0, true);
+                    }
+                    if let Some(ref parent_id) = agent.parent_agent_id {
+                        state.mark_stage_meta_dirty(parent_id);
                     }
                     state.last_created_agent_id = Some(ag_id.clone());
                     state.agents.insert(ag_id.clone(), agent);
@@ -1968,8 +2877,15 @@ impl OrbitAppCore {
                     let seq_regressed = local_max_seq > 0 && agent.latest_seq < local_max_seq;
                     if epoch_advanced || seq_regressed {
                         let had_mem = state.timelines.remove(&ag_id).is_some();
+                        state.stage_cache.remove(&ag_id);
+                        state.mark_stage_dirty(&ag_id, 0, true);
                         state.rewound_agents.insert(ag_id.clone());
                         stale_replica_agents.push((ag_id.clone(), had_mem));
+                    } else {
+                        state.mark_stage_meta_dirty(&ag_id);
+                    }
+                    if let Some(ref parent_id) = agent.parent_agent_id {
+                        state.mark_stage_meta_dirty(parent_id);
                     }
                     state.agents.insert(ag_id.clone(), agent);
                     notify_fleet = true;
@@ -2123,12 +3039,29 @@ impl OrbitAppCore {
                     ..
                 } => {
                     let ag_id = agent.agent_id.clone();
-                    let agent_card = agent_to_card_view(&agent);
+                    rewound_seen_reset = Some((ag_id.clone(), agent.latest_seq));
+                    let agent_card = {
+                        let prefs_guard = self.thread_prefs.read().ok();
+                        let existing_pref = prefs_guard
+                            .as_ref()
+                            .and_then(|p| p.get(&(host_id.to_string(), ag_id.clone())));
+                        let reset_pref = ClientThreadPref {
+                            host_id: host_id.to_string(),
+                            agent_id: ag_id.clone(),
+                            seen_seq: agent.latest_seq,
+                            is_pinned: existing_pref.is_some_and(|p| p.is_pinned),
+                            pinned_order: existing_pref.map(|p| p.pinned_order).unwrap_or(0),
+                            updated_at_ms: existing_pref.map(|p| p.updated_at_ms).unwrap_or(0),
+                        };
+                        agent_to_card_view(&agent, Some(&reset_pref))
+                    };
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
                     let last_seq = ordered.last().map(|e| e.seq).unwrap_or(0);
                     let is_complete = last_seq >= agent.latest_seq;
                     state.timelines.insert(ag_id.clone(), ordered.clone());
+                    state.stage_cache.remove(&ag_id);
+                    state.mark_stage_dirty(&ag_id, 0, true);
                     state.rewound_agents.insert(ag_id.clone());
                     state.agents.insert(ag_id.clone(), agent.clone());
                     rewound_to_persist = Some((agent, ordered, restored_files > 0, is_complete));
@@ -2155,35 +3088,52 @@ impl OrbitAppCore {
                     has_more,
                     ..
                 } => {
-                    let list = state.timelines.entry(agent_id.clone()).or_default();
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
                     let min_incoming_seq = ordered.first().map(|e| e.seq);
                     let max_seq = ordered.last().map(|e| e.seq);
-                    let existing_max_seq = list.iter().map(|e| e.seq).max().unwrap_or(0);
-                    let is_backfill = min_incoming_seq
-                        .is_some_and(|min_s| existing_max_seq > 0 && min_s <= existing_max_seq);
+
+                    let (is_backfill, min_dirty, min_aux_dirty, final_max) = {
+                        let list = state.timelines.entry(agent_id.clone()).or_default();
+                        let existing_max_seq = list.iter().map(|e| e.seq).max().unwrap_or(0);
+                        let is_backfill = min_incoming_seq
+                            .is_some_and(|min_s| existing_max_seq > 0 && min_s <= existing_max_seq);
+
+                        let (min_dirty, min_aux_dirty) = if is_backfill {
+                            let mut combined = std::mem::take(list);
+                            combined.extend(ordered);
+                            combined.sort_by_key(|e| (e.seq == 0, e.seq));
+                            let mut rebuilt = Vec::with_capacity(combined.len());
+                            for ev in combined {
+                                coalesce_or_push_timeline(&mut rebuilt, ev);
+                            }
+                            *list = rebuilt;
+                            (None, true)
+                        } else {
+                            let mut min_d: Option<usize> = None;
+                            let mut any_aux = false;
+                            for ev in ordered {
+                                let idx = coalesce_or_push_timeline(list, ev);
+                                any_aux |= payload_affects_auxiliary_state(&list[idx].payload);
+                                let d = dirty_index_for_event(list, idx, &list[idx].payload);
+                                min_d = Some(min_d.map_or(d, |prev| prev.min(d)));
+                            }
+                            (min_d, any_aux)
+                        };
+                        let final_max = list.iter().map(|e| e.seq).max().unwrap_or(0);
+                        (is_backfill, min_dirty, min_aux_dirty, final_max)
+                    };
 
                     if is_backfill {
-                        let mut combined = std::mem::take(list);
-                        combined.extend(ordered);
-                        combined.sort_by_key(|e| (e.seq == 0, e.seq));
-                        let mut rebuilt = Vec::with_capacity(combined.len());
-                        for ev in combined {
-                            coalesce_or_push_timeline(&mut rebuilt, ev);
-                        }
-                        *list = rebuilt;
                         state.rewound_agents.insert(agent_id.clone());
-                    } else {
-                        for ev in ordered {
-                            coalesce_or_push_timeline(list, ev);
-                        }
+                        state.mark_stage_dirty(&agent_id, 0, true);
+                    } else if let Some(d) = min_dirty {
+                        state.mark_stage_dirty_with_aux(&agent_id, d, false, min_aux_dirty);
                     }
 
                     if has_more && let Some(next_since) = max_seq {
                         continue_catchup = Some((agent_id.clone(), next_since));
                     } else {
-                        let final_max = list.iter().map(|e| e.seq).max().unwrap_or(0);
                         catchup_completed_cursor = Some((agent_id.clone(), final_max));
                     }
                     notify_timeline_agent = Some(agent_id);
@@ -2191,6 +3141,8 @@ impl OrbitAppCore {
                 WireMessage::TimelineLive { event } => {
                     let agent_id = event.agent_id.clone();
                     let live_seq = event.seq;
+                    let is_status_changed =
+                        matches!(event.payload, TimelinePayload::StatusChanged { .. });
                     if let TimelinePayload::StatusChanged { ref status } = event.payload
                         && let Some(ag) = state.agents.get_mut(&agent_id)
                     {
@@ -2198,8 +3150,20 @@ impl OrbitAppCore {
                         notify_fleet = true;
                         notify_host = true;
                     }
+                    if live_seq > 0
+                        && let Some(ag) = state.agents.get_mut(&agent_id)
+                        && live_seq > ag.latest_seq
+                    {
+                        ag.latest_seq = live_seq;
+                    }
                     let list = state.timelines.entry(agent_id.clone()).or_default();
-                    coalesce_or_push_timeline(list, event);
+                    let idx = coalesce_or_push_timeline(list, event);
+                    let dirty_idx = dirty_index_for_event(list, idx, &list[idx].payload);
+                    let aux_dirty = payload_affects_auxiliary_state(&list[idx].payload);
+                    state.mark_stage_dirty_with_aux(&agent_id, dirty_idx, false, aux_dirty);
+                    if is_status_changed {
+                        state.mark_stage_meta_dirty(&agent_id);
+                    }
                     if live_seq > 0 {
                         live_event_cursor = Some((agent_id.clone(), live_seq));
                     }
@@ -2274,6 +3238,11 @@ impl OrbitAppCore {
                     notify_host = true;
                 }
                 WireMessage::TerminalAttached { terminal, slot, .. } => {
+                    let slot = slot.max(1);
+                    state
+                        .slot_terminal_ids
+                        .insert(slot, terminal.terminal_id.clone());
+                    let _ = state.emulator_slot_mut(slot);
                     state.active_terminal_id = Some(terminal.terminal_id.clone());
                     state.active_terminal_slot = slot;
                     state
@@ -2382,6 +3351,64 @@ impl OrbitAppCore {
         if let Some(stored) = host_to_persist {
             let _ = self.store.upsert_client_host(&stored);
         }
+        if !initial_seen_seeds.is_empty()
+            && let Ok(mut prefs) = self.thread_prefs.write()
+        {
+            let now_ms = unix_ms_now() as i64;
+            for (ag_id, latest_seq) in initial_seen_seeds {
+                let key = (host_id.to_string(), ag_id.clone());
+                prefs.entry(key).or_insert_with(|| {
+                    let _ = self
+                        .store
+                        .set_client_thread_seen_seq(host_id, &ag_id, latest_seq, false, now_ms);
+                    ClientThreadPref {
+                        host_id: host_id.to_string(),
+                        agent_id: ag_id,
+                        seen_seq: latest_seq,
+                        is_pinned: false,
+                        pinned_order: 0,
+                        updated_at_ms: now_ms,
+                    }
+                });
+            }
+        }
+        if let Some((opt_id, real_id)) = migrated_opt_pref {
+            let _ = self
+                .store
+                .migrate_client_thread_pref(host_id, &opt_id, &real_id);
+            if let Ok(mut prefs) = self.thread_prefs.write()
+                && let Some(mut old_pref) = prefs.remove(&(host_id.to_string(), opt_id))
+            {
+                let real_key = (host_id.to_string(), real_id.clone());
+                if let std::collections::hash_map::Entry::Vacant(e) = prefs.entry(real_key) {
+                    old_pref.agent_id = real_id;
+                    e.insert(old_pref);
+                }
+            }
+        }
+        if let Some((rewound_ag_id, rewound_latest_seq)) = rewound_seen_reset {
+            let now_ms = unix_ms_now() as i64;
+            let _ = self.store.set_client_thread_seen_seq(
+                host_id,
+                &rewound_ag_id,
+                rewound_latest_seq,
+                true,
+                now_ms,
+            );
+            if let Ok(mut prefs) = self.thread_prefs.write() {
+                let key = (host_id.to_string(), rewound_ag_id.clone());
+                let entry = prefs.entry(key).or_insert_with(|| ClientThreadPref {
+                    host_id: host_id.to_string(),
+                    agent_id: rewound_ag_id,
+                    seen_seq: rewound_latest_seq,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    updated_at_ms: now_ms,
+                });
+                entry.seen_seq = rewound_latest_seq;
+                entry.updated_at_ms = now_ms;
+            }
+        }
         if let Some((ag, evs, files_restored, is_complete)) = rewound_to_persist {
             let _ = self.store.replace_replica_timeline(&ag.agent_id, &evs);
             if is_complete {
@@ -2464,22 +3491,20 @@ impl OrbitAppCore {
         {
             match frame {
                 TerminalBinaryFrame::Output { slot, data } => {
-                    if slot == state.active_terminal_slot {
-                        state.terminal_emulator.process(&data);
-                        raw_out = Some((slot, data));
-                    }
+                    let slot = slot.max(1);
+                    state.emulator_slot_mut(slot).process(&data);
+                    raw_out = Some((slot, data));
                 }
                 TerminalBinaryFrame::Snapshot { slot, data } => {
-                    if slot == state.active_terminal_slot {
-                        state.terminal_emulator.clear();
-                        state.terminal_emulator.process(&data);
-                        raw_out = Some((slot, data));
-                    }
+                    let slot = slot.max(1);
+                    let emu = state.emulator_slot_mut(slot);
+                    emu.clear();
+                    emu.process(&data);
+                    raw_out = Some((slot, data));
                 }
                 TerminalBinaryFrame::Resize { slot, cols, rows } => {
-                    if slot == state.active_terminal_slot {
-                        state.terminal_emulator.resize(cols, rows);
-                    }
+                    let slot = slot.max(1);
+                    state.emulator_slot_mut(slot).resize(cols, rows);
                 }
                 TerminalBinaryFrame::Input { .. } => {}
             }
@@ -2799,6 +3824,7 @@ impl OrbitAppCore {
                     },
                 }],
             );
+            h.mark_stage_dirty(&opt_id, 0, true);
         }
 
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -2852,16 +3878,7 @@ impl OrbitAppCore {
         let mem_max_seq = if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
-            if !h.timelines.contains_key(agent_id)
-                && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 50_000)
-                && !cached.is_empty()
-            {
-                let mut coalesced = Vec::with_capacity(cached.len());
-                for ev in cached {
-                    coalesce_or_push_timeline(&mut coalesced, ev);
-                }
-                h.timelines.insert(agent_id.to_string(), coalesced);
-            }
+            self.hydrate_timeline_if_missing(h, agent_id);
             h.timelines
                 .get(agent_id)
                 .and_then(|list| list.iter().map(|e| e.seq).max())
@@ -2944,21 +3961,22 @@ impl OrbitAppCore {
             if !agent_id.starts_with("opt_") {
                 h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
             }
-            h.timelines
-                .entry(agent_id.to_string())
-                .or_default()
-                .push(TimelineEvent {
-                    seq: 0,
-                    epoch: 1,
-                    agent_id: agent_id.to_string(),
-                    turn_id: None,
-                    timestamp: now,
-                    payload: TimelinePayload::UserPrompt {
-                        message_id: format!("opt_{}", Uuid::new_v4()),
-                        text: visible_text,
-                        badges: badges.clone(),
-                    },
-                });
+            let list = h.timelines.entry(agent_id.to_string()).or_default();
+            let push_idx = list.len();
+            list.push(TimelineEvent {
+                seq: 0,
+                epoch: 1,
+                agent_id: agent_id.to_string(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: format!("opt_{}", Uuid::new_v4()),
+                    text: visible_text,
+                    badges: badges.clone(),
+                },
+            });
+            h.mark_stage_dirty(agent_id, push_idx, false);
+            h.mark_stage_meta_dirty(agent_id);
         }
 
         self.emit(|revision| CoreNotification::HostChanged {
@@ -3013,6 +4031,7 @@ impl OrbitAppCore {
             if let Some(ag) = h.agents.get_mut(agent_id) {
                 ag.mode = mode.clone();
             }
+            h.mark_stage_meta_dirty(agent_id);
             if !agent_id.starts_with("opt_") {
                 h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
             }
@@ -3049,6 +4068,7 @@ impl OrbitAppCore {
                 ag.model = clean_model.clone();
                 ag.effort = effort;
             }
+            h.mark_stage_meta_dirty(agent_id);
             if !agent_id.starts_with("opt_") {
                 h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
             }
@@ -3079,6 +4099,7 @@ impl OrbitAppCore {
             if let Some(ag) = h.agents.get_mut(agent_id) {
                 ag.model = clean_model.clone();
             }
+            h.mark_stage_meta_dirty(agent_id);
             if !agent_id.starts_with("opt_") {
                 h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
             }
@@ -3126,6 +4147,7 @@ impl OrbitAppCore {
                 ag.model = clean_model.clone();
                 ag.effort = effort;
             }
+            h.mark_stage_meta_dirty(agent_id);
             if !agent_id.starts_with("opt_") {
                 h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
             }
@@ -3155,6 +4177,8 @@ impl OrbitAppCore {
             if agent_id.starts_with("opt_") {
                 h.agents.remove(agent_id);
                 h.timelines.remove(agent_id);
+                h.stage_cache.remove(agent_id);
+                h.stage_dirty.remove(agent_id);
             } else if let Some(ag) = h.agents.get_mut(agent_id) {
                 ag.archived_at = Some(Utc::now());
                 ag.attention = AttentionState::None;
@@ -3204,7 +4228,13 @@ impl OrbitAppCore {
         {
             h.agents.remove(agent_id);
             h.timelines.remove(agent_id);
+            h.stage_cache.remove(agent_id);
+            h.stage_dirty.remove(agent_id);
         }
+        if let Ok(mut prefs) = self.thread_prefs.write() {
+            prefs.remove(&(host_id.to_string(), agent_id.to_string()));
+        }
+        let _ = self.store.delete_client_thread_pref(host_id, agent_id);
         let _ = self.store.delete_replica_agent(host_id, agent_id);
         if !agent_id.starts_with("opt_") {
             self.dispatch_wire_queued(
@@ -3872,8 +4902,10 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
-            h.terminal_emulator.clear();
-            h.terminal_emulator.resize(cols, rows);
+            let slot = h.active_terminal_slot.max(1);
+            let emu = h.emulator_slot_mut(slot);
+            emu.clear();
+            emu.resize(cols, rows);
         }
         self.dispatch_wire_queued(
             host_id,
@@ -3892,9 +4924,11 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
-            if h.active_terminal_id.as_deref() != Some(terminal_id) {
-                h.terminal_emulator.clear();
+            let prev_id = h.slot_terminal_ids.get(&slot).map(String::as_str);
+            if prev_id != Some(terminal_id) {
+                h.emulator_slot_mut(slot).clear();
             }
+            h.slot_terminal_ids.insert(slot, terminal_id.to_string());
             h.active_terminal_id = Some(terminal_id.to_string());
             h.active_terminal_slot = slot;
         }
@@ -3972,13 +5006,12 @@ impl OrbitAppCore {
     }
 
     pub fn resize_terminal_slot(&self, host_id: &str, slot: u8, cols: u16, rows: u16) {
+        let slot = slot.max(1);
         let mut handle_opt = None;
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
-            if h.active_terminal_slot == slot {
-                h.terminal_emulator.resize(cols, rows);
-            }
+            h.emulator_slot_mut(slot).resize(cols, rows);
             handle_opt = h.session.clone();
         }
         if let Some(handle) = handle_opt {
@@ -4487,7 +5520,7 @@ impl OrbitAppCore {
                     request_id: req_id,
                     cwd: owned_cwd.clone(),
                     path: owned_path.clone(),
-                    max_bytes: Some(2 * 1024 * 1024),
+                    max_bytes: None,
                 })
                 .await;
 
@@ -4653,6 +5686,51 @@ impl OrbitAppCore {
             .await
             .map_err(|_| "side question dispatch cancelled".to_string())?
     }
+
+    pub fn rewind_agent_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        to_before_seq: u64,
+        restore_files: bool,
+    ) -> Result<RewindAgentResultView, String> {
+        self.runtime.block_on(self.rewind_agent_on_host(
+            host_id,
+            agent_id,
+            to_before_seq,
+            restore_files,
+        ))
+    }
+
+    pub fn read_workspace_file_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+    ) -> Result<WorkspaceFileView, String> {
+        self.runtime
+            .block_on(self.read_workspace_file_on_host(host_id, cwd, path))
+    }
+
+    pub fn ask_side_question_with_callback<F>(
+        self: &Arc<Self>,
+        req: AskSideQuestionRequest,
+        on_event: F,
+    ) -> Result<String, String>
+    where
+        F: Fn(SideQuestionStreamEvent) + Send + Sync + 'static,
+    {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let request_id = self
+            .runtime
+            .block_on(self.ask_side_question_on_host(req, tx))?;
+        self.runtime.spawn(async move {
+            while let Some(ev) = rx.recv().await {
+                on_event(ev);
+            }
+        });
+        Ok(request_id)
+    }
 }
 
 fn build_workspace_file_view(
@@ -4740,7 +5818,7 @@ fn normalize_cwd_trim(raw: &str) -> &str {
     }
 }
 
-fn cwd_paths_equivalent(stored_cwd: &str, query_cwd: &str) -> bool {
+pub(crate) fn cwd_paths_equivalent(stored_cwd: &str, query_cwd: &str) -> bool {
     let a = normalize_cwd_trim(stored_cwd);
     let b = normalize_cwd_trim(query_cwd);
     if a == b {
@@ -4782,10 +5860,27 @@ struct CoalescingState {
     terminals: HashMap<(String, u8), CoalesceSlot<CoreNotification>>,
 }
 
+struct StripTerminalBytesSubscriber {
+    downstream: Arc<dyn CoreEventSubscriber>,
+}
+
+impl CoreEventSubscriber for StripTerminalBytesSubscriber {
+    fn on_notification(&self, mut event: CoreNotification) {
+        if let CoreNotification::TerminalChanged {
+            ref mut raw_bytes, ..
+        } = event
+        {
+            raw_bytes.clear();
+        }
+        self.downstream.on_notification(event);
+    }
+}
+
 struct CoalescingSubscriber {
     downstream: Arc<dyn CoreEventSubscriber>,
     runtime_handle: tokio::runtime::Handle,
     interval: Duration,
+    include_terminal_raw_bytes: bool,
     state: Arc<Mutex<CoalescingState>>,
 }
 
@@ -4794,11 +5889,13 @@ impl CoalescingSubscriber {
         downstream: Arc<dyn CoreEventSubscriber>,
         runtime_handle: tokio::runtime::Handle,
         interval: Duration,
+        include_terminal_raw_bytes: bool,
     ) -> Self {
         Self {
             downstream,
             runtime_handle,
             interval,
+            include_terminal_raw_bytes,
             state: Arc::new(Mutex::new(CoalescingState {
                 timelines: HashMap::new(),
                 terminals: HashMap::new(),
@@ -4888,10 +5985,23 @@ impl CoreEventSubscriber for CoalescingSubscriber {
                                 ..
                             }) => {
                                 *prev_rev = revision;
-                                prev_bytes.extend_from_slice(raw_bytes);
+                                if self.include_terminal_raw_bytes {
+                                    prev_bytes.extend_from_slice(raw_bytes);
+                                } else {
+                                    prev_bytes.clear();
+                                }
                             }
                             _ => {
-                                slot.pending = Some(event.clone());
+                                slot.pending = Some(CoreNotification::TerminalChanged {
+                                    revision,
+                                    host_id: host_id.clone(),
+                                    slot: term_slot,
+                                    raw_bytes: if self.include_terminal_raw_bytes {
+                                        raw_bytes.clone()
+                                    } else {
+                                        Vec::new()
+                                    },
+                                });
                             }
                         }
                         if !slot.timer_scheduled {
@@ -4905,7 +6015,17 @@ impl CoreEventSubscriber for CoalescingSubscriber {
                 }
 
                 if emit_now {
-                    self.downstream.on_notification(event);
+                    if self.include_terminal_raw_bytes {
+                        self.downstream.on_notification(event);
+                    } else {
+                        self.downstream
+                            .on_notification(CoreNotification::TerminalChanged {
+                                revision,
+                                host_id: host_id.clone(),
+                                slot: term_slot,
+                                raw_bytes: Vec::new(),
+                            });
+                    }
                 } else if let Some(wait) = schedule_after {
                     let state = Arc::clone(&self.state);
                     let downstream = Arc::clone(&self.downstream);
@@ -4986,28 +6106,28 @@ fn record_agent_rpc_error(
             recoverable: true,
         };
     }
-    state
-        .timelines
-        .entry(agent_id.to_string())
-        .or_default()
-        .push(TimelineEvent {
-            seq: 0,
-            epoch: 1,
-            agent_id: agent_id.to_string(),
-            turn_id: None,
-            timestamp: Utc::now(),
-            payload: TimelinePayload::Notice {
-                level: "error".into(),
-                message: notice_message,
-            },
-        });
+    let list = state.timelines.entry(agent_id.to_string()).or_default();
+    let idx = list.len();
+    list.push(TimelineEvent {
+        seq: 0,
+        epoch: 1,
+        agent_id: agent_id.to_string(),
+        turn_id: None,
+        timestamp: Utc::now(),
+        payload: TimelinePayload::Notice {
+            level: "error".into(),
+            message: notice_message,
+        },
+    });
+    state.mark_stage_dirty(agent_id, idx, false);
+    state.mark_stage_meta_dirty(agent_id);
 }
 
 fn is_pending_optimistic_prompt(ev: &TimelineEvent) -> bool {
     ev.seq == 0 && matches!(ev.payload, TimelinePayload::UserPrompt { .. })
 }
 
-fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: TimelineEvent) {
+fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: TimelineEvent) -> usize {
     let active_end = list
         .iter()
         .position(is_pending_optimistic_prompt)
@@ -5055,7 +6175,7 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
         } => {
             if incoming.seq > 0 {
                 // Replace optimistic `seq == 0` UserPrompt with matching text
-                if let Some(opt_slot) = list.iter_mut().find(|ev| {
+                if let Some((idx, opt_slot)) = list.iter_mut().enumerate().find(|(_, ev)| {
                     ev.seq == 0
                         && matches!(
                             &ev.payload,
@@ -5063,11 +6183,11 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
                         )
                 }) {
                     *opt_slot = incoming;
-                    return;
+                    return idx;
                 }
             }
             if !inc_mid.is_empty()
-                && let Some(dup_slot) = list.iter_mut().find(|ev| {
+                && let Some((idx, dup_slot)) = list.iter_mut().enumerate().find(|(_, ev)| {
                     matches!(
                         &ev.payload,
                         TimelinePayload::UserPrompt { message_id, .. } if message_id == inc_mid
@@ -5075,7 +6195,7 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
                 })
             {
                 *dup_slot = incoming;
-                return;
+                return idx;
             }
         }
         TimelinePayload::AssistantMessage { item_id, .. } if !item_id.is_empty() => {
@@ -5095,10 +6215,11 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
             };
             *item_id = effective_id.clone();
 
-            if let Some(prev) = list[seg_start_idx..active_end]
+            if let Some((rel_idx, prev)) = list[seg_start_idx..active_end]
                 .iter_mut()
+                .enumerate()
                 .rev()
-                .find(|prev_ev| {
+                .find(|(_, prev_ev)| {
                     matches!(
                         &prev_ev.payload,
                         TimelinePayload::AssistantMessage { item_id: existing_id, .. }
@@ -5107,7 +6228,7 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
                 })
             {
                 *prev = incoming;
-                return;
+                return seg_start_idx + rel_idx;
             }
         }
         TimelinePayload::AssistantThinking { item_id, .. } if !item_id.is_empty() => {
@@ -5127,10 +6248,11 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
             };
             *item_id = effective_id.clone();
 
-            if let Some(prev) = list[seg_start_idx..active_end]
+            if let Some((rel_idx, prev)) = list[seg_start_idx..active_end]
                 .iter_mut()
+                .enumerate()
                 .rev()
-                .find(|prev_ev| {
+                .find(|(_, prev_ev)| {
                     matches!(
                         &prev_ev.payload,
                         TimelinePayload::AssistantThinking { item_id: existing_id, .. }
@@ -5139,15 +6261,16 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
                 })
             {
                 *prev = incoming;
-                return;
+                return seg_start_idx + rel_idx;
             }
         }
         TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
             let target_call_id = call_id.clone();
-            if let Some(prev) = list[turn_start_idx..active_end]
+            if let Some((rel_idx, prev)) = list[turn_start_idx..active_end]
                 .iter_mut()
+                .enumerate()
                 .rev()
-                .find(|prev_ev| {
+                .find(|(_, prev_ev)| {
                     matches!(
                         &prev_ev.payload,
                         TimelinePayload::ToolCall { call_id: existing_id, .. }
@@ -5156,23 +6279,314 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
                 })
             {
                 *prev = incoming;
-                return;
+                return turn_start_idx + rel_idx;
             }
         }
         _ => {}
     }
 
     if incoming.seq > 0 {
-        if let Some(same_seq) = list.iter_mut().find(|e| e.seq == incoming.seq) {
+        if let Some((idx, same_seq)) = list
+            .iter_mut()
+            .enumerate()
+            .find(|(_, e)| e.seq == incoming.seq)
+        {
             *same_seq = incoming;
-            return;
+            return idx;
         }
         if let Some(first_opt_idx) = list.iter().position(is_pending_optimistic_prompt) {
             list.insert(first_opt_idx, incoming);
-            return;
+            return first_opt_idx;
         }
     }
     list.push(incoming);
+    list.len() - 1
+}
+
+fn contains_ascii_case_insensitive_str(haystack: &str, needle: &str) -> bool {
+    let nb = needle.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(nb.len())
+        .any(|w| w.eq_ignore_ascii_case(nb))
+}
+
+fn payload_affects_auxiliary_state(payload: &TimelinePayload) -> bool {
+    match payload {
+        TimelinePayload::AssistantThinking { .. } => false,
+        TimelinePayload::AssistantMessage { text, .. } => {
+            contains_ascii_case_insensitive_str(text, "http://")
+                || contains_ascii_case_insensitive_str(text, "https://")
+        }
+        _ => true,
+    }
+}
+
+fn dirty_index_for_event(list: &[TimelineEvent], idx: usize, payload: &TimelinePayload) -> usize {
+    match payload {
+        TimelinePayload::PermissionResolved { request_id, .. } => list
+            .iter()
+            .position(|e| {
+                matches!(
+                    &e.payload,
+                    TimelinePayload::PermissionRequest { request_id: rid, .. }
+                        if rid == request_id
+                )
+            })
+            .map_or(idx, |found| found.min(idx)),
+        TimelinePayload::QuestionResolved { request_id, .. } => list
+            .iter()
+            .position(|e| {
+                matches!(
+                    &e.payload,
+                    TimelinePayload::QuestionRequest { request_id: rid, .. }
+                        if rid == request_id
+                )
+            })
+            .map_or(idx, |found| found.min(idx)),
+        _ => idx,
+    }
+}
+
+type ResolvedGatesMap = (HashMap<String, String>, HashMap<String, Vec<Vec<String>>>);
+
+fn collect_resolved_gates(events: &[TimelineEvent]) -> ResolvedGatesMap {
+    let mut all_resolved_perms: HashMap<String, String> = HashMap::new();
+    let mut all_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    for ev in events {
+        match &ev.payload {
+            TimelinePayload::PermissionResolved {
+                request_id,
+                decision,
+            } => {
+                all_resolved_perms.insert(request_id.clone(), decision.clone());
+            }
+            TimelinePayload::QuestionResolved {
+                request_id,
+                answers,
+            } => {
+                all_resolved_questions.insert(request_id.clone(), answers.clone());
+            }
+            _ => {}
+        }
+    }
+    (all_resolved_perms, all_resolved_questions)
+}
+
+fn render_timeline_event_view(
+    agent_id: &str,
+    agent_cwd: Option<&str>,
+    ev: &TimelineEvent,
+    all_resolved_perms: &HashMap<String, String>,
+    all_resolved_questions: &HashMap<String, Vec<Vec<String>>>,
+    markdown_cache: &mut HashMap<(String, u64, usize), Vec<RichBlockView>>,
+    streaming_markdown_cache: &mut HashMap<(String, String), (usize, Vec<RichBlockView>)>,
+) -> Option<TimelineItemView> {
+    let ts_ms = Some(ev.timestamp.timestamp_millis());
+    match &ev.payload {
+        TimelinePayload::UserPrompt {
+            message_id,
+            text,
+            badges,
+        } => {
+            let key = (agent_id.to_string(), ev.seq, text.len());
+            if markdown_cache.len() > 2048 {
+                markdown_cache.clear();
+            }
+            let blocks = markdown_cache
+                .entry(key)
+                .or_insert_with(|| parse_markdown_blocks(text, false))
+                .clone();
+            Some(TimelineItemView::UserPrompt {
+                seq: ev.seq,
+                message_id: message_id.clone(),
+                text: text.clone(),
+                badges: badges.clone(),
+                blocks,
+                timestamp_ms: ts_ms,
+            })
+        }
+        TimelinePayload::AssistantThinking { item_id, text } => {
+            Some(TimelineItemView::AssistantThinking {
+                seq: ev.seq,
+                item_id: item_id.clone(),
+                text: text.trim().to_string(),
+                timestamp_ms: ts_ms,
+            })
+        }
+        TimelinePayload::AssistantMessage {
+            item_id,
+            text,
+            streaming,
+        } => {
+            if let Some(warning_msg) = extract_legacy_provider_warning_text(text) {
+                Some(TimelineItemView::Notice {
+                    seq: ev.seq,
+                    level: "warning".into(),
+                    message: warning_msg,
+                    timestamp_ms: ts_ms,
+                })
+            } else if *streaming {
+                let slot_key = (
+                    agent_id.to_string(),
+                    if item_id.is_empty() {
+                        format!("seq:{}", ev.seq)
+                    } else {
+                        item_id.clone()
+                    },
+                );
+                let blocks = match streaming_markdown_cache.get(&slot_key) {
+                    Some((cached_len, cached_blocks)) if *cached_len == text.len() => {
+                        cached_blocks.clone()
+                    }
+                    _ => {
+                        let parsed = parse_markdown_blocks(text, true);
+                        if streaming_markdown_cache.len() > 64 {
+                            streaming_markdown_cache.clear();
+                        }
+                        streaming_markdown_cache.insert(slot_key, (text.len(), parsed.clone()));
+                        parsed
+                    }
+                };
+                Some(TimelineItemView::AssistantMessage {
+                    seq: ev.seq,
+                    item_id: item_id.clone(),
+                    text: text.clone(),
+                    streaming: true,
+                    blocks,
+                    timestamp_ms: ts_ms,
+                })
+            } else {
+                if !item_id.is_empty() {
+                    streaming_markdown_cache.remove(&(agent_id.to_string(), item_id.clone()));
+                }
+                let key = (agent_id.to_string(), ev.seq, text.len());
+                if markdown_cache.len() > 2048 {
+                    markdown_cache.clear();
+                }
+                let blocks = markdown_cache
+                    .entry(key)
+                    .or_insert_with(|| parse_markdown_blocks(text, false))
+                    .clone();
+                Some(TimelineItemView::AssistantMessage {
+                    seq: ev.seq,
+                    item_id: item_id.clone(),
+                    text: text.clone(),
+                    streaming: false,
+                    blocks,
+                    timestamp_ms: ts_ms,
+                })
+            }
+        }
+        TimelinePayload::ToolCall {
+            call_id,
+            status,
+            detail,
+        } => {
+            let (summary_title, diff_files) = summarize_tool_detail(detail);
+            let step_descriptor = Some(crate::stage::describe_tool_detail(
+                *status,
+                &summary_title,
+                detail,
+                &diff_files,
+                agent_cwd,
+            ));
+            Some(TimelineItemView::ToolCall {
+                seq: ev.seq,
+                call_id: call_id.clone(),
+                status: *status,
+                summary_title,
+                detail: detail.clone(),
+                step_descriptor,
+                diff_files,
+                timestamp_ms: ts_ms,
+            })
+        }
+        TimelinePayload::PermissionRequest {
+            request_id,
+            title,
+            detail,
+            allowed_decisions,
+        } => Some(TimelineItemView::PermissionRequest {
+            seq: ev.seq,
+            request_id: request_id.clone(),
+            title: title.clone(),
+            detail: detail.clone(),
+            allowed_decisions: allowed_decisions.clone(),
+            resolved_decision: all_resolved_perms.get(request_id).cloned(),
+            timestamp_ms: ts_ms,
+        }),
+        TimelinePayload::QuestionRequest {
+            request_id,
+            questions,
+        } => Some(TimelineItemView::QuestionRequest {
+            seq: ev.seq,
+            request_id: request_id.clone(),
+            questions: questions.clone(),
+            resolved_answers: all_resolved_questions.get(request_id).cloned(),
+            timestamp_ms: ts_ms,
+        }),
+        TimelinePayload::Notice { level, message } => Some(TimelineItemView::Notice {
+            seq: ev.seq,
+            level: level.clone(),
+            message: message.clone(),
+            timestamp_ms: ts_ms,
+        }),
+        TimelinePayload::AgentMessage {
+            message_id,
+            kind,
+            source_agent_id,
+            source_host_id,
+            source_title,
+            event,
+            text,
+            permission_context,
+        } => {
+            let key = (agent_id.to_string(), ev.seq, text.len());
+            if markdown_cache.len() > 2048 {
+                markdown_cache.clear();
+            }
+            let blocks = markdown_cache
+                .entry(key)
+                .or_insert_with(|| parse_markdown_blocks(text, false))
+                .clone();
+            Some(TimelineItemView::AgentMessage {
+                seq: ev.seq,
+                message_id: message_id.clone(),
+                kind: *kind,
+                source_agent_id: source_agent_id.clone(),
+                source_host_id: source_host_id.clone(),
+                source_title: source_title.clone(),
+                event: event.clone(),
+                text: text.clone(),
+                permission_context: permission_context.clone(),
+                blocks,
+                timestamp_ms: ts_ms,
+            })
+        }
+        TimelinePayload::StatusChanged {
+            status: AgentStatus::Error { message, .. },
+        } => (!message.trim().is_empty()).then(|| TimelineItemView::Notice {
+            seq: ev.seq,
+            level: "error".into(),
+            message: message.clone(),
+            timestamp_ms: ts_ms,
+        }),
+        TimelinePayload::StatusChanged {
+            status: AgentStatus::AutonomousWakeup { source, .. },
+        } => Some(TimelineItemView::Notice {
+            seq: ev.seq,
+            level: "wakeup".into(),
+            message: format_autonomous_wakeup_notice(source),
+            timestamp_ms: ts_ms,
+        }),
+        TimelinePayload::PermissionResolved { .. }
+        | TimelinePayload::QuestionResolved { .. }
+        | TimelinePayload::StatusChanged { .. } => None,
+    }
 }
 
 fn extract_legacy_provider_warning_text(text: &str) -> Option<String> {
@@ -5225,7 +6639,7 @@ fn format_autonomous_wakeup_notice(source: &str) -> String {
     }
 }
 
-fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
+fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> AgentCardView {
     let (status_label, is_running, is_awaiting_permission) = match &a.status {
         AgentStatus::Initializing => ("Starting".to_string(), true, false),
         AgentStatus::Idle => ("Idle".to_string(), false, false),
@@ -5247,6 +6661,11 @@ fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
         AgentStatus::Error { .. } => ("Error".to_string(), false, false),
         AgentStatus::Closed => ("Closed".to_string(), false, false),
     };
+    let seen_seq = pref.map(|p| p.seen_seq).unwrap_or(0);
+    let is_pinned = pref.is_some_and(|p| p.is_pinned);
+    let is_unread = !a.agent_id.starts_with("opt_")
+        && !is_running
+        && (a.latest_seq > seen_seq || a.attention != AttentionState::None);
     AgentCardView {
         agent_id: a.agent_id.clone(),
         workspace_id: a.workspace_id.clone(),
@@ -5271,6 +6690,9 @@ fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
         labels: a.labels.clone(),
         latest_seq: a.latest_seq,
         updated_at_rfc3339: a.updated_at.to_rfc3339(),
+        is_pinned,
+        seen_seq,
+        is_unread,
     }
 }
 
@@ -6168,5 +7590,656 @@ mod tests {
             TimelineItemView::AssistantMessage { seq: 3, text, .. }
                 if text.contains("Normal assistant reply")
         )));
+    }
+
+    #[test]
+    fn incremental_agent_stage_delta_slices_tail_resolves_gates_and_resets_on_rewind() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h1".into(),
+                hostname: "h1".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag1".into(),
+                AgentSummary {
+                    agent_id: "ag1".into(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/repo".into(),
+                    title: "Stage Delta".into(),
+                    provider: ProviderKind::Codex,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Running {
+                        turn_id: "t2".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 5,
+                    timeline_epoch: 1,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                },
+            );
+            guard.insert("h1".into(), mem);
+        }
+
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag1".into(),
+                has_more: false,
+                events: vec![
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 1,
+                        agent_id: "ag1".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::UserPrompt {
+                            message_id: "u1".into(),
+                            text: "turn 1".into(),
+                            badges: vec![],
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 1,
+                        agent_id: "ag1".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::PermissionRequest {
+                            request_id: "perm1".into(),
+                            title: "Run test".into(),
+                            detail: ToolCallDetail::Shell {
+                                command: "cargo test".into(),
+                                cwd: Some("/repo".into()),
+                                exit_code: None,
+                                output_preview: None,
+                            },
+                            allowed_decisions: vec!["allow_once".into()],
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 3,
+                        epoch: 1,
+                        agent_id: "ag1".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m1".into(),
+                            text: "done 1".into(),
+                            streaming: false,
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 4,
+                        epoch: 1,
+                        agent_id: "ag1".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::UserPrompt {
+                            message_id: "u2".into(),
+                            text: "turn 2".into(),
+                            badges: vec![],
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 5,
+                        epoch: 1,
+                        agent_id: "ag1".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m2".into(),
+                            text: "half".into(),
+                            streaming: true,
+                        },
+                    },
+                ],
+            },
+        );
+
+        let d0 = core.agent_stage_delta("h1", "ag1", 0);
+        assert!(d0.reset);
+        assert_eq!(d0.total_turn_count, 2);
+        assert_eq!(d0.pending_permissions.len(), 1);
+        let rev1 = d0.revision;
+
+        // No-op pull at same revision returns empty delta
+        let d_same = core.agent_stage_delta("h1", "ag1", rev1);
+        assert!(!d_same.reset);
+        assert!(d_same.changed_turns.is_empty());
+
+        // Tail streaming update only replaces turn index 1 (turn 2)
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 6,
+                    epoch: 1,
+                    agent_id: "ag1".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "m2".into(),
+                        text: "half + complete".into(),
+                        streaming: false,
+                    },
+                },
+            },
+        );
+        let d1 = core.agent_stage_delta("h1", "ag1", rev1);
+        assert!(!d1.reset);
+        assert_eq!(d1.replace_from_turn_index, 1);
+        assert_eq!(d1.changed_turns.len(), 1);
+        let rev2 = d1.revision;
+
+        // PermissionResolved invalidates original turn 0 where gate lived
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 7,
+                    epoch: 1,
+                    agent_id: "ag1".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::PermissionResolved {
+                        request_id: "perm1".into(),
+                        decision: "allow_once".into(),
+                    },
+                },
+            },
+        );
+        let d2 = core.agent_stage_delta("h1", "ag1", rev2);
+        assert!(!d2.reset);
+        assert_eq!(d2.replace_from_turn_index, 0);
+        assert!(d2.pending_permissions.is_empty());
+        let rev3 = d2.revision;
+
+        // Rewind resets stage revision history and forces full reset
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::AgentRewound {
+                request_id: Some(Uuid::new_v4()),
+                agent: AgentSummary {
+                    agent_id: "ag1".into(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/repo".into(),
+                    title: "Stage Delta".into(),
+                    provider: ProviderKind::Codex,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 3,
+                    timeline_epoch: 2,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                },
+                to_before_seq: 4,
+                events: vec![TimelineEvent {
+                    seq: 1,
+                    epoch: 2,
+                    agent_id: "ag1".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: "u1".into(),
+                        text: "turn 1".into(),
+                        badges: vec![],
+                    },
+                }],
+                restored_files: 0,
+                restored_prompt: None,
+                notice: None,
+            },
+        );
+        let d_rewind = core.agent_stage_delta("h1", "ag1", rev3);
+        assert!(d_rewind.reset);
+        assert_eq!(d_rewind.replace_from_turn_index, 0);
+        assert_eq!(d_rewind.total_turn_count, 1);
+    }
+
+    #[test]
+    fn fleet_sidebar_thread_prefs_opt_migration_and_multislot_terminal() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h1".into(),
+                hostname: "dev".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.workspaces.push(WorkspaceSummary {
+                workspace_id: "ws1".into(),
+                cwd: "/work/orbit".into(),
+                title: "orbit".into(),
+                is_worktree: false,
+                git_branch: Some("main".into()),
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+            });
+            guard.insert("h1".into(), mem);
+        }
+
+        // First AgentsSnapshot hydrates existing agent without unread badge
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::AgentsSnapshot {
+                request_id: Uuid::new_v4(),
+                agents: vec![AgentSummary {
+                    agent_id: "ag_old".into(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/work/orbit".into(),
+                    title: "Existing".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 10,
+                    timeline_epoch: 1,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                }],
+            },
+        );
+        let detail = core.host_detail("h1").expect("detail");
+        assert!(!detail.agents[0].is_unread);
+
+        // Pin optimistic session and verify migration on AgentCreated
+        let req_id = Uuid::new_v4();
+        let opt_id = format!("opt_{req_id}");
+        {
+            let mut guard = core.hosts.write().expect("lock");
+            let h = guard.get_mut("h1").expect("h1");
+            h.optimistic_by_req_id.insert(req_id, opt_id.clone());
+            h.agents.insert(
+                opt_id.clone(),
+                AgentSummary {
+                    agent_id: opt_id.clone(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/work/orbit".into(),
+                    title: "Draft".into(),
+                    provider: ProviderKind::Codex,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Initializing,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                },
+            );
+        }
+        assert!(core.toggle_pin_agent("h1", &opt_id));
+        core.handle_inbound_wire(
+            "h1",
+            WireMessage::AgentCreated {
+                request_id: req_id,
+                agent: AgentSummary {
+                    agent_id: "ag_real".into(),
+                    workspace_id: "ws1".into(),
+                    cwd: "/work/orbit".into(),
+                    title: "Draft".into(),
+                    provider: ProviderKind::Codex,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 3,
+                    timeline_epoch: 1,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                },
+            },
+        );
+
+        let sidebar = core.fleet_sidebar(
+            crate::sidebar::SidebarProjectSort::Recent,
+            crate::sidebar::SidebarThreadFilter::All,
+            "",
+            Some("h1"),
+            Some("ag_old"),
+            Some("/work/orbit"),
+        );
+        assert_eq!(sidebar.pinned_conversations.len(), 1);
+        assert_eq!(sidebar.pinned_conversations[0].agent.agent_id, "ag_real");
+        assert!(sidebar.pinned_conversations[0].is_unread);
+        core.mark_agent_seen("h1", "ag_real", 3);
+        let sidebar_after_seen = core.fleet_sidebar(
+            crate::sidebar::SidebarProjectSort::Recent,
+            crate::sidebar::SidebarThreadFilter::All,
+            "",
+            Some("h1"),
+            Some("ag_old"),
+            Some("/work/orbit"),
+        );
+        assert!(!sidebar_after_seen.pinned_conversations[0].is_unread);
+
+        // Multi-slot terminal isolation & StripTerminalBytesSubscriber
+        let received = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSub(Arc<Mutex<Vec<CoreNotification>>>);
+        impl CoreEventSubscriber for CapturingSub {
+            fn on_notification(&self, event: CoreNotification) {
+                if let Ok(mut g) = self.0.lock() {
+                    g.push(event);
+                }
+            }
+        }
+        core.subscribe_with_options(
+            SubscribeOptions {
+                min_interval_ms: 0,
+                include_terminal_raw_bytes: false,
+            },
+            Arc::new(CapturingSub(Arc::clone(&received))),
+        );
+
+        core.handle_inbound_terminal(
+            "h1",
+            TerminalBinaryFrame::Output {
+                slot: 1,
+                data: b"slot-one".to_vec(),
+            },
+        );
+        core.handle_inbound_terminal(
+            "h1",
+            TerminalBinaryFrame::Output {
+                slot: 2,
+                data: b"slot-two".to_vec(),
+            },
+        );
+        let s1 = core.terminal_screen_slot("h1", 1).expect("slot 1");
+        let s2 = core.terminal_screen_slot("h1", 2).expect("slot 2");
+        let row_contains = |screen: &TerminalScreenView, needle: &str| {
+            screen.rows_data.iter().any(|r| {
+                r.spans
+                    .iter()
+                    .map(|sp| sp.text.as_str())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+        };
+        assert!(row_contains(&s1, "slot-one"));
+        assert!(!row_contains(&s1, "slot-two"));
+        assert!(row_contains(&s2, "slot-two"));
+
+        let notes = received.lock().expect("notes");
+        assert!(notes.iter().any(|n| matches!(
+            n,
+            CoreNotification::TerminalChanged { slot: 2, raw_bytes, .. } if raw_bytes.is_empty()
+        )));
+    }
+
+    #[test]
+    fn streaming_markdown_updates_do_not_evict_settled_cache_and_preserve_aux_revision() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        let mut mem = HostMemoryState::new(SavedHostProfile {
+            host_id: "h_stream".into(),
+            hostname: "stream-box".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 7474,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            state: HostConnectionState::OnlineDirect,
+        });
+
+        let settled_ev = TimelineEvent {
+            seq: 1,
+            epoch: 1,
+            agent_id: "ag_s".into(),
+            turn_id: None,
+            timestamp: now,
+            payload: TimelinePayload::AssistantMessage {
+                item_id: "settled_1".into(),
+                text: "Settled paragraph".into(),
+                streaming: false,
+            },
+        };
+        let _ = render_timeline_event_view(
+            "ag_s",
+            None,
+            &settled_ev,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut mem.markdown_cache,
+            &mut mem.streaming_markdown_cache,
+        );
+        assert_eq!(mem.markdown_cache.len(), 1);
+
+        // Simulate 2500 streaming increments on one item: settled markdown_cache stays untouched.
+        for step in 1..=2500usize {
+            let stream_ev = TimelineEvent {
+                seq: 10 + step as u64,
+                epoch: 1,
+                agent_id: "ag_s".into(),
+                turn_id: None,
+                timestamp: now,
+                payload: TimelinePayload::AssistantMessage {
+                    item_id: "live_1".into(),
+                    text: "a".repeat(step),
+                    streaming: true,
+                },
+            };
+            let _ = render_timeline_event_view(
+                "ag_s",
+                None,
+                &stream_ev,
+                &HashMap::new(),
+                &HashMap::new(),
+                &mut mem.markdown_cache,
+                &mut mem.streaming_markdown_cache,
+            );
+        }
+        assert_eq!(mem.markdown_cache.len(), 1);
+        assert_eq!(mem.streaming_markdown_cache.len(), 1);
+
+        // Verify agent_stage_delta_with_aux skips unchanged aux state on pure text streaming
+        mem.agents.insert(
+            "ag_s".into(),
+            AgentSummary {
+                agent_id: "ag_s".into(),
+                workspace_id: "ws1".into(),
+                cwd: "/repo".into(),
+                title: "Stream".into(),
+                provider: ProviderKind::Codex,
+                model: None,
+                effort: None,
+                mode: SessionMode::Default,
+                status: AgentStatus::Running {
+                    turn_id: "t1".into(),
+                },
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 2,
+                timeline_epoch: 1,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: None,
+            },
+        );
+        core.hosts
+            .write()
+            .expect("lock")
+            .insert("h_stream".into(), mem);
+
+        core.handle_inbound_wire(
+            "h_stream",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag_s".into(),
+                has_more: false,
+                events: vec![
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 1,
+                        agent_id: "ag_s".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::ToolCall {
+                            call_id: "tc_edit".into(),
+                            status: ToolCallStatus::Completed,
+                            detail: ToolCallDetail::FileEdit {
+                                path: "/repo/a.rs".into(),
+                                unified_diff: Some(
+                                    "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b".into(),
+                                ),
+                            },
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 1,
+                        agent_id: "ag_s".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "msg_live".into(),
+                            text: "| col1 | col2 |\n| --- | --- |\n| a | b |".into(),
+                            streaming: true,
+                        },
+                    },
+                ],
+            },
+        );
+
+        let d0 = core.agent_stage_delta_with_aux("h_stream", "ag_s", 0, None);
+        assert!(!d0.aux_unchanged);
+        assert_eq!(d0.session_turn_diffs.len(), 1);
+        let aux_rev = d0.aux_revision;
+
+        // Streaming chunk without URLs or tool changes keeps aux_revision unchanged
+        core.handle_inbound_wire(
+            "h_stream",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 3,
+                    epoch: 1,
+                    agent_id: "ag_s".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "msg_live".into(),
+                        text: "| col1 | col2 |\n| --- | --- |\n| a | b |\n\nTrailing prose".into(),
+                        streaming: true,
+                    },
+                },
+            },
+        );
+        let d1 = core.agent_stage_delta_with_aux("h_stream", "ag_s", d0.revision, Some(aux_rev));
+        assert!(d1.aux_unchanged);
+        assert_eq!(d1.aux_revision, aux_rev);
+        assert!(d1.session_turn_diffs.is_empty());
+
+        // Emitting a localhost URL bumps aux_revision and ships insights again
+        core.handle_inbound_wire(
+            "h_stream",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 4,
+                    epoch: 1,
+                    agent_id: "ag_s".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "msg_live".into(),
+                        text: "| col1 | col2 |\n| --- | --- |\n| a | b |\n\nPreview http://localhost:5173".into(),
+                        streaming: false,
+                    },
+                },
+            },
+        );
+        let d2 = core.agent_stage_delta_with_aux("h_stream", "ag_s", d1.revision, Some(aux_rev));
+        assert!(!d2.aux_unchanged);
+        assert!(d2.aux_revision > aux_rev);
+        assert_eq!(d2.session_turn_diffs.len(), 1);
+        assert_eq!(
+            d2.insights.detected_local_urls,
+            vec!["http://localhost:5173".to_string()]
+        );
     }
 }

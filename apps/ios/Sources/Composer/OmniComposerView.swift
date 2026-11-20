@@ -78,13 +78,13 @@ struct OmniComposerView: View {
     private struct SlashTriggerMatch {
         let tokenRange: Range<String.Index>
         let query: String
-        let commands: [OrbitSlashCommand]
+        let commands: [FfiSlashCommand]
     }
 
     private struct MentionTriggerMatch {
         let tokenRange: Range<String.Index>
         let query: String
-        let candidates: [ComposerMentionCandidate]
+        let candidates: [FfiMentionCandidate]
     }
 
     private var clampedCursorIndex: String.Index {
@@ -108,7 +108,7 @@ struct OmniComposerView: View {
         guard query.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") }) else {
             return nil
         }
-        let commands = OrbitSlashCommand.filter(query: query)
+        let commands = store.filterSlashCommands(query: query)
         guard !commands.isEmpty else { return nil }
         return SlashTriggerMatch(
             tokenRange: tokenStart..<endIdx,
@@ -131,134 +131,13 @@ struct OmniComposerView: View {
         guard token.hasPrefix("@") else { return nil }
         let query = String(token.dropFirst())
         guard !query.contains("@") else { return nil }
-        let candidates = buildMentionCandidates(query: query)
+        let candidates = store.rankMentionCandidates(query: query, limit: 11)
         guard !candidates.isEmpty else { return nil }
         return MentionTriggerMatch(
             tokenRange: tokenStart..<endIdx,
             query: query,
             candidates: candidates
         )
-    }
-
-    private func buildMentionCandidates(query: String) -> [ComposerMentionCandidate] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var results: [ComposerMentionCandidate] = []
-
-        // 1. Live Context Sources (1:1 with Desktop mention-menu.tsx)
-        let specials: [(candidate: ComposerMentionCandidate, isDiff: Bool, isTerminal: Bool, label: String, subtitle: String)] = [
-            (
-                candidate: ComposerMentionCandidate(
-                    id: "special:working_diff",
-                    kind: .gitDiff(
-                        staged: false,
-                        label: "Working Tree Diff",
-                        subtitle: "Uncommitted changes in workspace"
-                    )
-                ),
-                isDiff: true,
-                isTerminal: false,
-                label: "Working Tree Diff",
-                subtitle: "Uncommitted changes in workspace"
-            ),
-            (
-                candidate: ComposerMentionCandidate(
-                    id: "special:staged_diff",
-                    kind: .gitDiff(
-                        staged: true,
-                        label: "Staged Diff",
-                        subtitle: "Git index staged changes"
-                    )
-                ),
-                isDiff: true,
-                isTerminal: false,
-                label: "Staged Diff",
-                subtitle: "Git index staged changes"
-            ),
-            (
-                candidate: ComposerMentionCandidate(
-                    id: "special:terminal",
-                    kind: .terminalOutput(
-                        label: "Terminal Output",
-                        subtitle: "Recent lines from active PTY terminal"
-                    )
-                ),
-                isDiff: false,
-                isTerminal: true,
-                label: "Terminal Output",
-                subtitle: "Recent lines from active PTY terminal"
-            )
-        ]
-
-        for entry in specials {
-            if q.isEmpty
-                || entry.label.lowercased().contains(q)
-                || entry.subtitle.lowercased().contains(q)
-                || (entry.isDiff && "diff".contains(q))
-                || (entry.isTerminal && "pty".contains(q)) {
-                results.append(entry.candidate)
-            }
-        }
-
-        // 2. Merged Git & Workspace Files with modified boost
-        let gitFiles = store.gitReview?.changedFiles ?? []
-        var gitStatusByPath: [String: String] = [:]
-        var orderedPaths: [String] = []
-        var seenPaths = Set<String>()
-
-        for gf in gitFiles {
-            let status = gf.untracked ? "U" : (gf.status.isEmpty ? "M" : gf.status)
-            gitStatusByPath[gf.path] = status
-            if seenPaths.insert(gf.path).inserted {
-                orderedPaths.append(gf.path)
-            }
-        }
-        for path in store.workspaceFilesList where seenPaths.insert(path).inserted {
-            orderedPaths.append(path)
-        }
-
-        var scoredFiles: [(score: Double, item: ComposerMentionCandidate)] = []
-        for path in orderedPaths {
-            let slashIdx = path.lastIndex(of: "/")
-            let basename = slashIdx.map { String(path[path.index(after: $0)...]) } ?? path
-            let dirPath = slashIdx.map { String(path[..<$0]) } ?? ""
-            let baseScore = mentionFuzzyScore(path: path, basename: basename, queryLower: q)
-            guard baseScore > 0 else { continue }
-            let gitStatus = gitStatusByPath[path]
-            let finalScore = baseScore + (gitStatus != nil ? 18.0 : 0.0) - min(12.0, Double(path.count) * 0.08)
-            scoredFiles.append((
-                score: finalScore,
-                item: ComposerMentionCandidate(
-                    id: "file:\(path)",
-                    kind: .file(
-                        path: path,
-                        basename: basename,
-                        dirPath: dirPath,
-                        gitStatus: gitStatus
-                    )
-                )
-            ))
-        }
-
-        scoredFiles.sort { lhs, rhs in
-            if lhs.score != rhs.score { return lhs.score > rhs.score }
-            return lhs.item.id < rhs.item.id
-        }
-        let maxFiles = max(4, 11 - results.count)
-        for entry in scoredFiles.prefix(maxFiles) {
-            results.append(entry.item)
-        }
-        return results
-    }
-
-    private func mentionFuzzyScore(path: String, basename: String, queryLower: String) -> Double {
-        guard !queryLower.isEmpty else { return 10 }
-        let baseLower = basename.lowercased()
-        let fullLower = path.lowercased()
-        if baseLower == queryLower { return 120 }
-        if baseLower.hasPrefix(queryLower) { return 100 }
-        if baseLower.contains(queryLower) { return 82 }
-        if fullLower.contains(queryLower) { return 64 }
-        return isFuzzySubsequence(needle: queryLower, haystack: fullLower) ? 40 : 0
     }
 
     var body: some View {
@@ -382,7 +261,7 @@ struct OmniComposerView: View {
         store.applyQuickWorkflow(directive)
     }
 
-    private func executeSlashCommand(_ cmd: OrbitSlashCommand, trigger: SlashTriggerMatch) {
+    private func executeSlashCommand(_ cmd: FfiSlashCommand, trigger: SlashTriggerMatch) {
         let text = store.composerText
         let collapsed = collapseStrippedToken(
             before: String(text[..<trigger.tokenRange.lowerBound]),
@@ -391,38 +270,44 @@ struct OmniComposerView: View {
         store.composerText = collapsed.text
         cursorOffset = collapsed.cursor
 
-        switch cmd {
-        case .plan:
+        switch cmd.id {
+        case "plan":
             store.applyQuickWorkflow(.plan)
-        case .review:
+        case "review":
             store.applyQuickWorkflow(.review)
-        case .compact:
+        case "compact":
             if !store.isDraftNewSession && store.selectedAgentId != nil {
                 store.applyQuickWorkflow(.compact)
             } else {
                 store.hapticWarning()
                 store.showToast("Start an active session first to compact context")
             }
-        case .ask:
+        case "orbit", "orbit-handoff", "orbit-committee", "orbit-advisor":
+            if let dir = OrbitSlashDirective(rawValue: cmd.id) {
+                store.applyQuickWorkflow(dir)
+            }
+        case "ask":
             store.applySessionMode(.default)
-        case .edits:
+        case "edits":
             store.applySessionMode(.acceptEdits)
-        case .full:
+        case "full":
             store.applySessionMode(.fullAccess)
-        case .diff:
+        case "diff":
             store.openGitDiff()
-        case .terminal:
+        case "terminal":
             store.openTerminal()
-        case .new:
+        case "new":
             store.startNewSessionDraft()
-        case .settings:
+        case "settings":
             store.activeSheet = .settings
+        default:
+            break
         }
         store.requestComposerFocus()
         store.hapticLight()
     }
 
-    private func executeMentionSelect(_ candidate: ComposerMentionCandidate, trigger: MentionTriggerMatch) {
+    private func executeMentionSelect(_ candidate: FfiMentionCandidate, trigger: MentionTriggerMatch) {
         let text = store.composerText
         let beforeAt = String(text[..<trigger.tokenRange.lowerBound])
         let afterToken = String(text[trigger.tokenRange.upperBound...])
@@ -437,23 +322,25 @@ struct OmniComposerView: View {
         }
 
         switch candidate.kind {
-        case let .file(path, basename, _, _):
-            let token = "@\(basename)"
+        case "file":
+            let path = candidate.filePath.isEmpty ? candidate.key : candidate.filePath
+            let token = candidate.tokenLabel.isEmpty ? "@\(candidate.title)" : candidate.tokenLabel
             store.registerInlineMention(token: token, item: .file(path: path))
             insertInlineToken(token)
-        case let .gitDiff(staged, label, _):
-            if staged {
-                store.setGitStagedFilter(true)
-            } else {
-                store.refreshGitReview()
-            }
-            let token = staged ? "@staged-diff" : "@working-diff"
-            store.registerInlineMention(token: token, item: .gitDiff(staged: staged, label: label))
+        case "git_diff":
+            store.refreshGitReview()
+            let token = candidate.tokenLabel.isEmpty ? "@working-diff" : candidate.tokenLabel
+            store.registerInlineMention(token: token, item: .gitDiff(staged: false, label: candidate.title))
             insertInlineToken(token)
-        case let .terminalOutput(label, _):
+        case "staged":
+            store.setGitStagedFilter(true)
+            let token = candidate.tokenLabel.isEmpty ? "@staged-diff" : candidate.tokenLabel
+            store.registerInlineMention(token: token, item: .gitDiff(staged: true, label: candidate.title))
+            insertInlineToken(token)
+        case "terminal":
             if let snap = store.captureTerminalSnapshotText() {
-                let token = "@terminal"
-                store.registerInlineMention(token: token, item: .terminalOutput(label: label, content: snap))
+                let token = candidate.tokenLabel.isEmpty ? "@terminal" : candidate.tokenLabel
+                store.registerInlineMention(token: token, item: .terminalOutput(label: candidate.title, content: snap))
                 insertInlineToken(token)
             } else {
                 let collapsed = collapseStrippedToken(before: beforeAt, after: afterToken)
@@ -462,6 +349,8 @@ struct OmniComposerView: View {
                 store.requestComposerFocus()
                 store.showToast("No active terminal output yet")
             }
+        default:
+            break
         }
     }
 
@@ -1070,17 +959,6 @@ struct OmniComposerView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Remove \(label)")
-    }
-
-    private func isFuzzySubsequence(needle: String, haystack: String) -> Bool {
-        var hIdx = haystack.startIndex
-        for ch in needle {
-            guard let found = haystack[hIdx...].firstIndex(of: ch) else {
-                return false
-            }
-            hIdx = haystack.index(after: found)
-        }
-        return true
     }
 }
 

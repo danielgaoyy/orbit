@@ -181,22 +181,7 @@ export struct ModelPickerSheet {
         return opts[i].description!.trim();
       }
     }
-    if (eff === 'off') {
-      return 'Direct replies without extended reasoning';
-    }
-    if (eff === 'low') {
-      return 'Fast lightweight reasoning';
-    }
-    if (eff === 'medium') {
-      return 'Balanced speed and reasoning depth';
-    }
-    if (eff === 'xhigh' || eff === 'extra_high') {
-      return 'Deep verification across files';
-    }
-    if (eff === 'max' || eff === 'ultra') {
-      return 'Maximum deep reasoning budget';
-    }
-    return eff.length > 0 ? formatEffortLabel(eff) : '';
+    return this.store.effortDescriptionText(eff);
   }
 
   private isSelectedModel(spec: ProviderModelSpecDto): boolean {
@@ -222,33 +207,14 @@ export struct ModelPickerSheet {
       return '';
     }
     const isActive = this.isSelectedModel(spec);
-    const catalog = this.store.catalogForProvider(this.store.composerProvider);
-    const candidates: string[] = [];
-    if (isActive && this.store.composerEffort.trim().length > 0) {
-      candidates.push(this.store.composerEffort.trim().toLowerCase());
-    }
-    if (spec.default_effort !== undefined && spec.default_effort !== null && spec.default_effort.trim().length > 0) {
-      candidates.push(spec.default_effort.trim().toLowerCase());
-    }
-    if (
-      catalog !== null &&
-      catalog.configured_default_effort !== undefined &&
-      catalog.configured_default_effort !== null &&
-      catalog.configured_default_effort.trim().length > 0
-    ) {
-      candidates.push(catalog.configured_default_effort.trim().toLowerCase());
-    }
-    for (let c = 0; c < candidates.length; c++) {
-      for (let i = 0; i < spec.thinking_options.length; i++) {
-        if (spec.thinking_options[i].effort.trim().toLowerCase() === candidates[c]) {
-          return spec.thinking_options[i].effort;
-        }
-      }
-    }
-    for (let i = 0; i < spec.thinking_options.length; i++) {
-      if (spec.thinking_options[i].is_default) {
-        return spec.thinking_options[i].effort;
-      }
+    const resolved = this.store.resolveModelSelectionFromCore(
+      this.store.composerProvider,
+      spec.id,
+      isActive ? this.store.composerEffort : ''
+    );
+    const eff = resolved?.selected_effort ?? '';
+    if (eff.length > 0) {
+      return eff;
     }
     return spec.thinking_options[0].effort;
   }

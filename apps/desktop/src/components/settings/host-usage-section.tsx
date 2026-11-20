@@ -164,14 +164,16 @@ export function HostUsageSection({ hostId }: { hostId: string }) {
                         <div className="bg-muted h-1.5 w-full overflow-hidden rounded-full">
                           <div
                             className={cn(
-                              "h-full transition-all duration-300",
+                              "h-full w-full origin-left rounded-full transition-transform duration-300 ease-[var(--ease-out-expo)]",
                               w.used_percent >= 85
                                 ? "bg-rose-500"
                                 : w.used_percent >= 70
                                   ? "bg-amber-500"
                                   : "bg-foreground/75",
                             )}
-                            style={{ width: `${Math.min(100, Math.max(0, w.used_percent))}%` }}
+                            style={{
+                              transform: `scaleX(${Math.min(1, Math.max(0, w.used_percent / 100))})`,
+                            }}
                           />
                         </div>
                       </div>

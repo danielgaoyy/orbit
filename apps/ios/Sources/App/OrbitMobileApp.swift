@@ -71,6 +71,9 @@ private struct OrbitThemedRootContainer: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(resolvedPalette.canvas.ignoresSafeArea())
         .environment(\.orbitPalette, resolvedPalette)
+        .environment(\.orbitDiagramRenderer) { kind, source, isDark in
+            await store.renderDiagram(kind: kind, source: source, isDark: isDark)
+        }
         .preferredColorScheme(appearanceMode.preferredColorScheme)
         .tint(resolvedPalette.primary)
         .onAppear {

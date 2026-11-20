@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   AlertCircle,
   ChevronRight,
@@ -14,15 +14,18 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { Separator } from "@/components/ui/separator";
-import type { AgentCardView, TimelineItemView } from "@/lib/orbit-ipc";
-import { deriveSessionInsights } from "@/lib/session-insights";
-import type { TurnFileDiffSummary } from "@/lib/timeline-coalesce";
+import type {
+  AgentCardView,
+  DiffFileView,
+  SessionInsightsView,
+} from "@/lib/orbit-ipc";
 import {
   type OverviewSectionId,
   type QueuedPromptItem,
@@ -116,8 +119,8 @@ interface StageOverviewContentProps {
   hostId: string;
   agentId: string;
   cwd: string;
-  items: readonly TimelineItemView[];
-  sessionTurnDiffs: readonly TurnFileDiffSummary[];
+  insights: SessionInsightsView;
+  sessionTurnDiffs: readonly DiffFileView[];
   currentAgent: AgentCardView | null;
 }
 
@@ -125,9 +128,8 @@ const StageOverviewBody = memo(function StageOverviewBody({
   hostId,
   agentId,
   cwd,
-  items,
+  insights: baseInsights,
   sessionTurnDiffs,
-  currentAgent,
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
@@ -139,17 +141,28 @@ const StageOverviewBody = memo(function StageOverviewBody({
     (s) => s.queuedPrompts[`${hostId}::${agentId}`] ?? EMPTY_QUEUED,
   );
 
-  const insights = useMemo(
-    () =>
-      deriveSessionInsights({
-        items,
-        cwd,
-        currentAgent,
-        hostDetail,
-        queuedPrompts,
-      }),
-    [items, cwd, currentAgent, hostDetail, queuedPrompts],
-  );
+  const backgroundTasks = useMemo(() => {
+    if (queuedPrompts.length === 0) return baseInsights.background_tasks;
+    const merged = [...baseInsights.background_tasks];
+    const seenIds = new Set(merged.map((t) => t.id));
+    for (const qp of queuedPrompts) {
+      const qId = `queue:${qp.id}`;
+      if (seenIds.has(qId)) continue;
+      merged.push({
+        id: qId,
+        kind: "queued",
+        title: (qp.displayText || "Queued follow-up").slice(0, 72),
+        subtitle: "Queued · runs when turn finishes",
+        status: "queued",
+        started_at_ms: null,
+        command: null,
+        output_preview: null,
+      });
+    }
+    return merged;
+  }, [baseInsights.background_tasks, queuedPrompts]);
+
+  const insights = baseInsights;
 
   const reviewSummary = useMemo(() => {
     const gitFiles = gitReview?.diff_files ?? [];
@@ -300,13 +313,13 @@ const StageOverviewBody = memo(function StageOverviewBody({
               type="button"
               variant="ghost"
               size="sm"
-              title={sa.promptPreview || sa.role}
+              title={sa.prompt_preview || sa.role}
               onClick={() =>
                 orbitActions.openSubagentTab({
                   callId: sa.id,
                   role: sa.role,
-                  promptPreview: sa.promptPreview,
-                  childAgentId: sa.childAgentId,
+                  promptPreview: sa.prompt_preview,
+                  childAgentId: sa.child_agent_id,
                 })
               }
               className="text-foreground/86 hover:bg-accent/65 hover:text-foreground h-[30px] w-full justify-start gap-2 rounded-[8px] px-2 text-[13px] font-normal shadow-none transition-colors"
@@ -332,15 +345,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
       )}
 
       {/* Layer 3: Background Tasks (progressive disclosure when active) */}
-      {insights.backgroundTasks.length > 0 && (
+      {backgroundTasks.length > 0 && (
         <OverviewLayerSection
           id="tasks"
           label="Background Tasks"
-          count={insights.backgroundTasks.length}
+          count={backgroundTasks.length}
           collapsed={collapsedSections.tasks}
-          isRunning={insights.backgroundTasks.some((t) => t.status === "running")}
+          isRunning={backgroundTasks.some((t) => t.status === "running")}
         >
-          {insights.backgroundTasks.map((task) => {
+          {backgroundTasks.map((task) => {
             const queuedIdx =
               task.kind === "queued"
                 ? queuedPrompts.findIndex((q) => `queue:${q.id}` === task.id)
@@ -414,48 +427,50 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
   hostId,
   agentId,
   cwd,
-  items,
+  insights,
   sessionTurnDiffs,
   currentAgent,
+  stageContainerRef,
 }: {
   canDock: boolean;
   hostId: string;
   agentId: string;
   cwd: string;
-  items: readonly TimelineItemView[];
-  sessionTurnDiffs: readonly TurnFileDiffSummary[];
+  insights: SessionInsightsView;
+  sessionTurnDiffs: readonly DiffFileView[];
   currentAgent: AgentCardView | null;
+  stageContainerRef?: RefObject<HTMLDivElement | null>;
 }) {
-  const desktopPrefOpen = useOrbitSelector((s) => s.overviewDesktopOpenPref);
   const popoverOpen = useOrbitSelector((s) => s.overviewPopoverOpen);
   const popoverRef = useRef<HTMLDivElement | null>(null);
+  const [dockedTopPx, setDockedTopPx] = useState(52);
+  const {
+    dockedOverviewMounted,
+    dockedOverviewVisualOpen,
+    dockedOverviewOffsetPx,
+    dockedOverviewTransition,
+  } = useWorkspaceMotion();
 
-  const isDockedVisible = canDock && desktopPrefOpen;
+  useLayoutEffect(() => {
+    const el = stageContainerRef?.current;
+    if (!el) return;
+    const syncTop = () => {
+      const nextTop = Math.round(el.getBoundingClientRect().top) + 12;
+      setDockedTopPx((prev) => (prev === nextTop ? prev : nextTop));
+    };
+    syncTop();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(syncTop) : null;
+    ro?.observe(el);
+    window.addEventListener("resize", syncTop);
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener("resize", syncTop);
+    };
+  }, [stageContainerRef, dockedOverviewMounted]);
+
   const isPopoverVisible = !canDock && popoverOpen;
-  const [dockedMounted, setDockedMounted] = useState(isDockedVisible);
-  const [dockedVisualOpen, setDockedVisualOpen] = useState(isDockedVisible);
   const [popoverMounted, setPopoverMounted] = useState(isPopoverVisible);
   const [popoverVisualOpen, setPopoverVisualOpen] = useState(isPopoverVisible);
-
-  // Double-rAF glide-in so mounted card always paints once before animating, and cleanly unmount after exit
-  useEffect(() => {
-    if (isDockedVisible) {
-      setDockedMounted(true);
-      let raf2 = 0;
-      const raf1 = window.requestAnimationFrame(() => {
-        raf2 = window.requestAnimationFrame(() => {
-          setDockedVisualOpen(true);
-        });
-      });
-      return () => {
-        window.cancelAnimationFrame(raf1);
-        if (raf2) window.cancelAnimationFrame(raf2);
-      };
-    }
-    setDockedVisualOpen(false);
-    const timer = window.setTimeout(() => setDockedMounted(false), 250);
-    return () => window.clearTimeout(timer);
-  }, [isDockedVisible]);
 
   // Symmetric interruptible enter & exit for compact floating popover
   useEffect(() => {
@@ -514,24 +529,33 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
 
   return (
     <>
-      {/* 1. Spacious Stage: Floating Top-Right Card (keeps scrollbar on far right edge) */}
-      {dockedMounted && (
+      {/* 1. Spacious Stage: Viewport-Anchored Top-Right Card (pure GPU coordinated, zero settle flash) */}
+      {dockedOverviewMounted && (
         <aside
           aria-label="Session overview"
-          inert={!dockedVisualOpen}
+          inert={!dockedOverviewVisualOpen}
+          style={{
+            top: `${dockedTopPx}px`,
+            transform: dockedOverviewVisualOpen
+              ? `translate3d(${dockedOverviewOffsetPx}px, 0, 0) scale(1)`
+              : `translate3d(${dockedOverviewOffsetPx}px, 0, 0) scale(0.985)`,
+            opacity: dockedOverviewVisualOpen ? 1 : 0,
+            transition: dockedOverviewTransition,
+          }}
           className={cn(
-            "absolute top-3 right-4 z-25 w-[312px] origin-top-right will-change-[transform,opacity]",
-            dockedVisualOpen
-              ? "translate-x-0 scale-100 opacity-100 transition-[opacity,transform] duration-[240ms] ease-[var(--ease-panel)]"
-              : "pointer-events-none translate-x-2.5 scale-[0.985] opacity-0 transition-[opacity,transform] duration-[200ms] ease-[var(--ease-panel-out)]",
+            "fixed right-4 z-[15] w-[312px] origin-top-right will-change-[transform,opacity]",
+            !dockedOverviewVisualOpen && "pointer-events-none",
           )}
         >
-          <Card className="overview-card-surface flex h-fit max-h-[calc(100%-24px)] w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0">
+          <Card
+            style={{ maxHeight: `calc(100vh - ${dockedTopPx + 12}px)` }}
+            className="overview-card-surface flex h-fit w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0"
+          >
             <StageOverviewBody
               hostId={hostId}
               agentId={agentId}
               cwd={cwd}
-              items={items}
+              insights={insights}
               sessionTurnDiffs={sessionTurnDiffs}
               currentAgent={currentAgent}
             />
@@ -553,12 +577,12 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
               : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[145ms] ease-[var(--ease-exit)]",
           )}
         >
-          <Card className="overview-card-surface floating-surface flex h-fit max-h-[min(560px,calc(100%-24px))] w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0 backdrop-blur-md">
+          <Card className="overview-card-surface floating-surface flex h-fit max-h-[min(560px,calc(100%-24px))] w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0">
             <StageOverviewBody
               hostId={hostId}
               agentId={agentId}
               cwd={cwd}
-              items={items}
+              insights={insights}
               sessionTurnDiffs={sessionTurnDiffs}
               currentAgent={currentAgent}
             />

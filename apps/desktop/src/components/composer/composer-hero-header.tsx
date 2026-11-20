@@ -10,7 +10,6 @@ import {
 } from "lucide-react";
 import { basenameOfCwd } from "@/components/composer/composer-constants";
 import {
-  buildUnifiedProjects,
   isBareHomeDir,
   matchesProjectDirectory,
   normalizeProjectPath,
@@ -33,6 +32,7 @@ import { cn } from "@/lib/utils";
  */
 export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
   const fleet = useOrbitSelector((s) => s.fleet);
+  const sidebarView = useOrbitSelector((s) => s.sidebarView);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
@@ -41,21 +41,28 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
   const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
 
   const heroProjects = useMemo(() => {
-    const unified = buildUnifiedProjects(
-      fleet.hosts,
-      fleet.projects ?? [],
-      hostDetails,
-      hiddenProjectKeys,
+    const hostNameById = new Map(fleet.hosts.map((h) => [h.host_id, h.display_name]));
+    const dirsById = new Map(
+      (sidebarView?.projects ?? []).map((p) => [p.id, p.directories]),
     );
-    const items = unified.map((u) => ({
-      id: u.id,
-      hostId: u.host.host_id,
-      hostName: u.host.display_name,
-      name: u.name,
-      path: u.primaryCwd,
-      directories: u.directories,
-      branch: u.gitBranch,
-    }));
+    const items = (sidebarView?.launchpad_projects ?? [])
+      .filter((lp) => {
+        const clean = normalizeProjectPath(lp.path);
+        const hiddenKey = `${lp.host_id}::${clean}`;
+        const hasConvs = (sidebarView?.projects ?? []).some(
+          (p) => p.id === lp.id && p.conversations.length > 0,
+        );
+        return hasConvs || !hiddenProjectKeys[hiddenKey];
+      })
+      .map((lp) => ({
+        id: lp.id,
+        hostId: lp.host_id,
+        hostName: hostNameById.get(lp.host_id) ?? "Host",
+        name: lp.name,
+        path: lp.path,
+        directories: dirsById.get(lp.id) ?? [normalizeProjectPath(lp.path)],
+        branch: lp.branch,
+      }));
 
     const cleanSelected = normalizeProjectPath(selectedCwd);
     const hasSelected =
@@ -67,7 +74,6 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
       );
 
     if (selectedHostId && cleanSelected && !hasSelected && !isBareHomeDir(cleanSelected)) {
-      const hostObj = fleet.hosts.find((h) => h.host_id === selectedHostId);
       const branch =
         hostDetail?.workspaces.find((w) => normalizeProjectPath(w.cwd) === cleanSelected)
           ?.git_branch ??
@@ -78,7 +84,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
       items.unshift({
         id: `${selectedHostId}::${cleanSelected}`,
         hostId: selectedHostId,
-        hostName: hostObj?.display_name ?? "Host",
+        hostName: hostNameById.get(selectedHostId) ?? "Host",
         name: basenameOfCwd(cleanSelected),
         path: cleanSelected,
         directories: [cleanSelected],
@@ -89,8 +95,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
     return items;
   }, [
     fleet.hosts,
-    fleet.projects,
-    hostDetails,
+    sidebarView,
     hiddenProjectKeys,
     selectedHostId,
     selectedCwd,

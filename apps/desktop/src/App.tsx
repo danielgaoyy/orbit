@@ -1,31 +1,32 @@
-import { useEffect, useState } from "react";
-import { PanelLeft } from "lucide-react";
+import { memo, useEffect, useState } from "react";
+import { PanelLeft, PanelRight } from "lucide-react";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
+import { MarkdownThemeProvider } from "@/components/markdown-blocks";
 import { ConnectionStatusBanner } from "@/components/layout/connection-status-banner";
 import { TopBar } from "@/components/layout/top-bar";
 import { SettingsView } from "@/components/settings/settings-view";
 import { QuickOpenFileDialog } from "@/components/side-panel/quick-open-file-dialog";
+import {
+  WorkspaceMotionProvider,
+  useWorkspaceMotion,
+} from "@/components/layout/workspace-motion";
 import { WorkspaceSidePanel } from "@/components/side-panel/workspace-side-panel";
 import { FleetSidebar } from "@/components/sidebar/fleet-sidebar";
 import { RemoteFolderPickerDialog } from "@/components/sidebar/remote-folder-picker-dialog";
 import { StreamStage } from "@/components/stage/stream-stage";
 import { SimpleTooltip, TooltipProvider } from "@/components/ui/overlays";
 import { modSymbol, useGlobalErgonomicKeybindings } from "@/lib/keybindings";
-import { isMacDesktop } from "@/lib/orbit-ipc";
+import { orbitIpc, isMacDesktop } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 export default function App() {
+  const isDarkTheme = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const activeView = useOrbitSelector((s) => s.activeView);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
-  const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
-  const sidebarWidth = useOrbitSelector((s) => s.sidebarWidth);
   const toastNotice = useOrbitSelector((s) => s.toastNotice);
   const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
-
-  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
-  const [transitionsReady, setTransitionsReady] = useState(false);
 
   // Presence state for smooth Settings modal enter & exit
   const isSettingsOpen = activeView === "settings";
@@ -36,29 +37,39 @@ export default function App() {
   const [renderedToast, setRenderedToast] = useState<string | null>(toastNotice);
   const [toastExiting, setToastExiting] = useState(false);
 
-  const isMac = isMacDesktop();
-  const mod = modSymbol();
-
   useGlobalErgonomicKeybindings();
 
   useEffect(() => {
     void orbitActions.init();
-    const raf = window.requestAnimationFrame(() => {
-      setTransitionsReady(true);
-    });
-    return () => window.cancelAnimationFrame(raf);
   }, []);
 
-  // Track OS/WebView internet connectivity so offline states surface immediately even with a local daemon
+  // Track OS/WebView internet connectivity & window foreground/background lifecycle
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const syncOnline = () => orbitActions.setBrowserOffline(!navigator.onLine);
+    const syncOnline = () => {
+      orbitActions.setBrowserOffline(!navigator.onLine);
+      if (navigator.onLine) {
+        void orbitIpc.onNetworkChanged();
+      }
+    };
+    const onFocus = () => void orbitIpc.onAppForeground();
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void orbitIpc.onAppForeground();
+      } else {
+        void orbitIpc.onAppBackground();
+      }
+    };
     syncOnline();
     window.addEventListener("offline", syncOnline);
     window.addEventListener("online", syncOnline);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.removeEventListener("offline", syncOnline);
       window.removeEventListener("online", syncOnline);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
 
@@ -135,11 +146,85 @@ export default function App() {
     }
   }, [toastNotice, renderedToast]);
 
+  return (
+    <TooltipProvider>
+      <MarkdownThemeProvider isDark={isDarkTheme}>
+        {/* Dedicated Full-Window Settings Center (`⌘,`) with Smooth Enter/Exit */}
+        {settingsMounted && <SettingsView closing={settingsClosing} />}
+
+        {/* Main Workspace Shell coordinated by 100% GPU WorkspaceMotionProvider */}
+        <WorkspaceMotionProvider>
+          <WorkspaceShellLayout isSettingsOpen={isSettingsOpen} workspacePanel={workspacePanel} />
+        </WorkspaceMotionProvider>
+
+        {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`) & Remote Folder Browser */}
+        <CommandPalette />
+        <QuickOpenFileDialog />
+        <RemoteFolderPickerDialog />
+
+        {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit & Undo Archive */}
+        {renderedToast && (
+          <div
+            className={cn(
+              "bg-elevated text-foreground floating-surface fixed right-4 bottom-4 z-50 flex items-center gap-2.5 rounded-xl border border-black/[0.08] px-3.5 py-2 text-[13px] dark:border-white/[0.10]",
+              lastArchivedUndo ? "pointer-events-auto" : "pointer-events-none",
+              toastExiting ? "orbit-toast-exit" : "orbit-toast-enter",
+            )}
+          >
+            <span>{renderedToast}</span>
+            {lastArchivedUndo && (
+              <button
+                type="button"
+                onClick={() => orbitActions.undoLastArchive()}
+                className="text-primary hover:bg-accent cursor-pointer rounded-md px-2 py-0.5 text-[12px] font-medium transition-colors"
+              >
+                Undo
+              </button>
+            )}
+          </div>
+        )}
+      </MarkdownThemeProvider>
+    </TooltipProvider>
+  );
+}
+
+const StableFleetSidebar = memo(function StableFleetSidebar() {
+  return <FleetSidebar />;
+});
+
+const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
+  isSettingsOpen,
+  workspacePanel,
+}: {
+  isSettingsOpen: boolean;
+  workspacePanel: "conversation" | "automations";
+}) {
+  const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
+  const sidebarWidth = useOrbitSelector((s) => s.sidebarWidth);
+  const sidePanelOpen = useOrbitSelector((s) => s.sidePanelOpen);
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+
+  const {
+    isAnimating,
+    hasSelectedHost,
+    leftLayoutReservePx,
+    rightLayoutReservePx,
+    leftVisible,
+    leftTransform,
+    leftTransition,
+    setIsResizingLeft,
+    onLeftTransitionEnd,
+  } = useWorkspaceMotion();
+
+  const isMac = isMacDesktop();
+  const mod = modSymbol();
+
   const startSidebarResize = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     const startX = e.clientX;
     const startW = sidebarWidth;
     setIsResizingSidebar(true);
+    setIsResizingLeft(true);
     document.body.style.cursor = "col-resize";
 
     const onMove = (ev: MouseEvent) => {
@@ -147,6 +232,7 @@ export default function App() {
     };
     const cleanup = () => {
       setIsResizingSidebar(false);
+      setIsResizingLeft(false);
       document.body.style.cursor = "";
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", cleanup);
@@ -158,16 +244,12 @@ export default function App() {
   };
 
   return (
-    <TooltipProvider>
-      {/* Dedicated Full-Window Settings Center (`⌘,`) with Smooth Enter/Exit */}
-      {settingsMounted && <SettingsView closing={settingsClosing} />}
-
+    <>
       {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow pointer events during resize */}
       {isResizingSidebar && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
 
-      {/* Main Workspace Shell */}
-      <div className="bg-canvas text-foreground relative flex h-screen w-screen overflow-hidden">
-        {/* Single Stationary Titlebar Sidebar Toggle (`[◫]`, `⌘B`) — optically centered with macOS traffic lights & title */}
+      <div className="bg-canvas text-foreground relative flex h-screen w-screen overflow-clip">
+        {/* Single Stationary Titlebar Sidebar Toggle (`⌘B`) — optically centered with macOS traffic lights */}
         {!isSettingsOpen && (
           <div
             className={cn(
@@ -191,23 +273,54 @@ export default function App() {
           </div>
         )}
 
-        {/* 1. Collapsible & Resizable Single Unified Fleet Sidebar (`⌘B` — Single Source of Truth) */}
+        {/* Single Stationary Top-Right Side Panel Toggle (`⌘\`) */}
+        {!isSettingsOpen && hasSelectedHost && (
+          <div
+            className={cn(
+              "pointer-events-none fixed top-0 right-[10px] z-30 flex h-[40px] items-center",
+              isMac && "translate-y-[1px]",
+            )}
+          >
+            <SimpleTooltip
+              label={sidePanelOpen ? "Hide side panel" : "Show side panel"}
+              shortcut={`${mod}\\`}
+            >
+              <button
+                type="button"
+                aria-label={sidePanelOpen ? "Hide side panel" : "Show side panel"}
+                onClick={() => orbitActions.toggleSidePanel()}
+                className={cn(
+                  "pointer-events-auto inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
+                  sidePanelOpen
+                    ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
+                    : "text-foreground/64 hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
+                )}
+              >
+                <PanelRight className="h-[16px] w-[16px] stroke-[1.75]" />
+              </button>
+            </SimpleTooltip>
+          </div>
+        )}
+
+        {/* 1. Left Unified Fleet Sidebar (`⌘B`) — Pure GPU translate3d Layer */}
         <div
           inert={!sidebarOpen}
           data-open={sidebarOpen ? "true" : "false"}
-          data-ready={transitionsReady ? "true" : "false"}
+          data-animating={isAnimating ? "true" : "false"}
           data-resizing={isResizingSidebar ? "true" : "false"}
+          onTransitionEnd={onLeftTransitionEnd}
           style={{
             width: `${sidebarWidth}px`,
-            marginLeft: sidebarOpen ? "0px" : `-${sidebarWidth}px`,
-            opacity: sidebarOpen ? 1 : 0,
+            transform: leftTransform,
+            transition: leftTransition,
+            visibility: leftVisible ? "visible" : "hidden",
           }}
           className={cn(
-            "orbit-panel-left relative h-full shrink-0 overflow-hidden",
+            "orbit-panel-left absolute inset-y-0 left-0 z-20 h-full shrink-0 overflow-hidden [contain:layout_style]",
             !sidebarOpen && "pointer-events-none",
           )}
         >
-          <FleetSidebar />
+          <StableFleetSidebar />
 
           {sidebarOpen && (
             <div
@@ -217,49 +330,24 @@ export default function App() {
           )}
         </div>
 
-        {/* 2. Center Narrative Stage + In-Stage Overview + Unified Right Side Panel */}
-        <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <div className="flex min-h-0 flex-1 overflow-hidden">
-            <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-              <TopBar />
-              <ConnectionStatusBanner />
-              <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
-              </main>
-            </div>
-
-            {/* 3. Unified Multi-Tab Right Side Panel (Open File, Review, Terminal, Browser, Side Question, Subagent) */}
-            <WorkspaceSidePanel />
-          </div>
-        </div>
-      </div>
-
-      {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`) & Remote Folder Browser */}
-      <CommandPalette />
-      <QuickOpenFileDialog />
-      <RemoteFolderPickerDialog />
-
-      {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit & Undo Archive */}
-      {renderedToast && (
+        {/* 2. Center Narrative Stage (statically reserved at rest, GPU-slid during panel motion) */}
         <div
-          className={cn(
-            "bg-elevated text-foreground floating-surface fixed right-4 bottom-4 z-50 flex items-center gap-2.5 rounded-xl border border-black/[0.08] px-3.5 py-2 text-[13px] dark:border-white/[0.10]",
-            lastArchivedUndo ? "pointer-events-auto" : "pointer-events-none",
-            toastExiting ? "orbit-toast-exit" : "orbit-toast-enter",
-          )}
+          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-clip"
+          style={{
+            paddingLeft: `${leftLayoutReservePx}px`,
+            paddingRight: `${rightLayoutReservePx}px`,
+          }}
         >
-          <span>{renderedToast}</span>
-          {lastArchivedUndo && (
-            <button
-              type="button"
-              onClick={() => orbitActions.undoLastArchive()}
-              className="text-primary hover:bg-accent cursor-pointer rounded-md px-2 py-0.5 text-[12px] font-medium transition-colors"
-            >
-              Undo
-            </button>
-          )}
+          <TopBar />
+          <ConnectionStatusBanner />
+          <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+            {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
+          </main>
         </div>
-      )}
-    </TooltipProvider>
+
+        {/* 3. Unified Multi-Tab Right Side Panel — Pure GPU translate3d Layer */}
+        <WorkspaceSidePanel />
+      </div>
+    </>
   );
-}
+});

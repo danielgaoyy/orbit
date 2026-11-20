@@ -237,7 +237,7 @@ export struct StreamStage {
               symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder'))
                 .fontColor([this.store.palette.iconPrimary]),
               content: proj.name,
-              labelInfo: proj.branch.length > 0 ? proj.branch : undefined,
+              labelInfo: (proj.branch ?? '').length > 0 ? (proj.branch ?? undefined) : undefined,
               symbolEndIcon: cwdPathsEquivalent(proj.path, this.store.activeCwd)
                 ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
                 : undefined

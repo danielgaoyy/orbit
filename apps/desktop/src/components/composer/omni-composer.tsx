@@ -39,6 +39,7 @@ import {
   SlashCommandMenu,
   filterSlashCommands,
 } from "@/components/composer/slash-menu";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
   type GitFileEntry,
@@ -92,6 +93,7 @@ export const OmniComposer = memo(function OmniComposer({
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const promptHistory = useOrbitSelector((s) => s.promptHistory);
   const slashCommands = useOrbitSelector((s) => s.slashCommands);
+  const ime = useImeCompositionGuard();
 
   // Primitive/narrow selectors instead of subscribing to full `HostDetailView`
   const hasCurrentAgent = useOrbitSelector((s) =>
@@ -552,7 +554,7 @@ export const OmniComposer = memo(function OmniComposer({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return;
+    if (ime.shouldIgnoreKeyDown(e)) return;
 
     if (slashTrigger) {
       const len = slashTrigger.items.length;
@@ -916,6 +918,7 @@ export const OmniComposer = memo(function OmniComposer({
                   }
                 }}
                 onPaste={handlePaste}
+                {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
                 className="text-foreground block min-h-[46px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] py-[13px] text-[15px] leading-[20px] outline-none"

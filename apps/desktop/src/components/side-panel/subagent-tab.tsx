@@ -73,7 +73,6 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           ? "completed"
           : "failed"
       : (parentSubagent?.status ?? "completed");
-
   const [providerEvents, setProviderEvents] = useState<ProviderSubagentEvent[]>([]);
   const lastFingerprintRef = useRef<string>("");
 
@@ -115,7 +114,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [hostId, parentAgentId, tab.providerSubagentId, status]);
+  }, [hostId, parentAgentId, tab.providerSubagentId, status, providerSubagent?.updated_at]);
 
   const handleOpenThread = useCallback(() => {
     if (hostId && tab.childAgentId) {

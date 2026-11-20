@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { Archive, MoreHorizontal } from "lucide-react";
 import type { AgentCardView, HostCardView } from "@/lib/orbit-ipc";
+import { useImeCompositionGuard } from "@/lib/ime";
 import type { MenuAnchorBox } from "@/components/sidebar/sidebar-menus";
 import {
   ConversationStatusGlyph,
@@ -56,6 +57,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   const [renameDraft, setRenameDraft] = useState(effectiveTitle);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const renameCancelledRef = useRef(false);
+  const ime = useImeCompositionGuard();
 
   const relativeLabel = agent.is_running
     ? "now"
@@ -136,8 +138,10 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
             onClick={(e) => e.stopPropagation()}
             onChange={(e) => setRenameDraft(e.target.value)}
             onBlur={commitRename}
+            {...ime.compositionProps}
             onKeyDown={(e) => {
               e.stopPropagation();
+              if (ime.shouldIgnoreKeyDown(e)) return;
               if (e.key === "Enter") {
                 e.preventDefault();
                 commitRename();

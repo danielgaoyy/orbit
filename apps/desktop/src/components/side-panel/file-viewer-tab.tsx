@@ -19,6 +19,7 @@ import {
   MarkdownLinkProvider,
 } from "@/components/markdown-blocks";
 import { formatLineRangeLabel, normalizeLineRange } from "@/lib/file-links";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { formatFileSizeCompact } from "@/lib/session-insights";
 import { stripWorkspacePrefix } from "@/lib/timeline-coalesce";
@@ -60,6 +61,7 @@ export const FileViewerTab = memo(function FileViewerTab({
 
   const findInputRef = useRef<HTMLInputElement | null>(null);
   const lineRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const ime = useImeCompositionGuard();
 
   useEffect(() => {
     setRenderedLineCap(800);
@@ -351,7 +353,9 @@ export const FileViewerTab = memo(function FileViewerTab({
             type="text"
             value={findQuery}
             onChange={(e) => setFindQuery(e.target.value)}
+            {...ime.compositionProps}
             onKeyDown={(e) => {
+              if (ime.shouldIgnoreKeyDown(e)) return;
               if (e.key === "Enter") {
                 e.preventDefault();
                 stepMatch(e.shiftKey ? -1 : 1);

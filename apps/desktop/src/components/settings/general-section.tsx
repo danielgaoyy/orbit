@@ -56,7 +56,7 @@ export function GeneralSection() {
   const preferredEditor = useOrbitSelector((s) => s.preferredEditor);
   const mod = modSymbol();
 
-  const [appVersion, setAppVersion] = useState("0.5.2");
+  const [appVersion, setAppVersion] = useState("0.5.4");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseUpdateInfo | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
@@ -101,8 +101,14 @@ export function GeneralSection() {
       if (!info.has_newer_version) {
         setUpdateStatus("You are on the latest version.");
       }
-    } catch {
-      setUpdateStatus("Unable to check for updates. Try again later.");
+    } catch (err) {
+      const detail =
+        err instanceof Error ? err.message : typeof err === "string" ? err.trim() : "";
+      setUpdateStatus(
+        detail
+          ? `Unable to check for updates: ${detail}`
+          : "Unable to check for updates. Try again later.",
+      );
     } finally {
       setCheckingUpdate(false);
     }
@@ -120,8 +126,12 @@ export function GeneralSection() {
           setUpdateStatus(`${ev.status}${pct}`);
         }
       });
-    } catch {
-      setUpdateStatus("Update failed. Try downloading manually.");
+    } catch (err) {
+      const detail =
+        err instanceof Error ? err.message : typeof err === "string" ? err.trim() : "";
+      setUpdateStatus(
+        detail ? `Update failed: ${detail}` : "Update failed. Try downloading manually.",
+      );
       setInstallingUpdate(false);
     }
   };

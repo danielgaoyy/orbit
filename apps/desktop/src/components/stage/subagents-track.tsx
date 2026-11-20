@@ -304,32 +304,62 @@ export const SubagentsTrack = memo(function SubagentsTrack({
                   const isSelected = inspectedProviderSub?.subagent_id === sub.subagent_id;
                   return (
                     <div key={sub.subagent_id} className="rounded-lg border border-transparent">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setInspectedProviderSub(isSelected ? null : sub)
-                        }
-                        className="hover:bg-accent/60 flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left"
-                      >
-                        <div className="flex min-w-0 items-center gap-2">
+                      <div className="hover:bg-accent/60 flex w-full items-center justify-between gap-1 rounded-lg px-2 py-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setInspectedProviderSub(isSelected ? null : sub)
+                          }
+                          className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
+                        >
                           <Bot className="text-muted-foreground h-[14px] w-[14px] shrink-0" />
-                          <div className="min-w-0">
+                          <div className="min-w-0 flex-1">
                             <div className="text-foreground truncate text-[12.5px] font-medium">
                               {sub.title}
                             </div>
-                            <div className="text-muted-foreground truncate text-[11px]">
-                              {sub.status}
-                              {sub.subtitle ? ` · ${sub.subtitle}` : ""}
+                            <div className="text-muted-foreground flex items-center gap-1.5 truncate text-[11px]">
+                              <span
+                                className={cn(
+                                  "inline-block h-1.5 w-1.5 shrink-0 rounded-full",
+                                  sub.status === "running"
+                                    ? "bg-blue-500"
+                                    : sub.status === "completed"
+                                      ? "bg-emerald-500"
+                                      : "bg-rose-500",
+                                )}
+                              />
+                              <span className="truncate">
+                                {sub.status}
+                                {sub.subtitle ? ` · ${sub.subtitle}` : ""}
+                              </span>
                             </div>
                           </div>
-                        </div>
-                        <ChevronRight
-                          className={cn(
-                            "text-muted-foreground h-[13px] w-[13px] shrink-0 transition-transform",
-                            isSelected && "rotate-90",
-                          )}
-                        />
-                      </button>
+                          <ChevronRight
+                            className={cn(
+                              "text-muted-foreground h-[13px] w-[13px] shrink-0 transition-transform",
+                              isSelected && "rotate-90",
+                            )}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          title="Inspect in Side Panel"
+                          onClick={() => {
+                            setOpen(false);
+                            orbitActions.openSubagentTab({
+                              callId: `provider:${sub.subagent_id}`,
+                              role: sub.title || "Subagent",
+                              promptPreview: sub.subtitle || "",
+                              childAgentId: null,
+                              providerSubagentId: sub.subagent_id,
+                              parentAgentId: agentId,
+                            });
+                          }}
+                          className="text-muted-foreground hover:text-foreground hover:bg-muted shrink-0 cursor-pointer rounded p-1"
+                        >
+                          <ArrowUpRight className="h-[13px] w-[13px]" />
+                        </button>
+                      </div>
 
                       {isSelected && (
                         <div className="border-border bg-muted/40 mx-2 mt-1 mb-2 max-h-48 overflow-auto rounded-lg border p-2 font-mono text-[11px]">

@@ -57,31 +57,173 @@ pub fn compare_semver(a: &str, b: &str) -> Ordering {
     parse_parts(a).cmp(&parse_parts(b))
 }
 
-pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
-    let client = reqwest::Client::builder()
+fn resolve_github_token() -> Option<String> {
+    for key in ["ORBIT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_tag_from_release_url(url: &str) -> Option<String> {
+    let clean = url.split(['?', '#']).next()?.trim().trim_end_matches('/');
+    let (_, after_tag) = clean.rsplit_once("/releases/tag/")?;
+    let tag = after_tag.split('/').next()?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag.to_string())
+}
+
+fn build_release_info_from_tag(tag_name: &str, current_version: &str) -> ReleaseUpdateInfo {
+    let clean_tag = tag_name.trim().to_string();
+    let latest_version = clean_tag.trim_start_matches(['v', 'V']).to_string();
+    ReleaseUpdateInfo {
+        current_version: current_version.to_string(),
+        latest_version: latest_version.clone(),
+        has_newer_version: compare_semver(&latest_version, current_version) == Ordering::Greater,
+        macos_dmg_url: Some(format!(
+            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-macOS-AppleSilicon.dmg"
+        )),
+        linux_arm64_deb_url: Some(format!(
+            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Linux-arm64.deb"
+        )),
+        linux_x64_deb_url: Some(format!(
+            "https://github.com/{GITHUB_REPO}/releases/download/{clean_tag}/Orbit-Linux-x64.deb"
+        )),
+        html_url: format!("https://github.com/{GITHUB_REPO}/releases/tag/{clean_tag}"),
+        tag_name: clean_tag,
+        notes: String::new(),
+    }
+}
+
+async fn resolve_latest_tag_via_web_redirect() -> Result<String, String> {
+    let no_redirect_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
         .build()
-        .map_err(|e| format!("初始化更新客户端失败: {e}"))?;
+        .map_err(|e| format!("初始化重定向客户端失败: {e}"))?;
 
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("连接 GitHub Release 失败: {e}"))?;
+    let latest_web_url = format!("https://github.com/{GITHUB_REPO}/releases/latest");
 
-    if !resp.status().is_success() {
-        return Err(format!("GitHub API 返回状态异常: HTTP {}", resp.status()));
+    // Prefer a lightweight HEAD request (0 body bytes, never consumes api.github.com quota);
+    // fall back to GET if a proxy rejects HEAD.
+    for use_head in [true, false] {
+        let req = if use_head {
+            no_redirect_client.head(&latest_web_url)
+        } else {
+            no_redirect_client.get(&latest_web_url)
+        };
+        match req.send().await {
+            Ok(resp) => {
+                if resp.status().is_redirection()
+                    && let Some(loc) = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                    && let Some(tag) = extract_tag_from_release_url(loc)
+                {
+                    return Ok(tag);
+                }
+                if let Some(tag) = extract_tag_from_release_url(resp.url().as_str()) {
+                    return Ok(tag);
+                }
+                if !use_head {
+                    return Err(format!(
+                        "GitHub Releases 重定向未包含版本标签 (HTTP {})",
+                        resp.status()
+                    ));
+                }
+            }
+            Err(e) if !use_head => {
+                return Err(format!("连接 GitHub Releases 失败: {e}"));
+            }
+            Err(_) => {}
+        }
     }
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析版本信息失败: {e}"))?;
+    Err("无法从 GitHub Releases 重定向解析最新版本".to_string())
+}
 
-    Ok(parse_github_release_json(&json, CURRENT_APP_VERSION))
+async fn fetch_release_json(
+    client: &reqwest::Client,
+    api_url: &str,
+) -> Result<serde_json::Value, String> {
+    let mut req = client
+        .get(api_url)
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = resolve_github_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("连接 GitHub API 失败: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        if status.as_u16() == 403 {
+            return Err("GitHub API 触发速率限制 (HTTP 403)".to_string());
+        }
+        return Err(format!("GitHub API 返回状态异常: HTTP {status}"));
+    }
+
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("解析版本信息失败: {e}"))
+}
+
+pub async fn check_latest_release() -> Result<ReleaseUpdateInfo, String> {
+    // 1. Primary path: resolve latest release tag via `github.com/.../releases/latest` 302 redirect.
+    //    This bypasses `api.github.com` completely and never hits the 60 req/hr unauthenticated limit.
+    match resolve_latest_tag_via_web_redirect().await {
+        Ok(tag) => {
+            let mut info = build_release_info_from_tag(&tag, CURRENT_APP_VERSION);
+            // Best-effort enrichment (release notes & exact asset URLs); silently ignore API rate limits.
+            if let Ok(api_client) = reqwest::Client::builder()
+                .timeout(Duration::from_secs(4))
+                .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
+                .build()
+            {
+                let api_url =
+                    format!("https://api.github.com/repos/{GITHUB_REPO}/releases/tags/{tag}");
+                if let Ok(json) = fetch_release_json(&api_client, &api_url).await {
+                    let enriched = parse_github_release_json(&json, CURRENT_APP_VERSION);
+                    if !enriched.notes.is_empty() {
+                        info.notes = enriched.notes;
+                    }
+                    if enriched.macos_dmg_url.is_some() {
+                        info.macos_dmg_url = enriched.macos_dmg_url;
+                    }
+                    if enriched.linux_arm64_deb_url.is_some() {
+                        info.linux_arm64_deb_url = enriched.linux_arm64_deb_url;
+                    }
+                    if enriched.linux_x64_deb_url.is_some() {
+                        info.linux_x64_deb_url = enriched.linux_x64_deb_url;
+                    }
+                }
+            }
+            Ok(info)
+        }
+        Err(web_err) => {
+            // 2. Fallback path: query GitHub REST API directly in case github.com web is proxied differently.
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(12))
+                .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
+                .build()
+                .map_err(|e| format!("初始化更新客户端失败: {e}"))?;
+            let api_url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
+            match fetch_release_json(&client, &api_url).await {
+                Ok(json) => Ok(parse_github_release_json(&json, CURRENT_APP_VERSION)),
+                Err(api_err) => Err(format!("{web_err}；API 回退亦失败: {api_err}")),
+            }
+        }
+    }
 }
 
 fn parse_github_release_json(json: &serde_json::Value, current_version: &str) -> ReleaseUpdateInfo {
@@ -452,17 +594,33 @@ async fn update_linux_deb_and_relaunch(
             sleep 0.25
           done
           DEST={sq_cur_exe}
-          if sudo -n dpkg -i {sq_deb} >/dev/null 2>&1; then
+          LAUNCH_TARGET=\"$DEST\"
+          IS_USER_LOCAL=0
+          case \"$DEST\" in
+            \"$HOME\"/*) IS_USER_LOCAL=1 ;;
+          esac
+          if [ \"$IS_USER_LOCAL\" = 1 ] && ( [ -w \"$DEST\" ] || [ -w \"$(dirname \"$DEST\")\" ] ); then
+            TMP_DEST=\"$DEST.new.$$\"
+            cp -f {sq_extracted} \"$TMP_DEST\" && chmod 755 \"$TMP_DEST\" && mv -f \"$TMP_DEST\" \"$DEST\"
+            WRAPPER=\"$(dirname \"$(dirname \"$DEST\")\")/orbit-desktop\"
+            if [ -x \"$WRAPPER\" ] && [ \"$WRAPPER\" != \"$DEST\" ]; then
+              LAUNCH_TARGET=\"$WRAPPER\"
+            fi
+          elif sudo -n dpkg -i {sq_deb} >/dev/null 2>&1; then
             DEST=/usr/bin/orbit-desktop
+            LAUNCH_TARGET=\"$DEST\"
           elif [ -w \"$DEST\" ] || [ -w \"$(dirname \"$DEST\")\" ]; then
-            cp -f {sq_extracted} \"$DEST\" && chmod 755 \"$DEST\"
+            TMP_DEST=\"$DEST.new.$$\"
+            cp -f {sq_extracted} \"$TMP_DEST\" && chmod 755 \"$TMP_DEST\" && mv -f \"$TMP_DEST\" \"$DEST\"
           else
             mkdir -p \"$HOME/.local/bin\"
             DEST=\"$HOME/.local/bin/orbit-desktop\"
-            cp -f {sq_extracted} \"$DEST\" && chmod 755 \"$DEST\"
+            TMP_DEST=\"$DEST.new.$$\"
+            cp -f {sq_extracted} \"$TMP_DEST\" && chmod 755 \"$TMP_DEST\" && mv -f \"$TMP_DEST\" \"$DEST\"
+            LAUNCH_TARGET=\"$DEST\"
           fi
           rm -rf {sq_stage} {sq_deb}
-          nohup \"$DEST\" >/dev/null 2>&1 &
+          nohup \"$LAUNCH_TARGET\" >/dev/null 2>&1 &
         ) >/dev/null 2>&1 &"
     );
 
@@ -481,5 +639,55 @@ mod tests {
         assert_eq!(compare_semver("0.2.3", "v0.2.3"), Ordering::Equal);
         assert_eq!(compare_semver("0.2.2", "0.2.3"), Ordering::Less);
         assert_eq!(compare_semver("1.0.0", "0.9.9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn extract_tag_from_release_redirect_handles_absolute_relative_and_invalid_urls() {
+        assert_eq!(
+            extract_tag_from_release_url(
+                "https://github.com/danielgaoyy/orbit/releases/tag/v0.5.4"
+            )
+            .as_deref(),
+            Some("v0.5.4")
+        );
+        assert_eq!(
+            extract_tag_from_release_url("/danielgaoyy/orbit/releases/tag/v0.5.4/?foo=1#top")
+                .as_deref(),
+            Some("v0.5.4")
+        );
+        assert_eq!(
+            extract_tag_from_release_url("https://github.com/danielgaoyy/orbit/releases/latest"),
+            None
+        );
+        assert_eq!(
+            extract_tag_from_release_url("https://github.com/danielgaoyy/orbit/releases/tag/"),
+            None
+        );
+    }
+
+    #[test]
+    fn build_release_info_from_tag_populates_platform_urls_without_api() {
+        let info = build_release_info_from_tag("v0.5.4", "0.5.3");
+        assert!(info.has_newer_version);
+        assert_eq!(info.tag_name, "v0.5.4");
+        assert_eq!(info.latest_version, "0.5.4");
+        assert_eq!(
+            info.macos_dmg_url.as_deref(),
+            Some(
+                "https://github.com/danielgaoyy/orbit/releases/download/v0.5.4/Orbit-macOS-AppleSilicon.dmg"
+            )
+        );
+        assert_eq!(
+            info.linux_arm64_deb_url.as_deref(),
+            Some(
+                "https://github.com/danielgaoyy/orbit/releases/download/v0.5.4/Orbit-Linux-arm64.deb"
+            )
+        );
+        assert_eq!(
+            info.linux_x64_deb_url.as_deref(),
+            Some(
+                "https://github.com/danielgaoyy/orbit/releases/download/v0.5.4/Orbit-Linux-x64.deb"
+            )
+        );
     }
 }

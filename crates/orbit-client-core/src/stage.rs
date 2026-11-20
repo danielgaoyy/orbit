@@ -2,7 +2,7 @@
 //! session insights derivation, and work-summary bucketing shared across Desktop, iOS (SwiftUI),
 //! Android (Compose), and HarmonyOS (ArkUI V2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use orbit_protocol::{
     GitStatusSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus, ToolCallDetail,
@@ -2419,27 +2419,35 @@ pub fn derive_session_insights(
                         role,
                         prompt_preview,
                     } => {
-                        let key = child_agent_id
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(call_id.as_str())
-                            .to_string();
-                        subagent_map.insert(
-                            key,
-                            SessionSubagentEntryView {
-                                id: call_id.clone(),
-                                role: if role.is_empty() {
-                                    "Subagent".to_string()
-                                } else {
-                                    role.clone()
+                        // Filter legacy misclassified subagent management calls (e.g. `manage_subagents`)
+                        // stored before strict subagent launch classification.
+                        let is_legacy_non_launch_placeholder =
+                            child_agent_id.as_deref().is_none_or(str::is_empty)
+                                && prompt_preview.trim().is_empty()
+                                && role.trim().eq_ignore_ascii_case("subagent");
+                        if !is_legacy_non_launch_placeholder {
+                            let key = child_agent_id
+                                .as_deref()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(call_id.as_str())
+                                .to_string();
+                            subagent_map.insert(
+                                key,
+                                SessionSubagentEntryView {
+                                    id: call_id.clone(),
+                                    role: if role.is_empty() {
+                                        "Subagent".to_string()
+                                    } else {
+                                        role.clone()
+                                    },
+                                    prompt_preview: prompt_preview.clone(),
+                                    status: *status,
+                                    child_agent_id: child_agent_id.clone(),
+                                    provider_subagent_id: None,
+                                    last_seq: *seq,
                                 },
-                                prompt_preview: prompt_preview.clone(),
-                                status: *status,
-                                child_agent_id: child_agent_id.clone(),
-                                provider_subagent_id: None,
-                                last_seq: *seq,
-                            },
-                        );
+                            );
+                        }
                     }
                     ToolCallDetail::Search { .. } | ToolCallDetail::Generic { .. } => {}
                 }
@@ -2557,11 +2565,24 @@ pub fn derive_session_insights(
                             );
                         }
                     }
+                } else if *status != ToolCallStatus::Running {
+                    // Clear any previously queued running entry for the same background task ID
+                    // or call ID once a terminal tool call update arrives.
+                    if let Some(bg_tid) = background_task
+                        .as_ref()
+                        .and_then(|b| b.task_id.as_deref())
+                        .filter(|s| !s.is_empty())
+                    {
+                        bg_task_map.remove(bg_tid);
+                    }
+                    bg_task_map.remove(call_id.as_str());
                 }
             }
             _ => {}
         }
     }
+
+    let host_agent_ids: HashSet<&str> = host_agents.iter().map(|a| a.agent_id.as_str()).collect();
 
     if let Some(cur) = current_agent {
         for ag in host_agents {
@@ -2615,13 +2636,44 @@ pub fn derive_session_insights(
                 k.as_str() == ps.subagent_id
                     || v.id == ps.subagent_id
                     || v.child_agent_id.as_deref() == Some(ps.subagent_id.as_str())
+                    || v.provider_subagent_id.as_deref() == Some(ps.subagent_id.as_str())
             })
-            .map(|(k, _)| k.clone());
+            .map(|(k, _)| k.clone())
+            .or_else(|| {
+                // Fallback match for legacy timeline entries whose `child_agent_id` could not be
+                // extracted when `invoke_subagent` returned plain text JSON: match an unclaimed
+                // non-Orbit entry with the exact same role/title.
+                let ps_title = ps.title.trim();
+                if ps_title.is_empty() {
+                    return None;
+                }
+                subagent_map
+                    .iter()
+                    .filter(|(_, v)| {
+                        v.provider_subagent_id.is_none()
+                            && v.child_agent_id
+                                .as_deref()
+                                .is_none_or(|cid| !host_agent_ids.contains(cid))
+                            && v.role.trim().eq_ignore_ascii_case(ps_title)
+                    })
+                    .min_by_key(|(_, v)| v.last_seq)
+                    .map(|(k, _)| k.clone())
+            });
         if let Some(key) = matched_key
             && let Some(existing) = subagent_map.get_mut(&key)
         {
             existing.status = status;
             existing.provider_subagent_id = Some(ps.subagent_id.clone());
+            // Native provider subagents carry a provider-side conversation UUID, NOT an Orbit
+            // managed agent ID; clear non-host `child_agent_id` so the UI opens the provider
+            // subagent timeline instead of looking up a non-existent Orbit agent.
+            if existing
+                .child_agent_id
+                .as_deref()
+                .is_some_and(|cid| !host_agent_ids.contains(cid))
+            {
+                existing.child_agent_id = None;
+            }
             if !ps.title.trim().is_empty() && existing.role == "Subagent" {
                 existing.role = ps.title.clone();
             }
@@ -3751,5 +3803,181 @@ Log: file:///tmp/spoofed.log\n";
             &provider_subs,
         );
         assert!(idle_insights.background_tasks.is_empty());
+    }
+
+    #[test]
+    fn derive_session_insights_filters_legacy_manage_subagents_and_syncs_provider_subagents() {
+        use chrono::Utc;
+        use orbit_protocol::{AgentStatus, BackgroundTaskInfo, ProviderKind, SessionMode};
+
+        let make_card = |agent_id: &str, running: bool, status_label: &str| AgentCardView {
+            agent_id: agent_id.into(),
+            workspace_id: "ws_1".into(),
+            cwd: "/repo".into(),
+            title: format!("Agent {agent_id}"),
+            provider: ProviderKind::Antigravity,
+            provider_label: "Antigravity".into(),
+            model: None,
+            effort: None,
+            mode: SessionMode::FullAccess,
+            status: if running {
+                AgentStatus::Running {
+                    turn_id: "t_1".into(),
+                }
+            } else {
+                AgentStatus::Idle
+            },
+            status_label: status_label.into(),
+            is_running: running,
+            is_awaiting_permission: false,
+            parent_agent_id: None,
+            parent_host_id: None,
+            profile_id: None,
+            background: false,
+            auto_archive: false,
+            attention: orbit_protocol::AttentionState::None,
+            archived_at_rfc3339: None,
+            labels: HashMap::new(),
+            latest_seq: 50,
+            updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
+            is_pinned: false,
+            seen_seq: 0,
+            is_unread: false,
+        };
+
+        let items = vec![
+            // Legacy misclassified `manage_subagents` entry (empty prompt, generic "subagent" role)
+            TimelineItemView::ToolCall {
+                seq: 1,
+                call_id: "call_manage".into(),
+                status: ToolCallStatus::Completed,
+                summary_title: "Run manage_subagents".into(),
+                detail: ToolCallDetail::Subagent {
+                    child_agent_id: None,
+                    role: "subagent".into(),
+                    prompt_preview: String::new(),
+                },
+                background_task: None,
+                step_descriptor: None,
+                diff_files: Vec::new(),
+                timestamp_ms: Some(1_000),
+            },
+            // Antigravity `invoke_subagent` tool call returns Completed immediately while the
+            // actual subagent runs asynchronously with a provider UUID.
+            TimelineItemView::ToolCall {
+                seq: 2,
+                call_id: "call_invoke_1".into(),
+                status: ToolCallStatus::Completed,
+                summary_title: "Run invoke_subagent".into(),
+                detail: ToolCallDetail::Subagent {
+                    child_agent_id: Some("conv-uuid-1111".into()),
+                    role: "Action Cinema Directing Researcher".into(),
+                    prompt_preview: "Research directing patterns".into(),
+                },
+                background_task: None,
+                step_descriptor: None,
+                diff_files: Vec::new(),
+                timestamp_ms: Some(1_100),
+            },
+            // Legacy `invoke_subagent` entry without extracted conversationId (matches by title)
+            TimelineItemView::ToolCall {
+                seq: 3,
+                call_id: "call_invoke_2".into(),
+                status: ToolCallStatus::Completed,
+                summary_title: "Run invoke_subagent".into(),
+                detail: ToolCallDetail::Subagent {
+                    child_agent_id: None,
+                    role: "AI Video Action Prompting Researcher".into(),
+                    prompt_preview: "Audit video prompts".into(),
+                },
+                background_task: None,
+                step_descriptor: None,
+                diff_files: Vec::new(),
+                timestamp_ms: Some(1_200),
+            },
+            // Background timer started on call_a and completed on call_b with same task_id
+            TimelineItemView::ToolCall {
+                seq: 4,
+                call_id: "call_timer_start".into(),
+                status: ToolCallStatus::Running,
+                summary_title: "Run schedule".into(),
+                detail: ToolCallDetail::Generic {
+                    tool_name: "Run schedule".into(),
+                    arguments_json: "{}".into(),
+                },
+                background_task: Some(BackgroundTaskInfo {
+                    task_id: Some("sess_x/task-46".into()),
+                    label: Some("Timer: 8m".into()),
+                    log_path: None,
+                }),
+                step_descriptor: None,
+                diff_files: Vec::new(),
+                timestamp_ms: Some(1_300),
+            },
+            TimelineItemView::ToolCall {
+                seq: 5,
+                call_id: "call_timer_end".into(),
+                status: ToolCallStatus::Completed,
+                summary_title: "Run schedule".into(),
+                detail: ToolCallDetail::Generic {
+                    tool_name: "schedule".into(),
+                    arguments_json: "{}".into(),
+                },
+                background_task: Some(BackgroundTaskInfo {
+                    task_id: Some("sess_x/task-46".into()),
+                    label: Some("Timer: 8m".into()),
+                    log_path: None,
+                }),
+                step_descriptor: None,
+                diff_files: Vec::new(),
+                timestamp_ms: Some(1_400),
+            },
+        ];
+
+        let cur = make_card("parent_1", true, "Running");
+        let host_agents = vec![cur.clone()];
+        let provider_subs = vec![
+            ProviderSubagentDescriptor {
+                subagent_id: "conv-uuid-1111".into(),
+                parent_agent_id: "parent_1".into(),
+                parent_subagent_id: None,
+                title: "Action Cinema Directing Researcher".into(),
+                subtitle: Some("Antigravity".into()),
+                status: ProviderSubagentStatus::Running,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            ProviderSubagentDescriptor {
+                subagent_id: "conv-uuid-2222".into(),
+                parent_agent_id: "parent_1".into(),
+                parent_subagent_id: None,
+                title: "AI Video Action Prompting Researcher".into(),
+                subtitle: Some("Antigravity".into()),
+                status: ProviderSubagentStatus::Running,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ];
+
+        let insights = derive_session_insights(
+            &items,
+            Some("/repo"),
+            Some(&cur),
+            &host_agents,
+            &provider_subs,
+        );
+
+        // Legacy `manage_subagents` placeholder excluded; both native subagents reconciled & Running
+        assert_eq!(insights.subagents.len(), 2);
+        for sa in &insights.subagents {
+            assert_eq!(sa.status, ToolCallStatus::Running);
+            assert!(
+                sa.child_agent_id.is_none(),
+                "provider UUID must not stay in child_agent_id"
+            );
+            assert!(sa.provider_subagent_id.is_some());
+        }
+        // Completed task_id cleared across different call_ids
+        assert!(insights.background_tasks.is_empty());
     }
 }

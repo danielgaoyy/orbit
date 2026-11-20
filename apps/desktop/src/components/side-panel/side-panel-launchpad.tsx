@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { orbitActions, sideQuestionScopeKey, useOrbitSelector } from "@/state/orbit-store";
@@ -190,6 +191,7 @@ export function SidePanelLaunchpad({
   const [showAllTasks, setShowAllTasks] = useState(false);
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const ime = useImeCompositionGuard();
 
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
@@ -432,6 +434,7 @@ export function SidePanelLaunchpad({
   }, [isPanelOpen, isPanelSettled, focusNonce]);
 
   const handleInputKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (ime.shouldIgnoreKeyDown(e)) return;
     if (isSearching) {
       if (e.key === "ArrowDown") {
         if (searchEntries.length === 0) return;
@@ -509,6 +512,7 @@ export function SidePanelLaunchpad({
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            {...ime.compositionProps}
             onKeyDown={handleInputKeyDown}
             placeholder="Search files or enter a URL"
             aria-label="Search files or enter a URL"

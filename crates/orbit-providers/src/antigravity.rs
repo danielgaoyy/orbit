@@ -449,13 +449,33 @@ async fn run_agy_actor(
     // Post-turn autonomous wakeup (`transcript_full.jsonl`) + first-class background-task tracking
     let mut transcript_monitor = AgyTranscriptMonitor::new(&session_id);
     // Skip any historical steps already recorded on disk when attaching/resuming, while remembering
-    // already-finished background task IDs so shim ring-buffer replay can never resurrect them.
+    // already-finished background task IDs so shim ring-buffer replay can never resurrect them,
+    // and registering any historical native subagents so Overview / SubagentsTrack reflect real state.
     let historical_bg_deltas = transcript_monitor.sync_silent_with_bg_tasks();
     let mut wakeup_tools = WakeupToolRegistry::default();
     let mut bg_tracker = BackgroundTaskTracker::default();
     for delta in historical_bg_deltas {
-        if let BgTaskDelta::Completed { task_id, .. } = delta {
-            bg_tracker.mark_finished(task_id);
+        match delta {
+            BgTaskDelta::Completed { task_id, .. } => {
+                bg_tracker.mark_finished(task_id);
+            }
+            BgTaskDelta::SubagentSpawned {
+                subagent_id,
+                role,
+                prompt_preview,
+            } => {
+                register_agy_subagent_monitor(
+                    &cfg.agent_id,
+                    &subagent_id,
+                    &role,
+                    &prompt_preview,
+                    true,
+                    &mut subagent_monitors,
+                    &evt_tx,
+                )
+                .await;
+            }
+            BgTaskDelta::Started { .. } => {}
         }
     }
     let mut autonomous_turn_id: Option<String> = None;
@@ -860,6 +880,22 @@ async fn run_agy_actor(
                                                     }
                                                 }
                                             }
+                                            BgTaskDelta::SubagentSpawned {
+                                                subagent_id,
+                                                role,
+                                                prompt_preview,
+                                            } => {
+                                                register_agy_subagent_monitor(
+                                                    &cfg.agent_id,
+                                                    &subagent_id,
+                                                    &role,
+                                                    &prompt_preview,
+                                                    false,
+                                                    &mut subagent_monitors,
+                                                    &evt_tx,
+                                                )
+                                                .await;
+                                            }
                                         }
                                     }
                                     // Settle any non-background foreground tools left open when the turn ended
@@ -1031,69 +1067,7 @@ async fn run_agy_actor(
                     if desc.status != ProviderSubagentStatus::Running {
                         continue;
                     }
-                    for wake_ev in sub_mon.poll_post_turn_wakeup() {
-                        match wake_ev {
-                            WakeupStep::Thinking { id, text } => {
-                                let _ = evt_tx
-                                    .send(DriverEvent::ProviderSubagentTimeline {
-                                        subagent_id: sub_id.clone(),
-                                        payload: TimelinePayload::AssistantThinking { item_id: id, text },
-                                    })
-                                    .await;
-                            }
-                            WakeupStep::Message { id, text } => {
-                                let _ = evt_tx
-                                    .send(DriverEvent::ProviderSubagentTimeline {
-                                        subagent_id: sub_id.clone(),
-                                        payload: TimelinePayload::AssistantMessage {
-                                            item_id: id,
-                                            text,
-                                            streaming: false,
-                                        },
-                                    })
-                                    .await;
-                            }
-                            WakeupStep::Tool { call_id, status, detail } => {
-                                let _ = evt_tx
-                                    .send(DriverEvent::ProviderSubagentTimeline {
-                                        subagent_id: sub_id.clone(),
-                                        payload: TimelinePayload::ToolCall {
-                                            call_id,
-                                            status,
-                                            detail,
-                                            background_task: None,
-                                        },
-                                    })
-                                    .await;
-                            }
-                            WakeupStep::Settled => {
-                                desc.status = ProviderSubagentStatus::Completed;
-                                desc.updated_at = Utc::now();
-                                let _ = evt_tx
-                                    .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
-                                    .await;
-                            }
-                            WakeupStep::Failed { message } => {
-                                desc.status = ProviderSubagentStatus::Failed;
-                                desc.subtitle = Some(message);
-                                desc.updated_at = Utc::now();
-                                let _ = evt_tx
-                                    .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
-                                    .await;
-                            }
-                            WakeupStep::Notice { level, message } => {
-                                let _ = evt_tx
-                                    .send(DriverEvent::ProviderSubagentTimeline {
-                                        subagent_id: sub_id.clone(),
-                                        payload: TimelinePayload::Notice { level, message },
-                                    })
-                                    .await;
-                            }
-                            WakeupStep::Started { .. }
-                            | WakeupStep::BackgroundTaskStarted { .. }
-                            | WakeupStep::BackgroundTaskCompleted { .. } => {}
-                        }
-                    }
+                    poll_agy_subagent_monitor(sub_id, desc, sub_mon, &evt_tx).await;
                 }
 
                 // Only monitor post-turn autonomous wakeups & self-healing when foreground turn is idle
@@ -1192,6 +1166,23 @@ async fn run_agy_actor(
                                     background_task,
                                 } = wakeup_tools.resolve_wakeup_tool(&call_id, status, detail)
                                 {
+                                    if let ToolCallDetail::Subagent {
+                                        child_agent_id: Some(ref child_conv_id),
+                                        ref role,
+                                        ref prompt_preview,
+                                    } = emit_detail
+                                    {
+                                        register_agy_subagent_monitor(
+                                            &cfg.agent_id,
+                                            child_conv_id,
+                                            role,
+                                            prompt_preview,
+                                            false,
+                                            &mut subagent_monitors,
+                                            &evt_tx,
+                                        )
+                                        .await;
+                                    }
                                     tool_cache.insert(canon_id.clone(), emit_detail.clone());
                                     let _ = evt_tx
                                         .send(DriverEvent::ToolCall {
@@ -1202,6 +1193,22 @@ async fn run_agy_actor(
                                         })
                                         .await;
                                 }
+                            }
+                            WakeupStep::SubagentSpawned {
+                                subagent_id,
+                                role,
+                                prompt_preview,
+                            } => {
+                                register_agy_subagent_monitor(
+                                    &cfg.agent_id,
+                                    &subagent_id,
+                                    &role,
+                                    &prompt_preview,
+                                    false,
+                                    &mut subagent_monitors,
+                                    &evt_tx,
+                                )
+                                .await;
                             }
                             WakeupStep::Notice { level, message } => {
                                 if level != "info" {
@@ -1660,7 +1667,17 @@ async fn handle_acp_session_update(
                     .and_then(|out| parse_bg_task_started(out, session_id))
                     .filter(|(tid, _, _)| !bg_tracker.is_finished(tid))
             };
-            let effective_status = if parsed_bg_start.is_some() {
+            // Do not let an ACP dispatch-ack `completed` update (e.g. `Run schedule` returning
+            // immediately after registering a background timer without an exit code or completion
+            // notice) prematurely settle an active background task!
+            let preserve_active_bg_running = status == ToolCallStatus::Completed
+                && parsed_bg_start.is_none()
+                && wakeup_tools.is_active_bg_task_entry(raw_call_id, &incoming_detail, bg_tracker)
+                && !acp_output_indicates_bg_completion(
+                    update.get("rawOutput"),
+                    raw_output_text.as_deref(),
+                );
+            let effective_status = if parsed_bg_start.is_some() || preserve_active_bg_running {
                 ToolCallStatus::Running
             } else {
                 status
@@ -1751,28 +1768,19 @@ async fn handle_acp_session_update(
             if let ToolCallDetail::Subagent {
                 child_agent_id: Some(ref child_conv_id),
                 ref role,
-                ..
+                ref prompt_preview,
             } = detail
-                && !subagent_monitors.contains_key(child_conv_id)
             {
-                let now = Utc::now();
-                let desc = ProviderSubagentDescriptor {
-                    subagent_id: child_conv_id.clone(),
-                    parent_agent_id: parent_agent_id.to_string(),
-                    parent_subagent_id: None,
-                    title: role.clone(),
-                    subtitle: Some("Antigravity".into()),
-                    status: ProviderSubagentStatus::Running,
-                    created_at: now,
-                    updated_at: now,
-                };
-                let _ = evt_tx
-                    .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
-                    .await;
-                subagent_monitors.insert(
-                    child_conv_id.clone(),
-                    (desc, AgyTranscriptMonitor::new(child_conv_id)),
-                );
+                register_agy_subagent_monitor(
+                    parent_agent_id,
+                    child_conv_id,
+                    role,
+                    prompt_preview,
+                    false,
+                    subagent_monitors,
+                    evt_tx,
+                )
+                .await;
             }
             tool_cache.insert(call_id.clone(), detail.clone());
             let _ = evt_tx
@@ -1787,6 +1795,197 @@ async fn handle_acp_session_update(
         }
         _ => None,
     }
+}
+
+async fn poll_agy_subagent_monitor(
+    sub_id: &str,
+    desc: &mut ProviderSubagentDescriptor,
+    sub_mon: &mut AgyTranscriptMonitor,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    for wake_ev in sub_mon.poll_post_turn_wakeup() {
+        match wake_ev {
+            WakeupStep::Thinking { id, text } => {
+                let _ = evt_tx
+                    .send(DriverEvent::ProviderSubagentTimeline {
+                        subagent_id: sub_id.to_string(),
+                        payload: TimelinePayload::AssistantThinking { item_id: id, text },
+                    })
+                    .await;
+            }
+            WakeupStep::Message { id, text } => {
+                let _ = evt_tx
+                    .send(DriverEvent::ProviderSubagentTimeline {
+                        subagent_id: sub_id.to_string(),
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: id,
+                            text,
+                            streaming: false,
+                        },
+                    })
+                    .await;
+            }
+            WakeupStep::Tool {
+                call_id,
+                status,
+                detail,
+            } => {
+                let _ = evt_tx
+                    .send(DriverEvent::ProviderSubagentTimeline {
+                        subagent_id: sub_id.to_string(),
+                        payload: TimelinePayload::ToolCall {
+                            call_id,
+                            status,
+                            detail,
+                            background_task: None,
+                        },
+                    })
+                    .await;
+            }
+            WakeupStep::Settled => {
+                desc.status = ProviderSubagentStatus::Completed;
+                desc.updated_at = Utc::now();
+                let _ = evt_tx
+                    .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+                    .await;
+            }
+            WakeupStep::Failed { message } => {
+                desc.status = ProviderSubagentStatus::Failed;
+                desc.subtitle = Some(message);
+                desc.updated_at = Utc::now();
+                let _ = evt_tx
+                    .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+                    .await;
+            }
+            WakeupStep::Notice { level, message } => {
+                let _ = evt_tx
+                    .send(DriverEvent::ProviderSubagentTimeline {
+                        subagent_id: sub_id.to_string(),
+                        payload: TimelinePayload::Notice { level, message },
+                    })
+                    .await;
+            }
+            WakeupStep::Started { .. }
+            | WakeupStep::BackgroundTaskStarted { .. }
+            | WakeupStep::BackgroundTaskCompleted { .. }
+            | WakeupStep::SubagentSpawned { .. } => {}
+        }
+    }
+}
+
+async fn register_agy_subagent_monitor(
+    parent_agent_id: &str,
+    child_conv_id: &str,
+    role: &str,
+    prompt_preview: &str,
+    is_historical: bool,
+    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let clean_id = child_conv_id.trim();
+    if clean_id.is_empty() || subagent_monitors.contains_key(clean_id) {
+        return;
+    }
+    let now = Utc::now();
+    let title = if role.trim().is_empty() || role.trim().eq_ignore_ascii_case("subagent") {
+        "Subagent".to_string()
+    } else {
+        role.trim().to_string()
+    };
+    let subtitle = if !prompt_preview.trim().is_empty() {
+        Some(truncate_preview(prompt_preview.trim(), 240))
+    } else {
+        Some("Antigravity".into())
+    };
+    let mut desc = ProviderSubagentDescriptor {
+        subagent_id: clean_id.to_string(),
+        parent_agent_id: parent_agent_id.to_string(),
+        parent_subagent_id: None,
+        title,
+        subtitle,
+        status: ProviderSubagentStatus::Running,
+        created_at: now,
+        updated_at: now,
+    };
+    let mut sub_mon = AgyTranscriptMonitor::new_subagent(clean_id);
+
+    if is_historical {
+        if sub_mon.active_path().is_none() {
+            // Historical subagent whose transcript is no longer on disk: mark completed so
+            // reattaching never leaves a stale permanent spinner.
+            desc.status = ProviderSubagentStatus::Completed;
+            let _ = evt_tx
+                .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+                .await;
+            subagent_monitors.insert(clean_id.to_string(), (desc, sub_mon));
+            return;
+        }
+        // Poll historical transcript first so already-settled subagents emit their final status
+        // immediately without flashing `Running`.
+        let initial_steps = sub_mon.poll_post_turn_wakeup();
+        let mut initial_timeline = Vec::new();
+        for wake_ev in initial_steps {
+            match wake_ev {
+                WakeupStep::Thinking { id, text } => {
+                    initial_timeline.push(TimelinePayload::AssistantThinking { item_id: id, text });
+                }
+                WakeupStep::Message { id, text } => {
+                    initial_timeline.push(TimelinePayload::AssistantMessage {
+                        item_id: id,
+                        text,
+                        streaming: false,
+                    });
+                }
+                WakeupStep::Tool {
+                    call_id,
+                    status,
+                    detail,
+                } => {
+                    initial_timeline.push(TimelinePayload::ToolCall {
+                        call_id,
+                        status,
+                        detail,
+                        background_task: None,
+                    });
+                }
+                WakeupStep::Notice { level, message } => {
+                    initial_timeline.push(TimelinePayload::Notice { level, message });
+                }
+                WakeupStep::Settled => {
+                    desc.status = ProviderSubagentStatus::Completed;
+                    desc.updated_at = Utc::now();
+                }
+                WakeupStep::Failed { message } => {
+                    desc.status = ProviderSubagentStatus::Failed;
+                    desc.subtitle = Some(message);
+                    desc.updated_at = Utc::now();
+                }
+                WakeupStep::Started { .. }
+                | WakeupStep::BackgroundTaskStarted { .. }
+                | WakeupStep::BackgroundTaskCompleted { .. }
+                | WakeupStep::SubagentSpawned { .. } => {}
+            }
+        }
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .await;
+        for payload in initial_timeline {
+            let _ = evt_tx
+                .send(DriverEvent::ProviderSubagentTimeline {
+                    subagent_id: clean_id.to_string(),
+                    payload,
+                })
+                .await;
+        }
+        subagent_monitors.insert(clean_id.to_string(), (desc, sub_mon));
+        return;
+    }
+
+    let _ = evt_tx
+        .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+        .await;
+    poll_agy_subagent_monitor(clean_id, &mut desc, &mut sub_mon, evt_tx).await;
+    subagent_monitors.insert(clean_id.to_string(), (desc, sub_mon));
 }
 
 fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCallDetail {
@@ -1883,25 +2082,37 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
         };
     }
 
-    if title.contains("subagent")
-        || raw_in
-            .and_then(|i| i.get("Role").or_else(|| i.get("TypeName")))
-            .is_some()
-    {
+    let prev_subagent = match prev {
+        Some(ToolCallDetail::Subagent {
+            child_agent_id,
+            role,
+            prompt_preview,
+        }) => Some((child_agent_id.clone(), role.clone(), prompt_preview.clone())),
+        _ => None,
+    };
+
+    if is_subagent_launch_tool(title, raw_in) || prev_subagent.is_some() {
+        let (prev_child_id, prev_role, prev_prompt) =
+            prev_subagent.unwrap_or((None, String::new(), String::new()));
         let role = raw_in
-            .and_then(|i| i.get("Role").or_else(|| i.get("TypeName")))
+            .and_then(|i| {
+                i.get("Role")
+                    .or_else(|| i.get("TypeName"))
+                    .or_else(|| i.get("role"))
+            })
             .and_then(|v| v.as_str())
-            .unwrap_or("subagent")
-            .to_string();
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| (!prev_role.trim().is_empty()).then_some(prev_role))
+            .unwrap_or_else(|| "Subagent".to_string());
         let prompt = raw_in
-            .and_then(|i| i.get("Prompt"))
+            .and_then(|i| i.get("Prompt").or_else(|| i.get("prompt")))
             .and_then(|v| v.as_str())
             .map(|s| truncate_preview(s, 240))
-            .unwrap_or_default();
-        let child_id = raw_out
-            .and_then(|o| o.get("conversationId"))
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned);
+            .filter(|s| !s.is_empty())
+            .unwrap_or(prev_prompt);
+        let child_id = extract_subagent_conversation_id(raw_out, None).or(prev_child_id);
         return ToolCallDetail::Subagent {
             child_agent_id: child_id,
             role,
@@ -2489,6 +2700,11 @@ enum WakeupStep {
         task_id: String,
         canceled: bool,
     },
+    SubagentSpawned {
+        subagent_id: String,
+        role: String,
+        prompt_preview: String,
+    },
     Notice {
         level: String,
         message: String,
@@ -2525,6 +2741,11 @@ enum BgTaskDelta {
     Completed {
         task_id: String,
         canceled: bool,
+    },
+    SubagentSpawned {
+        subagent_id: String,
+        role: String,
+        prompt_preview: String,
     },
 }
 
@@ -2672,10 +2893,18 @@ fn normalize_tool_signature(detail: &ToolCallDetail) -> ToolSignature {
             kind: "subagent",
             target: role.trim().to_ascii_lowercase(),
         },
-        ToolCallDetail::Generic { tool_name, .. } => ToolSignature {
-            kind: "generic",
-            target: tool_name.trim().to_ascii_lowercase(),
-        },
+        ToolCallDetail::Generic { tool_name, .. } => {
+            let lower = tool_name.trim().to_ascii_lowercase();
+            let canonical = lower
+                .strip_prefix("run ")
+                .unwrap_or(&lower)
+                .trim()
+                .to_string();
+            ToolSignature {
+                kind: "generic",
+                target: canonical,
+            }
+        }
     }
 }
 
@@ -2703,6 +2932,31 @@ fn merge_tool_details(existing: &ToolCallDetail, incoming: ToolCallDetail) -> To
             cwd: new_cwd.or_else(|| old_cwd.clone()),
             exit_code: new_code.or(*old_code),
             output_preview: new_out.or_else(|| old_out.clone()),
+        },
+        (
+            ToolCallDetail::Subagent {
+                child_agent_id: old_child,
+                role: old_role,
+                prompt_preview: old_prompt,
+            },
+            ToolCallDetail::Subagent {
+                child_agent_id: new_child,
+                role: new_role,
+                prompt_preview: new_prompt,
+            },
+        ) => ToolCallDetail::Subagent {
+            child_agent_id: new_child.or_else(|| old_child.clone()),
+            role: if new_role.trim().is_empty() || new_role.trim().eq_ignore_ascii_case("subagent")
+            {
+                old_role.clone()
+            } else {
+                new_role
+            },
+            prompt_preview: if new_prompt.trim().is_empty() {
+                old_prompt.clone()
+            } else {
+                new_prompt
+            },
         },
         (_, other) => other,
     }
@@ -2914,6 +3168,20 @@ impl WakeupToolRegistry {
     fn find_matching_call_id_for_bg_task(&self, description: Option<&str>) -> Option<String> {
         if let Some(desc) = description.map(str::trim).filter(|s| !s.is_empty()) {
             let norm_desc = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+            let lower_desc = norm_desc.to_ascii_lowercase();
+            // Match `schedule` tool calls (Timer / Cron) even if ACP already emitted a dispatch-ack
+            // `completed` status before `transcript_full.jsonl` exposed the background task ID.
+            if (lower_desc.starts_with("timer:") || lower_desc.starts_with("cron:"))
+                && let Some(cid) = self.order.iter().rev().find(|cid| {
+                    self.entries.get(*cid).is_some_and(|e| {
+                        !e.has_bg_task
+                            && e.signature.kind == "generic"
+                            && e.signature.target == "schedule"
+                    })
+                })
+            {
+                return Some(cid.clone());
+            }
             let desc_sig = ToolSignature {
                 kind: "shell",
                 target: norm_desc.clone(),
@@ -2944,6 +3212,34 @@ impl WakeupToolRegistry {
             return Some(open_shells[0].clone());
         }
         None
+    }
+
+    fn is_active_bg_task_entry(
+        &self,
+        acp_call_id: &str,
+        incoming_detail: &ToolCallDetail,
+        bg_tracker: &BackgroundTaskTracker,
+    ) -> bool {
+        let entry_is_live_bg = |e: &WakeupToolEntry| {
+            e.has_bg_task
+                && e.bg_info
+                    .as_ref()
+                    .and_then(|bg| bg.task_id.as_deref())
+                    .is_some_and(|tid| bg_tracker.tasks.contains_key(tid))
+        };
+        if let Some(canon_id) = self.lookup_canonical_id(acp_call_id)
+            && let Some(entry) = self.entries.get(canon_id)
+        {
+            return entry_is_live_bg(entry);
+        }
+        let incoming_sig = normalize_tool_signature(incoming_detail);
+        self.order.iter().rev().any(|cid| {
+            self.entries.get(cid).is_some_and(|e| {
+                e.call_id.starts_with("wake_tool_")
+                    && entry_is_live_bg(e)
+                    && signatures_match(&e.signature, &incoming_sig)
+            })
+        })
     }
 
     fn finish_tool(
@@ -3330,6 +3626,138 @@ fn parse_bg_task_completed_or_canceled(text: &str) -> Vec<(String, bool, Option<
     out
 }
 
+/// Extracts `sender=<id>` tokens from Antigravity `[Message]` system lines, e.g.:
+/// `[Message] timestamp=2026-11-20T10:18:46Z sender=e17d47cc-.../task-46 priority=MESSAGE_PRIORITY_HIGH content=...`
+fn parse_system_message_senders(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim_start();
+        if !line.starts_with("[Message]") {
+            continue;
+        }
+        if let Some(idx) = line.find("sender=") {
+            let rest = &line[idx + "sender=".len()..];
+            let token = rest
+                .split(|c: char| c.is_ascii_whitespace())
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'));
+            if !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | ':' | '.'))
+            {
+                out.push(token.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Distinguishes recurring `Cron:` schedules from one-shot `Timer:` schedules or background shells.
+fn is_recurring_bg_task_description(desc: Option<&str>) -> bool {
+    let Some(trimmed) = desc.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("cron:") || lower.starts_with("recurring:")
+}
+
+/// Strictly classifies subagent launch tools (`invoke_subagent` / `spawn_subagent`),
+/// explicitly excluding management tools like `manage_subagents` or `define_subagent`.
+fn is_subagent_launch_tool(name_or_title: &str, args_or_raw_in: Option<&Value>) -> bool {
+    let lower = name_or_title.trim().to_ascii_lowercase();
+    let clean = lower.strip_prefix("run ").unwrap_or(&lower).trim();
+    if clean.contains("manage_subagent")
+        || clean.contains("define_subagent")
+        || clean.contains("list_subagent")
+        || clean.contains("kill_subagent")
+        || clean.contains("send_message")
+    {
+        return false;
+    }
+    if clean == "invoke_subagent"
+        || clean == "spawn_subagent"
+        || clean.starts_with("invoke_subagent ")
+        || clean.starts_with("spawn_subagent ")
+    {
+        return true;
+    }
+    if let Some(obj) = args_or_raw_in {
+        let has_prompt = obj.get("Prompt").or_else(|| obj.get("prompt")).is_some();
+        let has_role = obj
+            .get("Role")
+            .or_else(|| obj.get("TypeName"))
+            .or_else(|| obj.get("role"))
+            .is_some();
+        if has_prompt && has_role {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracts `conversationId` from either structured JSON (`rawOutput.conversationId`)
+/// or plain text output containing `"conversationId": "<uuid>"` (Antigravity `invoke_subagent` output).
+fn extract_subagent_conversation_id(
+    raw_out: Option<&Value>,
+    text_fallback: Option<&str>,
+) -> Option<String> {
+    if let Some(o) = raw_out
+        && let Some(id) = o
+            .get("conversationId")
+            .or_else(|| o.get("conversation_id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        return Some(id.to_string());
+    }
+    let extracted_text = extract_acp_raw_output_text(raw_out);
+    let candidate_text = text_fallback.or(extracted_text.as_deref())?;
+    for key in ["\"conversationId\"", "\"conversation_id\""] {
+        if let Some(pos) = candidate_text.find(key) {
+            let after_key = candidate_text[pos + key.len()..].trim_start();
+            let Some(after_colon) = after_key.strip_prefix(':') else {
+                continue;
+            };
+            let after_ws = after_colon.trim_start();
+            let Some(after_quote) = after_ws.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end_quote) = after_quote.find('"') else {
+                continue;
+            };
+            let id = after_quote[..end_quote].trim();
+            if !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn acp_output_indicates_bg_completion(
+    raw_out: Option<&Value>,
+    raw_output_text: Option<&str>,
+) -> bool {
+    if raw_out.and_then(|o| o.get("exitCode")).is_some() {
+        return true;
+    }
+    if let Some(text) = raw_output_text
+        && (!parse_bg_task_completed_or_canceled(text).is_empty()
+            || text.contains("Command exited with code ")
+            || is_signal_termination_text(text))
+    {
+        return true;
+    }
+    false
+}
+
 fn is_signal_termination_text(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("command was terminated by signal or canceled")
@@ -3576,9 +4004,9 @@ fn map_transcript_tool_detail(tool_name: &str, args: Option<&Value>) -> ToolCall
         return ToolCallDetail::Search { query, scope };
     }
 
-    if lower.contains("subagent") {
+    if is_subagent_launch_tool(tool_name, args) {
         let role = transcript_arg_str(args, &["Role", "TypeName", "role"])
-            .unwrap_or_else(|| "subagent".into());
+            .unwrap_or_else(|| "Subagent".into());
         let prompt = transcript_arg_str(args, &["Prompt", "prompt"]).unwrap_or_default();
         return ToolCallDetail::Subagent {
             child_agent_id: None,
@@ -3617,6 +4045,11 @@ fn attach_transcript_tool_result(mut detail: ToolCallDetail, content: &str) -> T
                 *exit_code = Some(code);
             }
         }
+        ToolCallDetail::Subagent { child_agent_id, .. } => {
+            if child_agent_id.is_none() {
+                *child_agent_id = extract_subagent_conversation_id(None, Some(content));
+            }
+        }
         ToolCallDetail::Generic { arguments_json, .. } => {
             if arguments_json.is_empty()
                 && let Some(p) = preview
@@ -3637,8 +4070,11 @@ struct AgyTranscriptMonitor {
     byte_offset: u64,
     seen_steps: HashSet<u64>,
     max_seen_step: u64,
+    always_active: bool,
     in_wakeup: bool,
     pending_tools: Vec<(String, ToolCallDetail)>,
+    pending_silent_tools: VecDeque<Option<(String, String)>>,
+    active_bg_task_recurring: HashMap<String, bool>,
     consecutive_errors: u32,
     last_error_at: Option<Instant>,
     last_error_message: Option<String>,
@@ -3654,6 +4090,12 @@ impl AgyTranscriptMonitor {
         Self::from_brain_dir_with_session(brain_dir, session_id)
     }
 
+    fn new_subagent(session_id: &str) -> Self {
+        let data_dir = resolve_agy_data_dir();
+        let brain_dir = data_dir.join("brain").join(session_id);
+        Self::from_brain_dir_subagent(brain_dir, session_id)
+    }
+
     fn from_brain_dir_with_session(brain_dir: PathBuf, session_id: impl Into<String>) -> Self {
         let logs_dir = brain_dir.join(".system_generated/logs");
         Self {
@@ -3664,8 +4106,11 @@ impl AgyTranscriptMonitor {
             byte_offset: 0,
             seen_steps: HashSet::new(),
             max_seen_step: 0,
+            always_active: false,
             in_wakeup: false,
             pending_tools: Vec::new(),
+            pending_silent_tools: VecDeque::new(),
+            active_bg_task_recurring: HashMap::new(),
             consecutive_errors: 0,
             last_error_at: None,
             last_error_message: None,
@@ -3673,6 +4118,13 @@ impl AgyTranscriptMonitor {
             last_in_progress_heartbeat: None,
             seen_undelivered_files: HashSet::new(),
         }
+    }
+
+    fn from_brain_dir_subagent(brain_dir: PathBuf, session_id: impl Into<String>) -> Self {
+        let mut mon = Self::from_brain_dir_with_session(brain_dir, session_id);
+        mon.always_active = true;
+        mon.in_wakeup = true;
+        mon
     }
 
     fn max_seen_step(&self) -> u64 {
@@ -3696,8 +4148,9 @@ impl AgyTranscriptMonitor {
     fn sync_silent_with_bg_tasks(&mut self) -> Vec<BgTaskDelta> {
         let mut bg_deltas = Vec::new();
         let _ = self.read_new_lines(true, &mut bg_deltas);
-        self.in_wakeup = false;
+        self.in_wakeup = self.always_active;
         self.pending_tools.clear();
+        self.pending_silent_tools.clear();
         self.consecutive_errors = 0;
         self.last_error_at = None;
         self.last_error_message = None;
@@ -3907,24 +4360,97 @@ impl AgyTranscriptMonitor {
 
             let content = step.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Capture background-task lifecycle even in silent foreground sync mode.
+            // Track tool calls emitted by `PLANNER_RESPONSE` even in silent foreground sync mode
+            // so `invoke_subagent` `conversationId` outputs on subsequent `GENERIC` steps can be
+            // paired 1-to-1 with their role & prompt preview.
+            if step_type == "PLANNER_RESPONSE"
+                && let Some(calls) = step.get("tool_calls").and_then(|v| v.as_array())
+            {
+                for c in calls {
+                    let tname = c.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                    if is_subagent_launch_tool(tname, c.get("args")) {
+                        let role = transcript_arg_str(c.get("args"), &["Role", "TypeName", "role"])
+                            .unwrap_or_else(|| "Subagent".into());
+                        let prompt = transcript_arg_str(c.get("args"), &["Prompt", "prompt"])
+                            .map(|s| truncate_preview(&s, 240))
+                            .unwrap_or_default();
+                        self.pending_silent_tools.push_back(Some((role, prompt)));
+                    } else {
+                        self.pending_silent_tools.push_back(None);
+                    }
+                }
+            }
+
+            // Collect completed background tasks from both explicit `Task id "..." finished/canceled`
+            // messages and one-shot timer `[Message] ... sender=<session_id>/task-XX` notifications.
+            let mut completed_bg_tasks: Vec<(String, bool)> = Vec::new();
+
+            // Capture background-task & subagent lifecycle even in silent foreground sync mode.
             // Only `GENERIC` steps in `RUNNING` state with strict session-scoped header match
             // count as a real background task start; `DONE` tool outputs (read_file, grep, sqlite)
             // can never enqueue phantom background tasks.
-            if step_type == "GENERIC"
-                && status == "RUNNING"
-                && let Some((task_id, description, log_path)) =
-                    parse_bg_task_started(content, &self.session_id)
-            {
-                bg_deltas.push(BgTaskDelta::Started {
-                    task_id,
-                    call_id: None,
-                    description,
-                    log_path,
-                });
+            if step_type == "GENERIC" {
+                let popped_subagent = self.pending_silent_tools.pop_front().flatten();
+                if (popped_subagent.is_some()
+                    || content.contains("Created the following subagent:"))
+                    && let Some(sub_id) = extract_subagent_conversation_id(None, Some(content))
+                {
+                    let (role, prompt_preview) =
+                        popped_subagent.unwrap_or_else(|| ("Subagent".to_string(), String::new()));
+                    bg_deltas.push(BgTaskDelta::SubagentSpawned {
+                        subagent_id: sub_id.clone(),
+                        role: role.clone(),
+                        prompt_preview: prompt_preview.clone(),
+                    });
+                    if !silent {
+                        out.push(WakeupStep::SubagentSpawned {
+                            subagent_id: sub_id,
+                            role,
+                            prompt_preview,
+                        });
+                    }
+                }
+                if status == "RUNNING"
+                    && let Some((task_id, description, log_path)) =
+                        parse_bg_task_started(content, &self.session_id)
+                {
+                    let is_recurring = is_recurring_bg_task_description(description.as_deref());
+                    self.active_bg_task_recurring
+                        .insert(task_id.clone(), is_recurring);
+                    bg_deltas.push(BgTaskDelta::Started {
+                        task_id,
+                        call_id: None,
+                        description,
+                        log_path,
+                    });
+                }
             } else if is_system_message_step(step_type, content) {
                 for (task_id, canceled, _) in parse_bg_task_completed_or_canceled(content) {
-                    bg_deltas.push(BgTaskDelta::Completed { task_id, canceled });
+                    self.active_bg_task_recurring.remove(&task_id);
+                    if !completed_bg_tasks.iter().any(|(id, _)| id == &task_id) {
+                        completed_bg_tasks.push((task_id, canceled));
+                    }
+                }
+                let session_prefix = format!("{}/", self.session_id);
+                for sender in parse_system_message_senders(content) {
+                    if sender.starts_with(&session_prefix) && sender.len() > session_prefix.len() {
+                        let is_recurring = self
+                            .active_bg_task_recurring
+                            .get(&sender)
+                            .copied()
+                            .unwrap_or(false);
+                        if !is_recurring && !completed_bg_tasks.iter().any(|(id, _)| id == &sender)
+                        {
+                            self.active_bg_task_recurring.remove(&sender);
+                            completed_bg_tasks.push((sender, false));
+                        }
+                    }
+                }
+                for (task_id, canceled) in &completed_bg_tasks {
+                    bg_deltas.push(BgTaskDelta::Completed {
+                        task_id: task_id.clone(),
+                        canceled: *canceled,
+                    });
                 }
             }
 
@@ -3942,7 +4468,7 @@ impl AgyTranscriptMonitor {
                     message: "Context compacted automatically".into(),
                 });
             } else if is_system_message_step(step_type, content) {
-                for (task_id, canceled, _) in parse_bg_task_completed_or_canceled(content) {
+                for (task_id, canceled) in completed_bg_tasks {
                     out.push(WakeupStep::BackgroundTaskCompleted { task_id, canceled });
                 }
                 if !self.in_wakeup {
@@ -3951,10 +4477,17 @@ impl AgyTranscriptMonitor {
                     self.last_error_at = None;
                     self.last_error_message = None;
                     self.last_in_progress_heartbeat = Some(Instant::now());
-                    out.push(WakeupStep::Started {
-                        source: "background_task".into(),
-                    });
+                    if !self.always_active {
+                        out.push(WakeupStep::Started {
+                            source: "background_task".into(),
+                        });
+                    }
                 }
+            } else if self.always_active && step_type == "USER_INPUT" {
+                self.in_wakeup = true;
+                self.consecutive_errors = 0;
+                self.last_error_at = None;
+                self.last_error_message = None;
             } else if step_type == "ERROR_MESSAGE" {
                 let err_msg = step
                     .get("error")
@@ -5867,5 +6400,281 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             bg_tracker.waiting_source_label(),
             "waiting:1 background task"
         );
+    }
+
+    #[test]
+    fn schedule_timer_completes_on_system_message_sender_while_cron_stays_active() {
+        let dir = std::env::temp_dir().join(format!("orbit_timer_test_{}", uuid::Uuid::new_v4()));
+        let logs = dir.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("create logs dir");
+        let full_path = logs.join("transcript_full.jsonl");
+        let sess = "e17d47cc-55c1-4d29-9f49-e893aa911896";
+
+        let lines = [
+            json!({
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Created At: 2026-11-20T10:10:45+08:00\nTool is running as a background task with task id: {sess}/task-46\nTask Description: Timer: 8m, Prompt: Check progress\n")
+            }),
+            json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": format!("Created At: 2026-11-20T10:10:46+08:00\nTool is running as a background task with task id: {sess}/task-99\nTask Description: Cron: */5 * * * *, Prompt: Periodic health check\n")
+            }),
+            json!({
+                "step_index": 3,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": format!("[Message] timestamp=2026-11-20T10:18:46Z sender={sess}/task-46 priority=MESSAGE_PRIORITY_HIGH content=Check progress")
+            }),
+            json!({
+                "step_index": 4,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": format!("[Message] timestamp=2026-11-20T10:20:00Z sender={sess}/task-99 priority=MESSAGE_PRIORITY_HIGH content=Periodic health check")
+            }),
+        ];
+        let body = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&full_path, body).expect("write transcript");
+
+        let mut mon = AgyTranscriptMonitor::from_brain_dir_with_session(dir.clone(), sess);
+        let deltas = mon.sync_silent_with_bg_tasks();
+
+        // One-shot Timer (`task-46`) must emit Completed; recurring Cron (`task-99`) must NOT.
+        assert!(deltas.iter().any(|d| matches!(
+            d,
+            BgTaskDelta::Completed { task_id, canceled: false } if task_id == &format!("{sess}/task-46")
+        )));
+        assert!(!deltas.iter().any(|d| matches!(
+            d,
+            BgTaskDelta::Completed { task_id, .. } if task_id == &format!("{sess}/task-99")
+        )));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn acp_schedule_dispatch_ack_and_run_prefix_reconcile_without_duplicates() {
+        let mut wakeup_tools = WakeupToolRegistry::default();
+        let mut bg_tracker = BackgroundTaskTracker::default();
+        let mut seg_state = AgyStreamSegmentState {
+            turn_tag: "t1".into(),
+            ..AgyStreamSegmentState::default()
+        };
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let mut last_ask_raw = None;
+        let (evt_tx, mut evt_rx) = mpsc::channel(32);
+
+        // 1. ACP starts `Run schedule` and immediately emits dispatch-ack `completed` without `rawOutput`
+        handle_acp_session_update(
+            "ag_p",
+            "sess_sched",
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_sched_1",
+                "title": "Run schedule",
+                "status": "in_progress",
+                "rawInput": { "DurationSeconds": 480, "Prompt": "watchdog" }
+            }),
+            false,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        let _ = evt_rx.try_recv();
+
+        handle_acp_session_update(
+            "ag_p",
+            "sess_sched",
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_sched_1",
+                "title": "Run schedule",
+                "status": "completed"
+            }),
+            false,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        let _ = evt_rx.try_recv();
+
+        // 2. Transcript discovers `Timer: 8m` background task -> must bind onto `call_sched_1`
+        let matched =
+            wakeup_tools.find_matching_call_id_for_bg_task(Some("Timer: 8m, Prompt: watchdog"));
+        assert_eq!(matched.as_deref(), Some("call_sched_1"));
+
+        let bg_info = BackgroundTaskInfo {
+            task_id: Some("sess_sched/task-46".into()),
+            label: Some("Timer: 8m, Prompt: watchdog".into()),
+            log_path: None,
+        };
+        wakeup_tools.mark_background_task("call_sched_1", bg_info.clone());
+        bg_tracker.record_started(
+            "sess_sched/task-46".into(),
+            Some("call_sched_1".into()),
+            None,
+            Some(bg_info),
+        );
+
+        // 3. A subsequent ACP `completed` without exitCode/completion must keep it Running!
+        handle_acp_session_update(
+            "ag_p",
+            "sess_sched",
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_sched_1",
+                "title": "Run schedule",
+                "status": "completed"
+            }),
+            true,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        assert!(!bg_tracker.is_empty());
+
+        // 4. Normalized signatures match `"Run mcp_orbit_get_agent_status"` with `"mcp_orbit_get_agent_status"`
+        let acp_sig = normalize_tool_signature(&ToolCallDetail::Generic {
+            tool_name: "Run mcp_orbit_get_agent_status".into(),
+            arguments_json: "{}".into(),
+        });
+        let tx_sig = normalize_tool_signature(&ToolCallDetail::Generic {
+            tool_name: "mcp_orbit_get_agent_status".into(),
+            arguments_json: "{}".into(),
+        });
+        assert!(signatures_match(&acp_sig, &tx_sig));
+    }
+
+    #[test]
+    fn subagent_classification_and_text_conversation_id_and_subagent_monitor() {
+        // `manage_subagents` must NOT be classified as ToolCallDetail::Subagent
+        let manage_acp = map_agy_tool_detail(
+            &json!({
+                "title": "Run manage_subagents",
+                "rawInput": { "Action": "list" }
+            }),
+            None,
+        );
+        assert!(matches!(manage_acp, ToolCallDetail::Generic { .. }));
+        let manage_tx =
+            map_transcript_tool_detail("manage_subagents", Some(&json!({ "Action": "list" })));
+        assert!(matches!(manage_tx, ToolCallDetail::Generic { .. }));
+
+        // `invoke_subagent` with text-wrapped JSON extracts `conversationId`
+        let sub_text = "Created At: 2026-11-20T10:10:02+08:00\nCompleted At: 2026-11-20T10:10:02+08:00\nCreated the following subagent:\n{\n  \"conversationId\":  \"dbb609d7-d67b-42cb-a105-6c660888af12\",\n  \"logAbsoluteUri\":  \"file:///tmp/transcript.jsonl\"\n}";
+        let start_detail = map_agy_tool_detail(
+            &json!({
+                "title": "Run invoke_subagent",
+                "rawInput": {
+                    "Role": "Action Cinema Directing Researcher",
+                    "Prompt": "Investigate camera framing"
+                }
+            }),
+            None,
+        );
+        let done_detail = map_agy_tool_detail(
+            &json!({
+                "title": "Run invoke_subagent",
+                "rawOutput": sub_text
+            }),
+            Some(&start_detail),
+        );
+        assert!(matches!(
+            done_detail,
+            ToolCallDetail::Subagent {
+                child_agent_id: Some(ref cid),
+                ref role,
+                ref prompt_preview,
+            } if cid == "dbb609d7-d67b-42cb-a105-6c660888af12"
+                && role == "Action Cinema Directing Researcher"
+                && prompt_preview == "Investigate camera framing"
+        ));
+
+        // Subagent transcript monitor (`from_brain_dir_subagent`) streams steps & settles
+        let dir = std::env::temp_dir().join(format!("orbit_submon_test_{}", uuid::Uuid::new_v4()));
+        let logs = dir.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).expect("create logs dir");
+        let full_path = logs.join("transcript_full.jsonl");
+        let lines = [
+            json!({
+                "step_index": 0,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": "You are a subagent tasked with researching cinema framing."
+            }),
+            json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "thinking": "Searching literature",
+                "content": "",
+                "tool_calls": [{ "id": "tc1", "name": "search_web", "args": { "query": "action cinematography" } }]
+            }),
+            json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Found 10 references"
+            }),
+            json!({
+                "step_index": 3,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "Completed research and reported to parent.",
+                "tool_calls": []
+            }),
+        ];
+        std::fs::write(
+            &full_path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("write subagent transcript");
+
+        let mut sub_mon =
+            AgyTranscriptMonitor::from_brain_dir_subagent(dir.clone(), "dbb609d7-sub");
+        let events = sub_mon.poll_post_turn_wakeup();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WakeupStep::Thinking { .. }))
+        );
+        assert!(events.iter().any(|e| matches!(e, WakeupStep::Tool { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WakeupStep::Message { .. }))
+        );
+        assert!(events.iter().any(|e| matches!(e, WakeupStep::Settled)));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowUp, Square } from "lucide-react";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
 export interface ConversationComposerProps {
@@ -45,6 +46,7 @@ export const ConversationComposer = memo(function ConversationComposer({
   const [historyIdx, setHistoryIdx] = useState<number>(-1);
   const [widthTick, setWidthTick] = useState(0);
   const savedDraftRef = useRef<string>("");
+  const ime = useImeCompositionGuard();
 
   const minHeight = variant === "compact" ? 38 : 46;
   const maxHeight = variant === "compact" ? 180 : 220;
@@ -90,7 +92,7 @@ export const ConversationComposer = memo(function ConversationComposer({
   const showStop = isBusy && Boolean(onInterrupt) && value.trim().length === 0;
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.nativeEvent.isComposing) return;
+    if (ime.shouldIgnoreKeyDown(e)) return;
 
     const isModEnter = e.key === "Enter" && (e.metaKey || e.ctrlKey);
     const isPlainEnter = e.key === "Enter" && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey;
@@ -175,6 +177,7 @@ export const ConversationComposer = memo(function ConversationComposer({
               if (historyIdx !== -1) setHistoryIdx(-1);
               onChange(e.target.value);
             }}
+            {...ime.compositionProps}
             onKeyDown={handleKeyDown}
             placeholder={placeholder}
             style={{ minHeight: `${minHeight}px`, maxHeight: `${maxHeight}px` }}

@@ -651,31 +651,121 @@ pub fn default_daemon_listen() -> SocketAddr {
     SocketAddr::from(([0, 0, 0, 0], 6868))
 }
 
-pub async fn self_upgrade_cli(home_dir: &Path, force: bool) -> anyhow::Result<()> {
-    let current_ver = env!("CARGO_PKG_VERSION");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+fn resolve_github_token() -> Option<String> {
+    for key in ["ORBIT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_tag_from_release_url(url: &str) -> Option<String> {
+    let clean = url.split(['?', '#']).next()?.trim().trim_end_matches('/');
+    let (_, after_tag) = clean.rsplit_once("/releases/tag/")?;
+    let tag = after_tag.split('/').next()?.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    Some(tag.to_string())
+}
+
+async fn resolve_latest_release_tag(current_ver: &str) -> anyhow::Result<String> {
+    const LATEST_WEB_URL: &str = "https://github.com/danielgaoyy/orbit/releases/latest";
+    const LATEST_API_URL: &str = "https://api.github.com/repos/danielgaoyy/orbit/releases/latest";
+
+    // 1. Primary: lightweight no-redirect web HEAD/GET -> 302 Location (`/releases/tag/vX.Y.Z`).
+    //    Never consumes `api.github.com` unauthenticated 60 req/hr quota.
+    let no_redirect = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("orbit-cli/{current_ver}"))
         .build()?;
 
-    let meta: serde_json::Value = client
-        .get("https://api.github.com/repos/danielgaoyy/orbit/releases/latest")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let mut web_err: Option<String> = None;
+    for use_head in [true, false] {
+        let req = if use_head {
+            no_redirect.head(LATEST_WEB_URL)
+        } else {
+            no_redirect.get(LATEST_WEB_URL)
+        };
+        match req.send().await {
+            Ok(resp) => {
+                if resp.status().is_redirection()
+                    && let Some(loc) = resp
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                    && let Some(tag) = extract_tag_from_release_url(loc)
+                {
+                    return Ok(tag);
+                }
+                if let Some(tag) = extract_tag_from_release_url(resp.url().as_str()) {
+                    return Ok(tag);
+                }
+                if !use_head {
+                    web_err = Some(format!(
+                        "HTTP {} without release tag redirect",
+                        resp.status()
+                    ));
+                }
+            }
+            Err(e) if !use_head => {
+                web_err = Some(e.to_string());
+            }
+            Err(_) => {}
+        }
+    }
 
-    let tag = meta
-        .get("tag_name")
+    // 2. Fallback: GitHub REST API (automatically authenticated if token env var is present).
+    let api_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(format!("orbit-cli/{current_ver}"))
+        .build()?;
+    let mut req = api_client
+        .get(LATEST_API_URL)
+        .header("Accept", "application/vnd.github+json");
+    if let Some(token) = resolve_github_token() {
+        req = req.bearer_auth(token);
+    }
+    let resp = req.send().await.map_err(|e| {
+        anyhow::anyhow!(
+            "failed to resolve latest Orbit release (web redirect: {}; API: {e})",
+            web_err.as_deref().unwrap_or("unknown")
+        )
+    })?;
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "failed to resolve latest Orbit release (web redirect: {}; API HTTP {})",
+            web_err.as_deref().unwrap_or("unknown"),
+            resp.status()
+        );
+    }
+    let meta: serde_json::Value = resp.json().await?;
+    meta.get("tag_name")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing tag_name in GitHub release metadata"))?;
-    let latest_ver = tag.trim_start_matches('v');
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing tag_name in GitHub release metadata"))
+}
+
+pub async fn self_upgrade_cli(home_dir: &Path, force: bool) -> anyhow::Result<()> {
+    let current_ver = env!("CARGO_PKG_VERSION");
+    let tag = resolve_latest_release_tag(current_ver).await?;
+    let latest_ver = tag.trim_start_matches(['v', 'V']);
 
     if !force && latest_ver == current_ver {
         println!("[✓] Orbit is already at the latest version (v{current_ver}).");
         return Ok(());
     }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(format!("orbit-cli/{current_ver}"))
+        .build()?;
 
     let asset_name = match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "orbit-cli-linux-x64",
@@ -822,6 +912,30 @@ mod tests {
         assert_eq!(
             preflight_probe_relay(&url, "stranger_pubkey").await,
             RelayProbeOutcome::Forbidden403
+        );
+    }
+
+    #[test]
+    fn test_extract_tag_from_release_url() {
+        assert_eq!(
+            extract_tag_from_release_url(
+                "https://github.com/danielgaoyy/orbit/releases/tag/v0.5.4"
+            )
+            .as_deref(),
+            Some("v0.5.4")
+        );
+        assert_eq!(
+            extract_tag_from_release_url("/danielgaoyy/orbit/releases/tag/v0.5.4/?ref=abc#top")
+                .as_deref(),
+            Some("v0.5.4")
+        );
+        assert_eq!(
+            extract_tag_from_release_url("https://github.com/danielgaoyy/orbit/releases/latest"),
+            None
+        );
+        assert_eq!(
+            extract_tag_from_release_url("https://github.com/danielgaoyy/orbit/releases/tag/"),
+            None
         );
     }
 }

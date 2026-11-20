@@ -114,12 +114,182 @@ export interface FleetOverviewView {
   projects?: ClientProjectView[];
 }
 
+export type ActiveTurnBehavior = "steer" | "queue" | "interrupt";
+export type AttentionState = "none" | "unread" | "needs_permission" | "error";
+export type WorkspaceIsolation = "local" | "worktree";
+export type WorktreeCreateMode = "branch_off" | "checkout_branch" | "checkout_pr";
+export type WorkspaceSetupStatus = "none" | "running" | "succeeded" | "failed";
+export type AgentMessageKind = "direct_message" | "finish_notification" | "heartbeat";
+export type ProviderSubagentStatus = "running" | "completed" | "failed" | "stopped";
+export type ScheduleKind = "schedule" | "heartbeat";
+export type ScheduleStatus = "active" | "paused" | "completed";
+export type ScheduleRunStatus = "running" | "succeeded" | "failed" | "skipped";
+export type ConnectedHostStatus = "disabled" | "connecting" | "online" | "error";
+export type WorkspaceScriptKind = "setup" | "teardown" | "service" | "task";
+export type WorkspaceScriptStatus = "stopped" | "running" | "failed";
+
+export interface PermissionCheckpointRef {
+  child_agent_id: string;
+  child_host_id?: string | null;
+  permission_request_id: string;
+  title: string;
+  allowed_decisions: string[];
+}
+
+export interface PendingPermissionSummary {
+  agent_id: string;
+  agent_title: string;
+  request_id: string;
+  title: string;
+  detail: ToolCallDetail;
+  allowed_decisions: string[];
+  created_at: string;
+}
+
+export interface McpToolPolicy {
+  enabled: boolean;
+  disabled_tools: string[];
+}
+
+export interface AgentProfile {
+  profile_id: string;
+  name: string;
+  provider: ProviderKind;
+  model: string | null;
+  effort: ReasoningEffort | null;
+  mode: SessionMode;
+  when_to_use: string;
+  system_prompt_append: string | null;
+  mcp_policy: McpToolPolicy;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OrchestrationConfig {
+  mcp_inject_enabled: boolean;
+  idle_cleanup_enabled: boolean;
+  idle_timeout_secs: number;
+  resume_on_startup: boolean;
+  resume_prompt: string;
+  installed_skills: string[];
+}
+
+export interface OrchestrationSkillInfo {
+  id: string;
+  name: string;
+  slash_command: string;
+  description: string;
+  installed: boolean;
+  installed_targets: string[];
+  outdated: boolean;
+}
+
+export interface ScheduleNewAgentConfig {
+  cwd: string;
+  workspace_id?: string | null;
+  provider: ProviderKind;
+  model?: string | null;
+  effort?: ReasoningEffort | null;
+  profile_id?: string | null;
+  mode: SessionMode;
+  worktree: boolean;
+  base_ref?: string | null;
+  background?: boolean;
+  archive_on_finish: boolean;
+}
+
+export type ScheduleTarget =
+  | { type: "new_agent" } & ScheduleNewAgentConfig
+  | { type: "existing_agent"; agent_id: string };
+
+export interface ScheduleSpec {
+  schedule_id: string;
+  kind: ScheduleKind;
+  name: string;
+  cron_expr: string;
+  timezone: string | null;
+  prompt: string;
+  status: ScheduleStatus;
+  target: ScheduleTarget;
+  max_runs: number | null;
+  run_count: number;
+  expires_at: string | null;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  created_by_agent: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ScheduleRunRecord {
+  run_id: string;
+  schedule_id: string;
+  agent_id: string | null;
+  workspace_id: string | null;
+  status: ScheduleRunStatus;
+  summary: string | null;
+  error: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface ConnectedHostSummary {
+  registration_id: string;
+  host_id: string | null;
+  label: string;
+  daemon_pubkey_b64: string;
+  direct_endpoints: string[];
+  relay_url: string | null;
+  enabled: boolean;
+  status: ConnectedHostStatus;
+  last_error: string | null;
+  hostname: string | null;
+  available_providers: ProviderKind[];
+  updated_at: string;
+}
+
+export interface WorkspaceScriptInfo {
+  workspace_id: string;
+  name: string;
+  command: string;
+  kind: WorkspaceScriptKind;
+  status: WorkspaceScriptStatus;
+  terminal_id: string | null;
+  port: number | null;
+  proxy_url: string | null;
+}
+
+export interface ProviderSubagentDescriptor {
+  parent_agent_id: string;
+  subagent_id: string;
+  parent_subagent_id: string | null;
+  title: string;
+  subtitle: string | null;
+  status: ProviderSubagentStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProviderSubagentEvent {
+  seq: number;
+  parent_agent_id: string;
+  subagent_id: string;
+  timestamp: string;
+  payload: unknown;
+}
+
 export interface WorkspaceSummary {
   workspace_id: string;
   title: string;
   cwd: string;
   git_branch: string | null;
   is_worktree: boolean;
+  base_ref?: string | null;
+  parent_workspace_id?: string | null;
+  source_cwd?: string | null;
+  setup_status?: WorkspaceSetupStatus;
+  background?: boolean;
+  archived_at?: string | null;
   updated_at: string;
 }
 
@@ -137,6 +307,13 @@ export interface AgentCardView {
   is_running: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
+  parent_host_id?: string | null;
+  profile_id?: string | null;
+  background?: boolean;
+  auto_archive?: boolean;
+  attention?: AttentionState;
+  archived_at_rfc3339?: string | null;
+  labels?: Record<string, string>;
   latest_seq: number;
   updated_at_rfc3339: string;
 }
@@ -211,6 +388,14 @@ export interface HostDetailView {
   terminals: TerminalSummary[];
   active_terminal_id: string | null;
   active_terminal_slot: number;
+  profiles?: AgentProfile[];
+  schedules?: ScheduleSpec[];
+  connected_hosts?: ConnectedHostSummary[];
+  orchestration_config?: OrchestrationConfig;
+  orchestration_skills?: OrchestrationSkillInfo[];
+  workspace_scripts?: Record<string, WorkspaceScriptInfo[]>;
+  pending_permissions?: PendingPermissionSummary[];
+  provider_subagents?: Record<string, ProviderSubagentDescriptor[]>;
 }
 
 export interface InlineSpanView {
@@ -394,6 +579,20 @@ export type TimelineItemView =
       level: string;
       message: string;
       timestamp_ms?: number | null;
+    }
+  | {
+      item_type: "agent_message";
+      seq: number;
+      message_id: string;
+      kind: AgentMessageKind;
+      source_agent_id?: string | null;
+      source_host_id?: string | null;
+      source_title?: string | null;
+      event?: string | null;
+      text: string;
+      permission_context?: PermissionCheckpointRef | null;
+      blocks: RichBlockView[];
+      timestamp_ms?: number | null;
     };
 
 export interface AgentTimelineView {
@@ -530,6 +729,8 @@ export function timelineItemLogicalKey(item: TimelineItemView): string {
       return item.seq > 0
         ? `notice:${item.seq}`
         : `notice:0:${item.timestamp_ms ?? 0}:${item.message}`;
+    case "agent_message":
+      return `am:${item.message_id}`;
   }
 }
 
@@ -696,6 +897,7 @@ export const orbitIpc = {
     initialDisplayPrompt?: string | null;
     initialBadges?: PromptBadge[];
     worktreeBranch: string | null;
+    profileId?: string | null;
   }): Promise<string> => {
     if (!isTauriRuntime()) return "";
     return invoke<string>("create_agent", {
@@ -704,6 +906,7 @@ export const orbitIpc = {
       effort: params.effort ?? null,
       initialDisplayPrompt: params.initialDisplayPrompt ?? null,
       initialBadges: params.initialBadges ?? [],
+      profileId: params.profileId ?? null,
     });
   },
 
@@ -716,7 +919,11 @@ export const orbitIpc = {
     hostId: string,
     agentId: string,
     prompt: string,
-    meta?: { displayPrompt?: string; badges?: PromptBadge[] },
+    meta?: {
+      displayPrompt?: string;
+      badges?: PromptBadge[];
+      activeTurnBehavior?: ActiveTurnBehavior;
+    },
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("send_prompt", {
@@ -725,6 +932,7 @@ export const orbitIpc = {
       prompt,
       displayPrompt: meta?.displayPrompt ?? null,
       badges: meta?.badges ?? [],
+      activeTurnBehavior: meta?.activeTurnBehavior ?? null,
     });
   },
 
@@ -783,6 +991,276 @@ export const orbitIpc = {
     await invoke<void>("archive_agent", { hostId, agentId });
   },
 
+  unarchiveAgent: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("unarchive_agent", { hostId, agentId });
+  },
+
+  deleteAgent: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("delete_agent", { hostId, agentId });
+  },
+
+  detachAgent: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("detach_agent", { hostId, agentId });
+  },
+
+  markAgentRead: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("mark_agent_read", { hostId, agentId });
+  },
+
+  updateAgent: async (params: {
+    hostId: string;
+    agentId: string;
+    title?: string | null;
+    model?: string | null;
+    effort?: ReasoningEffort | null;
+    mode?: SessionMode | null;
+    labels?: Record<string, string> | null;
+  }): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_agent", {
+      hostId: params.hostId,
+      agentId: params.agentId,
+      title: params.title ?? null,
+      model: params.model ?? null,
+      effort: params.effort ?? null,
+      mode: params.mode ?? null,
+      labels: params.labels ?? null,
+    });
+  },
+
+  createWorkspaceV2: async (params: {
+    hostId: string;
+    sourceCwd: string;
+    title?: string | null;
+    isolation: WorkspaceIsolation;
+    worktreeMode: WorktreeCreateMode;
+    worktreeBranch?: string | null;
+    baseRef?: string | null;
+    prNumber?: number | null;
+  }): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("create_workspace_v2", {
+      hostId: params.hostId,
+      sourceCwd: params.sourceCwd,
+      title: params.title ?? null,
+      isolation: params.isolation,
+      worktreeMode: params.worktreeMode,
+      worktreeBranch: params.worktreeBranch ?? null,
+      baseRef: params.baseRef ?? null,
+      prNumber: params.prNumber ?? null,
+    });
+  },
+
+  renameWorkspace: async (hostId: string, workspaceId: string, title: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("rename_workspace", { hostId, workspaceId, title });
+  },
+
+  archiveWorkspace: async (hostId: string, workspaceId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("archive_workspace", { hostId, workspaceId });
+  },
+
+  unarchiveWorkspace: async (hostId: string, workspaceId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("unarchive_workspace", { hostId, workspaceId });
+  },
+
+  listWorkspaceScripts: async (hostId: string, workspaceId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("list_workspace_scripts", { hostId, workspaceId });
+  },
+
+  startWorkspaceScript: async (
+    hostId: string,
+    workspaceId: string,
+    scriptName: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("start_workspace_script", { hostId, workspaceId, scriptName });
+  },
+
+  stopWorkspaceScript: async (
+    hostId: string,
+    workspaceId: string,
+    scriptName: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("stop_workspace_script", { hostId, workspaceId, scriptName });
+  },
+
+  upsertProfile: async (hostId: string, profile: AgentProfile): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("upsert_profile", { hostId, profile });
+  },
+
+  deleteProfile: async (hostId: string, profileId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("delete_profile", { hostId, profileId });
+  },
+
+  createSchedule: async (params: {
+    hostId: string;
+    name: string;
+    cronExpr: string;
+    timezone?: string | null;
+    prompt: string;
+    target: ScheduleTarget;
+    maxRuns?: number | null;
+  }): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("create_schedule", {
+      hostId: params.hostId,
+      name: params.name,
+      cronExpr: params.cronExpr,
+      timezone: params.timezone ?? null,
+      prompt: params.prompt,
+      target: params.target,
+      maxRuns: params.maxRuns ?? null,
+    });
+  },
+
+  updateSchedule: async (params: {
+    hostId: string;
+    scheduleId: string;
+    name?: string | null;
+    cronExpr?: string | null;
+    prompt?: string | null;
+    maxRuns?: number | null;
+    archiveOnFinish?: boolean | null;
+  }): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_schedule", {
+      hostId: params.hostId,
+      scheduleId: params.scheduleId,
+      name: params.name ?? null,
+      cronExpr: params.cronExpr ?? null,
+      prompt: params.prompt ?? null,
+      maxRuns: params.maxRuns ?? null,
+      archiveOnFinish: params.archiveOnFinish ?? null,
+    });
+  },
+
+  pauseSchedule: async (hostId: string, scheduleId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("pause_schedule", { hostId, scheduleId });
+  },
+
+  resumeSchedule: async (hostId: string, scheduleId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("resume_schedule", { hostId, scheduleId });
+  },
+
+  runScheduleOnce: async (hostId: string, scheduleId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("run_schedule_once", { hostId, scheduleId });
+  },
+
+  deleteSchedule: async (hostId: string, scheduleId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("delete_schedule", { hostId, scheduleId });
+  },
+
+  fetchScheduleRuns: async (
+    hostId: string,
+    scheduleId: string,
+    limit?: number | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("fetch_schedule_runs", { hostId, scheduleId, limit: limit ?? null });
+  },
+
+  getScheduleRuns: async (hostId: string, scheduleId: string): Promise<ScheduleRunRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ScheduleRunRecord[]>("get_schedule_runs", { hostId, scheduleId });
+  },
+
+  addConnectedHost: async (
+    hostId: string,
+    pairingUri: string,
+    label?: string | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("add_connected_host", {
+      hostId,
+      label: label ?? null,
+      pairingUri,
+    });
+  },
+
+  updateConnectedHost: async (
+    hostId: string,
+    registrationId: string,
+    params: { label?: string | null; enabled?: boolean | null },
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_connected_host", {
+      hostId,
+      registrationId,
+      label: params.label ?? null,
+      enabled: params.enabled ?? null,
+    });
+  },
+
+  removeConnectedHost: async (hostId: string, registrationId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("remove_connected_host", { hostId, registrationId });
+  },
+
+  syncFleetConnectedHosts: async (targetHostId: string): Promise<number> => {
+    if (!isTauriRuntime()) return 0;
+    return invoke<number>("sync_fleet_connected_hosts", { targetHostId });
+  },
+
+  updateOrchestrationConfig: async (
+    hostId: string,
+    config: OrchestrationConfig,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_orchestration_config", { hostId, config });
+  },
+
+  syncOrchestrationSkills: async (hostId: string, skillIds: string[]): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("sync_orchestration_skills", { hostId, skillIds });
+  },
+
+  listProviderSubagents: async (hostId: string, parentAgentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("list_provider_subagents", { hostId, parentAgentId });
+  },
+
+  openProviderSubagentTimeline: async (
+    hostId: string,
+    parentAgentId: string,
+    subagentId: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("open_provider_subagent_timeline", { hostId, parentAgentId, subagentId });
+  },
+
+  getProviderSubagentTimeline: async (
+    hostId: string,
+    parentAgentId: string,
+    subagentId: string,
+  ): Promise<ProviderSubagentEvent[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<ProviderSubagentEvent[]>("get_provider_subagent_timeline", {
+      hostId,
+      parentAgentId,
+      subagentId,
+    });
+  },
+
+  refreshPendingPermissions: async (hostId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("refresh_pending_permissions", { hostId });
+  },
+
   rewindAgent: async (
     hostId: string,
     agentId: string,
@@ -799,7 +1277,6 @@ export const orbitIpc = {
       restoreFiles,
     });
   },
-
   resolvePermission: async (
     hostId: string,
     agentId: string,
@@ -1064,7 +1541,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.3.7";
+    if (!isTauriRuntime()) return "0.4.0";
     return invoke<string>("get_app_version");
   },
 

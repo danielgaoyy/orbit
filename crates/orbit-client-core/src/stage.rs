@@ -176,6 +176,7 @@ pub enum SearchSubkind {
 pub fn timeline_item_seq(item: &TimelineItemView) -> u64 {
     match item {
         TimelineItemView::UserPrompt { seq, .. }
+        | TimelineItemView::AgentMessage { seq, .. }
         | TimelineItemView::AssistantThinking { seq, .. }
         | TimelineItemView::AssistantMessage { seq, .. }
         | TimelineItemView::ToolCall { seq, .. }
@@ -188,6 +189,7 @@ pub fn timeline_item_seq(item: &TimelineItemView) -> u64 {
 pub fn timeline_item_timestamp_ms(item: &TimelineItemView) -> Option<i64> {
     let raw = match item {
         TimelineItemView::UserPrompt { timestamp_ms, .. }
+        | TimelineItemView::AgentMessage { timestamp_ms, .. }
         | TimelineItemView::AssistantThinking { timestamp_ms, .. }
         | TimelineItemView::AssistantMessage { timestamp_ms, .. }
         | TimelineItemView::ToolCall { timestamp_ms, .. }
@@ -1203,7 +1205,10 @@ pub fn process_timeline_for_stage(
             continue;
         }
 
-        if matches!(item, TimelineItemView::UserPrompt { .. }) {
+        if matches!(
+            item,
+            TimelineItemView::UserPrompt { .. } | TimelineItemView::AgentMessage { .. }
+        ) {
             flush_turn(
                 &mut turns,
                 &mut current_prompt,
@@ -1275,6 +1280,7 @@ fn finalize_turn(
 
     let key = match &user_prompt {
         Some(TimelineItemView::UserPrompt { message_id, .. }) => format!("turn-{message_id}"),
+        Some(TimelineItemView::AgentMessage { message_id, .. }) => format!("turn-am-{message_id}"),
         _ => format!("turn-init-{anchor_seq}"),
     };
 

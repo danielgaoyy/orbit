@@ -1,13 +1,25 @@
 //! Host-local Orbit Daemon (`orbit daemon`).
 //!
 //! Runs on each target machine (Devbox, Linux workstation, Mac mini), manages SQLite WAL state,
-//! supervises detached Shims, serves direct WebSocket clients, and optionally registers outbound to Relay
-//! with full `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
+//! supervises detached Shims, serves direct WebSocket clients, exposes the built-in Streamable
+//! HTTP MCP orchestration server (`/mcp/agents`), runs the Cron/Heartbeat scheduler, maintains
+//! Daemon-to-Daemon Connected Host links, and optionally registers outbound to Relay with full
+//! `Noise_NK_25519_ChaChaPoly_SHA256` end-to-end encryption.
 
 pub mod attachments;
+pub mod connected_hosts;
+pub mod cron;
 pub mod discovery;
+pub mod finish_subscriptions;
 pub mod git;
+pub mod idle_cleanup;
 pub mod manager;
+pub mod mcp;
+pub mod messaging;
+pub mod scheduler;
+pub mod skills;
+pub mod tools;
+pub mod workspace_runtime;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -17,33 +29,47 @@ use std::time::Duration;
 
 use axum::{
     Router,
+    body::Body,
     extract::{
         State,
         ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade},
     },
-    response::IntoResponse,
-    routing::get,
+    http::{Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use orbit_crypto::{DaemonHandshake, HostIdentityKeypair, PairingOffer};
 use orbit_protocol::{
-    HostInfo, PROTOCOL_VERSION, ProviderModelCatalog, TerminalBinaryFrame, WireMessage,
+    AgentMessageKind, HostInfo, OrchestrationConfig, PROTOCOL_VERSION, ProviderModelCatalog,
+    ScheduleStatus, TerminalBinaryFrame, WireMessage,
 };
 use orbit_providers::{
     SideQuestionSpec, catalogs_to_model_map, discover_installed_providers,
     probe_all_provider_models, probe_all_provider_quotas, run_side_question,
 };
 use orbit_relay_transport::{RelayConnector, is_ssh_relay_url, redact_relay_url};
-use orbit_store::OrbitStore;
+use orbit_store::{OrbitStore, ReceiptOutcome};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as AsyncMutex, RwLock, mpsc};
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::attachments::AttachmentStagingManager;
+use crate::connected_hosts::ConnectedHostsManager;
+use crate::finish_subscriptions::FinishSubscriptionManager;
 use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files, read_workspace_file};
-use crate::manager::{AgentOrchestrator, DaemonBroadcast, PtyBroadcast};
+use crate::idle_cleanup::IdleRuntimeCleanup;
+use crate::manager::{
+    AgentOrchestrator, CreateAgentSpec, CreateWorkspaceSpec, DaemonBroadcast, PtyBroadcast,
+};
+use crate::messaging::{
+    AgentMessageDelivery, AgentPromptSource, DEFAULT_COALESCE_WINDOW, QueuedAgentMessage,
+};
+use crate::scheduler::ScheduleEngine;
+use crate::workspace_runtime::WorkspaceScriptRegistry;
 
 const DIRECT_BIN_ZSTD_WIRE: u8 = 0x00;
 const E2EE_FRAME_WIRE: u8 = 0x00;
@@ -53,6 +79,8 @@ const E2EE_FRAME_TERMINAL: u8 = 0x01;
 pub struct DaemonPersistedConfig {
     pub listen_addr: Option<SocketAddr>,
     pub relay_url: Option<String>,
+    #[serde(default)]
+    pub orchestration: OrchestrationConfig,
 }
 
 impl DaemonPersistedConfig {
@@ -154,11 +182,22 @@ pub struct DaemonRuntime {
     pub orchestrator: Arc<AgentOrchestrator>,
     pub attachments: Arc<AttachmentStagingManager>,
     pub home_dir: PathBuf,
+    pub mcp_token: String,
+    pub listen_port: Arc<RwLock<u16>>,
+    pub orch_config: Arc<RwLock<OrchestrationConfig>>,
+    pub delivery: Arc<AgentMessageDelivery>,
+    pub finish_subs: Arc<FinishSubscriptionManager>,
+    pub connected_hosts: Arc<ConnectedHostsManager>,
+    pub scheduler: Arc<ScheduleEngine>,
+    pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
     catalog_refresh_lock: AsyncMutex<()>,
 }
 
 impl DaemonRuntime {
+    /// Lightweight, side-effect-free runtime bootstrap (safe for `orbit pair`, `orbit status`,
+    /// and tests). Call [`DaemonRuntime::activate_server`] after binding the TCP listener to start
+    /// shim recovery, connected hosts, finish subscriptions, scheduler, and idle cleanup.
     pub async fn bootstrap(home_dir: &Path) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(home_dir)?;
         std::fs::create_dir_all(home_dir.join("shims"))?;
@@ -180,15 +219,59 @@ impl DaemonRuntime {
             generated
         };
 
+        let persisted = DaemonPersistedConfig::load(home_dir);
+        let mcp_token = crate::mcp::load_or_create_mcp_token(home_dir)?;
+        let listen_port = Arc::new(RwLock::new(
+            persisted.listen_addr.map(|a| a.port()).unwrap_or(0),
+        ));
+        let orch_config = Arc::new(RwLock::new(persisted.orchestration));
+
+        let host_id = keypair.host_id()?;
         let store = Arc::new(OrbitStore::open(home_dir.join("orbit.db"))?);
-        let orchestrator = AgentOrchestrator::new(home_dir.to_path_buf(), store.clone()).await;
+        let scripts = WorkspaceScriptRegistry::new();
+        let orchestrator = AgentOrchestrator::new(
+            home_dir.to_path_buf(),
+            host_id.clone(),
+            mcp_token.clone(),
+            listen_port.clone(),
+            orch_config.clone(),
+            store.clone(),
+            scripts,
+        )
+        .await;
         let attachments = Arc::new(AttachmentStagingManager::new(home_dir));
+
+        let orch_for_dispatch = orchestrator.clone();
+        let delivery = AgentMessageDelivery::new(
+            DEFAULT_COALESCE_WINDOW,
+            Arc::new(move |batch| {
+                let orch = orch_for_dispatch.clone();
+                Box::pin(async move { orch.dispatch_coalesced_batch(batch).await })
+            }),
+        );
+
+        let connected_hosts = ConnectedHostsManager::new(host_id.clone(), store.clone());
+        let finish_subs = FinishSubscriptionManager::new(
+            host_id.clone(),
+            store.clone(),
+            orchestrator.clone(),
+            delivery.clone(),
+            connected_hosts.clone(),
+        );
+        let scheduler = ScheduleEngine::new(store.clone(), orchestrator.clone(), delivery.clone());
+        let idle_cleanup = IdleRuntimeCleanup::new(
+            store.clone(),
+            orchestrator.clone(),
+            delivery.clone(),
+            finish_subs.clone(),
+            orch_config.clone(),
+        );
 
         let discovered = discover_installed_providers();
         let available_providers = discovered.into_iter().map(|d| d.kind).collect();
 
         let host_info = HostInfo {
-            host_id: keypair.host_id()?,
+            host_id,
             hostname: hostname_string(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
@@ -198,23 +281,55 @@ impl DaemonRuntime {
             available_providers,
         };
 
-        let rt = Arc::new(Self {
+        Ok(Arc::new(Self {
             host_info,
             keypair,
             store,
             orchestrator,
             attachments,
             home_dir: home_dir.to_path_buf(),
+            mcp_token,
+            listen_port,
+            orch_config,
+            delivery,
+            finish_subs,
+            connected_hosts,
+            scheduler,
+            idle_cleanup,
             provider_catalogs: RwLock::new(None),
             catalog_refresh_lock: AsyncMutex::new(()),
-        });
+        }))
+    }
 
-        let rt_warm = rt.clone();
+    /// Record the active bound TCP port and activate all background orchestration loops.
+    pub async fn activate_server(self: &Arc<Self>, bound_port: u16) {
+        *self.listen_port.write().await = bound_port;
+        write_live_port_file(&self.home_dir, bound_port);
+
+        // 1. Reattach surviving shims now that the MCP server port is known
+        self.orchestrator.activate_runtime().await;
+        // 2. Establish outbound Daemon-to-Daemon mesh connections
+        self.connected_hosts.start_all().await;
+        // 3. Resume any persisted finish subscriptions across restarts
+        self.finish_subs.start_recovery().await;
+        // 4. Start Cron/Heartbeat scheduler & Idle Runtime Cleanup background loops
+        drop(self.scheduler.spawn_background());
+        drop(self.idle_cleanup.spawn_background());
+
+        // 5. Warm provider model catalogs in background
+        let rt_warm = Arc::clone(self);
         tokio::spawn(async move {
             let _ = rt_warm.get_or_probe_provider_catalogs(false).await;
         });
 
-        Ok(rt)
+        // 6. Refresh installed bundled orchestration skills if previously enabled
+        let installed_skills = self.orch_config.read().await.installed_skills.clone();
+        if !installed_skills.is_empty() {
+            tokio::task::spawn_blocking(move || {
+                let user_home = resolve_user_home();
+                let _ = crate::skills::sync_orchestration_skills(&user_home, &installed_skills);
+            });
+        }
     }
 
     pub async fn get_or_probe_provider_catalogs(
@@ -247,6 +362,69 @@ impl DaemonRuntime {
             pairing_secret: uuid::Uuid::new_v4().to_string(),
         }
     }
+}
+
+fn write_live_port_file(home_dir: &Path, port: u16) {
+    let port_file = home_dir.join("daemon-port");
+    let _ = std::fs::write(&port_file, format!("{port}\n"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&port_file, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// Read the active local Daemon port (prefers `$ORBIT_HOME/daemon-port`, falling back to `config.json` or `6868`).
+pub fn read_live_daemon_port(home_dir: &Path) -> u16 {
+    if let Ok(raw) = std::fs::read_to_string(home_dir.join("daemon-port"))
+        && let Ok(port) = raw.trim().parse::<u16>()
+        && port > 0
+    {
+        return port;
+    }
+    DaemonPersistedConfig::load(home_dir)
+        .listen_addr
+        .map(|a| a.port())
+        .filter(|&p| p > 0)
+        .unwrap_or(6868)
+}
+
+fn resolve_user_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz_handler))
+        .route("/ws", get(ws_handler))
+        .route("/mcp/agents", post(crate::mcp::mcp_agents_handler))
+        .fallback(service_reverse_proxy_fallback)
+        .with_state(runtime)
+}
+
+async fn service_reverse_proxy_fallback(
+    State(runtime): State<Arc<DaemonRuntime>>,
+    req: Request<Body>,
+) -> Response {
+    if let Some(host_val) = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        && let Some(target_port) = runtime
+            .orchestrator
+            .scripts
+            .resolve_proxy_port(host_val)
+            .await
+    {
+        return runtime
+            .orchestrator
+            .scripts
+            .proxy_http_request(target_port, req)
+            .await;
+    }
+    (StatusCode::NOT_FOUND, "Not Found").into_response()
 }
 
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
@@ -290,6 +468,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
     let bound_addr = listener.local_addr()?;
+    runtime.activate_server(bound_addr.port()).await;
 
     let direct_eps = if bound_addr.ip().is_unspecified() {
         discover_lan_ws_endpoints(bound_addr.port())
@@ -304,6 +483,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         hostname = %runtime.host_info.hostname,
         providers = ?runtime.host_info.available_providers,
         listen = %bound_addr,
+        mcp_url = %format!("http://127.0.0.1:{}/mcp/agents", bound_addr.port()),
         relay = ?redacted_relay,
         "Orbit Daemon ready"
     );
@@ -320,11 +500,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         });
     }
 
-    let app = Router::new()
-        .route("/healthz", get(healthz_handler))
-        .route("/ws", get(ws_handler))
-        .with_state(runtime);
-
+    let app = build_http_router(runtime);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -337,6 +513,7 @@ pub async fn spawn_embedded_daemon(
     let runtime = DaemonRuntime::bootstrap(&home_dir).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    runtime.activate_server(addr.port()).await;
 
     if let Some(r_url) = relay_url {
         let rt_relay = runtime.clone();
@@ -345,12 +522,7 @@ pub async fn spawn_embedded_daemon(
         });
     }
 
-    let rt_http = runtime.clone();
-    let app = Router::new()
-        .route("/healthz", get(healthz_handler))
-        .route("/ws", get(ws_handler))
-        .with_state(rt_http);
-
+    let app = build_http_router(runtime.clone());
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -633,9 +805,11 @@ async fn run_client_session_loop(
     let session_id = Uuid::new_v4();
     let mut use_zstd = false;
     let mut subscribed_agents: HashSet<String> = HashSet::new();
+    let mut subscribed_provider_subagents: HashSet<(String, String)> = HashSet::new();
     let mut slot_to_terminal: HashMap<u8, (String, tokio::task::AbortHandle)> = HashMap::new();
     let mut active_side_questions: Vec<tokio::task::AbortHandle> = Vec::new();
     let mut bcast_rx = runtime.orchestrator.broadcast_tx.subscribe();
+    let mut host_status_rx = runtime.connected_hosts.status_updates_tx.subscribe();
 
     loop {
         tokio::select! {
@@ -668,6 +842,7 @@ async fn run_client_session_loop(
                             msg,
                             &mut use_zstd,
                             &mut subscribed_agents,
+                            &mut subscribed_provider_subagents,
                             &mut slot_to_terminal,
                             &mut active_side_questions,
                             &out_tx,
@@ -688,30 +863,50 @@ async fn run_client_session_loop(
             }
 
             Ok(bcast) = bcast_rx.recv() => {
-                match bcast {
+                let maybe_msg = match bcast {
                     DaemonBroadcast::AgentUpdated(agent) => {
-                        if out_tx
-                            .send(SessionFrame::Wire {
-                                msg: WireMessage::AgentUpdated { agent },
-                                zstd: use_zstd,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                        Some(WireMessage::AgentUpdated { agent })
+                    }
+                    DaemonBroadcast::AgentDeleted(agent_id) => {
+                        subscribed_agents.remove(&agent_id);
+                        Some(WireMessage::AgentDeleted { agent_id })
                     }
                     DaemonBroadcast::TimelineLive(event) => {
-                        if subscribed_agents.contains(&event.agent_id)
-                            && out_tx
-                                .send(SessionFrame::Wire {
-                                    msg: WireMessage::TimelineLive { event },
-                                    zstd: use_zstd,
-                                })
-                                .await
-                                .is_err()
-                        {
-                            break;
+                        if subscribed_agents.contains(&event.agent_id) {
+                            Some(WireMessage::TimelineLive { event })
+                        } else {
+                            None
+                        }
+                    }
+                    DaemonBroadcast::WorkspaceUpdated(workspace) => {
+                        Some(WireMessage::WorkspaceUpdated { workspace })
+                    }
+                    DaemonBroadcast::WorkspaceSetupProgress(progress) => {
+                        Some(WireMessage::WorkspaceSetupProgress { progress })
+                    }
+                    DaemonBroadcast::WorkspaceScriptUpdated(script) => {
+                        Some(WireMessage::WorkspaceScriptUpdated { script })
+                    }
+                    DaemonBroadcast::ScheduleUpdated(schedule) => {
+                        Some(WireMessage::ScheduleUpdated { schedule })
+                    }
+                    DaemonBroadcast::ScheduleDeleted(schedule_id) => {
+                        Some(WireMessage::ScheduleDeleted { schedule_id })
+                    }
+                    DaemonBroadcast::ConnectedHostRemoved(registration_id) => {
+                        Some(WireMessage::ConnectedHostRemoved { registration_id })
+                    }
+                    DaemonBroadcast::ProviderSubagentUpdated(subagent) => {
+                        Some(WireMessage::ProviderSubagentUpdated { subagent })
+                    }
+                    DaemonBroadcast::ProviderSubagentTimelineLive(event) => {
+                        if subscribed_provider_subagents.contains(&(
+                            event.parent_agent_id.clone(),
+                            event.subagent_id.clone(),
+                        )) {
+                            Some(WireMessage::ProviderSubagentTimelineLive { event })
+                        } else {
+                            None
                         }
                     }
                     DaemonBroadcast::AgentRewound {
@@ -720,25 +915,41 @@ async fn run_client_session_loop(
                     } => {
                         if origin_session_id != session_id
                             && subscribed_agents.contains(&outcome.agent.agent_id)
-                            && out_tx
-                                .send(SessionFrame::Wire {
-                                    msg: WireMessage::AgentRewound {
-                                        request_id: None,
-                                        agent: outcome.agent,
-                                        to_before_seq: outcome.to_before_seq,
-                                        events: outcome.events,
-                                        restored_files: outcome.restored_files,
-                                        restored_prompt: outcome.restored_prompt,
-                                        notice: outcome.notice,
-                                    },
-                                    zstd: use_zstd,
-                                })
-                                .await
-                                .is_err()
                         {
-                            break;
+                            Some(WireMessage::AgentRewound {
+                                request_id: None,
+                                agent: outcome.agent,
+                                to_before_seq: outcome.to_before_seq,
+                                events: outcome.events,
+                                restored_files: outcome.restored_files,
+                                restored_prompt: outcome.restored_prompt,
+                                notice: outcome.notice,
+                            })
+                        } else {
+                            None
                         }
                     }
+                };
+                if let Some(msg) = maybe_msg
+                    && out_tx
+                        .send(SessionFrame::Wire { msg, zstd: use_zstd })
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+
+            Ok(host) = host_status_rx.recv() => {
+                if out_tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::ConnectedHostUpdated { host },
+                        zstd: use_zstd,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
         }
@@ -752,13 +963,14 @@ async fn run_client_session_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn handle_wire_rpc(
     runtime: &Arc<DaemonRuntime>,
     session_id: Uuid,
     req: WireMessage,
     use_zstd: &mut bool,
     subscribed_agents: &mut HashSet<String>,
+    subscribed_provider_subagents: &mut HashSet<(String, String)>,
     slot_to_terminal: &mut HashMap<u8, (String, tokio::task::AbortHandle)>,
     active_side_questions: &mut Vec<tokio::task::AbortHandle>,
     out_tx: &mpsc::Sender<SessionFrame>,
@@ -836,7 +1048,14 @@ async fn handle_wire_rpc(
             });
             None
         }
-        WireMessage::ListWorkspaces { request_id } => match runtime.store.list_workspaces() {
+        WireMessage::ListWorkspaces {
+            request_id,
+            include_archived,
+            include_background,
+        } => match runtime
+            .store
+            .list_workspaces_filtered(include_archived, include_background)
+        {
             Ok(workspaces) => Some(WireMessage::WorkspacesSnapshot {
                 request_id,
                 workspaces,
@@ -849,16 +1068,162 @@ async fn handle_wire_rpc(
             title,
             worktree_branch,
             base_ref,
+            isolation,
+            worktree_mode,
+            pr_number,
+            parent_workspace_id,
+            background,
+            idempotency_key,
+        } => {
+            let mut reserved_key: Option<String> = None;
+            if let Some(ref idem) = idempotency_key
+                && !idem.trim().is_empty()
+            {
+                let hash = hash_payload(&serde_json::json!({
+                    "source_cwd": source_cwd,
+                    "title": title,
+                    "worktree_branch": worktree_branch,
+                    "base_ref": base_ref,
+                    "isolation": isolation,
+                    "worktree_mode": worktree_mode,
+                    "pr_number": pr_number,
+                    "background": background,
+                }));
+                match runtime
+                    .store
+                    .check_or_reserve_receipt("ws_create", idem, &hash)
+                {
+                    Ok(ReceiptOutcome::Committed(json)) => {
+                        if let Ok(ws) = serde_json::from_str(&json) {
+                            return Some(WireMessage::WorkspaceCreated {
+                                request_id,
+                                workspace: ws,
+                            });
+                        }
+                    }
+                    Ok(ReceiptOutcome::Conflict) => {
+                        return Some(rpc_err(
+                            request_id,
+                            "idempotency_conflict",
+                            "idempotency_key was reused with different parameters",
+                        ));
+                    }
+                    Ok(ReceiptOutcome::PendingInFlight) => {
+                        return Some(rpc_err(
+                            request_id,
+                            "idempotency_pending",
+                            "a request with this idempotency_key is already in flight",
+                        ));
+                    }
+                    Ok(ReceiptOutcome::Reserved) => {
+                        reserved_key = Some(idem.clone());
+                    }
+                    Err(e) => return Some(rpc_err(request_id, "store_error", e)),
+                }
+            }
+
+            match runtime
+                .orchestrator
+                .create_workspace_v2(CreateWorkspaceSpec {
+                    source_cwd,
+                    title,
+                    worktree_branch,
+                    base_ref,
+                    isolation,
+                    worktree_mode,
+                    pr_number,
+                    parent_workspace_id,
+                    background,
+                })
+                .await
+            {
+                Ok(workspace) => {
+                    if let Some(ref k) = reserved_key
+                        && let Ok(raw) = serde_json::to_string(&workspace)
+                    {
+                        let _ = runtime.store.commit_receipt("ws_create", k, &raw);
+                    }
+                    Some(WireMessage::WorkspaceCreated {
+                        request_id,
+                        workspace,
+                    })
+                }
+                Err(e) => {
+                    if let Some(ref k) = reserved_key {
+                        let _ = runtime.store.delete_pending_receipt("ws_create", k);
+                    }
+                    Some(rpc_err(request_id, "workspace_error", e))
+                }
+            }
+        }
+        WireMessage::RenameWorkspace {
+            request_id,
+            workspace_id,
+            title,
         } => match runtime
             .orchestrator
-            .ensure_workspace(&source_cwd, title, worktree_branch, base_ref)
+            .rename_workspace(&workspace_id, &title)
             .await
         {
-            Ok(workspace) => Some(WireMessage::WorkspaceCreated {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "rename_workspace_failed", e)),
+        },
+        WireMessage::ArchiveWorkspace {
+            request_id,
+            workspace_id,
+        } => match runtime.orchestrator.archive_workspace(&workspace_id).await {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "archive_workspace_failed", e)),
+        },
+        WireMessage::UnarchiveWorkspace {
+            request_id,
+            workspace_id,
+        } => match runtime
+            .orchestrator
+            .unarchive_workspace(&workspace_id)
+            .await
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "unarchive_workspace_failed", e)),
+        },
+        WireMessage::ListWorkspaceScripts {
+            request_id,
+            workspace_id,
+        } => match runtime
+            .orchestrator
+            .list_workspace_scripts(&workspace_id)
+            .await
+        {
+            Ok(scripts) => Some(WireMessage::WorkspaceScriptsSnapshot {
                 request_id,
-                workspace,
+                workspace_id,
+                scripts,
             }),
-            Err(e) => Some(rpc_err(request_id, "workspace_error", e)),
+            Err(e) => Some(rpc_err(request_id, "list_scripts_failed", e)),
+        },
+        WireMessage::StartWorkspaceScript {
+            request_id,
+            workspace_id,
+            script_name,
+        } => match runtime
+            .orchestrator
+            .start_workspace_script(&workspace_id, &script_name)
+            .await
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "start_script_failed", e)),
+        },
+        WireMessage::StopWorkspaceScript {
+            request_id,
+            workspace_id,
+            script_name,
+        } => match runtime
+            .orchestrator
+            .stop_workspace_script(&workspace_id, &script_name)
+            .await
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "stop_script_failed", e)),
         },
         WireMessage::GetGitStatus { request_id, cwd } => {
             let tx = out_tx.clone();
@@ -951,7 +1316,15 @@ async fn handle_wire_rpc(
         WireMessage::ListAgents {
             request_id,
             workspace_id,
-        } => match runtime.store.list_agents(workspace_id.as_deref()) {
+            include_archived,
+            include_background,
+            parent_agent_id,
+        } => match runtime.store.list_agents_filtered(
+            workspace_id.as_deref(),
+            include_archived,
+            include_background,
+            parent_agent_id.as_deref(),
+        ) {
             Ok(agents) => Some(WireMessage::AgentsSnapshot { request_id, agents }),
             Err(e) => Some(rpc_err(request_id, "store_error", e)),
         },
@@ -968,10 +1341,71 @@ async fn handle_wire_rpc(
             initial_display_prompt,
             initial_badges,
             worktree,
+            workspace_id,
+            parent_agent_id,
+            parent_host_id,
+            profile_id,
+            background,
+            auto_archive,
+            notify_on_finish,
+            idempotency_key,
+            base_ref,
+            worktree_mode,
+            branch,
         } => {
+            let mut reserved_key: Option<String> = None;
+            if let Some(ref idem) = idempotency_key
+                && !idem.trim().is_empty()
+            {
+                let hash = hash_payload(&serde_json::json!({
+                    "cwd": cwd,
+                    "title": title,
+                    "provider": provider,
+                    "model": model,
+                    "mode": mode,
+                    "initial_prompt": initial_prompt,
+                    "worktree": worktree,
+                    "workspace_id": workspace_id,
+                    "profile_id": profile_id,
+                }));
+                match runtime
+                    .store
+                    .check_or_reserve_receipt("agent_create", idem, &hash)
+                {
+                    Ok(ReceiptOutcome::Committed(json)) => {
+                        if let Ok(agent) =
+                            serde_json::from_str::<orbit_protocol::AgentSummary>(&json)
+                        {
+                            subscribed_agents.insert(agent.agent_id.clone());
+                            return Some(WireMessage::AgentCreated { request_id, agent });
+                        }
+                    }
+                    Ok(ReceiptOutcome::Conflict) => {
+                        return Some(rpc_err(
+                            request_id,
+                            "idempotency_conflict",
+                            "idempotency_key was reused with different parameters",
+                        ));
+                    }
+                    Ok(ReceiptOutcome::PendingInFlight) => {
+                        return Some(rpc_err(
+                            request_id,
+                            "idempotency_pending",
+                            "a request with this idempotency_key is already in flight",
+                        ));
+                    }
+                    Ok(ReceiptOutcome::Reserved) => {
+                        reserved_key = Some(idem.clone());
+                    }
+                    Err(e) => return Some(rpc_err(request_id, "store_error", e)),
+                }
+            }
+
+            let parent_id_for_watch = parent_agent_id.clone();
+            let parent_host_for_watch = parent_host_id.clone();
             match runtime
                 .orchestrator
-                .create_and_start_agent(crate::manager::CreateAgentSpec {
+                .create_and_start_agent(CreateAgentSpec {
                     cwd,
                     extra_dirs,
                     title,
@@ -983,14 +1417,50 @@ async fn handle_wire_rpc(
                     initial_display_prompt,
                     initial_badges,
                     worktree,
+                    workspace_id,
+                    parent_agent_id,
+                    parent_host_id,
+                    profile_id,
+                    background,
+                    auto_archive,
+                    base_ref,
+                    worktree_mode,
+                    branch,
+                    pr_number: None,
                 })
                 .await
             {
                 Ok(agent) => {
                     subscribed_agents.insert(agent.agent_id.clone());
+                    // Register durable local finish subscription if caller is a local parent agent
+                    if notify_on_finish == Some(true)
+                        && let Some(caller_id) = parent_id_for_watch
+                    {
+                        let is_local_parent = parent_host_for_watch
+                            .as_deref()
+                            .is_none_or(|h| h == runtime.host_info.host_id);
+                        if is_local_parent
+                            && runtime.store.get_agent(&caller_id).ok().flatten().is_some()
+                        {
+                            let _ = runtime
+                                .finish_subs
+                                .register(caller_id, agent.agent_id.clone(), None, true)
+                                .await;
+                        }
+                    }
+                    if let Some(ref k) = reserved_key
+                        && let Ok(raw) = serde_json::to_string(&agent)
+                    {
+                        let _ = runtime.store.commit_receipt("agent_create", k, &raw);
+                    }
                     Some(WireMessage::AgentCreated { request_id, agent })
                 }
-                Err(e) => Some(rpc_err(request_id, "create_agent_failed", e)),
+                Err(e) => {
+                    if let Some(ref k) = reserved_key {
+                        let _ = runtime.store.delete_pending_receipt("agent_create", k);
+                    }
+                    Some(rpc_err(request_id, "create_agent_failed", e))
+                }
             }
         }
         WireMessage::SendPrompt {
@@ -999,15 +1469,64 @@ async fn handle_wire_rpc(
             prompt,
             display_prompt,
             badges,
+            active_turn_behavior,
+            message_id,
+            caller_agent_id,
+            notify_on_finish,
         } => {
             subscribed_agents.insert(agent_id.clone());
-            match runtime
-                .orchestrator
-                .send_prompt_with_meta(&agent_id, prompt, display_prompt, badges)
-                .await
-            {
-                Ok(()) => Some(WireMessage::Ack { request_id }),
-                Err(e) => Some(rpc_err(request_id, "send_prompt_failed", e)),
+            if let Some(caller_id) = caller_agent_id {
+                let caller_title = runtime
+                    .store
+                    .get_agent(&caller_id)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.title);
+                if notify_on_finish == Some(true)
+                    && runtime.store.get_agent(&caller_id).ok().flatten().is_some()
+                {
+                    let _ = runtime
+                        .finish_subs
+                        .register(caller_id.clone(), agent_id.clone(), None, false)
+                        .await;
+                }
+                let qmsg = QueuedAgentMessage {
+                    message_id: message_id
+                        .unwrap_or_else(|| format!("am_{}", uuid::Uuid::new_v4().simple())),
+                    recipient_id: agent_id,
+                    body: prompt,
+                    active_turn_behavior,
+                    session_mode: None,
+                    unarchive: true,
+                    source: AgentPromptSource {
+                        kind: AgentMessageKind::DirectMessage,
+                        source_agent_id: Some(caller_id),
+                        source_host_id: Some(runtime.host_info.host_id.clone()),
+                        source_title: caller_title,
+                        event: None,
+                        permission_context: None,
+                    },
+                };
+                match runtime.delivery.enqueue(qmsg).await {
+                    Ok(_) => Some(WireMessage::Ack { request_id }),
+                    Err(e) => Some(rpc_err(request_id, "send_prompt_failed", e)),
+                }
+            } else {
+                match runtime
+                    .orchestrator
+                    .send_prompt_with_options(
+                        &agent_id,
+                        prompt,
+                        display_prompt,
+                        badges,
+                        active_turn_behavior,
+                        message_id,
+                    )
+                    .await
+                {
+                    Ok(()) => Some(WireMessage::Ack { request_id }),
+                    Err(e) => Some(rpc_err(request_id, "send_prompt_failed", e)),
+                }
             }
         }
         WireMessage::InterruptTurn {
@@ -1065,10 +1584,72 @@ async fn handle_wire_rpc(
             agent_id,
         } => {
             subscribed_agents.remove(&agent_id);
+            runtime.finish_subs.cancel_for_caller(&agent_id).await;
             match runtime.orchestrator.archive_agent(&agent_id).await {
                 Ok(()) => Some(WireMessage::Ack { request_id }),
                 Err(e) => Some(rpc_err(request_id, "archive_failed", e)),
             }
+        }
+        WireMessage::UnarchiveAgent {
+            request_id,
+            agent_id,
+        } => match runtime.orchestrator.unarchive_agent(&agent_id).await {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "unarchive_failed", e)),
+        },
+        WireMessage::DeleteAgent {
+            request_id,
+            agent_id,
+        } => {
+            subscribed_agents.remove(&agent_id);
+            runtime.finish_subs.cancel_for_caller(&agent_id).await;
+            match runtime.orchestrator.delete_agent(&agent_id).await {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Err(e) => Some(rpc_err(request_id, "delete_agent_failed", e)),
+            }
+        }
+        WireMessage::DetachAgent {
+            request_id,
+            agent_id,
+        } => match runtime.orchestrator.detach_agent(&agent_id).await {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "detach_agent_failed", e)),
+        },
+        WireMessage::MarkAgentRead {
+            request_id,
+            agent_id,
+        } => match runtime.orchestrator.mark_agent_read(&agent_id).await {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "mark_read_failed", e)),
+        },
+        WireMessage::UpdateAgent {
+            request_id,
+            agent_id,
+            title,
+            model,
+            effort,
+            mode,
+            labels,
+        } => match runtime
+            .orchestrator
+            .update_agent(&agent_id, title, model, effort, mode, labels)
+            .await
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "update_agent_failed", e)),
+        },
+        WireMessage::ListPendingPermissions {
+            request_id,
+            agent_id,
+        } => {
+            let permissions = runtime
+                .orchestrator
+                .list_pending_permissions(agent_id.as_deref())
+                .await;
+            Some(WireMessage::PendingPermissionsSnapshot {
+                request_id,
+                permissions,
+            })
         }
         WireMessage::RewindAgent {
             request_id,
@@ -1222,6 +1803,308 @@ async fn handle_wire_rpc(
                 Err(e) => Some(rpc_err(request_id, "kill_terminal_failed", e)),
             }
         }
+        WireMessage::CaptureTerminal {
+            request_id,
+            terminal_id,
+            lines,
+        } => match runtime
+            .orchestrator
+            .capture_terminal_text(&terminal_id, lines)
+            .await
+        {
+            Ok(text) => Some(WireMessage::TerminalCaptured {
+                request_id,
+                terminal_id,
+                text,
+            }),
+            Err(e) => Some(rpc_err(request_id, "capture_terminal_failed", e)),
+        },
+        WireMessage::SendTerminalKeys {
+            request_id,
+            terminal_id,
+            text,
+            keys,
+        } => match runtime
+            .orchestrator
+            .send_terminal_keys(&terminal_id, text.as_deref(), &keys)
+            .await
+        {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "send_terminal_keys_failed", e)),
+        },
+
+        // Agent Profiles
+        WireMessage::ListProfiles { request_id } => match runtime.store.list_profiles() {
+            Ok(profiles) => Some(WireMessage::ProfilesSnapshot {
+                request_id,
+                profiles,
+            }),
+            Err(e) => Some(rpc_err(request_id, "store_error", e)),
+        },
+        WireMessage::UpsertProfile {
+            request_id,
+            mut profile,
+        } => {
+            if profile.profile_id.trim().is_empty() {
+                profile.profile_id =
+                    format!("prof_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+            }
+            profile.updated_at = chrono::Utc::now();
+            match runtime.store.upsert_profile(&profile) {
+                Ok(()) => Some(WireMessage::ProfileUpserted {
+                    request_id,
+                    profile,
+                }),
+                Err(e) => Some(rpc_err(request_id, "upsert_profile_failed", e)),
+            }
+        }
+        WireMessage::DeleteProfile {
+            request_id,
+            profile_id,
+        } => match runtime.store.delete_profile(&profile_id) {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "delete_profile_failed", e)),
+        },
+
+        // Schedules & Heartbeats
+        WireMessage::ListSchedules {
+            request_id,
+            include_completed,
+        } => match runtime.store.list_schedules(include_completed) {
+            Ok(schedules) => Some(WireMessage::SchedulesSnapshot {
+                request_id,
+                schedules,
+            }),
+            Err(e) => Some(rpc_err(request_id, "store_error", e)),
+        },
+        WireMessage::CreateSchedule {
+            request_id,
+            name,
+            cron_expr,
+            timezone,
+            prompt,
+            target,
+            max_runs,
+            expires_at,
+            created_by_agent,
+        } => match runtime.scheduler.create_schedule(
+            name,
+            &cron_expr,
+            timezone,
+            prompt,
+            target,
+            max_runs,
+            expires_at,
+            created_by_agent,
+        ) {
+            Ok(schedule) => Some(WireMessage::ScheduleCreated {
+                request_id,
+                schedule,
+            }),
+            Err(e) => Some(rpc_err(request_id, "create_schedule_failed", e)),
+        },
+        WireMessage::UpdateSchedule {
+            request_id,
+            schedule_id,
+            name,
+            cron_expr,
+            prompt,
+            max_runs,
+            expires_at,
+            archive_on_finish,
+        } => match runtime.scheduler.update_schedule(
+            &schedule_id,
+            name,
+            cron_expr.as_deref(),
+            prompt,
+            max_runs,
+            expires_at,
+            archive_on_finish,
+        ) {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "update_schedule_failed", e)),
+        },
+        WireMessage::PauseSchedule {
+            request_id,
+            schedule_id,
+        } => match runtime
+            .scheduler
+            .set_schedule_status(&schedule_id, ScheduleStatus::Paused)
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "pause_schedule_failed", e)),
+        },
+        WireMessage::ResumeSchedule {
+            request_id,
+            schedule_id,
+        } => match runtime
+            .scheduler
+            .set_schedule_status(&schedule_id, ScheduleStatus::Active)
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "resume_schedule_failed", e)),
+        },
+        WireMessage::RunScheduleOnce {
+            request_id,
+            schedule_id,
+        } => {
+            let scheduler = runtime.scheduler.clone();
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match scheduler.run_once(&schedule_id).await {
+                    Ok(_) => WireMessage::Ack { request_id },
+                    Err(e) => rpc_err(request_id, "run_schedule_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteSchedule {
+            request_id,
+            schedule_id,
+        } => match runtime.scheduler.delete_schedule(&schedule_id) {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "delete_schedule_failed", e)),
+        },
+        WireMessage::ListScheduleRuns {
+            request_id,
+            schedule_id,
+            limit,
+        } => match runtime
+            .store
+            .list_schedule_runs(&schedule_id, limit.unwrap_or(50) as usize)
+        {
+            Ok(runs) => Some(WireMessage::ScheduleRunsSnapshot {
+                request_id,
+                schedule_id,
+                runs,
+            }),
+            Err(e) => Some(rpc_err(request_id, "store_error", e)),
+        },
+
+        // Daemon-to-Daemon Connected Hosts
+        WireMessage::ListConnectedHosts { request_id } => {
+            let hosts = runtime.connected_hosts.list_summaries().await;
+            Some(WireMessage::ConnectedHostsSnapshot { request_id, hosts })
+        }
+        WireMessage::AddConnectedHost {
+            request_id,
+            label,
+            pairing_uri,
+        } => match runtime
+            .connected_hosts
+            .add_from_pairing_uri(label, &pairing_uri)
+            .await
+        {
+            Ok(host) => Some(WireMessage::ConnectedHostAdded { request_id, host }),
+            Err(e) => Some(rpc_err(request_id, "add_connected_host_failed", e)),
+        },
+        WireMessage::UpdateConnectedHost {
+            request_id,
+            registration_id,
+            label,
+            enabled,
+        } => match runtime
+            .connected_hosts
+            .update_registration(&registration_id, label, enabled)
+            .await
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "update_connected_host_failed", e)),
+        },
+        WireMessage::RemoveConnectedHost {
+            request_id,
+            registration_id,
+        } => match runtime
+            .connected_hosts
+            .remove_registration(&registration_id)
+            .await
+        {
+            Ok(_) => {
+                let _ = runtime
+                    .orchestrator
+                    .broadcast_tx
+                    .send(DaemonBroadcast::ConnectedHostRemoved(registration_id));
+                Some(WireMessage::Ack { request_id })
+            }
+            Err(e) => Some(rpc_err(request_id, "remove_connected_host_failed", e)),
+        },
+
+        // Host Orchestration Config & Bundled Skills
+        WireMessage::GetOrchestrationConfig { request_id } => {
+            let config = runtime.orch_config.read().await.clone();
+            Some(WireMessage::OrchestrationConfigSnapshot { request_id, config })
+        }
+        WireMessage::UpdateOrchestrationConfig { request_id, config } => {
+            *runtime.orch_config.write().await = config.clone();
+            let mut persisted = DaemonPersistedConfig::load(&runtime.home_dir);
+            persisted.orchestration = config.clone();
+            match persisted.save(&runtime.home_dir) {
+                Ok(()) => Some(WireMessage::OrchestrationConfigSnapshot { request_id, config }),
+                Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
+            }
+        }
+        WireMessage::ListOrchestrationSkills { request_id } => {
+            let user_home = resolve_user_home();
+            let skills = crate::skills::inspect_orchestration_skills(&user_home);
+            Some(WireMessage::OrchestrationSkillsSnapshot { request_id, skills })
+        }
+        WireMessage::SyncOrchestrationSkills {
+            request_id,
+            skill_ids,
+        } => {
+            let user_home = resolve_user_home();
+            match crate::skills::sync_orchestration_skills(&user_home, &skill_ids) {
+                Ok(skills) => {
+                    {
+                        let mut cfg = runtime.orch_config.write().await;
+                        cfg.installed_skills = skill_ids;
+                        let mut persisted = DaemonPersistedConfig::load(&runtime.home_dir);
+                        persisted.orchestration = cfg.clone();
+                        let _ = persisted.save(&runtime.home_dir);
+                    }
+                    Some(WireMessage::OrchestrationSkillsSnapshot { request_id, skills })
+                }
+                Err(e) => Some(rpc_err(request_id, "sync_skills_failed", e)),
+            }
+        }
+
+        // Provider-Native Subagent Observability
+        WireMessage::ListProviderSubagents {
+            request_id,
+            parent_agent_id,
+        } => match runtime.store.list_provider_subagents(&parent_agent_id) {
+            Ok(subagents) => Some(WireMessage::ProviderSubagentsSnapshot {
+                request_id,
+                parent_agent_id,
+                subagents,
+            }),
+            Err(e) => Some(rpc_err(request_id, "store_error", e)),
+        },
+        WireMessage::SubscribeProviderSubagent {
+            request_id,
+            parent_agent_id,
+            subagent_id,
+            since_seq,
+        } => {
+            subscribed_provider_subagents.insert((parent_agent_id.clone(), subagent_id.clone()));
+            match runtime.store.fetch_provider_subagent_events_since(
+                &parent_agent_id,
+                &subagent_id,
+                since_seq,
+                1000,
+            ) {
+                Ok((events, has_more)) => Some(WireMessage::ProviderSubagentTimelineCatchup {
+                    request_id,
+                    parent_agent_id,
+                    subagent_id,
+                    events,
+                    has_more,
+                }),
+                Err(e) => Some(rpc_err(request_id, "store_error", e)),
+            }
+        }
 
         // Quotas & Provider Model Catalogs (spawned off-loop so slow CLI probes never block RPC or PTY!)
         WireMessage::RefreshQuotas { request_id } => {
@@ -1365,6 +2248,13 @@ async fn handle_wire_rpc(
         }
         _ => None,
     }
+}
+
+fn hash_payload(val: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(val.to_string().as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub(crate) fn expand_host_path(raw: &str) -> PathBuf {

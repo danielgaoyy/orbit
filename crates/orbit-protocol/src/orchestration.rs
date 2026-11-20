@@ -1,0 +1,416 @@
+//! Orchestration domain models for multi-agent delegation, durable finish watches,
+//! agent profiles, cron schedules & heartbeats, worktree scripts/services, connected hosts,
+//! and provider-native subagent observability.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::{ProviderKind, ReasoningEffort, SessionMode, TimelinePayload, ToolCallDetail};
+
+/// Daemon-owned unread/attention indicator for an agent session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionState {
+    #[default]
+    None,
+    Finished,
+    Error,
+    Permission,
+}
+
+/// How an incoming prompt should be delivered when the target agent already has an active turn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveTurnBehavior {
+    /// Steer the running turn in-place when supported; otherwise deliver immediately on turn settle.
+    #[default]
+    Steer,
+    /// Queue strictly in FIFO order until the current turn transitions to `Idle`.
+    Queue,
+    /// Interrupt the current turn, await termination, then dispatch the new prompt.
+    Interrupt,
+}
+
+/// Isolation mode when creating a workspace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceIsolation {
+    #[default]
+    Local,
+    Worktree,
+}
+
+/// Strategy for creating a git worktree-backed workspace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeCreateMode {
+    #[default]
+    BranchOff,
+    CheckoutBranch,
+    CheckoutPr,
+}
+
+/// Lifecycle state of workspace `orbit.json` / `paseo.json` setup hooks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSetupStatus {
+    #[default]
+    Idle,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// Origin category for non-human agent timeline messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessageKind {
+    DirectMessage,
+    FinishNotification,
+    Heartbeat,
+}
+
+/// Inline actionable permission metadata embedded in a child-to-parent permission checkpoint notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionCheckpointRef {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    pub request_id: String,
+    pub title: String,
+    pub detail: ToolCallDetail,
+    pub allowed_decisions: Vec<String>,
+}
+
+/// Summary of a currently pending permission approval across managed agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPermissionSummary {
+    pub agent_id: String,
+    pub agent_title: String,
+    pub workspace_id: String,
+    pub request_id: String,
+    pub title: String,
+    pub detail: ToolCallDetail,
+    pub allowed_decisions: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Lifecycle state of a provider-owned native subagent (Claude Task, Codex collab thread, AGY subagent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSubagentStatus {
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+/// Read-only descriptor for a provider-native subagent surfaced in the parent's Subagents Track.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSubagentDescriptor {
+    pub subagent_id: String,
+    pub parent_agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_subagent_id: Option<String>,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    pub status: ProviderSubagentStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Sequenced read-only timeline entry belonging to a provider-native subagent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderSubagentEvent {
+    pub seq: u64,
+    pub parent_agent_id: String,
+    pub subagent_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub payload: TimelinePayload,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_resume_prompt() -> String {
+    "Resume working.".to_string()
+}
+
+/// Per-profile MCP tool catalog policy (e.g., disallow worker profiles from spawning recursive subagents).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolPolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+impl Default for McpToolPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            disabled_tools: Vec::new(),
+        }
+    }
+}
+
+/// Reusable host-scoped Agent Profile with specialization guidance (`when_to_use`) for orchestrators.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentProfile {
+    pub profile_id: String,
+    pub name: String,
+    pub provider: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    pub mode: SessionMode,
+    #[serde(default)]
+    pub when_to_use: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_append: Option<String>,
+    #[serde(default)]
+    pub mcp_policy: McpToolPolicy,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Host-level orchestration & lifecycle runtime settings persisted in `$ORBIT_HOME/config.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationConfig {
+    /// Inject Orbit's built-in MCP tool server into launched agents (default: `true`).
+    #[serde(default = "default_true")]
+    pub mcp_inject_enabled: bool,
+    /// Collect idle resumable provider runtimes after `idle_timeout_secs` (default: `true`).
+    #[serde(default = "default_true")]
+    pub idle_cleanup_enabled: bool,
+    /// Inactivity window before idle runtime collection (default: 3600s / 1 hour).
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// Automatically reopen agents that were `Running` before a daemon restart (default: `false`).
+    #[serde(default)]
+    pub resume_on_startup: bool,
+    /// Continuation prompt sent on startup recovery (default: `"Resume working."`).
+    #[serde(default = "default_resume_prompt")]
+    pub resume_prompt: String,
+    /// IDs of bundled orchestration skills synced to local agent skill directories.
+    #[serde(default)]
+    pub installed_skills: Vec<String>,
+}
+
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            mcp_inject_enabled: true,
+            idle_cleanup_enabled: true,
+            idle_timeout_secs: default_idle_timeout_secs(),
+            resume_on_startup: false,
+            resume_prompt: default_resume_prompt(),
+            installed_skills: Vec::new(),
+        }
+    }
+}
+
+/// Status projection of a bundled Orbit orchestration skill on a host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationSkillInfo {
+    pub id: String,
+    pub name: String,
+    pub slash_command: String,
+    pub description: String,
+    pub installed: bool,
+    #[serde(default)]
+    pub installed_targets: Vec<String>,
+    #[serde(default)]
+    pub outdated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleKind {
+    Schedule,
+    Heartbeat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleStatus {
+    Active,
+    Paused,
+    Completed,
+}
+
+/// Configuration for a Cron Schedule that launches a fresh agent on every trigger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleNewAgentConfig {
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub provider: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+    pub mode: SessionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default = "default_true")]
+    pub archive_on_finish: bool,
+    #[serde(default)]
+    pub background: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ScheduleTarget {
+    NewAgent(ScheduleNewAgentConfig),
+    ExistingAgent { agent_id: String },
+}
+
+/// Persisted Cron Schedule or Heartbeat definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleSpec {
+    pub schedule_id: String,
+    pub kind: ScheduleKind,
+    pub name: String,
+    pub cron_expr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    pub prompt: String,
+    pub status: ScheduleStatus,
+    pub target: ScheduleTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u32>,
+    #[serde(default)]
+    pub run_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_agent: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+/// Execution log record for a single trigger of a Schedule or Heartbeat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleRunRecord {
+    pub run_id: String,
+    pub schedule_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    pub status: ScheduleRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectedHostStatus {
+    Disabled,
+    Connecting,
+    Online,
+    Error,
+}
+
+/// Safe projection of a Daemon-owned outbound Connected Host (for cross-host orchestration).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectedHostSummary {
+    pub registration_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    pub label: String,
+    pub daemon_pubkey_b64: String,
+    #[serde(default)]
+    pub direct_endpoints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    pub enabled: bool,
+    pub status: ConnectedHostStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub available_providers: Vec<ProviderKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_version: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceScriptKind {
+    Command,
+    Service,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceScriptStatus {
+    Stopped,
+    Running,
+    Failed,
+}
+
+/// Configured script or long-running service parsed from `orbit.json` / `paseo.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceScriptInfo {
+    pub workspace_id: String,
+    pub name: String,
+    pub command: String,
+    pub kind: WorkspaceScriptKind,
+    pub status: WorkspaceScriptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Real-time setup hook progress event for worktree workspaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSetupProgress {
+    pub workspace_id: String,
+    pub status: WorkspaceSetupStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    pub step_index: u32,
+    pub total_steps: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}

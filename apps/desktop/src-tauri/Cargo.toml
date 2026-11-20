@@ -1,6 +1,6 @@
 [package]
 name = "orbit-desktop"
-version = "0.3.7"
+version = "0.4.0"
 description = "Orbit Multi-Host AI Coding Agent Desktop Control Plane (macOS & Linux)"
 edition = "2024"
 license = "MIT OR Apache-2.0"

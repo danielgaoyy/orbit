@@ -2,16 +2,26 @@
 //!
 //! Replaces Paseo's scattered JSON files with ACID event-sourced timelines and `< 1ms` cursor catch-up.
 
+pub mod orchestration;
+pub use orchestration::*;
+
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, AgentSummary, ProviderKind, ReasoningEffort, SessionMode, TerminalSummary,
-    TimelineEvent, TimelinePayload, WorkspaceSummary,
+    AgentStatus, AgentSummary, AttentionState, ProviderKind, ReasoningEffort, SessionMode,
+    TerminalSummary, TimelineEvent, TimelinePayload, WorkspaceSetupStatus, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+
+pub(crate) const AGENT_SELECT_COLS: &str =
+    "agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
+    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
+    parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
+    attention_state, last_activity_at, timeline_epoch";
 
 /// Extra host configuration metadata persisted alongside `StoredHostProfile`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -220,6 +230,7 @@ impl OrbitStore {
             );
             let _ = conn.execute_batch("PRAGMA user_version = 2;");
         }
+        orchestration::migrate_orchestration_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -227,16 +238,28 @@ impl OrbitStore {
 
     pub fn upsert_workspace(&self, ws: &WorkspaceSummary) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let setup_status_str = serde_json::to_string(&ws.setup_status)?
+            .trim_matches('"')
+            .to_string();
         conn.execute(
             "
-            INSERT INTO workspaces (workspace_id, title, cwd, git_branch, is_worktree, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            INSERT INTO workspaces (
+                workspace_id, title, cwd, git_branch, is_worktree, updated_at,
+                source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(workspace_id) DO UPDATE SET
                 title = excluded.title,
                 cwd = excluded.cwd,
                 git_branch = excluded.git_branch,
                 is_worktree = excluded.is_worktree,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                source_cwd = COALESCE(excluded.source_cwd, workspaces.source_cwd),
+                base_ref = COALESCE(excluded.base_ref, workspaces.base_ref),
+                parent_workspace_id = COALESCE(excluded.parent_workspace_id, workspaces.parent_workspace_id),
+                archived_at = excluded.archived_at,
+                background = excluded.background,
+                setup_status = excluded.setup_status
             ",
             params![
                 ws.workspace_id,
@@ -245,6 +268,12 @@ impl OrbitStore {
                 ws.git_branch,
                 i32::from(ws.is_worktree),
                 ws.updated_at.to_rfc3339(),
+                ws.source_cwd,
+                ws.base_ref,
+                ws.parent_workspace_id,
+                ws.archived_at.map(|t| t.to_rfc3339()),
+                i32::from(ws.background),
+                setup_status_str,
             ],
         )?;
         Ok(())
@@ -253,43 +282,18 @@ impl OrbitStore {
     pub fn find_workspace_by_cwd(&self, cwd: &str) -> Result<Option<WorkspaceSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
-            "SELECT workspace_id, title, cwd, git_branch, is_worktree, updated_at
-             FROM workspaces WHERE cwd = ?1 LIMIT 1",
+            "SELECT workspace_id, title, cwd, git_branch, is_worktree, updated_at,
+                    source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status
+             FROM workspaces WHERE cwd = ?1 AND archived_at IS NULL LIMIT 1",
             params![cwd],
-            |row| {
-                let ts: String = row.get(5)?;
-                Ok(WorkspaceSummary {
-                    workspace_id: row.get(0)?,
-                    title: row.get(1)?,
-                    cwd: row.get(2)?,
-                    git_branch: row.get(3)?,
-                    is_worktree: row.get::<_, i32>(4)? != 0,
-                    updated_at: parse_ts(&ts),
-                })
-            },
+            map_workspace_row,
         )
         .optional()
         .map_err(Into::into)
     }
 
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceSummary>, StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let mut stmt = conn.prepare(
-            "SELECT workspace_id, title, cwd, git_branch, is_worktree, updated_at
-             FROM workspaces ORDER BY updated_at DESC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let ts: String = row.get(5)?;
-            Ok(WorkspaceSummary {
-                workspace_id: row.get(0)?,
-                title: row.get(1)?,
-                cwd: row.get(2)?,
-                git_branch: row.get(3)?,
-                is_worktree: row.get::<_, i32>(4)? != 0,
-                updated_at: parse_ts(&ts),
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        self.list_workspaces_filtered(false, false)
     }
 
     pub fn upsert_agent(
@@ -306,24 +310,39 @@ impl OrbitStore {
             .transpose()?;
         let mode_json = serde_json::to_string(&agent.mode)?;
         let status_json = serde_json::to_string(&agent.status)?;
+        let labels_json = serde_json::to_string(&agent.labels)?;
+        let attention_str = serde_json::to_string(&agent.attention)?
+            .trim_matches('"')
+            .to_string();
 
         conn.execute(
             "
             INSERT INTO agents (
                 agent_id, workspace_id, cwd, title, provider_json, model, effort_json,
-                mode_json, status_json, parent_agent_id, persistence_ref,
-                latest_seq, created_at, updated_at
+                mode_json, status_json, parent_agent_id, parent_host_id, persistence_ref,
+                latest_seq, timeline_epoch, created_at, updated_at, archived_at, background, auto_archive,
+                profile_id, labels_json, attention_state, last_activity_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
             ON CONFLICT(agent_id) DO UPDATE SET
                 title = excluded.title,
                 model = excluded.model,
                 effort_json = excluded.effort_json,
                 mode_json = excluded.mode_json,
                 status_json = excluded.status_json,
+                parent_agent_id = excluded.parent_agent_id,
+                parent_host_id = excluded.parent_host_id,
                 persistence_ref = COALESCE(excluded.persistence_ref, agents.persistence_ref),
                 latest_seq = MAX(agents.latest_seq, excluded.latest_seq),
-                updated_at = excluded.updated_at
+                timeline_epoch = MAX(agents.timeline_epoch, excluded.timeline_epoch),
+                updated_at = excluded.updated_at,
+                archived_at = excluded.archived_at,
+                background = excluded.background,
+                auto_archive = excluded.auto_archive,
+                profile_id = COALESCE(excluded.profile_id, agents.profile_id),
+                labels_json = excluded.labels_json,
+                attention_state = excluded.attention_state,
+                last_activity_at = COALESCE(excluded.last_activity_at, agents.last_activity_at)
             ",
             params![
                 agent.agent_id,
@@ -336,10 +355,19 @@ impl OrbitStore {
                 mode_json,
                 status_json,
                 agent.parent_agent_id,
+                agent.parent_host_id,
                 persistence_ref,
                 agent.latest_seq as i64,
+                agent.timeline_epoch as i64,
                 agent.created_at.to_rfc3339(),
                 agent.updated_at.to_rfc3339(),
+                agent.archived_at.map(|t| t.to_rfc3339()),
+                i32::from(agent.background),
+                i32::from(agent.auto_archive),
+                agent.profile_id,
+                labels_json,
+                attention_str,
+                agent.last_activity_at.map(|t| t.to_rfc3339()),
             ],
         )?;
         Ok(())
@@ -347,16 +375,10 @@ impl OrbitStore {
 
     pub fn get_agent(&self, agent_id: &str) -> Result<Option<AgentSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.query_row(
-            "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
-                    timeline_epoch
-             FROM agents WHERE agent_id = ?1",
-            params![agent_id],
-            map_agent_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        let sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
+        conn.query_row(&sql, params![agent_id], map_agent_row)
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn update_agent_mode(&self, agent_id: &str, mode: &SessionMode) -> Result<(), StoreError> {
@@ -441,28 +463,7 @@ impl OrbitStore {
     }
 
     pub fn list_agents(&self, workspace_id: Option<&str>) -> Result<Vec<AgentSummary>, StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let sql = if workspace_id.is_some() {
-            "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
-                    timeline_epoch
-             FROM agents WHERE workspace_id = ?1 ORDER BY updated_at DESC"
-        } else {
-            "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                    status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
-                    timeline_epoch
-             FROM agents ORDER BY updated_at DESC"
-        };
-
-        let mut stmt = conn.prepare(sql)?;
-        let rows = if let Some(ws_id) = workspace_id {
-            stmt.query_map(params![ws_id], map_agent_row)?
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map([], map_agent_row)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(rows)
+        self.list_agents_filtered(workspace_id, false, false, None)
     }
 
     /// Atomically append a timeline event, supersede prior partial streaming chunks with the same
@@ -1024,15 +1025,9 @@ impl OrbitStore {
             return Ok(None);
         }
 
+        let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
         let agent = tx
-            .query_row(
-                "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                        status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
-                        timeline_epoch
-                 FROM agents WHERE agent_id = ?1",
-                params![agent_id],
-                map_agent_row,
-            )
+            .query_row(&select_sql, params![agent_id], map_agent_row)
             .optional()?;
         let Some(agent) = agent else {
             return Ok(None);
@@ -1332,23 +1327,27 @@ fn query_coalesce_boundary_seq(
             "SELECT COALESCE(MAX(seq), 0) FROM {table}
              WHERE agent_id = ?1 AND seq < ?2
                AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
+                    OR payload_json LIKE '%\"type\":\"agent_message\"%'
                     OR payload_json LIKE '%\"type\":\"tool_call\"%')"
         ),
         (true, false) => format!(
             "SELECT COALESCE(MAX(seq), 0) FROM {table}
              WHERE agent_id = ?1
                AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
+                    OR payload_json LIKE '%\"type\":\"agent_message\"%'
                     OR payload_json LIKE '%\"type\":\"tool_call\"%')"
         ),
         (false, true) => format!(
             "SELECT COALESCE(MAX(seq), 0) FROM {table}
              WHERE agent_id = ?1 AND seq < ?2
-               AND payload_json LIKE '%\"type\":\"user_prompt\"%'"
+               AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
+                    OR payload_json LIKE '%\"type\":\"agent_message\"%')"
         ),
         (false, false) => format!(
             "SELECT COALESCE(MAX(seq), 0) FROM {table}
              WHERE agent_id = ?1
-               AND payload_json LIKE '%\"type\":\"user_prompt\"%'"
+               AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
+                    OR payload_json LIKE '%\"type\":\"agent_message\"%')"
         ),
     };
 
@@ -1378,14 +1377,48 @@ fn coalesce_identity(payload: &TimelinePayload) -> Option<(&'static str, &str)> 
     }
 }
 
-fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
+pub(crate) fn map_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceSummary> {
+    let ts: String = row.get(5)?;
+    let archived_opt: Option<String> = row.get(9)?;
+    let setup_s: String = row.get(11)?;
+    let setup_status = match setup_s.as_str() {
+        "running" => WorkspaceSetupStatus::Running,
+        "succeeded" => WorkspaceSetupStatus::Succeeded,
+        "failed" => WorkspaceSetupStatus::Failed,
+        _ => WorkspaceSetupStatus::Idle,
+    };
+    Ok(WorkspaceSummary {
+        workspace_id: row.get(0)?,
+        title: row.get(1)?,
+        cwd: row.get(2)?,
+        git_branch: row.get(3)?,
+        is_worktree: row.get::<_, i32>(4)? != 0,
+        updated_at: parse_ts(&ts),
+        source_cwd: row.get(6)?,
+        base_ref: row.get(7)?,
+        parent_workspace_id: row.get(8)?,
+        archived_at: archived_opt.as_deref().map(parse_ts),
+        background: row.get::<_, i32>(10)? != 0,
+        setup_status,
+    })
+}
+
+pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
     let provider_str: String = row.get(4)?;
     let mode_str: String = row.get(6)?;
     let status_str: String = row.get(7)?;
     let created_str: String = row.get(10)?;
     let updated_str: String = row.get(11)?;
     let effort_opt_str: Option<String> = row.get(12)?;
-    let timeline_epoch: u64 = row.get::<_, i64>(13).unwrap_or(0).max(0) as u64;
+    let parent_host_id: Option<String> = row.get(13)?;
+    let archived_opt: Option<String> = row.get(14)?;
+    let background: bool = row.get::<_, i32>(15)? != 0;
+    let auto_archive: bool = row.get::<_, i32>(16)? != 0;
+    let profile_id: Option<String> = row.get(17)?;
+    let labels_str: String = row.get(18)?;
+    let attention_str: String = row.get(19)?;
+    let last_activity_opt: Option<String> = row.get(20)?;
+    let timeline_epoch: u64 = row.get::<_, i64>(21).unwrap_or(0).max(0) as u64;
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
@@ -1394,6 +1427,13 @@ fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
         .and_then(|s| serde_json::from_str(s).ok());
     let mode: SessionMode = serde_json::from_str(&mode_str).unwrap_or(SessionMode::Default);
     let status: AgentStatus = serde_json::from_str(&status_str).unwrap_or(AgentStatus::Closed);
+    let labels: HashMap<String, String> = serde_json::from_str(&labels_str).unwrap_or_default();
+    let attention = match attention_str.as_str() {
+        "finished" => AttentionState::Finished,
+        "error" => AttentionState::Error,
+        "permission" => AttentionState::Permission,
+        _ => AttentionState::None,
+    };
 
     Ok(AgentSummary {
         agent_id: row.get(0)?,
@@ -1406,14 +1446,22 @@ fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
         mode,
         status,
         parent_agent_id: row.get(8)?,
+        parent_host_id,
         latest_seq: row.get::<_, i64>(9)? as u64,
         timeline_epoch,
         created_at: parse_ts(&created_str),
         updated_at: parse_ts(&updated_str),
+        archived_at: archived_opt.as_deref().map(parse_ts),
+        background,
+        auto_archive,
+        profile_id,
+        labels,
+        attention,
+        last_activity_at: last_activity_opt.as_deref().map(parse_ts),
     })
 }
 
-fn parse_ts(s: &str) -> DateTime<Utc> {
+pub(crate) fn parse_ts(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
@@ -1436,6 +1484,12 @@ mod tests {
                 git_branch: Some("main".into()),
                 is_worktree: false,
                 updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
             })
             .expect("upsert ws");
 
@@ -1452,10 +1506,18 @@ mod tests {
                     mode: SessionMode::AcceptEdits,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 0,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
                 },
                 Some("session_abc"),
             )
@@ -1507,6 +1569,198 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_tables_soft_archive_detach_and_receipts() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        let ws = WorkspaceSummary {
+            workspace_id: "ws_orch".into(),
+            title: "orch".into(),
+            cwd: "/tmp/orch".into(),
+            git_branch: Some("feat/orch".into()),
+            is_worktree: true,
+            updated_at: now,
+            source_cwd: Some("/tmp/src".into()),
+            base_ref: Some("origin/main".into()),
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: WorkspaceSetupStatus::Idle,
+        };
+        store.upsert_workspace(&ws).expect("upsert ws");
+
+        let mut parent = AgentSummary {
+            agent_id: "ag_parent".into(),
+            workspace_id: "ws_orch".into(),
+            cwd: "/tmp/orch".into(),
+            title: "Parent Lead".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("claude-opus".into()),
+            effort: Some(ReasoningEffort::High),
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Running {
+                turn_id: "t1".into(),
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::Finished,
+            last_activity_at: Some(now),
+        };
+        store.upsert_agent(&parent, Some("ref_p")).expect("parent");
+
+        let mut child = parent.clone();
+        child.agent_id = "ag_child".into();
+        child.title = "Child Worker".into();
+        child.parent_agent_id = Some("ag_parent".into());
+        child
+            .labels
+            .insert("orbit.open_tab.desktop".into(), "true".into());
+        store.upsert_agent(&child, Some("ref_c")).expect("child");
+
+        // Detach strips parent & open_tab labels
+        store.detach_agent("ag_child").expect("detach");
+        let detached = store.get_agent("ag_child").expect("get").expect("some");
+        assert!(detached.parent_agent_id.is_none());
+        assert!(!detached.labels.contains_key("orbit.open_tab.desktop"));
+
+        // Soft archive normalizes running -> closed, hides from default list, and preserves events
+        store.archive_agent_soft("ag_parent").expect("soft archive");
+        let archived = store.get_agent("ag_parent").expect("get").expect("some");
+        assert!(archived.archived_at.is_some());
+        assert_eq!(archived.status, AgentStatus::Closed);
+        assert_eq!(archived.attention, AttentionState::None);
+        assert_eq!(store.list_agents(None).expect("active").len(), 1);
+        assert_eq!(
+            store
+                .list_agents_filtered(None, true, true, None)
+                .expect("all")
+                .len(),
+            2
+        );
+        store.unarchive_agent("ag_parent").expect("unarchive");
+        assert_eq!(store.list_agents(None).expect("active again").len(), 2);
+
+        // Finish subscriptions
+        let sub = StoredFinishSubscription {
+            id: "fs_1".into(),
+            caller_agent_id: "ag_parent".into(),
+            child_agent_id: "ag_child".into(),
+            target_host_id: Some("host_b".into()),
+            require_parent_owner: true,
+            delivered_perm_ids: Vec::new(),
+            created_at: now,
+        };
+        store.upsert_finish_subscription(&sub).expect("upsert sub");
+        assert!(
+            store
+                .has_finish_subscriptions_for_caller("ag_parent")
+                .expect("has sub")
+        );
+        store
+            .mark_finish_subscription_perm_delivered("fs_1", "perm_42")
+            .expect("mark perm");
+        let subs = store.list_finish_subscriptions().expect("list subs");
+        assert_eq!(subs[0].delivered_perm_ids, vec!["perm_42".to_string()]);
+
+        // Profiles
+        let profile = orbit_protocol::AgentProfile {
+            profile_id: "prof_rev".into(),
+            name: "Independent Reviewer".into(),
+            provider: ProviderKind::Codex,
+            model: Some("gpt-5.4".into()),
+            effort: Some(ReasoningEffort::Xhigh),
+            mode: SessionMode::Plan,
+            when_to_use: "Review diffs independently without editing files".into(),
+            system_prompt_append: Some("Never edit files.".into()),
+            mcp_policy: orbit_protocol::McpToolPolicy {
+                enabled: true,
+                disabled_tools: vec!["create_agent".into()],
+            },
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_profile(&profile).expect("upsert profile");
+        assert_eq!(
+            store
+                .get_profile_by_name("independent reviewer")
+                .expect("by name")
+                .expect("found")
+                .profile_id,
+            "prof_rev"
+        );
+
+        // Idempotency receipts
+        assert_eq!(
+            store
+                .check_or_reserve_receipt("create_agent", "k1", "hash_a")
+                .expect("reserve"),
+            ReceiptOutcome::Reserved
+        );
+        assert_eq!(
+            store
+                .check_or_reserve_receipt("create_agent", "k1", "hash_b")
+                .expect("conflict"),
+            ReceiptOutcome::Conflict
+        );
+        assert_eq!(
+            store
+                .check_or_reserve_receipt("create_agent", "k1", "hash_a")
+                .expect("pending"),
+            ReceiptOutcome::PendingInFlight
+        );
+        store
+            .commit_receipt("create_agent", "k1", "{\"agent_id\":\"ag_99\"}")
+            .expect("commit");
+        assert_eq!(
+            store
+                .check_or_reserve_receipt("create_agent", "k1", "hash_a")
+                .expect("committed"),
+            ReceiptOutcome::Committed("{\"agent_id\":\"ag_99\"}".into())
+        );
+
+        // Provider subagents
+        let psub = orbit_protocol::ProviderSubagentDescriptor {
+            subagent_id: "task_1".into(),
+            parent_agent_id: "ag_parent".into(),
+            parent_subagent_id: None,
+            title: "Codebase Explorer".into(),
+            subtitle: Some("Claude Sonnet · high".into()),
+            status: orbit_protocol::ProviderSubagentStatus::Running,
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_provider_subagent(&psub).expect("upsert psub");
+        let ev = store
+            .append_provider_subagent_event(
+                "ag_parent",
+                "task_1",
+                TimelinePayload::AssistantMessage {
+                    item_id: "m1".into(),
+                    text: "Scanning files...".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append psub ev");
+        let (evs, more) = store
+            .fetch_provider_subagent_events_since("ag_parent", "task_1", 0, 50)
+            .expect("fetch psub");
+        assert!(!more);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].seq, ev.seq);
+
+        parent.title = "Updated".into();
+        let _ = parent;
+    }
+
+    #[test]
     fn rewind_timeline_truncates_events_checkpoints_and_clears_persistence_ref() {
         let store = OrbitStore::open_in_memory().expect("open store");
         let now = Utc::now();
@@ -1519,6 +1773,12 @@ mod tests {
                 git_branch: Some("main".into()),
                 is_worktree: false,
                 updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
             })
             .expect("upsert ws");
 
@@ -1535,10 +1795,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 0,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
                 },
                 Some("prov_sess_1"),
             )
@@ -1655,6 +1923,12 @@ mod tests {
                 git_branch: None,
                 is_worktree: false,
                 updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
             })
             .expect("ws");
         store
@@ -1670,10 +1944,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 0,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
                 },
                 None,
             )
@@ -1722,6 +2004,12 @@ mod tests {
                 git_branch: None,
                 is_worktree: false,
                 updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
             })
             .expect("ws");
         store
@@ -1737,10 +2025,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 0,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
                 },
                 None,
             )

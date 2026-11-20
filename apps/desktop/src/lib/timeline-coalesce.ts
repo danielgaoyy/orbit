@@ -85,6 +85,7 @@ export interface StageTurn {
   turnIndex: number;
   anchorSeq: number;
   userPrompt: Extract<TimelineItemView, { item_type: "user_prompt" }> | null;
+  agentMessage: Extract<TimelineItemView, { item_type: "agent_message" }> | null;
   isCompactionCommand: boolean;
   /** Intermediate steps prior to `terminalReply` (all thinking, tool calls, resolved gates, and interim notes). */
   foldedSteps: TimelineItemView[];
@@ -1177,6 +1178,7 @@ function buildLiveSegments(
 interface CachedTurnEntry {
   turnIndex: number;
   userPrompt: Extract<TimelineItemView, { item_type: "user_prompt" }> | null;
+  agentMessage: Extract<TimelineItemView, { item_type: "agent_message" }> | null;
   bodyItems: TimelineItemView[];
   turn: StageTurn;
 }
@@ -1243,23 +1245,29 @@ function computeThoughtDurationFromTimestamps(
 function finalizeTurn(
   turnIndex: number,
   userPrompt: Extract<TimelineItemView, { item_type: "user_prompt" }> | null,
+  agentMessage: Extract<TimelineItemView, { item_type: "agent_message" }> | null,
   bodyItems: TimelineItemView[],
 ): StageTurn {
-  const cacheAnchor: TimelineItemView | undefined = userPrompt ?? bodyItems[0];
+  const cacheAnchor: TimelineItemView | undefined = userPrompt ?? agentMessage ?? bodyItems[0];
   if (cacheAnchor) {
     const cached = turnMemoCache.get(cacheAnchor);
     if (
       cached &&
       cached.turnIndex === turnIndex &&
       cached.userPrompt === userPrompt &&
+      cached.agentMessage === agentMessage &&
       shallowItemsEqual(cached.bodyItems, bodyItems)
     ) {
       return cached.turn;
     }
   }
 
-  const anchorSeq = userPrompt?.seq ?? bodyItems[0]?.seq ?? turnIndex;
-  const key = userPrompt ? `turn-${userPrompt.message_id}` : `turn-init-${anchorSeq}`;
+  const anchorSeq = userPrompt?.seq ?? agentMessage?.seq ?? bodyItems[0]?.seq ?? turnIndex;
+  const key = userPrompt
+    ? `turn-${userPrompt.message_id}`
+    : agentMessage
+      ? `turn-am-${agentMessage.message_id}`
+      : `turn-init-${anchorSeq}`;
   const isCompactionCommand = Boolean(
     userPrompt &&
       (/^\s*\/compact\b/i.test(userPrompt.text.trim()) ||
@@ -1404,6 +1412,7 @@ function finalizeTurn(
     turnIndex,
     anchorSeq,
     userPrompt,
+    agentMessage,
     isCompactionCommand,
     foldedSteps,
     workCounts: summary.counts,
@@ -1430,6 +1439,7 @@ function finalizeTurn(
     turnMemoCache.set(cacheAnchor, {
       turnIndex,
       userPrompt,
+      agentMessage,
       bodyItems: [...bodyItems],
       turn,
     });
@@ -1519,13 +1529,15 @@ export function processTimelineForStage(
   const sessionTurnDiffs: DiffFileView[] = [];
 
   let currentPrompt: Extract<TimelineItemView, { item_type: "user_prompt" }> | null = null;
+  let currentAgentMessage: Extract<TimelineItemView, { item_type: "agent_message" }> | null = null;
   let currentBody: TimelineItemView[] = [];
   let hasOpenTurn = false;
 
   const flushTurn = () => {
     if (!hasOpenTurn) return;
-    turns.push(finalizeTurn(turns.length, currentPrompt, currentBody));
+    turns.push(finalizeTurn(turns.length, currentPrompt, currentAgentMessage, currentBody));
     currentPrompt = null;
+    currentAgentMessage = null;
     currentBody = [];
     hasOpenTurn = false;
   };
@@ -1551,6 +1563,16 @@ export function processTimelineForStage(
     if (item.item_type === "user_prompt") {
       flushTurn();
       currentPrompt = item;
+      currentAgentMessage = null;
+      currentBody = [];
+      hasOpenTurn = true;
+      continue;
+    }
+
+    if (item.item_type === "agent_message") {
+      flushTurn();
+      currentPrompt = null;
+      currentAgentMessage = item;
       currentBody = [];
       hasOpenTurn = true;
       continue;
@@ -1559,6 +1581,7 @@ export function processTimelineForStage(
     if (!hasOpenTurn) {
       hasOpenTurn = true;
       currentPrompt = null;
+      currentAgentMessage = null;
     }
     currentBody.push(item);
   }

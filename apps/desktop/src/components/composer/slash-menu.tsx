@@ -5,14 +5,18 @@ import {
   FolderTree,
   GitCompareArrows,
   Globe,
+  Layers,
   ListTodo,
   MessageCircleQuestion,
+  Send,
   Settings,
   Shield,
   ShieldCheck,
   ShieldOff,
+  Sparkles,
   SquarePen,
   SquareTerminal,
+  Users,
   type LucideIcon,
 } from "lucide-react";
 import { modSymbol } from "@/lib/keybindings";
@@ -31,6 +35,10 @@ export type SlashCommandId =
   | "files"
   | "browser"
   | "compact"
+  | "orbit"
+  | "orbit-handoff"
+  | "orbit-committee"
+  | "orbit-advisor"
   | "terminal"
   | "new"
   | "settings";
@@ -106,6 +114,38 @@ export function getSlashCommands(): SlashCommandDef[] {
       description: "Ask active agent to summarize and compact conversation history",
       icon: FoldVertical,
       keywords: ["compact", "summarize", "context", "memory"],
+    },
+    {
+      id: "orbit",
+      command: "/orbit",
+      label: "Orbit Multi-Agent",
+      description: "Enable structured multi-agent delegation across profiles & hosts",
+      icon: Layers,
+      keywords: ["orbit", "orchestrate", "multi", "subagent", "delegate"],
+    },
+    {
+      id: "orbit-handoff",
+      command: "/orbit-handoff",
+      label: "Task Handoff",
+      description: "Hand off the current task cleanly to a specialist profile or worktree",
+      icon: Send,
+      keywords: ["handoff", "transfer", "delegate", "specialist"],
+    },
+    {
+      id: "orbit-committee",
+      command: "/orbit-committee",
+      label: "Committee Planning",
+      description: "Fan out planning to 2 distinct model families, synthesize, implement & review",
+      icon: Users,
+      keywords: ["committee", "consensus", "multi-model", "plan", "review"],
+    },
+    {
+      id: "orbit-advisor",
+      command: "/orbit-advisor",
+      label: "Read-Only Advisor",
+      description: "Get an independent second opinion or diff review from another model family",
+      icon: Sparkles,
+      keywords: ["advisor", "second-opinion", "critique", "audit"],
     },
     {
       id: "supervised",

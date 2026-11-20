@@ -24,7 +24,20 @@ import {
   timelineItemLogicalKey,
 } from "@/lib/orbit-ipc";
 
-export type SlashDirective = "plan" | "review" | "compact";
+export type SlashDirective =
+  | "plan"
+  | "review"
+  | "compact"
+  | "orbit"
+  | "orbit-handoff"
+  | "orbit-committee"
+  | "orbit-advisor";
+
+export interface UndoArchiveEntry {
+  hostId: string;
+  agentId: string;
+  title: string;
+}
 
 export interface PastedAttachment {
   id: string;
@@ -147,6 +160,7 @@ export interface OrbitUiState {
   draftModels: Record<ProviderKind, string | null>;
   draftEffort: ReasoningEffort;
   draftMode: SessionMode;
+  draftProfileId: string | null;
   draftUseWorktree: boolean;
   draftWorktreeBranch: string;
 
@@ -205,6 +219,7 @@ export interface OrbitUiState {
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
   toastNotice: string | null;
+  lastArchivedUndo: UndoArchiveEntry | null;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -413,6 +428,7 @@ let state: OrbitUiState = {
     initialPrefs.draftMode && initialPrefs.draftMode !== "plan"
       ? initialPrefs.draftMode
       : "accept_edits",
+  draftProfileId: null,
   draftUseWorktree: initialPrefs.draftUseWorktree ?? true,
   draftWorktreeBranch: "",
 
@@ -471,6 +487,7 @@ let state: OrbitUiState = {
   sshHosts: [],
   externalEditors: [],
   toastNotice: null,
+  lastArchivedUndo: null,
 
   theme: initialTheme,
   resolvedTheme: initialResolvedTheme,
@@ -622,13 +639,14 @@ function mergeTimelineDelta(
       canUpdateInPlace &&
       existingIdx !== undefined &&
       incoming.item_type !== "user_prompt" &&
+      incoming.item_type !== "agent_message" &&
       incoming.seq > 0
     ) {
       // Never allow an assistant/tool update to overwrite an item belonging to an earlier turn
       for (let j = existingIdx + 1; j < baseItems.length; j += 1) {
         const between = baseItems[j];
         if (
-          between.item_type === "user_prompt" &&
+          (between.item_type === "user_prompt" || between.item_type === "agent_message") &&
           between.seq > 0 &&
           between.seq < incoming.seq
         ) {
@@ -657,12 +675,16 @@ let initialized = false;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const notifiedApprovalAgents = new Set<string>();
 
-function notifyToast(msg: string): void {
+function notifyToast(msg: string, undo?: UndoArchiveEntry | null): void {
   if (toastTimer) clearTimeout(toastTimer);
-  setState((s) => ({ ...s, toastNotice: msg }));
+  setState((s) => ({
+    ...s,
+    toastNotice: msg,
+    lastArchivedUndo: undo ?? null,
+  }));
   toastTimer = setTimeout(() => {
-    setState((s) => ({ ...s, toastNotice: null }));
-  }, 3000);
+    setState((s) => ({ ...s, toastNotice: null, lastArchivedUndo: null }));
+  }, undo ? 6000 : 3000);
 }
 
 function syncAttentionIndicators(overview: FleetOverviewView, details: Record<string, HostDetailView>): void {
@@ -757,6 +779,43 @@ function buildHiddenWorkflowInstruction(directive: SlashDirective): string {
         "1. Core goal & user preferences",
         "2. Key architectural decisions & completed changes (with file paths)",
         "3. Open issues & immediate next steps",
+        "</WORKFLOW_INSTRUCTION>",
+      ].join("\n");
+    case "orbit":
+      return [
+        '<WORKFLOW_INSTRUCTION command="/orbit">',
+        "You are using Orbit Multi-Agent Orchestration.",
+        "Use your built-in Orbit MCP tools (`list_profiles`, `list_hosts`, `create_workspace`, `create_agent`, `send_agent_prompt`, `get_agent_status`, `create_heartbeat`, `delete_heartbeat`) to coordinate specialist agents.",
+        "Always create isolated worktrees via `create_workspace(isolation='worktree')` for parallel edits, and rely on automatic finish notifications rather than polling loops.",
+        "</WORKFLOW_INSTRUCTION>",
+      ].join("\n");
+    case "orbit-handoff":
+      return [
+        '<WORKFLOW_INSTRUCTION command="/orbit-handoff">',
+        "Hand off this task cleanly to a specialist Orbit agent.",
+        "1. Call `list_profiles` to choose the best-fit specialist profile.",
+        "2. Create an isolated worktree if file edits are needed.",
+        "3. Spawn the specialist with `create_agent` using a concise, self-contained briefing (goal, exact file paths, constraints, acceptance criteria).",
+        "4. Rely on automatic finish notification unless the user explicitly asks to detach.",
+        "</WORKFLOW_INSTRUCTION>",
+      ].join("\n");
+    case "orbit-committee":
+      return [
+        '<WORKFLOW_INSTRUCTION command="/orbit-committee">',
+        "Run the Orbit Committee Planning & Cross-Provider Review workflow:",
+        "1. Call `list_profiles` and spawn 2 independent planning/architect agents from distinct model families in read-only/plan mode.",
+        "2. End your turn and wait for their automatic finish notifications.",
+        "3. Synthesize the strongest unified plan, then delegate implementation to a dedicated worktree agent.",
+        "4. After implementation finishes, spawn an independent reviewer agent from another model family to audit the diff before reporting final results.",
+        "</WORKFLOW_INSTRUCTION>",
+      ].join("\n");
+    case "orbit-advisor":
+      return [
+        '<WORKFLOW_INSTRUCTION command="/orbit-advisor">',
+        "Consult an independent read-only Advisor agent from a different model family.",
+        "1. Call `list_profiles` and spawn a `plan`-mode reviewer agent with the focused question, relevant file paths, and constraints.",
+        "2. Instruct the advisor NOT to edit any files.",
+        "3. Wait for its automatic finish notification and critically evaluate its feedback before replying.",
         "</WORKFLOW_INSTRUCTION>",
       ].join("\n");
   }
@@ -1414,6 +1473,8 @@ export const orbitActions = {
     );
 
     void orbitIpc.openAgentTimeline(hostId, agentId);
+    void orbitIpc.markAgentRead(hostId, agentId);
+    void orbitIpc.listProviderSubagents(hostId, agentId);
     void orbitActions.pullTimelineDelta(hostId, agentId, false);
     if (state.inspectorOpen) {
       void orbitActions.refreshGit(hostId, nextCwd, null, state.diffStaged);
@@ -1523,6 +1584,7 @@ export const orbitActions = {
     model?: string | null;
     effort?: ReasoningEffort;
     mode?: SessionMode;
+    profileId?: string | null;
     useWorktree?: boolean;
     worktreeBranch?: string;
   }): void {
@@ -1539,6 +1601,12 @@ export const orbitActions = {
           draftModels: nextModels,
           draftEffort: patch.effort ?? s.draftEffort,
           draftMode: patch.mode ?? s.draftMode,
+          draftProfileId:
+            patch.profileId !== undefined
+              ? patch.profileId
+              : patch.provider !== undefined || patch.model !== undefined
+                ? null
+                : s.draftProfileId,
           draftUseWorktree: patch.useWorktree ?? s.draftUseWorktree,
           draftWorktreeBranch: patch.worktreeBranch ?? s.draftWorktreeBranch,
         };
@@ -2185,8 +2253,13 @@ export const orbitActions = {
         initialDisplayPrompt: cleanUserText,
         initialBadges: badges,
         worktreeBranch,
+        profileId: state.draftProfileId,
       });
-      setState((s) => ({ ...s, draftProvider: effectiveProvider, draftWorktreeBranch: "" }));
+      setState((s) => ({
+        ...s,
+        draftProvider: effectiveProvider,
+        draftWorktreeBranch: "",
+      }));
       return;
     }
 
@@ -2196,10 +2269,10 @@ export const orbitActions = {
 
     if (activeAgent?.is_running) {
       if (steerImmediately) {
-        await orbitIpc.interruptAgent(hostId, agentId);
         await orbitIpc.sendPrompt(hostId, agentId, assembledWirePrompt, {
           displayPrompt: cleanUserText,
           badges,
+          activeTurnBehavior: "steer",
         });
       } else {
         const queuedItem: QueuedPromptItem = {
@@ -2458,12 +2531,14 @@ export const orbitActions = {
       state.selectedHostId === hostId &&
       state.selectedAgentId === agentId;
 
+    const detail = state.hostDetails[hostId];
+    const targetAgent = detail?.agents.find((a) => a.agent_id === agentId);
     let fallbackAgentId: string | null = null;
     if (wasSelected) {
-      const detail = state.hostDetails[hostId];
       const nextCandidate = detail?.agents.find(
         (a) =>
           a.agent_id !== agentId &&
+          !a.archived_at_rfc3339 &&
           !state.archivedThreads[threadScopeKey(hostId, a.agent_id)],
       );
       fallbackAgentId = nextCandidate?.agent_id ?? null;
@@ -2491,10 +2566,15 @@ export const orbitActions = {
       true,
     );
 
+    void orbitIpc.archiveAgent(hostId, agentId);
     if (wasSelected && fallbackAgentId) {
       orbitActions.selectAgent(hostId, fallbackAgentId);
     }
-    notifyToast("Conversation archived");
+    notifyToast("Conversation archived", {
+      hostId,
+      agentId,
+      title: targetAgent?.title ?? agentId,
+    });
   },
 
   restoreArchivedThread(hostId: string, agentId: string): void {
@@ -2506,12 +2586,25 @@ export const orbitActions = {
         return {
           ...s,
           archivedThreads: nextArchived,
+          lastArchivedUndo: null,
         };
       },
       true,
     );
+    void orbitIpc.unarchiveAgent(hostId, agentId);
     orbitActions.selectAgent(hostId, agentId);
     notifyToast("Conversation restored");
+  },
+
+  undoLastArchive(): void {
+    const entry = state.lastArchivedUndo;
+    if (!entry) return;
+    orbitActions.restoreArchivedThread(entry.hostId, entry.agentId);
+  },
+
+  async detachAgent(hostId: string, agentId: string): Promise<void> {
+    await orbitIpc.detachAgent(hostId, agentId);
+    notifyToast("Detached subagent to standalone thread");
   },
 
   async deleteThreadPermanently(hostId: string, agentId: string): Promise<void> {
@@ -2541,7 +2634,8 @@ export const orbitActions = {
       true,
     );
 
-    await orbitIpc.archiveAgent(hostId, agentId);
+    await orbitIpc.deleteAgent(hostId, agentId);
+    notifyToast("Conversation deleted");
   },
 
   setSidebarViewPrefs(patch: {

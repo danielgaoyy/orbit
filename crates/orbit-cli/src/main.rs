@@ -1,3 +1,5 @@
+mod mcp_bridge;
+mod orchestration_cli;
 mod service;
 mod ssh_config;
 
@@ -18,7 +20,8 @@ use orbit_daemon::{
     DaemonConfig, DaemonPersistedConfig, DaemonRuntime, discover_lan_ws_endpoints, run_daemon,
 };
 use orbit_protocol::{
-    AgentStatus, ProviderKind, SessionMode, TimelinePayload, ToolCallDetail, WireMessage,
+    ActiveTurnBehavior, AgentStatus, ProviderKind, SessionMode, TimelinePayload, ToolCallDetail,
+    WireMessage, WorktreeCreateMode,
 };
 use orbit_providers::{discover_installed_providers, probe_all_provider_quotas};
 use orbit_relay::{RelayConfig, RelayPersistedConfig, run_relay};
@@ -26,6 +29,12 @@ use orbit_relay_transport::{is_ssh_relay_url, redact_relay_url};
 use orbit_shim::{ShimSpawnSpec, run_shim};
 use uuid::Uuid;
 
+use crate::orchestration_cli::{
+    CliBehavior, CliEffort, ConfigAction, HeartbeatAction, HostAction, PermitAction, ProfileAction,
+    ScheduleAction, ScriptAction, SkillAction, TerminalAction, WorkspaceAction, cmd_config,
+    cmd_heartbeat, cmd_host, cmd_inspect, cmd_permit, cmd_profile, cmd_schedule, cmd_script,
+    cmd_simple_agent_op, cmd_skill, cmd_terminal, cmd_wait, cmd_workspace, resolve_server_url,
+};
 use crate::service::{
     PortOwnership, RelayProbeOutcome, ServiceRole, check_local_health, default_daemon_listen,
     detect_public_ipv4, find_live_daemon_port_for_host, install_and_start_service,
@@ -42,15 +51,27 @@ use crate::ssh_config::{discover_ssh_hosts, provision_relay_via_ssh};
 )]
 struct Cli {
     /// Override Orbit state directory (defaults to `~/.orbit`).
-    #[arg(long, env = "ORBIT_HOME")]
+    #[arg(long, env = "ORBIT_HOME", global = true)]
     home: Option<PathBuf>,
+
+    /// Emit machine-readable JSON to stdout.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Target Orbit Daemon WebSocket URL or `orbit://pair/...` URI (auto-discovers local daemon if omitted).
+    #[arg(long, env = "ORBIT_SERVER", global = true)]
+    server: Option<String>,
+
+    /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
+    #[arg(long, global = true)]
+    via_relay: bool,
 
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum CliProvider {
+pub enum CliProvider {
     #[value(alias = "agy")]
     Antigravity,
     Codex,
@@ -69,7 +90,7 @@ impl From<CliProvider> for ProviderKind {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
-enum CliMode {
+pub enum CliMode {
     Default,
     AcceptEdits,
     Plan,
@@ -204,14 +225,17 @@ enum Commands {
 
     /// List managed agents on an Orbit Daemon.
     Ls {
-        #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
-        server: String,
-        /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
+        #[arg(short = 'a', long)]
+        all: bool,
         #[arg(long)]
-        via_relay: bool,
+        workspace: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        include_background: bool,
     },
 
-    /// Create and stream a live coding agent session (`agy`, `codex`, or `claude`).
+    /// Create and stream (or asynchronously launch with `--no-wait`) a coding agent session.
     Run {
         #[arg(short, long, value_enum, default_value = "antigravity")]
         provider: CliProvider,
@@ -219,39 +243,151 @@ enum Commands {
         mode: CliMode,
         #[arg(long)]
         model: Option<String>,
+        #[arg(long, value_enum)]
+        effort: Option<CliEffort>,
+        /// Apply a saved Agent Profile ID (fills provider/model/effort/mode/system prompt/MCP policy).
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         cwd: Option<PathBuf>,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
         /// Automatically run inside an isolated git worktree branch.
         #[arg(long)]
         worktree: bool,
-        #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
-        server: String,
-        /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
         #[arg(long)]
-        via_relay: bool,
+        branch: Option<String>,
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// Return immediately with the created agent_id instead of streaming stdout.
+        #[arg(long)]
+        no_wait: bool,
+        #[arg(long)]
+        background: bool,
+        #[arg(long)]
+        auto_archive: bool,
+        /// Notify parent agent automatically when the child finishes (defaults on if `ORBIT_AGENT_ID` is set).
+        #[arg(long)]
+        notify_on_finish: Option<bool>,
         /// Initial prompt to send to the agent.
         prompt: String,
     },
 
-    /// Send a follow-up prompt to an existing (or persisted) agent and stream the turn.
+    /// Send a follow-up prompt to an existing (or persisted) agent.
     Send {
         agent_id: String,
         prompt: String,
-        #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
-        server: String,
-        /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
+        #[arg(long, value_enum, default_value = "steer")]
+        behavior: CliBehavior,
         #[arg(long)]
-        via_relay: bool,
+        no_wait: bool,
+        #[arg(long)]
+        notify_on_finish: Option<bool>,
+    },
+
+    /// Block until an agent reaches Idle / AwaitingPermission / Error / Closed and print its final reply.
+    Wait {
+        agent_id: String,
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
+
+    /// Interrupt an agent's currently running turn.
+    Stop { agent_id: String },
+
+    /// Inspect an agent's metadata, pending permissions, provider subagents, and recent timeline.
+    Inspect { agent_id: String },
+
+    /// Soft-archive an agent (and its managed same-workspace subagents).
+    Archive { agent_id: String },
+
+    /// Restore a soft-archived agent.
+    Unarchive { agent_id: String },
+
+    /// Detach a subagent from its parent so it becomes a top-level standalone session.
+    Detach { agent_id: String },
+
+    /// Permanently delete an agent and its timeline history.
+    Delete { agent_id: String },
+
+    /// Change an agent's active session mode.
+    Mode {
+        agent_id: String,
+        #[arg(value_enum)]
+        mode: CliMode,
     },
 
     /// Read timeline history of an agent from an Orbit Daemon.
-    Logs {
-        agent_id: String,
-        #[arg(long, default_value = "ws://127.0.0.1:6868/ws", env = "ORBIT_SERVER")]
-        server: String,
-        /// Force connecting via E2EE Relay when `--server` is an `orbit://pair/...` URI.
+    Logs { agent_id: String },
+
+    /// Manage workspaces and isolated git worktrees.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+
+    /// Manage workspace scripts & reverse-proxied dev services (`orbit.json` / `paseo.json`).
+    Script {
+        #[command(subcommand)]
+        action: ScriptAction,
+    },
+
+    /// Manage detached PTY terminals (list, create, capture text, send-keys, kill).
+    Terminal {
+        #[command(subcommand)]
+        action: TerminalAction,
+    },
+
+    /// Manage Cron Schedules (`orbit schedule create | ls | pause | resume | run-once | logs | delete`).
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleAction,
+    },
+
+    /// Manage periodic agent Heartbeats (`orbit heartbeat create | ls | delete`).
+    Heartbeat {
+        #[command(subcommand)]
+        action: HeartbeatAction,
+    },
+
+    /// Manage Agent Profiles (`orbit profile ls | create | delete`).
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+
+    /// Manage Daemon-to-Daemon Connected Hosts for cross-host orchestration.
+    Host {
+        #[command(subcommand)]
+        action: HostAction,
+    },
+
+    /// Inspect and resolve pending tool permissions across agents.
+    Permit {
+        #[command(subcommand)]
+        action: PermitAction,
+    },
+
+    /// View or update host Orchestration runtime configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
+    /// Inspect or install bundled Orbit Orchestration skills (`orbit`, `orbit-handoff`, `orbit-committee`, `orbit-advisor`).
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
+
+    /// Stdio-to-HTTP MCP 2025-03-26 JSON-RPC bridge connecting external MCP clients to the local Orbit Daemon.
+    Mcp {
         #[arg(long)]
-        via_relay: bool,
+        caller_agent_id: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
     },
 
     /// Internal detached process supervisor invoked by `orbit daemon`.
@@ -276,15 +412,22 @@ fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+    let is_mcp_stdio = matches!(cli.command, Commands::Mcp { .. });
+    if !is_mcp_stdio {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+    }
+
     let home_dir = resolve_home(cli.home);
+    let json_mode = cli.json;
+    let via_relay = cli.via_relay;
+    let server = resolve_server_url(&home_dir, cli.server);
 
     match cli.command {
         Commands::Doctor => {
@@ -813,26 +956,36 @@ async fn main() -> anyhow::Result<()> {
             }
         },
 
-        Commands::Ls { server, via_relay } => {
+        Commands::Ls {
+            all,
+            workspace,
+            parent,
+            include_background,
+        } => {
             let client = connect_cli_server(&server, via_relay).await?;
             let req_id = Uuid::new_v4();
             let resp = client
                 .request(
                     WireMessage::ListAgents {
                         request_id: req_id,
-                        workspace_id: None,
+                        workspace_id: workspace,
+                        include_archived: all,
+                        include_background,
+                        parent_agent_id: parent,
                     },
                     Duration::from_secs(10),
                     |w| matches!(w, WireMessage::AgentsSnapshot { request_id: r, .. } if *r == req_id),
                 )
                 .await?;
             if let WireMessage::AgentsSnapshot { agents, .. } = resp {
-                if agents.is_empty() {
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&agents)?);
+                } else if agents.is_empty() {
                     println!("No agents registered on {server}.");
                 } else {
                     for a in agents {
                         println!(
-                            "{:<36} | {:<12} | {:<16} | {}",
+                            "{:<36} | {:<12} | {:<14} | {}",
                             a.agent_id,
                             a.provider.display_name(),
                             format_status(&a.status),
@@ -847,15 +1000,31 @@ async fn main() -> anyhow::Result<()> {
             provider,
             mode,
             model,
+            effort,
+            profile,
             cwd,
+            workspace,
+            title,
             worktree,
-            server,
-            via_relay,
+            branch,
+            base_ref,
+            no_wait,
+            background,
+            auto_archive,
+            notify_on_finish,
             prompt,
         } => {
             let target_cwd = cwd
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
+            let env_caller = std::env::var("ORBIT_AGENT_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let env_host = std::env::var("ORBIT_HOST_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            let effective_notify = notify_on_finish.or_else(|| env_caller.as_ref().map(|_| true));
+
             let client = connect_cli_server(&server, via_relay).await?;
             let mut sub_rx = client.subscribe();
 
@@ -866,17 +1035,28 @@ async fn main() -> anyhow::Result<()> {
                         request_id: req_id,
                         cwd: target_cwd.to_string_lossy().to_string(),
                         extra_dirs: Vec::new(),
-                        title: None,
+                        title,
                         provider: provider.into(),
                         model,
-                        effort: None,
+                        effort: effort.map(Into::into),
                         mode: mode.into(),
                         initial_prompt: prompt,
                         initial_display_prompt: None,
                         initial_badges: Vec::new(),
                         worktree,
+                        workspace_id: workspace,
+                        parent_agent_id: env_caller,
+                        parent_host_id: env_host,
+                        profile_id: profile,
+                        background,
+                        auto_archive,
+                        notify_on_finish: effective_notify,
+                        idempotency_key: None,
+                        base_ref,
+                        worktree_mode: WorktreeCreateMode::BranchOff,
+                        branch,
                     },
-                    Duration::from_secs(35),
+                    Duration::from_secs(45),
                     |w| {
                         matches!(
                             w,
@@ -888,31 +1068,51 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
 
-            let agent_id = match resp {
-                WireMessage::AgentCreated { agent, .. } => {
-                    println!(
-                        "Started {} session `{}` in {}",
-                        agent.provider.display_name(),
-                        agent.agent_id,
-                        agent.cwd
-                    );
-                    agent.agent_id
-                }
+            let agent = match resp {
+                WireMessage::AgentCreated { agent, .. } => agent,
                 WireMessage::RpcError { code, message, .. } => {
                     anyhow::bail!("[{code}] {message}");
                 }
                 _ => anyhow::bail!("unexpected response"),
             };
 
-            stream_turn_to_stdout(&client, &mut sub_rx, &agent_id).await?;
+            if no_wait {
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&agent)?);
+                } else {
+                    println!(
+                        "Started {} session `{}` in {}",
+                        agent.provider.display_name(),
+                        agent.agent_id,
+                        agent.cwd
+                    );
+                }
+            } else {
+                if !json_mode {
+                    println!(
+                        "Started {} session `{}` in {}",
+                        agent.provider.display_name(),
+                        agent.agent_id,
+                        agent.cwd
+                    );
+                }
+                stream_turn_to_stdout(&client, &mut sub_rx, &agent.agent_id).await?;
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&agent)?);
+                }
+            }
         }
 
         Commands::Send {
             agent_id,
             prompt,
-            server,
-            via_relay,
+            behavior,
+            no_wait,
+            notify_on_finish,
         } => {
+            let env_caller = std::env::var("ORBIT_AGENT_ID")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
             let client = connect_cli_server(&server, via_relay).await?;
             let mut sub_rx = client.subscribe();
             let req_id = Uuid::new_v4();
@@ -924,6 +1124,10 @@ async fn main() -> anyhow::Result<()> {
                         prompt,
                         display_prompt: None,
                         badges: Vec::new(),
+                        active_turn_behavior: ActiveTurnBehavior::from(behavior),
+                        message_id: None,
+                        caller_agent_id: env_caller,
+                        notify_on_finish,
                     },
                     Duration::from_secs(35),
                     |w| {
@@ -939,14 +1143,123 @@ async fn main() -> anyhow::Result<()> {
             if let WireMessage::RpcError { code, message, .. } = resp {
                 anyhow::bail!("[{code}] {message}");
             }
-            stream_turn_to_stdout(&client, &mut sub_rx, &agent_id).await?;
+            if no_wait {
+                if json_mode {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "ok": true,
+                            "agent_id": agent_id
+                        }))?
+                    );
+                } else {
+                    println!("[✓] Dispatched prompt to `{agent_id}`");
+                }
+            } else {
+                stream_turn_to_stdout(&client, &mut sub_rx, &agent_id).await?;
+            }
         }
 
-        Commands::Logs {
-            agent_id,
-            server,
-            via_relay,
-        } => {
+        Commands::Wait { agent_id, timeout } => {
+            cmd_wait(&server, via_relay, json_mode, &agent_id, timeout).await?;
+        }
+        Commands::Stop { agent_id } => {
+            let req_id = Uuid::new_v4();
+            cmd_simple_agent_op(
+                &server,
+                via_relay,
+                json_mode,
+                WireMessage::InterruptTurn {
+                    request_id: req_id,
+                    agent_id: agent_id.clone(),
+                },
+                req_id,
+                &format!("Stopped `{agent_id}`"),
+            )
+            .await?;
+        }
+        Commands::Inspect { agent_id } => {
+            cmd_inspect(&server, via_relay, json_mode, &agent_id).await?;
+        }
+        Commands::Archive { agent_id } => {
+            let req_id = Uuid::new_v4();
+            cmd_simple_agent_op(
+                &server,
+                via_relay,
+                json_mode,
+                WireMessage::ArchiveAgent {
+                    request_id: req_id,
+                    agent_id: agent_id.clone(),
+                },
+                req_id,
+                &format!("Archived `{agent_id}`"),
+            )
+            .await?;
+        }
+        Commands::Unarchive { agent_id } => {
+            let req_id = Uuid::new_v4();
+            cmd_simple_agent_op(
+                &server,
+                via_relay,
+                json_mode,
+                WireMessage::UnarchiveAgent {
+                    request_id: req_id,
+                    agent_id: agent_id.clone(),
+                },
+                req_id,
+                &format!("Unarchived `{agent_id}`"),
+            )
+            .await?;
+        }
+        Commands::Detach { agent_id } => {
+            let req_id = Uuid::new_v4();
+            cmd_simple_agent_op(
+                &server,
+                via_relay,
+                json_mode,
+                WireMessage::DetachAgent {
+                    request_id: req_id,
+                    agent_id: agent_id.clone(),
+                },
+                req_id,
+                &format!("Detached `{agent_id}`"),
+            )
+            .await?;
+        }
+        Commands::Delete { agent_id } => {
+            let req_id = Uuid::new_v4();
+            cmd_simple_agent_op(
+                &server,
+                via_relay,
+                json_mode,
+                WireMessage::DeleteAgent {
+                    request_id: req_id,
+                    agent_id: agent_id.clone(),
+                },
+                req_id,
+                &format!("Deleted `{agent_id}`"),
+            )
+            .await?;
+        }
+        Commands::Mode { agent_id, mode } => {
+            let req_id = Uuid::new_v4();
+            let sm: SessionMode = mode.into();
+            cmd_simple_agent_op(
+                &server,
+                via_relay,
+                json_mode,
+                WireMessage::SetSessionMode {
+                    request_id: req_id,
+                    agent_id: agent_id.clone(),
+                    mode: sm,
+                },
+                req_id,
+                &format!("Updated mode for `{agent_id}`"),
+            )
+            .await?;
+        }
+
+        Commands::Logs { agent_id } => {
             let client = connect_cli_server(&server, via_relay).await?;
             let req_id = Uuid::new_v4();
             let resp = client
@@ -961,10 +1274,51 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             if let WireMessage::TimelineCatchup { events, .. } = resp {
-                for ev in events {
-                    print_timeline_payload(ev.seq, &ev.payload);
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&events)?);
+                } else {
+                    for ev in events {
+                        print_timeline_payload(ev.seq, &ev.payload);
+                    }
                 }
             }
+        }
+
+        Commands::Workspace { action } => {
+            cmd_workspace(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Script { action } => {
+            cmd_script(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Terminal { action } => {
+            cmd_terminal(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Schedule { action } => {
+            cmd_schedule(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Heartbeat { action } => {
+            cmd_heartbeat(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Profile { action } => {
+            cmd_profile(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Host { action } => {
+            cmd_host(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Permit { action } => {
+            cmd_permit(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Config { action } => {
+            cmd_config(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Skill { action } => {
+            cmd_skill(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Mcp {
+            caller_agent_id,
+            url,
+        } => {
+            mcp_bridge::run_mcp_stdio_bridge(&home_dir, caller_agent_id, url).await?;
         }
 
         Commands::Shim { socket, spec_json } => {
@@ -976,7 +1330,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn connect_cli_server(server: &str, via_relay: bool) -> anyhow::Result<HostSessionHandle> {
+pub(crate) async fn connect_cli_server(
+    server: &str,
+    via_relay: bool,
+) -> anyhow::Result<HostSessionHandle> {
     let trimmed = server.trim();
     if trimmed.starts_with("orbit://pair/") {
         let offer = PairingOffer::from_qr_uri(trimmed)?;
@@ -1104,9 +1461,18 @@ async fn stream_turn_to_stdout(
     Ok(())
 }
 
-fn print_timeline_payload(seq: u64, payload: &TimelinePayload) {
+pub(crate) fn print_timeline_payload(seq: u64, payload: &TimelinePayload) {
     match payload {
         TimelinePayload::UserPrompt { text, .. } => println!("#{seq:04} [USER] {text}"),
+        TimelinePayload::AgentMessage {
+            kind,
+            source_title,
+            text,
+            ..
+        } => println!(
+            "#{seq:04} [AGENT:{kind:?}:{}] {text}",
+            source_title.as_deref().unwrap_or("system")
+        ),
         TimelinePayload::AssistantMessage {
             text,
             streaming: false,
@@ -1133,7 +1499,7 @@ fn summarize_tool(detail: &ToolCallDetail) -> String {
     }
 }
 
-fn format_status(s: &AgentStatus) -> &'static str {
+pub(crate) fn format_status(s: &AgentStatus) -> &'static str {
     match s {
         AgentStatus::Initializing => "initializing",
         AgentStatus::Idle => "idle",

@@ -663,8 +663,18 @@ impl From<HostDetailView> for FfiHostDetail {
             discovered_projects: v.discovered_projects.into_iter().map(Into::into).collect(),
             directory_listing: v.directory_listing.map(Into::into),
             provider_catalogs: v.provider_catalogs.into_iter().map(Into::into).collect(),
-            workspaces: v.workspaces.into_iter().map(Into::into).collect(),
-            agents: v.agents.into_iter().map(Into::into).collect(),
+            workspaces: v
+                .workspaces
+                .into_iter()
+                .filter(|w| w.archived_at.is_none() && !w.background)
+                .map(Into::into)
+                .collect(),
+            agents: v
+                .agents
+                .into_iter()
+                .filter(|a| a.archived_at_rfc3339.is_none() && !a.background)
+                .map(Into::into)
+                .collect(),
             last_created_agent_id: v.last_created_agent_id,
             replaced_optimistic_agents: v.replaced_optimistic_agents,
             quotas: v.quotas.into_iter().map(Into::into).collect(),
@@ -1428,6 +1438,25 @@ impl From<TimelineItemView> for FfiTimelineItem {
                 message,
                 timestamp_ms,
             },
+            TimelineItemView::AgentMessage {
+                seq,
+                source_title,
+                text,
+                timestamp_ms,
+                ..
+            } => {
+                let prefix = source_title
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|t| format!("[{t}] "))
+                    .unwrap_or_default();
+                Self::Notice {
+                    seq,
+                    level: "info".to_string(),
+                    message: format!("{prefix}{text}"),
+                    timestamp_ms,
+                }
+            }
         }
     }
 }

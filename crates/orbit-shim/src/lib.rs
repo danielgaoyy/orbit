@@ -144,6 +144,59 @@ impl ShimClient {
     }
 }
 
+/// Attempt to reconnect to an already-running `orbit shim` UDS socket (e.g. after Daemon hot-restart).
+/// If the socket file exists on disk but the shim process is gone (`ECONNREFUSED`), removes the stale file.
+pub async fn connect_existing_shim(socket_path: &Path) -> Option<ShimClient> {
+    if !socket_path.exists() {
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_millis(300), ShimClient::connect(socket_path)).await {
+        Ok(Ok(client)) => Some(client),
+        _ => {
+            let _ = std::fs::remove_file(socket_path);
+            None
+        }
+    }
+}
+
+/// Best-effort kill for a surviving shim socket that should be closed before replacement.
+pub async fn kill_existing_shim(socket_path: &Path) {
+    if let Some(client) = connect_existing_shim(socket_path).await {
+        let _ = client.kill().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = std::fs::remove_file(socket_path);
+}
+
+/// Synchronous best-effort kill for a shim socket (safe to call from RAII `Drop` guards in tests).
+pub fn kill_existing_shim_sync(socket_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        if let Ok(mut stream) = UnixStream::connect(socket_path) {
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+            let _ = stream.write_all(b"{\"type\":\"kill\"}\n");
+            let _ = stream.flush();
+            drop(stream);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+    let _ = std::fs::remove_file(socket_path);
+}
+
+/// Synchronously kill every active shim whose `.sock` lives in `shims_dir`.
+pub fn kill_all_shims_in_dir_sync(shims_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(shims_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sock") {
+            kill_existing_shim_sync(&path);
+        }
+    }
+}
+
 /// Spawn a detached `orbit shim` process in its own OS process group and connect to its UDS.
 pub async fn spawn_detached_shim(
     orbit_exe: &Path,

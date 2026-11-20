@@ -1,4 +1,7 @@
-//! Core wire types, state machines, timeline events, git/worktree models, and binary terminal framing.
+//! Core wire types, state machines, timeline events, git/worktree models, orchestration models, and binary terminal framing.
+
+pub mod orchestration;
+pub use orchestration::*;
 
 use std::collections::HashMap;
 
@@ -6,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// First-class supported coding agent CLIs in Orbit Phase 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -172,6 +175,18 @@ pub struct WorkspaceSummary {
     pub git_branch: Option<String>,
     pub is_worktree: bool,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub setup_status: WorkspaceSetupStatus,
 }
 
 /// Auto-discovered local project / Git repository choice for zero-typing UI selection.
@@ -236,9 +251,25 @@ pub struct AgentSummary {
     pub mode: SessionMode,
     pub status: AgentStatus,
     pub parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_host_id: Option<String>,
     pub latest_seq: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub auto_archive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub attention: AttentionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<DateTime<Utc>>,
 }
 
 /// Active detached PTY terminal summary.
@@ -386,6 +417,21 @@ pub enum TimelinePayload {
         level: String,
         message: String,
     },
+    AgentMessage {
+        message_id: String,
+        kind: AgentMessageKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_host_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<String>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_context: Option<PermissionCheckpointRef>,
+    },
     StatusChanged {
         status: AgentStatus,
     },
@@ -394,6 +440,7 @@ pub enum TimelinePayload {
 /// Client-to-Daemon and Daemon-to-Client RPC envelope over WebSocket / E2EE Relay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum WireMessage {
     Hello {
         client_id: String,
@@ -438,6 +485,10 @@ pub enum WireMessage {
     },
     ListWorkspaces {
         request_id: Uuid,
+        #[serde(default)]
+        include_archived: bool,
+        #[serde(default)]
+        include_background: bool,
     },
     WorkspacesSnapshot {
         request_id: Uuid,
@@ -450,10 +501,63 @@ pub enum WireMessage {
         /// If `Some(branch_name)`, creates an isolated git worktree under `$ORBIT_HOME/worktrees/`.
         worktree_branch: Option<String>,
         base_ref: Option<String>,
+        #[serde(default)]
+        isolation: WorkspaceIsolation,
+        #[serde(default)]
+        worktree_mode: WorktreeCreateMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr_number: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_workspace_id: Option<String>,
+        #[serde(default)]
+        background: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
     },
     WorkspaceCreated {
         request_id: Uuid,
         workspace: WorkspaceSummary,
+    },
+    WorkspaceUpdated {
+        workspace: WorkspaceSummary,
+    },
+    WorkspaceSetupProgress {
+        progress: WorkspaceSetupProgress,
+    },
+    RenameWorkspace {
+        request_id: Uuid,
+        workspace_id: String,
+        title: String,
+    },
+    ArchiveWorkspace {
+        request_id: Uuid,
+        workspace_id: String,
+    },
+    UnarchiveWorkspace {
+        request_id: Uuid,
+        workspace_id: String,
+    },
+    ListWorkspaceScripts {
+        request_id: Uuid,
+        workspace_id: String,
+    },
+    WorkspaceScriptsSnapshot {
+        request_id: Uuid,
+        workspace_id: String,
+        scripts: Vec<WorkspaceScriptInfo>,
+    },
+    StartWorkspaceScript {
+        request_id: Uuid,
+        workspace_id: String,
+        script_name: String,
+    },
+    StopWorkspaceScript {
+        request_id: Uuid,
+        workspace_id: String,
+        script_name: String,
+    },
+    WorkspaceScriptUpdated {
+        script: WorkspaceScriptInfo,
     },
     GetGitStatus {
         request_id: Uuid,
@@ -489,6 +593,12 @@ pub enum WireMessage {
     ListAgents {
         request_id: Uuid,
         workspace_id: Option<String>,
+        #[serde(default)]
+        include_archived: bool,
+        #[serde(default)]
+        include_background: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_agent_id: Option<String>,
     },
     AgentsSnapshot {
         request_id: Uuid,
@@ -512,6 +622,28 @@ pub enum WireMessage {
         initial_badges: Vec<PromptBadge>,
         #[serde(default)]
         worktree: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_host_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        #[serde(default)]
+        background: bool,
+        #[serde(default)]
+        auto_archive: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify_on_finish: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_ref: Option<String>,
+        #[serde(default)]
+        worktree_mode: WorktreeCreateMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
     },
     AgentCreated {
         request_id: Uuid,
@@ -519,6 +651,9 @@ pub enum WireMessage {
     },
     AgentUpdated {
         agent: AgentSummary,
+    },
+    AgentDeleted {
+        agent_id: String,
     },
     SendPrompt {
         request_id: Uuid,
@@ -528,6 +663,14 @@ pub enum WireMessage {
         display_prompt: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         badges: Vec<PromptBadge>,
+        #[serde(default)]
+        active_turn_behavior: ActiveTurnBehavior,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify_on_finish: Option<bool>,
     },
     InterruptTurn {
         request_id: Uuid,
@@ -561,6 +704,45 @@ pub enum WireMessage {
     ArchiveAgent {
         request_id: Uuid,
         agent_id: String,
+    },
+    UnarchiveAgent {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    DeleteAgent {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    DetachAgent {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    MarkAgentRead {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    UpdateAgent {
+        request_id: Uuid,
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<ReasoningEffort>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<SessionMode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        labels: Option<HashMap<String, String>>,
+    },
+    ListPendingPermissions {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+    },
+    PendingPermissionsSnapshot {
+        request_id: Uuid,
+        permissions: Vec<PendingPermissionSummary>,
     },
     ResolvePermission {
         request_id: Uuid,
@@ -623,6 +805,216 @@ pub enum WireMessage {
     KillTerminal {
         request_id: Uuid,
         terminal_id: String,
+    },
+    CaptureTerminal {
+        request_id: Uuid,
+        terminal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<u32>,
+    },
+    TerminalCaptured {
+        request_id: Uuid,
+        terminal_id: String,
+        text: String,
+    },
+    SendTerminalKeys {
+        request_id: Uuid,
+        terminal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(default)]
+        keys: Vec<String>,
+    },
+
+    // Agent Profiles
+    ListProfiles {
+        request_id: Uuid,
+    },
+    ProfilesSnapshot {
+        request_id: Uuid,
+        profiles: Vec<AgentProfile>,
+    },
+    UpsertProfile {
+        request_id: Uuid,
+        profile: AgentProfile,
+    },
+    ProfileUpserted {
+        request_id: Uuid,
+        profile: AgentProfile,
+    },
+    DeleteProfile {
+        request_id: Uuid,
+        profile_id: String,
+    },
+
+    // Schedules & Heartbeats
+    ListSchedules {
+        request_id: Uuid,
+        #[serde(default)]
+        include_completed: bool,
+    },
+    SchedulesSnapshot {
+        request_id: Uuid,
+        schedules: Vec<ScheduleSpec>,
+    },
+    CreateSchedule {
+        request_id: Uuid,
+        name: String,
+        cron_expr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timezone: Option<String>,
+        prompt: String,
+        target: ScheduleTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_runs: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_by_agent: Option<String>,
+    },
+    ScheduleCreated {
+        request_id: Uuid,
+        schedule: ScheduleSpec,
+    },
+    ScheduleUpdated {
+        schedule: ScheduleSpec,
+    },
+    ScheduleDeleted {
+        schedule_id: String,
+    },
+    UpdateSchedule {
+        request_id: Uuid,
+        schedule_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cron_expr: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_runs: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archive_on_finish: Option<bool>,
+    },
+    PauseSchedule {
+        request_id: Uuid,
+        schedule_id: String,
+    },
+    ResumeSchedule {
+        request_id: Uuid,
+        schedule_id: String,
+    },
+    RunScheduleOnce {
+        request_id: Uuid,
+        schedule_id: String,
+    },
+    DeleteSchedule {
+        request_id: Uuid,
+        schedule_id: String,
+    },
+    ListScheduleRuns {
+        request_id: Uuid,
+        schedule_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    ScheduleRunsSnapshot {
+        request_id: Uuid,
+        schedule_id: String,
+        runs: Vec<ScheduleRunRecord>,
+    },
+
+    // Daemon-to-Daemon Connected Hosts (Cross-Host Orchestration)
+    ListConnectedHosts {
+        request_id: Uuid,
+    },
+    ConnectedHostsSnapshot {
+        request_id: Uuid,
+        hosts: Vec<ConnectedHostSummary>,
+    },
+    AddConnectedHost {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        pairing_uri: String,
+    },
+    ConnectedHostAdded {
+        request_id: Uuid,
+        host: ConnectedHostSummary,
+    },
+    ConnectedHostUpdated {
+        host: ConnectedHostSummary,
+    },
+    ConnectedHostRemoved {
+        registration_id: String,
+    },
+    UpdateConnectedHost {
+        request_id: Uuid,
+        registration_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+    },
+    RemoveConnectedHost {
+        request_id: Uuid,
+        registration_id: String,
+    },
+
+    // Host Orchestration Config & Bundled Skills
+    GetOrchestrationConfig {
+        request_id: Uuid,
+    },
+    OrchestrationConfigSnapshot {
+        request_id: Uuid,
+        config: OrchestrationConfig,
+    },
+    UpdateOrchestrationConfig {
+        request_id: Uuid,
+        config: OrchestrationConfig,
+    },
+    ListOrchestrationSkills {
+        request_id: Uuid,
+    },
+    OrchestrationSkillsSnapshot {
+        request_id: Uuid,
+        skills: Vec<OrchestrationSkillInfo>,
+    },
+    SyncOrchestrationSkills {
+        request_id: Uuid,
+        skill_ids: Vec<String>,
+    },
+
+    // Provider-Native Subagent Observability
+    ListProviderSubagents {
+        request_id: Uuid,
+        parent_agent_id: String,
+    },
+    ProviderSubagentsSnapshot {
+        request_id: Uuid,
+        parent_agent_id: String,
+        subagents: Vec<ProviderSubagentDescriptor>,
+    },
+    ProviderSubagentUpdated {
+        subagent: ProviderSubagentDescriptor,
+    },
+    SubscribeProviderSubagent {
+        request_id: Uuid,
+        parent_agent_id: String,
+        subagent_id: String,
+        since_seq: u64,
+    },
+    ProviderSubagentTimelineCatchup {
+        request_id: Uuid,
+        parent_agent_id: String,
+        subagent_id: String,
+        events: Vec<ProviderSubagentEvent>,
+        has_more: bool,
+    },
+    ProviderSubagentTimelineLive {
+        event: ProviderSubagentEvent,
     },
 
     // Quotas & Provider Model Catalogs
@@ -796,6 +1188,17 @@ mod tests {
             initial_display_prompt: None,
             initial_badges: Vec::new(),
             worktree: false,
+            workspace_id: None,
+            parent_agent_id: None,
+            parent_host_id: None,
+            profile_id: None,
+            background: false,
+            auto_archive: false,
+            notify_on_finish: None,
+            idempotency_key: None,
+            base_ref: None,
+            worktree_mode: WorktreeCreateMode::BranchOff,
+            branch: None,
         };
         let raw_json = serde_json::to_vec(&msg).expect("serialize");
         let compressed = msg.encode_zstd(3).expect("compress");
@@ -807,6 +1210,82 @@ mod tests {
             }
             _ => panic!("unexpected variant"),
         }
+    }
+
+    #[test]
+    fn backward_compatible_v2_deserialization() {
+        let legacy_create = serde_json::json!({
+            "op": "create_agent",
+            "request_id": Uuid::new_v4(),
+            "cwd": "/tmp/demo",
+            "title": null,
+            "provider": "claude_code",
+            "model": null,
+            "mode": "accept_edits",
+            "initial_prompt": "hello"
+        });
+        let msg: WireMessage =
+            serde_json::from_value(legacy_create).expect("deserialize legacy v2 CreateAgent");
+        match msg {
+            WireMessage::CreateAgent {
+                workspace_id,
+                parent_agent_id,
+                background,
+                auto_archive,
+                ..
+            } => {
+                assert!(workspace_id.is_none());
+                assert!(parent_agent_id.is_none());
+                assert!(!background);
+                assert!(!auto_archive);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy_send = serde_json::json!({
+            "op": "send_prompt",
+            "request_id": Uuid::new_v4(),
+            "agent_id": "ag_1",
+            "prompt": "follow up"
+        });
+        let msg2: WireMessage =
+            serde_json::from_value(legacy_send).expect("deserialize legacy v2 SendPrompt");
+        match msg2 {
+            WireMessage::SendPrompt {
+                active_turn_behavior,
+                message_id,
+                ..
+            } => {
+                assert_eq!(active_turn_behavior, ActiveTurnBehavior::Steer);
+                assert!(message_id.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy_agent = serde_json::json!({
+            "agent_id": "ag_legacy",
+            "workspace_id": "ws_1",
+            "cwd": "/tmp/demo",
+            "title": "Legacy",
+            "provider": "codex",
+            "model": null,
+            "mode": "default",
+            "status": { "state": "idle" },
+            "parent_agent_id": null,
+            "latest_seq": 10,
+            "created_at": Utc::now(),
+            "updated_at": Utc::now()
+        });
+        let ag: AgentSummary =
+            serde_json::from_value(legacy_agent).expect("deserialize legacy v2 AgentSummary");
+        assert!(ag.archived_at.is_none());
+        assert_eq!(ag.attention, AttentionState::None);
+        assert!(ag.labels.is_empty());
+
+        let cfg = OrchestrationConfig::default();
+        assert!(cfg.mcp_inject_enabled);
+        assert!(cfg.idle_cleanup_enabled);
+        assert_eq!(cfg.idle_timeout_secs, 3600);
     }
 
     #[test]

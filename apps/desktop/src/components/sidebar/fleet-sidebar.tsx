@@ -130,6 +130,14 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
   const pinnedSet = useMemo(() => new Set(pinnedThreadKeys), [pinnedThreadKeys]);
 
+  const isAgentArchived = useCallback(
+    (hostId: string, ag: AgentCardView): boolean => {
+      if (ag.archived_at_rfc3339) return true;
+      return Boolean(archivedThreads[threadScopeKey(hostId, ag.agent_id)]);
+    },
+    [archivedThreads],
+  );
+
   const isThreadUnread = useCallback(
     (hostId: string, ag: AgentCardView): boolean => {
       const tKey = threadScopeKey(hostId, ag.agent_id);
@@ -139,6 +147,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
         selectedHostId === hostId &&
         selectedAgentId === ag.agent_id;
       if (isSelected || ag.is_running) return false;
+      if (ag.attention && ag.attention !== "none") return true;
       const seen = seenAgentSeqs[tKey];
       return seen !== undefined && ag.latest_seq > seen;
     },
@@ -156,7 +165,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
     for (const proj of rawProjects) {
       for (const { agent } of proj.conversations) {
         const tKey = threadScopeKey(proj.host.host_id, agent.agent_id);
-        if (agent.is_awaiting_permission && !archivedThreads[tKey]) {
+        if (agent.is_awaiting_permission && !isAgentArchived(proj.host.host_id, agent)) {
           items.push({
             host: proj.host,
             agent,
@@ -167,7 +176,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       }
     }
     return items;
-  }, [rawProjects, archivedThreads, threadCustomTitles]);
+  }, [rawProjects, isAgentArchived, threadCustomTitles]);
 
   // 2. Conditional Pinned conversations (0px when empty)
   const pinnedEntries = useMemo(() => {
@@ -179,7 +188,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
     for (const proj of rawProjects) {
       for (const conv of proj.conversations) {
         const tKey = threadScopeKey(proj.host.host_id, conv.agent.agent_id);
-        if (!archivedThreads[tKey]) {
+        if (!isAgentArchived(proj.host.host_id, conv.agent)) {
           lookup.set(tKey, { host: proj.host, projectName: proj.name, conv });
         }
       }
@@ -197,7 +206,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       }
     }
     return ordered;
-  }, [pinnedThreadKeys, rawProjects, archivedThreads]);
+  }, [pinnedThreadKeys, rawProjects, isAgentArchived]);
 
   // 3. Filtered & sorted Projects tree
   const displayProjects = useMemo(() => {
@@ -207,9 +216,22 @@ export const FleetSidebar = memo(function FleetSidebar() {
     }[] = [];
 
     for (const proj of rawProjects) {
+      const detail = hostDetails[proj.host.host_id];
+      const agentsById = new Map((detail?.agents ?? []).map((a) => [a.agent_id, a]));
+
       const nonArchived = proj.conversations.filter((c) => {
         const tKey = threadScopeKey(proj.host.host_id, c.agent.agent_id);
-        if (archivedThreads[tKey] || pinnedSet.has(tKey)) return false;
+        if (c.agent.background) return false;
+        if (isAgentArchived(proj.host.host_id, c.agent) || pinnedSet.has(tKey)) return false;
+
+        // Collapse same-workspace managed subagents under their parent's Subagents Track
+        if (c.agent.parent_agent_id && !c.agent.parent_host_id) {
+          const parent = agentsById.get(c.agent.parent_agent_id);
+          if (parent && !isAgentArchived(proj.host.host_id, parent) && parent.workspace_id === c.agent.workspace_id) {
+            return false;
+          }
+        }
+
         if (sidebarThreadFilter === "active_unread") {
           const unread = isThreadUnread(proj.host.host_id, c.agent);
           return c.agent.is_running || c.agent.is_awaiting_permission || unread;
@@ -224,9 +246,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       const hadConversationsOriginally = proj.conversations.length > 0;
       const allConversationsArchived =
         hadConversationsOriginally &&
-        proj.conversations.every(
-          (c) => Boolean(archivedThreads[threadScopeKey(proj.host.host_id, c.agent.agent_id)]),
-        );
+        proj.conversations.every((c) => isAgentArchived(proj.host.host_id, c.agent));
       if (!proj.pinnedProject && allConversationsArchived && !isActiveTarget) {
         continue;
       }
@@ -255,7 +275,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
     return list;
   }, [
     rawProjects,
-    archivedThreads,
+    hostDetails,
+    isAgentArchived,
     pinnedSet,
     sidebarThreadFilter,
     sidebarProjectSort,
@@ -264,10 +285,9 @@ export const FleetSidebar = memo(function FleetSidebar() {
     isThreadUnread,
   ]);
 
-  // 4. Restorable Archived Conversations for Footer Drawer
+  // 4. Restorable Archived Conversations (synced from Daemon `archived_at` + local drawer state)
   const archivedEntries = useMemo(() => {
-    const keys = Object.keys(archivedThreads);
-    if (keys.length === 0) return [];
+    const seen = new Set<string>();
     const entries: {
       key: string;
       hostId: string;
@@ -277,22 +297,29 @@ export const FleetSidebar = memo(function FleetSidebar() {
       archivedAtMs: number;
     }[] = [];
 
-    for (const meta of Object.values(archivedThreads)) {
-      const detail = hostDetails[meta.hostId];
-      const ag = detail?.agents.find((a) => a.agent_id === meta.agentId);
-      if (!ag) continue;
-      const matchedProj = rawProjects.find(
-        (p) =>
-          p.host.host_id === meta.hostId && matchesProjectDirectory(p.directories, ag.cwd),
-      );
-      entries.push({
-        key: meta.key,
-        hostId: meta.hostId,
-        agent: ag,
-        projectName: matchedProj?.name || basenameOfProjectPath(ag.cwd),
-        effectiveTitle: threadCustomTitles[meta.key] || ag.title,
-        archivedAtMs: meta.archivedAtMs,
-      });
+    for (const [hostId, detail] of Object.entries(hostDetails)) {
+      for (const ag of detail.agents) {
+        if (ag.background) continue;
+        const tKey = threadScopeKey(hostId, ag.agent_id);
+        const localMeta = archivedThreads[tKey];
+        if (!ag.archived_at_rfc3339 && !localMeta) continue;
+        if (seen.has(tKey)) continue;
+        seen.add(tKey);
+        const matchedProj = rawProjects.find(
+          (p) => p.host.host_id === hostId && matchesProjectDirectory(p.directories, ag.cwd),
+        );
+        const archivedAtMs = ag.archived_at_rfc3339
+          ? Date.parse(ag.archived_at_rfc3339) || Date.now()
+          : (localMeta?.archivedAtMs ?? Date.now());
+        entries.push({
+          key: tKey,
+          hostId,
+          agent: ag,
+          projectName: matchedProj?.name || basenameOfProjectPath(ag.cwd),
+          effectiveTitle: threadCustomTitles[tKey] || ag.title,
+          archivedAtMs,
+        });
+      }
     }
 
     entries.sort((a, b) => b.archivedAtMs - a.archivedAtMs);

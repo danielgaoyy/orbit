@@ -307,6 +307,12 @@ export const OmniComposer = memo(function OmniComposer({
           orbitActions.showToast("Start an active session first to compact context");
         }
         break;
+      case "orbit":
+      case "orbit-handoff":
+      case "orbit-committee":
+      case "orbit-advisor":
+        orbitActions.setSlashDirective(cmd.id);
+        break;
       case "terminal":
         orbitActions.toggleTerminalDock();
         break;

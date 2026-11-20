@@ -2041,6 +2041,7 @@ name = "orbit-cli"
 version = "0.3.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "futures-util",
  "orbit-client-core",
@@ -2051,6 +2052,7 @@ dependencies = [
  "orbit-relay",
  "orbit-relay-transport",
  "orbit-shim",
+ "orbit-store",
  "reqwest",
  "russh",
  "serde_json",
@@ -2111,12 +2113,15 @@ dependencies = [
  "orbit-relay-transport",
  "orbit-shim",
  "orbit-store",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
  "uuid",
+ "vt100",
 ]
 
 [[package]]

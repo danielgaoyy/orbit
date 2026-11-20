@@ -365,6 +365,12 @@ mod tests {
                 cwd: sub_str,
                 git_branch: None,
                 is_worktree: false,
+                base_ref: None,
+                parent_workspace_id: None,
+                source_cwd: None,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                background: false,
+                archived_at: None,
                 updated_at: chrono::Utc::now(),
             })
             .expect("upsert");

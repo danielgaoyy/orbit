@@ -58,6 +58,11 @@ import { OmniComposer } from "@/components/composer/omni-composer";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { StickyApprovalDock } from "@/components/stage/stage-approval-dock";
 import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
+import {
+  AgentMessageCard,
+  ParentSubagentBanner,
+  SubagentsTrack,
+} from "@/components/stage/subagents-track";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -1488,6 +1493,7 @@ const TurnStageSection = memo(function TurnStageSection({
   animatePromptEntrance = false,
   autoFoldCompleted,
   cwd,
+  hostId,
   agentId,
   timing,
   thinkingSignature,
@@ -1500,6 +1506,7 @@ const TurnStageSection = memo(function TurnStageSection({
   animatePromptEntrance?: boolean;
   autoFoldCompleted: boolean;
   cwd: string;
+  hostId: string;
   agentId: string;
   timing?: TurnTimingRecord;
   thinkingSignature: string;
@@ -1559,6 +1566,8 @@ const TurnStageSection = memo(function TurnStageSection({
           animateEntrance={animatePromptEntrance}
         />
       )}
+
+      {turn.agentMessage && <AgentMessageCard hostId={hostId} item={turn.agentMessage} />}
 
       {(turn.liveSegments.length > 0 || isTurnActive) && (
         <div className="px-[10px]">
@@ -2211,6 +2220,13 @@ export function StreamStage() {
         />
       )}
 
+      {/* Parent Back Banner when inspecting a managed subagent */}
+      {selectedHostId && currentAgent?.parent_agent_id && (
+        <div className="shrink-0 px-6">
+          <ParentSubagentBanner hostId={selectedHostId} agent={currentAgent} />
+        </div>
+      )}
+
       {/* 1. Scrollable Conversation Viewport — ends strictly ABOVE the Composer shelf */}
       <ScrollArea
         className="min-h-0 flex-1"
@@ -2242,6 +2258,7 @@ export function StreamStage() {
                 animatePromptEntrance={isFreshLivePrompt}
                 autoFoldCompleted={coalesceExploration}
                 cwd={selectedCwd || currentAgent?.cwd || ""}
+                hostId={selectedHostId ?? ""}
                 agentId={selectedAgentId}
                 timing={timing}
                 thinkingSignature={thinkingSignature}
@@ -2285,6 +2302,7 @@ export function StreamStage() {
           </button>
         </div>
 
+        <SubagentsTrack hostId={selectedHostId} agentId={selectedAgentId} />
         <StickyApprovalDock
           hostId={selectedHostId}
           agentId={selectedAgentId}

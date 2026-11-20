@@ -9,11 +9,25 @@ pub mod driver;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 use orbit_protocol::{ModelOption, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot};
 use serde::{Deserialize, Serialize};
 
-pub use driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
+pub use driver::{
+    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, ProviderSessionHandle, SessionLaunchConfig,
+};
+
+static PROVIDER_EXECUTABLE_OVERRIDES: OnceLock<RwLock<HashMap<ProviderKind, PathBuf>>> =
+    OnceLock::new();
+
+/// Register a safe in-process provider executable override (primarily for deterministic E2E tests).
+pub fn set_provider_executable_override(kind: ProviderKind, path: PathBuf) {
+    let lock = PROVIDER_EXECUTABLE_OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(mut guard) = lock.write() {
+        guard.insert(kind, path);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProvider {
@@ -26,14 +40,14 @@ pub struct DiscoveredProvider {
 /// across Linux workstations, cloud Devboxes, and macOS (Mac mini).
 pub fn discover_installed_providers() -> Vec<DiscoveredProvider> {
     let candidates = [
-        (ProviderKind::Antigravity, "agy", "acp-stdio + transcript"),
-        (ProviderKind::Codex, "codex", "app-server json-rpc"),
-        (ProviderKind::ClaudeCode, "claude", "stream-json control"),
+        (ProviderKind::Antigravity, "acp-stdio + transcript"),
+        (ProviderKind::Codex, "app-server json-rpc"),
+        (ProviderKind::ClaudeCode, "stream-json control"),
     ];
 
     let mut found = Vec::new();
-    for (kind, bin_name, transport) in candidates {
-        if let Some(path) = find_executable(bin_name) {
+    for (kind, transport) in candidates {
+        if let Some(path) = find_provider_executable(kind) {
             found.push(DiscoveredProvider {
                 kind,
                 executable_path: path,
@@ -45,6 +59,27 @@ pub fn discover_installed_providers() -> Vec<DiscoveredProvider> {
 }
 
 pub fn find_provider_executable(kind: ProviderKind) -> Option<PathBuf> {
+    if let Some(lock) = PROVIDER_EXECUTABLE_OVERRIDES.get()
+        && let Ok(guard) = lock.read()
+        && let Some(p) = guard.get(&kind)
+        && is_executable_file(p)
+    {
+        return Some(p.clone());
+    }
+    let env_key = match kind {
+        ProviderKind::Antigravity => "ORBIT_AGY_BIN",
+        ProviderKind::Codex => "ORBIT_CODEX_BIN",
+        ProviderKind::ClaudeCode => "ORBIT_CLAUDE_BIN",
+    };
+    if let Ok(override_path) = env::var(env_key) {
+        let trimmed = override_path.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if is_executable_file(&p) {
+                return Some(p);
+            }
+        }
+    }
     find_executable(kind.default_binary())
 }
 

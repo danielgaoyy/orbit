@@ -21,6 +21,7 @@ export default function App() {
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
   const sidebarWidth = useOrbitSelector((s) => s.sidebarWidth);
   const toastNotice = useOrbitSelector((s) => s.toastNotice);
+  const lastArchivedUndo = useOrbitSelector((s) => s.lastArchivedUndo);
 
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [transitionsReady, setTransitionsReady] = useState(false);
@@ -82,6 +83,27 @@ export default function App() {
       return () => window.clearTimeout(id);
     }
   }, [isSettingsOpen, settingsMounted]);
+
+  useEffect(() => {
+    if (!lastArchivedUndo) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        orbitActions.undoLastArchive();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [lastArchivedUndo]);
 
   useEffect(() => {
     if (toastNotice) {
@@ -197,15 +219,25 @@ export default function App() {
       <CommandPalette />
       <RemoteFolderPickerDialog />
 
-      {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit */}
+      {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit & Undo Archive */}
       {renderedToast && (
         <div
           className={cn(
-            "bg-elevated text-foreground floating-surface pointer-events-none fixed right-4 bottom-4 z-50 rounded-xl border border-black/[0.08] px-3.5 py-2 text-[13px] dark:border-white/[0.10]",
+            "bg-elevated text-foreground floating-surface fixed right-4 bottom-4 z-50 flex items-center gap-2.5 rounded-xl border border-black/[0.08] px-3.5 py-2 text-[13px] dark:border-white/[0.10]",
+            lastArchivedUndo ? "pointer-events-auto" : "pointer-events-none",
             toastExiting ? "orbit-toast-exit" : "orbit-toast-enter",
           )}
         >
-          {renderedToast}
+          <span>{renderedToast}</span>
+          {lastArchivedUndo && (
+            <button
+              type="button"
+              onClick={() => orbitActions.undoLastArchive()}
+              className="text-primary hover:bg-accent cursor-pointer rounded-md px-2 py-0.5 text-[12px] font-medium transition-colors"
+            >
+              Undo
+            </button>
+          )}
         </div>
       )}
     </TooltipProvider>

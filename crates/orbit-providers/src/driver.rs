@@ -1,13 +1,24 @@
 //! Unified Actor interface (`DriverCommand` / `DriverEvent`) shared by Antigravity, Codex, and Claude Code.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use orbit_protocol::{
-    AgentStatus, ProviderKind, QuestionItem, ReasoningEffort, SessionMode, ToolCallDetail,
-    ToolCallStatus,
+    ActiveTurnBehavior, AgentStatus, ProviderKind, ProviderSubagentDescriptor, QuestionItem,
+    ReasoningEffort, SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+/// Connection parameters for injecting Orbit's built-in MCP tool server into a provider session.
+#[derive(Debug, Clone)]
+pub struct OrbitMcpLaunchSpec {
+    pub server_name: String,
+    pub http_url: String,
+    pub bearer_token: String,
+    pub stdio_command: PathBuf,
+    pub stdio_args: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionLaunchConfig {
@@ -23,6 +34,11 @@ pub struct SessionLaunchConfig {
     pub effort: Option<ReasoningEffort>,
     pub mode: SessionMode,
     pub resume_session_id: Option<String>,
+    pub mcp_spec: Option<OrbitMcpLaunchSpec>,
+    pub system_prompt_append: Option<String>,
+    pub extra_env: HashMap<String, String>,
+    /// When `true`, attempt to reattach to an already-running `orbit shim` UDS before spawning.
+    pub reattach_existing_shim: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +46,7 @@ pub enum DriverCommand {
     SendPrompt {
         turn_id: String,
         prompt: String,
+        behavior: ActiveTurnBehavior,
     },
     Interrupt,
     SetMode {
@@ -52,6 +69,7 @@ pub enum DriverCommand {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum DriverEvent {
     SessionInitialized {
         persistence_ref: String,
@@ -85,6 +103,11 @@ pub enum DriverEvent {
     Notice {
         level: String,
         message: String,
+    },
+    ProviderSubagentUpsert(ProviderSubagentDescriptor),
+    ProviderSubagentTimeline {
+        subagent_id: String,
+        payload: TimelinePayload,
     },
     Exited {
         code: Option<i32>,

@@ -1,12 +1,15 @@
 import {
+  Archive,
   CheckCircle2,
   Circle,
   Copy,
   FolderOpen,
+  Hash,
   Pencil,
   Pin,
   PinOff,
   Trash2,
+  Unlink,
 } from "lucide-react";
 import { type AgentCardView, type HostCardView, orbitIpc } from "@/lib/orbit-ipc";
 import { type UnifiedProjectEntry, isLocalHostCard } from "@/lib/projects";
@@ -137,6 +140,41 @@ export function SharedConversationMenu({
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Copy className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
             <span>Copy</span>
+          </span>
+        </DropdownMenuItem>
+
+        <DropdownMenuItem
+          onSelect={() => {
+            void navigator.clipboard.writeText(agent.agent_id).then(() => {
+              orbitActions.showToast(`Copied ID ${agent.agent_id}`);
+            });
+          }}
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <Hash className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+            <span>Copy Agent ID</span>
+          </span>
+        </DropdownMenuItem>
+
+        {agent.parent_agent_id && (
+          <DropdownMenuItem
+            onSelect={() => {
+              void orbitActions.detachAgent(host.host_id, agent.agent_id);
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <Unlink className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+              <span>Detach</span>
+            </span>
+          </DropdownMenuItem>
+        )}
+
+        <DropdownMenuItem
+          onSelect={() => orbitActions.archiveThread(host.host_id, agent.agent_id)}
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <Archive className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+            <span>Archive</span>
           </span>
         </DropdownMenuItem>
 

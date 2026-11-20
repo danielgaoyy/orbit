@@ -1,17 +1,18 @@
 //! Native Rust driver for OpenAI Codex (`codex app-server` JSON-RPC 2.0 + `~/.codex/auth.json` Wham Usage).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use orbit_protocol::{
-    AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
-    QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, ToolCallDetail,
+    ActiveTurnBehavior, AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus, QuestionItem,
+    QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload, ToolCallDetail,
     ToolCallStatus,
 };
-use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, spawn_detached_shim};
+use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, spawn_detached_shim};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -30,63 +31,76 @@ fn codex_startup_mutex() -> &'static AsyncMutex<()> {
 pub async fn spawn_codex_session(
     cfg: SessionLaunchConfig,
 ) -> Result<ProviderSessionHandle, String> {
-    let startup_guard = codex_startup_mutex().lock().await;
-
-    let mut env = HashMap::new();
-    env.insert("NO_COLOR".into(), "1".into());
-
-    let spec = ShimSpawnSpec {
-        shim_id: format!("codex_{}", cfg.agent_id),
-        mode: ShimMode::Stdio,
-        program: cfg.executable.to_string_lossy().to_string(),
-        args: vec!["app-server".to_string()],
-        cwd: cfg.cwd.clone(),
-        env,
+    let reattached = if cfg.reattach_existing_shim {
+        connect_existing_shim(&cfg.shim_socket).await
+    } else {
+        None
     };
 
-    let mut shim = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
-        .await
-        .map_err(|e| format!("failed to spawn codex shim: {e}"))?;
+    let (shim, is_reattached) = if let Some(existing) = reattached {
+        (existing, true)
+    } else {
+        let startup_guard = codex_startup_mutex().lock().await;
 
-    // 1. Handshake: `initialize` -> `initialized` while holding startup lock
-    let init_req = json!({
-        "id": 1u64,
-        "method": "initialize",
-        "params": {
-            "clientInfo": {
-                "name": "codex_app_server_daemon",
-                "title": "Orbit Codex Driver",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "capabilities": {
-                "experimentalApi": true,
-                "mcpServerOpenaiFormElicitation": true
+        let mut env = cfg.extra_env.clone();
+        env.insert("NO_COLOR".into(), "1".into());
+
+        let spec = ShimSpawnSpec {
+            shim_id: format!("codex_{}", cfg.agent_id),
+            mode: ShimMode::Stdio,
+            program: cfg.executable.to_string_lossy().to_string(),
+            args: vec!["app-server".to_string()],
+            cwd: cfg.cwd.clone(),
+            env,
+        };
+
+        let mut fresh = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
+            .await
+            .map_err(|e| format!("failed to spawn codex shim: {e}"))?;
+
+        // 1. Handshake: `initialize` -> `initialized` while holding startup lock
+        let init_req = json!({
+            "id": 1u64,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "codex_app_server_daemon",
+                    "title": "Orbit Codex Driver",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                    "mcpServerOpenaiFormElicitation": true
+                }
             }
-        }
-    })
-    .to_string();
+        })
+        .to_string();
 
-    shim.write_stdin_line(init_req)
-        .await
-        .map_err(|e| format!("codex write initialize failed: {e}"))?;
+        fresh
+            .write_stdin_line(init_req)
+            .await
+            .map_err(|e| format!("codex write initialize failed: {e}"))?;
 
-    wait_codex_id_response(&mut shim, 1).await?;
+        wait_codex_id_response(&mut fresh, 1).await?;
 
-    let initialized_notif = json!({
-        "method": "initialized",
-        "params": {}
-    })
-    .to_string();
-    shim.write_stdin_line(initialized_notif)
-        .await
-        .map_err(|e| format!("codex write initialized failed: {e}"))?;
+        let initialized_notif = json!({
+            "method": "initialized",
+            "params": {}
+        })
+        .to_string();
+        fresh
+            .write_stdin_line(initialized_notif)
+            .await
+            .map_err(|e| format!("codex write initialized failed: {e}"))?;
 
-    drop(startup_guard);
+        drop(startup_guard);
+        (fresh, false)
+    };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<DriverCommand>(64);
     let (evt_tx, evt_rx) = mpsc::channel::<DriverEvent>(256);
 
-    tokio::spawn(run_codex_actor(cfg, shim, cmd_rx, evt_tx));
+    tokio::spawn(run_codex_actor(cfg, shim, is_reattached, cmd_rx, evt_tx));
 
     Ok(ProviderSessionHandle { cmd_tx, evt_rx })
 }
@@ -103,72 +117,111 @@ struct PendingCodexQuestion {
 async fn run_codex_actor(
     cfg: SessionLaunchConfig,
     mut shim: orbit_shim::ShimClient,
+    is_reattached: bool,
     mut cmd_rx: mpsc::Receiver<DriverCommand>,
     evt_tx: mpsc::Sender<DriverEvent>,
 ) {
-    let mut next_id: u64 = 2;
+    let mut next_id: u64 = if is_reattached { 1000 } else { 2 };
     let mut mode = cfg.mode.clone();
 
-    // Start or resume thread
-    let (approval_policy, start_sandbox) = codex_thread_mode_strings(&mode);
-    let thread_req_id = next_id;
-    next_id += 1;
+    let (thread_id, mut resolved_model) = if is_reattached
+        && let Some(ref tid) = cfg.resume_session_id
+    {
+        (tid.clone(), cfg.model.clone())
+    } else {
+        // Start or resume thread (injecting Orbit MCP server into `config.mcp_servers`)
+        let (approval_policy, start_sandbox) = codex_thread_mode_strings(&mode);
+        let thread_req_id = next_id;
+        next_id += 1;
 
-    let start_msg = if let Some(ref tid) = cfg.resume_session_id {
-        json!({
-            "id": thread_req_id,
-            "method": "thread/resume",
-            "params": {
+        let mut inner_config = serde_json::Map::new();
+        if let Some(ref mcp) = cfg.mcp_spec {
+            inner_config.insert(
+                "mcp_servers".into(),
+                json!({
+                    mcp.server_name.clone(): {
+                        "url": mcp.http_url,
+                        "http_headers": {
+                            "Authorization": format!("Bearer {}", mcp.bearer_token)
+                        },
+                        "tool_timeout_sec": 120
+                    }
+                }),
+            );
+        }
+        if let Some(ref sys_append) = cfg.system_prompt_append
+            && !sys_append.trim().is_empty()
+        {
+            inner_config.insert(
+                "developer_instructions".into(),
+                Value::String(sys_append.clone()),
+            );
+        }
+
+        let start_msg = if let Some(ref tid) = cfg.resume_session_id {
+            let mut params = json!({
                 "threadId": tid,
                 "excludeTurns": true
+            });
+            if !inner_config.is_empty() {
+                params["config"] = Value::Object(inner_config);
             }
-        })
-    } else {
-        let mut params = json!({
-            "cwd": cfg.cwd.to_string_lossy(),
-            "approvalPolicy": approval_policy,
-            "sandbox": start_sandbox,
-            "approvalsReviewer": "user",
-            "ephemeral": false
-        });
-        if let Some(ref m) = cfg.model {
-            params["model"] = Value::String(m.clone());
-        }
-        json!({
-            "id": thread_req_id,
-            "method": "thread/start",
-            "params": params
-        })
-    };
+            json!({
+                "id": thread_req_id,
+                "method": "thread/resume",
+                "params": params
+            })
+        } else {
+            let mut params = json!({
+                "cwd": cfg.cwd.to_string_lossy(),
+                "approvalPolicy": approval_policy,
+                "sandbox": start_sandbox,
+                "approvalsReviewer": "user",
+                "ephemeral": false
+            });
+            if let Some(ref m) = cfg.model {
+                params["model"] = Value::String(m.clone());
+            }
+            if !inner_config.is_empty() {
+                params["config"] = Value::Object(inner_config);
+            }
+            json!({
+                "id": thread_req_id,
+                "method": "thread/start",
+                "params": params
+            })
+        };
 
-    if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
-        return;
-    }
-
-    let thread_res = match wait_codex_id_response(&mut shim, thread_req_id).await {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = evt_tx
-                .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                    message: format!("Codex thread start failed: {e}"),
-                    recoverable: false,
-                }))
-                .await;
+        if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
             return;
         }
-    };
 
-    let thread_id = thread_res
-        .pointer("/thread/id")
-        .and_then(|v| v.as_str())
-        .or(cfg.resume_session_id.as_deref())
-        .unwrap_or("unknown")
-        .to_string();
-    let mut resolved_model = thread_res
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned)
-        .or_else(|| cfg.model.clone());
+        let thread_res = match wait_codex_id_response(&mut shim, thread_req_id).await {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = evt_tx
+                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                        message: format!("Codex thread start failed: {e}"),
+                        recoverable: false,
+                    }))
+                    .await;
+                return;
+            }
+        };
+
+        let tid = thread_res
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .or(cfg.resume_session_id.as_deref())
+            .unwrap_or("unknown")
+            .to_string();
+        let model = thread_res
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .or_else(|| cfg.model.clone());
+        (tid, model)
+    };
     let mut current_effort = cfg.effort;
 
     let _ = evt_tx
@@ -177,9 +230,11 @@ async fn run_codex_actor(
             model: resolved_model.clone(),
         })
         .await;
-    let _ = evt_tx
-        .send(DriverEvent::StatusChanged(AgentStatus::Idle))
-        .await;
+    if !is_reattached {
+        let _ = evt_tx
+            .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+            .await;
+    }
 
     let mut native_turn_id: Option<String> = None;
     let mut client_turn_id: Option<String> = None;
@@ -188,82 +243,81 @@ async fn run_codex_actor(
     let mut file_change_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_approvals: HashMap<String, PendingCodexApproval> = HashMap::new();
     let mut pending_questions: HashMap<String, PendingCodexQuestion> = HashMap::new();
+    let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
 
     loop {
         tokio::select! {
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
-                    DriverCommand::SendPrompt { turn_id, prompt } => {
-                        // If a turn is already active and we know `native_turn_id`, steer in-place!
+                    DriverCommand::SendPrompt { turn_id, prompt, behavior } => {
                         let input_items =
                             build_codex_input_items(&prompt, cfg.attachments_dir.as_deref());
                         if let Some(ref active_nat_tid) = native_turn_id {
-                            let req_id = next_id;
-                            next_id += 1;
-                            let steer = json!({
-                                "id": req_id,
-                                "method": "turn/steer",
-                                "params": {
-                                    "threadId": thread_id,
-                                    "expectedTurnId": active_nat_tid,
-                                    "input": input_items
+                            match behavior {
+                                ActiveTurnBehavior::Steer => {
+                                    let req_id = next_id;
+                                    next_id += 1;
+                                    let steer = json!({
+                                        "id": req_id,
+                                        "method": "turn/steer",
+                                        "params": {
+                                            "threadId": thread_id,
+                                            "expectedTurnId": active_nat_tid,
+                                            "input": input_items
+                                        }
+                                    });
+                                    let _ = shim.write_stdin_line(steer.to_string()).await;
+                                    continue;
                                 }
-                            });
-                            let _ = shim.write_stdin_line(steer.to_string()).await;
+                                ActiveTurnBehavior::Queue => {
+                                    queued_prompts.push_back((turn_id, prompt));
+                                    continue;
+                                }
+                                ActiveTurnBehavior::Interrupt => {
+                                    let req_id = next_id;
+                                    next_id += 1;
+                                    let req = json!({
+                                        "id": req_id,
+                                        "method": "turn/interrupt",
+                                        "params": {
+                                            "threadId": thread_id,
+                                            "turnId": active_nat_tid
+                                        }
+                                    });
+                                    let _ = shim.write_stdin_line(req.to_string()).await;
+                                    queued_prompts.push_front((turn_id, prompt));
+                                    continue;
+                                }
+                            }
+                        } else if client_turn_id.is_some() {
+                            match behavior {
+                                ActiveTurnBehavior::Queue => queued_prompts.push_back((turn_id, prompt)),
+                                ActiveTurnBehavior::Steer | ActiveTurnBehavior::Interrupt => {
+                                    queued_prompts.push_front((turn_id, prompt));
+                                }
+                            }
                             continue;
                         }
 
-                        client_turn_id = Some(turn_id.clone());
-                        msg_accum.clear();
-                        thought_accum.clear();
-                        let _ = evt_tx
-                            .send(DriverEvent::StatusChanged(AgentStatus::Running {
-                                turn_id: turn_id.clone(),
-                            }))
-                            .await;
-
-                        let (pol, sandbox_policy) = codex_turn_policies(&mode, &cfg.extra_dirs);
-                        let req_id = next_id;
-                        next_id += 1;
-                        let mut params = json!({
-                            "threadId": thread_id,
-                            "input": input_items,
-                            "cwd": cfg.cwd.to_string_lossy(),
-                            "approvalPolicy": pol,
-                            "approvalsReviewer": "user",
-                            "sandboxPolicy": sandbox_policy
-                        });
-                        if let Some(ref m) = resolved_model {
-                            params["model"] = Value::String(m.clone());
-                        }
-                        if let Some(eff) = current_effort {
-                            let eff_str = match eff {
-                                ReasoningEffort::Off => Some("none"),
-                                ReasoningEffort::Low => Some("low"),
-                                ReasoningEffort::Medium => Some("medium"),
-                                ReasoningEffort::High => Some("high"),
-                                ReasoningEffort::Xhigh => Some("xhigh"),
-                                ReasoningEffort::Max => Some("max"),
-                                ReasoningEffort::Ultra => Some("ultra"),
-                            };
-                            if let Some(s) = eff_str {
-                                params["effort"] = Value::String(s.to_string());
-                            }
-                        }
-                        if matches!(mode, SessionMode::Plan) {
-                            params["collaborationMode"] = json!({
-                                "mode": "plan",
-                                "settings": {}
-                            });
-                        }
-
-                        let req = json!({
-                            "id": req_id,
-                            "method": "turn/start",
-                            "params": params
-                        });
-                        if shim.write_stdin_line(req.to_string()).await.is_err() {
+                        if dispatch_codex_turn(
+                            &cfg,
+                            &thread_id,
+                            &mode,
+                            &resolved_model,
+                            current_effort,
+                            &turn_id,
+                            &prompt,
+                            &mut next_id,
+                            &mut client_turn_id,
+                            &mut msg_accum,
+                            &mut thought_accum,
+                            &shim,
+                            &evt_tx,
+                        )
+                        .await
+                        .is_err()
+                        {
                             break;
                         }
                     }
@@ -363,7 +417,8 @@ async fn run_codex_actor(
                         } else if rpc_id.is_none()
                             && let Some(m) = method
                         {
-                            handle_codex_notification(
+                            let turn_completed = handle_codex_notification(
+                                &cfg.agent_id,
                                 m,
                                 &val["params"],
                                 &mut native_turn_id,
@@ -374,6 +429,28 @@ async fn run_codex_actor(
                                 &evt_tx,
                             )
                             .await;
+                            if turn_completed
+                                && let Some((next_tid, next_prompt)) = queued_prompts.pop_front()
+                                && dispatch_codex_turn(
+                                    &cfg,
+                                    &thread_id,
+                                    &mode,
+                                    &resolved_model,
+                                    current_effort,
+                                    &next_tid,
+                                    &next_prompt,
+                                    &mut next_id,
+                                    &mut client_turn_id,
+                                    &mut msg_accum,
+                                    &mut thought_accum,
+                                    &shim,
+                                    &evt_tx,
+                                )
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
                         } else if rpc_id.is_some()
                             && method.is_none()
                             && let Some(err) = val.get("error").filter(|v| !v.is_null())
@@ -467,7 +544,79 @@ fn codex_turn_policies(mode: &SessionMode, extra_dirs: &[PathBuf]) -> (&'static 
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn dispatch_codex_turn(
+    cfg: &SessionLaunchConfig,
+    thread_id: &str,
+    mode: &SessionMode,
+    resolved_model: &Option<String>,
+    current_effort: Option<ReasoningEffort>,
+    turn_id: &str,
+    prompt: &str,
+    next_id: &mut u64,
+    client_turn_id: &mut Option<String>,
+    msg_accum: &mut HashMap<String, String>,
+    thought_accum: &mut HashMap<String, String>,
+    shim: &orbit_shim::ShimClient,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) -> Result<(), ()> {
+    let input_items = build_codex_input_items(prompt, cfg.attachments_dir.as_deref());
+    *client_turn_id = Some(turn_id.to_string());
+    msg_accum.clear();
+    thought_accum.clear();
+    let _ = evt_tx
+        .send(DriverEvent::StatusChanged(AgentStatus::Running {
+            turn_id: turn_id.to_string(),
+        }))
+        .await;
+
+    let (pol, sandbox_policy) = codex_turn_policies(mode, &cfg.extra_dirs);
+    let req_id = *next_id;
+    *next_id += 1;
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": input_items,
+        "cwd": cfg.cwd.to_string_lossy(),
+        "approvalPolicy": pol,
+        "approvalsReviewer": "user",
+        "sandboxPolicy": sandbox_policy
+    });
+    if let Some(m) = resolved_model {
+        params["model"] = Value::String(m.clone());
+    }
+    if let Some(eff) = current_effort {
+        let eff_str = match eff {
+            ReasoningEffort::Off => Some("none"),
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+            ReasoningEffort::Max => Some("max"),
+            ReasoningEffort::Ultra => Some("ultra"),
+        };
+        if let Some(s) = eff_str {
+            params["effort"] = Value::String(s.to_string());
+        }
+    }
+    if matches!(mode, SessionMode::Plan) {
+        params["collaborationMode"] = json!({
+            "mode": "plan",
+            "settings": {}
+        });
+    }
+
+    let req = json!({
+        "id": req_id,
+        "method": "turn/start",
+        "params": params
+    });
+    shim.write_stdin_line(req.to_string())
+        .await
+        .map_err(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_codex_notification(
+    parent_agent_id: &str,
     method: &str,
     params: &Value,
     native_turn_id: &mut Option<String>,
@@ -476,7 +625,7 @@ async fn handle_codex_notification(
     thought_accum: &mut HashMap<String, String>,
     file_change_cache: &mut HashMap<String, ToolCallDetail>,
     evt_tx: &mpsc::Sender<DriverEvent>,
-) {
+) -> bool {
     match method {
         "turn/started" => {
             if let Some(tid) = params.pointer("/turn/id").and_then(|v| v.as_str()) {
@@ -536,7 +685,7 @@ async fn handle_codex_notification(
         "item/started" | "item/completed" => {
             let is_done = method == "item/completed";
             let Some(item) = params.get("item") else {
-                return;
+                return false;
             };
             let turn_scope = native_turn_id
                 .as_deref()
@@ -651,6 +800,87 @@ async fn handle_codex_notification(
                         })
                         .await;
                 }
+                "mcpToolCall" | "McpToolCall" => {
+                    let server = item.get("server").and_then(|v| v.as_str()).unwrap_or("mcp");
+                    let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
+                    let args = serde_json::to_string(&item["arguments"]).unwrap_or_default();
+                    let status =
+                        map_codex_item_status(item.get("status").and_then(|v| v.as_str()), is_done);
+                    let _ = evt_tx
+                        .send(DriverEvent::ToolCall {
+                            call_id: item_id,
+                            status,
+                            detail: ToolCallDetail::Generic {
+                                tool_name: format!("{server}/{tool}"),
+                                arguments_json: truncate_str(&args, 800),
+                            },
+                        })
+                        .await;
+                }
+                "collabAgentToolCall" | "CollabAgentToolCall" => {
+                    let sub_id = item
+                        .get("receiverThreadId")
+                        .or_else(|| item.get("threadId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&item_id)
+                        .to_string();
+                    let title = item
+                        .get("prompt")
+                        .or_else(|| item.get("tool"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| truncate_str(s, 72))
+                        .unwrap_or_else(|| "Codex Subagent".to_string());
+                    let st = map_codex_item_status(item.get("status").and_then(|v| v.as_str()), is_done);
+                    let pstatus = match st {
+                        ToolCallStatus::Running => ProviderSubagentStatus::Running,
+                        ToolCallStatus::Completed => ProviderSubagentStatus::Completed,
+                        ToolCallStatus::Failed | ToolCallStatus::Denied => ProviderSubagentStatus::Failed,
+                    };
+                    let now = Utc::now();
+                    let _ = evt_tx
+                        .send(DriverEvent::ProviderSubagentUpsert(
+                            ProviderSubagentDescriptor {
+                                subagent_id: sub_id.clone(),
+                                parent_agent_id: parent_agent_id.to_string(),
+                                parent_subagent_id: None,
+                                title: title.clone(),
+                                subtitle: Some("Codex".into()),
+                                status: pstatus,
+                                created_at: now,
+                                updated_at: now,
+                            },
+                        ))
+                        .await;
+                    if is_done
+                        && let Some(out) = item.get("result").and_then(|v| v.as_str())
+                        && !out.trim().is_empty()
+                    {
+                        let _ = evt_tx
+                            .send(DriverEvent::ProviderSubagentTimeline {
+                                subagent_id: sub_id,
+                                payload: TimelinePayload::AssistantMessage {
+                                    item_id: format!("codex_sub_{item_id}"),
+                                    text: out.to_string(),
+                                    streaming: false,
+                                },
+                            })
+                            .await;
+                    }
+                    let _ = evt_tx
+                        .send(DriverEvent::ToolCall {
+                            call_id: item_id,
+                            status: st,
+                            detail: ToolCallDetail::Subagent {
+                                child_agent_id: item
+                                    .get("receiverThreadId")
+                                    .and_then(|v| v.as_str())
+                                    .map(ToOwned::to_owned),
+                                role: "Codex Subagent".into(),
+                                prompt_preview: title,
+                            },
+                        })
+                        .await;
+                }
                 _ => {}
             }
         }
@@ -678,9 +908,11 @@ async fn handle_codex_notification(
                     .send(DriverEvent::StatusChanged(AgentStatus::Idle))
                     .await;
             }
+            return true;
         }
         _ => {}
     }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]

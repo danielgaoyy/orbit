@@ -1,17 +1,18 @@
 //! Native Rust driver for Anthropic Claude Code (`claude` bidirectional `stream-json` Control Protocol
 //! + `~/.claude/.credentials.json` / macOS Keychain OAuth Usage).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec, ProviderQuotaSnapshot,
-    QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, ToolCallDetail,
+    ActiveTurnBehavior, AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus, QuestionItem,
+    QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload, ToolCallDetail,
     ToolCallStatus,
 };
-use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, spawn_detached_shim};
+use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, spawn_detached_shim};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -23,93 +24,124 @@ use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLa
 pub async fn spawn_claude_session(
     cfg: SessionLaunchConfig,
 ) -> Result<ProviderSessionHandle, String> {
-    let perm_mode = claude_mode_flag(&cfg.mode);
     let preassigned_session_id = cfg
         .resume_session_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let mut args = vec![
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-        "--input-format".to_string(),
-        "stream-json".to_string(),
-        "--permission-prompt-tool".to_string(),
-        "stdio".to_string(),
-        "--include-partial-messages".to_string(),
-        "--permission-mode".to_string(),
-        perm_mode.to_string(),
-        "--allow-dangerously-skip-permissions".to_string(),
-    ];
-
-    if let Some(ref resume_id) = cfg.resume_session_id {
-        args.push(format!("--resume={resume_id}"));
+    let shim = if cfg.reattach_existing_shim
+        && let Some(existing) = connect_existing_shim(&cfg.shim_socket).await
+    {
+        existing
     } else {
-        args.push(format!("--session-id={preassigned_session_id}"));
-    }
+        let perm_mode = claude_mode_flag(&cfg.mode);
 
-    if let Some(ref m) = cfg.model {
-        args.push("--model".to_string());
-        args.push(m.clone());
-    }
-    for extra in &cfg.extra_dirs {
-        args.push("--add-dir".to_string());
-        args.push(extra.to_string_lossy().to_string());
-    }
+        let mut args = vec![
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--permission-prompt-tool".to_string(),
+            "stdio".to_string(),
+            "--include-partial-messages".to_string(),
+            "--permission-mode".to_string(),
+            perm_mode.to_string(),
+            "--allow-dangerously-skip-permissions".to_string(),
+        ];
 
-    let mut env = HashMap::new();
-    env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-ts".into());
-    env.insert(
-        "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".into(),
-        "true".into(),
-    );
-    env.insert("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into());
-    env.insert("NO_COLOR".into(), "1".into());
-    if let Some(eff) = cfg.effort {
-        let eff_str = match eff {
-            ReasoningEffort::Off => None,
-            ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium => Some("medium"),
-            ReasoningEffort::High => Some("high"),
-            ReasoningEffort::Xhigh => Some("xhigh"),
-            ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
+        if let Some(ref resume_id) = cfg.resume_session_id {
+            args.push(format!("--resume={resume_id}"));
+        } else {
+            args.push(format!("--session-id={preassigned_session_id}"));
+        }
+
+        if let Some(ref m) = cfg.model {
+            args.push("--model".to_string());
+            args.push(m.clone());
+        }
+        for extra in &cfg.extra_dirs {
+            args.push("--add-dir".to_string());
+            args.push(extra.to_string_lossy().to_string());
+        }
+        if let Some(ref mcp) = cfg.mcp_spec {
+            let mcp_json = json!({
+                "mcpServers": {
+                    mcp.server_name.clone(): {
+                        "type": "http",
+                        "url": mcp.http_url,
+                        "headers": {
+                            "Authorization": format!("Bearer {}", mcp.bearer_token)
+                        }
+                    }
+                }
+            })
+            .to_string();
+            args.push("--mcp-config".to_string());
+            args.push(mcp_json);
+        }
+        if let Some(ref sys_append) = cfg.system_prompt_append
+            && !sys_append.trim().is_empty()
+        {
+            args.push("--append-system-prompt".to_string());
+            args.push(sys_append.clone());
+        }
+
+        let mut env = cfg.extra_env.clone();
+        env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-ts".into());
+        env.insert(
+            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".into(),
+            "true".into(),
+        );
+        env.insert("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into());
+        env.insert("NO_COLOR".into(), "1".into());
+        if let Some(eff) = cfg.effort {
+            let eff_str = match eff {
+                ReasoningEffort::Off => None,
+                ReasoningEffort::Low => Some("low"),
+                ReasoningEffort::Medium => Some("medium"),
+                ReasoningEffort::High => Some("high"),
+                ReasoningEffort::Xhigh => Some("xhigh"),
+                ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
+            };
+            if let Some(s) = eff_str {
+                env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), s.into());
+            }
+        }
+
+        let spec = ShimSpawnSpec {
+            shim_id: format!("claude_{}", cfg.agent_id),
+            mode: ShimMode::Stdio,
+            program: cfg.executable.to_string_lossy().to_string(),
+            args,
+            cwd: cfg.cwd.clone(),
+            env,
         };
-        if let Some(s) = eff_str {
-            env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), s.into());
-        }
-    }
 
-    let spec = ShimSpawnSpec {
-        shim_id: format!("claude_{}", cfg.agent_id),
-        mode: ShimMode::Stdio,
-        program: cfg.executable.to_string_lossy().to_string(),
-        args,
-        cwd: cfg.cwd.clone(),
-        env,
+        let mut fresh = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
+            .await
+            .map_err(|e| format!("failed to spawn claude shim: {e}"))?;
+
+        // Send mandatory `initialize` control_request handshake
+        let init_req = json!({
+            "request_id": "init_1",
+            "type": "control_request",
+            "request": {
+                "subtype": "initialize",
+                "forwardSubagentText": true,
+                "perTaskStopAffordance": true
+            }
+        })
+        .to_string();
+
+        fresh
+            .write_stdin_line(init_req)
+            .await
+            .map_err(|e| format!("failed to write claude initialize: {e}"))?;
+
+        wait_claude_init_response(&mut fresh).await?;
+        fresh
     };
-
-    let mut shim = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
-        .await
-        .map_err(|e| format!("failed to spawn claude shim: {e}"))?;
-
-    // Send mandatory `initialize` control_request handshake
-    let init_req = json!({
-        "request_id": "init_1",
-        "type": "control_request",
-        "request": {
-            "subtype": "initialize",
-            "forwardSubagentText": true,
-            "perTaskStopAffordance": true
-        }
-    })
-    .to_string();
-
-    shim.write_stdin_line(init_req)
-        .await
-        .map_err(|e| format!("failed to write claude initialize: {e}"))?;
-
-    wait_claude_init_response(&mut shim).await?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<DriverCommand>(64);
     let (evt_tx, evt_rx) = mpsc::channel::<DriverEvent>(256);
@@ -158,30 +190,73 @@ async fn run_claude_actor(
     let mut emitted_text_in_turn = false;
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingClaudePerm> = HashMap::new();
+    let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
+    let mut declared_tasks: HashMap<String, ProviderSubagentDescriptor> = HashMap::new();
+    let mut tool_use_to_task: HashMap<String, String> = HashMap::new();
 
     loop {
         tokio::select! {
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
-                    DriverCommand::SendPrompt { turn_id, prompt } => {
-                        let priority = if active_turn_id.is_some() {
-                            Some("next")
-                        } else {
-                            active_turn_id = Some(turn_id.clone());
-                            streamed_blocks.clear();
-                            emitted_text_in_turn = false;
-                            let _ = evt_tx
-                                .send(DriverEvent::StatusChanged(AgentStatus::Running {
-                                    turn_id: turn_id.clone(),
-                                }))
-                                .await;
-                            None
-                        };
+                    DriverCommand::SendPrompt { turn_id, prompt, behavior } => {
+                        if active_turn_id.is_some() {
+                            match behavior {
+                                ActiveTurnBehavior::Queue => {
+                                    queued_prompts.push_back((turn_id, prompt));
+                                    continue;
+                                }
+                                ActiveTurnBehavior::Interrupt => {
+                                    let rid = format!("ctrl_{ctrl_seq}");
+                                    ctrl_seq += 1;
+                                    let req = json!({
+                                        "request_id": rid,
+                                        "type": "control_request",
+                                        "request": {
+                                            "subtype": "interrupt",
+                                            "cancel_queued": true
+                                        }
+                                    });
+                                    let _ = shim.write_stdin_line(req.to_string()).await;
+                                    queued_prompts.push_front((turn_id, prompt));
+                                    continue;
+                                }
+                                ActiveTurnBehavior::Steer => {
+                                    let content_blocks = build_claude_content_blocks(
+                                        &prompt,
+                                        cfg.attachments_dir.as_deref(),
+                                    );
+                                    let user_frame = json!({
+                                        "type": "user",
+                                        "session_id": session_id,
+                                        "parent_tool_use_id": null,
+                                        "uuid": Uuid::new_v4().to_string(),
+                                        "priority": "next",
+                                        "message": {
+                                            "role": "user",
+                                            "content": content_blocks
+                                        }
+                                    });
+                                    if shim.write_stdin_line(user_frame.to_string()).await.is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
+                        active_turn_id = Some(turn_id.clone());
+                        streamed_blocks.clear();
+                        emitted_text_in_turn = false;
+                        let _ = evt_tx
+                            .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                                turn_id: turn_id.clone(),
+                            }))
+                            .await;
 
                         let content_blocks =
                             build_claude_content_blocks(&prompt, cfg.attachments_dir.as_deref());
-                        let mut user_frame = json!({
+                        let user_frame = json!({
                             "type": "user",
                             "session_id": session_id,
                             "parent_tool_use_id": null,
@@ -191,9 +266,6 @@ async fn run_claude_actor(
                                 "content": content_blocks
                             }
                         });
-                        if let Some(p) = priority {
-                            user_frame["priority"] = Value::String(p.to_string());
-                        }
                         if shim.write_stdin_line(user_frame.to_string()).await.is_err() {
                             break;
                         }
@@ -363,22 +435,134 @@ async fn run_claude_actor(
                         };
                         match frame_type {
                             "system" => {
-                                if val.get("subtype").and_then(|v| v.as_str()) == Some("init")
-                                    && let Some(sid) = val.get("session_id").and_then(|v| v.as_str())
-                                    && !sid.is_empty()
-                                    && sid != session_id
-                                {
-                                    session_id = sid.to_string();
-                                    let model = val
-                                        .get("model")
-                                        .and_then(|v| v.as_str())
-                                        .map(ToOwned::to_owned);
-                                    let _ = evt_tx
-                                        .send(DriverEvent::SessionInitialized {
-                                            persistence_ref: session_id.clone(),
-                                            model,
-                                        })
-                                        .await;
+                                let subtype = val.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+                                match subtype {
+                                    "init" => {
+                                        if let Some(sid) = val.get("session_id").and_then(|v| v.as_str())
+                                            && !sid.is_empty()
+                                            && sid != session_id
+                                        {
+                                            session_id = sid.to_string();
+                                            let model = val
+                                                .get("model")
+                                                .and_then(|v| v.as_str())
+                                                .map(ToOwned::to_owned);
+                                            let _ = evt_tx
+                                                .send(DriverEvent::SessionInitialized {
+                                                    persistence_ref: session_id.clone(),
+                                                    model,
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    "task_started" => {
+                                        let task_type = val.get("task_type").and_then(|v| v.as_str()).unwrap_or("local_agent");
+                                        let skip_transcript = val.get("skip_transcript").and_then(|v| v.as_bool()).unwrap_or(false);
+                                        if task_type != "local_bash" && !skip_transcript {
+                                            let task_id = val
+                                                .get("task_id")
+                                                .or_else(|| val.get("tool_use_id"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            if !task_id.is_empty() {
+                                                if let Some(tuid) = val.get("tool_use_id").and_then(|v| v.as_str()) {
+                                                    tool_use_to_task.insert(tuid.to_string(), task_id.clone());
+                                                }
+                                                let title = val
+                                                    .get("description")
+                                                    .or_else(|| val.get("summary"))
+                                                    .and_then(|v| v.as_str())
+                                                    .filter(|s| !s.trim().is_empty())
+                                                    .unwrap_or(if task_type == "local_workflow" { "Workflow" } else { "Subagent" })
+                                                    .to_string();
+                                                let parent_sub = val
+                                                    .get("parent_tool_use_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .and_then(|p| tool_use_to_task.get(p).cloned());
+                                                let now = Utc::now();
+                                                let desc = ProviderSubagentDescriptor {
+                                                    subagent_id: task_id.clone(),
+                                                    parent_agent_id: cfg.agent_id.clone(),
+                                                    parent_subagent_id: parent_sub,
+                                                    title,
+                                                    subtitle: val.get("model").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                                                    status: ProviderSubagentStatus::Running,
+                                                    created_at: now,
+                                                    updated_at: now,
+                                                };
+                                                declared_tasks.insert(task_id, desc.clone());
+                                                let _ = evt_tx.send(DriverEvent::ProviderSubagentUpsert(desc)).await;
+                                            }
+                                        }
+                                    }
+                                    "task_updated" | "task_progress" => {
+                                        let lookup_id = val
+                                            .get("task_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(ToOwned::to_owned)
+                                            .or_else(|| {
+                                                val.get("tool_use_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .and_then(|id| tool_use_to_task.get(id).cloned())
+                                            });
+                                        if let Some(tid) = lookup_id
+                                            && let Some(desc) = declared_tasks.get_mut(&tid)
+                                        {
+                                            if let Some(title) = val
+                                                .pointer("/patch/description")
+                                                .or_else(|| val.get("description"))
+                                                .and_then(|v| v.as_str())
+                                                .filter(|s| !s.trim().is_empty())
+                                            {
+                                                desc.title = title.to_string();
+                                            }
+                                            desc.updated_at = Utc::now();
+                                            let _ = evt_tx
+                                                .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+                                                .await;
+                                        }
+                                    }
+                                    "task_notification" => {
+                                        let lookup_id = val
+                                            .get("task_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(ToOwned::to_owned)
+                                            .or_else(|| {
+                                                val.get("tool_use_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .and_then(|id| tool_use_to_task.get(id).cloned())
+                                            });
+                                        if let Some(tid) = lookup_id
+                                            && let Some(desc) = declared_tasks.get_mut(&tid)
+                                        {
+                                            let st = val.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+                                            desc.status = match st {
+                                                "failed" | "error" => ProviderSubagentStatus::Failed,
+                                                "stopped" | "canceled" | "cancelled" => ProviderSubagentStatus::Canceled,
+                                                _ => ProviderSubagentStatus::Completed,
+                                            };
+                                            desc.updated_at = Utc::now();
+                                            let _ = evt_tx
+                                                .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+                                                .await;
+                                            if let Some(summary) = val.get("summary").and_then(|v| v.as_str())
+                                                && !summary.trim().is_empty()
+                                            {
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::ProviderSubagentTimeline {
+                                                        subagent_id: tid,
+                                                        payload: TimelinePayload::AssistantMessage {
+                                                            item_id: format!("task_notif_{}", Uuid::new_v4().simple()),
+                                                            text: summary.to_string(),
+                                                            streaming: false,
+                                                        },
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                             "stream_event" => {
@@ -461,7 +645,43 @@ async fn run_claude_actor(
                                 }
                             }
                             "assistant" => {
-                                if val.get("parent_tool_use_id").is_some_and(|v| !v.is_null()) {
+                                if let Some(parent_tuid) = val.get("parent_tool_use_id").and_then(|v| v.as_str()) {
+                                    if let Some(sub_id) = tool_use_to_task.get(parent_tuid).cloned()
+                                        && let Some(blocks) = val.pointer("/message/content").and_then(|v| v.as_array())
+                                    {
+                                        for (i, b) in blocks.iter().enumerate() {
+                                            let btype = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                            if btype == "text"
+                                                && let Some(txt) = b.get("text").and_then(|v| v.as_str())
+                                                && !txt.trim().is_empty()
+                                            {
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::ProviderSubagentTimeline {
+                                                        subagent_id: sub_id.clone(),
+                                                        payload: TimelinePayload::AssistantMessage {
+                                                            item_id: format!("sub_{i}_{}", Uuid::new_v4().simple()),
+                                                            text: txt.to_string(),
+                                                            streaming: false,
+                                                        },
+                                                    })
+                                                    .await;
+                                            } else if btype == "tool_use" {
+                                                let cid = b.get("id").and_then(|v| v.as_str()).unwrap_or("sub_t").to_string();
+                                                let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("Tool");
+                                                let detail = map_claude_tool_detail(name, &b["input"], None);
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::ProviderSubagentTimeline {
+                                                        subagent_id: sub_id.clone(),
+                                                        payload: TimelinePayload::ToolCall {
+                                                            call_id: cid,
+                                                            status: ToolCallStatus::Completed,
+                                                            detail,
+                                                        },
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                                 let mid = val
@@ -607,6 +827,35 @@ async fn run_claude_actor(
                                     let _ = evt_tx
                                         .send(DriverEvent::StatusChanged(AgentStatus::Idle))
                                         .await;
+                                }
+
+                                // Drain queued or interrupted-replacement prompt immediately on turn settle
+                                if let Some((next_tid, next_prompt)) = queued_prompts.pop_front() {
+                                    active_turn_id = Some(next_tid.clone());
+                                    streamed_blocks.clear();
+                                    emitted_text_in_turn = false;
+                                    let _ = evt_tx
+                                        .send(DriverEvent::StatusChanged(AgentStatus::Running {
+                                            turn_id: next_tid,
+                                        }))
+                                        .await;
+                                    let content_blocks = build_claude_content_blocks(
+                                        &next_prompt,
+                                        cfg.attachments_dir.as_deref(),
+                                    );
+                                    let user_frame = json!({
+                                        "type": "user",
+                                        "session_id": session_id,
+                                        "parent_tool_use_id": null,
+                                        "uuid": Uuid::new_v4().to_string(),
+                                        "message": {
+                                            "role": "user",
+                                            "content": content_blocks
+                                        }
+                                    });
+                                    if shim.write_stdin_line(user_frame.to_string()).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
                             _ => {}
@@ -1309,17 +1558,22 @@ pub async fn probe_claude_models(executable: Option<&Path>) -> ProviderModelCata
     let Some(exe) = executable else {
         return fallback_claude_models();
     };
-    let ver = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::process::Command::new(exe)
+    let ver = tokio::time::timeout(Duration::from_secs(2), async {
+        let child = tokio::process::Command::new(exe)
             .arg("--version")
             .env("NO_COLOR", "1")
-            .output(),
-    )
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let out = child.wait_with_output().await.ok()?;
+        parse_semver_prefix(&String::from_utf8_lossy(&out.stdout))
+    })
     .await
     .ok()
-    .and_then(|r| r.ok())
-    .and_then(|out| parse_semver_prefix(&String::from_utf8_lossy(&out.stdout)));
+    .flatten();
 
     build_claude_catalog_for_version(ver)
 }

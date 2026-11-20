@@ -17,8 +17,8 @@ use orbit_protocol::{
     WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
 };
 use orbit_providers::{
-    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, SessionLaunchConfig, find_provider_executable,
-    spawn_provider_session,
+    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, SessionLaunchConfig,
+    find_provider_executable, spawn_provider_session,
 };
 use orbit_shim::{
     ShimClient, ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, kill_existing_shim,
@@ -343,7 +343,19 @@ impl AgentOrchestrator {
                 }
             }
 
-            // No surviving live shim -> normalize stale transient statuses to `Closed`
+            // No surviving live shim -> normalize stale transient statuses to `Closed` and settle
+            // any orphaned `Running` background-task tool calls in place so they never resurrect.
+            if let Ok(stale_bg) = self.store.list_running_background_tool_calls(&ag.agent_id)
+                && !stale_bg.is_empty()
+            {
+                let settlements: Vec<(String, ToolCallStatus)> = stale_bg
+                    .into_iter()
+                    .map(|(cid, _, _)| (cid, ToolCallStatus::Failed))
+                    .collect();
+                let _ = self
+                    .store
+                    .settle_timeline_tool_calls_in_place(&ag.agent_id, &settlements);
+            }
             if matches!(
                 ag.status,
                 AgentStatus::Running { .. }
@@ -2685,6 +2697,24 @@ impl AgentOrchestrator {
             );
         }
 
+        let persisted_running_bg_tasks: Vec<PersistedBackgroundTask> = self
+            .store
+            .list_running_background_tool_calls(&summary.agent_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(call_id, detail, info)| PersistedBackgroundTask {
+                call_id,
+                detail,
+                info,
+            })
+            .collect();
+
+        let persisted_bg_wait = matches!(
+            &summary.status,
+            AgentStatus::AutonomousWakeup { source, .. }
+                if source.trim().starts_with("waiting:")
+        );
+
         let handle = spawn_provider_session(SessionLaunchConfig {
             agent_id: summary.agent_id.clone(),
             provider: summary.provider,
@@ -2702,6 +2732,8 @@ impl AgentOrchestrator {
             system_prompt_append: profile.and_then(|p| p.system_prompt_append),
             extra_env,
             reattach_existing_shim,
+            persisted_running_bg_tasks,
+            persisted_bg_wait,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -2793,6 +2825,17 @@ impl AgentOrchestrator {
                     let _ = self
                         .broadcast_tx
                         .send(DaemonBroadcast::ProviderSubagentTimelineLive(saved));
+                }
+                return;
+            }
+            DriverEvent::ReconcileBackgroundTasks(settlements) => {
+                if let Ok(updated) = self
+                    .store
+                    .settle_timeline_tool_calls_in_place(agent_id, &settlements)
+                    && updated > 0
+                    && let Ok(Some(ag)) = self.store.get_agent(agent_id)
+                {
+                    let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
                 }
                 return;
             }
@@ -2950,7 +2993,8 @@ impl AgentOrchestrator {
             }
             DriverEvent::SessionInitialized { .. }
             | DriverEvent::ProviderSubagentUpsert(_)
-            | DriverEvent::ProviderSubagentTimeline { .. } => unreachable!(),
+            | DriverEvent::ProviderSubagentTimeline { .. }
+            | DriverEvent::ReconcileBackgroundTasks(_) => unreachable!(),
         };
 
         let is_status_change = matches!(payload, TimelinePayload::StatusChanged { .. });

@@ -6,15 +6,15 @@ pub mod orchestration;
 pub mod workspace_sync;
 pub use orchestration::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, AgentSummary, ProviderKind, ReasoningEffort, SessionMode, TerminalSummary,
-    TimelineEvent, TimelinePayload, WorkspaceClusterSuggestion, WorkspaceSetupStatus,
-    WorkspaceSummary,
+    AgentStatus, AgentSummary, BackgroundTaskInfo, ProviderKind, ReasoningEffort, SessionMode,
+    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    WorkspaceClusterSuggestion, WorkspaceSetupStatus, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -666,6 +666,149 @@ impl OrbitStore {
             timestamp: now,
             payload,
         })
+    }
+
+    /// Returns all persisted background-task `ToolCall` entries for `agent_id` whose latest
+    /// chronological status in `timeline_events` is still `ToolCallStatus::Running`.
+    pub fn list_running_background_tool_calls(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<(String, ToolCallDetail, BackgroundTaskInfo)>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, payload_json
+             FROM timeline_events
+             WHERE agent_id = ?1
+               AND payload_json LIKE '%\"type\":\"tool_call\"%'
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![agent_id], |r| {
+            Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?))
+        })?;
+
+        let mut open_by_call: HashMap<String, (u64, ToolCallDetail, BackgroundTaskInfo)> =
+            HashMap::new();
+        let mut finished_task_ids: HashSet<String> = HashSet::new();
+
+        for row in rows {
+            let (seq, payload_str) = row?;
+            let Ok(TimelinePayload::ToolCall {
+                call_id,
+                status,
+                detail,
+                background_task,
+            }) = serde_json::from_str::<TimelinePayload>(&payload_str)
+            else {
+                continue;
+            };
+            if status == ToolCallStatus::Running {
+                if let Some(bg) = background_task {
+                    let already_finished = bg
+                        .task_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_some_and(|tid| finished_task_ids.contains(tid));
+                    if !already_finished {
+                        open_by_call.insert(call_id, (seq, detail, bg));
+                    }
+                }
+            } else {
+                open_by_call.remove(&call_id);
+                if let Some(tid) = background_task
+                    .as_ref()
+                    .and_then(|b| b.task_id.as_deref())
+                    .filter(|s| !s.is_empty())
+                {
+                    finished_task_ids.insert(tid.to_string());
+                    open_by_call.retain(|_, (_, _, bg)| bg.task_id.as_deref() != Some(tid));
+                }
+            }
+        }
+
+        let mut out: Vec<(u64, String, ToolCallDetail, BackgroundTaskInfo)> = open_by_call
+            .into_iter()
+            .map(|(cid, (seq, det, bg))| (seq, cid, det, bg))
+            .collect();
+        out.sort_by_key(|(seq, _, _, _)| *seq);
+        Ok(out
+            .into_iter()
+            .map(|(_, cid, det, bg)| (cid, det, bg))
+            .collect())
+    }
+
+    /// Reconcile stale historical `ToolCallStatus::Running` rows in place (preserving their
+    /// original chronological `seq`) and bump `agents.timeline_epoch` when rows change so all
+    /// connected clients refresh their replicas cleanly without appending cards to the latest turn.
+    pub fn settle_timeline_tool_calls_in_place(
+        &self,
+        agent_id: &str,
+        settlements: &[(String, ToolCallStatus)],
+    ) -> Result<usize, StoreError> {
+        if settlements.is_empty() {
+            return Ok(0);
+        }
+        let target_map: HashMap<&str, ToolCallStatus> = settlements
+            .iter()
+            .map(|(cid, st)| (cid.as_str(), *st))
+            .collect();
+
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+
+        let mut pending_updates: Vec<(i64, String)> = Vec::new();
+        {
+            let mut stmt = tx.prepare(
+                "SELECT seq, payload_json
+                 FROM timeline_events
+                 WHERE agent_id = ?1
+                   AND payload_json LIKE '%\"type\":\"tool_call\"%'
+                   AND payload_json LIKE '%\"status\":\"running\"%'",
+            )?;
+            let rows = stmt.query_map(params![agent_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (seq, payload_str) = row?;
+                if let Ok(TimelinePayload::ToolCall {
+                    call_id,
+                    status: ToolCallStatus::Running,
+                    detail,
+                    background_task,
+                }) = serde_json::from_str::<TimelinePayload>(&payload_str)
+                    && let Some(&final_status) = target_map.get(call_id.as_str())
+                {
+                    let updated_payload = TimelinePayload::ToolCall {
+                        call_id,
+                        status: final_status,
+                        detail,
+                        background_task,
+                    };
+                    let updated_json = serde_json::to_string(&updated_payload)?;
+                    pending_updates.push((seq, updated_json));
+                }
+            }
+        }
+
+        let updated_count = pending_updates.len();
+        for (seq, updated_json) in pending_updates {
+            tx.execute(
+                "UPDATE timeline_events SET payload_json = ?1 WHERE seq = ?2",
+                params![updated_json, seq],
+            )?;
+        }
+
+        if updated_count > 0 {
+            let now_str = Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE agents
+                 SET timeline_epoch = timeline_epoch + 1, updated_at = ?1
+                 WHERE agent_id = ?2",
+                params![now_str, agent_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(updated_count)
     }
 
     /// Upsert a server-sequenced timeline event into a client's local SQLite replica cache (`0ms` instant load).
@@ -2663,5 +2806,168 @@ mod tests {
                 .expect("list after host wipe")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn running_background_tool_calls_list_and_settle_in_place_bump_epoch() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_bg".into(),
+                title: "bg".into(),
+                cwd: "/repo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_bg".into(),
+                    workspace_id: "ws_bg".into(),
+                    cwd: "/repo".into(),
+                    title: "BG Test".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::FullAccess,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: orbit_protocol::AttentionState::None,
+                    last_activity_at: Some(now),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                },
+                Some("sess_bg"),
+            )
+            .expect("agent");
+
+        // Stale timer left `running` in Turn 1
+        let ev1 = store
+            .append_timeline_event(
+                "ag_bg",
+                1,
+                None,
+                TimelinePayload::ToolCall {
+                    call_id: "wake_tool_57_0".into(),
+                    status: ToolCallStatus::Running,
+                    detail: ToolCallDetail::Generic {
+                        tool_name: "schedule".into(),
+                        arguments_json: "{}".into(),
+                    },
+                    background_task: Some(BackgroundTaskInfo {
+                        task_id: Some("sess_bg/task-58".into()),
+                        label: Some("Timer: 4m".into()),
+                        log_path: None,
+                    }),
+                },
+            )
+            .expect("append stale timer");
+
+        // Turn 2 opens with a new user prompt and launches a genuinely live task
+        store
+            .append_timeline_event(
+                "ag_bg",
+                1,
+                None,
+                TimelinePayload::UserPrompt {
+                    message_id: "u2".into(),
+                    text: "continue".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("append prompt");
+        let ev3 = store
+            .append_timeline_event(
+                "ag_bg",
+                1,
+                None,
+                TimelinePayload::ToolCall {
+                    call_id: "call_live_1".into(),
+                    status: ToolCallStatus::Running,
+                    detail: ToolCallDetail::Shell {
+                        command: "python run.py".into(),
+                        cwd: None,
+                        exit_code: None,
+                        output_preview: None,
+                    },
+                    background_task: Some(BackgroundTaskInfo {
+                        task_id: Some("sess_bg/task-290".into()),
+                        label: Some("python run.py".into()),
+                        log_path: None,
+                    }),
+                },
+            )
+            .expect("append live task");
+
+        let running = store
+            .list_running_background_tool_calls("ag_bg")
+            .expect("list running");
+        assert_eq!(running.len(), 2);
+        assert_eq!(running[0].0, "wake_tool_57_0");
+        assert_eq!(running[1].0, "call_live_1");
+
+        // Settle only the stale timer in place -> preserves original `seq`, bumps `timeline_epoch`
+        let updated = store
+            .settle_timeline_tool_calls_in_place(
+                "ag_bg",
+                &[("wake_tool_57_0".into(), ToolCallStatus::Completed)],
+            )
+            .expect("settle in place");
+        assert_eq!(updated, 1);
+
+        let ag_after = store.get_agent("ag_bg").expect("get").expect("some");
+        assert_eq!(ag_after.timeline_epoch, 1);
+
+        let remaining = store
+            .list_running_background_tool_calls("ag_bg")
+            .expect("remaining");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, "call_live_1");
+
+        let all_events = store.fetch_timeline_from("ag_bg", 0).expect("fetch all");
+        assert_eq!(all_events.len(), 3);
+        assert_eq!(all_events[0].seq, ev1.seq);
+        assert!(matches!(
+            all_events[0].payload,
+            TimelinePayload::ToolCall {
+                status: ToolCallStatus::Completed,
+                ..
+            }
+        ));
+        assert_eq!(all_events[2].seq, ev3.seq);
+        assert!(matches!(
+            all_events[2].payload,
+            TimelinePayload::ToolCall {
+                status: ToolCallStatus::Running,
+                ..
+            }
+        ));
     }
 }

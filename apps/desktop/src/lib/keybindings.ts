@@ -250,7 +250,7 @@ export function useGlobalErgonomicKeybindings(): void {
         const now = Date.now();
         if (now - lastEscTimeRef.current < 420) {
           lastEscTimeRef.current = 0;
-          if (snap.selectedHostId && snap.selectedAgentId) {
+          if (!snap.isDraftNewSession && snap.selectedHostId && snap.selectedAgentId) {
             const detail = snap.hostDetails[snap.selectedHostId];
             const ag = detail?.agents.find((a) => a.agent_id === snap.selectedAgentId);
             if (ag?.is_running || ag?.is_awaiting_permission) {

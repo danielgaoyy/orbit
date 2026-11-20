@@ -762,6 +762,14 @@ function syncAttentionIndicators(overview: FleetOverviewView, details: Record<st
   }
 }
 
+/** Tracks an explicit user-initiated draft creation so unrelated background/child agents never hijack draft mode. */
+let pendingDraftCreate: {
+  hostId: string;
+  optimisticAgentId: string | null;
+  startedAt: number;
+} | null = null;
+const PENDING_DRAFT_CREATE_TTL_MS = 30_000;
+
 function slugifyPrefixedBranch(prefix: string, prompt: string): string {
   const cleanPrefix = prefix.trim().replace(/\/+$/, "");
   const slug = prompt
@@ -1145,7 +1153,6 @@ export const orbitActions = {
 
   async reloadFleetAndHosts(initialBootstrap = false): Promise<void> {
     const snap = await orbitIpc.getFleetOverview();
-    const targetHostId = state.selectedHostId ?? snap.hosts[0]?.host_id ?? null;
 
     const detailEntries = await Promise.all(
       snap.hosts.map(async (h) => {
@@ -1160,13 +1167,14 @@ export const orbitActions = {
     }
 
     setState((s) => {
+      const targetHostId = s.selectedHostId ?? snap.hosts[0]?.host_id ?? null;
       const activeHostId =
         targetHostId && snap.hosts.some((h) => h.host_id === targetHostId)
           ? targetHostId
           : (snap.hosts[0]?.host_id ?? null);
       const activeDetail = activeHostId ? nextDetails[activeHostId] : undefined;
 
-      let nextAgentId = s.selectedAgentId;
+      let nextAgentId = s.isDraftNewSession ? null : s.selectedAgentId;
       let nextDraft = s.isDraftNewSession;
       if (!s.isDraftNewSession && activeDetail && activeHostId) {
         const stillExists =
@@ -1182,7 +1190,10 @@ export const orbitActions = {
         }
       }
 
-      const activeAgent = activeDetail?.agents.find((a) => a.agent_id === nextAgentId);
+      const activeAgent =
+        !nextDraft && nextAgentId
+          ? activeDetail?.agents.find((a) => a.agent_id === nextAgentId)
+          : undefined;
       const nextCwd =
         activeAgent?.cwd ||
         s.selectedWorkspaceCwd ||
@@ -1231,6 +1242,7 @@ export const orbitActions = {
         }
         if (initialBootstrap || !state.stages[tlKey]) {
           void orbitIpc.openAgentTimeline(state.selectedHostId, state.selectedAgentId);
+          void orbitIpc.listProviderSubagents(state.selectedHostId, state.selectedAgentId);
           void orbitActions.pullStageDelta(state.selectedHostId, state.selectedAgentId, true);
         }
       }
@@ -1244,10 +1256,29 @@ export const orbitActions = {
     if (!detail) return;
 
     const prevAgents = state.hostDetails[hostId]?.agents ?? [];
+    if (
+      pendingDraftCreate &&
+      Date.now() - pendingDraftCreate.startedAt > PENDING_DRAFT_CREATE_TTL_MS
+    ) {
+      pendingDraftCreate = null;
+    }
+    const awaitingDraftForHost =
+      pendingDraftCreate !== null && pendingDraftCreate.hostId === hostId;
     const newestCreated =
-      state.selectedHostId === hostId && state.isDraftNewSession
-        ? detail.agents.find((a) => !prevAgents.some((p) => p.agent_id === a.agent_id))
+      state.selectedHostId === hostId && state.isDraftNewSession && awaitingDraftForHost
+        ? (pendingDraftCreate?.optimisticAgentId
+            ? detail.agents.find((a) => a.agent_id === pendingDraftCreate?.optimisticAgentId)
+            : undefined) ??
+          detail.agents.find(
+            (a) =>
+              !a.parent_agent_id &&
+              !a.background &&
+              !prevAgents.some((p) => p.agent_id === a.agent_id),
+          )
         : undefined;
+    if (newestCreated) {
+      pendingDraftCreate = null;
+    }
 
     if (
       state.notifyOnTurnComplete &&
@@ -1358,6 +1389,7 @@ export const orbitActions = {
 
     if (newestCreated) {
       void orbitIpc.openAgentTimeline(hostId, newestCreated.agent_id);
+      void orbitIpc.listProviderSubagents(hostId, newestCreated.agent_id);
       void orbitActions.pullStageDelta(hostId, newestCreated.agent_id, true);
     }
   },
@@ -1481,6 +1513,7 @@ export const orbitActions = {
   },
 
   selectHost(hostId: string): void {
+    pendingDraftCreate = null;
     const detail = state.hostDetails[hostId];
     const firstAgent =
       detail?.agents.find(
@@ -1514,6 +1547,7 @@ export const orbitActions = {
     if (firstAgent) {
       markThreadSeenInCore(hostId, firstAgent.agent_id, firstAgent.latest_seq);
       void orbitIpc.openAgentTimeline(hostId, firstAgent.agent_id);
+      void orbitIpc.listProviderSubagents(hostId, firstAgent.agent_id);
       void orbitActions.pullStageDelta(hostId, firstAgent.agent_id, false);
     }
     if (nextCwd && nextCwd !== "~") {
@@ -1522,6 +1556,7 @@ export const orbitActions = {
   },
 
   selectAgent(hostId: string, agentId: string): void {
+    pendingDraftCreate = null;
     const detail = state.hostDetails[hostId];
     const ag = detail?.agents.find((a) => a.agent_id === agentId);
     const nextCwd = ag?.cwd ?? state.selectedWorkspaceCwd;
@@ -1568,6 +1603,7 @@ export const orbitActions = {
     prefillPrompt?: string,
     prefillSlash?: SlashDirective | null,
   ): void {
+    pendingDraftCreate = null;
     const targetHostId = hostId ?? state.selectedHostId ?? state.fleet.hosts[0]?.host_id ?? null;
     const detail = targetHostId ? state.hostDetails[targetHostId] : undefined;
     const defaultCwd =
@@ -1589,6 +1625,7 @@ export const orbitActions = {
       activeView: "workspace",
       workspacePanel: "conversation",
       selectedHostId: targetHostId,
+      selectedAgentId: null,
       isDraftNewSession: true,
       selectedWorkspaceCwd: defaultCwd || "~",
       draftProvider: nextProvider,
@@ -1650,6 +1687,7 @@ export const orbitActions = {
     setState((s) => ({
       ...s,
       selectedHostId: hostId,
+      selectedAgentId: s.isDraftNewSession ? null : s.selectedAgentId,
       selectedWorkspaceCwd: cwd,
       selectedDiffPath: null,
       draftProvider:
@@ -2332,19 +2370,33 @@ export const orbitActions = {
           cat.configured_default_effort,
         );
 
-      await orbitIpc.createAgent({
-        hostId,
-        cwd: state.selectedWorkspaceCwd || "~",
-        provider: effectiveProvider,
-        model: resolvedModel,
-        effort: resolvedEffort,
-        mode: state.draftMode,
-        initialPrompt: assembledWirePrompt,
-        initialDisplayPrompt: cleanUserText,
-        initialBadges: badges,
-        worktreeBranch,
-        profileId: state.draftProfileId,
-      });
+      pendingDraftCreate = { hostId, optimisticAgentId: null, startedAt: Date.now() };
+      let optimisticId: string | undefined;
+      try {
+        optimisticId = await orbitIpc.createAgent({
+          hostId,
+          cwd: state.selectedWorkspaceCwd || "~",
+          provider: effectiveProvider,
+          model: resolvedModel,
+          effort: resolvedEffort,
+          mode: state.draftMode,
+          initialPrompt: assembledWirePrompt,
+          initialDisplayPrompt: cleanUserText,
+          initialBadges: badges,
+          worktreeBranch,
+          profileId: state.draftProfileId,
+        });
+      } catch (err) {
+        pendingDraftCreate = null;
+        throw err;
+      }
+      if (optimisticId && pendingDraftCreate && pendingDraftCreate.hostId === hostId) {
+        pendingDraftCreate = {
+          hostId,
+          optimisticAgentId: optimisticId,
+          startedAt: Date.now(),
+        };
+      }
       setState((s) => ({
         ...s,
         draftProvider: effectiveProvider,
@@ -3864,9 +3916,17 @@ export const orbitActions = {
     providerSubagentId?: string | null;
     parentAgentId?: string | null;
   }): void {
-    const tabId = `tab:subagent:${params.childAgentId || params.providerSubagentId || params.callId}`;
     const hostId = state.selectedHostId;
     const parentAgentId = params.parentAgentId ?? state.selectedAgentId;
+    const hasManagedChild = Boolean(
+      hostId &&
+        params.childAgentId &&
+        state.hostDetails[hostId]?.agents.some((a) => a.agent_id === params.childAgentId),
+    );
+    const effectiveChildAgentId = hasManagedChild ? params.childAgentId : null;
+    const effectiveProviderSubagentId =
+      params.providerSubagentId ?? (!hasManagedChild ? params.childAgentId : null);
+    const tabId = `tab:subagent:${effectiveChildAgentId || effectiveProviderSubagentId || params.callId}`;
     setState((s) => {
       const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
       let nextTabs = s.sidePanelTabs;
@@ -3878,8 +3938,8 @@ export const orbitActions = {
         subagentCallId: params.callId,
         subagentRole: params.role,
         subagentPrompt: params.promptPreview,
-        childAgentId: params.childAgentId,
-        providerSubagentId: params.providerSubagentId ?? null,
+        childAgentId: effectiveChildAgentId,
+        providerSubagentId: effectiveProviderSubagentId ?? null,
         parentAgentId: parentAgentId ?? null,
       };
       if (existingIdx >= 0) {
@@ -3900,11 +3960,11 @@ export const orbitActions = {
       };
     });
 
-    if (hostId && params.childAgentId) {
-      void orbitIpc.openAgentTimeline(hostId, params.childAgentId);
-      void orbitActions.pullStageDelta(hostId, params.childAgentId, false);
-    } else if (hostId && parentAgentId && params.providerSubagentId) {
-      void orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, params.providerSubagentId);
+    if (hostId && effectiveChildAgentId) {
+      void orbitIpc.openAgentTimeline(hostId, effectiveChildAgentId);
+      void orbitActions.pullStageDelta(hostId, effectiveChildAgentId, false);
+    } else if (hostId && parentAgentId && effectiveProviderSubagentId) {
+      void orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, effectiveProviderSubagentId);
     }
   },
 

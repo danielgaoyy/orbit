@@ -2709,7 +2709,15 @@ impl OrbitAppCore {
     fn handle_inbound_wire(self: &Arc<Self>, host_id: &str, msg: WireMessage) {
         let mut notify_fleet = false;
         let mut notify_host = false;
-        let mut notify_timeline_agent: Option<String> = None;
+        let mut notify_timeline_agents: Vec<String> = Vec::new();
+        let mut push_notify_timeline = |ag_id: String| {
+            if !notify_timeline_agents
+                .iter()
+                .any(|existing| existing == &ag_id)
+            {
+                notify_timeline_agents.push(ag_id);
+            }
+        };
         let mut notify_git_cwd: Option<String> = None;
         let mut auto_subscribe_agent: Option<String> = None;
         let mut continue_catchup: Option<(String, u64)> = None;
@@ -2833,9 +2841,10 @@ impl OrbitAppCore {
                             state.mark_stage_dirty(&ag_id, 0, true);
                             state.rewound_agents.insert(ag_id.clone());
                             stale_replica_agents.push((ag_id.clone(), had_mem));
-                            notify_timeline_agent = Some(ag_id.clone());
+                            push_notify_timeline(ag_id.clone());
                         } else if state.stage_cache.contains_key(&ag_id) {
                             state.mark_stage_meta_dirty(&ag_id);
+                            push_notify_timeline(ag_id.clone());
                         }
                         if is_initial_hydration && a.latest_seq > 0 {
                             initial_seen_seeds.push((ag_id.clone(), a.latest_seq));
@@ -2872,17 +2881,22 @@ impl OrbitAppCore {
                     }
                     if let Some(ref parent_id) = agent.parent_agent_id {
                         state.mark_stage_meta_dirty(parent_id);
+                        push_notify_timeline(parent_id.clone());
                     }
                     state.last_created_agent_id = Some(ag_id.clone());
                     state.agents.insert(ag_id.clone(), agent);
                     auto_subscribe_agent = Some(ag_id.clone());
                     notify_fleet = true;
                     notify_host = true;
-                    notify_timeline_agent = Some(ag_id);
+                    push_notify_timeline(ag_id);
                 }
                 WireMessage::AgentUpdated { agent } => {
                     let ag_id = agent.agent_id.clone();
                     let prev_epoch = state.agents.get(&ag_id).map(|a| a.timeline_epoch);
+                    let prev_parent_id = state
+                        .agents
+                        .get(&ag_id)
+                        .and_then(|a| a.parent_agent_id.clone());
                     let local_max_seq = state
                         .timelines
                         .get(&ag_id)
@@ -2901,16 +2915,31 @@ impl OrbitAppCore {
                     }
                     if let Some(ref parent_id) = agent.parent_agent_id {
                         state.mark_stage_meta_dirty(parent_id);
+                        push_notify_timeline(parent_id.clone());
+                    }
+                    if let Some(prev_pid) = prev_parent_id
+                        && agent.parent_agent_id.as_deref() != Some(prev_pid.as_str())
+                    {
+                        state.mark_stage_meta_dirty(&prev_pid);
+                        push_notify_timeline(prev_pid);
                     }
                     state.agents.insert(ag_id.clone(), agent);
                     notify_fleet = true;
                     notify_host = true;
-                    notify_timeline_agent = Some(ag_id);
+                    push_notify_timeline(ag_id);
                 }
                 WireMessage::AgentDeleted { agent_id } => {
+                    let parent_id = state
+                        .agents
+                        .get(&agent_id)
+                        .and_then(|a| a.parent_agent_id.clone());
                     state.agents.remove(&agent_id);
                     state.timelines.remove(&agent_id);
                     state.provider_subagents.remove(&agent_id);
+                    if let Some(pid) = parent_id {
+                        state.mark_stage_meta_dirty(&pid);
+                        push_notify_timeline(pid);
+                    }
                     notify_fleet = true;
                     notify_host = true;
                 }
@@ -2999,6 +3028,7 @@ impl OrbitAppCore {
                     ..
                 } => {
                     state.mark_stage_meta_dirty(&parent_agent_id);
+                    push_notify_timeline(parent_agent_id.clone());
                     state.provider_subagents.insert(parent_agent_id, subagents);
                     notify_host = true;
                 }
@@ -3017,6 +3047,7 @@ impl OrbitAppCore {
                         list.push(subagent);
                     }
                     state.mark_stage_meta_dirty(&parent_id);
+                    push_notify_timeline(parent_id);
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentTimelineCatchup {
@@ -3098,7 +3129,7 @@ impl OrbitAppCore {
                     }
                     notify_fleet = true;
                     notify_host = true;
-                    notify_timeline_agent = Some(ag_id);
+                    push_notify_timeline(ag_id);
                 }
                 WireMessage::TimelineCatchup {
                     agent_id,
@@ -3154,7 +3185,7 @@ impl OrbitAppCore {
                     } else {
                         catchup_completed_cursor = Some((agent_id.clone(), final_max));
                     }
-                    notify_timeline_agent = Some(agent_id);
+                    push_notify_timeline(agent_id);
                 }
                 WireMessage::TimelineLive { event } => {
                     let agent_id = event.agent_id.clone();
@@ -3185,7 +3216,7 @@ impl OrbitAppCore {
                     if live_seq > 0 {
                         live_event_cursor = Some((agent_id.clone(), live_seq));
                     }
-                    notify_timeline_agent = Some(agent_id);
+                    push_notify_timeline(agent_id);
                 }
                 WireMessage::GitStatusResponse { status, .. } => {
                     let cwd = status.cwd.clone();
@@ -3335,7 +3366,7 @@ impl OrbitAppCore {
                                     true,
                                 );
                                 notify_fleet = true;
-                                notify_timeline_agent = Some(opt_id);
+                                push_notify_timeline(opt_id);
                             } else if let Some(agent_id) = state.agent_req_by_req_id.remove(&req_id)
                             {
                                 let is_pending_turn =
@@ -3356,7 +3387,7 @@ impl OrbitAppCore {
                                 if reset_status {
                                     notify_fleet = true;
                                 }
-                                notify_timeline_agent = Some(agent_id);
+                                push_notify_timeline(agent_id);
                             }
                         }
                         notify_host = true;
@@ -3486,7 +3517,7 @@ impl OrbitAppCore {
                 host_id: host_id.to_string(),
             });
         }
-        if let Some(agent_id) = notify_timeline_agent {
+        for agent_id in notify_timeline_agents {
             self.emit(|revision| CoreNotification::TimelineChanged {
                 revision,
                 host_id: host_id.to_string(),
@@ -8265,5 +8296,160 @@ mod tests {
             d2.insights.detected_local_urls,
             vec!["http://localhost:5173".to_string()]
         );
+    }
+
+    #[test]
+    fn subagent_and_provider_subagent_updates_emit_parent_timeline_changed() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        struct CapturingSub(Arc<Mutex<Vec<CoreNotification>>>);
+        impl CoreEventSubscriber for CapturingSub {
+            fn on_notification(&self, event: CoreNotification) {
+                if let Ok(mut g) = self.0.lock() {
+                    g.push(event);
+                }
+            }
+        }
+        core.subscribe_with_options(
+            SubscribeOptions {
+                min_interval_ms: 0,
+                include_terminal_raw_bytes: false,
+            },
+            Arc::new(CapturingSub(Arc::clone(&received))),
+        );
+
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_sub".into(),
+                hostname: "sub-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_parent".into(),
+                AgentSummary {
+                    agent_id: "ag_parent".into(),
+                    workspace_id: "ws1".into(),
+                    title: "Parent".into(),
+                    cwd: "/repo".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    created_at: now,
+                    updated_at: now,
+                    latest_seq: 1,
+                    timeline_epoch: 1,
+                    archived_at: None,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                },
+            );
+            core.hosts
+                .write()
+                .expect("hosts write lock")
+                .insert("h_sub".into(), mem);
+        }
+
+        // Prime stage cache for parent
+        let initial = core.agent_stage_delta_with_aux("h_sub", "ag_parent", 0, None);
+        assert!(initial.insights.subagents.is_empty());
+
+        // Clear any initial notifications
+        received.lock().expect("lock").clear();
+
+        // 1. Child Orbit agent update must notify parent's timeline_changed
+        core.handle_inbound_wire(
+            "h_sub",
+            WireMessage::AgentUpdated {
+                agent: AgentSummary {
+                    agent_id: "ag_child".into(),
+                    workspace_id: "ws1".into(),
+                    title: "Child Worker".into(),
+                    cwd: "/repo".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    created_at: now,
+                    updated_at: now,
+                    latest_seq: 1,
+                    timeline_epoch: 1,
+                    archived_at: None,
+                    parent_agent_id: Some("ag_parent".into()),
+                    parent_host_id: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
+                },
+            },
+        );
+        {
+            let mut notes = received.lock().expect("lock");
+            assert!(notes.iter().any(|ev| matches!(
+                ev,
+                CoreNotification::TimelineChanged { agent_id, .. } if agent_id == "ag_parent"
+            )));
+            assert!(notes.iter().any(|ev| matches!(
+                ev,
+                CoreNotification::TimelineChanged { agent_id, .. } if agent_id == "ag_child"
+            )));
+            notes.clear();
+        }
+
+        // 2. ProviderSubagentUpdated must also notify parent's timeline_changed & update insights
+        core.handle_inbound_wire(
+            "h_sub",
+            WireMessage::ProviderSubagentUpdated {
+                subagent: orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "conv_sub_1".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Researcher".into(),
+                    subtitle: Some("Investigating".into()),
+                    status: orbit_protocol::ProviderSubagentStatus::Running,
+                    created_at: now,
+                    updated_at: now,
+                },
+            },
+        );
+        {
+            let notes = received.lock().expect("lock");
+            assert!(notes.iter().any(|ev| matches!(
+                ev,
+                CoreNotification::TimelineChanged { agent_id, .. } if agent_id == "ag_parent"
+            )));
+        }
+
+        let delta = core.agent_stage_delta_with_aux(
+            "h_sub",
+            "ag_parent",
+            initial.revision,
+            Some(initial.aux_revision),
+        );
+        assert!(!delta.aux_unchanged);
+        assert_eq!(delta.insights.subagents.len(), 2);
     }
 }

@@ -19,6 +19,7 @@ import {
   encodeHostPairingUri,
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { type SshHostItem, orbitIpc } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -34,6 +35,7 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   const [deployingSsh, setDeployingSsh] = useState<string | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [upgrading, setUpgrading] = useState(false);
+  const ime = useImeCompositionGuard();
 
   useEffect(() => {
     setRelayInput(host?.relay_url ?? "");
@@ -241,7 +243,9 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
               type="text"
               value={relayInput}
               onChange={(e) => setRelayInput(e.target.value)}
+              {...ime.compositionProps}
               onKeyDown={(e) => {
+                if (ime.shouldIgnoreKeyDown(e)) return;
                 if (e.key === "Enter" && relayDirty) void handleSaveRelay(false);
               }}
               placeholder="wss://relay.example.com"

@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useImeCompositionGuard } from "@/lib/ime";
 import {
   type SideQuestionEntry,
   orbitActions,
@@ -41,6 +42,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
 
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const ime = useImeCompositionGuard();
 
   useEffect(() => {
     requestAnimationFrame(() => inputRef.current?.focus());
@@ -181,8 +183,9 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
             rows={1}
             value={draft}
             onChange={(e) => orbitActions.setSideQuestionDraft(e.target.value)}
+            {...ime.compositionProps}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing) return;
+              if (ime.shouldIgnoreKeyDown(e)) return;
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
                 handleSubmit();

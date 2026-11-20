@@ -96,6 +96,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { isImeKeyEvent } from "@/lib/ime";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -931,6 +932,7 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   liveStartedAtMs,
   latestActivityMs,
   isNetworkOffline = false,
+  isBackgroundWait = false,
   settledDurationMs,
   cwd,
   agentId,
@@ -950,6 +952,7 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   liveStartedAtMs: number | null;
   latestActivityMs?: number | null;
   isNetworkOffline?: boolean;
+  isBackgroundWait?: boolean;
   settledDurationMs: number | null;
   cwd: string;
   agentId: string;
@@ -1020,6 +1023,7 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
               startedAtMs={effectiveLiveStartedAtMs}
               lastActivityMs={latestActivityMs}
               isNetworkOffline={isNetworkOffline}
+              stallLabel={isBackgroundWait ? "running in background" : undefined}
             />
             {showDiffNumbers && (
               <span className="tabular-nums flex shrink-0 items-center gap-1 font-mono text-[11.5px]">
@@ -1960,6 +1964,7 @@ function RewindTurnDialog({
   useEffect(() => {
     if (!target || submitting) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeKeyEvent(e)) return;
       if (e.key !== "Enter" || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
       const activeTag = (document.activeElement as HTMLElement | null)?.tagName;
       if (activeTag === "BUTTON" || activeTag === "INPUT") return;
@@ -2137,10 +2142,12 @@ const InlineLiveElapsed = memo(function InlineLiveElapsed({
   startedAtMs,
   lastActivityMs,
   isNetworkOffline = false,
+  stallLabel = "waiting for response",
 }: {
   startedAtMs: number;
   lastActivityMs?: number | null;
   isNetworkOffline?: boolean;
+  stallLabel?: string;
 }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -2169,7 +2176,7 @@ const InlineLiveElapsed = memo(function InlineLiveElapsed({
         </span>
       ) : isStalled ? (
         <span className="text-muted-foreground/65 shrink-0 text-[12px]">
-          · waiting for response
+          · {stallLabel}
         </span>
       ) : null}
     </>
@@ -2486,6 +2493,14 @@ const TurnStageSection = memo(function TurnStageSection({
                   it.status === "running" &&
                   Boolean(it.background_task),
               );
+              const hasRunningNonBgTool = seg.items.some(
+                (it) =>
+                  it.item_type === "tool_call" &&
+                  it.status === "running" &&
+                  !it.background_task,
+              );
+              const isBackgroundWait =
+                hasRunningBgTask && (seg.has_following_content || !hasRunningNonBgTool);
               const isGroupActive =
                 isTurnActive &&
                 (seg.has_following_content
@@ -2525,6 +2540,7 @@ const TurnStageSection = memo(function TurnStageSection({
                   liveStartedAtMs={groupLiveStartMs}
                   latestActivityMs={seg.latest_activity_ms ?? groupLiveStartMs}
                   isNetworkOffline={isNetworkOffline}
+                  isBackgroundWait={isBackgroundWait}
                   settledDurationMs={groupSettledDurationMs}
                   cwd={cwd}
                   agentId={agentId}

@@ -26,6 +26,7 @@ import {
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs";
 import { Kbd, ShortcutKbd } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import { orbitIpc } from "@/lib/orbit-ipc";
 import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
@@ -62,6 +63,7 @@ function CommandPaletteDialog() {
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
+  const ime = useImeCompositionGuard();
 
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
@@ -351,6 +353,7 @@ function CommandPaletteDialog() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (ime.shouldIgnoreKeyDown(e)) return;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       setActiveIndex((prev) => (filtered.length > 0 ? (prev + 1) % filtered.length : 0));
@@ -374,6 +377,7 @@ function CommandPaletteDialog() {
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            {...ime.compositionProps}
             onKeyDown={handleKeyDown}
             placeholder="Jump to session, run action, or switch host..."
             className="text-foreground placeholder:text-muted-foreground w-full bg-transparent text-[14px] outline-none"

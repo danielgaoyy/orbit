@@ -46,6 +46,20 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     return parentStage?.insights.subagents.find((sa) => sa.id === tab.subagentCallId) ?? null;
   });
 
+  const status = childAgent
+    ? childAgent.is_running
+      ? "running"
+      : childAgent.status_label.toLowerCase().includes("error")
+        ? "failed"
+        : "completed"
+    : providerSubagent
+      ? providerSubagent.status === "running"
+        ? "running"
+        : providerSubagent.status === "completed"
+          ? "completed"
+          : "failed"
+      : (parentSubagent?.status ?? "completed");
+
   const [providerEvents, setProviderEvents] = useState<ProviderSubagentEvent[]>([]);
 
   useEffect(() => {
@@ -65,26 +79,17 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       }
     };
     void poll();
+    if (status !== "running") {
+      return () => {
+        cancelled = true;
+      };
+    }
     const timer = window.setInterval(() => void poll(), 1500);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [hostId, parentAgentId, tab.providerSubagentId]);
-
-  const status = childAgent
-    ? childAgent.is_running
-      ? "running"
-      : childAgent.status_label.toLowerCase().includes("error")
-        ? "failed"
-        : "completed"
-    : providerSubagent
-      ? providerSubagent.status === "running"
-        ? "running"
-        : providerSubagent.status === "completed"
-          ? "completed"
-          : "failed"
-      : (parentSubagent?.status ?? "completed");
+  }, [hostId, parentAgentId, tab.providerSubagentId, status, providerSubagent?.updated_at]);
 
   const resolvedTitle =
     providerSubagent?.title || tab.subagentRole || childAgent?.title || "Subagent";

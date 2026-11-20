@@ -9,6 +9,16 @@ import { cn } from "@/lib/utils";
 
 const EMPTY_FILES: readonly string[] = [];
 
+function parseQueryAndLine(raw: string): { pathQuery: string; line: number | null } {
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^(.*?):(\d+)(?::\d+)?$/);
+  if (match && match[1]) {
+    const line = Number.parseInt(match[2], 10);
+    return { pathQuery: match[1].trim(), line: Number.isNaN(line) ? null : line };
+  }
+  return { pathQuery: trimmed, line: null };
+}
+
 function scorePathMatch(path: string, query: string): number {
   const lower = path.toLowerCase();
   const base = lower.split("/").pop() ?? lower;
@@ -43,33 +53,63 @@ function QuickOpenFileInner() {
   const files = useOrbitSelector((s) =>
     cacheKey ? (s.workspaceFilesCache[cacheKey] ?? EMPTY_FILES) : EMPTY_FILES,
   );
+  const gitStatusFiles = useOrbitSelector((s) =>
+    cacheKey ? (s.gitReviews[cacheKey]?.status?.files ?? null) : null,
+  );
 
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const itemRefs = useRef<Map<number, HTMLButtonElement>>(new Map());
+
+  const gitStatusMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const f of gitStatusFiles ?? []) {
+      map.set(f.path, f.status);
+    }
+    return map;
+  }, [gitStatusFiles]);
 
   useEffect(() => {
     const id = setTimeout(() => inputRef.current?.focus(), 10);
     return () => clearTimeout(id);
   }, []);
 
+  const parsed = useMemo(() => parseQueryAndLine(query), [query]);
+
   const matches = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return files.slice(0, 60);
+    const q = parsed.pathQuery.toLowerCase();
+    if (!q) {
+      // Prioritize Git-modified files first when query is empty
+      const modified = files.filter((p) => gitStatusMap.has(p));
+      const rest = files.filter((p) => !gitStatusMap.has(p));
+      return [...modified, ...rest].slice(0, 60);
+    }
     const scored: { path: string; score: number }[] = [];
     for (const p of files) {
       const sc = scorePathMatch(p, q);
-      if (sc > -1) scored.push({ path: p, score: sc });
+      if (sc > -1) {
+        const gitBoost = gitStatusMap.has(p) ? 25 : 0;
+        scored.push({ path: p, score: sc + gitBoost });
+      }
     }
     scored.sort((a, b) => b.score - a.score);
     return scored.slice(0, 60).map((s) => s.path);
-  }, [files, query]);
+  }, [files, parsed.pathQuery, gitStatusMap]);
 
   const safeIdx = matches.length === 0 ? 0 : Math.min(activeIndex, matches.length - 1);
 
+  useEffect(() => {
+    itemRefs.current.get(safeIdx)?.scrollIntoView({ block: "nearest" });
+  }, [safeIdx]);
+
   const openSelected = (filePath: string) => {
     if (!hostId) return;
-    orbitActions.openFileInSidePanel(filePath, { hostId, cwd });
+    orbitActions.openFileInSidePanel(filePath, {
+      hostId,
+      cwd,
+      focusLine: parsed.line,
+    });
   };
 
   return (
@@ -99,9 +139,14 @@ function QuickOpenFileInner() {
               openSelected(matches[safeIdx]);
             }
           }}
-          placeholder="Open file in Side Panel…"
+          placeholder="Open file in Side Panel… (supports path:line)"
           className="text-foreground placeholder:text-muted-foreground min-w-0 flex-1 bg-transparent text-[13px] outline-none"
         />
+        {parsed.line != null && (
+          <span className="bg-primary/12 text-primary rounded px-1.5 py-0.5 font-mono text-[11px]">
+            L{parsed.line}
+          </span>
+        )}
         <Kbd>Esc</Kbd>
       </div>
 
@@ -119,9 +164,14 @@ function QuickOpenFileInner() {
             const name = parts.pop() || filePath;
             const dir = parts.join("/");
             const active = idx === safeIdx;
+            const gitStatus = gitStatusMap.get(filePath);
             return (
               <button
                 key={filePath}
+                ref={(el) => {
+                  if (el) itemRefs.current.set(idx, el);
+                  else itemRefs.current.delete(idx);
+                }}
                 type="button"
                 onMouseEnter={() => setActiveIndex(idx)}
                 onClick={() => openSelected(filePath)}
@@ -139,6 +189,20 @@ function QuickOpenFileInner() {
                     </span>
                   )}
                 </div>
+                {gitStatus && (
+                  <span
+                    className={cn(
+                      "shrink-0 font-mono text-[10.5px] font-medium",
+                      gitStatus === "A" || gitStatus === "??"
+                        ? "text-emerald-600 dark:text-emerald-400"
+                        : gitStatus === "D"
+                          ? "text-rose-600 dark:text-rose-400"
+                          : "text-amber-600 dark:text-amber-400",
+                    )}
+                  >
+                    {gitStatus}
+                  </span>
+                )}
               </button>
             );
           })

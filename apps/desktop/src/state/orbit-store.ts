@@ -630,6 +630,7 @@ const fleetSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: n
 const sidebarSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const lastReportedSeenSeq = new Map<string, number>();
 const submittingComposerScopes = new Set<string>();
+const cancelledSideQuestionIds = new Set<string>();
 let gitChangedDebounceTimer: number | null = null;
 
 function markThreadSeenInCore(hostId: string, agentId: string, seq: number): void {
@@ -3787,10 +3788,43 @@ export const orbitActions = {
 
   clearSideQuestions(): void {
     const scope = sideQuestionScopeKey(state);
+    for (const e of state.sideQuestionsByScope[scope] ?? []) {
+      if (e.status === "streaming") cancelledSideQuestionIds.add(e.id);
+    }
     setState((s) => {
       const next = { ...s.sideQuestionsByScope };
       delete next[scope];
       return { ...s, sideQuestionsByScope: next };
+    });
+  },
+
+  cancelSideQuestion(scopeOverride?: string): void {
+    const scope = scopeOverride ?? sideQuestionScopeKey(state);
+    const list = state.sideQuestionsByScope[scope];
+    if (!list) return;
+    const streamingIds = list.filter((e) => e.status === "streaming").map((e) => e.id);
+    if (streamingIds.length === 0) return;
+    for (const id of streamingIds) {
+      cancelledSideQuestionIds.add(id);
+    }
+    setState((s) => {
+      const cur = s.sideQuestionsByScope[scope];
+      if (!cur) return s;
+      return {
+        ...s,
+        sideQuestionsByScope: {
+          ...s.sideQuestionsByScope,
+          [scope]: cur.map((e) =>
+            streamingIds.includes(e.id)
+              ? {
+                  ...e,
+                  status: e.answer.trim() ? ("done" as const) : ("error" as const),
+                  error: e.answer.trim() ? null : "Cancelled",
+                }
+              : e,
+          ),
+        },
+      };
     });
   },
 
@@ -3849,8 +3883,21 @@ export const orbitActions = {
             .buildSideQuestionContext(hostId, state.selectedAgentId, 3000)
             .catch(() => "")
         : "";
-    const contextSummary =
+    const priorSideTurns = (state.sideQuestionsByScope[scope] ?? [])
+      .filter((e) => e.status === "done" && e.answer.trim().length > 0)
+      .slice(-4);
+    const priorHistoryBlock =
+      priorSideTurns.length > 0
+        ? `\n\nPrior side-thread Q&A:\n${priorSideTurns
+            .map(
+              (e, i) =>
+                `Q${i + 1}: ${e.question.slice(0, 400)}\nA${i + 1}: ${e.answer.slice(0, 900)}`,
+            )
+            .join("\n\n")}`
+        : "";
+    const baseContext =
       rustContext || `Workspace: ${cwd || "~"}${branchName ? ` (branch: ${branchName})` : ""}`;
+    const contextSummary = `${baseContext}${priorHistoryBlock}`;
 
     const entryId = `sq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const newEntry: SideQuestionEntry = {
@@ -3932,6 +3979,13 @@ export const orbitActions = {
           contextSummary,
         },
         (ev) => {
+          if (cancelledSideQuestionIds.has(entryId)) {
+            if (parseTimer) {
+              clearTimeout(parseTimer);
+              parseTimer = null;
+            }
+            return;
+          }
           if (ev.kind === "delta") {
             accumText += ev.text_delta;
             patchEntry((e) => ({ ...e, answer: accumText, status: "streaming" }));
@@ -3952,11 +4006,19 @@ export const orbitActions = {
         },
       );
     } catch (err) {
-      patchEntry((e) => ({
-        ...e,
-        status: "error",
-        error: String(err),
-      }));
+      if (parseTimer) {
+        clearTimeout(parseTimer);
+        parseTimer = null;
+      }
+      if (!cancelledSideQuestionIds.has(entryId)) {
+        patchEntry((e) => ({
+          ...e,
+          status: "error",
+          error: String(err),
+        }));
+      }
+    } finally {
+      cancelledSideQuestionIds.delete(entryId);
     }
   },
 

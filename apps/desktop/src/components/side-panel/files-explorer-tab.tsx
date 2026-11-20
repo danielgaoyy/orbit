@@ -90,13 +90,27 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
     return m;
   }, [gitFiles]);
 
+  // Bubble git dirty status up to ancestor directories so collapsed folders show a subtle dot
+  const dirtyDirs = useMemo(() => {
+    const dirs = new Set<string>();
+    for (const f of gitFiles ?? []) {
+      const parts = f.path.split("/");
+      let acc = "";
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        acc = acc ? `${acc}/${parts[i]}` : parts[i];
+        dirs.add(acc);
+      }
+    }
+    return dirs;
+  }, [gitFiles]);
+
   const filteredList = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return null;
     return files.filter((p) => p.toLowerCase().includes(q)).slice(0, 150);
   }, [files, query]);
 
-  const tree = useMemo(() => (filteredList ? [] : buildFileTree(files)), [files, filteredList]);
+  const tree = useMemo(() => buildFileTree(files), [files]);
 
   const toggleDir = (dirPath: string, currentlyOpen: boolean) => {
     setExpandedDirs((prev) => ({ ...prev, [dirPath]: !currentlyOpen }));
@@ -106,26 +120,35 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
     nodes.map((node) => {
       if (node.isDir) {
         const isOpen = expandedDirs[node.path] ?? depth === 0;
+        const isDirty = dirtyDirs.has(node.path);
         return (
           <div key={node.path}>
             <button
               type="button"
               onClick={() => toggleDir(node.path, isOpen)}
               style={{ paddingLeft: `${8 + depth * 13}px` }}
-              className="hover:bg-accent/60 text-foreground/85 flex h-[27px] w-full cursor-pointer items-center gap-1.5 rounded-md pr-2 text-left text-[12.5px] transition-colors"
+              className="hover:bg-accent/60 text-foreground/85 flex h-[27px] w-full cursor-pointer items-center justify-between gap-1.5 rounded-md pr-2 text-left text-[12.5px] transition-colors"
             >
-              <ChevronRight
-                className={cn(
-                  "text-muted-foreground h-[12px] w-[12px] shrink-0 transition-transform duration-150",
-                  isOpen && "rotate-90",
+              <span className="flex min-w-0 items-center gap-1.5">
+                <ChevronRight
+                  className={cn(
+                    "text-muted-foreground h-[12px] w-[12px] shrink-0 transition-transform duration-150",
+                    isOpen && "rotate-90",
+                  )}
+                />
+                {isOpen ? (
+                  <FolderOpen className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                ) : (
+                  <Folder className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
                 )}
-              />
-              {isOpen ? (
-                <FolderOpen className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              ) : (
-                <Folder className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                <span className="truncate">{node.name}</span>
+              </span>
+              {isDirty && !isOpen && (
+                <span
+                  title="Contains modified files"
+                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500/80"
+                />
               )}
-              <span className="truncate">{node.name}</span>
             </button>
             {isOpen && node.children.length > 0 && renderTree(node.children, depth + 1)}
           </div>
@@ -136,34 +159,64 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
       const status = gitStatusMap.get(node.path);
 
       return (
-        <button
+        <div
           key={node.path}
-          type="button"
-          onClick={() =>
-            hostId && orbitActions.openFileInSidePanel(node.path, { hostId, cwd })
-          }
           style={{ paddingLeft: `${22 + depth * 13}px` }}
-          className="hover:bg-accent/60 text-foreground/80 hover:text-foreground flex h-[27px] w-full cursor-pointer items-center justify-between gap-2 rounded-md pr-2.5 text-left text-[12.5px] transition-colors"
+          className="group/frow hover:bg-accent/60 text-foreground/80 hover:text-foreground flex h-[27px] w-full items-center justify-between gap-1.5 rounded-md pr-2 text-[12.5px] transition-colors"
         >
-          <span className="flex min-w-0 items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() =>
+              hostId && orbitActions.openFileInSidePanel(node.path, { hostId, cwd })
+            }
+            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+          >
             <Icon className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
             <span className="truncate">{node.name}</span>
-          </span>
-          {status && (
-            <span
-              className={cn(
-                "shrink-0 font-mono text-[10.5px] font-medium",
-                status === "??" || status === "A"
-                  ? "text-emerald-600 dark:text-emerald-400"
-                  : status === "D"
-                    ? "text-rose-500"
-                    : "text-amber-600 dark:text-amber-400",
-              )}
+          </button>
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              title="Mention in Composer (@)"
+              onClick={() => {
+                orbitActions.addContextMention({
+                  id: `file_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                  kind: "file",
+                  path: node.path,
+                });
+                orbitActions.showToast(`Attached ${node.name} to Composer`);
+              }}
+              className="text-muted-foreground hover:text-foreground hidden h-[18px] cursor-pointer items-center rounded px-1 font-mono text-[10.5px] hover:bg-black/10 group-hover/frow:inline-flex dark:hover:bg-white/10"
             >
-              {status}
-            </span>
-          )}
-        </button>
+              @
+            </button>
+            <button
+              type="button"
+              title="Copy relative path"
+              onClick={() => {
+                void navigator.clipboard.writeText(node.path);
+                orbitActions.showToast("Copied relative path");
+              }}
+              className="text-muted-foreground hover:text-foreground hidden h-[18px] cursor-pointer items-center rounded px-1 text-[10.5px] hover:bg-black/10 group-hover/frow:inline-flex dark:hover:bg-white/10"
+            >
+              Copy
+            </button>
+            {status && (
+              <span
+                className={cn(
+                  "shrink-0 font-mono text-[10.5px] font-medium",
+                  status === "??" || status === "A"
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : status === "D"
+                      ? "text-rose-500"
+                      : "text-amber-600 dark:text-amber-400",
+                )}
+              >
+                {status}
+              </span>
+            )}
+          </div>
+        </div>
       );
     });
 

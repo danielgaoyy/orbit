@@ -3180,6 +3180,8 @@ mod tests {
                 old_line: None,
                 new_line: Some(1),
                 content: "pub mod stage;".into(),
+                tokens: Vec::new(),
+                inline_changes: Vec::new(),
             }],
         };
 

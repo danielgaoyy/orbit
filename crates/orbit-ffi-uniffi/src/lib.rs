@@ -979,6 +979,8 @@ impl From<FfiDiffLine> for DiffLineView {
             old_line: v.old_line,
             new_line: v.new_line,
             content: v.content,
+            tokens: Vec::new(),
+            inline_changes: Vec::new(),
         }
     }
 }

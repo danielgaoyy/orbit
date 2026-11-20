@@ -59,6 +59,8 @@ function normalizeAddressInput(raw: string): string {
   return sanitizeHttpUrl(`https://${trimmed}`);
 }
 
+const EMPTY_LOCAL_URLS: readonly string[] = [];
+
 function isLocalUrl(url: string): boolean {
   try {
     const host = new URL(url).hostname.toLowerCase();
@@ -68,7 +70,8 @@ function isLocalUrl(url: string): boolean {
       host === "0.0.0.0" ||
       host === "::1" ||
       host === "[::1]" ||
-      host.endsWith(".local")
+      host.endsWith(".local") ||
+      host.endsWith(".localhost")
     );
   } catch {
     return false;
@@ -84,22 +87,25 @@ export interface BrowserTabOverlayState {
 
 export const BrowserTab = memo(function BrowserTab({
   tab,
+  visible = true,
   overlayState,
 }: {
   tab: SidePanelTab;
+  visible?: boolean;
   overlayState?: BrowserTabOverlayState;
 }) {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const activeStage = useOrbitSelector((s) =>
+  const detectedUrls = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
-      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
+      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights.detected_local_urls ??
+        EMPTY_LOCAL_URLS)
+      : EMPTY_LOCAL_URLS,
+  );
+  const hostCard = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? (s.fleet.hosts.find((h) => h.host_id === s.selectedHostId) ?? null)
       : null,
   );
-  const hostDetail = useOrbitSelector((s) =>
-    s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
-  );
-
-  const detectedUrls = activeStage?.insights.detected_local_urls ?? [];
 
   const initialUrl = sanitizeHttpUrl(tab.url ?? "");
   const [navState, setNavState] = useState<{ entries: string[]; idx: number }>(() =>
@@ -110,9 +116,23 @@ export const BrowserTab = memo(function BrowserTab({
   const [viewportPreset, setViewportPreset] = useState<ViewportPreset>("fluid");
   const [isLoading, setIsLoading] = useState(false);
   const [dismissedFrameTip, setDismissedFrameTip] = useState(false);
+  const [stageWidth, setStageWidth] = useState(0);
 
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const addressInputRef = useRef<HTMLInputElement | null>(null);
   const activeUrl = navState.idx >= 0 ? sanitizeHttpUrl(navState.entries[navState.idx] ?? "") : "";
+
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      if (w > 0) setStageWidth(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // Clear loading spinner if a blocked/unreachable origin never triggers iframe `onLoad`
   useEffect(() => {
@@ -208,8 +228,35 @@ export const BrowserTab = memo(function BrowserTab({
     return Array.from(merged).slice(0, 6);
   }, [detectedUrls]);
 
+  const presetScale =
+    presetWidth !== null && stageWidth > 32
+      ? Math.min(1, (stageWidth - 32) / presetWidth)
+      : 1;
+  const isRemoteHost =
+    Boolean(hostCard) &&
+    (Boolean(hostCard?.ssh_alias) ||
+      !hostCard?.direct_endpoints.some(
+        (e) => e.includes("127.0.0.1") || e.includes("localhost"),
+      ));
+
   return (
-    <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div
+      className={cn(
+        "orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden",
+        !visible && "hidden",
+      )}
+      onKeyDown={(e) => {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "l") {
+          e.preventDefault();
+          addressInputRef.current?.focus();
+          addressInputRef.current?.select();
+        } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "r" && activeUrl) {
+          e.preventDefault();
+          setIsLoading(true);
+          setReloadNonce((n) => n + 1);
+        }
+      }}
+    >
       {/* Slim Browser Navigation Toolbar */}
       <div className="border-border bg-sidebar flex h-[38px] shrink-0 items-center gap-1.5 border-b px-2.5">
         <div className="flex shrink-0 items-center gap-0.5">
@@ -251,6 +298,7 @@ export const BrowserTab = memo(function BrowserTab({
         >
           <Globe className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0 opacity-75" />
           <input
+            ref={addressInputRef}
             type="text"
             value={addressInput}
             onChange={(e) => setAddressInput(e.target.value)}
@@ -338,7 +386,7 @@ export const BrowserTab = memo(function BrowserTab({
       )}
 
       {/* Layered Preview Stage (Base Frame + Extensible Read-Only Overlay Slot) */}
-      <div className="bg-canvas relative flex min-h-0 flex-1 flex-col overflow-auto">
+      <div ref={stageRef} className="bg-canvas relative flex min-h-0 flex-1 flex-col overflow-auto">
         {!activeUrl ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 py-10 text-center">
             <div className="bg-muted text-muted-foreground inline-flex h-10 w-10 items-center justify-center rounded-xl">
@@ -385,7 +433,15 @@ export const BrowserTab = memo(function BrowserTab({
             )}
           >
             <div
-              style={presetWidth ? { width: `${presetWidth}px` } : undefined}
+              style={
+                presetWidth
+                  ? {
+                      width: `${presetWidth}px`,
+                      transform: presetScale < 1 ? `scale(${presetScale})` : undefined,
+                      transformOrigin: "top center",
+                    }
+                  : undefined
+              }
               className={cn(
                 "relative flex min-h-full shrink-0 overflow-hidden bg-white",
                 presetWidth === null
@@ -426,9 +482,15 @@ export const BrowserTab = memo(function BrowserTab({
       </div>
 
       {/* Host Context Footnote when Connected to Remote Host */}
-      {selectedHostId && activeUrl && isLocalUrl(activeUrl) && hostDetail && !hostDetail.host.direct_endpoints.some((e) => e.includes("127.0.0.1") || e.includes("localhost")) && (
-        <div className="border-border bg-sidebar/80 text-muted-foreground border-t px-3 py-1 text-[11px]">
-          Preview loads from your local machine; forward remote ports via SSH if serving on {hostDetail.host.display_name}.
+      {selectedHostId && activeUrl && isLocalUrl(activeUrl) && hostCard && isRemoteHost && (
+        <div className="border-border bg-sidebar/80 text-muted-foreground flex items-center justify-between border-t px-3 py-1 text-[11px]">
+          <span>
+            Preview loads from your local machine; forward remote ports via SSH if serving on{" "}
+            {hostCard.display_name}.
+          </span>
+          {presetWidth !== null && presetScale < 1 && (
+            <span className="tabular-nums font-mono">{Math.round(presetScale * 100)}%</span>
+          )}
         </div>
       )}
     </div>

@@ -459,11 +459,18 @@ export type RichBlockView =
 
 export type DiffLineKind = "meta" | "hunk_header" | "context" | "added" | "removed";
 
+export interface InlineDiffSpan {
+  start: number;
+  end: number;
+}
+
 export interface DiffLineView {
   kind: DiffLineKind;
   old_line: number | null;
   new_line: number | null;
   content: string;
+  tokens?: HighlightedTokenView[];
+  inline_changes?: InlineDiffSpan[];
 }
 
 export interface DiffFileView {

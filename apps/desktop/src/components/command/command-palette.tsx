@@ -229,7 +229,7 @@ function CommandPaletteDialog() {
       if (!detail) continue;
       for (const ag of detail.agents) {
         const tKey = threadScopeKey(h.host_id, ag.agent_id);
-        const isArchived = Boolean(archivedThreads[tKey]);
+        const isArchived = Boolean(archivedThreads[tKey] || ag.archived_at_rfc3339);
         const effectiveTitle = threadCustomTitles[tKey] || ag.title;
         list.push({
           id: `thread-${h.host_id}-${ag.agent_id}`,
@@ -279,21 +279,21 @@ function CommandPaletteDialog() {
       },
       {
         id: "pref-theme-light",
-        section: "Fleet & Preferences",
+        section: "Settings & Fleet",
         title: "Appearance: Light Mode",
         icon: <Sun className="size-3.5" />,
         run: () => orbitActions.setTheme("light"),
       },
       {
         id: "pref-theme-dark",
-        section: "Fleet & Preferences",
+        section: "Settings & Fleet",
         title: "Appearance: Dark Mode",
         icon: <Moon className="size-3.5" />,
         run: () => orbitActions.setTheme("dark"),
       },
       {
         id: "pref-enter",
-        section: "Fleet & Preferences",
+        section: "Settings & Fleet",
         title: enterToSend
           ? `Require ${mod}Enter to Send Prompts`
           : "Use Enter to Send Prompts",

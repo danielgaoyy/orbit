@@ -1,7 +1,10 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, Check, Layers, Loader2, AlertTriangle } from "lucide-react";
+import {
+  ConversationMessageFooter,
+  ConversationViewport,
+} from "@/components/conversation/conversation-viewport";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { type ProviderSubagentEvent, orbitIpc } from "@/lib/orbit-ipc";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -22,6 +25,7 @@ function formatProviderSubagentPayload(payload: unknown): string {
 
 export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTab }) {
   const hostId = useOrbitSelector((s) => tab.hostId ?? s.selectedHostId);
+  const cwd = useOrbitSelector((s) => tab.cwd ?? s.selectedWorkspaceCwd);
   const parentAgentId = useOrbitSelector((s) => tab.parentAgentId ?? s.selectedAgentId);
   const childAgent = useOrbitSelector((s) =>
     hostId && tab.childAgentId
@@ -46,32 +50,6 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     return parentStage?.insights.subagents.find((sa) => sa.id === tab.subagentCallId) ?? null;
   });
 
-  const [providerEvents, setProviderEvents] = useState<ProviderSubagentEvent[]>([]);
-
-  useEffect(() => {
-    if (!hostId || !parentAgentId || !tab.providerSubagentId) {
-      setProviderEvents([]);
-      return;
-    }
-    const subId = tab.providerSubagentId;
-    let cancelled = false;
-    void orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, subId);
-    const poll = async () => {
-      try {
-        const evs = await orbitIpc.getProviderSubagentTimeline(hostId, parentAgentId, subId);
-        if (!cancelled) setProviderEvents(evs);
-      } catch {
-        // ignore transient polling error
-      }
-    };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 1500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [hostId, parentAgentId, tab.providerSubagentId]);
-
   const status = childAgent
     ? childAgent.is_running
       ? "running"
@@ -86,9 +64,47 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           : "failed"
       : (parentSubagent?.status ?? "completed");
 
+  const [providerEvents, setProviderEvents] = useState<ProviderSubagentEvent[]>([]);
+  const lastFingerprintRef = useRef<string>("");
+
+  useEffect(() => {
+    if (!hostId || !parentAgentId || !tab.providerSubagentId) {
+      setProviderEvents([]);
+      lastFingerprintRef.current = "";
+      return;
+    }
+    const subId = tab.providerSubagentId;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const evs = await orbitIpc.getProviderSubagentTimeline(hostId, parentAgentId, subId);
+        if (cancelled) return;
+        const fp = `${evs.length}:${evs[evs.length - 1]?.seq ?? 0}`;
+        if (fp !== lastFingerprintRef.current) {
+          lastFingerprintRef.current = fp;
+          setProviderEvents(evs);
+        }
+      } catch {
+        // ignore transient polling error
+      }
+    };
+    void poll();
+    if (status !== "running") {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const timer = window.setInterval(() => void poll(), 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [hostId, parentAgentId, tab.providerSubagentId, status]);
+
   const resolvedTitle =
     providerSubagent?.title || tab.subagentRole || childAgent?.title || "Subagent";
   const resolvedPrompt = tab.subagentPrompt || providerSubagent?.subtitle || "";
+  const contentVersion = `${childStage?.revision ?? 0}:${providerEvents.length}:${providerEvents[providerEvents.length - 1]?.seq ?? 0}`;
 
   return (
     <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -131,8 +147,14 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         )}
       </div>
 
-      {/* Subagent Prompt & Child Activity */}
-      <ScrollArea className="bg-canvas min-h-0 flex-1" viewportClassName="space-y-4 p-4">
+      {/* Shared Conversation Viewport */}
+      <ConversationViewport
+        hostId={hostId}
+        cwd={cwd}
+        resetKey={tab.id}
+        contentVersion={contentVersion}
+        viewportClassName="space-y-4 p-4"
+      >
         {resolvedPrompt && (
           <div className="space-y-1.5">
             <div className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
@@ -157,12 +179,15 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                   </div>
                 )}
                 {turn.terminal_reply?.item_type === "assistant_message" && (
-                  <div className="text-[12.5px]">
+                  <div className="space-y-1 text-[12.5px]">
                     <MarkdownBlocksView
                       blocks={turn.terminal_reply.blocks}
                       streaming={turn.terminal_reply.streaming}
                       compact
                     />
+                    {!turn.terminal_reply.streaming && turn.terminal_reply.text.trim() && (
+                      <ConversationMessageFooter copyText={turn.terminal_reply.text} />
+                    )}
                   </div>
                 )}
               </div>
@@ -192,7 +217,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
               : "Subagent execution completed. Summary and outputs are folded into the parent conversation."}
           </div>
         )}
-      </ScrollArea>
+      </ConversationViewport>
     </div>
   );
 });

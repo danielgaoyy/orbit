@@ -7,10 +7,12 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
+import type { TerminalSummary } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 const LazyXtermPane = lazy(() => import("@/components/xterm-pane"));
+const EMPTY_TERMINALS: readonly TerminalSummary[] = [];
 
 function shortDir(p: string): string {
   if (!p || p === "~") return "~";
@@ -33,8 +35,8 @@ export const TerminalTab = memo(function TerminalTab({
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const activeTerminalTabKey = useOrbitSelector((s) => s.activeTerminalTabKey);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const hostDetail = useOrbitSelector((s) =>
-    s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
+  const hostTerminals = useOrbitSelector((s) =>
+    selectedHostId ? (s.hostDetails[selectedHostId]?.terminals ?? EMPTY_TERMINALS) : EMPTY_TERMINALS,
   );
 
   const hostTabs = useMemo(
@@ -43,11 +45,11 @@ export const TerminalTab = memo(function TerminalTab({
   );
 
   const detachedTerminals = useMemo(() => {
-    if (!hostDetail) return [];
-    return hostDetail.terminals.filter(
+    if (hostTerminals.length === 0) return [];
+    return hostTerminals.filter(
       (t) => !hostTabs.some((openTab) => openTab.terminalId === t.terminal_id),
     );
-  }, [hostDetail, hostTabs]);
+  }, [hostTerminals, hostTabs]);
 
   return (
     <div

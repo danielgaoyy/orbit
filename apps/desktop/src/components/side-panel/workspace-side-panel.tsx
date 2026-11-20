@@ -279,10 +279,20 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
           <TerminalTab selectedHostId={selectedHostId} visible={isTerminalVisible} />
         )}
 
+        {/* Persistent Browser Preview Pool (kept alive across Side Panel tab switches) */}
+        {tabs
+          .filter((t) => t.kind === "browser")
+          .map((browserTab) => (
+            <BrowserTab
+              key={browserTab.id}
+              tab={browserTab}
+              visible={panelVisible && activeTab?.id === browserTab.id}
+            />
+          ))}
+
         {activeTab?.kind === "review" && <ReviewTab selectedHostId={selectedHostId} />}
         {activeTab?.kind === "files" && <FilesExplorerTab />}
         {activeTab?.kind === "file" && <FileViewerTab key={activeTab.id} tab={activeTab} />}
-        {activeTab?.kind === "browser" && <BrowserTab key={activeTab.id} tab={activeTab} />}
         {activeTab?.kind === "side_question" && <SideQuestionTab />}
         {activeTab?.kind === "subagent" && <SubagentTab key={activeTab.id} tab={activeTab} />}
 

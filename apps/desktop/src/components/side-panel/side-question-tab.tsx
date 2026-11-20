@@ -1,26 +1,32 @@
-import { memo, useEffect, useRef } from "react";
+import { memo, useMemo } from "react";
 import {
   AlertTriangle,
-  ArrowUp,
   ArrowUpRight,
   Loader2,
   MessageCircleQuestion,
   Trash2,
 } from "lucide-react";
+import {
+  ConversationMessageFooter,
+  ConversationUserBubble,
+  ConversationViewport,
+} from "@/components/conversation/conversation-viewport";
+import { ConversationComposer } from "@/components/conversation/conversation-composer";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   type SideQuestionEntry,
   orbitActions,
   sideQuestionScopeKey,
   useOrbitSelector,
 } from "@/state/orbit-store";
-import { cn } from "@/lib/utils";
 
 const EMPTY_ENTRIES: readonly SideQuestionEntry[] = [];
 
 export const SideQuestionTab = memo(function SideQuestionTab() {
   const scope = useOrbitSelector((s) => sideQuestionScopeKey(s));
+  const hostId = useOrbitSelector((s) => s.selectedHostId);
+  const cwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const entries = useOrbitSelector((s) => s.sideQuestionsByScope[scope] ?? EMPTY_ENTRIES);
   const draft = useOrbitSelector((s) => s.sideQuestionDrafts[scope] ?? "");
   const focusNonce = useOrbitSelector((s) => s.sideQuestionFocusNonce);
@@ -39,18 +45,10 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         : "Codex";
   });
 
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const bottomRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    requestAnimationFrame(() => inputRef.current?.focus());
-  }, [focusNonce]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [entries.length, entries[entries.length - 1]?.answer.length]);
-
   const isStreaming = entries.some((e) => e.status === "streaming");
+  const promptHistory = useMemo(() => entries.map((e) => e.question), [entries]);
+  const lastEntry = entries[entries.length - 1];
+  const contentVersion = `${entries.length}:${lastEntry?.id ?? ""}:${lastEntry?.answer.length ?? 0}:${lastEntry?.status ?? ""}`;
 
   const handleSubmit = () => {
     const trimmed = draft.trim();
@@ -64,7 +62,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
       <div className="border-border flex h-[36px] shrink-0 items-center justify-between gap-2 border-b px-3">
         <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[11.5px]">
           <span className="font-mono text-foreground/75">/btw</span>
-          <span className="truncate">Read-only · never alters main thread</span>
+          <span className="truncate">Read-only · multi-turn side thread</span>
         </div>
 
         {entries.length > 0 && (
@@ -80,8 +78,13 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         )}
       </div>
 
-      {/* Ephemeral Q&A Stream */}
-      <ScrollArea className="bg-canvas min-h-0 flex-1" viewportClassName="px-4 py-4">
+      {/* Shared Conversation Viewport */}
+      <ConversationViewport
+        hostId={hostId}
+        cwd={cwd}
+        resetKey={scope}
+        contentVersion={contentVersion}
+      >
         {entries.length === 0 ? (
           <div className="flex min-h-[240px] flex-col items-center justify-center gap-3 px-4 text-center">
             <div className="bg-muted text-muted-foreground inline-flex h-9 w-9 items-center justify-center rounded-xl">
@@ -104,12 +107,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
           <div className="space-y-5">
             {entries.map((entry) => (
               <div key={entry.id} className="orbit-bubble-enter space-y-2.5">
-                {/* User Side Question */}
-                <div className="flex justify-end">
-                  <div className="prompt-bubble-surface selectable-text text-foreground max-w-[90%] rounded-2xl rounded-tr-md px-3.5 py-2 text-[12.5px] leading-relaxed whitespace-pre-wrap">
-                    {entry.question}
-                  </div>
-                </div>
+                <ConversationUserBubble text={entry.question} compact />
 
                 {/* Assistant Side Answer */}
                 <div className="space-y-1.5">
@@ -147,74 +145,56 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                   )}
 
                   {entry.status === "done" && entry.answer.trim() && (
-                    <div className="flex items-center justify-between pt-0.5">
-                      <span className="text-muted-foreground/75 text-[11px]">
-                        {entry.providerLabel} · ephemeral
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          orbitActions.promoteSideQuestionToComposer(
-                            `Regarding "${entry.question}":\n${entry.answer}`,
-                          )
-                        }
-                        className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] transition-colors"
-                      >
-                        <span>Send to main chat</span>
-                        <ArrowUpRight className="h-[11.5px] w-[11.5px]" />
-                      </button>
-                    </div>
+                    <ConversationMessageFooter
+                      copyText={entry.answer}
+                      metaLabel={`${entry.providerLabel} · side thread`}
+                      rightSlot={
+                        <button
+                          type="button"
+                          onClick={() =>
+                            orbitActions.promoteSideQuestionToComposer(
+                              `Regarding "${entry.question}":\n${entry.answer}`,
+                            )
+                          }
+                          className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] transition-colors"
+                        >
+                          <span>Send to main chat</span>
+                          <ArrowUpRight className="h-[11.5px] w-[11.5px]" />
+                        </button>
+                      }
+                    />
                   )}
                 </div>
               </div>
             ))}
-            <div ref={bottomRef} />
           </div>
         )}
-      </ScrollArea>
+      </ConversationViewport>
 
-      {/* Compact Side Input */}
-      <div className="border-border bg-sidebar shrink-0 border-t p-2.5">
-        <div className="composer-surface flex items-end gap-2 rounded-xl px-3 py-2">
-          <textarea
-            ref={inputRef}
-            rows={1}
-            value={draft}
-            onChange={(e) => orbitActions.setSideQuestionDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing) return;
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                handleSubmit();
-              }
-            }}
-            placeholder={
-              activeProviderLabel
-                ? `Ask ${activeProviderLabel} on the side…`
-                : "Ask a side question…"
-            }
-            className="text-foreground placeholder:text-muted-foreground max-h-28 min-h-[22px] flex-1 resize-none bg-transparent text-[12.5px] leading-[1.45] outline-none"
-          />
-          <button
-            type="button"
-            disabled={!draft.trim() || isStreaming}
-            onClick={handleSubmit}
-            aria-label="Send side question"
-            className={cn(
-              "orbit-press inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-lg transition-colors",
-              draft.trim() && !isStreaming
-                ? "bg-foreground text-background hover:opacity-90"
-                : "bg-muted text-muted-foreground cursor-default opacity-60",
-            )}
-          >
-            {isStreaming ? (
-              <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
-            ) : (
-              <ArrowUp className="h-[14px] w-[14px] stroke-[2.2]" />
-            )}
-          </button>
-        </div>
-      </div>
+      {/* Shared Conversation Composer */}
+      <ConversationComposer
+        variant="compact"
+        value={draft}
+        onChange={(next) => orbitActions.setSideQuestionDraft(next)}
+        onSubmit={handleSubmit}
+        onInterrupt={isStreaming ? () => orbitActions.cancelSideQuestion(scope) : undefined}
+        isBusy={isStreaming}
+        enterToSend={enterToSend}
+        focusNonce={focusNonce}
+        promptHistory={promptHistory}
+        placeholder={
+          activeProviderLabel
+            ? `Ask ${activeProviderLabel} on the side…`
+            : "Ask a side question…"
+        }
+        leftControlsSlot={
+          activeProviderLabel ? (
+            <span className="text-muted-foreground/80 truncate text-[11px]">
+              {activeProviderLabel}
+            </span>
+          ) : null
+        }
+      />
     </div>
   );
 });

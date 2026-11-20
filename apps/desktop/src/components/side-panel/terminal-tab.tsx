@@ -1,5 +1,5 @@
 import { Suspense, lazy, memo, useMemo } from "react";
-import { ChevronDown, Plus, Terminal as TerminalIcon, X } from "lucide-react";
+import { ChevronDown, Plus, X } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -54,12 +54,12 @@ export const TerminalTab = memo(function TerminalTab({
   return (
     <div
       className={cn(
-        "flex min-h-0 flex-1 flex-col overflow-hidden bg-[#F7F8FA] select-none dark:bg-[#0B0E14]",
+        "bg-canvas flex min-h-0 flex-1 flex-col overflow-hidden select-none dark:bg-[#0B0E14]",
         !visible && "hidden",
       )}
     >
       {/* Compact PTY Session Sub-Bar */}
-      <div className="border-border bg-sidebar flex h-[36px] shrink-0 items-center justify-between gap-1.5 border-b px-2.5">
+      <div className="border-border/70 bg-canvas flex h-[38px] shrink-0 items-center justify-between gap-1.5 border-b px-3 dark:bg-[#0E121A]">
         <div className="flex min-w-0 items-center gap-1 overflow-x-auto">
           {hostTabs.map((tab) => {
             const active = tab.key === activeTerminalTabKey;
@@ -68,13 +68,18 @@ export const TerminalTab = memo(function TerminalTab({
                 key={tab.key}
                 onClick={() => orbitActions.setActiveTerminalTab(tab.key)}
                 className={cn(
-                  "group inline-flex h-[24px] cursor-pointer items-center gap-1.5 rounded-md px-2 text-[11.5px] transition-colors",
+                  "group inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[11.5px] transition-colors",
                   active
-                    ? "bg-accent text-foreground font-medium"
-                    : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+                    ? "border-border bg-elevated text-foreground font-medium shadow-2xs dark:bg-white/[0.07]"
+                    : "text-muted-foreground hover:bg-accent/60 hover:text-foreground border-transparent",
                 )}
               >
-                <TerminalIcon className="h-[12.5px] w-[12.5px] shrink-0 opacity-75" />
+                <span
+                  className={cn(
+                    "h-1.5 w-1.5 shrink-0 rounded-full",
+                    active ? "bg-emerald-500" : "bg-muted-foreground/40",
+                  )}
+                />
                 <span className="max-w-36 truncate font-mono">
                   {tab.title} · {shortDir(tab.cwd)}
                 </span>
@@ -97,7 +102,7 @@ export const TerminalTab = memo(function TerminalTab({
             type="button"
             title="New detached PTY shell"
             onClick={() => orbitActions.spawnNewTerminalTab(selectedHostId, selectedCwd || "~")}
-            className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors"
+            className="text-muted-foreground hover:bg-accent hover:text-foreground inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-lg transition-colors"
           >
             <Plus className="h-[14px] w-[14px]" />
           </button>

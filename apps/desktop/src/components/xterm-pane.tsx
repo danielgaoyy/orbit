@@ -15,10 +15,10 @@ const DARK_XTERM_THEME: ITheme = {
 };
 
 const LIGHT_XTERM_THEME: ITheme = {
-  background: "#F7F8FA",
+  background: "#FFFFFF",
   foreground: "#1E293B",
   cursor: "#2563EB",
-  selectionBackground: "rgba(37, 99, 235, 0.18)",
+  selectionBackground: "rgba(37, 99, 235, 0.16)",
   black: "#1E293B",
   red: "#DC2626",
   green: "#16A34A",
@@ -294,7 +294,7 @@ export function XtermPane({
       onFocusCapture={() => orbitActions.setTerminalFocused(true)}
       onBlurCapture={() => orbitActions.setTerminalFocused(false)}
       className={cn(
-        "relative h-full w-full overflow-hidden bg-[#F7F8FA] px-2.5 py-1.5 dark:bg-[#0B0E14]",
+        "bg-canvas relative h-full w-full overflow-hidden px-3.5 py-2.5 dark:bg-[#0B0E14]",
         !active && "hidden",
       )}
     >

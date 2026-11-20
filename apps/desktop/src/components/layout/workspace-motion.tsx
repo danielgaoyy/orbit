@@ -317,8 +317,14 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       if (e.target !== e.currentTarget || e.propertyName !== "transform") return;
       if (phaseRef.current !== "playing") return;
       const m = motionRef.current;
-      const expectedAxis: "left" | "right" | "stage" =
-        m.from.W !== m.to.W ? "right" : m.from.L !== m.to.L ? "left" : "stage";
+      const stageMoved =
+        m.from.L !== m.to.L || m.from.W !== m.to.W || m.from.D !== m.to.D;
+      // Always wait for the stage transform when stage moved so layout commit never snaps ahead of GPU slide.
+      const expectedAxis: "left" | "right" | "stage" = stageMoved
+        ? "stage"
+        : m.from.W !== m.to.W
+          ? "right"
+          : "left";
       if (axis !== expectedAxis) return;
 
       if (fallbackTimerRef.current !== null) {
@@ -410,11 +416,9 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     const stageShiftPx =
       phase === "idle"
         ? 0
-        : Math.round(
-            (phase === "prep"
-              ? xCenter(m.from.L, m.from.W, m.from.D)
-              : xCenter(m.to.L, m.to.W, m.to.D)) - xCenter(m.base.L, m.base.W, m.base.D),
-          );
+        : (phase === "prep"
+            ? xCenter(m.from.L, m.from.W, m.from.D)
+            : xCenter(m.to.L, m.to.W, m.to.D)) - xCenter(m.base.L, m.base.W, m.base.D);
     const stageTransition =
       !isResizing && phase === "playing" ? `transform ${m.durationMs}ms ${PANEL_EASE}` : "none";
 
@@ -423,7 +427,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       const availTo = availContent(m.to.L, m.to.W, m.to.D);
       const availFrom = availContent(m.from.L, m.from.W, m.from.D);
       if (availTo < 768 && availTo < availFrom) {
-        stageMaxContentWidthPx = Math.max(240, Math.floor(availTo));
+        stageMaxContentWidthPx = Math.max(240, availTo);
       }
     }
 

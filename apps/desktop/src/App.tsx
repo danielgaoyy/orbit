@@ -329,7 +329,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
             visibility: leftVisible ? "visible" : "hidden",
           }}
           className={cn(
-            "orbit-panel-left absolute inset-y-0 left-0 z-20 h-full shrink-0 overflow-hidden [contain:layout_style]",
+            "orbit-panel-left bg-sidebar absolute inset-y-0 left-0 z-20 h-full shrink-0 overflow-hidden [backface-visibility:hidden]",
             !sidebarOpen && "pointer-events-none",
           )}
         >

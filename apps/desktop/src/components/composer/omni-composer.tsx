@@ -158,7 +158,7 @@ export const OmniComposer = memo(function OmniComposer({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const mirrorTextareaRef = useRef<HTMLDivElement | null>(null);
   const lastTextareaHeightRef = useRef<number>(46);
-  const [composerWidthTick, setComposerWidthTick] = useState(0);
+  const [composerWidthPx, setComposerWidthPx] = useState(0);
   const draftTextRef = useRef<string>(draftText);
   draftTextRef.current = draftText;
   const directivePrefixRef = useRef<HTMLSpanElement | null>(null);
@@ -204,12 +204,13 @@ export const OmniComposer = memo(function OmniComposer({
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    let lastW = el.clientWidth;
+    let lastW = Math.round(el.clientWidth);
+    if (lastW > 0) setComposerWidthPx(lastW);
     const ro = new ResizeObserver((entries) => {
       const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
       if (nextW > 0 && nextW !== lastW) {
         lastW = nextW;
-        setComposerWidthTick((n) => n + 1);
+        setComposerWidthPx(nextW);
       }
     });
     ro.observe(el);
@@ -245,7 +246,7 @@ export const OmniComposer = memo(function OmniComposer({
     if (el.style.overflowY !== nextOverflow) {
       el.style.overflowY = nextOverflow;
     }
-  }, [draftText, scopeKey, slashDirective, directiveIndentPx, composerWidthTick]);
+  }, [draftText, scopeKey, slashDirective, directiveIndentPx, composerWidthPx]);
 
   useEffect(() => {
     return orbitActions.onComposerFocusRequest(() => {
@@ -923,7 +924,7 @@ export const OmniComposer = memo(function OmniComposer({
 
             {/* Bottom Control Bar (`34px` uniform control rhythm) */}
             <div className="flex items-center justify-between gap-2 px-2.5 pt-0 pb-2">
-              <div className="flex min-w-0 items-center gap-0.5">
+              <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">
                 {/* 1. `[+]` Add Context Menu (`34×34` -> Files, Mentions, Actions) */}
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -978,7 +979,11 @@ export const OmniComposer = memo(function OmniComposer({
 
               {/* Right Cluster: Isolated Access Permissions Selector + `34×34` Primary Action Circle */}
               <div className="flex shrink-0 items-center gap-1.5">
-                <ComposerModePicker mode={activeMode} onSelectMode={handleSelectMode} />
+                <ComposerModePicker
+                  mode={activeMode}
+                  onSelectMode={handleSelectMode}
+                  iconOnly={composerWidthPx > 0 && composerWidthPx < 440}
+                />
 
                 {isTurnBusy && !hasPayload ? (
                   <button

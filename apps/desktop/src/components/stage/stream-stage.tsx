@@ -825,6 +825,8 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   defaultCollapsed,
   autoOpenForError,
   liveStartedAtMs,
+  latestActivityMs,
+  isNetworkOffline = false,
   settledDurationMs,
   cwd,
   agentId,
@@ -842,6 +844,8 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   defaultCollapsed: boolean;
   autoOpenForError: boolean;
   liveStartedAtMs: number | null;
+  latestActivityMs?: number | null;
+  isNetworkOffline?: boolean;
   settledDurationMs: number | null;
   cwd: string;
   agentId: string;
@@ -859,7 +863,11 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
     return (
       <div className="text-muted-foreground flex max-w-full items-center gap-1.5 py-0.5 text-[13.5px] font-normal">
         <span className="agent-text-shimmer truncate">{liveLabel || "Working…"}</span>
-        <InlineLiveElapsed startedAtMs={effectiveLiveStartedAtMs} />
+        <InlineLiveElapsed
+          startedAtMs={effectiveLiveStartedAtMs}
+          lastActivityMs={latestActivityMs}
+          isNetworkOffline={isNetworkOffline}
+        />
       </div>
     );
   }
@@ -904,7 +912,11 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
                 · {items.length} steps
               </span>
             )}
-            <InlineLiveElapsed startedAtMs={effectiveLiveStartedAtMs} />
+            <InlineLiveElapsed
+              startedAtMs={effectiveLiveStartedAtMs}
+              lastActivityMs={latestActivityMs}
+              isNetworkOffline={isNetworkOffline}
+            />
             {showDiffNumbers && (
               <span className="tabular-nums flex shrink-0 items-center gap-1 font-mono text-[11.5px]">
                 {summaryCounts.additions > 0 && (
@@ -1457,29 +1469,48 @@ function UndoActionButton({
   );
 }
 
+interface RewindFileEntry {
+  displayPath: string;
+  basename: string;
+  additions: number;
+  deletions: number;
+}
+
 interface RewindRequestTarget {
   seq: number;
   promptText: string;
   affectedTurnsCount: number;
-  editedFiles: string[];
+  editedFiles: RewindFileEntry[];
+}
+
+function isRevertibleWorkspaceFile(rawPath: string, cwd: string): boolean {
+  const trimmed = rawPath.trim();
+  if (!trimmed || trimmed === "Working Tree" || trimmed === "Staged Diff") {
+    return false;
+  }
+  const cleanCwd = cwd.replace(/\/+$/, "");
+  if (trimmed.startsWith("/") && cleanCwd && cleanCwd !== "~") {
+    return trimmed === cleanCwd || trimmed.startsWith(`${cleanCwd}/`);
+  }
+  return true;
 }
 
 function RewindTurnDialog({
   target,
-  cwd,
   isAgentRunning,
   submitting,
   onOpenChange,
   onConfirm,
 }: {
   target: RewindRequestTarget | null;
-  cwd: string;
   isAgentRunning: boolean;
   submitting: boolean;
   onOpenChange: (open: boolean) => void;
   onConfirm: (restoreFiles: boolean) => void;
 }) {
   const [restoreFiles, setRestoreFiles] = useState(true);
+  const files = target?.editedFiles ?? [];
+  const hasFiles = files.length > 0;
 
   useEffect(() => {
     if (target) {
@@ -1487,118 +1518,124 @@ function RewindTurnDialog({
     }
   }, [target]);
 
-  const previewText = target?.promptText.replace(/\s+/g, " ").trim() ?? "";
-  const visibleFiles = (target?.editedFiles ?? []).slice(0, 4);
-  const extraFilesCount = Math.max(0, (target?.editedFiles.length ?? 0) - visibleFiles.length);
+  useEffect(() => {
+    if (!target || submitting) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Enter" || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      const activeTag = (document.activeElement as HTMLElement | null)?.tagName;
+      if (activeTag === "BUTTON" || activeTag === "INPUT") return;
+      e.preventDefault();
+      onConfirm(hasFiles ? restoreFiles : false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [target, submitting, hasFiles, restoreFiles, onConfirm]);
+
+  const basenameCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const f of files) {
+      counts.set(f.basename, (counts.get(f.basename) ?? 0) + 1);
+    }
+    return counts;
+  }, [files]);
+
+  const effectiveRestore = hasFiles && restoreFiles;
 
   return (
     <Dialog open={target !== null} onOpenChange={(open) => !submitting && onOpenChange(open)}>
-      <DialogContent className="max-w-[440px] gap-4 p-5">
-        <DialogHeader className="gap-1 pr-6">
-          <DialogTitle className="flex items-center gap-2 text-[15px]">
-            <RotateCcw className="text-muted-foreground size-4 stroke-[1.9]" />
-            <span>Undo to this point</span>
-          </DialogTitle>
-          <DialogDescription className="text-[12.5px] leading-relaxed">
-            Rewinds{" "}
-            {target && target.affectedTurnsCount > 1
-              ? `${target.affectedTurnsCount} turns from this message onward`
-              : "this turn"}{" "}
-            and places the prompt back into the composer.
+      <DialogContent className="max-w-[440px] gap-3.5 p-5">
+        <DialogHeader className="gap-1.5 pr-6">
+          <DialogTitle className="text-[15.5px] font-semibold">Confirm Undo</DialogTitle>
+          <DialogDescription className="text-[13px] leading-snug">
+            {hasFiles
+              ? "Confirming this undo action will make the following changes:"
+              : `Confirming this undo action will rewind ${
+                  target && target.affectedTurnsCount > 1
+                    ? `${target.affectedTurnsCount} turns`
+                    : "this turn"
+                } and restore the prompt to the composer.`}
           </DialogDescription>
         </DialogHeader>
 
-        {previewText && (
-          <div className="border-border bg-muted/45 text-foreground/85 rounded-xl border px-3 py-2 text-[12.5px] leading-relaxed">
-            <p className="line-clamp-2 break-words">{previewText}</p>
+        {hasFiles && (
+          <div className="min-w-0 space-y-2.5">
+            <label className="inline-flex cursor-pointer items-center gap-2.5 select-none">
+              <button
+                type="button"
+                role="checkbox"
+                aria-checked={restoreFiles}
+                disabled={submitting}
+                onClick={() => setRestoreFiles((v) => !v)}
+                className={cn(
+                  "flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-[4px] border transition-colors disabled:opacity-60",
+                  restoreFiles
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-muted-foreground/45 bg-background hover:border-foreground/50",
+                )}
+              >
+                {restoreFiles && <Check className="size-3 stroke-[2.5]" />}
+              </button>
+              <span className="text-foreground text-[13.5px] font-medium">
+                Revert file changes
+              </span>
+            </label>
+
+            <div className="relative min-w-0">
+              <div
+                className={cn(
+                  "max-h-[216px] space-y-1.5 overflow-y-auto pr-1 transition-opacity duration-150",
+                  !restoreFiles && "opacity-45",
+                )}
+              >
+                {files.map((file) => {
+                  const FileIcon = resolveSemanticFileIcon(file.displayPath);
+                  const showRelPath = (basenameCounts.get(file.basename) ?? 0) > 1;
+                  return (
+                    <div
+                      key={file.displayPath}
+                      title={file.displayPath}
+                      className="flex min-w-0 items-center gap-2 py-0.5 text-[13px]"
+                    >
+                      <FileIcon className="text-muted-foreground/85 size-3.5 shrink-0 stroke-[1.75]" />
+                      <span
+                        className={cn(
+                          "text-foreground/90 min-w-0 truncate",
+                          !restoreFiles && "line-through",
+                        )}
+                      >
+                        {showRelPath ? file.displayPath : file.basename}
+                      </span>
+                      {(file.additions > 0 || file.deletions > 0) && (
+                        <span className="tabular-nums flex shrink-0 items-center gap-1.5 font-mono text-[12px]">
+                          <span className="text-emerald-600 dark:text-emerald-400">
+                            +{file.additions}
+                          </span>
+                          <span className="text-rose-600 dark:text-rose-400">
+                            -{file.deletions}
+                          </span>
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {files.length > 7 && (
+                <div
+                  className="pointer-events-none absolute inset-x-0 bottom-0 h-7"
+                  style={{
+                    background:
+                      "linear-gradient(to top, var(--surface-elevated) 0%, transparent 100%)",
+                  }}
+                />
+              )}
+            </div>
           </div>
         )}
-
-        <div className="space-y-2">
-          <button
-            type="button"
-            disabled={submitting}
-            onClick={() => setRestoreFiles(true)}
-            className={cn(
-              "flex w-full cursor-pointer items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60",
-              restoreFiles
-                ? "border-foreground/25 bg-accent/60"
-                : "border-border hover:bg-accent/35",
-            )}
-          >
-            <span
-              className={cn(
-                "mt-[3px] flex size-3.5 shrink-0 items-center justify-center rounded-full border",
-                restoreFiles ? "border-foreground bg-foreground" : "border-muted-foreground/50",
-              )}
-            >
-              {restoreFiles && <span className="bg-background size-1.5 rounded-full" />}
-            </span>
-            <span className="min-w-0 flex-1 space-y-1">
-              <span className="flex items-center gap-1.5 text-[13px] font-medium">
-                <span>Restore code &amp; conversation</span>
-                {target && target.editedFiles.length > 0 && (
-                  <span className="bg-muted text-muted-foreground tabular-nums rounded-full px-1.5 py-0.5 text-[11px] font-normal">
-                    {target.editedFiles.length}{" "}
-                    {target.editedFiles.length === 1 ? "file" : "files"}
-                  </span>
-                )}
-              </span>
-              <span className="text-muted-foreground block text-[12px] leading-snug">
-                Reverts workspace changes made since this message and rewinds the conversation.
-              </span>
-              {visibleFiles.length > 0 && (
-                <span className="flex flex-wrap gap-1 pt-0.5">
-                  {visibleFiles.map((filePath) => (
-                    <span
-                      key={filePath}
-                      className="border-border/80 bg-background/70 text-foreground/80 max-w-full truncate rounded-md border px-1.5 py-0.5 font-mono text-[11px]"
-                    >
-                      {stripWorkspacePrefix(filePath, cwd)}
-                    </span>
-                  ))}
-                  {extraFilesCount > 0 && (
-                    <span className="text-muted-foreground px-1 py-0.5 text-[11px]">
-                      +{extraFilesCount} more
-                    </span>
-                  )}
-                </span>
-              )}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            disabled={submitting}
-            onClick={() => setRestoreFiles(false)}
-            className={cn(
-              "flex w-full cursor-pointer items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60",
-              !restoreFiles
-                ? "border-foreground/25 bg-accent/60"
-                : "border-border hover:bg-accent/35",
-            )}
-          >
-            <span
-              className={cn(
-                "mt-[3px] flex size-3.5 shrink-0 items-center justify-center rounded-full border",
-                !restoreFiles ? "border-foreground bg-foreground" : "border-muted-foreground/50",
-              )}
-            >
-              {!restoreFiles && <span className="bg-background size-1.5 rounded-full" />}
-            </span>
-            <span className="min-w-0 flex-1 space-y-0.5">
-              <span className="block text-[13px] font-medium">Rewind conversation only</span>
-              <span className="text-muted-foreground block text-[12px] leading-snug">
-                Keeps current workspace files untouched and only truncates the conversation.
-              </span>
-            </span>
-          </button>
-        </div>
 
         {isAgentRunning && (
           <div className="flex items-center gap-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] px-3 py-2 text-[12px] text-amber-700 dark:text-amber-300">
             <AlertTriangle className="size-3.5 shrink-0" />
-            <span>The active turn will be stopped before rewinding.</span>
+            <span>Active turn will be stopped first.</span>
           </div>
         )}
 
@@ -1616,11 +1653,12 @@ function RewindTurnDialog({
             type="button"
             size="sm"
             disabled={submitting}
-            onClick={() => onConfirm(restoreFiles)}
+            onClick={() => onConfirm(effectiveRestore)}
             className="gap-1.5"
           >
             {submitting && <Loader2 className="size-3.5 animate-spin" />}
-            <span>{restoreFiles ? "Restore & Rewind" : "Rewind"}</span>
+            <span>Confirm</span>
+            {!submitting && <span className="text-[11px] opacity-75">↵</span>}
           </Button>
         </div>
       </DialogContent>
@@ -1661,11 +1699,15 @@ const RelativeTimestampPill = memo(function RelativeTimestampPill({
   );
 });
 
-/** Isolated 1-second live elapsed ticker so parent rows never re-render on ticks. */
+/** Isolated 1-second live elapsed ticker with offline & silent-stall hints. */
 const InlineLiveElapsed = memo(function InlineLiveElapsed({
   startedAtMs,
+  lastActivityMs,
+  isNetworkOffline = false,
 }: {
   startedAtMs: number;
+  lastActivityMs?: number | null;
+  isNetworkOffline?: boolean;
 }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -1676,12 +1718,28 @@ const InlineLiveElapsed = memo(function InlineLiveElapsed({
   }, [startedAtMs]);
 
   const elapsedMs = Math.max(0, nowMs - startedAtMs);
-  if (elapsedMs < 1000) return null;
+  const silentMs = Math.max(0, nowMs - (lastActivityMs ?? startedAtMs));
+  const isStalled = !isNetworkOffline && silentMs >= 45_000;
+
+  if (elapsedMs < 1000 && !isNetworkOffline) return null;
 
   return (
-    <span className="text-muted-foreground/75 tabular-nums shrink-0 text-[12.5px]">
-      · {formatDurationCompact(elapsedMs)}
-    </span>
+    <>
+      {elapsedMs >= 1000 && (
+        <span className="text-muted-foreground/75 tabular-nums shrink-0 text-[12.5px]">
+          · {formatDurationCompact(elapsedMs)}
+        </span>
+      )}
+      {isNetworkOffline ? (
+        <span className="shrink-0 text-[12px] text-amber-600 dark:text-amber-400">
+          · offline
+        </span>
+      ) : isStalled ? (
+        <span className="text-muted-foreground/65 shrink-0 text-[12px]">
+          · waiting for response
+        </span>
+      ) : null}
+    </>
   );
 });
 
@@ -1746,6 +1804,19 @@ const CompactionDivider = memo(function CompactionDivider({ label }: { label?: s
   );
 });
 
+const WakeupDivider = memo(function WakeupDivider({ label }: { label?: string }) {
+  return (
+    <div className="text-muted-foreground/80 flex items-center gap-3 py-1.5 text-[11.5px]">
+      <div className="border-border/75 flex-1 border-t" />
+      <span className="inline-flex items-center gap-1.5">
+        <Sparkles className="size-3 opacity-70" />
+        <span>{label || "Resumed from background task"}</span>
+      </span>
+      <div className="border-border/75 flex-1 border-t" />
+    </div>
+  );
+});
+
 const EMPTY_TIMELINE_ITEMS: TimelineItemView[] = [];
 
 function computeTotalThinkingDurationMs(
@@ -1772,27 +1843,53 @@ function buildTurnThinkingSignature(
   thinkingTimings: Record<string, TurnTimingRecord>,
 ): string {
   let sig = "";
-  for (const it of turn.foldedSteps) {
-    if (it.item_type !== "assistant_thinking") continue;
-    const key = `${agentId}::think::${it.item_id || it.seq}`;
-    const dur = thinkingTimings[key]?.durationMs;
-    if (dur !== null && dur !== undefined) {
-      sig += `${it.seq}:${dur};`;
+  for (const seg of turn.liveSegments) {
+    if (seg.kind !== "step_group") continue;
+    for (const it of seg.items) {
+      if (it.item_type !== "assistant_thinking") continue;
+      const key = `${agentId}::think::${it.item_id || it.seq}`;
+      const dur = thinkingTimings[key]?.durationMs;
+      if (dur !== null && dur !== undefined) {
+        sig += `${it.seq}:${dur};`;
+      }
     }
   }
   return sig;
 }
 
+const EMPTY_WORK_COUNTS: WorkSummaryResult["counts"] = {
+  editedFileCount: 0,
+  createdFileCount: 0,
+  commandCount: 0,
+  readFileCount: 0,
+  searchCount: 0,
+  subagentCount: 0,
+  mcpServerCount: 0,
+  otherToolCount: 0,
+  thoughtCount: 0,
+  narrationCount: 0,
+  actionSteps: 0,
+  totalSteps: 0,
+  failedCount: 0,
+  deniedCount: 0,
+  unrecoveredFailureCount: 0,
+  additions: 0,
+  deletions: 0,
+};
+
 /**
- * Renders a complete Conversation Turn:
- * - All pre-reply thinking, tool calls, resolved gates, and interim narration stay unified inside
- *   `TurnActivityDisclosure` with live status + elapsed duration, with zero structural switches
- *   between streaming and completion.
- * - Unrecovered tool failures without a final reply stay expanded so error output is visible.
+ * Renders a complete Conversation Turn as chronological interleaved segments:
+ * - Consecutive thinking, tool calls, and resolved gates fold cleanly inside per-batch
+ *   `TurnActivityDisclosure` disclosures with live elapsed / stall / offline indicators.
+ * - Every assistant reply (`assistant_message`) renders inline as top-level Markdown prose and
+ *   is never swallowed into step disclosures — including interim updates and replies prior to
+ *   post-turn autonomous wakeups.
+ * - Notices (API warnings, stream interruptions, errors) and wakeup boundaries render in place.
  */
 const TurnStageSection = memo(function TurnStageSection({
   turn,
   isTurnActive,
+  isNetworkOffline,
   animatePromptEntrance = false,
   autoFoldCompleted,
   cwd,
@@ -1806,6 +1903,7 @@ const TurnStageSection = memo(function TurnStageSection({
 }: {
   turn: StageTurn;
   isTurnActive: boolean;
+  isNetworkOffline: boolean;
   animatePromptEntrance?: boolean;
   autoFoldCompleted: boolean;
   cwd: string;
@@ -1824,25 +1922,6 @@ const TurnStageSection = memo(function TurnStageSection({
     [registerTurnEl, turn.anchorSeq],
   );
 
-  const settledLabel = useMemo(() => {
-    if (turn.workCounts.actionSteps === 0 && turn.workCounts.thoughtCount > 0) {
-      const thoughtMs =
-        computeTotalThinkingDurationMs(turn.foldedSteps, agentId, getThinkingDurationMs) ??
-        turn.thoughtDurationMs;
-      return formatThoughtSummaryLabel(thoughtMs, turn.workCounts.thoughtCount);
-    }
-    return turn.workSummaryLabel;
-  }, [
-    agentId,
-    thinkingSignature,
-    getThinkingDurationMs,
-    turn.foldedSteps,
-    turn.thoughtDurationMs,
-    turn.workCounts.actionSteps,
-    turn.workCounts.thoughtCount,
-    turn.workSummaryLabel,
-  ]);
-
   if (
     turn.isCompactionCommand &&
     turn.foldedSteps.length === 0 &&
@@ -1856,20 +1935,20 @@ const TurnStageSection = memo(function TurnStageSection({
     );
   }
 
-  const hasRunningFoldedTool = turn.foldedSteps.some(
-    (it) => it.item_type === "tool_call" && it.status === "running",
-  );
-  const isWorkActive = isTurnActive && (turn.terminalReply === null || hasRunningFoldedTool);
-  const showActivity = turn.foldedSteps.length > 0 || isWorkActive;
-  const hasBody =
-    showActivity ||
-    turn.terminalReply !== null ||
-    turn.notices.length > 0 ||
-    turn.compactions.length > 0;
-
-  const settledDurationMs =
-    timing?.workDurationMs ?? turn.workDurationMs ?? timing?.durationMs ?? null;
+  const segments = turn.liveSegments;
+  const lastSeg = segments[segments.length - 1] ?? null;
+  const hasBody = segments.length > 0 || isTurnActive;
   const liveStartedAtMs = timing?.startedAtMs ?? turn.startedAtMs ?? null;
+
+  // Show a lightweight trailing live indicator when the turn is active, but the last rendered
+  // segment is already settled (e.g., after an interim reply, notice, or wakeup divider).
+  const needsTrailingActivity =
+    isTurnActive &&
+    (lastSeg === null ||
+      (lastSeg.kind === "assistant_message" && !lastSeg.item.streaming) ||
+      lastSeg.kind === "notice" ||
+      lastSeg.kind === "wakeup" ||
+      lastSeg.kind === "compaction");
 
   return (
     <div
@@ -1888,65 +1967,127 @@ const TurnStageSection = memo(function TurnStageSection({
 
       {hasBody && (
         <div className="px-[10px]">
-          <div className="space-y-2.5">
-            {turn.compactions.map((c) => (
-              <CompactionDivider key={`compact-${c.seq}`} label={c.label} />
-            ))}
+          <div className="space-y-3">
+            {segments.map((seg, idx) => {
+              const isLastSeg = idx === segments.length - 1;
 
-            {showActivity && (
+              if (seg.kind === "compaction") {
+                return <CompactionDivider key={seg.key} label={seg.label} />;
+              }
+
+              if (seg.kind === "wakeup") {
+                return <WakeupDivider key={seg.key} label={seg.label} />;
+              }
+
+              if (seg.kind === "notice") {
+                const n = seg.item;
+                const isError = n.level === "error";
+                const isWarning = n.level === "warning";
+                return (
+                  <div
+                    key={seg.key}
+                    className={cn(
+                      "flex items-start gap-2 rounded-xl border px-3.5 py-2 text-[13px] leading-[1.45]",
+                      isError
+                        ? "border-rose-500/30 bg-rose-500/[0.07] text-rose-700 dark:text-rose-300"
+                        : isWarning
+                          ? "border-amber-500/30 bg-amber-500/[0.07] text-amber-800 dark:text-amber-200"
+                          : "text-muted-foreground border-border bg-muted/50",
+                    )}
+                  >
+                    <AlertTriangle
+                      className={cn(
+                        "mt-[2px] size-4 shrink-0",
+                        isError
+                          ? "text-rose-600 dark:text-rose-400"
+                          : isWarning
+                            ? "text-amber-600 dark:text-amber-400"
+                            : "text-muted-foreground",
+                      )}
+                    />
+                    <span className="selectable-text min-w-0 whitespace-pre-wrap break-words">
+                      {n.message}
+                    </span>
+                  </div>
+                );
+              }
+
+              if (seg.kind === "assistant_message") {
+                return (
+                  <MarkdownBlocksView
+                    key={seg.key}
+                    blocks={seg.item.blocks}
+                    streaming={seg.item.streaming}
+                  />
+                );
+              }
+
+              // `step_group`
+              const isGroupActive =
+                isTurnActive && (seg.hasRunningStep || (isLastSeg && !seg.hasFollowingContent));
+              const groupThoughtMs =
+                computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
+                seg.thoughtDurationMs;
+              const groupSettledLabel =
+                seg.summary.counts.actionSteps === 0 && seg.summary.counts.thoughtCount > 0
+                  ? formatThoughtSummaryLabel(groupThoughtMs, seg.summary.counts.thoughtCount)
+                  : seg.summary.label;
+              const groupSettledDurationMs =
+                seg.workDurationMs ??
+                (segments.length === 1
+                  ? (timing?.workDurationMs ?? turn.workDurationMs ?? timing?.durationMs ?? null)
+                  : null);
+              const groupLiveStartMs = seg.startedAtMs ?? liveStartedAtMs;
+
+              return (
+                <TurnActivityDisclosure
+                  key={seg.key}
+                  items={seg.items}
+                  isWorkActive={isGroupActive}
+                  liveLabel={seg.summary.liveLabel}
+                  liveDetail={seg.summary.liveDetail}
+                  settledLabel={groupSettledLabel}
+                  summaryCounts={seg.summary.counts}
+                  labelIncludesFailure={seg.summary.labelIncludesFailure}
+                  defaultCollapsed={autoFoldCompleted}
+                  autoOpenForError={
+                    !isGroupActive &&
+                    !seg.hasFollowingContent &&
+                    seg.summary.counts.unrecoveredFailureCount > 0
+                  }
+                  liveStartedAtMs={groupLiveStartMs}
+                  latestActivityMs={seg.latestActivityMs ?? groupLiveStartMs}
+                  isNetworkOffline={isNetworkOffline}
+                  settledDurationMs={groupSettledDurationMs}
+                  cwd={cwd}
+                  agentId={agentId}
+                  thinkingSignature={thinkingSignature}
+                  getThinkingDurationMs={getThinkingDurationMs}
+                  holdViewport={holdViewport}
+                />
+              );
+            })}
+
+            {needsTrailingActivity && (
               <TurnActivityDisclosure
-                items={turn.foldedSteps}
-                isWorkActive={isWorkActive}
-                liveLabel={turn.workSummaryLiveLabel}
-                liveDetail={turn.workSummaryLiveDetail}
-                settledLabel={settledLabel}
-                summaryCounts={turn.workCounts}
-                labelIncludesFailure={turn.workSummaryIncludesFailure}
+                items={EMPTY_TIMELINE_ITEMS}
+                isWorkActive
+                liveLabel={lastSeg === null ? "Working…" : "Thinking…"}
+                liveDetail={null}
+                settledLabel=""
+                summaryCounts={EMPTY_WORK_COUNTS}
+                labelIncludesFailure={false}
                 defaultCollapsed={autoFoldCompleted}
-                autoOpenForError={
-                  !isWorkActive &&
-                  turn.terminalReply === null &&
-                  turn.workCounts.unrecoveredFailureCount > 0
-                }
+                autoOpenForError={false}
                 liveStartedAtMs={liveStartedAtMs}
-                settledDurationMs={settledDurationMs}
+                latestActivityMs={turn.completedAtMs ?? liveStartedAtMs}
+                isNetworkOffline={isNetworkOffline}
+                settledDurationMs={null}
                 cwd={cwd}
                 agentId={agentId}
                 thinkingSignature={thinkingSignature}
                 getThinkingDurationMs={getThinkingDurationMs}
                 holdViewport={holdViewport}
-              />
-            )}
-
-            {turn.notices.map((n, idx) => {
-              const isError = n.level === "error";
-              return (
-                <div
-                  key={`notice-${n.seq}-${n.timestamp_ms ?? 0}-${idx}`}
-                  className={cn(
-                    "flex items-center gap-2 rounded-xl border px-3.5 py-2 text-[13px]",
-                    isError
-                      ? "border-rose-500/30 bg-rose-500/[0.07] text-rose-700 dark:text-rose-300"
-                      : "text-muted-foreground border-border bg-muted/50",
-                  )}
-                >
-                  <AlertTriangle
-                    className={cn(
-                      "size-4 shrink-0",
-                      isError
-                        ? "text-rose-600 dark:text-rose-400"
-                        : "text-amber-600 dark:text-amber-400",
-                    )}
-                  />
-                  <span className="selectable-text">{n.message}</span>
-                </div>
-              );
-            })}
-
-            {turn.terminalReply && (
-              <MarkdownBlocksView
-                blocks={turn.terminalReply.blocks}
-                streaming={turn.terminalReply.streaming}
               />
             )}
 
@@ -1956,7 +2097,7 @@ const TurnStageSection = memo(function TurnStageSection({
               isTurnActive={isTurnActive}
               timing={timing}
               completedAtMs={turn.completedAtMs}
-              replyText={!isTurnActive ? (turn.terminalReply?.text ?? null) : null}
+              replyText={!isTurnActive ? (turn.lastAssistantReply?.text ?? null) : null}
             />
           </div>
         </div>
@@ -1966,6 +2107,7 @@ const TurnStageSection = memo(function TurnStageSection({
 }, (prev, next) =>
   prev.turn === next.turn &&
   prev.isTurnActive === next.isTurnActive &&
+  prev.isNetworkOffline === next.isNetworkOffline &&
   prev.animatePromptEntrance === next.animatePromptEntrance &&
   prev.autoFoldCompleted === next.autoFoldCompleted &&
   prev.cwd === next.cwd &&
@@ -1999,6 +2141,8 @@ export function StreamStage() {
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const sessionScrollNonce = useOrbitSelector((s) => s.sessionScrollNonce);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
+  const overviewDesktopOpenPref = useOrbitSelector((s) => s.overviewDesktopOpenPref);
+  const isNetworkOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const hostDetail = useOrbitSelector((s) =>
     s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
   );
@@ -2014,7 +2158,6 @@ export function StreamStage() {
   );
 
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
-  const convoColumnRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const composerShelfRef = useRef<HTMLDivElement | null>(null);
@@ -2035,7 +2178,7 @@ export function StreamStage() {
 
   const [isOccludingText, setIsOccludingText] = useState(false);
   const [showJumpLatest, setShowJumpLatest] = useState(false);
-  const [isStageWide, setIsStageWide] = useState(false);
+  const [stageWidth, setStageWidth] = useState(0);
   const [canDockOverview, setCanDockOverview] = useState(false);
   const canDockOverviewRef = useRef(false);
   const [activePromptSeq, setActivePromptSeq] = useState<number | null>(null);
@@ -2155,19 +2298,19 @@ export function StreamStage() {
     }
   }, [selectedAgentId, latestTurn, isLatestTurnActive, cachedTimeline?.items]);
 
-  // Hysteresis-guarded ResizeObserver for Stage Overview docking (`>= 1000px` dock, `< 960px` collapse)
-  // and independent conversation-column threshold (`>= 880px`) for the peripheral outline rail.
+  // Hysteresis-guarded ResizeObserver for Stage Overview docking (`>= 1040px` dock, `< 1000px` collapse)
+  // and unified stage width tracking for the peripheral outline rail.
   // Synchronous `useLayoutEffect` prevents first-paint layout shift when entering an active session.
   useLayoutEffect(() => {
     const stageEl = stageContainerRef.current;
-    const convoEl = convoColumnRef.current;
     if (!stageEl || typeof ResizeObserver === "undefined") {
       orbitActions.setStageCanDockOverview(false);
       return;
     }
 
     const syncStageWidth = (w: number) => {
-      const nextCanDock = canDockOverviewRef.current ? w >= 960 : w >= 1000;
+      setStageWidth((prev) => (Math.abs(prev - w) < 0.5 ? prev : w));
+      const nextCanDock = canDockOverviewRef.current ? w >= 1000 : w >= 1040;
       if (nextCanDock !== canDockOverviewRef.current) {
         canDockOverviewRef.current = nextCanDock;
         setCanDockOverview(nextCanDock);
@@ -2176,7 +2319,8 @@ export function StreamStage() {
     };
 
     const initialW = stageEl.getBoundingClientRect().width;
-    const initialDock = initialW >= 1000;
+    const initialDock = initialW >= 1040;
+    setStageWidth(initialW);
     canDockOverviewRef.current = initialDock;
     setCanDockOverview(initialDock);
     orbitActions.setStageCanDockOverview(initialDock);
@@ -2187,22 +2331,13 @@ export function StreamStage() {
     });
     roStage.observe(stageEl);
 
-    let roConvo: ResizeObserver | null = null;
-    if (convoEl) {
-      setIsStageWide(convoEl.getBoundingClientRect().width >= 880);
-      roConvo = new ResizeObserver((entries) => {
-        const cw = entries[0]?.contentRect.width ?? 0;
-        const wide = cw >= 880;
-        setIsStageWide((prev) => (prev === wide ? prev : wide));
-      });
-      roConvo.observe(convoEl);
-    }
-
     return () => {
       roStage.disconnect();
-      roConvo?.disconnect();
     };
   }, [isDraft, selectedAgentId]);
+
+  const isOverviewDockedVisible = canDockOverview && overviewDesktopOpenPref;
+  const isStageWide = stageWidth - (isOverviewDockedVisible ? 324 : 0) >= 820;
 
   const outlinePrompts = useMemo(
     () =>
@@ -2228,28 +2363,57 @@ export function StreamStage() {
   const turnsCountRef = useRef(stage.turns.length);
   turnsCountRef.current = stage.turns.length;
 
+  const effectiveCwdRef = useRef("");
+  effectiveCwdRef.current = selectedCwd || currentAgent?.cwd || "";
+
   const handleRequestRewind = useCallback((seq: number, promptText: string) => {
+    const activeCwd = effectiveCwdRef.current;
     const affected = stageTurnsRef.current.filter((t) => t.anchorSeq >= seq);
-    const editedSet = new Set<string>();
+    const byPath = new Map<string, RewindFileEntry>();
+
+    const recordFile = (rawPath: string, additions: number, deletions: number) => {
+      if (!isRevertibleWorkspaceFile(rawPath, activeCwd)) return;
+      const displayPath = stripWorkspacePrefix(rawPath, activeCwd).replace(/^\.\//, "");
+      if (!displayPath) return;
+      const prev = byPath.get(displayPath);
+      if (prev) {
+        prev.additions += additions;
+        prev.deletions += deletions;
+      } else {
+        const basename = displayPath.split("/").pop() || displayPath;
+        byPath.set(displayPath, {
+          displayPath,
+          basename,
+          additions,
+          deletions,
+        });
+      }
+    };
+
     for (const turn of affected) {
       for (const diff of turn.turnDiffs) {
-        if (diff.path) editedSet.add(diff.path);
+        if (diff.path) recordFile(diff.path, diff.additions, diff.deletions);
       }
-      for (const step of turn.foldedSteps) {
-        if (
-          step.item_type === "tool_call" &&
-          step.detail.kind === "file_edit" &&
-          step.detail.path
-        ) {
-          editedSet.add(step.detail.path);
+      for (const seg of turn.liveSegments) {
+        if (seg.kind !== "step_group") continue;
+        for (const step of seg.items) {
+          if (
+            step.item_type === "tool_call" &&
+            step.detail.kind === "file_edit" &&
+            step.detail.path &&
+            step.diff_files.length === 0
+          ) {
+            recordFile(step.detail.path, 0, 0);
+          }
         }
       }
     }
+
     setRewindTarget({
       seq,
       promptText,
       affectedTurnsCount: Math.max(1, affected.length),
-      editedFiles: Array.from(editedSet),
+      editedFiles: Array.from(byPath.values()),
     });
   }, []);
 
@@ -2600,93 +2764,102 @@ export function StreamStage() {
   return (
     <div
       ref={stageContainerRef}
-      className="relative flex min-h-0 flex-1 flex-row overflow-hidden"
+      className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
     >
-      {/* Left: Unified Conversation Viewport + Docked Composer Column */}
-      <div
-        ref={convoColumnRef}
-        className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
-      >
-        {/* Peripheral Megathread Outline Rail (spacious conversation column >= 880px only) */}
-        {isStageWide && outlinePrompts.length >= 2 && (
-          <ChatOutlineRail
-            prompts={outlinePrompts}
-            activeSeq={activePromptSeq ?? outlinePrompts[outlinePrompts.length - 1]?.seq ?? null}
-            onJumpToSeq={jumpToPromptSeq}
-          />
+      {/* Peripheral Megathread Outline Rail (spacious conversation column >= 820px only) */}
+      {isStageWide && outlinePrompts.length >= 2 && (
+        <ChatOutlineRail
+          prompts={outlinePrompts}
+          activeSeq={activePromptSeq ?? outlinePrompts[outlinePrompts.length - 1]?.seq ?? null}
+          onJumpToSeq={jumpToPromptSeq}
+        />
+      )}
+
+      {/* 1. Unified Scrollable Conversation Viewport — scrollbar stays on far right edge */}
+      <ScrollArea
+        className="min-h-0 flex-1"
+        viewportRef={scrollRef}
+        onViewportScroll={handleScroll}
+        viewportClassName={cn(
+          "pt-6 pb-11 pl-6 transition-[padding-right]",
+          isOverviewDockedVisible
+            ? "pr-[348px] duration-[240ms] ease-[var(--ease-panel)]"
+            : "pr-6 duration-[200ms] ease-[var(--ease-panel-out)]",
         )}
-
-        {/* 1. Scrollable Conversation Viewport — ends strictly ABOVE the Composer shelf */}
-        <ScrollArea
-          className="min-h-0 flex-1"
-          viewportRef={scrollRef}
-          onViewportScroll={handleScroll}
-          viewportClassName="px-6 pt-6 pb-11"
+      >
+        <div
+          key={selectedAgentId}
+          ref={contentRef}
+          className="orbit-stage-enter mx-auto w-full max-w-[768px] space-y-8"
         >
+          {stage.turns.length === 0 &&
+            wasSessionRewound &&
+            cachedTimeline !== null &&
+            (cachedTimeline.agent?.latest_seq ?? 0) === 0 &&
+            !isAgentRunning && (
+              <div className="text-muted-foreground flex flex-col items-center justify-center py-20 text-center">
+                <RotateCcw className="mb-2.5 size-5 opacity-45" />
+                <p className="text-[13.5px]">
+                  Rewound to the start of this session. Edit your prompt below to continue.
+                </p>
+              </div>
+            )}
+
+          {stage.turns.map((turn, idx) => {
+            const isLast = idx === stage.turns.length - 1;
+            const turnActive = isLast && isLatestTurnActive;
+            const isFreshLivePrompt =
+              turn.userPrompt !== null && turn.userPrompt.seq > baselineMaxSeq;
+            const timing = turnTimingsRef.current[`${selectedAgentId}::${turn.key}`];
+            const thinkingSignature = buildTurnThinkingSignature(
+              turn,
+              selectedAgentId,
+              thinkingTimingsRef.current,
+            );
+            return (
+              <TurnStageSection
+                key={turn.key}
+                turn={turn}
+                isTurnActive={turnActive}
+                isNetworkOffline={isNetworkOffline}
+                animatePromptEntrance={isFreshLivePrompt}
+                autoFoldCompleted={coalesceExploration}
+                cwd={effectiveCwd}
+                agentId={selectedAgentId}
+                timing={timing}
+                thinkingSignature={thinkingSignature}
+                getThinkingDurationMs={getThinkingDurationMs}
+                holdViewport={holdViewport}
+                registerTurnEl={registerTurnEl}
+                onRequestRewind={handleRequestRewind}
+              />
+            );
+          })}
+        </div>
+      </ScrollArea>
+
+      {/* 2. Docked Composer Shelf — normal flex sibling below scrollRef (scrollbar never enters here) */}
+      <div ref={composerShelfRef} className="bg-canvas relative z-20 shrink-0">
+        {/* Upward Occlusion Fade & `38×38` [↓] Button */}
+        <div className="pointer-events-none absolute inset-x-0 bottom-full h-7">
           <div
-            key={selectedAgentId}
-            ref={contentRef}
-            className="orbit-stage-enter mx-auto w-full max-w-[768px] space-y-8"
+            className={cn(
+              "h-full w-full transition-opacity duration-150",
+              isOccludingText ? "opacity-100" : "opacity-0",
+            )}
+            style={{
+              background:
+                "linear-gradient(to top, var(--surface-canvas) 0%, color-mix(in oklab, var(--surface-canvas) 66%, transparent) 48%, transparent 100%)",
+            }}
+          />
+          <div
+            className={cn(
+              "pointer-events-none absolute inset-y-0 left-0 transition-[right]",
+              isOverviewDockedVisible
+                ? "right-[324px] duration-[240ms] ease-[var(--ease-panel)]"
+                : "right-0 duration-[200ms] ease-[var(--ease-panel-out)]",
+            )}
           >
-            {stage.turns.length === 0 &&
-              wasSessionRewound &&
-              cachedTimeline !== null &&
-              (cachedTimeline.agent?.latest_seq ?? 0) === 0 &&
-              !isAgentRunning && (
-                <div className="text-muted-foreground flex flex-col items-center justify-center py-20 text-center">
-                  <RotateCcw className="mb-2.5 size-5 opacity-45" />
-                  <p className="text-[13.5px]">
-                    Rewound to the start of this session. Edit your prompt below to continue.
-                  </p>
-                </div>
-              )}
-
-            {stage.turns.map((turn, idx) => {
-              const isLast = idx === stage.turns.length - 1;
-              const turnActive = isLast && isLatestTurnActive;
-              const isFreshLivePrompt =
-                turn.userPrompt !== null && turn.userPrompt.seq > baselineMaxSeq;
-              const timing = turnTimingsRef.current[`${selectedAgentId}::${turn.key}`];
-              const thinkingSignature = buildTurnThinkingSignature(
-                turn,
-                selectedAgentId,
-                thinkingTimingsRef.current,
-              );
-              return (
-                <TurnStageSection
-                  key={turn.key}
-                  turn={turn}
-                  isTurnActive={turnActive}
-                  animatePromptEntrance={isFreshLivePrompt}
-                  autoFoldCompleted={coalesceExploration}
-                  cwd={effectiveCwd}
-                  agentId={selectedAgentId}
-                  timing={timing}
-                  thinkingSignature={thinkingSignature}
-                  getThinkingDurationMs={getThinkingDurationMs}
-                  holdViewport={holdViewport}
-                  registerTurnEl={registerTurnEl}
-                  onRequestRewind={handleRequestRewind}
-                />
-              );
-            })}
-          </div>
-        </ScrollArea>
-
-        {/* 2. Docked Composer Shelf — normal flex sibling below scrollRef (scrollbar never enters here) */}
-        <div ref={composerShelfRef} className="bg-canvas relative z-20 shrink-0">
-          {/* Upward Occlusion Fade & `34×34` [↓] Button */}
-          <div className="pointer-events-none absolute inset-x-0 bottom-full h-7">
-            <div
-              className={cn(
-                "h-full w-full transition-opacity duration-150",
-                isOccludingText ? "opacity-100" : "opacity-0",
-              )}
-              style={{
-                background:
-                  "linear-gradient(to top, var(--surface-canvas) 0%, color-mix(in oklab, var(--surface-canvas) 66%, transparent) 48%, transparent 100%)",
-              }}
-            />
             <button
               type="button"
               aria-label="Scroll to latest"
@@ -2694,16 +2867,25 @@ export function StreamStage() {
               tabIndex={showJumpLatest ? 0 : -1}
               onClick={scrollToLatest}
               className={cn(
-                "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute bottom-2 left-1/2 inline-flex size-8.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-all duration-150 ease-out dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
+                "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute bottom-2 left-1/2 inline-flex size-9.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-all duration-200 ease-[var(--ease-out-expo)] dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
                 showJumpLatest
                   ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
                   : "pointer-events-none translate-y-1 scale-95 opacity-0",
               )}
             >
-              <ArrowDown className="size-4 stroke-[1.9]" />
+              <ArrowDown className="size-[18px] stroke-[1.9]" />
             </button>
           </div>
+        </div>
 
+        <div
+          className={cn(
+            "transition-[padding-right]",
+            isOverviewDockedVisible
+              ? "pr-[324px] duration-[240ms] ease-[var(--ease-panel)]"
+              : "pr-0 duration-[200ms] ease-[var(--ease-panel-out)]",
+          )}
+        >
           <StickyApprovalDock
             hostId={selectedHostId}
             agentId={selectedAgentId}
@@ -2715,7 +2897,7 @@ export function StreamStage() {
         </div>
       </div>
 
-      {/* Right: Responsive In-Stage Overview Panel (Docked on spacious stage, Floating Popover on narrow/split stage) */}
+      {/* 3. Top-Right Floating Overview Card Overlay (to the left of the far-right scrollbar) */}
       <StageOverviewPanel
         canDock={canDockOverview}
         hostId={selectedHostId}
@@ -2728,7 +2910,6 @@ export function StreamStage() {
 
       <RewindTurnDialog
         target={rewindTarget}
-        cwd={effectiveCwd}
         isAgentRunning={isAgentRunning}
         submitting={rewindSubmitting}
         onOpenChange={(open) => {

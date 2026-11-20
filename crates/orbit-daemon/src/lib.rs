@@ -252,6 +252,14 @@ impl DaemonRuntime {
 pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
     let mut persisted = DaemonPersistedConfig::load(&config.home_dir);
     let effective_relay = config.relay_url.or_else(|| persisted.relay_url.clone());
+    let cleaned_sockets =
+        orbit_shim::cleanup_stale_shim_sockets(&config.home_dir.join("shims")).await;
+    if cleaned_sockets > 0 {
+        info!(
+            removed = cleaned_sockets,
+            "Cleaned up stale shim sockets from previous runs"
+        );
+    }
     let runtime = DaemonRuntime::bootstrap(&config.home_dir).await?;
     let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
         Ok(l) => l,
@@ -487,19 +495,23 @@ async fn serve_e2ee_relay_tunnel(
                     continue;
                 }
                 match plain[0] {
-                    E2EE_FRAME_WIRE => {
-                        if let Ok(wire) = WireMessage::decode_zstd(&plain[1..])
-                            && in_tx
+                    E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
+                        Ok(wire) => {
+                            if in_tx
                                 .send(SessionFrame::Wire {
                                     msg: wire,
                                     zstd: true,
                                 })
                                 .await
                                 .is_err()
-                        {
-                            break;
+                            {
+                                break;
+                            }
                         }
-                    }
+                        Err(err) => {
+                            tracing::warn!(error = %err, bytes = plain.len(), "failed to decode E2EE zstd wire message");
+                        }
+                    },
                     E2EE_FRAME_TERMINAL => {
                         if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..])
                             && in_tx.send(SessionFrame::Terminal(term)).await.is_err()
@@ -573,16 +585,22 @@ async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
                 }
                 AxumWsMsg::Binary(bin) if !bin.is_empty() => {
                     if bin[0] == DIRECT_BIN_ZSTD_WIRE {
-                        if let Ok(wire) = WireMessage::decode_zstd(&bin[1..])
-                            && in_tx
-                                .send(SessionFrame::Wire {
-                                    msg: wire,
-                                    zstd: true,
-                                })
-                                .await
-                                .is_err()
-                        {
-                            break;
+                        match WireMessage::decode_zstd(&bin[1..]) {
+                            Ok(wire) => {
+                                if in_tx
+                                    .send(SessionFrame::Wire {
+                                        msg: wire,
+                                        zstd: true,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, bytes = bin.len(), "failed to decode direct zstd wire message");
+                            }
                         }
                     } else if let Ok(term) = TerminalBinaryFrame::decode(&bin)
                         && in_tx.send(SessionFrame::Terminal(term)).await.is_err()
@@ -1105,10 +1123,12 @@ async fn handle_wire_rpc(
             since_seq,
         } => {
             subscribed_agents.insert(agent_id.clone());
-            match runtime
-                .store
-                .fetch_timeline_since(&agent_id, since_seq, 2000)
-            {
+            match runtime.store.fetch_timeline_since_budgeted(
+                &agent_id,
+                since_seq,
+                2000,
+                orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES,
+            ) {
                 Ok((events, has_more)) => Some(WireMessage::TimelineCatchup {
                     request_id,
                     agent_id,

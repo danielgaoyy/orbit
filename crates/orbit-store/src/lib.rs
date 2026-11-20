@@ -190,6 +190,11 @@ impl OrbitStore {
                 payload_json TEXT NOT NULL,
                 PRIMARY KEY (agent_id, seq)
             );
+
+            CREATE TABLE IF NOT EXISTS client_replica_cursors (
+                agent_id       TEXT PRIMARY KEY,
+                contiguous_seq INTEGER NOT NULL DEFAULT 0
+            );
             ",
         )?;
         // Non-destructive forward-compatible column migrations for pre-existing databases
@@ -558,6 +563,78 @@ impl OrbitStore {
         Ok(())
     }
 
+    /// Batch-upsert a page of replica timeline events in a single SQLite transaction.
+    pub fn upsert_replica_timeline_events_batch(
+        &self,
+        events: &[TimelineEvent],
+    ) -> Result<(), StoreError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        for ev in events {
+            let payload_json = serde_json::to_string(&ev.payload)?;
+            let ts_str = ev.timestamp.to_rfc3339();
+            if let Some((json_key, id_val)) = coalesce_identity(&ev.payload) {
+                let boundary_seq = query_coalesce_boundary_seq(
+                    &tx,
+                    "client_replica_events",
+                    &ev.agent_id,
+                    &ev.payload,
+                    Some(ev.seq),
+                );
+                let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
+                let _ = tx.execute(
+                    "DELETE FROM client_replica_events
+                     WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND payload_json LIKE ?4",
+                    params![ev.agent_id, boundary_seq, ev.seq as i64, pattern],
+                );
+            }
+            tx.execute(
+                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(agent_id, seq) DO UPDATE SET
+                    payload_json = excluded.payload_json",
+                params![
+                    ev.agent_id,
+                    ev.seq as i64,
+                    ev.epoch,
+                    ev.turn_id,
+                    ts_str,
+                    payload_json
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_replica_contiguous_seq(&self, agent_id: &str) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let seq: Option<i64> = conn
+            .query_row(
+                "SELECT contiguous_seq FROM client_replica_cursors WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(seq.unwrap_or(0).max(0) as u64)
+    }
+
+    pub fn set_replica_contiguous_seq(&self, agent_id: &str, seq: u64) -> Result<(), StoreError> {
+        let seq_i64 = i64::try_from(seq)
+            .map_err(|_| StoreError::InvalidArgument("contiguous_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO client_replica_cursors (agent_id, contiguous_seq)
+             VALUES (?1, ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET contiguous_seq = excluded.contiguous_seq",
+            params![agent_id, seq_i64],
+        )?;
+        Ok(())
+    }
+
     /// Replace all cached replica events for an agent after an authoritative server-side rewind.
     pub fn replace_replica_timeline(
         &self,
@@ -568,6 +645,10 @@ impl OrbitStore {
         let tx = conn.transaction()?;
         tx.execute(
             "DELETE FROM client_replica_events WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM client_replica_cursors WHERE agent_id = ?1",
             params![agent_id],
         )?;
         for ev in events {
@@ -733,6 +814,19 @@ impl OrbitStore {
         since_seq: u64,
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
+        self.fetch_timeline_since_budgeted(agent_id, since_seq, limit, usize::MAX)
+    }
+
+    /// Fetch timeline events strictly after `since_seq` bounded by both event count and an
+    /// approximate uncompressed JSON byte budget (`max_bytes`), always yielding at least one event
+    /// when any exist so oversized single events never stall catchup pagination.
+    pub fn fetch_timeline_since_budgeted(
+        &self,
+        agent_id: &str,
+        since_seq: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let fetch_limit = (limit.saturating_add(1)) as i64;
         let mut stmt = conn.prepare(
@@ -744,6 +838,8 @@ impl OrbitStore {
         )?;
 
         let mut events = Vec::new();
+        let mut approx_bytes: usize = 0;
+        let mut has_more = false;
         let rows = stmt.query_map(params![agent_id, since_seq as i64, fetch_limit], |row| {
             let seq = row.get::<_, i64>(0)? as u64;
             let epoch = row.get::<_, u32>(1)?;
@@ -756,7 +852,15 @@ impl OrbitStore {
 
         for row in rows {
             let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = row?;
+            let row_bytes = payload_str.len().saturating_add(128);
+            if events.len() >= limit
+                || (!events.is_empty() && approx_bytes.saturating_add(row_bytes) > max_bytes)
+            {
+                has_more = true;
+                break;
+            }
             let payload: TimelinePayload = serde_json::from_str(&payload_str)?;
+            approx_bytes = approx_bytes.saturating_add(row_bytes);
             events.push(TimelineEvent {
                 seq,
                 epoch,
@@ -767,10 +871,6 @@ impl OrbitStore {
             });
         }
 
-        let has_more = events.len() > limit;
-        if has_more {
-            events.truncate(limit);
-        }
         Ok((events, has_more))
     }
 
@@ -939,6 +1039,8 @@ impl OrbitStore {
         };
 
         let mut remaining = Vec::new();
+        let mut approx_bytes: usize = 0;
+        let max_inline_bytes = orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES;
         {
             let mut stmt = tx.prepare(
                 "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
@@ -957,7 +1059,14 @@ impl OrbitStore {
             })?;
             for row in rows {
                 let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = row?;
+                let row_bytes = payload_str.len().saturating_add(128);
+                if !remaining.is_empty()
+                    && approx_bytes.saturating_add(row_bytes) > max_inline_bytes
+                {
+                    break;
+                }
                 let payload: TimelinePayload = serde_json::from_str(&payload_str)?;
+                approx_bytes = approx_bytes.saturating_add(row_bytes);
                 remaining.push(TimelineEvent {
                     seq,
                     epoch,
@@ -1184,6 +1293,26 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
+    }
+
+    /// Purge legacy daemon-schema `timeline_events` / `turn_checkpoints` rows that accumulated in
+    /// older client replica databases (`desktop-client.sqlite`) before `client_replica_events` was
+    /// introduced. Only call this on client-side replica DBs — never on the daemon's `orbit.db`.
+    pub fn purge_legacy_client_timeline_events(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let legacy_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM timeline_events", [], |row| row.get(0))
+            .unwrap_or(0);
+        if legacy_count <= 0 {
+            return Ok(0);
+        }
+        conn.execute("DELETE FROM turn_checkpoints", [])?;
+        conn.execute("DELETE FROM timeline_events", [])?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        if legacy_count >= 100 {
+            let _ = conn.execute_batch("VACUUM;");
+        }
+        Ok(legacy_count as usize)
     }
 }
 
@@ -1512,5 +1641,169 @@ mod tests {
             .expect("fetch replica");
         assert_eq!(rep.len(), 2);
         assert_eq!(rep[1].seq, a1.seq);
+    }
+
+    #[test]
+    fn purge_legacy_client_timeline_events_preserves_replica_rows() {
+        let store = OrbitStore::open_in_memory().expect("mem db");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_leg".into(),
+                title: "demo".into(),
+                cwd: "/tmp/demo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_leg".into(),
+                    workspace_id: "ws_leg".into(),
+                    cwd: "/tmp/demo".into(),
+                    title: "Legacy".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                },
+                None,
+            )
+            .expect("ag");
+
+        let ev = store
+            .append_timeline_event(
+                "ag_leg",
+                1,
+                None,
+                TimelinePayload::UserPrompt {
+                    message_id: "m1".into(),
+                    text: "legacy row".into(),
+                    badges: vec![],
+                },
+            )
+            .expect("append");
+        store.upsert_replica_timeline_event(&ev).expect("replica");
+
+        let purged = store.purge_legacy_client_timeline_events().expect("purge");
+        assert_eq!(purged, 1);
+        assert!(
+            store
+                .fetch_timeline_from("ag_leg", 0)
+                .expect("fetch")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .fetch_replica_timeline("ag_leg", 50)
+                .expect("replica")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn budgeted_timeline_pagination_and_replica_cursor_reset() {
+        let store = OrbitStore::open_in_memory().expect("in-memory store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_pg".into(),
+                title: "ws".into(),
+                cwd: "/tmp/pg".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_pg".into(),
+                    workspace_id: "ws_pg".into(),
+                    cwd: "/tmp/pg".into(),
+                    title: "Big".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                },
+                None,
+            )
+            .expect("ag");
+
+        let big_text = "x".repeat(2000);
+        let mut seqs = Vec::new();
+        for idx in 0..5 {
+            let ev = store
+                .append_timeline_event(
+                    "ag_pg",
+                    1,
+                    None,
+                    TimelinePayload::AssistantMessage {
+                        item_id: format!("m_{idx}"),
+                        text: big_text.clone(),
+                        streaming: false,
+                    },
+                )
+                .expect("append");
+            seqs.push(ev.seq);
+        }
+
+        // Budget of 5000 bytes (~2 events per page) must paginate across multiple chunks
+        let (p1, more1) = store
+            .fetch_timeline_since_budgeted("ag_pg", 0, 100, 5000)
+            .expect("p1");
+        assert!(more1);
+        assert_eq!(p1.len(), 2);
+
+        let (p2, more2) = store
+            .fetch_timeline_since_budgeted("ag_pg", p1[1].seq, 100, 5000)
+            .expect("p2");
+        assert!(more2);
+        assert_eq!(p2.len(), 2);
+
+        let (p3, more3) = store
+            .fetch_timeline_since_budgeted("ag_pg", p2[1].seq, 100, 5000)
+            .expect("p3");
+        assert!(!more3);
+        assert_eq!(p3.len(), 1);
+        assert_eq!(p3[0].seq, seqs[4]);
+
+        // Even if a single event exceeds max_bytes, at least 1 event is always yielded
+        let (oversized, has_more) = store
+            .fetch_timeline_since_budgeted("ag_pg", 0, 100, 100)
+            .expect("oversized");
+        assert_eq!(oversized.len(), 1);
+        assert!(has_more);
+
+        // Replica cursor tracks contiguous sync and resets on replace_replica_timeline
+        assert_eq!(store.get_replica_contiguous_seq("ag_pg").expect("get"), 0);
+        store
+            .upsert_replica_timeline_events_batch(&p1)
+            .expect("batch");
+        store
+            .set_replica_contiguous_seq("ag_pg", p1[1].seq)
+            .expect("set");
+        assert_eq!(
+            store.get_replica_contiguous_seq("ag_pg").expect("get"),
+            p1[1].seq
+        );
+        store.replace_replica_timeline("ag_pg", &[]).expect("wipe");
+        assert_eq!(store.get_replica_contiguous_seq("ag_pg").expect("get"), 0);
     }
 }

@@ -983,7 +983,21 @@ impl AgentOrchestrator {
                 }
                 return;
             }
-            DriverEvent::StatusChanged(status) => TimelinePayload::StatusChanged { status },
+            DriverEvent::StatusChanged(status) => {
+                if let AgentStatus::Error {
+                    ref message,
+                    recoverable,
+                } = status
+                {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        recoverable,
+                        error = %message,
+                        "Agent transitioned to Error state"
+                    );
+                }
+                TimelinePayload::StatusChanged { status }
+            }
             DriverEvent::ThinkingText { item_id, text } => {
                 TimelinePayload::AssistantThinking { item_id, text }
             }
@@ -1030,8 +1044,25 @@ impl AgentOrchestrator {
                     questions: questions as Vec<QuestionItem>,
                 }
             }
-            DriverEvent::Notice { level, message } => TimelinePayload::Notice { level, message },
-            DriverEvent::Exited { .. } => {
+            DriverEvent::Notice { level, message } => {
+                if level == "error" || level == "warning" {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        level = %level,
+                        notice = %message,
+                        "Agent emitted runtime notice"
+                    );
+                }
+                TimelinePayload::Notice { level, message }
+            }
+            DriverEvent::Exited { code } => {
+                if code != Some(0) {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        exit_code = ?code,
+                        "Agent driver process exited"
+                    );
+                }
                 self.clear_pending_requests(agent_id).await;
                 TimelinePayload::StatusChanged {
                     status: AgentStatus::Closed,

@@ -66,37 +66,68 @@ export function WorkspaceSidePanel() {
   );
 
   const shouldOpen = sidePanelOpen && Boolean(selectedHostId);
-  const [mounted, setMounted] = useState(shouldOpen || hasTerminalTab);
-  const [visualOpen, setVisualOpen] = useState(shouldOpen);
+  const [transitionsReady, setTransitionsReady] = useState(false);
+  const [isClosing, setIsClosing] = useState(false);
+  const [bodyMounted, setBodyMounted] = useState(shouldOpen || hasTerminalTab);
+  const prevShouldOpenRef = useRef(shouldOpen);
 
   useEffect(() => {
+    const raf = window.requestAnimationFrame(() => {
+      setTransitionsReady(true);
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, []);
+
+  useEffect(() => {
+    const wasOpen = prevShouldOpenRef.current;
+    prevShouldOpenRef.current = shouldOpen;
+
     if (shouldOpen) {
-      setMounted(true);
-      const raf = window.requestAnimationFrame(() => {
-        setVisualOpen(true);
-      });
-      return () => window.cancelAnimationFrame(raf);
+      setIsClosing(false);
+      return;
     }
-    setVisualOpen(false);
-    // Keep mounted in hidden state if live PTY sessions exist so xterm WebGL canvases never reset
-    if (hasTerminalTab) return;
+    if (!wasOpen) return;
+
+    setIsClosing(true);
     const id = window.setTimeout(() => {
-      setMounted(false);
-    }, 185);
+      setIsClosing(false);
+    }, 270);
     return () => window.clearTimeout(id);
-  }, [shouldOpen, hasTerminalTab]);
+  }, [shouldOpen]);
 
-  if (!mounted || !selectedHostId) return null;
+  useEffect(() => {
+    if (shouldOpen || isClosing || hasTerminalTab) {
+      setBodyMounted(true);
+    } else {
+      setBodyMounted(false);
+    }
+  }, [shouldOpen, isClosing, hasTerminalTab]);
 
-  return <WorkspaceSidePanelInner selectedHostId={selectedHostId} visualOpen={visualOpen} />;
+  if (!selectedHostId) return null;
+
+  return (
+    <WorkspaceSidePanelInner
+      selectedHostId={selectedHostId}
+      shouldOpen={shouldOpen}
+      transitionsReady={transitionsReady}
+      bodyMounted={bodyMounted}
+      isClosing={isClosing}
+    />
+  );
 }
 
 const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   selectedHostId,
-  visualOpen,
+  shouldOpen,
+  transitionsReady,
+  bodyMounted,
+  isClosing,
 }: {
   selectedHostId: string;
-  visualOpen: boolean;
+  shouldOpen: boolean;
+  transitionsReady: boolean;
+  bodyMounted: boolean;
+  isClosing: boolean;
 }) {
   const sidePanelWidth = useOrbitSelector((s) => s.sidePanelWidth);
   const tabs = useOrbitSelector((s) => s.sidePanelTabs);
@@ -124,7 +155,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0] ?? null;
   const hasTerminalTabInBar = tabs.some((t) => t.kind === "terminal");
   const hasAnyPtySession = totalTerminalCount > 0;
-  const isTerminalVisible = visualOpen && activeTab?.kind === "terminal";
+  const isTerminalVisible = (shouldOpen || isClosing) && activeTab?.kind === "terminal";
 
   const startResize = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -158,30 +189,41 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
 
   return (
     <aside
-      inert={!visualOpen}
+      inert={!shouldOpen}
+      data-open={shouldOpen ? "true" : "false"}
+      data-ready={transitionsReady ? "true" : "false"}
+      data-resizing={isResizing ? "true" : "false"}
       style={{
         width: effectiveWidthExpr,
-        marginRight: visualOpen ? "0px" : `calc(-1 * ${effectiveWidthExpr})`,
+        marginRight: shouldOpen ? "0px" : `calc(-1 * ${effectiveWidthExpr})`,
+        opacity: shouldOpen ? 1 : 0,
+        visibility: shouldOpen || isClosing ? "visible" : "hidden",
       }}
       className={cn(
-        "border-border bg-sidebar relative flex h-full shrink-0 flex-col overflow-hidden border-l select-none",
-        !visualOpen && "pointer-events-none",
-        !isResizing &&
-          (visualOpen
-            ? "transition-[margin-right] duration-[210ms] ease-[cubic-bezier(0.22,1,0.36,1)]"
-            : "transition-[margin-right] duration-[175ms] ease-[cubic-bezier(0.22,1,0.36,1)]"),
+        "orbit-panel-right border-border bg-sidebar relative flex h-full shrink-0 flex-col overflow-hidden border-l select-none",
+        !shouldOpen && "pointer-events-none",
       )}
     >
       {/* Left Resize Drag Handle */}
-      <div
-        onMouseDown={startResize}
-        className="hover:bg-primary/40 absolute top-0 left-0 z-20 h-full w-1 cursor-col-resize transition-colors"
-      />
+      {shouldOpen && (
+        <div
+          onMouseDown={startResize}
+          className="hover:bg-primary/40 absolute top-0 left-0 z-20 h-full w-1 cursor-col-resize transition-colors duration-150"
+        />
+      )}
 
       {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow resize events */}
       {isResizing && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
 
-      {/* Flush 40px Multi-Tab Header Bar */}
+      <div
+        data-open={shouldOpen ? "true" : "false"}
+        data-ready={transitionsReady ? "true" : "false"}
+        data-resizing={isResizing ? "true" : "false"}
+        className="orbit-panel-right-inner flex min-h-0 flex-1 flex-col overflow-hidden"
+      >
+        {bodyMounted && (
+          <>
+            {/* Flush 40px Multi-Tab Header Bar */}
       <div
         data-tauri-drag-region
         className="border-border flex h-[40px] shrink-0 items-center justify-between gap-1.5 border-b px-2"
@@ -341,17 +383,20 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         {activeTab?.kind === "side_question" && <SideQuestionTab />}
         {activeTab?.kind === "subagent" && <SubagentTab key={activeTab.id} tab={activeTab} />}
 
-        {!activeTab && (
-          <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 text-[12.5px]">
-            <span>No open tabs.</span>
-            <button
-              type="button"
-              onClick={() => orbitActions.openReviewTab()}
-              className="border-border hover:bg-accent text-foreground cursor-pointer rounded-lg border px-3 py-1 text-[12px] transition-colors"
-            >
-              Open Diff Review
-            </button>
+            {!activeTab && (
+              <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 text-[12.5px]">
+                <span>No open tabs.</span>
+                <button
+                  type="button"
+                  onClick={() => orbitActions.openReviewTab()}
+                  className="border-border hover:bg-accent text-foreground cursor-pointer rounded-lg border px-3 py-1 text-[12px] transition-colors"
+                >
+                  Open Diff Review
+                </button>
+              </div>
+            )}
           </div>
+          </>
         )}
       </div>
     </aside>

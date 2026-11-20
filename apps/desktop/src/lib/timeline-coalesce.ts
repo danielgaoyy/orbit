@@ -45,6 +45,10 @@ export type TurnLiveSegment =
       firstSeq: number;
       items: TimelineItemView[];
       summary: WorkSummaryResult;
+      thoughtDurationMs: number | null;
+      workDurationMs: number | null;
+      startedAtMs: number | null;
+      latestActivityMs: number | null;
       /** True when subsequent prose or another segment has already started after this step batch. */
       hasFollowingContent: boolean;
       /** True if any tool call inside this group is currently `running`. */
@@ -62,6 +66,11 @@ export type TurnLiveSegment =
     }
   | {
       kind: "compaction";
+      key: string;
+      label: string;
+    }
+  | {
+      kind: "wakeup";
       key: string;
       label: string;
     };
@@ -95,6 +104,8 @@ export interface StageTurn {
   workDurationMs: number | null;
   /** Final synthesis reply of the turn, kept visible when pre-reply work folds. */
   terminalReply: Extract<TimelineItemView, { item_type: "assistant_message" }> | null;
+  /** Most recent assistant message anywhere in the turn (used for TurnFooter Copy action). */
+  lastAssistantReply: Extract<TimelineItemView, { item_type: "assistant_message" }> | null;
   /** Notices (warnings/errors) surfaced unconditionally so system alerts are never buried. */
   notices: Extract<TimelineItemView, { item_type: "notice" }>[];
   /** Context compaction notices preserved in chronological turn context. */
@@ -1067,22 +1078,50 @@ function isStepRowItem(item: TimelineItemView): boolean {
   );
 }
 
-function buildLiveSegments(bodyItems: TimelineItemView[]): TurnLiveSegment[] {
+function buildLiveSegments(
+  bodyItems: TimelineItemView[],
+  fallbackStartMs: number | null,
+): TurnLiveSegment[] {
   const rawSegments: TurnLiveSegment[] = [];
   let stepBuf: TimelineItemView[] = [];
 
-  const flushSteps = (hasFollowingContent: boolean) => {
+  const flushSteps = (
+    hasFollowingContent: boolean,
+    followingItem: TimelineItemView | null,
+  ) => {
     if (stepBuf.length === 0) return;
     const firstSeq = stepBuf[0].seq;
     const hasRunningStep = stepBuf.some(
       (it) => it.item_type === "tool_call" && it.status === "running",
     );
+    const thoughtDurationMs = computeThoughtDurationFromTimestamps(stepBuf, followingItem);
+    const startedAtMs =
+      stepBuf.map(validTimestampMs).find((v) => v !== null) ??
+      (rawSegments.length === 0 ? fallbackStartMs : null);
+    let latestActivityMs: number | null = null;
+    for (let i = stepBuf.length - 1; i >= 0; i -= 1) {
+      const ts = validTimestampMs(stepBuf[i]);
+      if (ts !== null) {
+        latestActivityMs = ts;
+        break;
+      }
+    }
+    const endMs = validTimestampMs(followingItem) ?? latestActivityMs;
+    const workDurationMs =
+      startedAtMs !== null && endMs !== null && endMs - startedAtMs >= 1000
+        ? endMs - startedAtMs
+        : null;
+
     rawSegments.push({
       kind: "step_group",
       key: `steps-${firstSeq}`,
       firstSeq,
       items: stepBuf,
-      summary: summarizeWorkItems(stepBuf),
+      summary: summarizeWorkItems(stepBuf, { thoughtDurationMs }),
+      thoughtDurationMs,
+      workDurationMs,
+      startedAtMs,
+      latestActivityMs,
       hasFollowingContent,
       hasRunningStep,
     });
@@ -1096,22 +1135,32 @@ function buildLiveSegments(bodyItems: TimelineItemView[]): TurnLiveSegment[] {
     }
 
     if (it.item_type === "assistant_message") {
-      flushSteps(true);
+      if (it.text.trim().length === 0 && !it.streaming) {
+        continue;
+      }
+      flushSteps(true, it);
       rawSegments.push({
         kind: "assistant_message",
         key: `msg-${it.item_id}-${it.seq}`,
         item: it,
       });
     } else if (it.item_type === "notice") {
-      if (it.level !== "error" && /compact/i.test(it.message)) {
-        flushSteps(true);
+      if (it.level === "wakeup") {
+        flushSteps(true, it);
+        rawSegments.push({
+          kind: "wakeup",
+          key: `wakeup-${it.seq}`,
+          label: it.message || "Resumed from background task",
+        });
+      } else if (it.level !== "error" && /compact/i.test(it.message)) {
+        flushSteps(true, it);
         rawSegments.push({
           kind: "compaction",
           key: `compact-${it.seq}`,
           label: it.message,
         });
       } else {
-        flushSteps(false);
+        flushSteps(false, it);
         rawSegments.push({
           kind: "notice",
           key: `notice-${it.seq}`,
@@ -1121,7 +1170,7 @@ function buildLiveSegments(bodyItems: TimelineItemView[]): TurnLiveSegment[] {
     }
   }
 
-  flushSteps(false);
+  flushSteps(false, null);
   return rawSegments;
 }
 
@@ -1340,6 +1389,16 @@ function finalizeTurn(
     completedAtMs = validTimestampMs(userPrompt);
   }
 
+  let lastAssistantReply: Extract<TimelineItemView, { item_type: "assistant_message" }> | null =
+    null;
+  for (let i = nonNoticeBody.length - 1; i >= 0; i -= 1) {
+    const candidate = nonNoticeBody[i];
+    if (candidate.item_type === "assistant_message" && candidate.text.trim().length > 0) {
+      lastAssistantReply = candidate;
+      break;
+    }
+  }
+
   const turn: StageTurn = {
     key,
     turnIndex,
@@ -1355,9 +1414,10 @@ function finalizeTurn(
     thoughtDurationMs,
     workDurationMs,
     terminalReply,
+    lastAssistantReply,
     notices,
     compactions,
-    liveSegments: buildLiveSegments(bodyItems),
+    liveSegments: buildLiveSegments(bodyItems, startedAtMs),
     turnDiffs: Array.from(diffByPath.values()),
     hasError,
     hasUnrecoveredError: fullTurnToolSummary.counts.unrecoveredFailureCount > 0,

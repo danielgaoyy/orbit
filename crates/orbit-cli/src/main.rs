@@ -276,15 +276,28 @@ fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
     let home_dir = resolve_home(cli.home);
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let use_rotating_daemon_log = matches!(cli.command, Commands::Daemon { action: None, .. });
+    if use_rotating_daemon_log
+        && let Ok(log_writer) = orbit_client_core::logging::RotatingLogWriter::open(
+            home_dir.join("logs").join("daemon.log"),
+            orbit_client_core::logging::DEFAULT_LOG_MAX_BYTES,
+            orbit_client_core::logging::DEFAULT_LOG_MAX_BACKUPS,
+            std::io::stderr().is_terminal(),
+        )
+    {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(env_filter)
+            .with_writer(move || log_writer.clone())
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
 
     match cli.command {
         Commands::Doctor => {

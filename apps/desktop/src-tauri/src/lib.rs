@@ -762,11 +762,46 @@ async fn perform_app_self_update(
     perform_one_click_update(release, on_progress).await
 }
 
+fn init_desktop_file_logging() {
+    let log_path = resolve_user_home()
+        .map(|home| home.join(".orbit").join("logs").join("desktop.log"))
+        .unwrap_or_else(|| PathBuf::from("orbit-desktop.log"));
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if let Ok(writer) = orbit_client_core::logging::RotatingLogWriter::open(
+        log_path,
+        orbit_client_core::logging::DEFAULT_LOG_MAX_BYTES,
+        orbit_client_core::logging::DEFAULT_LOG_MAX_BACKUPS,
+        cfg!(debug_assertions),
+    ) {
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(env_filter)
+            .with_writer(move || writer.clone())
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    init_desktop_file_logging();
     let db_path = default_desktop_db_path();
+    tracing::info!(
+        version = CURRENT_APP_VERSION,
+        db_path = %db_path.display(),
+        "Starting Orbit Desktop"
+    );
     let core = OrbitAppCore::open(&db_path, true)
-        .or_else(|_| OrbitAppCore::open_in_memory())
+        .or_else(|err| {
+            tracing::error!(error = %err, "Failed to open desktop replica SQLite; falling back to in-memory store");
+            OrbitAppCore::open_in_memory()
+        })
         .expect("failed to initialize OrbitAppCore");
     core.connect_all_hosts();
 

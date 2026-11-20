@@ -13,6 +13,64 @@ use std::path::{Path, PathBuf};
 
 use orbit_protocol::{ModelOption, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot};
 use serde::{Deserialize, Serialize};
+use similar::TextDiff;
+
+const MAX_COMPACT_UNIFIED_DIFF_BYTES: usize = 64 * 1024;
+
+/// Build a standard compact unified diff (3 context lines per hunk) from `old_text` and `new_text`.
+/// Returns `None` when both texts are identical, and safely caps extreme payloads at 64 KiB on a
+/// UTF-8 line boundary so large file rewrites never bloat SQLite or WebSocket frames.
+pub(crate) fn build_compact_unified_diff(
+    path: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Option<String> {
+    if old_text == new_text {
+        return None;
+    }
+
+    let clean_path = path.trim().trim_start_matches("./");
+    let display_path = if clean_path.is_empty() {
+        "file"
+    } else {
+        clean_path
+    };
+    let old_header = if old_text.is_empty() {
+        "/dev/null".to_string()
+    } else {
+        format!("a/{display_path}")
+    };
+    let new_header = if new_text.is_empty() {
+        "/dev/null".to_string()
+    } else {
+        format!("b/{display_path}")
+    };
+
+    let diff = TextDiff::from_lines(old_text, new_text);
+    let mut rendered = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(&old_header, &new_header)
+        .to_string();
+
+    if rendered.trim().is_empty() {
+        return None;
+    }
+
+    if rendered.len() > MAX_COMPACT_UNIFIED_DIFF_BYTES {
+        let mut cut = MAX_COMPACT_UNIFIED_DIFF_BYTES;
+        while cut > 0 && !rendered.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        if let Some(nl) = rendered[..cut].rfind('\n') {
+            cut = nl + 1;
+        }
+        rendered.truncate(cut);
+        rendered.push_str("\\ Diff truncated for storage efficiency\n");
+    }
+
+    Some(rendered)
+}
 
 pub use driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 pub use side_question::{SideQuestionSpec, run_side_question};

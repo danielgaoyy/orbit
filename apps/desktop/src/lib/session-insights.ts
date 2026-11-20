@@ -83,7 +83,17 @@ export function deriveSessionInsights(params: {
   const subagentMap = new Map<string, SessionSubagentEntry>();
   const urlSet = new Set<string>();
 
-  for (const item of items) {
+  let lastUserPromptIndex = -1;
+  for (let idx = items.length - 1; idx >= 0; idx -= 1) {
+    if (items[idx].item_type === "user_prompt") {
+      lastUserPromptIndex = idx;
+      break;
+    }
+  }
+  const agentRunning = Boolean(currentAgent?.is_running);
+
+  for (let idx = 0; idx < items.length; idx += 1) {
+    const item = items[idx];
     if (item.item_type === "assistant_message") {
       collectLocalUrls(item.text, urlSet);
       continue;
@@ -138,7 +148,7 @@ export function deriveSessionInsights(params: {
       }
       case "shell": {
         collectLocalUrls(item.detail.output_preview, urlSet);
-        if (item.status === "running") {
+        if (agentRunning && idx > lastUserPromptIndex && item.status === "running") {
           const firstLine =
             item.detail.command
               .split(/\r?\n/)

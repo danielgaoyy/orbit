@@ -216,8 +216,8 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
       }}
       style={{
         animation: closing
-          ? "orbit-backdrop-out 115ms var(--ease-exit) forwards"
-          : "orbit-backdrop-in 160ms var(--ease-out-expo)",
+          ? "orbit-backdrop-out 155ms var(--ease-exit) forwards"
+          : "orbit-backdrop-in 195ms var(--ease-out-quart)",
       }}
       className={cn(
         "fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-6 backdrop-blur-[2px] select-none",
@@ -230,8 +230,8 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
         aria-label="Settings"
         style={{
           animation: closing
-            ? "orbit-modal-card-out 115ms var(--ease-exit) forwards"
-            : "orbit-modal-card-in 180ms var(--ease-out-expo)",
+            ? "orbit-modal-card-out 155ms var(--ease-exit) forwards"
+            : "orbit-modal-card-in 210ms var(--ease-out-expo)",
         }}
         className="border-border bg-elevated text-foreground floating-surface relative flex h-[min(720px,86vh)] w-[min(1020px,92vw)] overflow-hidden rounded-[18px] border"
       >
@@ -244,7 +244,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
           <X className="h-[15.5px] w-[15.5px]" />
         </button>
 
-        {/* Left Settings Rail (232px) — Flat on Local-Only; Paseo Host Picker on Remote/Multi-Host */}
+        {/* Left Settings Rail (232px) — Flat on Local-Only; Host Picker on Remote/Multi-Host */}
         <aside className="border-border bg-sidebar/75 flex w-[232px] shrink-0 flex-col border-r px-3 py-4">
           <div className="px-2.5 pb-3 text-[14.5px] font-semibold tracking-[-0.01em]">
             Settings

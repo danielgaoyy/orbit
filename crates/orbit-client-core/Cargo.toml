@@ -21,6 +21,7 @@ base64.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 pulldown-cmark.workspace = true
 syntect.workspace = true
 similar.workspace = true

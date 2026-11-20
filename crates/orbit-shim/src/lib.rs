@@ -198,9 +198,45 @@ pub async fn run_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), Shi
     }
 }
 
+/// RAII guard that guarantees the shim Unix socket file is unlinked even on early error returns.
+struct SocketCleanupGuard(PathBuf);
+
+impl Drop for SocketCleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Probe every `*.sock` entry under `shims_dir` and unlink orphaned sockets whose listener has
+/// already exited (`ConnectionRefused` / `NotFound`). Active shims survive untouched.
+pub async fn cleanup_stale_shim_sockets(shims_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(shims_dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+            continue;
+        }
+        if let Ok(Err(err)) =
+            tokio::time::timeout(Duration::from_millis(150), UnixStream::connect(&path)).await
+            && matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+            && std::fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), ShimError> {
     prepare_socket_path(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
+    let _socket_guard = SocketCleanupGuard(socket_path.to_path_buf());
 
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
@@ -312,6 +348,7 @@ async fn run_pty_shim(
 ) -> Result<(), ShimError> {
     prepare_socket_path(socket_path)?;
     let listener = UnixListener::bind(socket_path)?;
+    let _socket_guard = SocketCleanupGuard(socket_path.to_path_buf());
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -573,5 +610,28 @@ mod tests {
 
         client2.kill().await.expect("kill");
         let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_shim_sockets_removes_dead_and_keeps_live_sockets() {
+        let dir = std::env::temp_dir().join(format!("orbit_stale_sock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let live_sock = dir.join("live.sock");
+        let _live_listener = UnixListener::bind(&live_sock).expect("bind live");
+
+        let dead_sock = dir.join("dead.sock");
+        {
+            let _dead_listener = UnixListener::bind(&dead_sock).expect("bind dead");
+        } // listener dropped -> stale socket file remains on disk
+
+        assert!(dead_sock.exists());
+        let removed = cleanup_stale_shim_sockets(&dir).await;
+        assert_eq!(removed, 1);
+        assert!(!dead_sock.exists(), "dead socket should be unlinked");
+        assert!(live_sock.exists(), "live socket must remain untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

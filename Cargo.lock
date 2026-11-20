@@ -2080,6 +2080,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.26.2",
+ "tracing",
  "uuid",
  "vt100",
 ]
@@ -2166,6 +2167,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "similar",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

@@ -762,6 +762,11 @@ pub enum ProtocolError {
     InvalidBinaryFrame,
 }
 
+/// Anti-bomb upper bound on a single decompressed Zstd `WireMessage` payload (32 MiB).
+pub const MAX_ZSTD_WIRE_DECODE_BYTES: usize = 32 * 1024 * 1024;
+/// Target uncompressed JSON byte budget per paginated timeline batch (`TimelineCatchup` / `AgentRewound`).
+pub const MAX_WIRE_TIMELINE_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
 impl WireMessage {
     /// Encode message as Zstd-compressed JSON bytes for cross-border / mobile bandwidth efficiency.
     pub fn encode_zstd(&self, level: i32) -> Result<Vec<u8>, ProtocolError> {
@@ -769,14 +774,23 @@ impl WireMessage {
         Ok(zstd::encode_all(json.as_slice(), level)?)
     }
 
-    /// Decode a Zstd-compressed WireMessage (with a 16 MiB anti-bomb cap).
+    /// Decode a Zstd-compressed WireMessage (with a 32 MiB anti-bomb cap).
     pub fn decode_zstd(compressed: &[u8]) -> Result<Self, ProtocolError> {
         use std::io::Read;
         let decoder = zstd::Decoder::new(compressed)?;
         let mut decompressed = Vec::new();
         decoder
-            .take(16 * 1024 * 1024)
+            .take((MAX_ZSTD_WIRE_DECODE_BYTES as u64) + 1)
             .read_to_end(&mut decompressed)?;
+        if decompressed.len() > MAX_ZSTD_WIRE_DECODE_BYTES {
+            return Err(ProtocolError::Compression(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "zstd wire payload exceeds {} MiB limit",
+                    MAX_ZSTD_WIRE_DECODE_BYTES / (1024 * 1024)
+                ),
+            )));
+        }
         Ok(serde_json::from_slice(&decompressed)?)
     }
 }

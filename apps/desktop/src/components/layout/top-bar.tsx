@@ -1,6 +1,6 @@
 import { memo } from "react";
 import { FileText } from "lucide-react";
-import { isMacDesktop } from "@/lib/orbit-ipc";
+import { isAgentBackgroundWaiting, isMacDesktop } from "@/lib/orbit-ipc";
 import { modSymbol } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { SimpleTooltip } from "@/components/ui/overlays";
@@ -15,10 +15,28 @@ export const TopBar = memo(function TopBar() {
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const hasActiveSession = workspacePanel === "conversation" && !isDraft && Boolean(selectedAgentId);
+  const hasRunningBackgroundTasks = useOrbitSelector((s) => {
+    if (
+      s.workspacePanel !== "conversation" ||
+      s.isDraftNewSession ||
+      !s.selectedHostId ||
+      !s.selectedAgentId
+    ) {
+      return false;
+    }
+    const ag = s.hostDetails[s.selectedHostId]?.agents.find(
+      (a) => a.agent_id === s.selectedAgentId,
+    );
+    if (isAgentBackgroundWaiting(ag)) return true;
+    const tasks =
+      s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.background_tasks;
+    return Boolean(tasks && tasks.some((t) => t.status === "running"));
+  });
 
   const {
     topbarUseOpenLeftPad,
     topbarReserveRightToggle,
+    topbarPaddingTransition,
     topbarTitleOffsetPx,
     topbarTitleTransition,
     topbarRightOffsetPx,
@@ -51,12 +69,17 @@ export const TopBar = memo(function TopBar() {
   return (
     <header
       data-tauri-drag-region
+      style={
+        topbarPaddingTransition !== "none"
+          ? { transition: topbarPaddingTransition }
+          : undefined
+      }
       className={cn(
         "bg-canvas flex h-[40px] shrink-0 items-center justify-between gap-3 select-none",
         showBottomBorder &&
           "shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.055)] dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.06)]",
-        topbarUseOpenLeftPad ? "pl-4" : isMac ? "pl-[114px]" : "pl-[48px]",
-        topbarReserveRightToggle ? "pr-[42px]" : "pr-3",
+        topbarUseOpenLeftPad ? "pl-[16px]" : isMac ? "pl-[114px]" : "pl-[48px]",
+        topbarReserveRightToggle ? "pr-[42px]" : "pr-[12px]",
       )}
     >
       {/* Left: Conversation Title (glides smoothly via pure GPU translate3d) */}
@@ -99,7 +122,13 @@ export const TopBar = memo(function TopBar() {
       >
         {hasActiveSession && (
           <SimpleTooltip
-            label={overviewVisible ? "Hide overview" : "Show overview"}
+            label={
+              overviewVisible
+                ? "Hide overview"
+                : hasRunningBackgroundTasks
+                  ? "Show overview (background task running)"
+                  : "Show overview"
+            }
             shortcut={`${mod}⌥O`}
           >
             <button
@@ -108,13 +137,19 @@ export const TopBar = memo(function TopBar() {
               aria-label={overviewVisible ? "Hide overview" : "Show overview"}
               onClick={() => orbitActions.toggleOverviewPanel()}
               className={cn(
-                "inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
+                "relative inline-flex h-[28px] w-[28px] cursor-pointer items-center justify-center rounded-[7px] transition-colors",
                 overviewVisible
                   ? "bg-black/[0.06] text-foreground dark:bg-white/[0.085]"
                   : "text-foreground/65 hover:text-foreground hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
               )}
             >
               <FileText className="h-[15.5px] w-[15.5px] stroke-[1.75]" />
+              {!overviewVisible && hasRunningBackgroundTasks && (
+                <span
+                  aria-hidden="true"
+                  className="ring-canvas absolute top-[5px] right-[5px] h-[5px] w-[5px] rounded-full bg-emerald-500/90 ring-[1.5px]"
+                />
+              )}
             </button>
           </SimpleTooltip>
         )}

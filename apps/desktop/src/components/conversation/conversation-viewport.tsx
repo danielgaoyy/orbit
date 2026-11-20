@@ -16,6 +16,7 @@ export const ConversationViewport = memo(function ConversationViewport({
   resetKey,
   className,
   viewportClassName,
+  contentClassName,
   children,
 }: {
   hostId?: string | null;
@@ -24,6 +25,7 @@ export const ConversationViewport = memo(function ConversationViewport({
   resetKey?: string;
   className?: string;
   viewportClassName?: string;
+  contentClassName?: string;
   children: ReactNode;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -88,6 +90,7 @@ export const ConversationViewport = memo(function ConversationViewport({
           className="min-h-0 flex-1"
           viewportRef={viewportRef}
           viewportClassName={cn("px-4 py-4", viewportClassName)}
+          contentClassName={contentClassName}
           onViewportScroll={handleScroll}
           onWheel={handleWheel}
         >

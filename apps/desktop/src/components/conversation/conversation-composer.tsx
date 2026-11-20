@@ -1,5 +1,5 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowUp, Square } from "lucide-react";
+import { ArrowUp } from "lucide-react";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 
@@ -16,7 +16,7 @@ export interface ConversationComposerProps {
   variant?: "compact" | "docked";
   topSlot?: ReactNode;
   leftControlsSlot?: ReactNode;
-  rightControlsSlot?: ReactNode;
+  rightControlsSlot?: ReactNode | ((widthPx: number) => ReactNode);
   className?: string;
 }
 
@@ -45,6 +45,7 @@ export const ConversationComposer = memo(function ConversationComposer({
   const mirrorRef = useRef<HTMLDivElement | null>(null);
   const [historyIdx, setHistoryIdx] = useState<number>(-1);
   const [widthTick, setWidthTick] = useState(0);
+  const [composerWidthPx, setComposerWidthPx] = useState(0);
   const savedDraftRef = useRef<string>("");
   const ime = useImeCompositionGuard();
 
@@ -61,10 +62,12 @@ export const ConversationComposer = memo(function ConversationComposer({
     const el = textareaRef.current;
     if (!el) return;
     let lastW = el.clientWidth;
+    setComposerWidthPx(lastW);
     const ro = new ResizeObserver((entries) => {
       const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
       if (nextW > 0 && nextW !== lastW) {
         lastW = nextW;
+        setComposerWidthPx(nextW);
         setWidthTick((n) => n + 1);
       }
     });
@@ -146,8 +149,19 @@ export const ConversationComposer = memo(function ConversationComposer({
       ? "px-[12px] py-[9px] text-[13.5px] leading-[20px]"
       : "px-[14px] py-[13px] text-[15px] leading-[20px]";
 
+  const resolvedRightControls =
+    typeof rightControlsSlot === "function"
+      ? rightControlsSlot(composerWidthPx)
+      : rightControlsSlot;
+
   return (
-    <div className={cn("bg-canvas shrink-0 px-3 pt-1 pb-3", className)}>
+    <div
+      className={cn(
+        "bg-canvas shrink-0",
+        variant === "compact" ? "px-3 pt-1 pb-3" : "px-3 pt-0 pb-4",
+        className,
+      )}
+    >
       {topSlot}
       <div
         className={cn(
@@ -188,20 +202,25 @@ export const ConversationComposer = memo(function ConversationComposer({
           />
         </div>
 
-        {/* Bottom Control Bar matching primary OmniComposer rhythm */}
+        {/* Bottom Control Bar matching primary OmniComposer rhythm (`34px` controls, `pb-2`) */}
         <div className="flex items-center justify-between gap-2 px-2.5 pt-0 pb-2">
-          <div className="flex min-w-0 items-center gap-1.5">{leftControlsSlot}</div>
+          <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">
+            {leftControlsSlot}
+          </div>
           <div className="flex shrink-0 items-center gap-1.5">
-            {rightControlsSlot}
+            {resolvedRightControls}
             {showStop ? (
               <button
                 type="button"
                 onClick={onInterrupt}
                 title="Stop generating (Esc)"
                 aria-label="Stop generating"
-                className="orbit-press inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-full bg-rose-500/90 text-white transition-opacity hover:opacity-90"
+                className={cn(
+                  "orbit-press inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full bg-black/[0.06] hover:bg-black/[0.10] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]",
+                  variant === "compact" ? "size-[30px]" : "size-8.5",
+                )}
               >
-                <Square className="h-[11px] w-[11px] fill-current" />
+                <span className="size-[11px] rounded-[2.5px] bg-[#EF4444]" />
               </button>
             ) : (
               <button
@@ -214,13 +233,20 @@ export const ConversationComposer = memo(function ConversationComposer({
                 }}
                 aria-label="Send message"
                 className={cn(
-                  "orbit-press inline-flex h-[30px] w-[30px] shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors",
+                  "orbit-press inline-flex shrink-0 cursor-pointer items-center justify-center rounded-full",
+                  variant === "compact" ? "size-[30px]" : "size-8.5",
                   canSend
-                    ? "bg-foreground text-background hover:opacity-90"
-                    : "bg-muted text-muted-foreground cursor-default opacity-60",
+                    ? "bg-[#141416] text-white hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
+                    : "text-foreground/30 pointer-events-none bg-black/[0.055] dark:bg-white/[0.08] dark:text-white/30",
                 )}
               >
-                <ArrowUp className="h-[15px] w-[15px] stroke-[2.2]" />
+                <ArrowUp
+                  className={
+                    variant === "compact"
+                      ? "h-[15px] w-[15px] stroke-[2.2]"
+                      : "size-[17px] stroke-[2.15]"
+                  }
+                />
               </button>
             )}
           </div>

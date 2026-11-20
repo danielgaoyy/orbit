@@ -303,10 +303,7 @@ impl AgentOrchestrator {
                 } else {
                     None
                 };
-            let was_running = matches!(
-                ag.status,
-                AgentStatus::Running { .. } | AgentStatus::AutonomousWakeup { .. }
-            );
+            let was_running = ag.status.is_foreground_busy();
 
             if surviving_sock.is_some()
                 && let Some(executable) = find_provider_executable(ag.provider)
@@ -900,6 +897,7 @@ impl AgentOrchestrator {
             labels: HashMap::new(),
             attention: AttentionState::None,
             last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
         };
         self.store.upsert_agent(&summary, None)?;
         if !extra_strs.is_empty() {
@@ -1073,6 +1071,114 @@ impl AgentOrchestrator {
             message_id,
         )
         .await
+    }
+
+    /// Server-authoritative queued follow-up prompt:
+    /// - If the agent is foreground-idle (including background-only waiting), dispatches immediately.
+    /// - Otherwise persists in SQLite and broadcasts `AgentUpdated` to all connected clients.
+    pub async fn enqueue_user_prompt(
+        self: &Arc<Self>,
+        agent_id: &str,
+        prompt: String,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
+        queue_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        let Some(ag) = self.store.get_agent(agent_id)? else {
+            anyhow::bail!("agent `{agent_id}` not found");
+        };
+        let is_busy = ag.status.is_foreground_busy()
+            || matches!(ag.status, AgentStatus::AwaitingPermission { .. })
+            || self.has_pending_permissions(agent_id).await;
+        if !is_busy {
+            return self
+                .send_prompt_with_options(
+                    agent_id,
+                    prompt,
+                    display_prompt,
+                    badges,
+                    ActiveTurnBehavior::Steer,
+                    None,
+                )
+                .await;
+        }
+
+        let qid = queue_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("q_{}", Uuid::new_v4().simple()));
+        let visible = display_prompt.unwrap_or_else(|| prompt.clone());
+        self.store
+            .enqueue_agent_prompt(agent_id, &qid, &prompt, &visible, &badges)?;
+        if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
+    }
+
+    pub async fn remove_queued_user_prompt(
+        &self,
+        agent_id: &str,
+        queue_id: &str,
+    ) -> anyhow::Result<()> {
+        let removed = self.store.remove_queued_prompt(agent_id, queue_id)?;
+        if removed && let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
+    }
+
+    pub async fn flush_queued_user_prompt_now(
+        self: &Arc<Self>,
+        agent_id: &str,
+        queue_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(item) = self.store.take_queued_prompt(agent_id, queue_id)? else {
+            return Ok(());
+        };
+        if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        let should_interrupt = self
+            .store
+            .get_agent(agent_id)
+            .ok()
+            .flatten()
+            .is_some_and(|ag| {
+                ag.status.is_foreground_busy()
+                    || matches!(ag.status, AgentStatus::AwaitingPermission { .. })
+            });
+        if should_interrupt {
+            let _ = self.interrupt_agent(agent_id).await;
+        }
+        self.send_prompt_with_options(
+            agent_id,
+            item.wire_prompt,
+            Some(item.display_prompt),
+            item.badges,
+            ActiveTurnBehavior::Steer,
+            None,
+        )
+        .await
+    }
+
+    pub async fn reorder_queued_user_prompts(
+        &self,
+        agent_id: &str,
+        queue_ids: &[String],
+    ) -> anyhow::Result<()> {
+        let changed = self.store.reorder_queued_prompts(agent_id, queue_ids)?;
+        if changed && let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
     }
 
     /// Dispatch a coalesced batch of agent-originated messages / finish notifications / heartbeats.
@@ -2015,19 +2121,25 @@ impl AgentOrchestrator {
         }
 
         let mut should_check_auto_archive = false;
+        let mut should_drain_queued_prompt = false;
         let payload = match evt {
             DriverEvent::StatusChanged(status) => {
                 let prev = self.store.get_agent(agent_id).ok().flatten();
-                let was_active = prev.as_ref().is_some_and(|a| {
-                    matches!(
-                        a.status,
-                        AgentStatus::Running { .. } | AgentStatus::AutonomousWakeup { .. }
-                    )
-                });
+                let was_foreground_busy =
+                    prev.as_ref().is_some_and(|a| a.status.is_foreground_busy());
+                let was_awaiting_permission = prev
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.status, AgentStatus::AwaitingPermission { .. }));
+                let was_background_waiting = prev
+                    .as_ref()
+                    .is_some_and(|a| a.status.is_background_waiting());
                 match &status {
                     AgentStatus::Idle => {
                         self.clear_pending_requests(agent_id).await;
-                        if was_active {
+                        if was_foreground_busy || was_awaiting_permission {
+                            should_drain_queued_prompt = true;
+                        }
+                        if was_foreground_busy {
                             let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                             if prev.as_ref().is_some_and(|a| !a.background) {
                                 let _ = self
@@ -2035,7 +2147,26 @@ impl AgentOrchestrator {
                                     .set_agent_attention(agent_id, AttentionState::Finished);
                             }
                             should_check_auto_archive = true;
+                        } else if was_background_waiting {
+                            should_check_auto_archive = true;
                         }
+                    }
+                    AgentStatus::AutonomousWakeup { .. } if status.is_background_waiting() => {
+                        self.clear_pending_requests(agent_id).await;
+                        if was_foreground_busy || was_awaiting_permission {
+                            should_drain_queued_prompt = true;
+                        }
+                        if was_foreground_busy {
+                            let _ = self.store.touch_agent_activity(agent_id, Utc::now());
+                            if prev.as_ref().is_some_and(|a| !a.background) {
+                                let _ = self
+                                    .store
+                                    .set_agent_attention(agent_id, AttentionState::Finished);
+                            }
+                        }
+                    }
+                    AgentStatus::AutonomousWakeup { .. } => {
+                        let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                     }
                     AgentStatus::Error {
                         message,
@@ -2166,12 +2297,49 @@ impl AgentOrchestrator {
                 .broadcast_tx
                 .send(DaemonBroadcast::TimelineLive(saved_ev));
         }
-        if is_status_change && let Ok(Some(ag)) = self.store.get_agent(agent_id) {
-            let auto_arch = ag.auto_archive && ag.archived_at.is_none();
+        if is_status_change && let Ok(Some(mut ag)) = self.store.get_agent(agent_id) {
+            let mut drained_prompt = None;
+            if should_drain_queued_prompt
+                && ag.archived_at.is_none()
+                && !self.has_pending_permissions(agent_id).await
+                && let Ok(Some(next_item)) = self.store.pop_next_queued_prompt(agent_id)
+            {
+                if let Ok(Some(refreshed)) = self.store.get_agent(agent_id) {
+                    ag = refreshed;
+                }
+                drained_prompt = Some(next_item);
+            }
+
+            let auto_arch = ag.auto_archive && ag.archived_at.is_none() && drained_prompt.is_none();
             let ws_id = ag.workspace_id.clone();
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
-            if should_check_auto_archive && auto_arch {
+            if let Some(next_item) = drained_prompt {
+                let mgr = Arc::clone(self);
+                let aid = agent_id.to_string();
+                tokio::spawn(async move {
+                    let _ = mgr.store.set_agent_attention(&aid, AttentionState::None);
+                    let _ = mgr.store.touch_agent_activity(&aid, Utc::now());
+                    if let Err(e) = mgr
+                        .dispatch_user_prompt_with_handoff(
+                            &aid,
+                            next_item.wire_prompt,
+                            Some(next_item.display_prompt),
+                            next_item.badges,
+                            None,
+                            ActiveTurnBehavior::Steer,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            agent_id = %aid,
+                            error = %e,
+                            "Failed auto-draining daemon queued prompt"
+                        );
+                    }
+                });
+            } else if should_check_auto_archive && auto_arch {
                 let mgr = Arc::clone(self);
                 let aid = agent_id.to_string();
                 tokio::spawn(async move {

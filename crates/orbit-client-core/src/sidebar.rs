@@ -242,7 +242,10 @@ fn matches_conversation_filter(
     match filter {
         SidebarThreadFilter::All => true,
         SidebarThreadFilter::ActiveUnread => {
-            conv.agent.is_running || conv.agent.is_awaiting_permission || conv.is_unread
+            conv.agent.is_running
+                || conv.agent.has_background_tasks
+                || conv.agent.is_awaiting_permission
+                || conv.is_unread
         }
     }
 }
@@ -799,6 +802,7 @@ mod tests {
                 "Idle".to_string()
             },
             is_running,
+            has_background_tasks: false,
             is_awaiting_permission,
             parent_agent_id: None,
             parent_host_id: None,
@@ -813,6 +817,7 @@ mod tests {
             is_pinned,
             seen_seq: if is_unread { 2 } else { 5 },
             is_unread,
+            queued_prompts: Vec::new(),
         }
     }
 

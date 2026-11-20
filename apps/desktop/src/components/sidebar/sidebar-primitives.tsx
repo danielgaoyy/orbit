@@ -1,9 +1,10 @@
 import { memo, useEffect, useState } from "react";
-import { FolderPlus, GitBranch, Loader2, ShieldCheck } from "lucide-react";
+import { FolderPlus, GitBranch, ShieldCheck } from "lucide-react";
 import {
   type AgentCardView,
   type HostCardView,
   type HostConnectionState,
+  isAgentBackgroundWaiting,
 } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import {
@@ -14,6 +15,7 @@ import {
   DropdownMenuTrigger,
   SimpleTooltip,
 } from "@/components/ui/overlays";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { orbitActions } from "@/state/orbit-store";
 
 export function formatCompactRelativeTime(rfc3339: string, nowMs: number): string {
@@ -70,7 +72,7 @@ export const HostStateDot = memo(function HostStateDot({
       );
     case "connecting_direct":
     case "connecting_relay":
-      return <Loader2 className="h-[11.5px] w-[11.5px] shrink-0 animate-spin text-amber-500" />;
+      return <OrbitSpinner size={12} className="text-amber-500" />;
     default:
       return (
         <span
@@ -82,11 +84,11 @@ export const HostStateDot = memo(function HostStateDot({
 });
 
 /**
- * Strict 4-state semantic status slot (`16×16px`):
+ * Left `16×16px` semantic status slot (running spinner lives in the right time/action slot):
  * - Blocked / awaiting input -> `6.5px` amber dot
- * - Running -> `12.5px` subtle spinning ring
  * - Unread completed -> `6px` sky-blue dot
  * - Error -> `6px` rose dot
+ * - Background task running -> `6px` calm emerald dot
  * - Idle & read inside isolated Git worktree -> `12.5px` muted branch glyph
  * - Normal local idle & read -> completely blank (zero gray bullet clutter)
  */
@@ -102,16 +104,19 @@ export const ConversationStatusGlyph = memo(function ConversationStatusGlyph({
   if (agent.is_awaiting_permission) {
     return <span className="h-[6.5px] w-[6.5px] shrink-0 rounded-full bg-amber-500" />;
   }
-  if (agent.is_running) {
-    return (
-      <Loader2 className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0 animate-spin stroke-[1.9]" />
-    );
-  }
   if (isUnread) {
     return <span className="h-[6px] w-[6px] shrink-0 rounded-full bg-sky-500" />;
   }
   if (agent.status_label === "Error") {
     return <span className="h-[6px] w-[6px] shrink-0 rounded-full bg-rose-500" />;
+  }
+  if (isAgentBackgroundWaiting(agent)) {
+    return (
+      <span
+        title={agent.status_label || "Background task running"}
+        className="h-[6px] w-[6px] shrink-0 rounded-full bg-emerald-500/85"
+      />
+    );
   }
   if (isWorktree) {
     return (

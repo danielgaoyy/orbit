@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// First-class supported coding agent CLIs in Orbit Phase 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -153,6 +153,30 @@ pub enum AgentStatus {
     Closed,
 }
 
+impl AgentStatus {
+    /// Returns `true` when the foreground turn has completed and the session is only
+    /// keeping track of asynchronous background tasks (ready for new user prompts immediately).
+    pub fn is_background_waiting(&self) -> bool {
+        matches!(
+            self,
+            AgentStatus::AutonomousWakeup { source, .. }
+                if source.trim().starts_with("waiting:")
+        )
+    }
+
+    /// Returns `true` when a foreground turn or active autonomous wakeup is actively executing.
+    pub fn is_foreground_busy(&self) -> bool {
+        match self {
+            AgentStatus::Initializing | AgentStatus::Running { .. } => true,
+            AgentStatus::AutonomousWakeup { source, .. } => !source.trim().starts_with("waiting:"),
+            AgentStatus::Idle
+            | AgentStatus::AwaitingPermission { .. }
+            | AgentStatus::Error { .. }
+            | AgentStatus::Closed => false,
+        }
+    }
+}
+
 /// Host identity and metadata for Multi-Host fleet management.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostInfo {
@@ -237,6 +261,16 @@ pub struct GitStatusSnapshot {
     pub files: Vec<GitFileEntry>,
 }
 
+/// Synchronized follow-up prompt queued on the host daemon for multi-device visibility & offline drain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedPromptView {
+    pub queue_id: String,
+    pub display_text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub badges: Vec<PromptBadge>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Summary projection of an agent session for fast directory listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSummary {
@@ -274,6 +308,8 @@ pub struct AgentSummary {
     pub attention: AttentionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<QueuedPromptView>,
 }
 
 /// Active detached PTY terminal summary.
@@ -712,6 +748,37 @@ pub enum WireMessage {
         caller_agent_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notify_on_finish: Option<bool>,
+    },
+    EnqueuePrompt {
+        request_id: Uuid,
+        agent_id: String,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        badges: Vec<PromptBadge>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_id: Option<String>,
+    },
+    RemoveQueuedPrompt {
+        request_id: Uuid,
+        agent_id: String,
+        queue_id: String,
+    },
+    FlushQueuedPromptNow {
+        request_id: Uuid,
+        agent_id: String,
+        queue_id: String,
+    },
+    ReorderQueuedPrompts {
+        request_id: Uuid,
+        agent_id: String,
+        queue_ids: Vec<String>,
+    },
+    UpgradeDaemon {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_version: Option<String>,
     },
     InterruptTurn {
         request_id: Uuid,
@@ -1564,6 +1631,7 @@ mod tests {
                 labels: HashMap::new(),
                 attention: AttentionState::None,
                 last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
             },
             to_before_seq: 42,
             events: Vec::new(),

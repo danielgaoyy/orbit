@@ -39,6 +39,7 @@ import {
   MessageSquareText,
   Quote,
   RotateCcw,
+  RotateCw,
   Scissors,
   Search,
   Sparkles,
@@ -59,6 +60,7 @@ import {
   type TimelineItemView,
   type TurnFileDiffSummaryView,
   type WorkSummaryResultView,
+  isAgentForegroundRunning,
 } from "@/lib/orbit-ipc";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import {
@@ -1328,7 +1330,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
     return (
       <div
         title={badge.label}
-        className="border-border bg-muted/55 size-[92px] shrink-0 animate-pulse rounded-[16px] border"
+        className="border-border bg-muted/55 size-[56px] shrink-0 animate-pulse rounded-[12px] border"
       />
     );
   }
@@ -1349,7 +1351,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
             cwd,
           })
         }
-        className="group/img border-border bg-muted/40 relative size-[92px] shrink-0 cursor-pointer overflow-hidden rounded-[16px] border shadow-[0_1px_4px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow] duration-150 hover:border-foreground/25 dark:shadow-[0_2px_8px_rgba(0,0,0,0.28)]"
+        className="group/img border-border bg-muted/40 relative size-[56px] shrink-0 cursor-pointer overflow-hidden rounded-[12px] border shadow-[0_1px_3px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow] duration-150 hover:border-foreground/25 dark:shadow-[0_1px_6px_rgba(0,0,0,0.26)]"
       >
         <img
           src={imgUrl}
@@ -1577,7 +1579,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
       {imageBadges.length > 0 && (
         <div
           className={cn(
-            "flex max-w-[80%] flex-wrap justify-end gap-2 select-none",
+            "flex max-w-[80%] flex-wrap justify-end gap-1.5 select-none",
             hasBubbleContent && "mb-1.5",
           )}
         >
@@ -2231,28 +2233,49 @@ const TurnFooter = memo(function TurnFooter({
   );
 });
 
-const CompactionDivider = memo(function CompactionDivider({ label }: { label?: string }) {
+/**
+ * Returns true when a `wakeup` segment represents a transient "waiting for background task(s)"
+ * state rather than a permanent timeline milestone.
+ */
+function isWaitingWakeupLabel(label: string | undefined | null): boolean {
+  return Boolean(label && /^waiting for\b/i.test(label.trim()));
+}
+
+/**
+ * Returns true when a `wakeup` segment should be hidden from the main conversation stream:
+ * both transient "Waiting for ..." states (surfaced in Overview) and internal
+ * "Resumed from background task" runtime scheduling transitions (which mature agents
+ * fold silently into the normal continuation of the turn).
+ */
+function isHiddenWakeupLabel(label: string | undefined | null): boolean {
+  if (!label) return true;
+  const trimmed = label.trim();
   return (
-    <div className="text-muted-foreground flex items-center gap-3 px-[10px] py-2 text-[12px]">
-      <div className="border-border flex-1 border-t" />
-      <span className="inline-flex items-center gap-1.5">
-        <Scissors className="size-3 opacity-75" />
-        <span>{label || "Context compacted"}</span>
+    /^waiting for\b/i.test(trimmed) ||
+    /^resumed from background task\b/i.test(trimmed)
+  );
+}
+
+const CompactionMilestoneRow = memo(function CompactionMilestoneRow({
+  label,
+}: {
+  label?: string;
+}) {
+  return (
+    <div className="py-0.5 select-none">
+      <span className="text-muted-foreground/85 border-border/75 bg-muted/45 dark:bg-muted/30 inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[12px] font-normal">
+        <Scissors className="size-3 shrink-0 opacity-75" />
+        <span className="truncate">{label || "Context compacted"}</span>
       </span>
-      <div className="border-border flex-1 border-t" />
     </div>
   );
 });
 
-const WakeupDivider = memo(function WakeupDivider({ label }: { label?: string }) {
+const WakeupEventRow = memo(function WakeupEventRow({ label }: { label?: string }) {
   return (
-    <div className="text-muted-foreground/80 flex items-center gap-3 py-1.5 text-[11.5px]">
-      <div className="border-border/75 flex-1 border-t" />
-      <span className="inline-flex items-center gap-1.5">
-        <Sparkles className="size-3 opacity-70" />
-        <span>{label || "Resumed from background task"}</span>
-      </span>
-      <div className="border-border/75 flex-1 border-t" />
+    <div className="text-muted-foreground/80 flex items-center gap-1.5 py-0.5 text-[12.5px] font-normal select-none">
+      <RotateCw className="size-3 shrink-0 opacity-75" />
+      <span className="truncate">{label || "Resumed from background task"}</span>
     </div>
   );
 });
@@ -2338,6 +2361,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   turn,
   isTurnActive,
   agentStatusLabel = null,
+  hasLiveBackgroundTasks = false,
   isNetworkOffline,
   animatePromptEntrance = false,
   autoFoldCompleted,
@@ -2354,6 +2378,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   turn: StageTurnView;
   isTurnActive: boolean;
   agentStatusLabel?: string | null;
+  hasLiveBackgroundTasks?: boolean;
   isNetworkOffline: boolean;
   animatePromptEntrance?: boolean;
   autoFoldCompleted: boolean;
@@ -2367,18 +2392,60 @@ export const TurnStageSection = memo(function TurnStageSection({
   onRequestRewind: (seq: number, promptText: string) => void;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
+  const rawSegments = turn.live_segments;
+  const lastRawSeg = rawSegments[rawSegments.length - 1] ?? null;
+
+  // Exclude transient `Waiting for ...` and internal `Resumed from background task` wakeup rows
+  // from permanent timeline history, and collapse consecutive duplicate external wakeup events.
+  const segments = useMemo(() => {
+    const out: typeof rawSegments = [];
+    for (const seg of rawSegments) {
+      if (seg.kind === "wakeup") {
+        if (isHiddenWakeupLabel(seg.label)) continue;
+        const prev = out[out.length - 1];
+        if (prev?.kind === "wakeup" && prev.label === seg.label) continue;
+      }
+      out.push(seg);
+    }
+    return out;
+  }, [rawSegments]);
+
   if (
     turn.is_compaction_command &&
     turn.folded_steps.length === 0 &&
     turn.terminal_reply === null &&
     turn.notices.length === 0
   ) {
-    return <CompactionDivider label={turn.compactions[0]?.label || "Context compacted"} />;
+    return (
+      <div className="min-w-0 px-[10px]">
+        <CompactionMilestoneRow label={turn.compactions[0]?.label || "Context compacted"} />
+      </div>
+    );
   }
 
-  const segments = turn.live_segments;
-  const lastSeg = segments[segments.length - 1] ?? null;
-  const hasBody = segments.length > 0 || isTurnActive;
+  const isWaitingOnlyOnBackgroundTasks =
+    hasLiveBackgroundTasks &&
+    ((lastRawSeg?.kind === "wakeup" && isWaitingWakeupLabel(lastRawSeg.label)) ||
+      (Boolean(agentStatusLabel && /background task/i.test(agentStatusLabel)) &&
+        (lastRawSeg === null ||
+          (lastRawSeg.kind === "assistant_message" &&
+            lastRawSeg.item.item_type === "assistant_message" &&
+            !lastRawSeg.item.streaming))));
+
+  // Show a lightweight trailing live indicator when the turn is active, but the last rendered
+  // segment is already settled (unless `LiveBackgroundTasksBar` already owns the waiting state).
+  const needsTrailingActivity =
+    isTurnActive &&
+    !isWaitingOnlyOnBackgroundTasks &&
+    (lastRawSeg === null ||
+      (lastRawSeg.kind === "assistant_message" &&
+        lastRawSeg.item.item_type === "assistant_message" &&
+        !lastRawSeg.item.streaming) ||
+      lastRawSeg.kind === "notice" ||
+      lastRawSeg.kind === "wakeup" ||
+      lastRawSeg.kind === "compaction");
+
+  const hasBody = segments.length > 0 || needsTrailingActivity;
   const liveStartedAtMs = timing?.startedAtMs ?? turn.started_at_ms ?? null;
   const promptItem =
     turn.user_prompt?.item_type === "user_prompt" ? turn.user_prompt : null;
@@ -2386,18 +2453,6 @@ export const TurnStageSection = memo(function TurnStageSection({
     !isTurnActive && turn.last_assistant_reply?.item_type === "assistant_message"
       ? turn.last_assistant_reply.text
       : null;
-
-  // Show a lightweight trailing live indicator when the turn is active, but the last rendered
-  // segment is already settled (e.g., after an interim reply, notice, or wakeup divider).
-  const needsTrailingActivity =
-    isTurnActive &&
-    (lastSeg === null ||
-      (lastSeg.kind === "assistant_message" &&
-        lastSeg.item.item_type === "assistant_message" &&
-        !lastSeg.item.streaming) ||
-      lastSeg.kind === "notice" ||
-      lastSeg.kind === "wakeup" ||
-      lastSeg.kind === "compaction");
 
   return (
     <div
@@ -2428,11 +2483,11 @@ export const TurnStageSection = memo(function TurnStageSection({
               const isLastSeg = idx === segments.length - 1;
 
               if (seg.kind === "compaction") {
-                return <CompactionDivider key={seg.key} label={seg.label} />;
+                return <CompactionMilestoneRow key={seg.key} label={seg.label} />;
               }
 
               if (seg.kind === "wakeup") {
-                return <WakeupDivider key={seg.key} label={seg.label} />;
+                return <WakeupEventRow key={seg.key} label={seg.label} />;
               }
 
               if (seg.kind === "notice") {
@@ -2556,13 +2611,17 @@ export const TurnStageSection = memo(function TurnStageSection({
                 items={EMPTY_TIMELINE_ITEMS}
                 isWorkActive
                 liveLabel={
-                  lastSeg === null
+                  lastRawSeg === null
                     ? "Working…"
-                    : lastSeg.kind === "wakeup" && lastSeg.label.trim()
-                      ? lastSeg.label.trim().endsWith("…")
-                        ? lastSeg.label.trim()
-                        : `${lastSeg.label.trim()}…`
-                      : agentStatusLabel && /background task|waking/i.test(agentStatusLabel)
+                    : lastRawSeg.kind === "wakeup" &&
+                        !isHiddenWakeupLabel(lastRawSeg.label) &&
+                        lastRawSeg.label.trim()
+                      ? lastRawSeg.label.trim().endsWith("…")
+                        ? lastRawSeg.label.trim()
+                        : `${lastRawSeg.label.trim()}…`
+                      : agentStatusLabel &&
+                          /waking/i.test(agentStatusLabel) &&
+                          !/background[_\s]task/i.test(agentStatusLabel)
                         ? agentStatusLabel.trim().endsWith("…")
                           ? agentStatusLabel.trim()
                           : `${agentStatusLabel.trim()}…`
@@ -2603,6 +2662,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.turn === next.turn &&
   prev.isTurnActive === next.isTurnActive &&
   prev.agentStatusLabel === next.agentStatusLabel &&
+  prev.hasLiveBackgroundTasks === next.hasLiveBackgroundTasks &&
   prev.isNetworkOffline === next.isNetworkOffline &&
   prev.animatePromptEntrance === next.animatePromptEntrance &&
   prev.autoFoldCompleted === next.autoFoldCompleted &&
@@ -2618,7 +2678,7 @@ export const TurnStageSection = memo(function TurnStageSection({
 
 function NewSessionLaunchpad() {
   return (
-    <div className="orbit-stage-enter flex h-full w-full flex-col justify-center px-6 py-12 pb-[10vh]">
+    <div className="orbit-stage-enter flex h-full w-full flex-col justify-center px-[24px] py-12 pb-[10vh]">
       <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,768px)] space-y-6">
         <h1 className="text-foreground/90 px-1 text-center text-[26px] font-normal tracking-[-0.018em]">
           What would you like to build?
@@ -2878,6 +2938,12 @@ function estimateTurnSizeFallback(turn: StageTurnView | undefined): number {
       }
     } else if (seg.kind === "step_group") {
       est += 34;
+    } else if (seg.kind === "wakeup") {
+      if (!isHiddenWakeupLabel(seg.label)) {
+        est += 28;
+      }
+    } else if (seg.kind === "compaction") {
+      est += 32;
     } else {
       est += 44;
     }
@@ -2900,6 +2966,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   stageTurns,
   isLatestTurnActive,
   agentStatusLabel,
+  hasLiveBackgroundTasks,
   baselineMaxSeq,
   isNetworkOffline,
   autoFoldCompleted,
@@ -2921,6 +2988,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   stageTurns: StageTurnView[];
   isLatestTurnActive: boolean;
   agentStatusLabel: string | null;
+  hasLiveBackgroundTasks: boolean;
   baselineMaxSeq: number;
   isNetworkOffline: boolean;
   autoFoldCompleted: boolean;
@@ -3164,11 +3232,25 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     [readScrollVelocity],
   );
 
+  const initialBottomOffset = useMemo(() => {
+    if (stageTurns.length === 0) return 0;
+    let total = 0;
+    for (let i = 0; i < stageTurns.length; i += 1) {
+      const turn = stageTurns[i];
+      const cached = getCachedTurnHeight(`${selectedAgentId}::${turn.key}::${widthBucket}`);
+      total += (cached ?? estimateTurnSizeFallback(turn)) + TURN_LIST_GAP_PX;
+    }
+    return total;
+    // Compute initial bottom anchor only when mounting a fresh session list
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAgentId]);
+
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
     count: stageTurns.length,
     getScrollElement: () => scrollRef.current,
     getItemKey,
     estimateSize,
+    initialOffset: initialBottomOffset,
     rangeExtractor,
     onChange: handleVirtualizerChange,
     gap: TURN_LIST_GAP_PX,
@@ -3325,6 +3407,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               turn={turn}
               isTurnActive={turnActive}
               agentStatusLabel={turnActive ? agentStatusLabel : null}
+              hasLiveBackgroundTasks={turnActive && hasLiveBackgroundTasks}
               isNetworkOffline={isNetworkOffline}
               animatePromptEntrance={isFreshLivePrompt}
               autoFoldCompleted={autoFoldCompleted}
@@ -3357,12 +3440,15 @@ export function StreamStage() {
     canDockOverview,
     isStageWide,
     dockedOverviewLayout,
+    overviewReservePx,
+    overviewReserveTransition,
     stageShiftPx,
     stageTransition,
     stageMaxContentWidthPx,
     outlineOffsetPx,
     outlineTransition,
     isAnimating,
+    isResizing,
     onStageTransitionEnd,
   } = useWorkspaceMotion();
   const hostDetail = useOrbitSelector((s) =>
@@ -3387,6 +3473,8 @@ export function StreamStage() {
   const prevComposerHeightRef = useRef<number>(0);
   const lastObservedScrollTopRef = useRef<number>(0);
   const stickToBottomRef = useRef<boolean>(true);
+  const sessionEntryLockUntilRef = useRef<number>(0);
+  const prevTurnsCountRef = useRef<number>(0);
   const holdActiveRef = useRef<boolean>(false);
   const programmaticScrollRef = useRef<boolean>(false);
   const programmaticScrollTimerRef = useRef<number | null>(null);
@@ -3408,6 +3496,8 @@ export function StreamStage() {
 
   const isStageWideRef = useRef(isStageWide);
   isStageWideRef.current = isStageWide;
+  const isShellLayoutMovingRef = useRef(isAnimating || isResizing);
+  isShellLayoutMovingRef.current = isAnimating || isResizing;
   const [, setTimingTick] = useState(0);
   const [rewindTarget, setRewindTarget] = useState<RewindRequestTarget | null>(null);
   const [rewindSubmitting, setRewindSubmitting] = useState(false);
@@ -3426,7 +3516,8 @@ export function StreamStage() {
       null,
     [hostDetail, selectedAgentId, stageView?.agent],
   );
-  const isAgentRunning = Boolean(currentAgent?.is_running);
+  const isAgentRunning = isAgentForegroundRunning(currentAgent);
+  const fleetHydrated = useOrbitSelector((s) => s.fleetHydrated);
 
   const stageTurns = stageView?.turns ?? EMPTY_TURNS;
   const pendingPermissions = useMemo(
@@ -3694,9 +3785,20 @@ export function StreamStage() {
     } else {
       const nearBottom = distanceFromBottom < 36;
       const scrolledUp = currentTop < prevTop - 1.5;
-      if (nearBottom) {
+      const inEntrySettle = performance.now() < sessionEntryLockUntilRef.current;
+      if (inEntrySettle && stickToBottomRef.current) {
+        // Protect bottom-pinning from browser/virtualizer scrollTop clamping during session switch
+        // or return from New Conversation; explicit user wheel/scrollbar gestures clear this lock immediately.
+        if (distanceFromBottom >= 2) {
+          el.scrollTop = el.scrollHeight;
+          lastObservedScrollTopRef.current = el.scrollTop;
+        }
+      } else if (nearBottom) {
         stickToBottomRef.current = true;
-      } else if (scrolledUp) {
+      } else if (scrolledUp && !isShellLayoutMovingRef.current) {
+        // Ignore browser/virtualizer scrollTop clamping during sidebar open/close/resize animations
+        // so bottom-pinned conversations never lose their pin mid-transition; explicit user wheel-up
+        // still unpins immediately via `onPassiveWheel`.
         stickToBottomRef.current = false;
       }
       const pinned = stickToBottomRef.current;
@@ -3771,6 +3873,7 @@ export function StreamStage() {
     if (!el) return;
     const onPassiveWheel = (e: WheelEvent) => {
       if (e.deltaY < -0.5) {
+        sessionEntryLockUntilRef.current = 0;
         stickToBottomRef.current = false;
         if (programmaticScrollRef.current) {
           programmaticScrollRef.current = false;
@@ -3781,12 +3884,24 @@ export function StreamStage() {
         }
       }
     };
+    const onPointerDown = (e: PointerEvent) => {
+      // Grabbing the native right-edge scrollbar immediately yields control to the user
+      const rect = el.getBoundingClientRect();
+      if (e.clientX >= rect.right - 20) {
+        sessionEntryLockUntilRef.current = 0;
+      }
+    };
     el.addEventListener("wheel", onPassiveWheel, { passive: true });
-    return () => el.removeEventListener("wheel", onPassiveWheel);
+    el.addEventListener("pointerdown", onPointerDown, { passive: true });
+    return () => {
+      el.removeEventListener("wheel", onPassiveWheel);
+      el.removeEventListener("pointerdown", onPointerDown);
+    };
   }, [isDraft, selectedHostId, selectedAgentId]);
 
-  // Keep conversation bottom anchored cleanly when virtualized content or viewport height changes
-  useEffect(() => {
+  // Keep conversation bottom anchored cleanly when virtualized content or viewport height changes.
+  // Attached in useLayoutEffect so it catches the very first virtualizer container height expansion on mount.
+  useLayoutEffect(() => {
     const contentEl = contentRef.current;
     const scrollerEl = scrollRef.current;
     if (!contentEl || !scrollerEl || typeof ResizeObserver === "undefined") return;
@@ -3802,6 +3917,11 @@ export function StreamStage() {
       lastClientHeight = ch;
 
       if (heightChanged) {
+        // Snap synchronously before paint so continuous width transitions stay pixel-locked
+        // to the bottom with zero 1-frame lag, then follow up with metrics sync.
+        if (stickToBottomRef.current && !programmaticScrollRef.current) {
+          snapScrollerToBottom();
+        }
         scheduleBottomSync();
       } else {
         handleScroll();
@@ -3810,7 +3930,14 @@ export function StreamStage() {
     ro.observe(contentEl);
     ro.observe(scrollerEl);
     return () => ro.disconnect();
-  }, [isDraft, selectedHostId, selectedAgentId, scheduleBottomSync, handleScroll]);
+  }, [
+    isDraft,
+    selectedHostId,
+    selectedAgentId,
+    snapScrollerToBottom,
+    scheduleBottomSync,
+    handleScroll,
+  ]);
 
   // Keep conversation bottom anchored cleanly above the Composer when the Composer grows (multiline / attachments)
   useEffect(() => {
@@ -3942,7 +4069,10 @@ export function StreamStage() {
 
   // Always reset bottom-pinning cleanly before paint whenever switching into a session
   useLayoutEffect(() => {
-    if (!activeSessionScope) return;
+    if (!activeSessionScope) {
+      prevTurnsCountRef.current = 0;
+      return;
+    }
     if (programmaticScrollTimerRef.current !== null) {
       window.clearTimeout(programmaticScrollTimerRef.current);
       programmaticScrollTimerRef.current = null;
@@ -3950,23 +4080,71 @@ export function StreamStage() {
     programmaticScrollRef.current = false;
     holdActiveRef.current = false;
     stickToBottomRef.current = true;
+    sessionEntryLockUntilRef.current = performance.now() + 600;
     lastObservedScrollTopRef.current = 0;
+    prevTurnsCountRef.current = turnsCountRef.current;
     scrollUiStore.update({
       isOccludingText: false,
       showJumpLatest: false,
       activePromptSeq: null,
     });
     setRewindTarget(null);
-    if (turnsCountRef.current > 0) {
-      virtualizerRef.current?.scrollToIndex(turnsCountRef.current - 1, { align: "end" });
-    }
-    snapScrollerToBottom();
-    scheduleBottomSync();
-  }, [activeSessionScope, sessionScrollNonce, scrollUiStore, snapScrollerToBottom, scheduleBottomSync]);
 
-  // Synchronously keep pinned to bottom before paint as timeline items arrive or turns append
+    const anchorToBottom = () => {
+      if (!stickToBottomRef.current || programmaticScrollRef.current) return;
+      if (turnsCountRef.current > 0) {
+        virtualizerRef.current?.scrollToIndex(turnsCountRef.current - 1, { align: "end" });
+      }
+      snapScrollerToBottom();
+    };
+
+    anchorToBottom();
+    scheduleBottomSync();
+
+    // Re-anchor across the next two frames once TanStack Virtual measures scrollRect & bottom turn heights
+    let raf2: number | null = null;
+    const raf1 = window.requestAnimationFrame(() => {
+      anchorToBottom();
+      raf2 = window.requestAnimationFrame(() => {
+        anchorToBottom();
+        syncScrollMetrics();
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(raf1);
+      if (raf2 !== null) window.cancelAnimationFrame(raf2);
+    };
+  }, [
+    activeSessionScope,
+    sessionScrollNonce,
+    scrollUiStore,
+    snapScrollerToBottom,
+    scheduleBottomSync,
+    syncScrollMetrics,
+  ]);
+
+  // Synchronously keep pinned to bottom before paint as timeline items arrive, turns append,
+  // or sidebar layout motion starts/settles.
   useLayoutEffect(() => {
     if (!activeSessionScope) return;
+    const prevCount = prevTurnsCountRef.current;
+    prevTurnsCountRef.current = stageTurns.length;
+
+    // Async stage hydration (0 -> N turns) after switching into an uncached session
+    if (prevCount === 0 && stageTurns.length > 0 && stickToBottomRef.current) {
+      sessionEntryLockUntilRef.current = performance.now() + 600;
+      virtualizerRef.current?.scrollToIndex(stageTurns.length - 1, { align: "end" });
+      snapScrollerToBottom();
+      const raf = window.requestAnimationFrame(() => {
+        if (stickToBottomRef.current && !programmaticScrollRef.current) {
+          virtualizerRef.current?.scrollToIndex(turnsCountRef.current - 1, { align: "end" });
+          snapScrollerToBottom();
+          syncScrollMetrics();
+        }
+      });
+      return () => window.cancelAnimationFrame(raf);
+    }
+
     if (stickToBottomRef.current && !programmaticScrollRef.current) {
       snapScrollerToBottom();
     }
@@ -3975,11 +4153,17 @@ export function StreamStage() {
     activeSessionScope,
     stageView?.latest_seq,
     stageTurns.length,
+    stageMaxContentWidthPx,
+    isAnimating,
     snapScrollerToBottom,
     scheduleBottomSync,
+    syncScrollMetrics,
   ]);
 
   if (!selectedHostId) {
+    if (!fleetHydrated) {
+      return <div className="flex-1" />;
+    }
     return (
       <div className="text-muted-foreground flex flex-1 items-center justify-center text-[13.5px]">
         Pair or select an Orbit host to begin.
@@ -4037,7 +4221,7 @@ export function StreamStage() {
       }
       className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
     >
-      {/* Peripheral Megathread Outline Rail (real left gutter >= 900px / < 868px) */}
+      {/* Peripheral Megathread Outline Rail (clean left gutter >= 800px / < 776px) */}
       {outlinePrompts.length >= 2 && (
         <StageOutlineRailBridge
           visible={isStageWide}
@@ -4053,10 +4237,11 @@ export function StreamStage() {
       {/* Parent Back Banner when inspecting a managed subagent */}
       {selectedHostId && currentAgent?.parent_agent_id && (
         <div
-          className={cn(
-            "shrink-0 pl-6",
-            dockedOverviewLayout ? "pr-[348px]" : "pr-6",
-          )}
+          style={{
+            paddingRight: `${24 + overviewReservePx}px`,
+            transition: overviewReserveTransition,
+          }}
+          className="shrink-0 pl-[24px]"
         >
           <div style={stagePushStyle}>
             <ParentSubagentBanner hostId={selectedHostId} agent={currentAgent} />
@@ -4069,10 +4254,12 @@ export function StreamStage() {
         className="min-h-0 flex-1"
         viewportRef={scrollRef}
         onViewportScroll={handleScroll}
-        viewportClassName={cn(
-          "pt-6 pb-11 pl-6",
-          dockedOverviewLayout ? "pr-[348px]" : "pr-6",
-        )}
+        viewportStyle={{
+          paddingRight: `${24 + overviewReservePx}px`,
+          transition: overviewReserveTransition,
+        }}
+        onViewportTransitionEnd={onStageTransitionEnd}
+        viewportClassName="pt-6 pb-11 pl-[24px]"
       >
         <div
           key={selectedAgentId}
@@ -4102,6 +4289,7 @@ export function StreamStage() {
               stageTurns={stageTurns}
               isLatestTurnActive={isLatestTurnActive}
               agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
+              hasLiveBackgroundTasks={stageInsights.background_tasks.length > 0}
               baselineMaxSeq={baselineMaxSeq}
               isNetworkOffline={isNetworkOffline}
               autoFoldCompleted={coalesceExploration}
@@ -4132,7 +4320,12 @@ export function StreamStage() {
           onJumpLatest={scrollToLatest}
         />
 
-        <div className={dockedOverviewLayout ? "pr-[324px]" : "pr-0"}>
+        <div
+          style={{
+            paddingRight: `${overviewReservePx}px`,
+            transition: overviewReserveTransition,
+          }}
+        >
           <div style={stagePushStyle}>
             <SubagentsTrack hostId={selectedHostId} agentId={selectedAgentId} />
             <StickyApprovalDock

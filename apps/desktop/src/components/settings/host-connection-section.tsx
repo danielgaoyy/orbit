@@ -20,13 +20,20 @@ import {
   hostConnectionLabel,
 } from "@/components/settings/settings-primitives";
 import { useImeCompositionGuard } from "@/lib/ime";
-import { type SshHostItem, orbitIpc } from "@/lib/orbit-ipc";
+import {
+  type SshHostItem,
+  compareSemver,
+  normalizeSemver,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 export function HostConnectionSection({ hostId }: { hostId: string }) {
   const fleet = useOrbitSelector((s) => s.fleet);
   const sshHosts = useOrbitSelector((s) => s.sshHosts);
+  const appVersion = useOrbitSelector((s) => s.appVersion);
+  const upgradeState = useOrbitSelector((s) => s.hostUpgradeStates[hostId] ?? null);
   const host = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
 
   const [relayInput, setRelayInput] = useState(host?.relay_url ?? "");
@@ -34,7 +41,6 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   const [showSshDeploy, setShowSshDeploy] = useState(false);
   const [deployingSsh, setDeployingSsh] = useState<string | null>(null);
   const [copiedField, setCopiedField] = useState<string | null>(null);
-  const [upgrading, setUpgrading] = useState(false);
   const ime = useImeCompositionGuard();
 
   useEffect(() => {
@@ -80,17 +86,15 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
     }
   };
 
+  const upgrading = upgradeState?.status === "upgrading";
+  const normApp = normalizeSemver(appVersion);
+  const normDaemon = normalizeSemver(host.daemon_version);
+  const isDaemonOutdated = Boolean(
+    normApp && normDaemon && compareSemver(normDaemon, normApp) < 0,
+  );
+
   const handleUpgradeDaemon = async () => {
-    if (!host.ssh_alias) return;
-    setUpgrading(true);
-    try {
-      await orbitIpc.upgradeRemoteDaemon(host.host_id, host.ssh_alias);
-      orbitActions.showToast(`Upgraded daemon on ${host.display_name}`);
-    } catch (err) {
-      orbitActions.showToast(String(err));
-    } finally {
-      setUpgrading(false);
-    }
+    await orbitActions.upgradeHostDaemon(host.host_id, { force: true });
   };
 
   const handleRemoveHost = async () => {
@@ -160,26 +164,42 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             </button>
           </SettingRow>
 
-          {!isLocal && host.ssh_alias && (
-            <SettingRow
-              title="Remote daemon"
-              description="Update the Orbit binary on this host over SSH."
+          <SettingRow
+            title={isLocal ? "Local service" : "Host service"}
+            description={
+              normDaemon
+                ? isDaemonOutdated && normApp
+                  ? `Running v${normDaemon} · v${normApp} available (active sessions stay running).`
+                  : `Running v${normDaemon} · Up to date.`
+                : isLocal
+                  ? "Keep the local Orbit background service synced with Desktop."
+                  : "Orbit background service on this host."
+            }
+          >
+            <button
+              type="button"
+              disabled={upgrading}
+              onClick={() => void handleUpgradeDaemon()}
+              className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
             >
-              <button
-                type="button"
-                disabled={upgrading}
-                onClick={() => void handleUpgradeDaemon()}
-                className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
-              >
-                {upgrading ? (
-                  <Loader2 className="h-[13px] w-[13px] animate-spin" />
-                ) : (
-                  <ArrowUpCircle className="h-[13.5px] w-[13.5px]" />
-                )}
-                <span>{upgrading ? "Upgrading…" : "Upgrade"}</span>
-              </button>
-            </SettingRow>
-          )}
+              {upgrading ? (
+                <Loader2 className="h-[13px] w-[13px] animate-spin" />
+              ) : isDaemonOutdated ? (
+                <ArrowUpCircle className="h-[13.5px] w-[13.5px]" />
+              ) : (
+                <RefreshCw className="h-[13px] w-[13px]" />
+              )}
+              <span>
+                {upgrading
+                  ? "Updating…"
+                  : isDaemonOutdated
+                    ? "Update"
+                    : isLocal
+                      ? "Restart"
+                      : "Update"}
+              </span>
+            </button>
+          </SettingRow>
         </SettingCard>
       </div>
 

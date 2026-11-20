@@ -2337,7 +2337,7 @@ pub fn derive_session_insights(
     let mut subagent_map: HashMap<String, SessionSubagentEntryView> = HashMap::new();
     let mut detected_local_urls: Vec<String> = Vec::new();
 
-    let agent_running = current_agent.is_some_and(|a| a.is_running);
+    let agent_has_live_work = current_agent.is_some_and(|a| a.is_running || a.has_background_tasks);
 
     for item in items {
         match item {
@@ -2455,7 +2455,7 @@ pub fn derive_session_insights(
                 // Only include genuinely asynchronous background tasks (never foreground commands,
                 // never subagents). Structured `background_task` metadata is authoritative; legacy
                 // persisted timelines fall back to strict header-anchored parsing on Shell output.
-                if agent_running
+                if agent_has_live_work
                     && *status == ToolCallStatus::Running
                     && !matches!(detail, ToolCallDetail::Subagent { .. })
                 {
@@ -2590,7 +2590,7 @@ pub fn derive_session_insights(
                 continue;
             }
             if ag.parent_agent_id.as_deref() == Some(cur.agent_id.as_str()) {
-                let status = if ag.is_running {
+                let status = if ag.is_running || ag.has_background_tasks {
                     ToolCallStatus::Running
                 } else if contains_ascii_case_insensitive(&ag.status_label, "error") {
                     ToolCallStatus::Failed
@@ -2712,10 +2712,11 @@ pub fn derive_session_insights(
     // is already surfaced for the session.
     if background_tasks.is_empty()
         && let Some(cur) = current_agent
-        && cur.is_running
+        && (cur.is_running || cur.has_background_tasks)
     {
         let trimmed = cur.status_label.trim_start();
-        let is_waiting_bg = contains_ascii_case_insensitive(trimmed, "background task");
+        let is_waiting_bg =
+            cur.has_background_tasks || contains_ascii_case_insensitive(trimmed, "background task");
         let is_waking = starts_with_ignore_ascii_case(trimmed, "waking")
             && trimmed["waking".len()..].trim_start().starts_with('(');
         if is_waiting_bg || is_waking {
@@ -3436,6 +3437,7 @@ mod tests {
             },
             status_label: "Waking (cron)".into(),
             is_running: true,
+            has_background_tasks: false,
             is_awaiting_permission: false,
             parent_agent_id: None,
             parent_host_id: None,
@@ -3450,6 +3452,7 @@ mod tests {
             is_pinned: false,
             seen_seq: 0,
             is_unread: false,
+            queued_prompts: Vec::new(),
         };
         let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[], &[]);
         assert_eq!(
@@ -3596,6 +3599,7 @@ Log: file:///tmp/spoofed.log\n";
             },
             status_label: status_label.into(),
             is_running: running,
+            has_background_tasks: false,
             is_awaiting_permission: false,
             parent_agent_id: parent.map(ToOwned::to_owned),
             parent_host_id: None,
@@ -3610,6 +3614,7 @@ Log: file:///tmp/spoofed.log\n";
             is_pinned: false,
             seen_seq: 0,
             is_unread: false,
+            queued_prompts: Vec::new(),
         };
 
         let mut items: Vec<TimelineItemView> = Vec::new();
@@ -3829,6 +3834,7 @@ Log: file:///tmp/spoofed.log\n";
             },
             status_label: status_label.into(),
             is_running: running,
+            has_background_tasks: false,
             is_awaiting_permission: false,
             parent_agent_id: None,
             parent_host_id: None,
@@ -3843,6 +3849,7 @@ Log: file:///tmp/spoofed.log\n";
             is_pinned: false,
             seen_seq: 0,
             is_unread: false,
+            queued_prompts: Vec::new(),
         };
 
         let items = vec![
@@ -3979,5 +3986,84 @@ Log: file:///tmp/spoofed.log\n";
         }
         // Completed task_id cleared across different call_ids
         assert!(insights.background_tasks.is_empty());
+    }
+
+    #[test]
+    fn background_waiting_keeps_tasks_visible_when_foreground_is_idle() {
+        use orbit_protocol::{AgentStatus, BackgroundTaskInfo, ProviderKind, SessionMode};
+
+        let cur = AgentCardView {
+            agent_id: "ag_bg".into(),
+            workspace_id: "ws_1".into(),
+            cwd: "/repo".into(),
+            title: "Dev Server".into(),
+            provider: ProviderKind::Antigravity,
+            provider_label: "Antigravity".into(),
+            model: None,
+            effort: None,
+            mode: SessionMode::FullAccess,
+            status: AgentStatus::AutonomousWakeup {
+                turn_id: "bgwait_1".into(),
+                source: "waiting:1 background task".into(),
+            },
+            status_label: "1 background task".into(),
+            is_running: false,
+            has_background_tasks: true,
+            is_awaiting_permission: false,
+            parent_agent_id: None,
+            parent_host_id: None,
+            profile_id: None,
+            background: false,
+            auto_archive: false,
+            attention: orbit_protocol::AttentionState::Finished,
+            archived_at_rfc3339: None,
+            labels: HashMap::new(),
+            latest_seq: 12,
+            updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
+            is_pinned: false,
+            seen_seq: 10,
+            is_unread: true,
+            queued_prompts: Vec::new(),
+        };
+
+        let items = vec![TimelineItemView::ToolCall {
+            seq: 11,
+            call_id: "call_tauri_dev".into(),
+            status: ToolCallStatus::Running,
+            summary_title: "Run shell".into(),
+            detail: ToolCallDetail::Shell {
+                command: "cd apps/desktop && npm run tauri dev".into(),
+                cwd: Some("/repo".into()),
+                exit_code: None,
+                output_preview: Some("running in background".into()),
+            },
+            background_task: Some(BackgroundTaskInfo {
+                task_id: Some("conv/task-308".into()),
+                label: Some("cd apps/desktop && npm run tauri dev".into()),
+                log_path: Some("/tmp/task-308.txt".into()),
+            }),
+            step_descriptor: None,
+            diff_files: Vec::new(),
+            timestamp_ms: Some(1_000),
+        }];
+
+        let insights = derive_session_insights(&items, Some("/repo"), Some(&cur), &[], &[]);
+        assert_eq!(insights.background_tasks.len(), 1);
+        assert_eq!(
+            insights.background_tasks[0].title,
+            "cd apps/desktop && npm run tauri dev"
+        );
+        assert_eq!(
+            insights.background_tasks[0].log_path.as_deref(),
+            Some("/tmp/task-308.txt")
+        );
+
+        // Fallback wakeup task also surfaces when no structured ToolCall item is present
+        let fallback_insights = derive_session_insights(&[], Some("/repo"), Some(&cur), &[], &[]);
+        assert_eq!(fallback_insights.background_tasks.len(), 1);
+        assert_eq!(
+            fallback_insights.background_tasks[0].kind,
+            SessionBackgroundTaskKind::Wakeup
+        );
     }
 }

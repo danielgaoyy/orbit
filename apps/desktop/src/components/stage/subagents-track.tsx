@@ -419,20 +419,50 @@ export const AgentMessageCard = memo(function AgentMessageCard({
   );
   const [resolvedLocal, setResolvedLocal] = useState<string | null>(null);
 
-  // Heartbeat renders as a lightweight inline divider
+  // Heartbeat renders as a left-aligned collapsible activity row matching the stage timeline axis.
   if (item.kind === "heartbeat") {
+    const trimmedBody = item.text.trim();
+    const canExpand = trimmedBody.length > 0;
     return (
-      <div className="my-2 flex items-center gap-2.5 px-2">
-        <div className="bg-border h-px flex-1" />
+      <div className="min-w-0 px-[10px]">
         <button
           type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="text-muted-foreground hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 text-[11.5px] font-medium"
+          disabled={!canExpand}
+          aria-expanded={canExpand ? expanded : undefined}
+          onClick={() => {
+            if (!canExpand) return;
+            setExpanded((v) => !v);
+          }}
+          className={cn(
+            "group/hb text-muted-foreground/85 -ml-1.5 inline-flex max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left text-[12.5px] font-normal transition-colors",
+            canExpand
+              ? "hover:text-foreground hover:bg-accent/55 cursor-pointer"
+              : "cursor-default",
+          )}
         >
-          <HeartPulse className="h-[12px] w-[12px] text-rose-500/80" />
-          <span>{item.source_title || "Heartbeat wakeup"}</span>
+          <HeartPulse className="size-3.5 shrink-0 text-rose-500/75" />
+          <span className="truncate">{item.source_title || "Heartbeat wakeup"}</span>
+          {canExpand && (
+            <ChevronRight
+              className={cn(
+                "size-3 shrink-0 opacity-65 transition-transform duration-150 group-hover/hb:opacity-100",
+                expanded && "rotate-90",
+              )}
+            />
+          )}
         </button>
-        <div className="bg-border h-px flex-1" />
+
+        {expanded && canExpand && (
+          <div className="orbit-stage-enter border-border my-1.5 ml-[7px] border-l pl-3 text-[12.5px]">
+            {item.blocks.length > 0 ? (
+              <MarkdownBlocksView blocks={item.blocks} compact />
+            ) : (
+              <p className="selectable-text text-muted-foreground whitespace-pre-wrap break-words">
+                {trimmedBody}
+              </p>
+            )}
+          </div>
+        )}
       </div>
     );
   }

@@ -1,21 +1,15 @@
 import { memo, useMemo } from "react";
-import {
-  AlertTriangle,
-  ArrowUpRight,
-  ChevronDown,
-  Loader2,
-  Plus,
-  Shield,
-  Trash2,
-} from "lucide-react";
+import { AlertTriangle, ArrowUpRight, Loader2, Plus, Trash2 } from "lucide-react";
+import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
+import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
+import { ConversationComposer } from "@/components/conversation/conversation-composer";
 import {
   ConversationMessageFooter,
   ConversationUserBubble,
   ConversationViewport,
 } from "@/components/conversation/conversation-viewport";
-import { ConversationComposer } from "@/components/conversation/conversation-composer";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
-import { ProviderIcon } from "@/components/ui/provider-icons";
+import type { SessionMode } from "@/lib/orbit-ipc";
 import {
   type SideQuestionEntry,
   orbitActions,
@@ -40,17 +34,6 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
   const draft = useOrbitSelector((s) => s.sideQuestionDrafts[scope] ?? "");
   const focusNonce = useOrbitSelector((s) => s.sideQuestionFocusNonce);
 
-  const activeProvider = useOrbitSelector((s) => {
-    if (!s.selectedHostId) return s.draftProvider;
-    if (!s.isDraftNewSession && s.selectedAgentId) {
-      const ag = s.hostDetails[s.selectedHostId]?.agents.find(
-        (a) => a.agent_id === s.selectedAgentId,
-      );
-      if (ag) return ag.provider;
-    }
-    return s.draftProvider;
-  });
-
   const activeProviderLabel = useOrbitSelector((s) => {
     if (!s.selectedHostId) return "Assistant";
     if (!s.isDraftNewSession && s.selectedAgentId) {
@@ -66,15 +49,14 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         : "Codex";
   });
 
-  const activeModel = useOrbitSelector((s) => {
-    if (!s.selectedHostId) return null;
-    if (!s.isDraftNewSession && s.selectedAgentId) {
+  const activeMode: SessionMode = useOrbitSelector((s) => {
+    if (!s.isDraftNewSession && s.selectedHostId && s.selectedAgentId) {
       const ag = s.hostDetails[s.selectedHostId]?.agents.find(
         (a) => a.agent_id === s.selectedAgentId,
       );
-      if (ag) return ag.model ?? null;
+      if (ag) return ag.mode;
     }
-    return s.draftModels[s.draftProvider] ?? null;
+    return s.draftMode;
   });
 
   const isStreaming = entries.some((e) => e.status === "streaming");
@@ -97,9 +79,10 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         resetKey={scope}
         contentVersion={contentVersion}
         viewportClassName="px-5 py-5"
+        contentClassName={entries.length === 0 ? "flex min-h-full flex-col" : undefined}
       >
         {entries.length === 0 ? (
-          <div className="flex min-h-[calc(100%-24px)] flex-col items-center justify-center px-4 py-12 text-center">
+          <div className="flex flex-1 flex-col items-center justify-center px-4 py-8 text-center">
             <div className="max-w-[300px] space-y-5">
               <div className="space-y-1.5">
                 <h3 className="text-foreground text-[15px] font-medium tracking-[-0.015em]">
@@ -191,7 +174,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         )}
       </ConversationViewport>
 
-      {/* Twin Conversation Composer matching primary OmniComposer (read-only controls disabled) */}
+      {/* Shared ConversationComposer reusing main ComposerModelPicker & ComposerModePicker (read-only disabled) */}
       <ConversationComposer
         variant="docked"
         value={draft}
@@ -204,7 +187,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         promptHistory={promptHistory}
         placeholder={`Ask ${activeProviderLabel} on the side…`}
         leftControlsSlot={
-          <div className="flex min-w-0 items-center gap-0.5">
+          <>
             <button
               type="button"
               disabled
@@ -213,20 +196,14 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
             >
               <Plus className="size-[18px] stroke-[1.75]" />
             </button>
-            <button
-              type="button"
+            <ComposerModelPicker
               disabled
-              title={`Inherits active session engine (${activeProviderLabel})`}
-              className="text-foreground/65 inline-flex h-8.5 min-w-0 cursor-not-allowed items-center gap-1.5 rounded-full px-2 text-[13.5px] font-normal"
-            >
-              <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
-              <span className="truncate">{activeModel || activeProviderLabel}</span>
-              <ChevronDown className="text-foreground/30 size-3.5 shrink-0 stroke-[1.75]" />
-            </button>
-          </div>
+              disabledTitle={`Inherits active session model & thinking effort (${activeProviderLabel})`}
+            />
+          </>
         }
-        rightControlsSlot={
-          <div className="flex items-center gap-1">
+        rightControlsSlot={(widthPx) => (
+          <>
             {entries.length > 0 && (
               <button
                 type="button"
@@ -237,16 +214,14 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                 <Trash2 className="size-[14px]" />
               </button>
             )}
-            <button
-              type="button"
+            <ComposerModePicker
+              mode={activeMode}
               disabled
-              title="Read-only — side questions never modify files or main thread"
-              className="text-foreground/45 inline-flex h-8.5 cursor-not-allowed items-center gap-1 rounded-full px-2 text-[13px]"
-            >
-              <Shield className="size-4 shrink-0 stroke-[1.75]" />
-            </button>
-          </div>
-        }
+              iconOnly={widthPx > 0 && widthPx < 360}
+              disabledTitle="Read-only in side questions — inherits context without modifying files"
+            />
+          </>
+        )}
       />
     </div>
   );

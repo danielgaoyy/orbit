@@ -192,7 +192,10 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         className="flex h-[40px] shrink-0 items-center justify-between gap-1.5 pl-2 pr-[44px] shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.055)] dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.06)]"
       >
         {tabs.length > 0 ? (
-          <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          <div
+            data-tauri-drag-region
+            className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          >
             {tabs.map((tab) => {
               const isActive = tab.id === activeTab?.id;
               const showPulseDot =

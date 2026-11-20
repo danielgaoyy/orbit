@@ -42,9 +42,20 @@ import {
   type SlashDirective,
   type SshHostItem,
   type WorkspaceFileView,
+  isAgentBackgroundWaiting,
+  isAgentForegroundRunning,
   isMacDesktop,
+  compareSemver,
+  normalizeSemver,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+
+export interface HostDaemonUpgradeState {
+  status: "upgrading" | "failed";
+  mode: "local" | "ssh" | "wire";
+  error?: string;
+  startedAt: number;
+}
 
 export type { SlashDirective };
 
@@ -215,6 +226,7 @@ export function sideQuestionScopeKey(s: Pick<OrbitUiState, "selectedHostId" | "s
 
 export interface OrbitUiState {
   fleet: FleetOverviewView;
+  fleetHydrated: boolean;
   hostDetails: Record<string, HostDetailView>;
   selectedHostId: string | null;
   selectedAgentId: string | null;
@@ -308,6 +320,7 @@ export interface OrbitUiState {
   appVersion: string | null;
   isBrowserOffline: boolean;
   dismissedVersionMismatchHosts: Record<string, string>;
+  hostUpgradeStates: Record<string, HostDaemonUpgradeState>;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -489,6 +502,7 @@ const initialIsTightForDualSidebars =
 
 let state: OrbitUiState = {
   fleet: { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] },
+  fleetHydrated: false,
   hostDetails: {},
   selectedHostId: null,
   selectedAgentId: null,
@@ -592,6 +606,7 @@ let state: OrbitUiState = {
   appVersion: null,
   isBrowserOffline: typeof navigator !== "undefined" ? !navigator.onLine : false,
   dismissedVersionMismatchHosts: {},
+  hostUpgradeStates: {},
 
   theme: initialTheme,
   resolvedTheme: initialResolvedTheme,
@@ -612,6 +627,46 @@ let state: OrbitUiState = {
 const listeners = new Set<() => void>();
 const composerDraftListeners = new Set<() => void>();
 const composerFocusListeners = new Set<() => void>();
+
+const autoUpgradeAttempted = new Map<string, string>();
+
+function maybeAutoSyncOutdatedHosts(): void {
+  const normApp = normalizeSemver(state.appVersion);
+  if (!normApp || state.isBrowserOffline) return;
+
+  for (const host of state.fleet.hosts) {
+    const isOnline =
+      host.connection_state === "online_direct" || host.connection_state === "online_relay";
+    if (!isOnline) continue;
+
+    const normDaemon = normalizeSemver(host.daemon_version);
+    if (!normDaemon) continue;
+
+    // Clear stale upgrade failure once the daemon catches up
+    if (compareSemver(normDaemon, normApp) >= 0) {
+      if (state.hostUpgradeStates[host.host_id]?.status === "failed") {
+        setState((s) => {
+          const next = { ...s.hostUpgradeStates };
+          delete next[host.host_id];
+          return { ...s, hostUpgradeStates: next };
+        });
+      }
+      continue;
+    }
+
+    // Only auto-upgrade strictly older daemons, and at most once per (host, daemonVer -> appVer)
+    const attemptKey = `${normDaemon}->${normApp}`;
+    if (autoUpgradeAttempted.get(host.host_id) === attemptKey) continue;
+    if (state.hostUpgradeStates[host.host_id]?.status === "upgrading") continue;
+
+    const isLocal = isLocalHostCard(host);
+    const supportsNativeWireUpgrade = (host.daemon_protocol_version ?? 0) >= 4;
+    if (isLocal || host.ssh_alias || supportsNativeWireUpgrade) {
+      autoUpgradeAttempted.set(host.host_id, attemptKey);
+      void orbitActions.upgradeHostDaemon(host.host_id, { silent: true });
+    }
+  }
+}
 
 // Coalesced single-flight gates so daemon bursts never pile up overlapping IPC roundtrips or duplicate renders
 interface StagePullGate {
@@ -794,7 +849,12 @@ async function drainPromptQueueIfIdle(hostId: string, detail: HostDetailView): P
   for (const ag of detail.agents) {
     const key = `${hostId}::${ag.agent_id}`;
     const queue = state.queuedPrompts[key];
-    if (queue && queue.length > 0 && !ag.is_running && !ag.is_awaiting_permission) {
+    if (
+      queue &&
+      queue.length > 0 &&
+      !isAgentForegroundRunning(ag) &&
+      !ag.is_awaiting_permission
+    ) {
       const [nextItem, ...rest] = queue;
       setState((s) => ({
         ...s,
@@ -950,57 +1010,28 @@ async function uploadContextAttachmentToHost(
   await task;
 }
 
+const localQueuedDraftExtras = new Map<
+  string,
+  Pick<QueuedPromptItem, "slashDirective" | "contexts" | "pastes" | "quotes">
+>();
+
+function rememberLocalQueuedDraftExtras(
+  queueId: string,
+  extras: Pick<QueuedPromptItem, "slashDirective" | "contexts" | "pastes" | "quotes">,
+): void {
+  localQueuedDraftExtras.set(queueId, extras);
+  if (localQueuedDraftExtras.size > 32) {
+    const oldest = localQueuedDraftExtras.keys().next().value;
+    if (oldest) localQueuedDraftExtras.delete(oldest);
+  }
+}
+
 export const orbitActions = {
   async init(): Promise<void> {
     if (initialized) return;
     initialized = true;
 
-    const [editors, sshList, version, fallbackCatalogs, slashCommands] = await Promise.all([
-      orbitIpc.listExternalEditors(),
-      orbitIpc.listSshHosts(),
-      orbitIpc.getAppVersion().catch(() => null),
-      orbitIpc.getFallbackProviderCatalogs().catch(() => []),
-      orbitIpc.getSlashCommands("desktop").catch(() => []),
-    ]);
-    seedFallbackProviderCatalogs(fallbackCatalogs);
-    setState((s) => ({
-      ...s,
-      externalEditors: editors,
-      sshHosts: sshList,
-      appVersion: version,
-      slashCommands,
-    }));
-
-    // Sanitize persisted draft models against Rust catalog & retired-slug table
-    const providers: ProviderKind[] = ["claude_code", "codex", "antigravity"];
-    const sanitizedEntries = await Promise.all(
-      providers.map(async (provider) => {
-        const current = state.draftModels[provider] ?? null;
-        if (!current) return [provider, null] as const;
-        const resolved = await orbitIpc
-          .resolveModelSelection({
-            host_id: null,
-            provider,
-            desired_model: current,
-            desired_effort: state.draftEffort,
-          })
-          .catch(() => null);
-        return [provider, resolved ? resolved.selected_model_id : current] as const;
-      }),
-    );
-    const nextDraftModels = { ...state.draftModels };
-    let modelsChanged = false;
-    for (const [provider, nextModel] of sanitizedEntries) {
-      if (nextDraftModels[provider] !== nextModel) {
-        nextDraftModels[provider] = nextModel;
-        modelsChanged = true;
-      }
-    }
-    if (modelsChanged) {
-      setState((s) => ({ ...s, draftModels: nextDraftModels }), true);
-    }
-
-    // One-time migration of legacy localStorage pin/seen prefs into Rust SQLite
+    // 1. One-time migration of legacy localStorage pin/seen prefs into Rust SQLite
     if (typeof window !== "undefined") {
       try {
         if (window.localStorage.getItem(THREAD_PREF_MIGRATION_KEY) !== "1") {
@@ -1046,60 +1077,117 @@ export const orbitActions = {
       }
     }
 
-    await orbitActions.reloadFleetAndHosts(true);
-    orbitActions.refreshSidebarView();
+    // 2. Non-blocking secondary metadata bootstrap (never blocks or aborts fleet hydration)
+    void (async () => {
+      const [editors, sshList, version, fallbackCatalogs, slashCommands] = await Promise.all([
+        orbitIpc.listExternalEditors().catch(() => []),
+        orbitIpc.listSshHosts().catch(() => []),
+        orbitIpc.getAppVersion().catch(() => null),
+        orbitIpc.getFallbackProviderCatalogs().catch(() => []),
+        orbitIpc.getSlashCommands("desktop").catch(() => []),
+      ]);
+      seedFallbackProviderCatalogs(fallbackCatalogs);
+      setState((s) => ({
+        ...s,
+        externalEditors: editors,
+        sshHosts: sshList,
+        appVersion: version,
+        slashCommands,
+      }));
+      maybeAutoSyncOutdatedHosts();
 
-    await orbitIpc.subscribe((ev: CoreNotification) => {
-      if (ev.kind === "fleet_changed") {
-        scheduleCoalescedGate(fleetSyncGate, () => orbitActions.reloadFleetAndHosts(false));
-      } else if (ev.kind === "host_changed") {
-        let gate = hostSyncGates.get(ev.host_id);
-        if (!gate) {
-          gate = { inFlight: false, queued: false, rafId: null };
-          hostSyncGates.set(ev.host_id, gate);
-        }
-        const hostId = ev.host_id;
-        scheduleCoalescedGate(gate, () => orbitActions.reloadHostDetail(hostId, true));
-      } else if (ev.kind === "timeline_changed") {
-        // Only stream live stage deltas for the actively viewed session (Rust already coalesces at 16ms).
-        if (
-          !state.isDraftNewSession &&
-          ev.host_id === state.selectedHostId &&
-          ev.agent_id === state.selectedAgentId
-        ) {
-          void orbitActions.pullStageDelta(ev.host_id, ev.agent_id);
-        }
-      } else if (ev.kind === "git_changed") {
-        if (ev.host_id === state.selectedHostId && ev.cwd === state.selectedWorkspaceCwd) {
-          const hostId = ev.host_id;
-          const cwd = ev.cwd;
-          if (gitChangedDebounceTimer !== null) {
-            window.clearTimeout(gitChangedDebounceTimer);
-          }
-          gitChangedDebounceTimer = window.setTimeout(() => {
-            gitChangedDebounceTimer = null;
-            void orbitActions.loadGitReviewSnapshot(hostId, cwd, state.selectedDiffPath);
-            void orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
-            orbitActions.markOpenFilesStaleForWorkspace(hostId, cwd);
-          }, 150);
-        }
-      } else if (ev.kind === "terminal_changed") {
-        const chKey = `${ev.host_id}::${ev.slot}`;
-        let ch = terminalChannels.get(chKey);
-        if (!ch) {
-          ch = { chunks: [], subs: new Set() };
-          terminalChannels.set(chKey, ch);
-        }
-        const bytes = Uint8Array.from(ev.raw_bytes);
-        ch.chunks.push(bytes);
-        if (ch.chunks.length > 96) {
-          ch.chunks.splice(0, ch.chunks.length - 96);
-        }
-        for (const sub of ch.subs) {
-          sub(bytes);
+      // Sanitize persisted draft models against Rust catalog & retired-slug table
+      const providers: ProviderKind[] = ["claude_code", "codex", "antigravity"];
+      const sanitizedEntries = await Promise.all(
+        providers.map(async (provider) => {
+          const current = state.draftModels[provider] ?? null;
+          if (!current) return [provider, null] as const;
+          const resolved = await orbitIpc
+            .resolveModelSelection({
+              host_id: null,
+              provider,
+              desired_model: current,
+              desired_effort: state.draftEffort,
+            })
+            .catch(() => null);
+          return [provider, resolved ? resolved.selected_model_id : current] as const;
+        }),
+      );
+      const nextDraftModels = { ...state.draftModels };
+      let modelsChanged = false;
+      for (const [provider, nextModel] of sanitizedEntries) {
+        if (nextDraftModels[provider] !== nextModel) {
+          nextDraftModels[provider] = nextModel;
+          modelsChanged = true;
         }
       }
-    });
+      if (modelsChanged) {
+        setState((s) => ({ ...s, draftModels: nextDraftModels }), true);
+      }
+    })();
+
+    // 3. Highest priority: subscribe to live core events and hydrate fleet/local host immediately
+    const subscribePromise = orbitIpc
+      .subscribe((ev: CoreNotification) => {
+        if (ev.kind === "fleet_changed") {
+          scheduleCoalescedGate(fleetSyncGate, () => orbitActions.reloadFleetAndHosts(false));
+        } else if (ev.kind === "host_changed") {
+          let gate = hostSyncGates.get(ev.host_id);
+          if (!gate) {
+            gate = { inFlight: false, queued: false, rafId: null };
+            hostSyncGates.set(ev.host_id, gate);
+          }
+          const hostId = ev.host_id;
+          scheduleCoalescedGate(gate, () => orbitActions.reloadHostDetail(hostId, true));
+        } else if (ev.kind === "timeline_changed") {
+          // Only stream live stage deltas for the actively viewed session (Rust already coalesces at 16ms).
+          if (
+            !state.isDraftNewSession &&
+            ev.host_id === state.selectedHostId &&
+            ev.agent_id === state.selectedAgentId
+          ) {
+            void orbitActions.pullStageDelta(ev.host_id, ev.agent_id);
+          }
+        } else if (ev.kind === "git_changed") {
+          if (ev.host_id === state.selectedHostId && ev.cwd === state.selectedWorkspaceCwd) {
+            const hostId = ev.host_id;
+            const cwd = ev.cwd;
+            if (gitChangedDebounceTimer !== null) {
+              window.clearTimeout(gitChangedDebounceTimer);
+            }
+            gitChangedDebounceTimer = window.setTimeout(() => {
+              gitChangedDebounceTimer = null;
+              void orbitActions.loadGitReviewSnapshot(hostId, cwd, state.selectedDiffPath);
+              void orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+              orbitActions.markOpenFilesStaleForWorkspace(hostId, cwd);
+            }, 150);
+          }
+        } else if (ev.kind === "terminal_changed") {
+          const chKey = `${ev.host_id}::${ev.slot}`;
+          let ch = terminalChannels.get(chKey);
+          if (!ch) {
+            ch = { chunks: [], subs: new Set() };
+            terminalChannels.set(chKey, ch);
+          }
+          const bytes = Uint8Array.from(ev.raw_bytes);
+          ch.chunks.push(bytes);
+          if (ch.chunks.length > 96) {
+            ch.chunks.splice(0, ch.chunks.length - 96);
+          }
+          for (const sub of ch.subs) {
+            sub(bytes);
+          }
+        }
+      })
+      .catch(() => undefined);
+
+    try {
+      await orbitActions.reloadFleetAndHosts(true);
+    } catch {
+      setState((s) => (s.fleetHydrated ? s : { ...s, fleetHydrated: true }));
+    }
+    orbitActions.refreshSidebarView();
+    await subscribePromise;
   },
 
   refreshSidebarView(): void {
@@ -1163,6 +1251,97 @@ export const orbitActions = {
     }
   },
 
+  async upgradeHostDaemon(
+    hostId: string,
+    opts?: { force?: boolean; silent?: boolean },
+  ): Promise<void> {
+    const host = state.fleet.hosts.find((h) => h.host_id === hostId);
+    if (!host) return;
+    if (state.hostUpgradeStates[hostId]?.status === "upgrading") return;
+
+    const isLocal = isLocalHostCard(host);
+    const mode: "local" | "ssh" | "wire" = isLocal ? "local" : host.ssh_alias ? "ssh" : "wire";
+
+    setState((s) => ({
+      ...s,
+      hostUpgradeStates: {
+        ...s.hostUpgradeStates,
+        [hostId]: {
+          status: "upgrading",
+          mode,
+          startedAt: Date.now(),
+        },
+      },
+    }));
+
+    try {
+      if (mode === "local") {
+        const res = await orbitIpc.syncLocalDaemon(hostId, Boolean(opts?.force));
+        setState((s) => {
+          const next = { ...s.hostUpgradeStates };
+          delete next[hostId];
+          return { ...s, hostUpgradeStates: next };
+        });
+        if (res.status === "skipped_dev") {
+          return;
+        }
+        await orbitActions.reloadFleetAndHosts(false);
+        if (!opts?.silent) {
+          notifyToast(
+            res.status === "updated"
+              ? `Updated local Orbit service${res.daemon_version ? ` to v${res.daemon_version}` : ""}`
+              : "Restarted local Orbit service",
+          );
+        }
+      } else if (mode === "ssh" && host.ssh_alias) {
+        await orbitIpc.upgradeRemoteDaemon(
+          host.host_id,
+          host.ssh_alias,
+          host.remote_daemon_port || undefined,
+        );
+        setState((s) => {
+          const next = { ...s.hostUpgradeStates };
+          delete next[hostId];
+          return { ...s, hostUpgradeStates: next };
+        });
+        await orbitIpc.connectHost(host.host_id);
+        await orbitActions.reloadFleetAndHosts(false);
+        if (!opts?.silent) {
+          notifyToast(`Updated ${host.display_name}`);
+        }
+      } else {
+        await orbitIpc.upgradeHostDaemonOverWire(host.host_id, normalizeSemver(state.appVersion));
+        setState((s) => {
+          const next = { ...s.hostUpgradeStates };
+          delete next[hostId];
+          return { ...s, hostUpgradeStates: next };
+        });
+        await orbitIpc.connectHost(host.host_id);
+        await orbitActions.reloadFleetAndHosts(false);
+        if (!opts?.silent) {
+          notifyToast(`Updated ${host.display_name}`);
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setState((s) => ({
+        ...s,
+        hostUpgradeStates: {
+          ...s.hostUpgradeStates,
+          [hostId]: {
+            status: "failed",
+            mode,
+            error: msg,
+            startedAt: Date.now(),
+          },
+        },
+      }));
+      if (!opts?.silent) {
+        notifyToast(`Upgrade failed: ${msg}`);
+      }
+    }
+  },
+
   async reloadFleetAndHosts(initialBootstrap = false): Promise<void> {
     const snap = await orbitIpc.getFleetOverview();
 
@@ -1220,6 +1399,7 @@ export const orbitActions = {
       return {
         ...s,
         fleet: snap,
+        fleetHydrated: true,
         hostDetails: nextDetails,
         selectedHostId: activeHostId,
         selectedAgentId: nextAgentId,
@@ -1259,6 +1439,7 @@ export const orbitActions = {
         }
       }
     }
+    maybeAutoSyncOutdatedHosts();
   },
 
   async reloadHostDetail(hostId: string, includeFleetOverview = false): Promise<void> {
@@ -1301,7 +1482,11 @@ export const orbitActions = {
     ) {
       for (const nextAg of detail.agents) {
         const prevAg = prevAgents.find((p) => p.agent_id === nextAg.agent_id);
-        if (prevAg?.is_running && !nextAg.is_running && !nextAg.is_awaiting_permission) {
+        if (
+          isAgentForegroundRunning(prevAg) &&
+          !isAgentForegroundRunning(nextAg) &&
+          !nextAg.is_awaiting_permission
+        ) {
           new Notification(`Orbit · ${detail.host.display_name}`, {
             body: `Completed: ${nextAg.title}`,
           });
@@ -1397,6 +1582,7 @@ export const orbitActions = {
 
     syncAttentionIndicators(state.fleet, state.hostDetails);
     orbitActions.refreshSidebarView();
+    maybeAutoSyncOutdatedHosts();
     void drainPromptQueueIfIdle(hostId, detail);
 
     if (newestCreated) {
@@ -1446,7 +1632,10 @@ export const orbitActions = {
             prevAgent.status_label !== nextAgent.status_label ||
             prevAgent.latest_seq !== nextAgent.latest_seq ||
             prevAgent.is_running !== nextAgent.is_running ||
+            Boolean(prevAgent.has_background_tasks) !== Boolean(nextAgent.has_background_tasks) ||
             prevAgent.is_awaiting_permission !== nextAgent.is_awaiting_permission ||
+            (prevAgent.queued_prompts?.length ?? 0) !== (nextAgent.queued_prompts?.length ?? 0) ||
+            prevAgent.queued_prompts?.[0]?.queue_id !== nextAgent.queued_prompts?.[0]?.queue_id ||
             prevAgent.model !== nextAgent.model ||
             prevAgent.effort !== nextAgent.effort ||
             prevAgent.title !== nextAgent.title ||
@@ -2440,13 +2629,27 @@ export const orbitActions = {
     const agentId = state.selectedAgentId;
     const detail = state.hostDetails[hostId];
     const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
+    const supportsServerQueue = Boolean(detail?.host.supports_server_queue);
 
-    if (activeAgent?.is_running || activeAgent?.is_awaiting_permission) {
+    if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
       if (steerImmediately) {
         await orbitIpc.sendPrompt(hostId, agentId, assembledWirePrompt, {
           displayPrompt: cleanUserText,
           badges,
           activeTurnBehavior: "steer",
+        });
+      } else if (supportsServerQueue) {
+        const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        rememberLocalQueuedDraftExtras(queueId, {
+          slashDirective: effectiveDirective,
+          contexts: mergedContexts,
+          pastes,
+          quotes,
+        });
+        await orbitIpc.enqueuePrompt(hostId, agentId, assembledWirePrompt, {
+          displayPrompt: cleanUserText,
+          badges,
+          queueId,
         });
       } else {
         const queuedItem: QueuedPromptItem = {
@@ -2477,7 +2680,16 @@ export const orbitActions = {
     });
   },
 
-  removeQueuedPrompt(index: number): void {
+  removeQueuedPrompt(index: number, queueId?: string): void {
+    const hostId = state.selectedHostId;
+    const agentId = state.selectedAgentId;
+    const detail = hostId ? state.hostDetails[hostId] : undefined;
+    if (hostId && agentId && detail?.host.supports_server_queue && queueId) {
+      localQueuedDraftExtras.delete(queueId);
+      void orbitIpc.removeQueuedPrompt(hostId, agentId, queueId);
+      return;
+    }
+
     const key = composerScopeKey(state);
     setState((s) => ({
       ...s,
@@ -2488,8 +2700,59 @@ export const orbitActions = {
     }));
   },
 
-  popQueuedToDraft(index: number): void {
+  popQueuedToDraft(index: number, queueId?: string): void {
     const key = composerScopeKey(state);
+    const hostId = state.selectedHostId;
+    const agentId = state.selectedAgentId;
+    const detail = hostId ? state.hostDetails[hostId] : undefined;
+    if (hostId && agentId && detail?.host.supports_server_queue && queueId) {
+      const activeAgent = detail.agents.find((a) => a.agent_id === agentId);
+      const serverTarget = activeAgent?.queued_prompts?.find((q) => q.queue_id === queueId);
+      if (!serverTarget) return;
+      const extras = localQueuedDraftExtras.get(queueId);
+      localQueuedDraftExtras.delete(queueId);
+      const restoredContexts: ContextMentionItem[] =
+        extras?.contexts ??
+        (serverTarget.badges ?? [])
+          .filter((b) => b.kind === "file" && b.path)
+          .map((b, bIdx) => ({
+            id: `ctx_q_${Date.now()}_${bIdx}`,
+            kind: "file" as const,
+            path: b.path as string,
+            filename: b.label,
+          }));
+      setState((s) => ({
+        ...s,
+        composerDrafts: {
+          ...s.composerDrafts,
+          [key]:
+            s.composerDrafts[key] && serverTarget.display_text
+              ? `${s.composerDrafts[key]}\n${serverTarget.display_text}`
+              : serverTarget.display_text || s.composerDrafts[key] || "",
+        },
+        slashDirectives: {
+          ...s.slashDirectives,
+          [key]: extras?.slashDirective ?? s.slashDirectives[key] ?? null,
+        },
+        contextItems: {
+          ...s.contextItems,
+          [key]: [...(s.contextItems[key] ?? []), ...restoredContexts],
+        },
+        pastedAttachments: {
+          ...s.pastedAttachments,
+          [key]: [...(s.pastedAttachments[key] ?? []), ...(extras?.pastes ?? [])],
+        },
+        diffQuotes: {
+          ...s.diffQuotes,
+          [key]: [...(s.diffQuotes[key] ?? []), ...(extras?.quotes ?? [])],
+        },
+      }));
+      void orbitIpc.removeQueuedPrompt(hostId, agentId, queueId);
+      orbitActions.refreshSidebarView();
+      orbitActions.focusComposer();
+      return;
+    }
+
     const list = state.queuedPrompts[key] ?? [];
     const target = list[index];
     if (!target) return;
@@ -2527,10 +2790,18 @@ export const orbitActions = {
     orbitActions.focusComposer();
   },
 
-  async flushQueuedPromptImmediately(index: number): Promise<void> {
+  async flushQueuedPromptImmediately(index: number, queueId?: string): Promise<void> {
     const hostId = state.selectedHostId;
     const agentId = state.selectedAgentId;
     if (!hostId || !agentId) return;
+    const detail = state.hostDetails[hostId];
+    if (detail?.host.supports_server_queue && queueId) {
+      localQueuedDraftExtras.delete(queueId);
+      setState((s) => ({ ...s, sessionScrollNonce: s.sessionScrollNonce + 1 }));
+      await orbitIpc.flushQueuedPromptNow(hostId, agentId, queueId);
+      return;
+    }
+
     const key = `${hostId}::${agentId}`;
     const list = state.queuedPrompts[key] ?? [];
     const target = list[index];
@@ -2543,11 +2814,47 @@ export const orbitActions = {
         [key]: list.filter((_, idx) => idx !== index),
       },
     }));
-    await orbitIpc.interruptAgent(hostId, agentId);
+    const activeAgent = state.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId);
+    if (isAgentForegroundRunning(activeAgent) || activeAgent?.is_awaiting_permission) {
+      await orbitIpc.interruptAgent(hostId, agentId);
+    }
     await orbitIpc.sendPrompt(hostId, agentId, target.wirePrompt, {
       displayPrompt: target.displayText,
       badges: target.badges,
     });
+  },
+
+  reorderQueuedPrompts(fromIndex: number, toIndex: number): void {
+    if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return;
+    const hostId = state.selectedHostId;
+    const agentId = state.selectedAgentId;
+    const detail = hostId ? state.hostDetails[hostId] : undefined;
+    if (hostId && agentId && detail?.host.supports_server_queue) {
+      const activeAgent = detail.agents.find((a) => a.agent_id === agentId);
+      const current = activeAgent?.queued_prompts ?? [];
+      if (fromIndex >= current.length || toIndex >= current.length) return;
+      const nextIds = current.map((q) => q.queue_id);
+      const [moved] = nextIds.splice(fromIndex, 1);
+      if (!moved) return;
+      nextIds.splice(toIndex, 0, moved);
+      void orbitIpc.reorderQueuedPrompts(hostId, agentId, nextIds);
+      return;
+    }
+
+    const key = composerScopeKey(state);
+    const list = state.queuedPrompts[key] ?? [];
+    if (fromIndex >= list.length || toIndex >= list.length) return;
+    const next = list.slice();
+    const [moved] = next.splice(fromIndex, 1);
+    if (!moved) return;
+    next.splice(toIndex, 0, moved);
+    setState((s) => ({
+      ...s,
+      queuedPrompts: {
+        ...s.queuedPrompts,
+        [key]: next,
+      },
+    }));
   },
 
   jumpToNextAttentionItem(): void {
@@ -3121,7 +3428,10 @@ export const orbitActions = {
     const hostId = project.host_id;
     try {
       const running = project.conversations.filter(
-        ({ agent }) => agent.is_running || agent.is_awaiting_permission,
+        ({ agent }) =>
+          isAgentForegroundRunning(agent) ||
+          isAgentBackgroundWaiting(agent) ||
+          agent.is_awaiting_permission,
       );
       if (running.length > 0) {
         await Promise.allSettled(
@@ -3332,7 +3642,8 @@ export const orbitActions = {
       activeTab.hostId &&
       activeTab.cwd &&
       activeTab.filePath &&
-      activeFileKey.startsWith(prefix)
+      activeFileKey.startsWith(prefix) &&
+      state.fileViewCache[activeFileKey]?.status !== "error"
     ) {
       void orbitActions.loadWorkspaceFile(activeTab.hostId, activeTab.cwd, activeTab.filePath, true);
     }
@@ -3373,6 +3684,7 @@ export const orbitActions = {
   },
 
   closeSidePanelTab(tabId: string): void {
+    let closedPanel = false;
     setState((s) => {
       const idx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
       if (idx < 0) return s;
@@ -3381,9 +3693,18 @@ export const orbitActions = {
         s.activeSidePanelTabId === tabId
           ? (remaining[Math.min(idx, remaining.length - 1)]?.id ?? null)
           : s.activeSidePanelTabId;
-      const showingLaunchpad = remaining.length === 0 || nextActive === null;
+      const shouldClosePanel = remaining.length === 0;
+      closedPanel = shouldClosePanel;
+      const shouldRestoreSidebar =
+        shouldClosePanel && s.sidebarAutoYieldedForSidePanel && !s.isCompactViewport;
+      const showingLaunchpad = !shouldClosePanel && nextActive === null;
       return {
         ...s,
+        sidePanelOpen: shouldClosePanel ? false : s.sidePanelOpen,
+        sidebarOpen: shouldRestoreSidebar ? s.sidebarDesktopOpenPref : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldRestoreSidebar
+          ? false
+          : s.sidebarAutoYieldedForSidePanel,
         sidePanelTabs: remaining,
         activeSidePanelTabId: nextActive,
         sidePanelLaunchpadFocusNonce: showingLaunchpad
@@ -3392,7 +3713,7 @@ export const orbitActions = {
       };
     });
 
-    if (state.selectedHostId && state.selectedWorkspaceCwd) {
+    if (!closedPanel && state.selectedHostId && state.selectedWorkspaceCwd) {
       void orbitActions.ensureWorkspaceFiles(state.selectedHostId, state.selectedWorkspaceCwd);
     }
   },

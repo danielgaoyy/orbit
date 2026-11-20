@@ -10,9 +10,10 @@ import {
 import {
   ArrowUp,
   AtSign,
-  Clock,
+  CornerDownRight,
   FileSearch,
   FoldVertical,
+  GripVertical,
   Layers,
   ListTodo,
   Paperclip,
@@ -22,7 +23,6 @@ import {
   SquareSlash,
   Users,
   X,
-  Zap,
 } from "lucide-react";
 import {
   collapseStrippedToken,
@@ -44,8 +44,10 @@ import { modSymbol } from "@/lib/keybindings";
 import {
   type GitFileEntry,
   type MentionCandidateView,
+  type QueuedPromptView,
   type SessionMode,
   type SlashCommandView,
+  isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
@@ -54,6 +56,7 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuTrigger,
+  SimpleTooltip,
 } from "@/components/ui/overlays";
 import {
   type ContextMentionItem,
@@ -72,6 +75,7 @@ const EMPTY_CONTEXTS: readonly ContextMentionItem[] = [];
 const EMPTY_PASTES: readonly PastedAttachment[] = [];
 const EMPTY_QUOTES: readonly DiffQuoteSnippet[] = [];
 const EMPTY_QUEUED: readonly QueuedPromptItem[] = [];
+const EMPTY_SERVER_QUEUED: readonly QueuedPromptView[] = [];
 const EMPTY_FILES: readonly string[] = [];
 const EMPTY_GIT_FILES: readonly GitFileEntry[] = [];
 const EMPTY_MENTIONS: MentionCandidateView[] = [];
@@ -109,8 +113,9 @@ export const OmniComposer = memo(function OmniComposer({
       !s.isDraftNewSession &&
         s.selectedHostId &&
         s.selectedAgentId &&
-        s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
-          ?.is_running,
+        isAgentForegroundRunning(
+          s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId),
+        ),
     ),
   );
   const isAwaitingPermission = useOrbitSelector((s) =>
@@ -143,7 +148,27 @@ export const OmniComposer = memo(function OmniComposer({
     (s) => s.pastedAttachments[composerScopeKey(s)] ?? EMPTY_PASTES,
   );
   const quotes = useOrbitSelector((s) => s.diffQuotes[composerScopeKey(s)] ?? EMPTY_QUOTES);
-  const queued = useOrbitSelector((s) => s.queuedPrompts[composerScopeKey(s)] ?? EMPTY_QUEUED);
+  const localQueued = useOrbitSelector((s) => s.queuedPrompts[composerScopeKey(s)] ?? EMPTY_QUEUED);
+  const hostSupportsServerQueue = useOrbitSelector((s) =>
+    Boolean(s.selectedHostId && s.hostDetails[s.selectedHostId]?.host.supports_server_queue),
+  );
+  const serverQueued = useOrbitSelector((s) => {
+    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return EMPTY_SERVER_QUEUED;
+    return (
+      s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
+        ?.queued_prompts ?? EMPTY_SERVER_QUEUED
+    );
+  });
+  const queued = useMemo(() => {
+    if (hostSupportsServerQueue) {
+      return serverQueued.map((q) => ({
+        id: q.queue_id,
+        displayText: q.display_text,
+        badges: q.badges ?? [],
+      }));
+    }
+    return localQueued;
+  }, [hostSupportsServerQueue, serverQueued, localQueued]);
 
   const workspaceFiles = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedWorkspaceCwd
@@ -169,6 +194,101 @@ export const OmniComposer = memo(function OmniComposer({
 
   const [cursorOffset, setCursorOffset] = useState<number>(0);
   const [directiveIndentPx, setDirectiveIndentPx] = useState<number>(0);
+  const [queueDrag, setQueueDrag] = useState<{
+    fromIndex: number;
+    overIndex: number;
+    deltaY: number;
+    rowStep: number;
+  } | null>(null);
+  const queueRowRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const queueDragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    // Abort any in-flight drag cleanly if the queue shrinks or swaps underneath us
+    if (queueDrag && queueDrag.fromIndex >= queued.length) {
+      queueDragCleanupRef.current?.();
+    }
+  }, [queueDrag, queued.length]);
+
+  useEffect(() => {
+    return () => {
+      queueDragCleanupRef.current?.();
+    };
+  }, []);
+
+  const handleQueueRowPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>, fromIndex: number) => {
+      if (e.button !== 0 || queued.length < 2) return;
+      if ((e.target as HTMLElement | null)?.closest("button")) return;
+
+      const firstRect = queueRowRefs.current[0]?.getBoundingClientRect();
+      const secondRect = queueRowRefs.current[1]?.getBoundingClientRect();
+      const measuredStep =
+        firstRect && secondRect && secondRect.top > firstRect.top
+          ? secondRect.top - firstRect.top
+          : 30;
+      const startY = e.clientY;
+      const count = queued.length;
+      const minDeltaY = -fromIndex * measuredStep;
+      const maxDeltaY = (count - 1 - fromIndex) * measuredStep;
+
+      let active = false;
+      let overIndex = fromIndex;
+
+      const cleanup = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        window.removeEventListener("pointercancel", onCancel);
+        window.removeEventListener("keydown", onKeyDown);
+        queueDragCleanupRef.current = null;
+        setQueueDrag(null);
+      };
+
+      const onMove = (ev: PointerEvent) => {
+        const rawDelta = ev.clientY - startY;
+        if (!active) {
+          if (Math.abs(rawDelta) < 4) return;
+          active = true;
+        }
+        const clampedDeltaY = Math.max(minDeltaY, Math.min(maxDeltaY, rawDelta));
+        const slotShift = Math.round(clampedDeltaY / measuredStep);
+        overIndex = Math.max(0, Math.min(count - 1, fromIndex + slotShift));
+        setQueueDrag({
+          fromIndex,
+          overIndex,
+          deltaY: clampedDeltaY,
+          rowStep: measuredStep,
+        });
+      };
+
+      const onUp = () => {
+        const shouldCommit = active && overIndex !== fromIndex;
+        const targetIndex = overIndex;
+        cleanup();
+        if (shouldCommit) {
+          orbitActions.reorderQueuedPrompts(fromIndex, targetIndex);
+        }
+      };
+
+      const onCancel = () => {
+        cleanup();
+      };
+
+      const onKeyDown = (ev: KeyboardEvent) => {
+        if (ev.key === "Escape") {
+          cleanup();
+        }
+      };
+
+      queueDragCleanupRef.current?.();
+      queueDragCleanupRef.current = cleanup;
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+      window.addEventListener("pointercancel", onCancel);
+      window.addEventListener("keydown", onKeyDown);
+    },
+    [queued.length],
+  );
   const [menuHighlightIdx, setMenuHighlightIdx] = useState<number>(0);
   const [dismissedToken, setDismissedToken] = useState<string | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
@@ -212,7 +332,10 @@ export const OmniComposer = memo(function OmniComposer({
       const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
       if (nextW > 0 && nextW !== lastW) {
         lastW = nextW;
-        setComposerWidthPx(nextW);
+        // Avoid re-rendering the entire composer tree on every sidebar animation frame when empty.
+        if (el.value.length > 0) {
+          setComposerWidthPx(nextW);
+        }
       }
     });
     ro.observe(el);
@@ -730,49 +853,121 @@ export const OmniComposer = memo(function OmniComposer({
 
         {/* Queued Follow-Up Strip when Agent is Running */}
         {queued.length > 0 && (
-          <div className="border-border bg-elevated/95 space-y-1 rounded-2xl border px-4 py-2 text-[12.5px]">
-            {queued.map((qItem, idx) => (
-              <div key={qItem.id} className="flex items-center justify-between gap-2">
-                <div className="text-muted-foreground flex min-w-0 items-center gap-1.5">
-                  <Clock className="size-3.5 shrink-0" />
-                  <span className="shrink-0 text-[12px] font-medium">Queued</span>
-                  {qItem.badges.map((b, bIdx) => (
-                    <span
-                      key={`${b.kind}-${bIdx}`}
-                      className="bg-muted text-foreground/80 shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px]"
-                    >
-                      {b.label}
-                    </span>
-                  ))}
-                  {qItem.displayText && (
-                    <span className="text-foreground/85 truncate">{qItem.displayText}</span>
+          <div className="approval-dock-surface orbit-stage-enter space-y-0.5 rounded-[14px] px-2 py-1.5 text-[12.5px]">
+            {queued.map((qItem, idx) => {
+              const canDrag = queued.length > 1;
+              const isDragged = queueDrag !== null && queueDrag.fromIndex === idx;
+              let translateY = 0;
+              if (queueDrag) {
+                if (isDragged) {
+                  translateY = queueDrag.deltaY;
+                } else if (
+                  queueDrag.fromIndex < queueDrag.overIndex &&
+                  idx > queueDrag.fromIndex &&
+                  idx <= queueDrag.overIndex
+                ) {
+                  translateY = -queueDrag.rowStep;
+                } else if (
+                  queueDrag.fromIndex > queueDrag.overIndex &&
+                  idx >= queueDrag.overIndex &&
+                  idx < queueDrag.fromIndex
+                ) {
+                  translateY = queueDrag.rowStep;
+                }
+              }
+
+              return (
+                <div
+                  key={qItem.id}
+                  ref={(el) => {
+                    queueRowRefs.current[idx] = el;
+                  }}
+                  onPointerDown={canDrag ? (e) => handleQueueRowPointerDown(e, idx) : undefined}
+                  style={
+                    queueDrag
+                      ? { transform: `translate3d(0, ${translateY}px, 0)` }
+                      : undefined
+                  }
+                  className={cn(
+                    "group/qrow flex h-[28px] items-center justify-between gap-2 rounded-[8px] px-2 select-none",
+                    isDragged
+                      ? "bg-elevated/95 ring-border/75 relative z-10 cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.08)] ring-1 dark:shadow-[0_4px_14px_rgba(0,0,0,0.34)]"
+                      : cn(
+                          queueDrag
+                            ? "transition-transform duration-150 ease-out"
+                            : "transition-colors hover:bg-black/[0.025] dark:hover:bg-white/[0.035]",
+                          canDrag && !queueDrag && "cursor-grab",
+                        ),
                   )}
+                >
+                  <div className="flex min-w-0 flex-1 items-center gap-2">
+                    {canDrag ? (
+                      <>
+                        <CornerDownRight
+                          className={cn(
+                            "text-muted-foreground/60 size-3.5 shrink-0 stroke-[1.8]",
+                            isDragged ? "hidden" : "group-hover/qrow:hidden",
+                          )}
+                        />
+                        <GripVertical
+                          className={cn(
+                            "text-muted-foreground/75 size-3.5 shrink-0 stroke-[1.8]",
+                            isDragged ? "block" : "hidden group-hover/qrow:block",
+                          )}
+                        />
+                      </>
+                    ) : (
+                      <CornerDownRight className="text-muted-foreground/60 size-3.5 shrink-0 stroke-[1.8]" />
+                    )}
+                    {qItem.badges.map((b, bIdx) => (
+                      <span
+                        key={`${b.kind}-${bIdx}`}
+                        className="bg-muted text-foreground/80 shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px]"
+                      >
+                        {b.label}
+                      </span>
+                    ))}
+                    {qItem.displayText && (
+                      <span className="text-foreground/86 truncate">{qItem.displayText}</span>
+                    )}
+                  </div>
+                  <div
+                    className={cn(
+                      "flex shrink-0 items-center gap-0.5",
+                      queueDrag && "pointer-events-none opacity-45",
+                    )}
+                  >
+                    <SimpleTooltip label="Send now (interrupts current turn)">
+                      <button
+                        type="button"
+                        onClick={() => void orbitActions.flushQueuedPromptImmediately(idx, qItem.id)}
+                        className="text-foreground/82 hover:text-foreground inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                      >
+                        Send
+                      </button>
+                    </SimpleTooltip>
+                    <button
+                      type="button"
+                      aria-label="Edit queued message"
+                      onClick={() => orbitActions.popQueuedToDraft(idx, qItem.id)}
+                      className="text-muted-foreground hover:text-foreground inline-flex h-[22px] cursor-pointer items-center rounded-[6px] px-2 text-[11.5px] font-medium transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                    >
+                      Edit
+                    </button>
+                    <SimpleTooltip label="Remove">
+                      <button
+                        type="button"
+                        aria-label="Remove queued message"
+                        onClick={() => orbitActions.removeQueuedPrompt(idx, qItem.id)}
+                        className="text-muted-foreground hover:text-foreground inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+                      >
+                        <X className="size-3.5 stroke-[1.8]" />
+                      </button>
+                    </SimpleTooltip>
+                  </div>
                 </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => void orbitActions.flushQueuedPromptImmediately(idx)}
-                    className="text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium"
-                  >
-                    <Zap className="size-3" /> Steer
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => orbitActions.popQueuedToDraft(idx)}
-                    className="text-muted-foreground hover:text-foreground cursor-pointer rounded-md px-2 py-0.5 text-[11.5px]"
-                  >
-                    Edit
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => orbitActions.removeQueuedPrompt(idx)}
-                    className="text-muted-foreground hover:text-foreground cursor-pointer rounded-md p-1"
-                  >
-                    <X className="size-3.5" />
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
@@ -1005,7 +1200,7 @@ export const OmniComposer = memo(function OmniComposer({
                   <button
                     type="button"
                     disabled={!hasPayload}
-                    title={isTurnBusy ? `Queue follow-up (${modSymbol()}↵ to steer)` : "Send"}
+                    title={isTurnBusy ? `Queue follow-up (${modSymbol()}↵ to send now)` : "Send"}
                     onClick={() => void orbitActions.submitComposer(false)}
                     className={cn(
                       "orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full",

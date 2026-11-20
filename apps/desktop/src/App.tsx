@@ -209,6 +209,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
     hasSelectedHost,
     leftLayoutReservePx,
     rightLayoutReservePx,
+    shellReserveTransition,
     leftVisible,
     leftTransform,
     leftTransition,
@@ -343,12 +344,13 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
           )}
         </div>
 
-        {/* 2. Center Narrative Stage (statically reserved at rest, GPU-slid during panel motion) */}
+        {/* 2. Center Narrative Stage (pure GPU-slid when width is constant; fluid padding sync when width changes) */}
         <div
           className="flex min-h-0 min-w-0 flex-1 flex-col overflow-clip"
           style={{
             paddingLeft: `${leftLayoutReservePx}px`,
             paddingRight: `${rightLayoutReservePx}px`,
+            transition: shellReserveTransition,
           }}
         >
           <TopBar />

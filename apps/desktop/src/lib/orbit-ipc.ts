@@ -56,6 +56,32 @@ export interface AppUpdateProgress {
   done: boolean;
 }
 
+export interface LocalDaemonSyncResult {
+  status: "updated" | "restarted" | "skipped_dev" | string;
+  daemon_version: string | null;
+  source: "bundled" | "github" | "existing" | "dev" | string;
+}
+
+export function normalizeSemver(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim().replace(/^v/i, "");
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function compareSemver(a: string | null | undefined, b: string | null | undefined): number {
+  const parse = (raw: string | null | undefined): [number, number, number] => {
+    const clean = (normalizeSemver(raw) ?? "0.0.0").split(/[+-]/)[0] ?? "0.0.0";
+    const parts = clean.split(".").map((n) => Number.parseInt(n, 10) || 0);
+    return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] !== pb[i]) return pa[i] > pb[i] ? 1 : -1;
+  }
+  return 0;
+}
+
 export interface ClientProjectView {
   project_id: string;
   host_id: string;
@@ -95,6 +121,8 @@ export interface HostCardView {
   via_ssh_tunnel: boolean;
   last_ping_ms: number | null;
   daemon_version: string | null;
+  daemon_protocol_version?: number | null;
+  client_protocol_version?: number;
   os_arch: string | null;
   daemon_pubkey_b64: string;
   direct_endpoints: string[];
@@ -105,6 +133,7 @@ export interface HostCardView {
   workspace_count: number;
   agent_count: number;
   pending_approval_count: number;
+  supports_server_queue?: boolean;
 }
 
 export interface FleetOverviewView {
@@ -293,6 +322,13 @@ export interface WorkspaceSummary {
   updated_at: string;
 }
 
+export interface QueuedPromptView {
+  queue_id: string;
+  display_text: string;
+  badges?: PromptBadge[];
+  created_at: string;
+}
+
 export interface AgentCardView {
   agent_id: string;
   workspace_id: string;
@@ -305,6 +341,7 @@ export interface AgentCardView {
   mode: SessionMode;
   status_label: string;
   is_running: boolean;
+  has_background_tasks?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
   parent_host_id?: string | null;
@@ -319,6 +356,37 @@ export interface AgentCardView {
   is_pinned: boolean;
   seen_seq: number;
   is_unread: boolean;
+  queued_prompts?: QueuedPromptView[];
+}
+
+/**
+ * Returns true when an agent's foreground turn has finished and it is only keeping track of
+ * asynchronous background tasks (e.g. a dev server or long-running build).
+ * Includes a legacy fallback for older remote daemons that don't yet emit `has_background_tasks`.
+ */
+export function isAgentBackgroundWaiting(
+  agent: Pick<AgentCardView, "has_background_tasks" | "status_label"> | null | undefined,
+): boolean {
+  if (!agent) return false;
+  if (typeof agent.has_background_tasks === "boolean") {
+    return agent.has_background_tasks;
+  }
+  const lbl = agent.status_label.trim();
+  return /^running\s*\(.*background task/i.test(lbl) || /^background task$/i.test(lbl);
+}
+
+/**
+ * Returns true ONLY when a foreground turn or active autonomous wakeup is actively executing.
+ * Background-only waiting states never block sending new user prompts or draining prompt queues.
+ */
+export function isAgentForegroundRunning(
+  agent:
+    | Pick<AgentCardView, "is_running" | "has_background_tasks" | "status_label">
+    | null
+    | undefined,
+): boolean {
+  if (!agent) return false;
+  return Boolean(agent.is_running) && !isAgentBackgroundWaiting(agent);
 }
 
 export interface QuotaWindow {
@@ -1535,6 +1603,54 @@ export const orbitIpc = {
     });
   },
 
+  enqueuePrompt: async (
+    hostId: string,
+    agentId: string,
+    prompt: string,
+    meta?: {
+      displayPrompt?: string;
+      badges?: PromptBadge[];
+      queueId?: string;
+    },
+  ): Promise<string> => {
+    if (!isTauriRuntime()) return meta?.queueId ?? `q_${Date.now()}`;
+    return invoke<string>("enqueue_prompt", {
+      hostId,
+      agentId,
+      prompt,
+      displayPrompt: meta?.displayPrompt ?? null,
+      badges: meta?.badges ?? [],
+      queueId: meta?.queueId ?? null,
+    });
+  },
+
+  removeQueuedPrompt: async (
+    hostId: string,
+    agentId: string,
+    queueId: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("remove_queued_prompt", { hostId, agentId, queueId });
+  },
+
+  flushQueuedPromptNow: async (
+    hostId: string,
+    agentId: string,
+    queueId: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("flush_queued_prompt_now", { hostId, agentId, queueId });
+  },
+
+  reorderQueuedPrompts: async (
+    hostId: string,
+    agentId: string,
+    queueIds: string[],
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("reorder_queued_prompts", { hostId, agentId, queueIds });
+  },
+
   interruptAgent: async (hostId: string, agentId: string): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("interrupt_agent", { hostId, agentId });
@@ -2163,6 +2279,30 @@ export const orbitIpc = {
     return invoke<void>("perform_app_self_update", {
       release,
       onProgress: ch,
+    });
+  },
+
+  syncLocalDaemon: async (
+    hostId?: string | null,
+    force = false,
+  ): Promise<LocalDaemonSyncResult> => {
+    if (!isTauriRuntime()) {
+      return { status: "skipped_dev", daemon_version: null, source: "dev" };
+    }
+    return invoke<LocalDaemonSyncResult>("sync_local_daemon", {
+      hostId: hostId ?? null,
+      force,
+    });
+  },
+
+  upgradeHostDaemonOverWire: async (
+    hostId: string,
+    targetVersion?: string | null,
+  ): Promise<string> => {
+    if (!isTauriRuntime()) return "ok";
+    return invoke<string>("upgrade_host_daemon_over_wire", {
+      hostId,
+      targetVersion: targetVersion ?? null,
     });
   },
 };

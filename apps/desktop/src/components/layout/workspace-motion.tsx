@@ -19,6 +19,67 @@ export type ShellMotionPhase = "idle" | "prep" | "playing";
 const PANEL_EASE = "cubic-bezier(0.32, 0.72, 0, 1)";
 const OVERVIEW_OPACITY_IN = "opacity 210ms cubic-bezier(0.25, 1, 0.5, 1)";
 const OVERVIEW_OPACITY_OUT = "opacity 175ms cubic-bezier(0.4, 0, 0.2, 1)";
+const STAGE_MAX_WIDTH_PX = 768;
+const STAGE_MIN_LOCK_WIDTH_PX = 240;
+const STAGE_H_PADDING_PX = 48;
+
+function availStageContent(V: number, t: ShellGeometryTuple): number {
+  return Math.max(0, V - t.L - t.W - t.D - STAGE_H_PADDING_PX);
+}
+
+function stageCenterX(V: number, t: ShellGeometryTuple): number {
+  return (V + t.L - t.W - t.D) / 2;
+}
+
+/**
+ * Computes stage motion strategy & geometry:
+ * - When content width stays unchanged (`wFrom === wTo`, e.g. wide viewports where prose remains 768px):
+ *   stays 100% on the pure GPU `translate3d` path (zero per-frame layout work).
+ * - When content width actually changes (`wFrom !== wTo`, e.g. opening/closing a side panel narrows
+ *   the conversation column below 768px): switches to fluid CSS `padding` transitions in lockstep
+ *   with the sliding sidebar's GPU `translate3d`, so conversation width smoothly expands/compresses
+ *   with zero initial snap and zero settle snap.
+ */
+function computeStageMotionGeometry(
+  V: number,
+  m: ShellMotionSnapshot,
+): {
+  isFluidWidthMotion: boolean;
+  stageMaxContentWidthPx: number | null;
+  prepShiftPx: number;
+  playingShiftPx: number;
+} {
+  const availFrom = availStageContent(V, m.from);
+  const availTo = availStageContent(V, m.to);
+  const availBase = availStageContent(V, m.base);
+
+  const wFrom = Math.min(STAGE_MAX_WIDTH_PX, Math.max(STAGE_MIN_LOCK_WIDTH_PX, availFrom));
+  const wTo = Math.min(STAGE_MAX_WIDTH_PX, Math.max(STAGE_MIN_LOCK_WIDTH_PX, availTo));
+
+  if (Math.abs(wTo - wFrom) > 0.5) {
+    return {
+      isFluidWidthMotion: true,
+      stageMaxContentWidthPx: null,
+      prepShiftPx: 0,
+      playingShiftPx: 0,
+    };
+  }
+
+  const stageMaxContentWidthPx =
+    availTo < STAGE_MAX_WIDTH_PX && availTo < availBase
+      ? Math.max(STAGE_MIN_LOCK_WIDTH_PX, availTo)
+      : null;
+
+  const prepShiftPx = stageCenterX(V, m.from) - stageCenterX(V, m.base);
+  const playingShiftPx = stageCenterX(V, m.to) - stageCenterX(V, m.base);
+
+  return {
+    isFluidWidthMotion: false,
+    stageMaxContentWidthPx,
+    prepShiftPx,
+    playingShiftPx,
+  };
+}
 
 export interface ShellGeometryTuple {
   L: number;
@@ -42,6 +103,9 @@ export interface WorkspaceMotionContextValue {
   panelWidthPx: number;
   leftLayoutReservePx: number;
   rightLayoutReservePx: number;
+  shellReserveTransition: string;
+  overviewReservePx: number;
+  overviewReserveTransition: string;
   dockedOverviewLayout: boolean;
   leftVisible: boolean;
   leftTransform: string;
@@ -52,6 +116,7 @@ export interface WorkspaceMotionContextValue {
   rightTransition: string;
   topbarUseOpenLeftPad: boolean;
   topbarReserveRightToggle: boolean;
+  topbarPaddingTransition: string;
   topbarTitleOffsetPx: number;
   topbarTitleTransition: string;
   topbarRightOffsetPx: number;
@@ -90,6 +155,8 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
   const [viewportWidth, setViewportWidth] = useState<number>(() =>
     typeof window !== "undefined" ? window.innerWidth : 1280,
   );
+  const viewportWidthRef = useRef(viewportWidth);
+  viewportWidthRef.current = viewportWidth;
   const [isResizingLeft, setIsResizingLeftState] = useState(false);
   const [isResizingRight, setIsResizingRightState] = useState(false);
 
@@ -132,7 +199,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
 
   const D = hasActiveSession && canDockOverview && overviewDesktopOpenPref ? 324 : 0;
   const effectiveContentW = centerW - D;
-  const isStageWide = isWideRef.current ? effectiveContentW >= 868 : effectiveContentW >= 900;
+  const isStageWide = isWideRef.current ? effectiveContentW >= 776 : effectiveContentW >= 800;
   isWideRef.current = isStageWide;
 
   useLayoutEffect(() => {
@@ -314,17 +381,28 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
 
   const handleAxisTransitionEnd = useCallback(
     (axis: "left" | "right" | "stage", e: TransitionEvent<HTMLElement>) => {
-      if (e.target !== e.currentTarget || e.propertyName !== "transform") return;
+      if (e.target !== e.currentTarget) return;
       if (phaseRef.current !== "playing") return;
       const m = motionRef.current;
-      const stageMoved =
-        m.from.L !== m.to.L || m.from.W !== m.to.W || m.from.D !== m.to.D;
-      // Always wait for the stage transform when stage moved so layout commit never snaps ahead of GPU slide.
+      const { isFluidWidthMotion, prepShiftPx, playingShiftPx } = computeStageMotionGeometry(
+        viewportWidthRef.current,
+        m,
+      );
+      if (axis === "stage" && isFluidWidthMotion) {
+        if (e.propertyName !== "padding-right") return;
+      } else if (e.propertyName !== "transform") {
+        return;
+      }
+      const stageMoved = !isFluidWidthMotion && Math.abs(playingShiftPx - prepShiftPx) > 0.5;
+      // In pure-GPU mode wait for stage transform; in fluid-width mode wait for the sliding panel
+      // (or viewport padding-right when only the Overview card toggled).
       const expectedAxis: "left" | "right" | "stage" = stageMoved
         ? "stage"
         : m.from.W !== m.to.W
           ? "right"
-          : "left";
+          : m.from.L !== m.to.L
+            ? "left"
+            : "stage";
       if (axis !== expectedAxis) return;
 
       if (fallbackTimerRef.current !== null) {
@@ -357,12 +435,44 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
 
     const xTitle = (l: number) => l + (l > 0 ? 16 : isMac ? 114 : 48);
     const xTopRight = (w: number) => V - w - (w > 0 ? 12 : hasSelectedHost ? 42 : 12);
-    const xCenter = (l: number, w: number, d: number) => (V + l - w - d) / 2;
-    const availContent = (l: number, w: number, d: number) => Math.max(0, V - l - w - d - 48);
 
-    const leftLayoutReservePx = phase === "idle" ? target.L : m.base.L;
-    const rightLayoutReservePx = phase === "idle" ? target.W : m.base.W;
-    const dockedOverviewLayout = phase === "idle" ? target.D > 0 : m.base.D > 0;
+    const stageGeom = phase === "idle" ? null : computeStageMotionGeometry(V, m);
+    const isFluidWidthMotion = Boolean(stageGeom?.isFluidWidthMotion);
+
+    const leftLayoutReservePx =
+      phase === "idle"
+        ? target.L
+        : isFluidWidthMotion
+          ? phase === "prep"
+            ? m.from.L
+            : m.to.L
+          : m.base.L;
+    const rightLayoutReservePx =
+      phase === "idle"
+        ? target.W
+        : isFluidWidthMotion
+          ? phase === "prep"
+            ? m.from.W
+            : m.to.W
+          : m.base.W;
+    const overviewReservePx =
+      phase === "idle"
+        ? target.D
+        : isFluidWidthMotion
+          ? phase === "prep"
+            ? m.from.D
+            : m.to.D
+          : m.base.D;
+    const dockedOverviewLayout = overviewReservePx > 0;
+
+    const shellReserveTransition =
+      !isResizing && phase === "playing" && isFluidWidthMotion
+        ? `padding-left ${m.durationMs}ms ${PANEL_EASE}, padding-right ${m.durationMs}ms ${PANEL_EASE}`
+        : "none";
+    const overviewReserveTransition =
+      !isResizing && phase === "playing" && isFluidWidthMotion && m.from.D !== m.to.D
+        ? `padding-right ${m.durationMs}ms ${PANEL_EASE}`
+        : "none";
 
     const leftVisible = phase === "idle" ? target.L > 0 : m.from.L > 0 || m.to.L > 0;
     const leftShown =
@@ -385,51 +495,53 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
 
     const topbarUseOpenLeftPad = leftLayoutReservePx > 0;
     const topbarReserveRightToggle = hasSelectedHost && rightLayoutReservePx === 0;
+    const topbarPaddingTransition =
+      !isResizing && phase === "playing" && isFluidWidthMotion
+        ? `padding-left ${m.durationMs}ms ${PANEL_EASE}, padding-right ${m.durationMs}ms ${PANEL_EASE}`
+        : "none";
 
     const topbarTitleOffsetPx =
-      phase === "idle"
+      phase === "idle" || isFluidWidthMotion
         ? 0
         : (phase === "prep" ? xTitle(m.from.L) : xTitle(m.to.L)) - xTitle(m.base.L);
     const topbarTitleTransition =
-      !isResizing && phase === "playing" && m.from.L !== m.to.L
+      !isResizing && !isFluidWidthMotion && phase === "playing" && m.from.L !== m.to.L
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
     const outlineOffsetPx =
-      phase === "idle"
+      phase === "idle" || isFluidWidthMotion
         ? 0
         : (phase === "prep" ? m.from.L : m.to.L) - m.base.L;
     const outlineTransition =
-      !isResizing && phase === "playing" && m.from.L !== m.to.L
+      !isResizing && !isFluidWidthMotion && phase === "playing" && m.from.L !== m.to.L
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
     const topbarRightOffsetPx =
-      phase === "idle"
+      phase === "idle" || isFluidWidthMotion
         ? 0
         : (phase === "prep" ? xTopRight(m.from.W) : xTopRight(m.to.W)) - xTopRight(m.base.W);
     const topbarRightTransition =
-      !isResizing && phase === "playing" && m.from.W !== m.to.W
+      !isResizing && !isFluidWidthMotion && phase === "playing" && m.from.W !== m.to.W
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
     const stageShiftPx =
-      phase === "idle"
+      stageGeom === null || isFluidWidthMotion
         ? 0
-        : (phase === "prep"
-            ? xCenter(m.from.L, m.from.W, m.from.D)
-            : xCenter(m.to.L, m.to.W, m.to.D)) - xCenter(m.base.L, m.base.W, m.base.D);
+        : phase === "prep"
+          ? stageGeom.prepShiftPx
+          : stageGeom.playingShiftPx;
+    const stageMoved =
+      stageGeom !== null &&
+      !isFluidWidthMotion &&
+      Math.abs(stageGeom.playingShiftPx - stageGeom.prepShiftPx) > 0.5;
     const stageTransition =
-      !isResizing && phase === "playing" ? `transform ${m.durationMs}ms ${PANEL_EASE}` : "none";
-
-    let stageMaxContentWidthPx: number | null = null;
-    if (phase !== "idle") {
-      const availTo = availContent(m.to.L, m.to.W, m.to.D);
-      const availFrom = availContent(m.from.L, m.from.W, m.from.D);
-      if (availTo < 768 && availTo < availFrom) {
-        stageMaxContentWidthPx = Math.max(240, availTo);
-      }
-    }
+      !isResizing && phase === "playing" && stageMoved
+        ? `transform ${m.durationMs}ms ${PANEL_EASE}`
+        : "none";
+    const stageMaxContentWidthPx = stageGeom?.stageMaxContentWidthPx ?? null;
 
     const dockedOverviewMounted =
       phase === "idle" ? target.D > 0 : m.from.D > 0 || m.to.D > 0;
@@ -469,6 +581,9 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       panelWidthPx,
       leftLayoutReservePx,
       rightLayoutReservePx,
+      shellReserveTransition,
+      overviewReservePx,
+      overviewReserveTransition,
       dockedOverviewLayout,
       leftVisible,
       leftTransform,
@@ -479,6 +594,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       rightTransition,
       topbarUseOpenLeftPad,
       topbarReserveRightToggle,
+      topbarPaddingTransition,
       topbarTitleOffsetPx,
       topbarTitleTransition,
       topbarRightOffsetPx,

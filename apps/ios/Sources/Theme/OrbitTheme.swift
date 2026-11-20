@@ -7,7 +7,6 @@ public enum OrbitAppearanceMode: String, CaseIterable, Identifiable, Sendable {
     case system
     case light
     case dark
-    case oled
 
     public var id: String { rawValue }
 
@@ -15,17 +14,26 @@ public enum OrbitAppearanceMode: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .system: return "System"
         case .light: return "Light"
-        case .dark: return "Graphite"
-        case .oled: return "OLED"
+        case .dark: return "Dark"
         }
     }
 
-    public var subtitle: String {
+    public var systemImage: String {
         switch self {
-        case .system: return "Match system"
-        case .light: return "Daylight paper"
-        case .dark: return "Quiet graphite"
-        case .oled: return "True pitch black"
+        case .system: return "circle.lefthalf.filled"
+        case .light: return "sun.max"
+        case .dark: return "moon"
+        }
+    }
+
+    public static func fromStorage(_ raw: String) -> OrbitAppearanceMode {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "light":
+            return .light
+        case "dark", "graphite", "oled", "black":
+            return .dark
+        default:
+            return .system
         }
     }
 
@@ -33,7 +41,7 @@ public enum OrbitAppearanceMode: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .system: return nil
         case .light: return .light
-        case .dark, .oled: return .dark
+        case .dark: return .dark
         }
     }
 
@@ -41,7 +49,7 @@ public enum OrbitAppearanceMode: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .system: return .unspecified
         case .light: return .light
-        case .dark, .oled: return .dark
+        case .dark: return .dark
         }
     }
 
@@ -51,8 +59,6 @@ public enum OrbitAppearanceMode: String, CaseIterable, Identifiable, Sendable {
             return .light
         case .dark:
             return .graphiteDark
-        case .oled:
-            return .oledPure
         case .system:
             return systemScheme == .dark ? .graphiteDark : .light
         }
@@ -256,7 +262,7 @@ public enum OrbitSpacing {
 
     public static let hitTarget: CGFloat = 44
     public static let sidebarWidth: CGFloat = 260
-    public static let drawerWidth: CGFloat = 296
+    public static let drawerWidth: CGFloat = 316
     public static let inspectorWidth: CGFloat = 360
 }
 
@@ -336,6 +342,16 @@ public extension View {
             self
         }
     }
+
+    /// Subtle symbol replacement transition on iOS 17+ for copy/checkmark toggles.
+    @ViewBuilder
+    func orbitSymbolReplaceTransition() -> some View {
+        if #available(iOS 17.0, *) {
+            self.contentTransition(.symbolEffect(.replace))
+        } else {
+            self
+        }
+    }
 }
 
 public struct OrbitGlassContainer<Content: View>: View {
@@ -402,6 +418,32 @@ public struct PulsingDotView: View {
             )
             .onAppear {
                 isPulsing = true
+            }
+    }
+}
+
+public struct OrbitSpinnerRingView: View {
+    public let color: Color
+    public var size: CGFloat = 12.5
+    @State private var isSpinning = false
+
+    public init(color: Color, size: CGFloat = 12.5) {
+        self.color = color
+        self.size = size
+    }
+
+    public var body: some View {
+        Circle()
+            .trim(from: 0, to: 0.72)
+            .stroke(color, style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+            .frame(width: size, height: size)
+            .rotationEffect(.degrees(isSpinning ? 360 : 0))
+            .animation(
+                .linear(duration: 0.9).repeatForever(autoreverses: false),
+                value: isSpinning
+            )
+            .onAppear {
+                isSpinning = true
             }
     }
 }
@@ -622,6 +664,68 @@ public enum OrbitFormatters {
         }
     }
 
+    private static let shortDateSameYearFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.setLocalizedDateFormatFromTemplate("MMMd")
+        return f
+    }()
+
+    private static let shortDateWithYearFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.setLocalizedDateFormatFromTemplate("MMMdyyyy")
+        return f
+    }()
+
+    public static func relativeTimeLabel(
+        timestampMs: Int64,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> String {
+        let diffSec = max(0, Int((nowMs - timestampMs) / 1000))
+        if diffSec < 60 {
+            return "just now"
+        }
+        let mins = diffSec / 60
+        if mins < 60 {
+            return "\(mins)m ago"
+        }
+        let hours = mins / 60
+        if hours < 24 {
+            return "\(hours)h ago"
+        }
+        let days = hours / 24
+        if days < 30 {
+            return "\(days)d ago"
+        }
+        let date = Date(timeIntervalSince1970: Double(timestampMs) / 1000.0)
+        let nowDate = Date(timeIntervalSince1970: Double(nowMs) / 1000.0)
+        let cal = Calendar.current
+        let sameYear = cal.component(.year, from: date) == cal.component(.year, from: nowDate)
+        return (sameYear ? shortDateSameYearFormatter : shortDateWithYearFormatter).string(from: date)
+    }
+
+    public static func stripWorkspacePrefix(_ rawPath: String, cwd: String) -> String {
+        var normPath = compactPath(rawPath)
+        var normCwd = compactPath(cwd)
+        while normPath.count > 1 && normPath.hasSuffix("/") {
+            normPath.removeLast()
+        }
+        while normCwd.count > 1 && normCwd.hasSuffix("/") {
+            normCwd.removeLast()
+        }
+        if !normCwd.isEmpty && normCwd != "~" {
+            let prefix = normCwd == "/" ? "/" : normCwd + "/"
+            if normPath.hasPrefix(prefix) {
+                let rel = String(normPath.dropFirst(prefix.count))
+                if !rel.isEmpty {
+                    return rel
+                }
+            }
+        }
+        return shortPath(rawPath)
+    }
+
     public static func decisionLabel(_ raw: String) -> String {
         let lower = raw.lowercased()
         if lower == "allow" || lower == "accept" {
@@ -634,6 +738,257 @@ public enum OrbitFormatters {
         return raw
             .replacingOccurrences(of: "_", with: " ")
             .capitalized
+    }
+
+    private static let lockfileNames: Set<String> = [
+        "cargo.lock", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+        "bun.lock", "bun.lockb", "flake.lock", "poetry.lock", "uv.lock"
+    ]
+
+    private static let codeExtensions: Set<String> = [
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "swift",
+        "kt", "kts", "java", "c", "h", "cc", "cpp", "hpp", "cs", "rb",
+        "php", "lua", "zig", "nix", "proto", "graphql", "gql", "css",
+        "scss", "less", "html", "vue", "svelte", "astro"
+    ]
+
+    /// Semantic monochrome SF Symbol aligned 1:1 with Desktop Lucide file icons.
+    public static func semanticFileIcon(for basename: String) -> String {
+        let lower = basename.lowercased()
+        if lockfileNames.contains(lower) || lower.hasSuffix(".lock") {
+            return "lock.doc"
+        }
+        if lower == "dockerfile" || lower.hasPrefix("dockerfile.")
+            || lower.hasPrefix(".env") || lower.contains(".config.") {
+            return "doc.badge.gearshape"
+        }
+        if lower == "makefile" || lower == "justfile" {
+            return "terminal"
+        }
+        if lower == "license" || lower.hasPrefix("readme") || lower.hasPrefix("changelog") {
+            return "doc.text"
+        }
+        let ext = (lower as NSString).pathExtension
+        switch ext {
+        case "json", "jsonc", "jsonl":
+            return "curlybraces"
+        case "toml", "yaml", "yml", "ini", "conf", "plist":
+            return "doc.badge.gearshape"
+        case "sh", "zsh", "bash", "fish", "ps1":
+            return "terminal"
+        case "md", "mdx", "txt", "rst", "adoc":
+            return "doc.text"
+        case "png", "jpg", "jpeg", "webp", "gif", "svg", "ico", "icns", "bmp", "heic":
+            return "photo"
+        case "sql", "sqlite", "db", "prisma":
+            return "cylinder.split.1x2"
+        default:
+            return codeExtensions.contains(ext) ? "chevron.left.forwardslash.chevron.right" : "doc"
+        }
+    }
+}
+
+// MARK: - Compact Liquid Glass Popover Primitives
+
+public struct OrbitPopoverSectionHeader: View {
+    public let title: String
+    public let trailing: String?
+
+    @Environment(\.orbitPalette) private var palette
+
+    public init(title: String, trailing: String? = nil) {
+        self.title = title
+        self.trailing = trailing
+    }
+
+    public var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(palette.fgMuted)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            if let trailing, !trailing.isEmpty {
+                Text(trailing)
+                    .font(.system(size: 11.5, weight: .regular))
+                    .foregroundStyle(palette.fgMuted)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .frame(height: 22)
+        .padding(.horizontal, 10)
+    }
+}
+
+public struct OrbitPopoverLeadingIcon: View {
+    public let systemName: String?
+    public let color: Color?
+
+    @Environment(\.orbitPalette) private var palette
+
+    public init(systemName: String?, color: Color? = nil) {
+        self.systemName = systemName
+        self.color = color
+    }
+
+    @ViewBuilder
+    public var body: some View {
+        if let systemName {
+            Image(systemName: systemName)
+                .font(.system(size: 13.5, weight: .medium))
+                .foregroundStyle(color ?? palette.fgSecondary)
+                .frame(width: 16, alignment: .center)
+        }
+    }
+}
+
+public struct OrbitPopoverOptionRow<Leading: View, TrailingBadge: View>: View {
+    public let title: String
+    public let subtitle: String?
+    public let isSelected: Bool
+    public let action: () -> Void
+    private let leading: Leading
+    private let trailingBadge: TrailingBadge
+
+    @Environment(\.orbitPalette) private var palette
+
+    public init(
+        title: String,
+        subtitle: String? = nil,
+        isSelected: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder leading: () -> Leading,
+        @ViewBuilder trailingBadge: () -> TrailingBadge
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.isSelected = isSelected
+        self.action = action
+        self.leading = leading()
+        self.trailingBadge = trailingBadge()
+    }
+
+    public var body: some View {
+        Button(action: action) {
+            HStack(alignment: subtitle == nil ? .center : .top, spacing: 8) {
+                leading
+                    .padding(.top, subtitle == nil ? 0 : 2)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13.5, weight: isSelected ? .medium : .regular))
+                        .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgPrimary.opacity(0.88))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    if let subtitle, !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.system(size: 11.5, weight: .regular))
+                            .foregroundStyle(palette.fgMuted)
+                            .lineLimit(2)
+                    }
+                }
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+
+                trailingBadge
+
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(palette.fgPrimary)
+                        .padding(.top, subtitle == nil ? 0 : 2)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, subtitle == nil ? 0 : 7)
+            .frame(minHeight: subtitle == nil ? 36 : 46)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(isSelected ? palette.activeRowFill.opacity(0.85) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+extension OrbitPopoverOptionRow where Leading == OrbitPopoverLeadingIcon, TrailingBadge == EmptyView {
+    public init(
+        title: String,
+        subtitle: String? = nil,
+        systemImage: String? = nil,
+        iconColor: Color? = nil,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) {
+        self.init(
+            title: title,
+            subtitle: subtitle,
+            isSelected: isSelected,
+            action: action,
+            leading: {
+                OrbitPopoverLeadingIcon(systemName: systemImage, color: iconColor)
+            },
+            trailingBadge: { EmptyView() }
+        )
+    }
+}
+
+public struct OrbitPopoverActionRow: View {
+    public let title: String
+    public let systemImage: String
+    public let action: () -> Void
+
+    @Environment(\.orbitPalette) private var palette
+
+    public init(title: String, systemImage: String, action: @escaping () -> Void) {
+        self.title = title
+        self.systemImage = systemImage
+        self.action = action
+    }
+
+    public var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(palette.fgSecondary)
+                    .frame(width: 16, alignment: .center)
+
+                Text(title)
+                    .font(.system(size: 13.5, weight: .regular))
+                    .foregroundStyle(palette.fgPrimary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 36)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+public extension View {
+    func orbitCompactPopover<PopoverContent: View>(
+        isPresented: Binding<Bool>,
+        arrowEdge: Edge = .top,
+        palette: OrbitPalette,
+        @ViewBuilder content: @escaping () -> PopoverContent
+    ) -> some View {
+        self.popover(
+            isPresented: isPresented,
+            attachmentAnchor: .rect(.bounds),
+            arrowEdge: arrowEdge
+        ) {
+            content()
+                .environment(\.orbitPalette, palette)
+                .presentationCompactAdaptation(.popover)
+        }
     }
 }
 

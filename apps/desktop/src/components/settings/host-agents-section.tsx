@@ -22,6 +22,7 @@ import {
   type SessionMode,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import { isLocalHostCard } from "@/lib/projects";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -42,16 +43,17 @@ const DEFAULT_ORCH_CONFIG: OrchestrationConfig = {
 };
 
 export function HostAgentsSection({ hostId }: { hostId: string }) {
-  const hostCard = useOrbitSelector(
-    (s) => s.fleet.hosts.find((h) => h.host_id === hostId) ?? null,
-  );
-  const otherFleetHostsCount = useOrbitSelector(
-    (s) => s.fleet.hosts.filter((h) => h.host_id !== hostId).length,
-  );
+  const fleet = useOrbitSelector((s) => s.fleet);
+  const hostCard = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
+  const otherFleetHostsCount = fleet.hosts.filter((h) => h.host_id !== hostId).length;
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
 
   const [refreshingModels, setRefreshingModels] = useState(false);
+
+  const showHostBadge =
+    Boolean(hostCard) &&
+    (fleet.hosts.length > 1 || (hostCard !== null && !isLocalHostCard(hostCard)));
 
   // New Profile form state
   const [addingProfile, setAddingProfile] = useState(false);
@@ -175,7 +177,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
         title="Agents & Orchestration"
         description="Installed CLIs, built-in Orbit MCP orchestration, reusable Profiles, bundled Skills, and Cross-Host Mesh."
         badge={
-          hostCard ? (
+          showHostBadge && hostCard ? (
             <span className="bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-[11.5px] font-medium">
               {hostCard.display_name}
             </span>

@@ -30,7 +30,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.KeyboardReturn
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.FormatQuote
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -65,6 +64,7 @@ import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import dev.orbit.android.store.OrbitFormatters
+import dev.orbit.android.ui.theme.OrbitCopyIcon
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 import dev.orbit.android.ui.theme.parseHexColor
@@ -280,7 +280,7 @@ fun PtyTerminalSheet(
                     horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
                 ) {
                     Icon(
-                        imageVector = Icons.Outlined.ContentCopy,
+                        imageVector = OrbitCopyIcon,
                         contentDescription = "Copy terminal output",
                         tint = colors.fgSecondary,
                         modifier = Modifier.size(OrbitSpacing.iconSm),
@@ -372,6 +372,7 @@ fun PtyTerminalSheet(
                                     defaultBg = termBg,
                                     cursorCol = if (isCursorRow) cursorCol else -1,
                                     cursorAccent = colors.primary,
+                                    cursorText = colors.onPrimary,
                                 ),
                                 style = typography.code,
                             )
@@ -419,7 +420,7 @@ fun PtyTerminalSheet(
                         Text(
                             text = key.label,
                             style = typography.codeMedium,
-                            color = if (latched) Color.White else colors.fgPrimary,
+                            color = if (latched) colors.onPrimary else colors.fgPrimary,
                         )
                     }
                 }
@@ -514,7 +515,7 @@ fun PtyTerminalSheet(
                     Icon(
                         imageVector = Icons.AutoMirrored.Outlined.KeyboardReturn,
                         contentDescription = "Send Enter",
-                        tint = Color.White,
+                        tint = colors.onPrimary,
                         modifier = Modifier.size(OrbitSpacing.iconMd),
                     )
                 }
@@ -529,6 +530,7 @@ private fun buildTerminalRowString(
     defaultBg: Color,
     cursorCol: Int,
     cursorAccent: Color,
+    cursorText: Color,
 ): AnnotatedString = buildAnnotatedString {
     var colOffset = 0
     row.spans.forEach { sp ->
@@ -553,7 +555,7 @@ private fun buildTerminalRowString(
             }
             pushStyle(
                 baseStyle.copy(
-                    color = Color.White,
+                    color = cursorText,
                     background = cursorAccent,
                 )
             )
@@ -572,7 +574,7 @@ private fun buildTerminalRowString(
         colOffset = endCol
     }
     if (cursorCol >= colOffset && cursorCol >= 0) {
-        pushStyle(SpanStyle(color = Color.White, background = cursorAccent))
+        pushStyle(SpanStyle(color = cursorText, background = cursorAccent))
         append(" ")
         pop()
     }

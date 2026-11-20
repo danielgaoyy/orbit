@@ -1,10 +1,67 @@
 import SwiftUI
+import UIKit
+
+private let liveStepAutoCollapseThreshold = 5
+private let liveStepVisibleTailCount = 3
+private let orbitDisclosureAnimation: Animation = .timingCurve(0.22, 1.0, 0.36, 1.0, duration: 0.24)
+
+private struct VerticalRevealLayout: Layout {
+    var progress: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        guard let content = subviews.first else { return .zero }
+        let clamped = min(1, max(0, progress))
+        let natural = content.sizeThatFits(ProposedViewSize(width: proposal.width, height: nil))
+        let width = proposal.width ?? natural.width
+        return CGSize(width: width, height: natural.height * clamped)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let content = subviews.first else { return }
+        let natural = content.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+        content.place(
+            at: CGPoint(x: bounds.minX, y: bounds.minY),
+            anchor: .topLeading,
+            proposal: ProposedViewSize(width: bounds.width, height: natural.height)
+        )
+    }
+}
+
+private struct VerticalRevealModifier: ViewModifier, Animatable {
+    var progress: CGFloat
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func body(content: Content) -> some View {
+        let clamped = min(1, max(0, progress))
+        let opacity = Double(min(1, max(0, clamped * 1.25)))
+        VerticalRevealLayout(progress: clamped) {
+            content
+        }
+        .clipped()
+        .opacity(opacity)
+    }
+}
+
+private extension AnyTransition {
+    static var orbitVerticalDisclosure: AnyTransition {
+        .modifier(
+            active: VerticalRevealModifier(progress: 0),
+            identity: VerticalRevealModifier(progress: 1)
+        )
+    }
+}
 
 struct StageTurnView: View {
     @ObservedObject var store: OrbitIosStore
     let turn: FfiStageTurn
+    var isTurnActive: Bool = false
 
     @Environment(\.orbitPalette) private var palette
+    @State private var isFoldedStepsExpanded = false
 
     private var isFirstStepBearingTurn: Bool {
         if let firstWithSteps = store.agentStage?.turns.first(where: { !$0.foldedSteps.isEmpty }) {
@@ -12,8 +69,6 @@ struct StageTurnView: View {
         }
         return turn.turnIndex == 0 || turn.key == store.agentStage?.turns.first?.key
     }
-    @State private var isFoldedStepsExpanded = false
-    @State private var copiedReply = false
 
     private var settledSummaryLabel: String {
         let label = turn.workSummaryLabel.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -26,65 +81,95 @@ struct StageTurnView: View {
         return "Completed \(turn.foldedSteps.count) \(turn.foldedSteps.count == 1 ? "step" : "steps")"
     }
 
+    private var canFoldPreReplyWork: Bool {
+        turn.terminalReply != nil && !turn.foldedSteps.isEmpty
+    }
+
+    private var terminalReplyText: String? {
+        guard case let .assistantMessage(_, _, text, _, blocks, _) = turn.terminalReply else {
+            return nil
+        }
+        let resolved = resolvedAssistantText(text: text, blocks: blocks)
+        return resolved.isEmpty ? nil : resolved
+    }
+
+    private var hasAssistantBody: Bool {
+        !turn.liveSegments.isEmpty || turn.terminalReply != nil || !turn.notices.isEmpty || isTurnActive
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.md) {
-            // 1. User Prompt Bubble (right-aligned elevated card)
-            if let promptItem = turn.userPrompt,
-               case let .userPrompt(_, _, text, badges, _, _) = promptItem {
-                UserPromptBubbleView(text: text, badges: badges)
-            }
-
-            // 2. Compaction Command Indicator
-            if turn.isCompactionCommand {
+        Group {
+            if turn.isCompactionCommand && turn.liveSegments.isEmpty && turn.terminalReply == nil {
                 compactionDivider(label: "Context compacted")
-            }
+            } else {
+                VStack(alignment: .leading, spacing: OrbitSpacing.md) {
+                    if let promptItem = turn.userPrompt,
+                       case let .userPrompt(_, _, text, badges, blocks, timestampMs) = promptItem {
+                        UserPromptBubbleView(
+                            text: text,
+                            badges: badges,
+                            blocks: blocks,
+                            timestampMs: timestampMs
+                        )
+                    }
 
-            // 3. Settled Turn vs Live Streaming Turn
-            if let replyItem = turn.terminalReply {
-                if !turn.foldedSteps.isEmpty {
-                    settledStepsSection
-                }
+                    if hasAssistantBody {
+                        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+                            if canFoldPreReplyWork {
+                                settledStepsSection
 
-                if case let .assistantMessage(_, _, text, _, blocks, _) = replyItem {
-                    let resolvedReply = resolvedAssistantText(text: text, blocks: blocks)
-                    VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-                        RichMarkdownView(blocks: blocks, fallbackText: text)
-                            .contextMenu {
-                                if !resolvedReply.isEmpty {
-                                    Button {
-                                        copyReply(resolvedReply)
-                                    } label: {
-                                        Label("Copy", systemImage: "doc.on.doc")
+                                ForEach(Array(turn.notices.enumerated()), id: \.offset) { _, noticeItem in
+                                    if case let .notice(_, level, message, _) = noticeItem {
+                                        TurnNoticeRow(level: level, message: message)
                                     }
+                                }
 
-                                    Button {
-                                        store.quoteAssistantReply(turnKey: turn.key, text: resolvedReply)
-                                    } label: {
-                                        Label("Quote", systemImage: "text.quote")
+                                if let replyItem = turn.terminalReply,
+                                   case let .assistantMessage(_, _, text, _, blocks, _) = replyItem {
+                                    assistantMarkdownBlock(text: text, blocks: blocks)
+                                }
+                            } else if !turn.liveSegments.isEmpty {
+                                liveSegmentsSection
+                            } else {
+                                ForEach(Array(turn.notices.enumerated()), id: \.offset) { _, noticeItem in
+                                    if case let .notice(_, level, message, _) = noticeItem {
+                                        TurnNoticeRow(level: level, message: message)
                                     }
+                                }
+
+                                if let replyItem = turn.terminalReply,
+                                   case let .assistantMessage(_, _, text, _, blocks, _) = replyItem {
+                                    assistantMarkdownBlock(text: text, blocks: blocks)
                                 }
                             }
 
-                        if !resolvedReply.isEmpty {
-                            settledReplyMicroActions(resolvedReply: resolvedReply)
+                            if !isTurnActive && !turn.turnDiffs.isEmpty {
+                                TurnChangesBarView(
+                                    diffs: turn.turnDiffs,
+                                    cwd: store.activeCwd,
+                                    onOpenDiff: { path in
+                                        store.hapticLight()
+                                        store.openGitDiff(focusFilePath: path)
+                                    }
+                                )
+                                .padding(.top, 2)
+                            }
+
+                            TurnFooterView(
+                                isTurnActive: isTurnActive,
+                                startedAtMs: turn.startedAtMs,
+                                completedAtMs: turn.completedAtMs,
+                                replyText: !isTurnActive ? terminalReplyText : nil,
+                                onCopy: { reply in
+                                    store.copyAssistantReply(reply)
+                                }
+                            )
                         }
                     }
                 }
-
-                ForEach(Array(turn.notices.enumerated()), id: \.offset) { _, noticeItem in
-                    if case let .notice(_, level, message, _) = noticeItem {
-                        TurnNoticeRow(level: level, message: message)
-                    }
-                }
-
-                if !turn.turnDiffs.isEmpty {
-                    turnDiffPillsStrip
-                }
-            } else {
-                liveStreamingSection
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear {
             if store.expandAllWorkGroupsByDefault {
                 isFoldedStepsExpanded = true
@@ -107,219 +192,114 @@ struct StageTurnView: View {
         }
     }
 
+    // MARK: - Assistant Markdown (Native Range Selection + Quote)
+
+    @ViewBuilder
+    private func assistantMarkdownBlock(text: String, blocks: [FfiRichBlock]) -> some View {
+        RichMarkdownView(
+            blocks: blocks,
+            fallbackText: text,
+            onQuoteSelection: { selected in
+                store.quoteAssistantReply(turnKey: turn.key, text: selected)
+            }
+        )
+    }
+
     // MARK: - Settled Folded Steps Header + Vertical Hairline Rail
 
     private var settledStepsSection: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-            Button {
+        VStack(alignment: .leading, spacing: 0) {
+            StepSummaryDisclosureButton(
+                label: settledSummaryLabel,
+                unrecoveredFailureCount: turn.workCounts.unrecoveredFailureCount,
+                labelIncludesFailure: turn.workSummaryIncludesFailure,
+                isExpanded: isFoldedStepsExpanded,
+                showInlineDiffStat: false,
+                additions: turn.workCounts.additions,
+                deletions: turn.workCounts.deletions,
+                isLiveRunning: false
+            ) {
                 store.hapticLight()
-                withAnimation(.spring(response: 0.26, dampingFraction: 0.86)) {
+                withAnimation(orbitDisclosureAnimation) {
                     isFoldedStepsExpanded.toggle()
                 }
-            } label: {
-                HStack(spacing: OrbitSpacing.sm) {
-                    Text(settledSummaryLabel)
-                        .font(OrbitTypography.subhead(.medium))
-                        .foregroundStyle(turn.workSummaryIncludesFailure ? palette.warning : palette.fgSecondary)
-                        .lineLimit(1)
-
-                    if let dur = OrbitFormatters.formatDurationMs(turn.turnDurationMs ?? turn.thoughtDurationMs) {
-                        Text(dur)
-                            .font(OrbitTypography.meta(.regular))
-                            .foregroundStyle(palette.fgMuted)
-                    }
-
-                    if turn.workCounts.additions > 0 || turn.workCounts.deletions > 0 {
-                        HStack(spacing: OrbitSpacing.xs) {
-                            if turn.workCounts.additions > 0 {
-                                Text("+\(turn.workCounts.additions)")
-                                    .font(OrbitTypography.meta(.medium))
-                                    .foregroundStyle(palette.added)
-                            }
-                            if turn.workCounts.deletions > 0 {
-                                Text("-\(turn.workCounts.deletions)")
-                                    .font(OrbitTypography.meta(.medium))
-                                    .foregroundStyle(palette.removed)
-                            }
-                        }
-                    }
-
-                    Image(systemName: "chevron.right")
-                        .font(OrbitTypography.iconMicro)
-                        .foregroundStyle(palette.fgMuted)
-                        .rotationEffect(.degrees(isFoldedStepsExpanded ? 90 : 0))
-
-                    Spacer(minLength: 0)
-                }
-                .frame(minHeight: OrbitSpacing.hitTarget)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .zIndex(1)
 
             if isFoldedStepsExpanded {
                 StepRailListView(
                     store: store,
                     items: turn.foldedSteps,
-                    expandFirstToolStep: store.expandFirstStepByDefault && isFirstStepBearingTurn
+                    expandFirstToolStep: store.expandFirstStepByDefault && isFirstStepBearingTurn,
+                    isLiveActive: false,
+                    autoExpandErrors: turn.workCounts.failedCount > 0 || turn.workCounts.deniedCount > 0
                 )
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .padding(.top, OrbitSpacing.xs)
+                .transition(.orbitVerticalDisclosure)
             }
         }
     }
 
-    // MARK: - Live Streaming Segments
+    // MARK: - Live / Multi-Segment Stream
 
-    @ViewBuilder
-    private var liveStreamingSection: some View {
-        if turn.liveSegments.isEmpty {
-            if turn.hasActiveItem {
-                HStack(spacing: OrbitSpacing.sm) {
-                    PulsingDotView(color: palette.primary, size: 6)
-                    Text(turn.workSummaryLiveLabel.isEmpty ? "Thinking…" : turn.workSummaryLiveLabel)
-                        .font(OrbitTypography.subhead(.medium))
-                        .foregroundStyle(palette.fgSecondary)
-                }
-                .padding(.vertical, OrbitSpacing.xs)
-            }
-        } else {
-            VStack(alignment: .leading, spacing: OrbitSpacing.md) {
-                ForEach(turn.liveSegments, id: \.segmentKey) { segment in
-                    switch segment {
-                    case let .stepGroup(_, _, items, summary, hasFollowingContent, hasRunningStep):
-                        LiveStepGroupView(
-                            store: store,
-                            items: items,
-                            summary: summary,
-                            fallbackLiveLabel: turn.workSummaryLiveLabel,
-                            hasFollowingContent: hasFollowingContent,
-                            hasRunningStep: hasRunningStep
-                        )
+    private var liveSegmentsSection: some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+            ForEach(Array(turn.liveSegments.enumerated()), id: \.element.segmentKey) { segIdx, segment in
+                switch segment {
+                case let .stepGroup(_, _, items, summary, hasFollowingContent, hasRunningStep):
+                    let isTrailingSeg = segIdx == turn.liveSegments.count - 1
+                    let isSegLiveActive = isTurnActive && isTrailingSeg && !hasFollowingContent
+                    let segSettled = !isSegLiveActive && !hasRunningStep
+                    let keepOpenForTrailingFailure = !hasFollowingContent && summary.counts.unrecoveredFailureCount > 0
+                    let shouldFold = segSettled && !keepOpenForTrailingFailure
 
-                    case let .assistantMessage(_, item):
-                        if case let .assistantMessage(_, _, text, _, blocks, _) = item {
-                            RichMarkdownView(blocks: blocks, fallbackText: text)
-                        }
+                    LiveStepGroupView(
+                        store: store,
+                        items: items,
+                        summary: summary,
+                        fallbackLiveLabel: turn.workSummaryLiveLabel,
+                        shouldFold: shouldFold,
+                        isLiveActive: isSegLiveActive,
+                        showInlineDiffStat: isTurnActive
+                    )
 
-                    case let .notice(_, item):
-                        if case let .notice(_, level, message, _) = item {
-                            TurnNoticeRow(level: level, message: message)
-                        }
-
-                    case let .compaction(_, label):
-                        compactionDivider(label: label.isEmpty ? "Context compacted" : label)
+                case let .assistantMessage(_, item):
+                    if case let .assistantMessage(_, _, text, _, blocks, _) = item {
+                        assistantMarkdownBlock(text: text, blocks: blocks)
                     }
-                }
-            }
-        }
-    }
 
-    // MARK: - Turn Diff Summary Pills
-
-    private var turnDiffPillsStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: OrbitSpacing.sm) {
-                ForEach(turn.turnDiffs, id: \.path) { diff in
-                    Button {
-                        store.hapticLight()
-                        store.openGitDiff(focusFilePath: diff.path)
-                    } label: {
-                        HStack(spacing: OrbitSpacing.xs) {
-                            Image(systemName: "doc.text")
-                                .font(OrbitTypography.iconMicro)
-                                .foregroundStyle(palette.fgMuted)
-
-                            Text(OrbitFormatters.shortPath(diff.path))
-                                .font(OrbitTypography.code(.medium))
-                                .foregroundStyle(palette.fgSecondary)
-
-                            if diff.additions > 0 {
-                                Text("+\(diff.additions)")
-                                    .font(OrbitTypography.meta(.medium))
-                                    .foregroundStyle(palette.added)
-                            }
-                            if diff.deletions > 0 {
-                                Text("-\(diff.deletions)")
-                                    .font(OrbitTypography.meta(.medium))
-                                    .foregroundStyle(palette.removed)
-                            }
-                        }
-                        .padding(.horizontal, OrbitSpacing.sm)
-                        .frame(minHeight: 36)
-                        .background(palette.subtleFill)
-                        .clipShape(Capsule())
-                        .overlay(Capsule().strokeBorder(palette.hairline, lineWidth: 0.5))
-                        .frame(minHeight: OrbitSpacing.hitTarget)
-                        .contentShape(Rectangle())
+                case let .notice(_, item):
+                    if case let .notice(_, level, message, _) = item {
+                        TurnNoticeRow(level: level, message: message)
                     }
-                    .buttonStyle(.plain)
+
+                case let .compaction(_, label):
+                    compactionDivider(label: label.isEmpty ? "Context compacted" : label)
                 }
             }
         }
     }
+
+    // MARK: - Compaction Divider
 
     private func compactionDivider(label: String) -> some View {
-        HStack(spacing: OrbitSpacing.sm) {
+        HStack(spacing: 10) {
             OrbitHairline()
-            Text(label)
-                .font(OrbitTypography.meta(.medium))
-                .foregroundStyle(palette.fgMuted)
+            HStack(spacing: 5) {
+                Image(systemName: "scissors")
+                    .font(.system(size: 11, weight: .medium))
+                    .opacity(0.75)
+                Text(label.isEmpty ? "Context compacted" : label)
+                    .font(OrbitTypography.meta(.regular))
+            }
+            .foregroundStyle(palette.fgMuted)
+            .fixedSize()
             OrbitHairline()
         }
-        .padding(.vertical, OrbitSpacing.xs)
+        .padding(.vertical, OrbitSpacing.sm)
     }
 
-    // MARK: - Settled Reply Micro-Actions (Copy / Quote)
-
-    private func settledReplyMicroActions(resolvedReply: String) -> some View {
-        HStack(spacing: OrbitSpacing.md) {
-            Button {
-                copyReply(resolvedReply)
-            } label: {
-                HStack(spacing: OrbitSpacing.xs) {
-                    Image(systemName: copiedReply ? "checkmark" : "doc.on.doc")
-                        .font(OrbitTypography.iconMicro)
-                    Text(copiedReply ? "Copied" : "Copy")
-                        .font(OrbitTypography.meta(.medium))
-                }
-                .foregroundStyle(copiedReply ? palette.direct : palette.fgMuted)
-                .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Copy Assistant Reply")
-
-            Button {
-                store.quoteAssistantReply(turnKey: turn.key, text: resolvedReply)
-            } label: {
-                HStack(spacing: OrbitSpacing.xs) {
-                    Image(systemName: "text.quote")
-                        .font(OrbitTypography.iconMicro)
-                    Text("Quote")
-                        .font(OrbitTypography.meta(.medium))
-                }
-                .foregroundStyle(palette.fgMuted)
-                .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Quote Assistant Reply")
-
-            Spacer(minLength: 0)
-        }
-    }
-
-    private func copyReply(_ text: String) {
-        store.copyAssistantReply(text)
-        withAnimation(.easeOut(duration: 0.15)) {
-            copiedReply = true
-        }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            withAnimation(.easeIn(duration: 0.2)) {
-                copiedReply = false
-            }
-        }
-    }
+    // MARK: - Utilities
 
     private func resolvedAssistantText(text: String, blocks: [FfiRichBlock]) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -380,46 +360,420 @@ private extension FfiTurnLiveSegment {
     }
 }
 
-// MARK: - User Prompt Bubble (Right-Aligned, 18pt Radius, >8 Line Collapse)
+// MARK: - Quiet Turn Footer (Live Elapsed Ticker or Settled Icon Actions + Timestamp)
 
-struct UserPromptBubbleView: View {
-    let text: String
-    let badges: [FfiPromptBadge]
+private struct TurnFooterView: View {
+    let isTurnActive: Bool
+    let startedAtMs: Int64?
+    let completedAtMs: Int64?
+    let replyText: String?
+    let onCopy: (String) -> Void
 
     @Environment(\.orbitPalette) private var palette
-    @State private var isExpanded = false
+    @State private var copied = false
 
-    private var cleanText: String {
-        text.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var shouldCollapse: Bool {
-        let lineCount = cleanText.components(separatedBy: .newlines).count
-        return lineCount > 8 || cleanText.count > 420
+    private var hasSettledContent: Bool {
+        replyText != nil || completedAtMs != nil
     }
 
     var body: some View {
-        HStack {
-            Spacer(minLength: OrbitSpacing.xxl)
-
-            VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
-                if !badges.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: OrbitSpacing.xs) {
-                            ForEach(Array(badges.enumerated()), id: \.offset) { _, badge in
-                                badgeChip(badge)
+        if isTurnActive || hasSettledContent {
+            HStack(spacing: 4) {
+                if isTurnActive {
+                    LiveTurnElapsedView(startedAtMs: startedAtMs)
+                } else {
+                    if let reply = replyText {
+                        Button {
+                            onCopy(reply)
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                copied = true
                             }
+                            Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                                withAnimation(.easeIn(duration: 0.2)) {
+                                    copied = false
+                                }
+                            }
+                        } label: {
+                            Image(systemName: copied ? "checkmark" : "square.on.square")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(copied ? palette.direct : palette.fgSecondary.opacity(0.75))
+                                .orbitSymbolReplaceTransition()
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(copied ? "Copied Reply" : "Copy Assistant Reply")
+                    }
+
+                    if let completedMs = completedAtMs {
+                        RelativeTimestampText(timestampMs: completedMs)
+                            .padding(.leading, replyText != nil ? 2 : 0)
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, (!isTurnActive && replyText != nil) ? -6 : 0)
+            .frame(minHeight: 28)
+        }
+    }
+}
+
+private struct LiveTurnElapsedView: View {
+    let startedAtMs: Int64?
+
+    @Environment(\.orbitPalette) private var palette
+    @State private var fallbackStartDate = Date()
+
+    var body: some View {
+        let startDate = startedAtMs.map { Date(timeIntervalSince1970: Double($0) / 1000.0) } ?? fallbackStartDate
+
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            let elapsedSec = max(0, Int(context.date.timeIntervalSince(startDate)))
+            let mins = elapsedSec / 60
+            let secs = elapsedSec % 60
+            let formatted = String(format: "%d:%02d", mins, secs)
+
+            HStack(spacing: 7) {
+                PulsingDotView(color: palette.fgMuted, size: 5.5)
+                Text(formatted)
+                    .font(OrbitTypography.meta(.regular))
+                    .foregroundStyle(palette.fgMuted)
+            }
+        }
+    }
+}
+
+private struct RelativeTimestampText: View {
+    let timestampMs: Int64
+
+    @Environment(\.orbitPalette) private var palette
+
+    private var needsLiveRefresh: Bool {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        return (nowMs - timestampMs) < 3_600_000
+    }
+
+    var body: some View {
+        if needsLiveRefresh {
+            TimelineView(.periodic(from: .now, by: 30)) { context in
+                let nowMs = Int64(context.date.timeIntervalSince1970 * 1000)
+                Text(OrbitFormatters.relativeTimeLabel(timestampMs: timestampMs, nowMs: nowMs))
+                    .font(OrbitTypography.meta(.regular))
+                    .foregroundStyle(palette.fgSecondary.opacity(0.78))
+            }
+        } else {
+            Text(OrbitFormatters.relativeTimeLabel(timestampMs: timestampMs))
+                .font(OrbitTypography.meta(.regular))
+                .foregroundStyle(palette.fgSecondary.opacity(0.78))
+        }
+    }
+}
+
+// MARK: - Turn-End Aggregated Diff Pill (`Edited foo.rs +12 -4 Review ›` / `N files changed`)
+
+private struct TurnChangesBarView: View {
+    let diffs: [FfiTurnFileDiffSummary]
+    let cwd: String
+    let onOpenDiff: (String?) -> Void
+
+    @Environment(\.orbitPalette) private var palette
+
+    var body: some View {
+        let primaryPath = diffs.first?.path
+        let totalAdd = diffs.reduce(UInt32(0)) { $0 + $1.additions }
+        let totalDel = diffs.reduce(UInt32(0)) { $0 + $1.deletions }
+
+        let iconName: String = {
+            if diffs.count == 1, let p = primaryPath {
+                return OrbitFormatters.semanticFileIcon(for: OrbitFormatters.shortPath(p))
+            }
+            return "chevron.left.forwardslash.chevron.right"
+        }()
+
+        let titleLabel: String = {
+            if diffs.count == 1, let p = primaryPath {
+                return "Edited \(OrbitFormatters.stripWorkspacePrefix(p, cwd: cwd))"
+            }
+            return "\(diffs.count) files changed"
+        }()
+
+        Button {
+            onOpenDiff(primaryPath)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: iconName)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(palette.fgMuted)
+
+                Text(titleLabel)
+                    .font(OrbitTypography.meta(.medium))
+                    .foregroundStyle(palette.fgPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                if totalAdd > 0 || totalDel > 0 {
+                    HStack(spacing: 4) {
+                        if totalAdd > 0 {
+                            Text("+\(totalAdd)")
+                                .font(OrbitTypography.code(.regular))
+                                .foregroundStyle(palette.added)
+                        }
+                        if totalDel > 0 {
+                            Text("-\(totalDel)")
+                                .font(OrbitTypography.code(.regular))
+                                .foregroundStyle(palette.removed)
                         }
                     }
                 }
 
-                if !cleanText.isEmpty {
-                    Text(cleanText)
-                        .orbitBodyStyle()
-                        .foregroundStyle(palette.fgPrimary)
-                        .lineLimit(shouldCollapse && !isExpanded ? 8 : nil)
-                        .textSelection(.enabled)
+                HStack(spacing: 3) {
+                    Text("Review")
+                        .font(OrbitTypography.meta(.regular))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9.5, weight: .semibold))
                 }
+                .foregroundStyle(palette.fgMuted)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(palette.isDark ? palette.elevated : palette.canvas)
+            .clipShape(Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(palette.hairline, lineWidth: 0.5)
+            )
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(titleLabel). Review changes")
+    }
+}
+
+// MARK: - User Prompt Bubble (Soft Surface, Inline Slash Prefix, Wrapping Chips, Fade Collapse)
+
+private struct PromptPresentation {
+    let cleanText: String
+    let badges: [FfiPromptBadge]
+    let sanitizedLegacy: Bool
+}
+
+private let legacyPlanPrefix =
+    "Analyze the relevant codebase and propose a concise step-by-step plan before making edits:"
+private let legacyReviewPrompt =
+    "Review the uncommitted working tree changes for bugs, edge cases, and architectural consistency."
+
+private func extractUserPromptPresentation(
+    text: String,
+    badges: [FfiPromptBadge]
+) -> PromptPresentation {
+    if !badges.isEmpty {
+        return PromptPresentation(
+            cleanText: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            badges: badges,
+            sanitizedLegacy: false
+        )
+    }
+
+    var working = text
+    var inferred: [FfiPromptBadge] = []
+    var sanitized = false
+
+    func stripRegex(_ pattern: String, options: NSRegularExpression.Options = [.anchorsMatchLines], handler: ([String]) -> Void) {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { return }
+        let full = NSRange(working.startIndex..<working.endIndex, in: working)
+        let matches = regex.matches(in: working, options: [], range: full)
+        guard !matches.isEmpty else { return }
+        sanitized = true
+        for match in matches {
+            var groups: [String] = []
+            for idx in 1..<match.numberOfRanges {
+                if let r = Range(match.range(at: idx), in: working) {
+                    groups.append(String(working[r]))
+                }
+            }
+            handler(groups)
+        }
+        for match in matches.reversed() {
+            if let r = Range(match.range, in: working) {
+                working.removeSubrange(r)
+            }
+        }
+    }
+
+    stripRegex(#"^Attached image file:\s*`([^`]+)`\s*$"#) { groups in
+        if let raw = groups.first {
+            let name = raw.split(separator: "/").last.map(String.init) ?? raw
+            inferred.append(FfiPromptBadge(kind: "image", label: name))
+        }
+    }
+
+    stripRegex(#"^Referenced workspace files:\s*(.+)$"#) { groups in
+        if let listStr = groups.first,
+           let itemRegex = try? NSRegularExpression(pattern: #"`@?([^`]+)`"#) {
+            let range = NSRange(listStr.startIndex..<listStr.endIndex, in: listStr)
+            for match in itemRegex.matches(in: listStr, range: range) {
+                if let r = Range(match.range(at: 1), in: listStr) {
+                    let raw = String(listStr[r])
+                    let name = raw.split(separator: "/").last.map(String.init) ?? raw
+                    inferred.append(FfiPromptBadge(kind: "file", label: name))
+                }
+            }
+        }
+    }
+
+    stripRegex(#"^>\s*(Working Tree Diff|Staged Diff):\r?\n```diff\r?\n[\s\S]*?\r?\n```\s*$"#) { groups in
+        if let label = groups.first {
+            inferred.append(FfiPromptBadge(kind: "git_diff", label: label))
+        }
+    }
+
+    stripRegex(#"^>\s*Context:\s*Inspect (staged|working tree) git changes\.\s*$"#, options: [.anchorsMatchLines, .caseInsensitive]) { groups in
+        let isStaged = groups.first?.lowercased() == "staged"
+        inferred.append(FfiPromptBadge(kind: "git_diff", label: isStaged ? "Staged Diff" : "Working Tree Diff"))
+    }
+
+    stripRegex(#"^>\s*([^:\r\n]*lines):\r?\n```text\r?\n[\s\S]*?\r?\n```\s*$"#) { groups in
+        if let label = groups.first {
+            inferred.append(FfiPromptBadge(kind: "terminal", label: label.trimmingCharacters(in: .whitespaces)))
+        }
+    }
+
+    stripRegex(#"^>\s*Reference\s*`([^`]+)`:\r?\n```[\s\S]*?\r?\n```\s*$"#) { groups in
+        if let loc = groups.first {
+            let shortLoc = loc.split(separator: "/").last.map(String.init) ?? loc
+            inferred.append(FfiPromptBadge(kind: "quote", label: shortLoc))
+        }
+    }
+
+    working = working.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if working.hasPrefix(legacyPlanPrefix) {
+        sanitized = true
+        inferred.insert(FfiPromptBadge(kind: "slash", label: "/plan"), at: 0)
+        working = String(working.dropFirst(legacyPlanPrefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+    } else if working == legacyReviewPrompt {
+        sanitized = true
+        inferred.insert(FfiPromptBadge(kind: "slash", label: "/review"), at: 0)
+        working = ""
+    }
+
+    return PromptPresentation(cleanText: working, badges: inferred, sanitizedLegacy: sanitized)
+}
+
+private struct WrappingHStackLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var usedWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(ProposedViewSize(width: maxWidth, height: nil))
+            if x > 0 && x + size.width > maxWidth {
+                usedWidth = max(usedWidth, max(0, x - spacing))
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        usedWidth = max(usedWidth, max(0, x - spacing))
+        return CGSize(width: min(usedWidth, maxWidth), height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(ProposedViewSize(width: bounds.width, height: nil))
+            if x > bounds.minX && x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
+struct UserPromptBubbleView: View {
+    let text: String
+    let badges: [FfiPromptBadge]
+    var blocks: [FfiRichBlock] = []
+    var timestampMs: Int64? = nil
+
+    @Environment(\.orbitPalette) private var palette
+    @State private var isExpanded = false
+
+    private var presentation: PromptPresentation {
+        extractUserPromptPresentation(text: text, badges: badges)
+    }
+
+    private var slashBadge: FfiPromptBadge? {
+        presentation.badges.first(where: { $0.kind == "slash" })
+    }
+
+    private var attachmentBadges: [FfiPromptBadge] {
+        presentation.badges.filter { $0.kind != "slash" }
+    }
+
+    private var shouldCollapse: Bool {
+        let clean = presentation.cleanText
+        let lineCount = clean.components(separatedBy: .newlines).count
+        return lineCount > 8 || clean.count > 420
+    }
+
+    private var bubbleFill: Color {
+        palette.elevated
+    }
+
+    private var hasRichMarkdownBlocks: Bool {
+        guard !presentation.sanitizedLegacy && !blocks.isEmpty else { return false }
+        if blocks.count > 1 { return true }
+        guard let first = blocks.first else { return false }
+        switch first {
+        case let .paragraph(spans):
+            return spans.contains { $0.bold || $0.italic || $0.strikethrough || $0.inlineCode || $0.linkUrl != nil }
+        case .heading, .listItem, .blockQuote, .codeBlock, .table, .horizontalRule:
+            return true
+        }
+    }
+
+    var body: some View {
+        HStack {
+            Spacer(minLength: 52)
+
+            VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+                if !attachmentBadges.isEmpty {
+                    WrappingHStackLayout(spacing: 6) {
+                        ForEach(Array(attachmentBadges.enumerated()), id: \.offset) { _, badge in
+                            attachmentChip(badge)
+                        }
+                    }
+                }
+
+                promptBodyView
+                    .overlay(alignment: .bottom) {
+                        if shouldCollapse && !isExpanded {
+                            LinearGradient(
+                                colors: [bubbleFill.opacity(0), bubbleFill],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                            .frame(height: 36)
+                            .allowsHitTesting(false)
+                        }
+                    }
 
                 if shouldCollapse {
                     Button {
@@ -428,122 +782,304 @@ struct UserPromptBubbleView: View {
                         }
                     } label: {
                         Text(isExpanded ? "Show less" : "Show more")
-                            .font(OrbitTypography.subhead(.medium))
-                            .foregroundStyle(palette.primary)
-                            .frame(minHeight: 32, alignment: .leading)
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(palette.fgSecondary)
+                            .padding(.top, 2)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, OrbitSpacing.md)
-            .padding(.vertical, OrbitSpacing.sm + 2)
-            .background(palette.elevated)
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .strokeBorder(palette.hairline, lineWidth: 0.5)
-            )
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8.5)
+            .background {
+                let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
+                shape
+                    .fill(bubbleFill)
+                    .overlay {
+                        if palette.isDark {
+                            shape.strokeBorder(
+                                LinearGradient(
+                                    colors: [Color.white.opacity(0.055), .clear, .clear],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                ),
+                                lineWidth: 0.5
+                            )
+                        }
+                    }
+                    .overlay(
+                        shape.strokeBorder(
+                            palette.isDark ? Color.white.opacity(0.09) : Color.black.opacity(0.075),
+                            lineWidth: 0.5
+                        )
+                    )
+                    .shadow(
+                        color: Color.black.opacity(palette.isDark ? 0.10 : 0.028),
+                        radius: 3,
+                        x: 0,
+                        y: 1
+                    )
+            }
         }
     }
 
-    private func badgeChip(_ badge: FfiPromptBadge) -> some View {
-        let isSlash = badge.kind == "slash"
-        return HStack(spacing: OrbitSpacing.xs) {
-            Image(systemName: badgeIcon(for: badge.kind))
-                .font(OrbitTypography.iconMicro)
+    @ViewBuilder
+    private var promptBodyView: some View {
+        let clean = presentation.cleanText
+        if slashBadge != nil {
+            OrbitSelectableTextView(
+                attributedText: buildUserPromptAttributedString(),
+                stretchesToProposedWidth: false,
+                maxLines: shouldCollapse && !isExpanded ? 8 : 0,
+                isDarkAppearance: palette.isDark,
+                linkColor: UIColor(palette.primary)
+            )
+        } else if !clean.isEmpty {
+            if hasRichMarkdownBlocks && (!shouldCollapse || isExpanded) {
+                RichMarkdownView(blocks: blocks, fallbackText: clean)
+            } else {
+                OrbitSelectableTextView(
+                    attributedText: buildUserPromptAttributedString(),
+                    stretchesToProposedWidth: false,
+                    maxLines: shouldCollapse && !isExpanded ? 8 : 0,
+                    isDarkAppearance: palette.isDark,
+                    linkColor: UIColor(palette.primary)
+                )
+            }
+        }
+    }
+
+    private func buildUserPromptAttributedString() -> NSAttributedString {
+        let clean = presentation.cleanText
+        let uiPrimary = UIColor(palette.fgPrimary)
+        let uiSecondary = UIColor(palette.fgSecondary)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = OrbitTypography.bodyLineSpacing
+
+        let result = NSMutableAttributedString()
+        if let slash = slashBadge {
+            let slashIcon = badgeIcon(for: slash)
+            let slashLabel = slash.label.hasPrefix("/") ? String(slash.label.dropFirst()) : slash.label
+            let config = UIImage.SymbolConfiguration(pointSize: 13.5, weight: .medium)
+            if let sym = UIImage(systemName: slashIcon, withConfiguration: config)?
+                .withTintColor(uiSecondary, renderingMode: .alwaysOriginal) {
+                let attachment = NSTextAttachment()
+                attachment.image = sym
+                let bodyFont = UIFont.systemFont(ofSize: 15, weight: .regular)
+                let yOffset = (bodyFont.capHeight - sym.size.height) / 2.0
+                attachment.bounds = CGRect(x: 0, y: yOffset, width: sym.size.width, height: sym.size.height)
+                result.append(NSAttributedString(attachment: attachment))
+            }
+            result.append(NSAttributedString(
+                string: " \(slashLabel)",
+                attributes: [
+                    .font: UIFont.systemFont(ofSize: 15, weight: .medium),
+                    .foregroundColor: uiPrimary,
+                    .paragraphStyle: paragraph
+                ]
+            ))
+            if !clean.isEmpty {
+                result.append(NSAttributedString(
+                    string: " \(clean)",
+                    attributes: [
+                        .font: UIFont.systemFont(ofSize: 15, weight: .regular),
+                        .foregroundColor: uiPrimary,
+                        .paragraphStyle: paragraph
+                    ]
+                ))
+            }
+        } else {
+            result.append(NSAttributedString(
+                string: clean,
+                attributes: [
+                    .font: UIFont.systemFont(ofSize: 15, weight: .regular),
+                    .foregroundColor: uiPrimary,
+                    .paragraphStyle: paragraph
+                ]
+            ))
+        }
+        return result
+    }
+
+    private func attachmentChip(_ badge: FfiPromptBadge) -> some View {
+        let isMono = badge.kind == "file" || badge.kind == "quote"
+        return HStack(spacing: 5) {
+            Image(systemName: badgeIcon(for: badge))
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(palette.fgMuted)
             Text(badge.label)
-                .font(OrbitTypography.code(.medium))
+                .font(isMono ? OrbitTypography.code(.medium) : OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.fgSecondary)
                 .lineLimit(1)
         }
-        .foregroundStyle(isSlash ? palette.primary : palette.fgSecondary)
-        .padding(.horizontal, OrbitSpacing.sm)
+        .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .background(isSlash ? palette.primary.opacity(0.12) : palette.subtleFill)
-        .clipShape(Capsule())
+        .background(palette.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(palette.hairline, lineWidth: 0.5)
+        )
     }
 
-    private func badgeIcon(for kind: String) -> String {
-        switch kind {
-        case "slash": return "sparkles"
-        case "file": return "doc.text"
-        case "git_diff": return "arrow.triangle.branch"
-        case "terminal": return "terminal"
-        case "quote": return "text.quote"
-        case "image": return "photo"
-        default: return "paperclip"
+    private func badgeIcon(for badge: FfiPromptBadge) -> String {
+        switch badge.kind {
+        case "slash":
+            switch badge.label {
+            case "/plan": return "checklist"
+            case "/review": return "doc.text.magnifyingglass"
+            case "/compact": return "rectangle.compress.vertical"
+            default: return "sparkles"
+            }
+        case "file":
+            return OrbitFormatters.semanticFileIcon(for: badge.label)
+        case "git_diff":
+            return badge.label.localizedCaseInsensitiveContains("staged") ? "arrow.left.arrow.right" : "doc.badge.plus"
+        case "terminal":
+            return "terminal"
+        case "quote":
+            return "text.quote"
+        case "image":
+            return "photo"
+        case "paste":
+            let prefix = badge.label.components(separatedBy: "·").first?.trimmingCharacters(in: .whitespaces) ?? ""
+            return prefix.contains(".") ? OrbitFormatters.semanticFileIcon(for: prefix) : "doc.text"
+        default:
+            return "doc.text"
         }
     }
 }
 
-// MARK: - Live Step Group
+// MARK: - Step Group Disclosure & Live Segments
+
+private struct StepSummaryDisclosureButton: View {
+    let label: String
+    let unrecoveredFailureCount: UInt32
+    let labelIncludesFailure: Bool
+    let isExpanded: Bool
+    let showInlineDiffStat: Bool
+    let additions: UInt32
+    let deletions: UInt32
+    let isLiveRunning: Bool
+    let action: () -> Void
+
+    @Environment(\.orbitPalette) private var palette
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if isLiveRunning {
+                    PulsingDotView(color: palette.primary, size: 5.5)
+                }
+
+                Text(label)
+                    .font(OrbitTypography.subhead(.regular))
+                    .foregroundStyle(labelIncludesFailure ? palette.danger : palette.fgSecondary)
+                    .lineLimit(1)
+
+                if unrecoveredFailureCount > 0 && !labelIncludesFailure {
+                    Text("· \(unrecoveredFailureCount) failed")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.danger)
+                }
+
+                if showInlineDiffStat && (additions > 0 || deletions > 0) {
+                    HStack(spacing: 4) {
+                        if additions > 0 {
+                            Text("+\(additions)")
+                                .font(OrbitTypography.code(.regular))
+                                .foregroundStyle(palette.added)
+                        }
+                        if deletions > 0 {
+                            Text("-\(deletions)")
+                                .font(OrbitTypography.code(.regular))
+                                .foregroundStyle(palette.removed)
+                        }
+                    }
+                }
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(palette.fgMuted.opacity(0.75))
+                    .rotationEffect(.degrees(isExpanded ? 90 : 0))
+
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
 
 private struct LiveStepGroupView: View {
     @ObservedObject var store: OrbitIosStore
     let items: [FfiTimelineItem]
     let summary: FfiWorkSummaryResult
     let fallbackLiveLabel: String
-    let hasFollowingContent: Bool
-    let hasRunningStep: Bool
+    let shouldFold: Bool
+    let isLiveActive: Bool
+    let showInlineDiffStat: Bool
 
-    @Environment(\.orbitPalette) private var palette
-    @State private var manualExpanded: Bool?
-
-    private var isExpanded: Bool {
-        if let manual = manualExpanded {
-            return manual
-        }
-        if store.expandAllWorkGroupsByDefault || store.expandFirstStepByDefault {
-            return true
-        }
-        return hasRunningStep && !hasFollowingContent
-    }
+    @State private var manualExpanded = false
 
     private var headerText: String {
-        if hasRunningStep {
+        if isLiveActive {
             if !summary.liveLabel.isEmpty { return summary.liveLabel }
             if !fallbackLiveLabel.isEmpty { return fallbackLiveLabel }
             return "Working…"
         }
-        return summary.label.isEmpty ? "Completed \(items.count) steps" : summary.label
+        return summary.label.isEmpty ? "Completed \(items.count) \(items.count == 1 ? "step" : "steps")" : summary.label
+    }
+
+    private var forceExpanded: Bool {
+        store.expandAllWorkGroupsByDefault || store.expandFirstStepByDefault
+    }
+
+    private var isFoldOpen: Bool {
+        forceExpanded || manualExpanded
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-            Button {
-                store.hapticLight()
-                withAnimation(.spring(response: 0.25, dampingFraction: 0.86)) {
-                    manualExpanded = !isExpanded
-                }
-            } label: {
-                HStack(spacing: OrbitSpacing.sm) {
-                    if hasRunningStep {
-                        PulsingDotView(color: palette.primary, size: 6)
+        if !shouldFold || forceExpanded {
+            StepRailListView(
+                store: store,
+                items: items,
+                expandFirstToolStep: store.expandFirstStepByDefault,
+                isLiveActive: isLiveActive,
+                autoExpandErrors: !isLiveActive && summary.counts.unrecoveredFailureCount > 0
+            )
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                StepSummaryDisclosureButton(
+                    label: headerText,
+                    unrecoveredFailureCount: summary.counts.unrecoveredFailureCount,
+                    labelIncludesFailure: summary.labelIncludesFailure,
+                    isExpanded: isFoldOpen,
+                    showInlineDiffStat: showInlineDiffStat,
+                    additions: summary.counts.additions,
+                    deletions: summary.counts.deletions,
+                    isLiveRunning: false
+                ) {
+                    store.hapticLight()
+                    withAnimation(orbitDisclosureAnimation) {
+                        manualExpanded.toggle()
                     }
-
-                    Text(headerText)
-                        .font(OrbitTypography.subhead(.medium))
-                        .foregroundStyle(summary.labelIncludesFailure ? palette.warning : palette.fgSecondary)
-                        .lineLimit(1)
-
-                    Image(systemName: "chevron.right")
-                        .font(OrbitTypography.iconMicro)
-                        .foregroundStyle(palette.fgMuted)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-
-                    Spacer(minLength: 0)
                 }
-                .frame(minHeight: OrbitSpacing.hitTarget)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
+                .zIndex(1)
 
-            if isExpanded {
-                StepRailListView(
-                    store: store,
-                    items: items,
-                    expandFirstToolStep: store.expandFirstStepByDefault
-                )
+                if isFoldOpen {
+                    StepRailListView(
+                        store: store,
+                        items: items,
+                        expandFirstToolStep: store.expandFirstStepByDefault,
+                        isLiveActive: false,
+                        autoExpandErrors: summary.counts.failedCount > 0 || summary.counts.deniedCount > 0
+                    )
+                    .padding(.top, OrbitSpacing.xs)
+                    .transition(.orbitVerticalDisclosure)
+                }
             }
         }
     }
@@ -551,38 +1087,159 @@ private struct LiveStepGroupView: View {
 
 // MARK: - Vertical Hairline Rail & Step Rows
 
+private struct IndexedStepRow: Identifiable {
+    let id: String
+    let item: FfiTimelineItem
+}
+
 struct StepRailListView: View {
     @ObservedObject var store: OrbitIosStore
     let items: [FfiTimelineItem]
     var expandFirstToolStep: Bool = false
+    var isLiveActive: Bool = false
+    var autoExpandErrors: Bool = false
 
     @Environment(\.orbitPalette) private var palette
+    @State private var showAllLiveSteps = false
 
-    private var firstToolCallIndex: Int? {
-        items.firstIndex { item in
-            if case .toolCall = item { return true }
+    private var canRollUpEarlier: Bool {
+        isLiveActive && items.count >= liveStepAutoCollapseThreshold
+    }
+
+    private var hiddenCount: Int {
+        canRollUpEarlier ? max(0, items.count - liveStepVisibleTailCount) : 0
+    }
+
+    private var firstToolCallSeq: UInt64? {
+        items.first(where: {
+            if case .toolCall = $0 { return true }
             return false
-        } ?? (items.isEmpty ? nil : 0)
+        }).map(stepSeq) ?? items.first.map(stepSeq)
+    }
+
+    private var lastSeq: UInt64? {
+        items.last.map(stepSeq)
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: OrbitSpacing.md) {
+        VStack(alignment: .leading, spacing: 2) {
+            if canRollUpEarlier && hiddenCount > 0 {
+                let earlierCount = items.count - liveStepVisibleTailCount
+                let earlierRows = indexedRows(for: Array(items.prefix(earlierCount)), indexOffset: 0)
+                let tailRows = indexedRows(for: Array(items.suffix(liveStepVisibleTailCount)), indexOffset: earlierCount)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        store.hapticLight()
+                        withAnimation(orbitDisclosureAnimation) {
+                            showAllLiveSteps.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(palette.fgMuted.opacity(0.8))
+                                .rotationEffect(.degrees(showAllLiveSteps ? 90 : 0))
+                                .frame(width: 16, alignment: .center)
+
+                            Text(showAllLiveSteps ? "Hide steps" : "\(hiddenCount) \(hiddenCount == 1 ? "step" : "steps")")
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
+
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.vertical, 5)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .zIndex(1)
+
+                    if showAllLiveSteps {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(earlierRows) { row in
+                                stepRowView(for: row.item)
+                            }
+                        }
+                        .padding(.bottom, 2)
+                        .transition(.orbitVerticalDisclosure)
+                    }
+                }
+
+                ForEach(tailRows) { row in
+                    stepRowView(for: row.item)
+                }
+            } else {
+                ForEach(indexedRows(for: items, indexOffset: 0)) { row in
+                    stepRowView(for: row.item)
+                }
+            }
+        }
+        .padding(.leading, 19)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .leading) {
             Rectangle()
                 .fill(palette.hairline)
                 .frame(width: 1)
-                .padding(.leading, OrbitSpacing.xs)
-                .padding(.vertical, OrbitSpacing.xs)
+                .padding(.leading, 6)
+                .padding(.vertical, 4)
+                .allowsHitTesting(false)
+        }
+    }
 
-            VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-                ForEach(Array(items.enumerated()), id: \.offset) { idx, item in
-                    StepRowView(
-                        store: store,
-                        item: item,
-                        autoExpandOnAppear: expandFirstToolStep && (idx == firstToolCallIndex)
-                    )
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+    private func stepRowView(for item: FfiTimelineItem) -> some View {
+        let seq = stepSeq(item)
+        let isLastInLiveGroup = isLiveActive && seq == lastSeq
+        let isActivelyThinking: Bool = {
+            if case .assistantThinking = item { return isLastInLiveGroup }
+            return false
+        }()
+
+        return StepRowView(
+            store: store,
+            item: item,
+            autoExpandOnAppear: expandFirstToolStep && (seq == firstToolCallSeq),
+            autoExpandError: autoExpandErrors,
+            isActivelyThinking: isActivelyThinking
+        )
+    }
+
+    private func indexedRows(for slice: [FfiTimelineItem], indexOffset: Int) -> [IndexedStepRow] {
+        slice.enumerated().map { idx, item in
+            IndexedStepRow(
+                id: stepRowKey(item, fallbackIndex: indexOffset + idx),
+                item: item
+            )
+        }
+    }
+
+    private func stepRowKey(_ item: FfiTimelineItem, fallbackIndex: Int) -> String {
+        switch item {
+        case let .userPrompt(seq, id, _, _, _, _):
+            return "prompt-\(seq)-\(id)"
+        case let .assistantThinking(seq, id, _, _, _):
+            return "think-\(seq)-\(id)"
+        case let .assistantMessage(seq, id, _, _, _, _):
+            return "msg-\(seq)-\(id)"
+        case let .toolCall(seq, callId, _, _, _, _, _, _, _):
+            return "tool-\(seq)-\(callId)"
+        case let .permissionRequest(seq, id, _, _, _, _, _, _):
+            return "perm-\(seq)-\(id)"
+        case let .questionRequest(seq, id, _, _, _):
+            return "q-\(seq)-\(id)"
+        case let .notice(seq, _, _, _):
+            return "notice-\(seq)-\(fallbackIndex)"
+        }
+    }
+
+    private func stepSeq(_ item: FfiTimelineItem) -> UInt64 {
+        switch item {
+        case let .userPrompt(seq, _, _, _, _, _): return seq
+        case let .assistantThinking(seq, _, _, _, _): return seq
+        case let .assistantMessage(seq, _, _, _, _, _): return seq
+        case let .toolCall(seq, _, _, _, _, _, _, _, _): return seq
+        case let .permissionRequest(seq, _, _, _, _, _, _, _): return seq
+        case let .questionRequest(seq, _, _, _, _): return seq
+        case let .notice(seq, _, _, _): return seq
         }
     }
 }
@@ -591,16 +1248,36 @@ struct StepRowView: View {
     @ObservedObject var store: OrbitIosStore
     let item: FfiTimelineItem
     var autoExpandOnAppear: Bool = false
+    var autoExpandError: Bool = false
+    var isActivelyThinking: Bool = false
 
     @Environment(\.orbitPalette) private var palette
     @State private var isDetailExpanded = false
     @State private var copiedStepDetail = false
+
+    private var shouldAutoExpandFailedTool: Bool {
+        guard autoExpandError, case let .toolCall(_, _, status, _, _, _, descriptor, _, _) = item else {
+            return false
+        }
+        let isFailed = descriptor?.isFailed ?? (status == .failed)
+        let isDenied = descriptor?.isDenied ?? (status == .denied)
+        return isFailed || isDenied
+    }
 
     var body: some View {
         Group {
             switch item {
             case let .assistantThinking(_, _, text, headline, _):
                 thinkingStepRow(text: text, headline: headline)
+
+            case let .assistantMessage(_, _, text, _, blocks, _):
+                intermediateMessageRow(text: text, blocks: blocks)
+
+            case let .permissionRequest(_, _, title, _, _, _, resolvedDecision, _):
+                resolvedPermissionRow(title: title, resolvedDecision: resolvedDecision)
+
+            case let .questionRequest(_, _, questions, _, _):
+                resolvedQuestionRow(count: questions.count)
 
             case let .toolCall(_, _, status, summaryTitle, previewBody, detail, stepDescriptor, diffFiles, _):
                 let descriptor = stepDescriptor ?? store.describeTool(item)
@@ -616,12 +1293,12 @@ struct StepRowView: View {
             case let .notice(_, level, message, _):
                 TurnNoticeRow(level: level, message: message)
 
-            default:
+            case .userPrompt:
                 EmptyView()
             }
         }
         .onAppear {
-            if autoExpandOnAppear {
+            if autoExpandOnAppear || shouldAutoExpandFailedTool {
                 isDetailExpanded = true
             }
         }
@@ -630,56 +1307,203 @@ struct StepRowView: View {
                 isDetailExpanded = true
             }
         }
-    }
-
-    private func thinkingStepRow(text: String, headline: String) -> some View {
-        let cleanHeadline = headline.trimmingCharacters(in: .whitespacesAndNewlines)
-        let title = cleanHeadline.isEmpty ? "Reasoning" : cleanHeadline
-        let cleanBody = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let canExpand = !cleanBody.isEmpty
-
-        return VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-            Button {
-                guard canExpand else { return }
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    isDetailExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: OrbitSpacing.xs) {
-                    Text("Thought")
-                        .font(OrbitTypography.subhead(.regular))
-                        .foregroundStyle(palette.fgMuted)
-
-                    if title != "Reasoning" && title != "Thought" {
-                        Text(title)
-                            .font(OrbitTypography.subhead(.regular))
-                            .foregroundStyle(palette.fgSecondary)
-                            .lineLimit(1)
-                    }
-
-                    if canExpand {
-                        Image(systemName: "chevron.right")
-                            .font(OrbitTypography.iconMicro)
-                            .foregroundStyle(palette.fgMuted)
-                            .rotationEffect(.degrees(isDetailExpanded ? 90 : 0))
-                    }
-
-                    Spacer(minLength: 0)
-                }
-                .frame(minHeight: OrbitSpacing.hitTarget)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if isDetailExpanded && canExpand {
-                Text(cleanBody)
-                    .orbitSubheadStyle()
-                    .foregroundStyle(palette.fgSecondary)
-                    .padding(.bottom, OrbitSpacing.xs)
-                    .textSelection(.enabled)
+        .onChange(of: autoExpandError) { _ in
+            if shouldAutoExpandFailedTool {
+                isDetailExpanded = true
             }
         }
     }
+
+    // MARK: - Thinking Step Row
+
+    private func thinkingStepRow(text: String, headline: String) -> some View {
+        let cleanHeadline = headline.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanBody = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let canExpand = !cleanBody.isEmpty
+        let hasDistinctHeadline = !cleanHeadline.isEmpty && cleanHeadline != "Reasoning" && cleanHeadline != "Thought"
+
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                guard canExpand else { return }
+                store.hapticLight()
+                withAnimation(orbitDisclosureAnimation) {
+                    isDetailExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Group {
+                        if isActivelyThinking {
+                            PulsingDotView(color: palette.primary, size: 5.5)
+                        } else {
+                            Image(systemName: "sparkles")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+                    }
+                    .frame(width: 16, alignment: .center)
+
+                    Text(isActivelyThinking ? "Thinking" : "Thought")
+                        .font(OrbitTypography.subhead(.regular))
+                        .foregroundStyle(isActivelyThinking ? palette.fgPrimary : palette.fgPrimary.opacity(0.78))
+
+                    if !isDetailExpanded && hasDistinctHeadline {
+                        Text(cleanHeadline)
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgSecondary)
+                            .lineLimit(1)
+                            .transition(.opacity)
+                    }
+
+                    if canExpand {
+                        Spacer(minLength: OrbitSpacing.xs)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted.opacity(0.65))
+                            .rotationEffect(.degrees(isDetailExpanded ? 90 : 0))
+                    } else {
+                        Spacer(minLength: 0)
+                    }
+                }
+                .padding(.vertical, 5)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .zIndex(1)
+
+            if isDetailExpanded && canExpand {
+                let paragraph = NSMutableParagraphStyle()
+                let _ = (paragraph.lineSpacing = OrbitTypography.metaLineSpacing)
+                let bodyAttr = NSAttributedString(
+                    string: cleanBody,
+                    attributes: [
+                        .font: UIFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                        .foregroundColor: UIColor(palette.fgSecondary),
+                        .paragraphStyle: paragraph
+                    ]
+                )
+                OrbitSelectableTextView(
+                    attributedText: bodyAttr,
+                    stretchesToProposedWidth: true,
+                    isDarkAppearance: palette.isDark,
+                    linkColor: UIColor(palette.primary)
+                )
+                .padding(.leading, 24)
+                .padding(.top, 2)
+                .padding(.bottom, OrbitSpacing.xs)
+                .transition(.orbitVerticalDisclosure)
+            }
+        }
+    }
+
+    // MARK: - Intermediate Assistant Message Row
+
+    @ViewBuilder
+    private func intermediateMessageRow(text: String, blocks: [FfiRichBlock]) -> some View {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            let singleLinePreview = trimmed.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            let isCompactSingleLine = !trimmed.contains("\n") && singleLinePreview.count <= 120
+
+            if isCompactSingleLine {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "text.bubble")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(palette.fgMuted)
+                        .frame(width: 16, alignment: .center)
+                        .padding(.top, 2)
+
+                    Text(trimmed)
+                        .orbitSubheadStyle()
+                        .foregroundStyle(palette.fgSecondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.vertical, 5)
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        store.hapticLight()
+                        withAnimation(orbitDisclosureAnimation) {
+                            isDetailExpanded.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "text.bubble")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(palette.fgMuted)
+                                .frame(width: 16, alignment: .center)
+
+                            Text(singleLinePreview)
+                                .font(OrbitTypography.subhead(.regular))
+                                .foregroundStyle(palette.fgSecondary)
+                                .lineLimit(1)
+
+                            Spacer(minLength: OrbitSpacing.xs)
+
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(palette.fgMuted.opacity(0.65))
+                                .rotationEffect(.degrees(isDetailExpanded ? 90 : 0))
+                        }
+                        .padding(.vertical, 5)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .zIndex(1)
+
+                    if isDetailExpanded {
+                        RichMarkdownView(blocks: blocks, fallbackText: trimmed)
+                            .padding(.leading, 24)
+                            .padding(.top, 2)
+                            .padding(.bottom, OrbitSpacing.xs)
+                            .transition(.orbitVerticalDisclosure)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Resolved Permission & Question Rows
+
+    private func resolvedPermissionRow(title: String, resolvedDecision: String?) -> some View {
+        let rawDecision = resolvedDecision ?? "resolved"
+        let denied = rawDecision.range(of: "deny|reject|decline", options: [.regularExpression, .caseInsensitive]) != nil
+        let formattedDecision = OrbitFormatters.decisionLabel(rawDecision)
+
+        return HStack(spacing: 8) {
+            Image(systemName: denied ? "exclamationmark.triangle" : "checkmark")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(denied ? palette.danger : palette.direct)
+                .frame(width: 16, alignment: .center)
+
+            Text("\(title) · \(formattedDecision)")
+                .font(OrbitTypography.meta(.regular))
+                .foregroundStyle(palette.fgSecondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func resolvedQuestionRow(count: Int) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(palette.primary)
+                .frame(width: 16, alignment: .center)
+
+            Text("Answered \(count) clarifying \(count == 1 ? "question" : "questions")")
+                .font(OrbitTypography.meta(.regular))
+                .foregroundStyle(palette.fgSecondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Tool Call Step Row
 
     private func toolStepRow(
         status: FfiToolStatus,
@@ -694,81 +1518,175 @@ struct StepRowView: View {
         let isFailed = descriptor?.isFailed ?? (status == .failed)
         let isDenied = descriptor?.isDenied ?? (status == .denied)
         let isRunning = descriptor?.isRunning ?? (status == .running)
+        let isError = isFailed || isDenied
         let additions = descriptor?.additions ?? 0
         let deletions = descriptor?.deletions ?? 0
+        let openPath = descriptor?.openPath
+        let canOpenFileInDiff = openPath != nil && (descriptor?.kind == .fileEdit || descriptor?.kind == .fileCreate)
 
-        return VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
+        let hasInlineDiff: Bool = {
+            if let first = diffFiles.first, !first.lines.isEmpty { return true }
+            if case let .fileEdit(_, unified) = detail,
+               let raw = unified?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !raw.isEmpty {
+                return true
+            }
+            return false
+        }()
+        let descriptorExpandable = descriptor?.hasExpandableDetail ?? hasRichToolDetail(detail)
+        let canExpand = descriptorExpandable && {
+            if case .fileEdit = detail {
+                return hasInlineDiff
+            }
+            return true
+        }()
+        let isInteractive = canExpand || canOpenFileInDiff
+        let iconName = toolStepIcon(descriptor: descriptor, detail: detail, summaryTitle: summaryTitle)
+
+        return VStack(alignment: .leading, spacing: 0) {
             Button {
-                store.hapticLight()
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    isDetailExpanded.toggle()
+                if canExpand {
+                    store.hapticLight()
+                    withAnimation(orbitDisclosureAnimation) {
+                        isDetailExpanded.toggle()
+                    }
+                } else if canOpenFileInDiff, let path = openPath {
+                    store.hapticLight()
+                    store.openGitDiff(focusFilePath: path)
                 }
             } label: {
-                HStack(spacing: OrbitSpacing.sm) {
-                    if isRunning {
-                        PulsingDotView(color: palette.primary, size: 5)
+                HStack(spacing: 8) {
+                    Group {
+                        if isRunning {
+                            PulsingDotView(color: palette.primary, size: 5.5)
+                        } else if isError {
+                            Image(systemName: "exclamationmark.triangle")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(palette.danger)
+                        } else {
+                            Image(systemName: iconName)
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundStyle(palette.fgMuted)
+                        }
                     }
+                    .frame(width: 16, alignment: .center)
 
                     Text(verb)
                         .font(OrbitTypography.subhead(.regular))
                         .foregroundStyle(
                             isFailed ? palette.danger :
                             isDenied ? palette.warning :
-                            palette.fgSecondary
+                            palette.fgPrimary.opacity(0.78)
                         )
 
                     if !target.isEmpty {
                         Text(target)
-                            .font(OrbitTypography.code(.medium))
-                            .foregroundStyle(palette.fgPrimary)
+                            .font(OrbitTypography.code(.regular))
+                            .foregroundStyle(isRunning ? palette.fgPrimary : palette.fgSecondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
 
+                    if let secondaryMeta = descriptor?.secondaryMeta, !secondaryMeta.isEmpty {
+                        Text(secondaryMeta)
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgSecondary.opacity(0.78))
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: OrbitSpacing.xs)
+
                     if additions > 0 || deletions > 0 {
-                        HStack(spacing: OrbitSpacing.xs) {
+                        HStack(spacing: 4) {
                             if additions > 0 {
                                 Text("+\(additions)")
-                                    .font(OrbitTypography.meta(.medium))
+                                    .font(OrbitTypography.code(.regular))
                                     .foregroundStyle(palette.added)
                             }
                             if deletions > 0 {
                                 Text("-\(deletions)")
-                                    .font(OrbitTypography.meta(.medium))
+                                    .font(OrbitTypography.code(.regular))
                                     .foregroundStyle(palette.removed)
                             }
                         }
                     }
 
-                    if let code = descriptor?.exitCode, code != 0 {
+                    if descriptor?.kind == .shell, !isRunning, let code = descriptor?.exitCode, code != 0 {
                         Text("exit \(code)")
-                            .font(OrbitTypography.meta(.medium))
+                            .font(OrbitTypography.code(.regular))
                             .foregroundStyle(palette.danger)
                     }
 
-                    Image(systemName: "chevron.right")
-                        .font(OrbitTypography.iconMicro)
-                        .foregroundStyle(palette.fgMuted)
-                        .rotationEffect(.degrees(isDetailExpanded ? 90 : 0))
-
-                    Spacer(minLength: 0)
+                    if canExpand {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted.opacity(0.65))
+                            .rotationEffect(.degrees(isDetailExpanded ? 90 : 0))
+                    }
                 }
-                .frame(minHeight: OrbitSpacing.hitTarget)
+                .padding(.vertical, 5)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(!isInteractive)
             .accessibilityLabel("\(verb) \(target)")
+            .zIndex(1)
 
-            if isDetailExpanded {
+            if isDetailExpanded && canExpand {
                 expandedToolDetailView(
                     summaryTitle: summaryTitle,
                     detail: detail,
                     previewBody: previewBody,
-                    diffFiles: diffFiles
+                    diffFiles: diffFiles,
+                    isError: isError
                 )
+                .padding(.leading, 24)
+                .padding(.top, OrbitSpacing.xs)
                 .padding(.bottom, OrbitSpacing.xs)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(.orbitVerticalDisclosure)
             }
+        }
+    }
+
+    private func toolStepIcon(
+        descriptor: FfiToolStepDescriptor?,
+        detail: FfiToolCallDetail,
+        summaryTitle: String
+    ) -> String {
+        let kind: FfiToolStepKind = descriptor?.kind ?? {
+            switch detail {
+            case .fileRead: return .fileRead
+            case .fileEdit: return .fileEdit
+            case .search: return .search
+            case .shell: return .shell
+            case .subagent: return .subagent
+            case .generic: return .generic
+            }
+        }()
+        switch kind {
+        case .fileRead:
+            return "doc.text"
+        case .fileCreate:
+            return "doc.badge.plus"
+        case .fileEdit:
+            return "chevron.left.forwardslash.chevron.right"
+        case .search:
+            if case let .search(query, _) = detail {
+                let hay = "\(query) \(summaryTitle)".lowercased()
+                if hay.contains("web") || hay.contains("http://") || hay.contains("https://") || hay.contains("fetch") {
+                    return "globe"
+                }
+                if hay.contains("glob") || hay.contains("find") || hay.contains("files") || hay.contains("*.") {
+                    return "doc.text.magnifyingglass"
+                }
+            }
+            return "magnifyingglass"
+        case .shell:
+            return "terminal"
+        case .subagent:
+            return "square.stack.3d.up"
+        case .generic:
+            return "wrench"
         }
     }
 
@@ -777,7 +1695,8 @@ struct StepRowView: View {
         summaryTitle: String,
         detail: FfiToolCallDetail,
         previewBody: String?,
-        diffFiles: [FfiDiffFile]
+        diffFiles: [FfiDiffFile],
+        isError: Bool
     ) -> some View {
         switch detail {
         case let .fileEdit(path, unifiedDiff):
@@ -812,26 +1731,20 @@ struct StepRowView: View {
                         RoundedRectangle(cornerRadius: 8, style: .continuous)
                             .strokeBorder(palette.hairline, lineWidth: 0.5)
                     )
-                } else {
-                    monospacedStepSnippetCard(
-                        headerLine: path,
-                        metaLine: nil,
-                        bodyText: previewBody,
-                        copyPayload: path
-                    )
                 }
 
                 Button {
+                    store.hapticLight()
                     store.openGitDiff(focusFilePath: path)
                 } label: {
-                    HStack(spacing: OrbitSpacing.xs) {
-                        Image(systemName: "arrow.triangle.branch")
-                            .font(OrbitTypography.iconMicro)
-                        Text("Inspect Full Diff")
-                            .font(OrbitTypography.meta(.semibold))
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.left.arrow.right")
+                            .font(.system(size: 11, weight: .medium))
+                        Text("Open in Diff Review")
+                            .font(OrbitTypography.meta(.medium))
                     }
-                    .foregroundStyle(palette.primary)
-                    .frame(minHeight: OrbitSpacing.hitTarget)
+                    .foregroundStyle(palette.fgSecondary)
+                    .padding(.vertical, 4)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -859,7 +1772,8 @@ struct StepRowView: View {
                 headerLine: "$ \(command)",
                 metaLine: meta,
                 bodyText: out,
-                copyPayload: copyText
+                copyPayload: copyText,
+                isError: isError
             )
 
         case let .fileRead(path, startLine, endLine):
@@ -875,7 +1789,8 @@ struct StepRowView: View {
                 headerLine: path,
                 metaLine: rangeText,
                 bodyText: cleanPreview,
-                copyPayload: copyText
+                copyPayload: copyText,
+                isError: isError
             )
 
         case let .search(query, scope):
@@ -887,7 +1802,8 @@ struct StepRowView: View {
                 headerLine: header,
                 metaLine: "Search query",
                 bodyText: cleanPreview,
-                copyPayload: copyText
+                copyPayload: copyText,
+                isError: isError
             )
 
         case let .subagent(_, role, promptPreview):
@@ -896,7 +1812,8 @@ struct StepRowView: View {
                 headerLine: role.isEmpty ? "Subagent" : role,
                 metaLine: nil,
                 bodyText: cleanPrompt.isEmpty ? previewBody : cleanPrompt,
-                copyPayload: cleanPrompt.isEmpty ? role : "\(role)\n\(cleanPrompt)"
+                copyPayload: cleanPrompt.isEmpty ? role : "\(role)\n\(cleanPrompt)",
+                isError: isError
             )
 
         case let .generic(toolName, argumentsJson):
@@ -907,7 +1824,8 @@ struct StepRowView: View {
                 headerLine: header,
                 metaLine: nil,
                 bodyText: bodyText,
-                copyPayload: bodyText?.isEmpty == false ? "\(header)\n\(bodyText!)" : header
+                copyPayload: bodyText?.isEmpty == false ? "\(header)\n\(bodyText!)" : header,
+                isError: isError
             )
         }
     }
@@ -916,7 +1834,8 @@ struct StepRowView: View {
         headerLine: String,
         metaLine: String?,
         bodyText: String?,
-        copyPayload: String
+        copyPayload: String,
+        isError: Bool = false
     ) -> some View {
         let bodyLines: [String] = {
             guard let raw = bodyText?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
@@ -941,23 +1860,25 @@ struct StepRowView: View {
                             .foregroundStyle(palette.fgMuted)
                     }
                 }
-                .padding(.top, OrbitSpacing.sm)
+                .padding(.top, 8)
 
                 Spacer(minLength: OrbitSpacing.xs)
 
                 Button {
                     copyStepSnippet(copyPayload)
                 } label: {
-                    Image(systemName: copiedStepDetail ? "checkmark" : "doc.on.doc")
-                        .font(OrbitTypography.iconMicro)
+                    Image(systemName: copiedStepDetail ? "checkmark" : "square.on.square")
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(copiedStepDetail ? palette.direct : palette.fgMuted)
-                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .orbitSymbolReplaceTransition()
+                        .frame(width: 32, height: 32)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Copy Step Output")
             }
             .padding(.leading, OrbitSpacing.md)
+            .padding(.trailing, 4)
 
             if !cappedLines.isEmpty {
                 OrbitHairline()
@@ -986,11 +1907,11 @@ struct StepRowView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(palette.subtleFill)
+        .background(isError ? palette.danger.opacity(0.05) : palette.subtleFill)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(palette.hairline, lineWidth: 0.5)
+                .strokeBorder(isError ? palette.danger.opacity(0.30) : palette.hairline, lineWidth: 0.5)
         )
     }
 
@@ -1136,25 +2057,40 @@ struct TurnNoticeRow: View {
         return palette.fgSecondary
     }
 
+    private var noticeAttributedText: NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = OrbitTypography.subheadLineSpacing
+        return NSAttributedString(
+            string: message,
+            attributes: [
+                .font: UIFont.systemFont(ofSize: 13, weight: .regular),
+                .foregroundColor: UIColor(accentColor),
+                .paragraphStyle: paragraph
+            ]
+        )
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: OrbitSpacing.sm) {
-            Image(systemName: level.lowercased().contains("err") ? "exclamationmark.circle" : "info.circle")
+            Image(systemName: level.lowercased().contains("err") ? "exclamationmark.circle" : "exclamationmark.triangle")
                 .font(OrbitTypography.iconSmall)
                 .foregroundStyle(accentColor)
                 .padding(.top, 2)
 
-            Text(message)
-                .orbitSubheadStyle()
-                .foregroundStyle(accentColor)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            OrbitSelectableTextView(
+                attributedText: noticeAttributedText,
+                stretchesToProposedWidth: true,
+                isDarkAppearance: palette.isDark,
+                linkColor: UIColor(palette.primary)
+            )
         }
         .padding(.horizontal, OrbitSpacing.md)
         .padding(.vertical, OrbitSpacing.sm)
-        .background(accentColor.opacity(0.08))
+        .background(accentColor.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(accentColor.opacity(0.25), lineWidth: 0.5)
+                .strokeBorder(accentColor.opacity(0.22), lineWidth: 0.5)
         )
     }
 }

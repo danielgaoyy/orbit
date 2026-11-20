@@ -35,6 +35,13 @@ export interface DiscoveredProjectDto {
   last_modified_unix: number;
 }
 
+export interface LaunchpadProjectDto {
+  id: string;
+  name: string;
+  path: string;
+  branch: string;
+}
+
 export interface HostCardDto {
   host_id: string;
   display_name: string;
@@ -444,6 +451,38 @@ export interface TerminalScreenDto {
   rows_data: TerminalRowDto[];
 }
 
+export interface StagedAttachmentDto {
+  path: string;
+  filename: string;
+  size_bytes: number;
+}
+
+export interface ComposerAttachmentItem {
+  id: string;
+  path: string;
+  filename: string;
+  sizeBytes: number;
+  isImage: boolean;
+  localUri: string;
+}
+
+export interface InlineMentionRegistration {
+  token: string;
+  kind: string;
+  path: string;
+  staged: boolean;
+  label: string;
+}
+
+export interface OrbitSlashCommand {
+  id: string;
+  command: string;
+  label: string;
+  description: string;
+  symbol: Resource;
+  keywords: string[];
+}
+
 export interface QuotedDiffSnippet {
   id: string;
   path: string;
@@ -468,6 +507,8 @@ export interface QueuedPromptItem {
   badgesJson: string | null;
   badges: PromptBadgeDto[];
   quotedSnippets: QuotedDiffSnippet[];
+  stagedAttachments: ComposerAttachmentItem[];
+  inlineMentions: InlineMentionRegistration[];
   createdAtMs: number;
 }
 
@@ -528,7 +569,7 @@ export function formatProviderShortLabel(provider: string): string {
 
 export function formatEffortLabel(effort: string | null | undefined): string {
   if (effort === null || effort === undefined || effort.length === 0) {
-    return 'High';
+    return '';
   }
   const clean = effort.trim().toLowerCase();
   if (clean === 'off') {
@@ -549,12 +590,15 @@ export function formatEffortLabel(effort: string | null | undefined): string {
   if (clean === 'ultra') {
     return 'Ultra';
   }
-  return 'High';
+  if (clean === 'high') {
+    return 'High';
+  }
+  return effort;
 }
 
 export function formatShortEffortLabel(effort: string | null | undefined): string {
   if (effort === null || effort === undefined || effort.length === 0) {
-    return 'High';
+    return '';
   }
   const clean = effort.trim().toLowerCase();
   if (clean === 'off') {
@@ -575,7 +619,10 @@ export function formatShortEffortLabel(effort: string | null | undefined): strin
   if (clean === 'ultra') {
     return 'Ultra';
   }
-  return 'High';
+  if (clean === 'high') {
+    return 'High';
+  }
+  return effort;
 }
 
 export function normalizeModeSlug(raw: string | CustomSessionModeDto | null | undefined): string {
@@ -583,7 +630,10 @@ export function normalizeModeSlug(raw: string | CustomSessionModeDto | null | un
     return 'accept_edits';
   }
   if (typeof raw === 'string') {
-    return raw.length > 0 ? raw : 'default';
+    if (raw === 'plan' || raw.length === 0) {
+      return 'default';
+    }
+    return raw;
   }
   if (raw.custom !== undefined && raw.custom.length > 0) {
     return raw.custom;
@@ -592,11 +642,8 @@ export function normalizeModeSlug(raw: string | CustomSessionModeDto | null | un
 }
 
 export function formatModeLabel(modeSlug: string): string {
-  if (modeSlug === 'default') {
+  if (modeSlug === 'default' || modeSlug === 'plan') {
     return 'Always Ask';
-  }
-  if (modeSlug === 'plan') {
-    return 'Plan Mode';
   }
   if (modeSlug === 'accept_edits') {
     return 'Accept Edits';
@@ -701,6 +748,23 @@ export function basenameOfPath(rawPath: string): string {
     return trimmed.substring(idx + 1);
   }
   return trimmed;
+}
+
+export function compactPath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (trimmed.length === 0 || trimmed === '~') {
+    return '~';
+  }
+  let clean = trimmed;
+  while (clean.length > 1 && clean.endsWith('/')) {
+    clean = clean.substring(0, clean.length - 1);
+  }
+  const parts = clean.split('/').filter((seg: string) => seg.length > 0);
+  if (clean.startsWith('/') && parts.length >= 2 && (parts[0] === 'Users' || parts[0] === 'home')) {
+    const rest = parts.slice(2);
+    return rest.length === 0 ? '~' : `~/${rest.join('/')}`;
+  }
+  return clean;
 }
 
 function stripHomePrefixToRel(normPath: string): string | null {
@@ -832,4 +896,174 @@ export function isAutoCollapsedDiffPath(rawPath: string): boolean {
     return true;
   }
   return false;
+}
+
+export function getOrbitSlashCommands(): OrbitSlashCommand[] {
+  return [
+    {
+      id: 'plan',
+      command: '/plan',
+      label: 'Draft Implementation Plan',
+      description: 'Prompt the agent to design a step-by-step plan before editing',
+      symbol: $r('sys.symbol.list_checkmark'),
+      keywords: ['plan', 'design', 'architect', 'checklist'],
+    },
+    {
+      id: 'review',
+      command: '/review',
+      label: 'Code Review Working Tree',
+      description: 'Attach uncommitted git diff and prepare an engineering review',
+      symbol: $r('sys.symbol.doc_text_badge_magnifyingglass'),
+      keywords: ['review', 'audit', 'critique', 'git'],
+    },
+    {
+      id: 'diff',
+      command: '/diff',
+      label: 'Toggle Diff Inspector',
+      description: 'Open or close the side-by-side Git & Turn Diff panel',
+      symbol: $r('sys.symbol.arrow_left_arrow_right'),
+      keywords: ['diff', 'inspector', 'changes'],
+    },
+    {
+      id: 'compact',
+      command: '/compact',
+      label: 'Compact Context',
+      description: 'Ask active agent to summarize and compact conversation history',
+      symbol: $r('sys.symbol.cut'),
+      keywords: ['compact', 'summarize', 'context', 'memory'],
+    },
+    {
+      id: 'supervised',
+      command: '/ask',
+      label: 'Always Ask Permissions',
+      description: 'Require approval before file edits and shell commands',
+      symbol: $r('sys.symbol.security_shield'),
+      keywords: ['ask', 'supervised', 'default', 'safe', 'permission'],
+    },
+    {
+      id: 'auto',
+      command: '/edits',
+      label: 'Accept Edits Permissions',
+      description: 'Auto-approve file edits, ask before shell commands',
+      symbol: $r('sys.symbol.checkmark_shield'),
+      keywords: ['edits', 'auto', 'edit', 'accept', 'permission'],
+    },
+    {
+      id: 'full',
+      command: '/full',
+      label: 'Full Access Permissions',
+      description: 'Edit files and run commands without approval prompts',
+      symbol: $r('sys.symbol.key_shield_slash'),
+      keywords: ['full', 'autonomous', 'bypass', 'unrestricted', 'permission'],
+    },
+    {
+      id: 'terminal',
+      command: '/terminal',
+      label: 'Toggle PTY Terminal',
+      description: 'Show or hide the persistent multi-slot terminal dock',
+      symbol: $r('sys.symbol.code'),
+      keywords: ['terminal', 'pty', 'shell', 'console'],
+    },
+    {
+      id: 'new',
+      command: '/new',
+      label: 'New Agent Session',
+      description: 'Start a fresh isolated session in the stage',
+      symbol: $r('sys.symbol.square_and_pencil'),
+      keywords: ['new', 'thread', 'session', 'clear'],
+    },
+    {
+      id: 'settings',
+      command: '/settings',
+      label: 'Settings',
+      description: 'Configure hosts, engines, worktrees, and keybindings',
+      symbol: $r('sys.symbol.gearshape'),
+      keywords: ['settings', 'preferences', 'config'],
+    },
+  ];
+}
+
+export function filterOrbitSlashCommands(query: string): OrbitSlashCommand[] {
+  const all = getOrbitSlashCommands();
+  const q = query.trim().toLowerCase();
+  if (q.length === 0) {
+    return all;
+  }
+  return all.filter((c) => {
+    if (c.command.substring(1).toLowerCase().includes(q) || c.label.toLowerCase().includes(q)) {
+      return true;
+    }
+    for (let i = 0; i < c.keywords.length; i++) {
+      if (c.keywords[i].includes(q)) {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
+export function formatRelativeTimeLabel(unixSecs: number): string {
+  if (unixSecs <= 0) {
+    return '';
+  }
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const delta = Math.max(0, nowSecs - unixSecs);
+  if (delta < 60) {
+    return 'just now';
+  }
+  if (delta < 3600) {
+    return `${Math.floor(delta / 60)}m ago`;
+  }
+  if (delta < 86400) {
+    return `${Math.floor(delta / 3600)}h ago`;
+  }
+  return `${Math.floor(delta / 86400)}d ago`;
+}
+
+export function stripWorkspacePrefix(path: string, cwd: string): string {
+  const cleanPath = path.trim();
+  let cleanCwd = cwd.trim();
+  while (cleanCwd.length > 1 && cleanCwd.endsWith('/')) {
+    cleanCwd = cleanCwd.substring(0, cleanCwd.length - 1);
+  }
+  if (cleanPath.length === 0 || cleanCwd.length === 0 || cleanCwd === '~') {
+    return cleanPath;
+  }
+  if (cleanPath === cleanCwd) {
+    return '.';
+  }
+  if (cleanPath.startsWith(`${cleanCwd}/`)) {
+    return cleanPath.substring(cleanCwd.length + 1);
+  }
+  return cleanPath;
+}
+
+export function parseRfc3339Ms(rfc3339: string): number {
+  const trimmed = rfc3339.trim();
+  if (trimmed.length === 0) {
+    return 0;
+  }
+  const ms = Date.parse(trimmed);
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+export function formatCompactRelativeTime(rfc3339: string): string {
+  const ms = parseRfc3339Ms(rfc3339);
+  if (ms <= 0) {
+    return '';
+  }
+  const deltaSecs = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (deltaSecs < 60) {
+    return 'now';
+  }
+  if (deltaSecs < 3600) {
+    return `${Math.floor(deltaSecs / 60)}m`;
+  }
+  if (deltaSecs < 86400) {
+    return `${Math.floor(deltaSecs / 3600)}h`;
+  }
+  if (deltaSecs < 604800) {
+    return `${Math.floor(deltaSecs / 86400)}d`;
+  }
+  return `${Math.floor(deltaSecs / 604800)}w`;
 }

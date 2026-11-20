@@ -29,10 +29,11 @@ use uuid::Uuid;
 
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
-    extract_ws_port, normalize_relay_input, stage_local_attachment,
+    extract_ws_port, normalize_relay_input, read_local_workspace_file, stage_local_attachment,
 };
 use crate::render::{
-    DiffFileView, RichBlockView, TerminalGridEmulator, TerminalScreenView, parse_markdown_blocks,
+    DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
+    detect_language_for_path, highlight_code_lines_capped, parse_markdown_blocks,
     parse_unified_diff,
 };
 use crate::{
@@ -86,6 +87,13 @@ pub struct DirectoryListingView {
     pub current_path: String,
     pub parent_path: Option<String>,
     pub entries: Vec<DirectoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedAttachmentView {
+    pub path: String,
+    pub filename: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +317,17 @@ pub struct AgentTimelineDeltaView {
     pub upserted_items: Vec<TimelineItemView>,
     pub resolved_permissions: HashMap<String, String>,
     pub resolved_questions: HashMap<String, Vec<Vec<String>>>,
+    /// Set to `true` after an authoritative server-side rewind so clients replace their local list.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindAgentResultView {
+    pub agent: AgentCardView,
+    pub restored_files: u32,
+    pub restored_prompt: Option<String>,
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -320,6 +339,58 @@ pub struct GitReviewView {
     pub selected_path: Option<String>,
     pub raw_diff: String,
     pub diff_files: Vec<DiffFileView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceFileView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub resolved_path: String,
+    pub language: String,
+    /// `"text"` | `"image"` | `"binary"`
+    pub content_kind: String,
+    pub mime_type: Option<String>,
+    pub content: String,
+    pub size_bytes: u64,
+    pub truncated: bool,
+    pub highlighted_lines: Vec<HighlightedLineView>,
+    pub markdown_blocks: Vec<RichBlockView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SideQuestionStreamEvent {
+    Delta {
+        request_id: String,
+        text_delta: String,
+    },
+    Done {
+        request_id: String,
+        full_text: String,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AskSideQuestionRequest {
+    pub host_id: String,
+    pub agent_id: Option<String>,
+    pub cwd: String,
+    pub provider: ProviderKind,
+    pub model: Option<String>,
+    pub question: String,
+    pub context_summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct RawFileReadResponse {
+    resolved_path: String,
+    content_kind: String,
+    mime_type: Option<String>,
+    content: String,
+    size_bytes: u64,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -347,7 +418,15 @@ struct HostMemoryState {
     pending_outbox: Vec<WireMessage>,
     pending_attachment_acks:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AttachmentStageAck, String>>>,
+    pending_file_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RawFileReadResponse, String>>>,
+    pending_side_questions:
+        HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
+    pending_rewinds:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RewindAgentResultView, String>>>,
+    rewound_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
+    agent_req_by_req_id: HashMap<Uuid, String>,
     replaced_optimistic_agents: HashMap<String, String>,
     last_created_agent_id: Option<String>,
     discovered_projects: Vec<DiscoveredProject>,
@@ -400,7 +479,12 @@ impl HostMemoryState {
             session: None,
             pending_outbox: Vec::new(),
             pending_attachment_acks: HashMap::new(),
+            pending_file_reads: HashMap::new(),
+            pending_side_questions: HashMap::new(),
+            pending_rewinds: HashMap::new(),
+            rewound_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
+            agent_req_by_req_id: HashMap::new(),
             replaced_optimistic_agents: HashMap::new(),
             last_created_agent_id: None,
             discovered_projects: Vec::new(),
@@ -509,6 +593,14 @@ impl OrbitAppCore {
         auto_discover_local_daemon: bool,
     ) -> Result<Arc<Self>, ClientCoreError> {
         let store = Arc::new(OrbitStore::open(local_db_path)?);
+        if let Ok(purged) = store.purge_legacy_client_timeline_events()
+            && purged > 0
+        {
+            tracing::info!(
+                purged_rows = purged,
+                "Purged legacy daemon timeline_events rows from client replica database"
+            );
+        }
         Self::from_store(store, auto_discover_local_daemon)
     }
 
@@ -774,6 +866,7 @@ impl OrbitAppCore {
                 upserted_items: Vec::new(),
                 resolved_permissions: HashMap::new(),
                 resolved_questions: HashMap::new(),
+                reset: false,
             };
         };
         let Some(host_state) = guard.get_mut(host_id) else {
@@ -785,13 +878,14 @@ impl OrbitAppCore {
                 upserted_items: Vec::new(),
                 resolved_permissions: HashMap::new(),
                 resolved_questions: HashMap::new(),
+                reset: false,
             };
         };
 
         // Hydrate from local SQLite replica on first open for 0ms offline-first rendering
         if !host_state.timelines.contains_key(agent_id)
             && !agent_id.starts_with("opt_")
-            && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 500)
+            && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 50_000)
             && !cached.is_empty()
         {
             let mut coalesced = Vec::with_capacity(cached.len());
@@ -809,11 +903,20 @@ impl OrbitAppCore {
             .cloned()
             .unwrap_or_default();
 
+        let actual_max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+        let was_rewound = host_state.rewound_agents.remove(agent_id);
+        let needs_reset = was_rewound || (since_seq > 0 && actual_max_seq < since_seq);
+        let effective_since_seq = if needs_reset { 0 } else { since_seq };
+
         let mut all_resolved_perms: HashMap<String, String> = HashMap::new();
         let mut all_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         let mut delta_resolved_perms: HashMap<String, String> = HashMap::new();
         let mut delta_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
-        let mut latest_seq = since_seq;
+        let mut latest_seq = if needs_reset {
+            actual_max_seq
+        } else {
+            since_seq
+        };
         for ev in &events {
             if ev.seq > latest_seq {
                 latest_seq = ev.seq;
@@ -824,7 +927,7 @@ impl OrbitAppCore {
                     decision,
                 } => {
                     all_resolved_perms.insert(request_id.clone(), decision.clone());
-                    if since_seq == 0 || ev.seq > since_seq {
+                    if effective_since_seq == 0 || ev.seq > effective_since_seq {
                         delta_resolved_perms.insert(request_id.clone(), decision.clone());
                     }
                 }
@@ -833,7 +936,7 @@ impl OrbitAppCore {
                     answers,
                 } => {
                     all_resolved_questions.insert(request_id.clone(), answers.clone());
-                    if since_seq == 0 || ev.seq > since_seq {
+                    if effective_since_seq == 0 || ev.seq > effective_since_seq {
                         delta_resolved_questions.insert(request_id.clone(), answers.clone());
                     }
                 }
@@ -843,7 +946,9 @@ impl OrbitAppCore {
 
         let mut upserted_items = Vec::new();
         for ev in &events {
-            if since_seq > 0 && ev.seq <= since_seq {
+            let is_local_notice =
+                ev.seq == 0 && matches!(ev.payload, TimelinePayload::Notice { .. });
+            if effective_since_seq > 0 && ev.seq <= effective_since_seq && !is_local_notice {
                 continue;
             }
             let ts_ms = Some(ev.timestamp.timestamp_millis());
@@ -875,7 +980,7 @@ impl OrbitAppCore {
                     upserted_items.push(TimelineItemView::AssistantThinking {
                         seq: ev.seq,
                         item_id: item_id.clone(),
-                        text: text.clone(),
+                        text: text.trim().to_string(),
                         timestamp_ms: ts_ms,
                     });
                 }
@@ -884,23 +989,32 @@ impl OrbitAppCore {
                     text,
                     streaming,
                 } => {
-                    let key = (agent_id.to_string(), ev.seq, text.len(), *streaming);
-                    if host_state.markdown_cache.len() > 2048 {
-                        host_state.markdown_cache.clear();
+                    if let Some(warning_msg) = extract_legacy_provider_warning_text(text) {
+                        upserted_items.push(TimelineItemView::Notice {
+                            seq: ev.seq,
+                            level: "warning".into(),
+                            message: warning_msg,
+                            timestamp_ms: ts_ms,
+                        });
+                    } else {
+                        let key = (agent_id.to_string(), ev.seq, text.len(), *streaming);
+                        if host_state.markdown_cache.len() > 2048 {
+                            host_state.markdown_cache.clear();
+                        }
+                        let blocks = host_state
+                            .markdown_cache
+                            .entry(key)
+                            .or_insert_with(|| parse_markdown_blocks(text, *streaming))
+                            .clone();
+                        upserted_items.push(TimelineItemView::AssistantMessage {
+                            seq: ev.seq,
+                            item_id: item_id.clone(),
+                            text: text.clone(),
+                            streaming: *streaming,
+                            blocks,
+                            timestamp_ms: ts_ms,
+                        });
                     }
-                    let blocks = host_state
-                        .markdown_cache
-                        .entry(key)
-                        .or_insert_with(|| parse_markdown_blocks(text, *streaming))
-                        .clone();
-                    upserted_items.push(TimelineItemView::AssistantMessage {
-                        seq: ev.seq,
-                        item_id: item_id.clone(),
-                        text: text.clone(),
-                        streaming: *streaming,
-                        blocks,
-                        timestamp_ms: ts_ms,
-                    });
                 }
                 TimelinePayload::ToolCall {
                     call_id,
@@ -995,6 +1109,29 @@ impl OrbitAppCore {
                         timestamp_ms: ts_ms,
                     });
                 }
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::Error { message, .. },
+                } => {
+                    if !message.trim().is_empty() {
+                        upserted_items.push(TimelineItemView::Notice {
+                            seq: ev.seq,
+                            level: "error".into(),
+                            message: message.clone(),
+                            timestamp_ms: ts_ms,
+                        });
+                    }
+                }
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::AutonomousWakeup { source, .. },
+                } => {
+                    let label = format_autonomous_wakeup_notice(source);
+                    upserted_items.push(TimelineItemView::Notice {
+                        seq: ev.seq,
+                        level: "wakeup".into(),
+                        message: label,
+                        timestamp_ms: ts_ms,
+                    });
+                }
                 TimelinePayload::PermissionResolved { .. }
                 | TimelinePayload::QuestionResolved { .. }
                 | TimelinePayload::StatusChanged { .. } => {}
@@ -1009,6 +1146,7 @@ impl OrbitAppCore {
             upserted_items,
             resolved_permissions: delta_resolved_perms,
             resolved_questions: delta_resolved_questions,
+            reset: needs_reset,
         }
     }
 
@@ -1235,7 +1373,7 @@ impl OrbitAppCore {
                 .write()
                 .map_err(|_| ClientCoreError::LockPoisoned)?;
             if let Some(mut removed) = guard.remove(host_id) {
-                fail_pending_attachment_acks(&mut removed, "Host removed during attachment upload");
+                fail_pending_host_requests(&mut removed, "Host removed before request completed");
             }
         }
         if let Ok(mut projs) = self.projects.write() {
@@ -1372,7 +1510,10 @@ impl OrbitAppCore {
             };
             h.last_error = None;
             h.session = None;
-            fail_pending_attachment_acks(h, "Host reconnecting during attachment upload");
+            if h.pending_outbox.is_empty() {
+                h.agent_req_by_req_id.clear();
+            }
+            fail_pending_host_requests(h, "Host reconnecting before request completed");
             h.profile.clone()
         };
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -1530,6 +1671,7 @@ impl OrbitAppCore {
                 });
             }
             Err(err) => {
+                tracing::warn!(host_id = %host_id, error = %err, "Host connection attempt failed");
                 let is_identity_mismatch =
                     matches!(err, ClientCoreError::HostIdentityMismatch { .. });
                 if is_identity_mismatch {
@@ -1620,6 +1762,7 @@ impl OrbitAppCore {
     }
 
     fn handle_unexpected_disconnect(self: &Arc<Self>, host_id: &str) {
+        tracing::warn!(host_id = %host_id, "Host session disconnected unexpectedly; scheduling reconnect");
         let mut should_reconnect = false;
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
@@ -1628,7 +1771,10 @@ impl OrbitAppCore {
             h.profile.state = HostConnectionState::Disconnected;
             h.via_ssh_tunnel = false;
             h.session = None;
-            fail_pending_attachment_acks(h, "Host disconnected during attachment upload");
+            if h.pending_outbox.is_empty() {
+                h.agent_req_by_req_id.clear();
+            }
+            fail_pending_host_requests(h, "Host disconnected before request completed");
             should_reconnect = true;
         }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -1669,7 +1815,11 @@ impl OrbitAppCore {
         let mut notify_git_cwd: Option<String> = None;
         let mut auto_subscribe_agent: Option<String> = None;
         let mut continue_catchup: Option<(String, u64)> = None;
+        let mut catchup_completed_cursor: Option<(String, u64)> = None;
+        let mut live_event_cursor: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
+        let mut rewound_to_persist: Option<(AgentSummary, Vec<TimelineEvent>, bool, bool)> = None;
+        let mut stale_replica_agents: Vec<(String, bool)> = Vec::new();
 
         if let Ok(mut guard) = self.hosts.write()
             && let Some(state) = guard.get_mut(host_id)
@@ -1758,9 +1908,29 @@ impl OrbitAppCore {
                 }
                 WireMessage::AgentsSnapshot { agents, .. } => {
                     // Keep any 0ms optimistic `opt_*` sessions while refreshing server-confirmed ones
+                    let prev_agents: HashMap<String, (u64, u64)> = state
+                        .agents
+                        .iter()
+                        .map(|(k, v)| (k.clone(), (v.timeline_epoch, v.latest_seq)))
+                        .collect();
                     state.agents.retain(|k, _| k.starts_with("opt_"));
                     for a in agents {
-                        state.agents.insert(a.agent_id.clone(), a);
+                        let ag_id = a.agent_id.clone();
+                        let prev = prev_agents.get(&ag_id).copied();
+                        let local_max_seq = state
+                            .timelines
+                            .get(&ag_id)
+                            .and_then(|evs| evs.iter().map(|e| e.seq).max())
+                            .unwrap_or(0);
+                        let epoch_advanced = prev.is_some_and(|(ep, _)| a.timeline_epoch > ep);
+                        let seq_regressed = local_max_seq > 0 && a.latest_seq < local_max_seq;
+                        if epoch_advanced || seq_regressed {
+                            let had_mem = state.timelines.remove(&ag_id).is_some();
+                            state.rewound_agents.insert(ag_id.clone());
+                            stale_replica_agents.push((ag_id.clone(), had_mem));
+                            notify_timeline_agent = Some(ag_id.clone());
+                        }
+                        state.agents.insert(ag_id, a);
                     }
                     notify_fleet = true;
                     notify_host = true;
@@ -1787,6 +1957,19 @@ impl OrbitAppCore {
                 }
                 WireMessage::AgentUpdated { agent } => {
                     let ag_id = agent.agent_id.clone();
+                    let prev_epoch = state.agents.get(&ag_id).map(|a| a.timeline_epoch);
+                    let local_max_seq = state
+                        .timelines
+                        .get(&ag_id)
+                        .and_then(|evs| evs.iter().map(|e| e.seq).max())
+                        .unwrap_or(0);
+                    let epoch_advanced = prev_epoch.is_some_and(|ep| agent.timeline_epoch > ep);
+                    let seq_regressed = local_max_seq > 0 && agent.latest_seq < local_max_seq;
+                    if epoch_advanced || seq_regressed {
+                        let had_mem = state.timelines.remove(&ag_id).is_some();
+                        state.rewound_agents.insert(ag_id.clone());
+                        stale_replica_agents.push((ag_id.clone(), had_mem));
+                    }
                     state.agents.insert(ag_id.clone(), agent);
                     notify_fleet = true;
                     notify_host = true;
@@ -1929,6 +2112,42 @@ impl OrbitAppCore {
                     }
                     notify_host = true;
                 }
+                WireMessage::AgentRewound {
+                    request_id,
+                    agent,
+                    events,
+                    restored_files,
+                    restored_prompt,
+                    notice,
+                    ..
+                } => {
+                    let ag_id = agent.agent_id.clone();
+                    let agent_card = agent_to_card_view(&agent);
+                    let mut ordered = events;
+                    ordered.sort_by_key(|e| e.seq);
+                    let last_seq = ordered.last().map(|e| e.seq).unwrap_or(0);
+                    let is_complete = last_seq >= agent.latest_seq;
+                    state.timelines.insert(ag_id.clone(), ordered.clone());
+                    state.rewound_agents.insert(ag_id.clone());
+                    state.agents.insert(ag_id.clone(), agent.clone());
+                    rewound_to_persist = Some((agent, ordered, restored_files > 0, is_complete));
+                    if !is_complete {
+                        continue_catchup = Some((ag_id.clone(), last_seq));
+                    }
+                    if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_rewinds.remove(&req_id)
+                    {
+                        let _ = tx.send(Ok(RewindAgentResultView {
+                            agent: agent_card,
+                            restored_files,
+                            restored_prompt,
+                            notice,
+                        }));
+                    }
+                    notify_fleet = true;
+                    notify_host = true;
+                    notify_timeline_agent = Some(ag_id);
+                }
                 WireMessage::TimelineCatchup {
                     agent_id,
                     events,
@@ -1938,17 +2157,39 @@ impl OrbitAppCore {
                     let list = state.timelines.entry(agent_id.clone()).or_default();
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
+                    let min_incoming_seq = ordered.first().map(|e| e.seq);
                     let max_seq = ordered.last().map(|e| e.seq);
-                    for ev in ordered {
-                        coalesce_or_push_timeline(list, ev);
+                    let existing_max_seq = list.iter().map(|e| e.seq).max().unwrap_or(0);
+                    let is_backfill = min_incoming_seq
+                        .is_some_and(|min_s| existing_max_seq > 0 && min_s <= existing_max_seq);
+
+                    if is_backfill {
+                        let mut combined = std::mem::take(list);
+                        combined.extend(ordered);
+                        combined.sort_by_key(|e| (e.seq == 0, e.seq));
+                        let mut rebuilt = Vec::with_capacity(combined.len());
+                        for ev in combined {
+                            coalesce_or_push_timeline(&mut rebuilt, ev);
+                        }
+                        *list = rebuilt;
+                        state.rewound_agents.insert(agent_id.clone());
+                    } else {
+                        for ev in ordered {
+                            coalesce_or_push_timeline(list, ev);
+                        }
                     }
+
                     if has_more && let Some(next_since) = max_seq {
                         continue_catchup = Some((agent_id.clone(), next_since));
+                    } else {
+                        let final_max = list.iter().map(|e| e.seq).max().unwrap_or(0);
+                        catchup_completed_cursor = Some((agent_id.clone(), final_max));
                     }
                     notify_timeline_agent = Some(agent_id);
                 }
                 WireMessage::TimelineLive { event } => {
                     let agent_id = event.agent_id.clone();
+                    let live_seq = event.seq;
                     if let TimelinePayload::StatusChanged { ref status } = event.payload
                         && let Some(ag) = state.agents.get_mut(&agent_id)
                     {
@@ -1958,6 +2199,9 @@ impl OrbitAppCore {
                     }
                     let list = state.timelines.entry(agent_id.clone()).or_default();
                     coalesce_or_push_timeline(list, event);
+                    if live_seq > 0 {
+                        live_event_cursor = Some((agent_id.clone(), live_seq));
+                    }
                     notify_timeline_agent = Some(agent_id);
                 }
                 WireMessage::GitStatusResponse { status, .. } => {
@@ -1979,6 +2223,51 @@ impl OrbitAppCore {
                     state.workspace_files.insert(cwd.clone(), files);
                     notify_git_cwd = Some(cwd);
                 }
+                WireMessage::WorkspaceFileContentResponse {
+                    request_id,
+                    resolved_path,
+                    content_kind,
+                    mime_type,
+                    content,
+                    size_bytes,
+                    truncated,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_file_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(RawFileReadResponse {
+                            resolved_path,
+                            content_kind,
+                            mime_type,
+                            content,
+                            size_bytes,
+                            truncated,
+                        }));
+                    }
+                }
+                WireMessage::SideQuestionDelta {
+                    request_id,
+                    text_delta,
+                } => {
+                    if let Some(tx) = state.pending_side_questions.get(&request_id) {
+                        let _ = tx.send(SideQuestionStreamEvent::Delta {
+                            request_id: request_id.to_string(),
+                            text_delta,
+                        });
+                    }
+                }
+                WireMessage::SideQuestionDone {
+                    request_id,
+                    full_text,
+                    error,
+                } => {
+                    if let Some(tx) = state.pending_side_questions.remove(&request_id) {
+                        let _ = tx.send(SideQuestionStreamEvent::Done {
+                            request_id: request_id.to_string(),
+                            full_text,
+                            error,
+                        });
+                    }
+                }
                 WireMessage::TerminalsSnapshot { terminals, .. } => {
                     state.terminals = terminals;
                     notify_host = true;
@@ -1999,6 +2288,9 @@ impl OrbitAppCore {
                 WireMessage::ProviderModelsSnapshot { catalogs, .. } => {
                     state.provider_catalogs = catalogs;
                     notify_host = true;
+                }
+                WireMessage::Ack { request_id } => {
+                    state.agent_req_by_req_id.remove(&request_id);
                 }
                 WireMessage::AttachmentStaged {
                     request_id,
@@ -2022,35 +2314,62 @@ impl OrbitAppCore {
                     code,
                     message,
                 } => {
+                    let formatted_err = format!("[{code}] {message}");
                     if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_attachment_acks.remove(&req_id)
                     {
-                        let _ = tx.send(Err(format!("[{code}] {message}")));
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_file_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_rewinds.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_side_questions.remove(&req_id)
+                    {
+                        let _ = tx.send(SideQuestionStreamEvent::Done {
+                            request_id: req_id.to_string(),
+                            full_text: String::new(),
+                            error: Some(formatted_err),
+                        });
                     } else {
-                        state.last_error = Some(format!("[{code}] {message}"));
-                        if let Some(req_id) = request_id
-                            && let Some(opt_id) = state.optimistic_by_req_id.remove(&req_id)
-                        {
-                            if let Some(opt_ag) = state.agents.get_mut(&opt_id) {
-                                opt_ag.status = AgentStatus::Error {
-                                    message: message.clone(),
-                                    recoverable: true,
-                                };
+                        state.last_error = Some(formatted_err.clone());
+                        if let Some(req_id) = request_id {
+                            if let Some(opt_id) = state.optimistic_by_req_id.remove(&req_id) {
+                                record_agent_rpc_error(
+                                    state,
+                                    &opt_id,
+                                    &message,
+                                    message.clone(),
+                                    true,
+                                );
+                                notify_fleet = true;
+                                notify_timeline_agent = Some(opt_id);
+                            } else if let Some(agent_id) = state.agent_req_by_req_id.remove(&req_id)
+                            {
+                                let is_pending_turn =
+                                    state.agents.get(&agent_id).is_some_and(|ag| {
+                                        matches!(
+                                            &ag.status,
+                                            AgentStatus::Running { turn_id } if turn_id == "pending"
+                                        )
+                                    });
+                                let reset_status = is_pending_turn || code == "send_prompt_failed";
+                                record_agent_rpc_error(
+                                    state,
+                                    &agent_id,
+                                    &message,
+                                    formatted_err,
+                                    reset_status,
+                                );
+                                if reset_status {
+                                    notify_fleet = true;
+                                }
+                                notify_timeline_agent = Some(agent_id);
                             }
-                            state.timelines.entry(opt_id.clone()).or_default().push(
-                                TimelineEvent {
-                                    seq: 0,
-                                    epoch: 1,
-                                    agent_id: opt_id.clone(),
-                                    turn_id: None,
-                                    timestamp: Utc::now(),
-                                    payload: TimelinePayload::Notice {
-                                        level: "error".into(),
-                                        message,
-                                    },
-                                },
-                            );
-                            notify_timeline_agent = Some(opt_id);
                         }
                         notify_host = true;
                     }
@@ -2061,6 +2380,42 @@ impl OrbitAppCore {
 
         if let Some(stored) = host_to_persist {
             let _ = self.store.upsert_client_host(&stored);
+        }
+        if let Some((ag, evs, files_restored, is_complete)) = rewound_to_persist {
+            let _ = self.store.replace_replica_timeline(&ag.agent_id, &evs);
+            if is_complete {
+                let _ = self
+                    .store
+                    .set_replica_contiguous_seq(&ag.agent_id, ag.latest_seq);
+            }
+            let _ = self.store.upsert_single_replica_agent(host_id, &ag);
+            if files_restored {
+                self.fetch_git_status(host_id, &ag.cwd);
+                self.fetch_git_diff(host_id, &ag.cwd, None, false);
+            }
+        }
+        if let Some((ag_id, max_seq)) = catchup_completed_cursor
+            && max_seq > 0
+        {
+            let _ = self.store.set_replica_contiguous_seq(&ag_id, max_seq);
+        }
+        if let Some((ag_id, live_seq)) = live_event_cursor
+            && self.store.get_replica_contiguous_seq(&ag_id).unwrap_or(0) > 0
+        {
+            let _ = self.store.set_replica_contiguous_seq(&ag_id, live_seq);
+        }
+        for (stale_ag_id, should_resubscribe) in stale_replica_agents {
+            let _ = self.store.replace_replica_timeline(&stale_ag_id, &[]);
+            if should_resubscribe {
+                self.dispatch_wire(
+                    host_id,
+                    WireMessage::SubscribeTimeline {
+                        request_id: Uuid::new_v4(),
+                        agent_id: stale_ag_id,
+                        since_seq: 0,
+                    },
+                );
+            }
         }
         if let Some(new_agent_id) = auto_subscribe_agent {
             self.open_agent_timeline(host_id, &new_agent_id);
@@ -2417,6 +2772,7 @@ impl OrbitAppCore {
                 last_activity_at: Some(now),
                 labels: HashMap::new(),
                 latest_seq: 0,
+                timeline_epoch: 0,
                 created_at: now,
                 updated_at: now,
             };
@@ -2491,16 +2847,34 @@ impl OrbitAppCore {
         if agent_id.starts_with("opt_") {
             return;
         }
-        let since_seq = self
-            .hosts
-            .read()
-            .ok()
-            .and_then(|g| {
-                g.get(host_id)
-                    .and_then(|h| h.timelines.get(agent_id))
-                    .and_then(|list| list.iter().map(|e| e.seq).max())
-            })
-            .unwrap_or(0);
+        let contiguous_seq = self.store.get_replica_contiguous_seq(agent_id).unwrap_or(0);
+        let mem_max_seq = if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if !h.timelines.contains_key(agent_id)
+                && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 50_000)
+                && !cached.is_empty()
+            {
+                let mut coalesced = Vec::with_capacity(cached.len());
+                for ev in cached {
+                    coalesce_or_push_timeline(&mut coalesced, ev);
+                }
+                h.timelines.insert(agent_id.to_string(), coalesced);
+            }
+            h.timelines
+                .get(agent_id)
+                .and_then(|list| list.iter().map(|e| e.seq).max())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        // Only perform incremental catchup when a contiguous replica cursor has been confirmed;
+        // otherwise start from `0` so any historical gap from a prior interrupted sync self-heals.
+        let since_seq = if contiguous_seq == 0 {
+            0
+        } else {
+            contiguous_seq.min(mem_max_seq)
+        };
         self.dispatch_wire_queued(
             host_id,
             WireMessage::SubscribeTimeline {
@@ -2509,6 +2883,17 @@ impl OrbitAppCore {
                 since_seq,
             },
         );
+    }
+
+    fn record_agent_request(&self, host_id: &str, req_id: Uuid, agent_id: &str) {
+        if agent_id.starts_with("opt_") {
+            return;
+        }
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
+        }
     }
 
     pub fn send_prompt(self: &Arc<Self>, host_id: &str, agent_id: &str, prompt: &str) {
@@ -2543,6 +2928,7 @@ impl OrbitAppCore {
         active_turn_behavior: ActiveTurnBehavior,
     ) {
         let now = Utc::now();
+        let req_id = Uuid::new_v4();
         let visible_text = display_prompt.clone().unwrap_or_else(|| prompt.to_string());
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
@@ -2553,6 +2939,9 @@ impl OrbitAppCore {
                 };
                 ag.archived_at = None;
                 ag.updated_at = now;
+            }
+            if !agent_id.starts_with("opt_") {
+                h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
             }
             h.timelines
                 .entry(agent_id.to_string())
@@ -2584,7 +2973,7 @@ impl OrbitAppCore {
         self.dispatch_wire_queued(
             host_id,
             WireMessage::SendPrompt {
-                request_id: Uuid::new_v4(),
+                request_id: req_id,
                 agent_id: agent_id.to_string(),
                 prompt: prompt.to_string(),
                 display_prompt,
@@ -2598,27 +2987,40 @@ impl OrbitAppCore {
     }
 
     pub fn interrupt_agent(&self, host_id: &str, agent_id: &str) {
+        let req_id = Uuid::new_v4();
+        if !agent_id.starts_with("opt_")
+            && let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && h.session.is_some()
+        {
+            h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
+        }
         self.dispatch_wire(
             host_id,
             WireMessage::InterruptTurn {
-                request_id: Uuid::new_v4(),
+                request_id: req_id,
                 agent_id: agent_id.to_string(),
             },
         );
     }
 
     pub fn set_session_mode(self: &Arc<Self>, host_id: &str, agent_id: &str, mode: SessionMode) {
+        let req_id = Uuid::new_v4();
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
-            && let Some(ag) = h.agents.get_mut(agent_id)
         {
-            ag.mode = mode.clone();
+            if let Some(ag) = h.agents.get_mut(agent_id) {
+                ag.mode = mode.clone();
+            }
+            if !agent_id.starts_with("opt_") {
+                h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
+            }
         }
         if !agent_id.starts_with("opt_") {
             self.dispatch_wire_queued(
                 host_id,
                 WireMessage::SetSessionMode {
-                    request_id: Uuid::new_v4(),
+                    request_id: req_id,
                     agent_id: agent_id.to_string(),
                     mode,
                 },
@@ -2637,19 +3039,24 @@ impl OrbitAppCore {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     ) {
+        let req_id = Uuid::new_v4();
         let clean_model = model.filter(|m| !m.trim().is_empty());
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
-            && let Some(ag) = h.agents.get_mut(agent_id)
         {
-            ag.model = clean_model.clone();
-            ag.effort = effort;
+            if let Some(ag) = h.agents.get_mut(agent_id) {
+                ag.model = clean_model.clone();
+                ag.effort = effort;
+            }
+            if !agent_id.starts_with("opt_") {
+                h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
+            }
         }
         if !agent_id.starts_with("opt_") {
             self.dispatch_wire_queued(
                 host_id,
                 WireMessage::SetAgentConfig {
-                    request_id: Uuid::new_v4(),
+                    request_id: req_id,
                     agent_id: agent_id.to_string(),
                     model: clean_model,
                     effort,
@@ -2663,18 +3070,23 @@ impl OrbitAppCore {
     }
 
     pub fn set_agent_model(self: &Arc<Self>, host_id: &str, agent_id: &str, model: Option<String>) {
+        let req_id = Uuid::new_v4();
         let clean_model = model.filter(|m| !m.trim().is_empty());
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
-            && let Some(ag) = h.agents.get_mut(agent_id)
         {
-            ag.model = clean_model.clone();
+            if let Some(ag) = h.agents.get_mut(agent_id) {
+                ag.model = clean_model.clone();
+            }
+            if !agent_id.starts_with("opt_") {
+                h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
+            }
         }
         if !agent_id.starts_with("opt_") {
             self.dispatch_wire_queued(
                 host_id,
                 WireMessage::SetAgentModel {
-                    request_id: Uuid::new_v4(),
+                    request_id: req_id,
                     agent_id: agent_id.to_string(),
                     model: clean_model,
                 },
@@ -2703,20 +3115,25 @@ impl OrbitAppCore {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     ) {
+        let req_id = Uuid::new_v4();
         let clean_model = model.filter(|m| !m.trim().is_empty());
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
-            && let Some(ag) = h.agents.get_mut(agent_id)
         {
-            ag.provider = provider;
-            ag.model = clean_model.clone();
-            ag.effort = effort;
+            if let Some(ag) = h.agents.get_mut(agent_id) {
+                ag.provider = provider;
+                ag.model = clean_model.clone();
+                ag.effort = effort;
+            }
+            if !agent_id.starts_with("opt_") {
+                h.agent_req_by_req_id.insert(req_id, agent_id.to_string());
+            }
         }
         if !agent_id.starts_with("opt_") {
             self.dispatch_wire_queued(
                 host_id,
                 WireMessage::SwitchAgentProvider {
-                    request_id: Uuid::new_v4(),
+                    request_id: req_id,
                     agent_id: agent_id.to_string(),
                     provider,
                     model: clean_model,
@@ -3326,10 +3743,12 @@ impl OrbitAppCore {
         permission_request_id: &str,
         decision: &str,
     ) {
+        let req_id = Uuid::new_v4();
+        self.record_agent_request(host_id, req_id, agent_id);
         self.dispatch_wire_queued(
             host_id,
             WireMessage::ResolvePermission {
-                request_id: Uuid::new_v4(),
+                request_id: req_id,
                 agent_id: agent_id.to_string(),
                 permission_request_id: permission_request_id.to_string(),
                 decision: decision.to_string(),
@@ -3344,10 +3763,12 @@ impl OrbitAppCore {
         question_request_id: &str,
         answers: Vec<Vec<String>>,
     ) {
+        let req_id = Uuid::new_v4();
+        self.record_agent_request(host_id, req_id, agent_id);
         self.dispatch_wire_queued(
             host_id,
             WireMessage::AnswerQuestion {
-                request_id: Uuid::new_v4(),
+                request_id: req_id,
                 agent_id: agent_id.to_string(),
                 question_request_id: question_request_id.to_string(),
                 answers,
@@ -3391,6 +3812,27 @@ impl OrbitAppCore {
                 cwd: cwd.to_string(),
             },
         );
+    }
+
+    pub fn stage_attachment(
+        self: &Arc<Self>,
+        host_id: &str,
+        filename: &str,
+        _mime_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<StagedAttachmentView, ClientCoreError> {
+        if bytes.is_empty() {
+            return Err(ClientCoreError::Transport("Attachment is empty".into()));
+        }
+        let info = self
+            .runtime
+            .block_on(self.stage_attachment_on_host(host_id, filename, bytes))
+            .map_err(ClientCoreError::Transport)?;
+        Ok(StagedAttachmentView {
+            path: info.path,
+            filename: info.filename,
+            size_bytes: info.size_bytes as u64,
+        })
     }
 
     pub fn workspace_files(&self, host_id: &str, cwd: &str) -> Vec<String> {
@@ -3846,6 +4288,390 @@ impl OrbitAppCore {
 
         Err("Attachment upload ended without confirmation".into())
     }
+
+    pub fn is_local_host(&self, host_id: &str) -> bool {
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|g| g.get(host_id).map(|h| h.is_local))
+            .unwrap_or(false)
+    }
+
+    /// Rewind an agent conversation (and optionally restore workspace files) to strictly before `to_before_seq`.
+    pub async fn rewind_agent_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        to_before_seq: u64,
+        restore_files: bool,
+    ) -> Result<RewindAgentResultView, String> {
+        if agent_id.starts_with("opt_") {
+            return Err("Wait for the session to finish initializing before rewinding".into());
+        }
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to rewind this session".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let owned_agent_id = agent_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_rewinds.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before rewinding session".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::RewindAgent {
+                    request_id: req_id,
+                    agent_id: owned_agent_id,
+                    to_before_seq,
+                    restore_files,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_rewinds.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send rewind request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(Ok(view))) => Ok(view),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while rewinding session".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_rewinds.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to rewind session (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Rewind task terminated unexpectedly".to_string())?
+    }
+
+    /// Read a workspace file from a local or remote Orbit host and pre-render syntax highlighting / Markdown AST.
+    pub async fn read_workspace_file_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+    ) -> Result<WorkspaceFileView, String> {
+        let (session, is_local) = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            (h.session.clone(), h.is_local)
+        };
+
+        let Some(session) = session else {
+            if is_local {
+                let owned_host = host_id.to_string();
+                let owned_cwd = cwd.to_string();
+                let owned_path = path.to_string();
+                return tokio::task::spawn_blocking(move || {
+                    let raw = read_local_workspace_file(&owned_cwd, &owned_path, None)?;
+                    Ok(build_workspace_file_view(
+                        &owned_host,
+                        &owned_cwd,
+                        &owned_path,
+                        RawFileReadResponse {
+                            resolved_path: raw.resolved_path,
+                            content_kind: raw.content_kind,
+                            mime_type: raw.mime_type,
+                            content: raw.content,
+                            size_bytes: raw.size_bytes,
+                            truncated: raw.truncated,
+                        },
+                    ))
+                })
+                .await
+                .map_err(|_| "local file read task cancelled".to_string())?;
+            }
+            return Err("Remote host is disconnected; reconnect to open files".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let owned_cwd = cwd.to_string();
+        let owned_path = path.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_file_reads.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before reading file".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let send_res = session
+                .send_wire(WireMessage::ReadWorkspaceFile {
+                    request_id: req_id,
+                    cwd: owned_cwd.clone(),
+                    path: owned_path.clone(),
+                    max_bytes: Some(2 * 1024 * 1024),
+                })
+                .await;
+
+            if let Err(e) = send_res {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_file_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to request file read: {e}")));
+                return;
+            }
+
+            // Shorter wait on local hosts so older local daemons fall back cleanly to local fs read
+            let timeout_secs = if is_local { 3 } else { 15 };
+            let raw_res = match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await
+            {
+                Ok(Ok(Ok(raw))) => Ok(raw),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while reading file".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_file_reads.remove(&req_id);
+                    }
+                    if is_local {
+                        let fallback_cwd = owned_cwd.clone();
+                        let fallback_path = owned_path.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            read_local_workspace_file(&fallback_cwd, &fallback_path, None)
+                        })
+                        .await
+                        {
+                            Ok(Ok(local)) => Ok(RawFileReadResponse {
+                                resolved_path: local.resolved_path,
+                                content_kind: local.content_kind,
+                                mime_type: local.mime_type,
+                                content: local.content,
+                                size_bytes: local.size_bytes,
+                                truncated: local.truncated,
+                            }),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err("local file read task cancelled".to_string()),
+                        }
+                    } else {
+                        Err(
+                            "Timed out waiting for remote daemon to read file (ensure remote orbit daemon is up to date)"
+                                .to_string(),
+                        )
+                    }
+                }
+            };
+
+            let final_view = match raw_res {
+                Ok(raw) => tokio::task::spawn_blocking(move || {
+                    build_workspace_file_view(&owned_host_id, &owned_cwd, &owned_path, raw)
+                })
+                .await
+                .map_err(|_| "file highlight task cancelled".to_string()),
+                Err(e) => Err(e),
+            };
+            let _ = res_tx.send(final_view);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "file read task cancelled".to_string())?
+    }
+
+    /// Execute an ephemeral side question (`/btw`) on the target host and stream chunks via `event_tx`.
+    /// Returns `Ok(request_id)` if dispatched to the host daemon, or `Err(reason)` if unavailable.
+    pub async fn ask_side_question_on_host(
+        self: &Arc<Self>,
+        req: AskSideQuestionRequest,
+        event_tx: tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>,
+    ) -> Result<String, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect before asking a side question".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let req_id_str = req_id.to_string();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_side_questions.insert(req_id, event_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before sending side question".into()),
+                        None => Some(format!("host `{}` removed", req.host_id)),
+                    },
+                    Err(_) => Some("host state lock poisoned".into()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let wire_msg = WireMessage::AskSideQuestion {
+                request_id: req_id,
+                agent_id: req.agent_id,
+                cwd: req.cwd,
+                provider: req.provider,
+                model: req.model,
+                question: req.question,
+                context_summary: req.context_summary,
+            };
+
+            if let Err(e) = session.send_wire(wire_msg).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_side_questions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send side question: {e}")));
+                return;
+            }
+
+            let _ = res_tx.send(Ok(req_id_str));
+
+            // Reap orphaned pending side-question channels if an older remote daemon never replies.
+            let host_for_timeout = req.host_id;
+            let core_for_timeout = Arc::clone(&core);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(105)).await;
+                if let Ok(mut guard) = core_for_timeout.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_for_timeout)
+                    && let Some(tx) = h.pending_side_questions.remove(&req_id)
+                {
+                    let _ = tx.send(SideQuestionStreamEvent::Done {
+                        request_id: req_id.to_string(),
+                        full_text: String::new(),
+                        error: Some(
+                            "Timed out waiting for side question response (ensure remote orbit daemon is up to date)"
+                                .to_string(),
+                        ),
+                    });
+                }
+            });
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "side question dispatch cancelled".to_string())?
+    }
+}
+
+fn build_workspace_file_view(
+    host_id: &str,
+    cwd: &str,
+    path: &str,
+    raw: RawFileReadResponse,
+) -> WorkspaceFileView {
+    let language = detect_language_for_path(path).to_string();
+    let (highlighted_lines, markdown_blocks) = if raw.content_kind == "text" {
+        let lines = highlight_code_lines_capped(&language, &raw.content, 2500);
+        let md = if language == "markdown" {
+            parse_markdown_blocks(&raw.content, false)
+        } else {
+            Vec::new()
+        };
+        (lines, md)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    WorkspaceFileView {
+        host_id: host_id.to_string(),
+        cwd: cwd.to_string(),
+        path: path.to_string(),
+        resolved_path: raw.resolved_path,
+        language,
+        content_kind: raw.content_kind,
+        mime_type: raw.mime_type,
+        content: raw.content,
+        size_bytes: raw.size_bytes,
+        truncated: raw.truncated,
+        highlighted_lines,
+        markdown_blocks,
+    }
 }
 
 struct AttachmentUploadTarget<'a> {
@@ -3855,9 +4681,22 @@ struct AttachmentUploadTarget<'a> {
     daemon_protocol_version: Option<u32>,
 }
 
-fn fail_pending_attachment_acks(h: &mut HostMemoryState, reason: &str) {
+fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_attachment_acks.drain() {
         let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_file_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_rewinds.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (req_id, tx) in h.pending_side_questions.drain() {
+        let _ = tx.send(SideQuestionStreamEvent::Done {
+            request_id: req_id.to_string(),
+            full_text: String::new(),
+            error: Some(reason.to_string()),
+        });
     }
 }
 
@@ -4115,8 +4954,48 @@ fn is_legacy_shared_item_id(raw_id: &str) -> bool {
     )
 }
 
+/// Records an RPC error against an agent in memory, injecting a client-local error `Notice`
+/// (with `seq == 0` so daemon `latest_seq` cursors are never skewed) and optionally resetting
+/// an optimistic `Running` status back to `AgentStatus::Error`.
+fn record_agent_rpc_error(
+    state: &mut HostMemoryState,
+    agent_id: &str,
+    status_message: &str,
+    notice_message: String,
+    reset_status: bool,
+) {
+    if reset_status && let Some(ag) = state.agents.get_mut(agent_id) {
+        ag.status = AgentStatus::Error {
+            message: status_message.to_string(),
+            recoverable: true,
+        };
+    }
+    state
+        .timelines
+        .entry(agent_id.to_string())
+        .or_default()
+        .push(TimelineEvent {
+            seq: 0,
+            epoch: 1,
+            agent_id: agent_id.to_string(),
+            turn_id: None,
+            timestamp: Utc::now(),
+            payload: TimelinePayload::Notice {
+                level: "error".into(),
+                message: notice_message,
+            },
+        });
+}
+
+fn is_pending_optimistic_prompt(ev: &TimelineEvent) -> bool {
+    ev.seq == 0 && matches!(ev.payload, TimelinePayload::UserPrompt { .. })
+}
+
 fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: TimelineEvent) {
-    let active_end = list.iter().position(|e| e.seq == 0).unwrap_or(list.len());
+    let active_end = list
+        .iter()
+        .position(is_pending_optimistic_prompt)
+        .unwrap_or(list.len());
     let precedes_incoming =
         |ev: &TimelineEvent| -> bool { ev.seq > 0 && (incoming.seq == 0 || ev.seq < incoming.seq) };
 
@@ -4272,12 +5151,53 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
             *same_seq = incoming;
             return;
         }
-        if let Some(first_opt_idx) = list.iter().position(|e| e.seq == 0) {
+        if let Some(first_opt_idx) = list.iter().position(is_pending_optimistic_prompt) {
             list.insert(first_opt_idx, incoming);
             return;
         }
     }
     list.push(incoming);
+}
+
+fn extract_legacy_provider_warning_text(text: &str) -> Option<String> {
+    if !text.contains('⚠') {
+        return None;
+    }
+    let mut warnings = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rest = trimmed.strip_prefix('⚠')?.trim();
+        let lower = rest.to_ascii_lowercase();
+        let is_runtime_warning = lower.starts_with("api error")
+            || lower.starts_with("the stream was interrupted")
+            || lower.starts_with("rate limit")
+            || lower.starts_with("request failed")
+            || lower.starts_with("connection ")
+            || lower.starts_with("network ")
+            || lower.starts_with("retrying")
+            || lower.starts_with("error:");
+        if !is_runtime_warning {
+            return None;
+        }
+        warnings.push(rest);
+    }
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("\n"))
+    }
+}
+
+fn format_autonomous_wakeup_notice(source: &str) -> String {
+    let cleaned = source.trim().replace('_', " ");
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("background task") {
+        "Resumed from background task".to_string()
+    } else {
+        format!("Resumed from {cleaned}")
+    }
 }
 
 fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
@@ -4909,5 +5829,307 @@ mod tests {
             ))
             .expect_err("disconnected remote host must not fall back to local disk");
         assert!(err.contains("disconnected"));
+    }
+
+    #[test]
+    fn status_changed_error_projects_to_error_notice_in_timeline_and_delta() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = PairingOffer {
+            host_id: "host_err_vis".into(),
+            hostname: "mac-studio".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        let uri = offer.to_qr_uri().expect("uri");
+        core.pair_host(&uri).expect("pair");
+
+        let now = chrono::Utc::now();
+        core.handle_inbound_wire(
+            "host_err_vis",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag_1".into(),
+                has_more: false,
+                events: vec![TimelineEvent {
+                    seq: 1,
+                    epoch: 1,
+                    agent_id: "ag_1".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::UserPrompt {
+                        message_id: "u1".into(),
+                        text: "hello".into(),
+                        badges: Vec::new(),
+                    },
+                }],
+            },
+        );
+
+        core.handle_inbound_wire(
+            "host_err_vis",
+            WireMessage::TimelineLive {
+                event: TimelineEvent {
+                    seq: 2,
+                    epoch: 1,
+                    agent_id: "ag_1".into(),
+                    turn_id: Some("t1".into()),
+                    timestamp: now,
+                    payload: TimelinePayload::StatusChanged {
+                        status: AgentStatus::Error {
+                            message: "Prompt rejected while awaiting question answer".into(),
+                            recoverable: true,
+                        },
+                    },
+                },
+            },
+        );
+
+        let full = core.agent_timeline("host_err_vis", "ag_1");
+        assert!(full.items.iter().any(|it| matches!(
+            it,
+            TimelineItemView::Notice {
+                seq: 2,
+                level,
+                message,
+                ..
+            } if level == "error" && message == "Prompt rejected while awaiting question answer"
+        )));
+
+        let delta = core.agent_timeline_delta("host_err_vis", "ag_1", 1);
+        assert_eq!(delta.latest_seq, 2);
+        assert_eq!(delta.upserted_items.len(), 1);
+        assert!(matches!(
+            &delta.upserted_items[0],
+            TimelineItemView::Notice {
+                seq: 2,
+                level,
+                message,
+                ..
+            } if level == "error" && message == "Prompt rejected while awaiting question answer"
+        ));
+    }
+
+    #[test]
+    fn rpc_error_for_existing_agent_resets_pending_status_and_surfaces_in_delta() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
+        let offer = PairingOffer {
+            host_id: "host_rpc_err".into(),
+            hostname: "mac-studio".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        let uri = offer.to_qr_uri().expect("uri");
+        core.pair_host(&uri).expect("pair");
+
+        let now = chrono::Utc::now();
+        core.handle_inbound_wire(
+            "host_rpc_err",
+            WireMessage::AgentsSnapshot {
+                request_id: Uuid::new_v4(),
+                agents: vec![AgentSummary {
+                    agent_id: "ag_existing".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/tmp/proj".into(),
+                    title: "Existing".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 5,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                }],
+            },
+        );
+        core.handle_inbound_wire(
+            "host_rpc_err",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag_existing".into(),
+                has_more: false,
+                events: vec![TimelineEvent {
+                    seq: 5,
+                    epoch: 1,
+                    agent_id: "ag_existing".into(),
+                    turn_id: None,
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "m5".into(),
+                        text: "ready".into(),
+                        streaming: false,
+                    },
+                }],
+            },
+        );
+
+        core.send_prompt("host_rpc_err", "ag_existing", "follow up");
+        let req_id = {
+            let guard = core.hosts.read().expect("read");
+            let h = guard.get("host_rpc_err").expect("host");
+            assert_eq!(h.pending_outbox.len(), 1);
+            match &h.pending_outbox[0] {
+                WireMessage::SendPrompt { request_id, .. } => *request_id,
+                other => panic!("unexpected outbox msg: {other:?}"),
+            }
+        };
+
+        core.handle_inbound_wire(
+            "host_rpc_err",
+            WireMessage::RpcError {
+                request_id: Some(req_id),
+                code: "send_prompt_failed".into(),
+                message: "agent session not active".into(),
+            },
+        );
+
+        let delta = core.agent_timeline_delta("host_rpc_err", "ag_existing", 5);
+        assert_eq!(
+            delta.latest_seq, 5,
+            "synthetic seq=0 notice must not advance daemon latest_seq"
+        );
+        let agent_card = delta.agent.expect("agent card");
+        assert!(!agent_card.is_running);
+        assert_eq!(agent_card.status_label, "Error");
+        assert!(delta.upserted_items.iter().any(|it| matches!(
+            it,
+            TimelineItemView::Notice {
+                seq: 0,
+                level,
+                message,
+                ..
+            } if level == "error" && message.contains("agent session not active")
+        )));
+    }
+
+    #[test]
+    fn projects_autonomous_wakeup_and_legacy_provider_warnings_as_notices() {
+        let core = OrbitAppCore::open_in_memory().expect("in-memory core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("write");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "host_warn".into(),
+                hostname: "local".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_w".into(),
+                AgentSummary {
+                    agent_id: "ag_w".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/tmp".into(),
+                    title: "Test".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 3,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                },
+            );
+            guard.insert("host_warn".into(), mem);
+        }
+
+        core.handle_inbound_wire(
+            "host_warn",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag_w".into(),
+                has_more: false,
+                events: vec![
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 1,
+                        agent_id: "ag_w".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m1".into(),
+                            text: "\n⚠ API error (attempt 1): dial tcp i/o timeout\n".into(),
+                            streaming: false,
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 1,
+                        agent_id: "ag_w".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::StatusChanged {
+                            status: AgentStatus::AutonomousWakeup {
+                                turn_id: "wk1".into(),
+                                source: "background_task".into(),
+                            },
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 3,
+                        epoch: 1,
+                        agent_id: "ag_w".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m2".into(),
+                            text: "Normal assistant reply with ⚠ symbol inline.".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+            },
+        );
+
+        let full = core.agent_timeline("host_warn", "ag_w");
+        assert!(full.items.iter().any(|it| matches!(
+            it,
+            TimelineItemView::Notice { seq: 1, level, message, .. }
+                if level == "warning" && message.contains("i/o timeout")
+        )));
+        assert!(full.items.iter().any(|it| matches!(
+            it,
+            TimelineItemView::Notice { seq: 2, level, message, .. }
+                if level == "wakeup" && message.contains("background task")
+        )));
+        assert!(full.items.iter().any(|it| matches!(
+            it,
+            TimelineItemView::AssistantMessage { seq: 3, text, .. }
+                if text.contains("Normal assistant reply")
+        )));
     }
 }

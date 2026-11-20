@@ -189,7 +189,7 @@ fun PairQrSheet(
                         Icon(
                             imageVector = Icons.Outlined.ContentPaste,
                             contentDescription = null,
-                            tint = Color.White,
+                            tint = colors.onPrimary,
                             modifier = Modifier.size(OrbitSpacing.iconMd),
                         )
                     }
@@ -218,7 +218,7 @@ fun PairQrSheet(
                         Text(
                             text = "Pair",
                             style = typography.subheadSemiBold,
-                            color = Color.White,
+                            color = colors.onPrimary,
                             maxLines = 1,
                             softWrap = false,
                         )
@@ -419,7 +419,7 @@ fun PairQrSheet(
                     Text(
                         text = "Pair Host",
                         style = typography.bodySemiBold,
-                        color = if (canPair) Color.White else colors.fgMuted,
+                        color = if (canPair) colors.onPrimary else colors.fgMuted,
                     )
                 }
             }

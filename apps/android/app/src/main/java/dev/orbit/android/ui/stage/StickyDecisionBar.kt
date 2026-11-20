@@ -323,7 +323,7 @@ private fun PermissionDecisionCard(
                 val fgColor = when {
                     isDeny -> colors.dangerRemoved
                     isAlways -> colors.fgPrimary
-                    else -> Color.White
+                    else -> colors.onPrimary
                 }
                 val btnShape = RoundedCornerShape(OrbitSpacing.md)
 
@@ -513,7 +513,7 @@ private fun QuestionDecisionCard(
                                     Icon(
                                         imageVector = Icons.Outlined.Check,
                                         contentDescription = null,
-                                        tint = Color.White,
+                                        tint = colors.onPrimary,
                                         modifier = Modifier.size(OrbitSpacing.md),
                                     )
                                 }
@@ -593,7 +593,7 @@ private fun QuestionDecisionCard(
                 Text(
                     text = "Submit",
                     style = typography.subheadSemiBold,
-                    color = if (canSubmit) Color.White else colors.fgMuted,
+                    color = if (canSubmit) colors.onPrimary else colors.fgMuted,
                 )
             }
         }

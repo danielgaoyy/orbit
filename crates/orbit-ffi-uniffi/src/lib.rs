@@ -8,7 +8,8 @@ use std::sync::Arc;
 use orbit_client_core::app_core::{
     AgentCardView, AgentTimelineDeltaView, AgentTimelineView, ClientProjectView,
     CoreEventSubscriber, CoreNotification, CreateAgentRequest, DirectoryListingView,
-    FleetOverviewView, GitReviewView, HostCardView, HostDetailView, OrbitAppCore, TimelineItemView,
+    FleetOverviewView, GitReviewView, HostCardView, HostDetailView, OrbitAppCore,
+    StagedAttachmentView, TimelineItemView,
 };
 use orbit_client_core::catalog::{
     default_effort_description as core_default_effort_description,
@@ -1846,6 +1847,23 @@ impl From<TerminalScreenView> for FfiTerminalScreen {
     }
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiStagedAttachment {
+    pub path: String,
+    pub filename: String,
+    pub size_bytes: u64,
+}
+
+impl From<StagedAttachmentView> for FfiStagedAttachment {
+    fn from(v: StagedAttachmentView) -> Self {
+        Self {
+            path: v.path,
+            filename: v.filename,
+            size_bytes: v.size_bytes,
+        }
+    }
+}
+
 // --- Pure-Rust Catalog & Formatting Helpers Exported to Swift & Kotlin ---
 
 #[uniffi::export]
@@ -2263,6 +2281,21 @@ impl OrbitMobileCore {
 
     pub fn workspace_files(&self, host_id: String, cwd: String) -> Vec<String> {
         self.inner.workspace_files(&host_id, &cwd)
+    }
+
+    pub fn stage_attachment(
+        &self,
+        host_id: String,
+        filename: String,
+        mime_type: Option<String>,
+        bytes: Vec<u8>,
+    ) -> Result<FfiStagedAttachment, FfiOrbitError> {
+        self.inner
+            .stage_attachment(&host_id, &filename, mime_type.as_deref(), bytes)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
     }
 
     pub fn start_terminal(&self, host_id: String, cwd: String, cols: u16, rows: u16) {

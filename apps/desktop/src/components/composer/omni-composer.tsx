@@ -38,6 +38,7 @@ import {
   SlashCommandMenu,
   filterSlashCommands,
 } from "@/components/composer/slash-menu";
+import { modSymbol } from "@/lib/keybindings";
 import {
   type GitFileEntry,
   type SessionMode,
@@ -105,6 +106,16 @@ export const OmniComposer = memo(function OmniComposer({
           ?.is_running,
     ),
   );
+  const isAwaitingPermission = useOrbitSelector((s) =>
+    Boolean(
+      !s.isDraftNewSession &&
+        s.selectedHostId &&
+        s.selectedAgentId &&
+        s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
+          ?.is_awaiting_permission,
+    ),
+  );
+  const isTurnBusy = isRunning || isAwaitingPermission;
   const activeAgentMode = useOrbitSelector((s) => {
     if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return null;
     return (
@@ -282,6 +293,9 @@ export const OmniComposer = memo(function OmniComposer({
     setMenuHighlightIdx(0);
 
     switch (cmd.id) {
+      case "btw":
+        orbitActions.openSideQuestionTab();
+        return;
       case "plan":
         orbitActions.setSlashDirective("plan");
         break;
@@ -298,8 +312,14 @@ export const OmniComposer = memo(function OmniComposer({
         orbitActions.setSlashDirective("review");
         break;
       case "diff":
-        orbitActions.toggleInspector();
+        orbitActions.toggleReviewTab();
         break;
+      case "files":
+        orbitActions.openFilesExplorerTab();
+        return;
+      case "browser":
+        orbitActions.openBrowserTab();
+        return;
       case "compact":
         if (!isDraft && hasCurrentAgent) {
           orbitActions.setSlashDirective("compact");
@@ -314,14 +334,14 @@ export const OmniComposer = memo(function OmniComposer({
         orbitActions.setSlashDirective(cmd.id);
         break;
       case "terminal":
-        orbitActions.toggleTerminalDock();
-        break;
+        orbitActions.toggleTerminalTab();
+        return;
       case "new":
         orbitActions.startNewThreadDraft();
         break;
       case "settings":
         orbitActions.openSettings();
-        break;
+        return;
     }
 
     requestAnimationFrame(() => {
@@ -607,24 +627,20 @@ export const OmniComposer = memo(function OmniComposer({
       }
     }
 
-    if (e.key === "Enter" && e.altKey) {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       setHistoryCursor(null);
-      void orbitActions.submitComposer(true);
+      void orbitActions.submitComposer(isTurnBusy);
       return;
     }
 
     if (enterToSend) {
-      if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+      if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         setHistoryCursor(null);
         void orbitActions.submitComposer(false);
         return;
       }
-    } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      setHistoryCursor(null);
-      void orbitActions.submitComposer(false);
     }
   };
 
@@ -780,9 +796,7 @@ export const OmniComposer = memo(function OmniComposer({
                   aria-hidden="true"
                   className="text-foreground/45 pointer-events-none absolute top-[13px] right-[14px] left-[14px] truncate text-[15px] leading-[20px] select-none"
                 >
-                  {isRunning
-                    ? "Ask a follow-up, @ to mention, or ⌥↵ to steer"
-                    : "Ask anything, @ to mention, / for actions"}
+                  Ask anything, @ to mention, / for actions
                 </div>
               )}
 
@@ -903,7 +917,7 @@ export const OmniComposer = memo(function OmniComposer({
               <div className="flex shrink-0 items-center gap-1.5">
                 <ComposerModePicker mode={activeMode} onSelectMode={handleSelectMode} />
 
-                {isRunning && !hasPayload ? (
+                {isTurnBusy && !hasPayload ? (
                   <button
                     type="button"
                     title="Stop generation"
@@ -916,31 +930,11 @@ export const OmniComposer = memo(function OmniComposer({
                   >
                     <span className="size-[11px] rounded-[2.5px] bg-[#EF4444]" />
                   </button>
-                ) : isRunning && hasPayload ? (
-                  <div className="orbit-pill-enter flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      title="Interrupt and steer immediately (⌥↵)"
-                      onClick={() => void orbitActions.submitComposer(true)}
-                      className="border-border bg-secondary/85 text-foreground hover:bg-accent orbit-press inline-flex h-8.5 cursor-pointer items-center gap-1 rounded-full border px-3 text-[13px] font-medium"
-                    >
-                      <Zap className="size-3.5" />
-                      <span>Steer</span>
-                    </button>
-                    <button
-                      type="button"
-                      title="Queue follow-up"
-                      onClick={() => void orbitActions.submitComposer(false)}
-                      className="orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full bg-[#141416] text-white hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
-                    >
-                      <ArrowUp className="size-[17px] stroke-[2.2]" />
-                    </button>
-                  </div>
                 ) : (
                   <button
                     type="button"
                     disabled={!hasPayload}
-                    title="Send"
+                    title={isTurnBusy ? `Queue follow-up (${modSymbol()}↵ to steer)` : "Send"}
                     onClick={() => void orbitActions.submitComposer(false)}
                     className={cn(
                       "orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full",

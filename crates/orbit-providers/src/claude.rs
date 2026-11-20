@@ -1090,7 +1090,7 @@ fn map_claude_tool_detail(
                 input.get("old_string").and_then(|v| v.as_str()),
                 input.get("new_string").and_then(|v| v.as_str()),
             ) {
-                (Some(o), Some(n)) => Some(format!("--- old\n+++ new\n-{o}\n+{n}")),
+                (Some(o), Some(n)) => crate::build_compact_unified_diff(&path, o, n),
                 _ => None,
             };
             ToolCallDetail::FileEdit {

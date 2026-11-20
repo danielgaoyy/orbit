@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 
 use crate::attachments::{build_agy_prompt_blocks, is_path_within_dir};
 use crate::driver::{
@@ -96,9 +97,24 @@ struct PendingPerm {
     raw_questions: Vec<QuestionItem>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElicitationOptionMapping {
+    label: String,
+    wire_value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElicitationFieldMeta {
+    key: String,
+    is_multi: bool,
+    options: Vec<ElicitationOptionMapping>,
+    other_option_value: Option<String>,
+    other_field_key: Option<String>,
+}
+
 struct PendingElicitation {
     rpc_id: Value,
-    field_keys: Vec<(String, bool)>, // (key, is_multi_select)
+    fields: Vec<ElicitationFieldMeta>,
 }
 
 #[derive(Default)]
@@ -202,6 +218,7 @@ async fn run_agy_actor(
                 .await
                 .is_err()
             {
+                warn!(agent_id = %cfg.agent_id, "Antigravity ACP initialize failed");
                 let _ = evt_tx
                     .send(DriverEvent::StatusChanged(AgentStatus::Error {
                         message: "Antigravity ACP initialize failed".into(),
@@ -423,9 +440,11 @@ async fn run_agy_actor(
 
     // Post-turn autonomous wakeup (`transcript_full.jsonl`) state
     let mut transcript_monitor = AgyTranscriptMonitor::new(&session_id);
-    let mut suppress_catchup_until_user_chunk = false;
+    // Skip any historical steps already recorded on disk when attaching/resuming
+    transcript_monitor.sync_silent();
     let mut synthesized_wakeup_tools: HashSet<String> = HashSet::new();
     let mut autonomous_turn_id: Option<String> = None;
+    let mut last_ask_question_raw: Option<Vec<QuestionItem>> = None;
     let mut transcript_poll = tokio::time::interval(Duration::from_millis(200));
 
     loop {
@@ -433,41 +452,56 @@ async fn run_agy_actor(
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
-                    DriverCommand::SendPrompt { turn_id, prompt, behavior } => {
-                        if active_turn_id.is_some() {
-                            match behavior {
-                                ActiveTurnBehavior::Queue => {
-                                    pending_prompts.push_back((turn_id, prompt));
-                                }
-                                ActiveTurnBehavior::Steer => {
-                                    pending_prompts.push_front((turn_id, prompt));
-                                }
-                                ActiveTurnBehavior::Interrupt => {
-                                    let cancel = json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "session/cancel",
-                                        "params": { "sessionId": session_id }
+                    DriverCommand::SendPrompt {
+                        turn_id,
+                        prompt,
+                        behavior,
+                    } => {
+                        if active_prompt_rpc_key.is_some() || active_turn_id.is_some() {
+                            if !pending_perms.is_empty() || !pending_elicits.is_empty() {
+                                let _ = evt_tx
+                                    .send(DriverEvent::Notice {
+                                        level: "warning".into(),
+                                        message: "Waiting for your permission or question response above. Please answer it (or stop the current turn) before sending a new prompt.".into(),
                                     })
-                                    .to_string();
-                                    let _ = shim.write_stdin_line(cancel).await;
-                                    pending_prompts.push_front((turn_id, prompt));
+                                    .await;
+                            } else {
+                                match behavior {
+                                    ActiveTurnBehavior::Queue => {
+                                        pending_prompts.push_back((turn_id, prompt));
+                                    }
+                                    ActiveTurnBehavior::Steer => {
+                                        pending_prompts.push_front((turn_id, prompt));
+                                    }
+                                    ActiveTurnBehavior::Interrupt => {
+                                        let cancel = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "session/cancel",
+                                            "params": { "sessionId": session_id }
+                                        })
+                                        .to_string();
+                                        let _ = shim.write_stdin_line(cancel).await;
+                                        pending_prompts.push_front((turn_id, prompt));
+                                    }
                                 }
                             }
                             continue;
                         }
 
                         if dispatch_agy_prompt(
-                            &cfg,
+                            &shim,
                             &session_id,
-                            &turn_id,
-                            &prompt,
+                            cfg.attachments_dir.as_deref(),
                             &mut next_rpc_id,
                             &mut active_turn_id,
                             &mut active_prompt_rpc_key,
+                            &mut autonomous_turn_id,
+                            &mut transcript_monitor,
                             &mut seg_state,
-                            &mut suppress_catchup_until_user_chunk,
-                            &shim,
+                            &mut last_ask_question_raw,
                             &evt_tx,
+                            turn_id,
+                            prompt,
                         )
                         .await
                         .is_err()
@@ -476,6 +510,31 @@ async fn run_agy_actor(
                         }
                     }
                     DriverCommand::Interrupt => {
+                        for (_, p) in pending_perms.drain() {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": p.rpc_id,
+                                "result": {
+                                    "outcome": {
+                                        "outcome": "cancelled"
+                                    }
+                                }
+                            })
+                            .to_string();
+                            let _ = shim.write_stdin_line(resp).await;
+                        }
+                        for (_, el) in pending_elicits.drain() {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": el.rpc_id,
+                                "result": {
+                                    "action": "cancel"
+                                }
+                            })
+                            .to_string();
+                            let _ = shim.write_stdin_line(resp).await;
+                        }
+                        last_ask_question_raw = None;
                         let cancel = json!({
                             "jsonrpc": "2.0",
                             "method": "session/cancel",
@@ -600,21 +659,7 @@ async fn run_agy_actor(
                             .to_string();
                             let _ = shim.write_stdin_line(resp).await;
                         } else if let Some(el) = pending_elicits.remove(&request_id) {
-                            let mut content = serde_json::Map::new();
-                            for (idx, (key, is_multi)) in el.field_keys.iter().enumerate() {
-                                let vals = answers.get(idx).cloned().unwrap_or_default();
-                                if *is_multi {
-                                    content.insert(
-                                        key.clone(),
-                                        Value::Array(vals.into_iter().map(Value::String).collect()),
-                                    );
-                                } else {
-                                    content.insert(
-                                        key.clone(),
-                                        Value::String(vals.into_iter().next().unwrap_or_default()),
-                                    );
-                                }
-                            }
+                            let content = build_elicitation_response_content(&el.fields, &answers);
                             let resp = json!({
                                 "jsonrpc": "2.0",
                                 "id": el.rpc_id,
@@ -655,6 +700,9 @@ async fn run_agy_actor(
                                 let key = rid.as_key();
                                 if active_prompt_rpc_key.as_deref() == Some(key.as_str()) {
                                     active_prompt_rpc_key = None;
+                                    pending_perms.clear();
+                                    pending_elicits.clear();
+                                    last_ask_question_raw = None;
                                     seg_state.active_msg_id = None;
                                     seg_state.active_thought_id = None;
                                     // Finalize any streaming message buffers
@@ -670,12 +718,42 @@ async fn run_agy_actor(
                                     active_turn_id = None;
                                     // Fast-forward transcript reader past foreground steps
                                     transcript_monitor.sync_silent();
-                                    if let Some(err_obj) = val.get("error") {
+                                    // Drain queued / steered / interrupted-replacement prompt
+                                    if let Some((next_turn_id, next_prompt)) =
+                                        pending_prompts.pop_front()
+                                    {
+                                        if dispatch_agy_prompt(
+                                            &shim,
+                                            &session_id,
+                                            cfg.attachments_dir.as_deref(),
+                                            &mut next_rpc_id,
+                                            &mut active_turn_id,
+                                            &mut active_prompt_rpc_key,
+                                            &mut autonomous_turn_id,
+                                            &mut transcript_monitor,
+                                            &mut seg_state,
+                                            &mut last_ask_question_raw,
+                                            &evt_tx,
+                                            next_turn_id,
+                                            next_prompt,
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                    } else if let Some(err_obj) = val.get("error") {
                                         let msg = err_obj
                                             .get("message")
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("Antigravity turn failed")
                                             .to_string();
+                                        warn!(
+                                            agent_id = %cfg.agent_id,
+                                            session_id = %session_id,
+                                            error = %msg,
+                                            "Antigravity ACP session/prompt failed"
+                                        );
                                         let _ = evt_tx
                                             .send(DriverEvent::StatusChanged(AgentStatus::Error {
                                                 message: msg,
@@ -687,39 +765,20 @@ async fn run_agy_actor(
                                             .send(DriverEvent::StatusChanged(AgentStatus::Idle))
                                             .await;
                                     }
-
-                                    // Drain queued / steered / interrupted-replacement prompt
-                                    if let Some((next_tid, next_prompt)) = pending_prompts.pop_front()
-                                        && dispatch_agy_prompt(
-                                            &cfg,
-                                            &session_id,
-                                            &next_tid,
-                                            &next_prompt,
-                                            &mut next_rpc_id,
-                                            &mut active_turn_id,
-                                            &mut active_prompt_rpc_key,
-                                            &mut seg_state,
-                                            &mut suppress_catchup_until_user_chunk,
-                                            &shim,
-                                            &evt_tx,
-                                        )
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
                                 }
                             }
                         } else if !has_id && method == Some("session/update") {
-                            if let Some(update) = val.pointer("/params/update") {
+                            if !(active_turn_id.is_none() && autonomous_turn_id.is_some())
+                                && let Some(update) = val.pointer("/params/update")
+                            {
                                 handle_acp_session_update(
                                     &cfg.agent_id,
                                     update,
-                                    &mut suppress_catchup_until_user_chunk,
                                     &synthesized_wakeup_tools,
                                     &mut seg_state,
                                     &mut tool_cache,
                                     &mut subagent_monitors,
+                                    &mut last_ask_question_raw,
                                     &evt_tx,
                                 )
                                 .await;
@@ -739,6 +798,7 @@ async fn run_agy_actor(
                             handle_acp_elicitation_request(
                                 &val,
                                 &active_turn_id,
+                                last_ask_question_raw.as_deref(),
                                 &mut pending_elicits,
                                 &evt_tx,
                             )
@@ -746,6 +806,14 @@ async fn run_agy_actor(
                         }
                     }
                     ShimFrame::Exited { code } => {
+                        if code != Some(0) {
+                            warn!(
+                                agent_id = %cfg.agent_id,
+                                session_id = %session_id,
+                                exit_code = ?code,
+                                "Antigravity shim process exited"
+                            );
+                        }
                         let _ = evt_tx.send(DriverEvent::Exited { code }).await;
                         break;
                     }
@@ -800,6 +868,22 @@ async fn run_agy_actor(
                                     .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
                                     .await;
                             }
+                            WakeupStep::Failed { message } => {
+                                desc.status = ProviderSubagentStatus::Failed;
+                                desc.subtitle = Some(message);
+                                desc.updated_at = Utc::now();
+                                let _ = evt_tx
+                                    .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+                                    .await;
+                            }
+                            WakeupStep::Notice { level, message } => {
+                                let _ = evt_tx
+                                    .send(DriverEvent::ProviderSubagentTimeline {
+                                        subagent_id: sub_id.clone(),
+                                        payload: TimelinePayload::Notice { level, message },
+                                    })
+                                    .await;
+                            }
                             WakeupStep::Started { .. } => {}
                         }
                     }
@@ -812,7 +896,6 @@ async fn run_agy_actor(
                             WakeupStep::Started { source } => {
                                 let tid = format!("wakeup_{}", uuid::Uuid::new_v4().simple());
                                 autonomous_turn_id = Some(tid.clone());
-                                suppress_catchup_until_user_chunk = true;
                                 let _ = evt_tx
                                     .send(DriverEvent::StatusChanged(AgentStatus::AutonomousWakeup {
                                         turn_id: tid,
@@ -844,6 +927,33 @@ async fn run_agy_actor(
                                     })
                                     .await;
                             }
+                            WakeupStep::Notice { level, message } => {
+                                warn!(
+                                    agent_id = %cfg.agent_id,
+                                    session_id = %session_id,
+                                    level = %level,
+                                    notice = %message,
+                                    "Antigravity post-turn wakeup reported runtime warning"
+                                );
+                                let _ = evt_tx
+                                    .send(DriverEvent::Notice { level, message })
+                                    .await;
+                            }
+                            WakeupStep::Failed { message } => {
+                                warn!(
+                                    agent_id = %cfg.agent_id,
+                                    session_id = %session_id,
+                                    error = %message,
+                                    "Antigravity post-turn wakeup failed after retries"
+                                );
+                                autonomous_turn_id = None;
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                        message,
+                                        recoverable: true,
+                                    }))
+                                    .await;
+                            }
                             WakeupStep::Settled => {
                                 if autonomous_turn_id.take().is_some() {
                                     let _ = evt_tx
@@ -857,6 +967,55 @@ async fn run_agy_actor(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_agy_prompt(
+    shim: &orbit_shim::ShimClient,
+    session_id: &str,
+    attachments_dir: Option<&Path>,
+    next_rpc_id: &mut i64,
+    active_turn_id: &mut Option<String>,
+    active_prompt_rpc_key: &mut Option<String>,
+    autonomous_turn_id: &mut Option<String>,
+    transcript_monitor: &mut AgyTranscriptMonitor,
+    seg_state: &mut AgyStreamSegmentState,
+    last_ask_question_raw: &mut Option<Vec<QuestionItem>>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+    turn_id: String,
+    prompt: String,
+) -> Result<(), ()> {
+    if autonomous_turn_id.take().is_some() {
+        transcript_monitor.sync_silent();
+    }
+    *active_turn_id = Some(turn_id.clone());
+    *seg_state = AgyStreamSegmentState {
+        turn_tag: turn_id.clone(),
+        ..AgyStreamSegmentState::default()
+    };
+    *last_ask_question_raw = None;
+
+    let _ = evt_tx
+        .send(DriverEvent::StatusChanged(AgentStatus::Running { turn_id }))
+        .await;
+
+    let id = *next_rpc_id;
+    *next_rpc_id += 1;
+    let key = RpcId::Num(id).as_key();
+    *active_prompt_rpc_key = Some(key);
+
+    let prompt_blocks = build_agy_prompt_blocks(&prompt, attachments_dir);
+    let req = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": session_id,
+            "prompt": prompt_blocks
+        }
+    })
+    .to_string();
+    shim.write_stdin_line(req).await.map_err(|_| ())
 }
 
 async fn send_acp_req(
@@ -928,61 +1087,14 @@ async fn wait_rpc_during_boot(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_agy_prompt(
-    cfg: &SessionLaunchConfig,
-    session_id: &str,
-    turn_id: &str,
-    prompt: &str,
-    next_rpc_id: &mut i64,
-    active_turn_id: &mut Option<String>,
-    active_prompt_rpc_key: &mut Option<String>,
-    seg_state: &mut AgyStreamSegmentState,
-    suppress_catchup_until_user_chunk: &mut bool,
-    shim: &orbit_shim::ShimClient,
-    evt_tx: &mpsc::Sender<DriverEvent>,
-) -> Result<(), ()> {
-    *active_turn_id = Some(turn_id.to_string());
-    *seg_state = AgyStreamSegmentState {
-        turn_tag: turn_id.to_string(),
-        ..AgyStreamSegmentState::default()
-    };
-    if prompt.trim_start().starts_with('/') {
-        *suppress_catchup_until_user_chunk = false;
-    }
-
-    let _ = evt_tx
-        .send(DriverEvent::StatusChanged(AgentStatus::Running {
-            turn_id: turn_id.to_string(),
-        }))
-        .await;
-
-    let id = *next_rpc_id;
-    *next_rpc_id += 1;
-    *active_prompt_rpc_key = Some(RpcId::Num(id).as_key());
-
-    let prompt_blocks = build_agy_prompt_blocks(prompt, cfg.attachments_dir.as_deref());
-    let req = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "session/prompt",
-        "params": {
-            "sessionId": session_id,
-            "prompt": prompt_blocks
-        }
-    })
-    .to_string();
-    shim.write_stdin_line(req).await.map_err(|_| ())
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn handle_acp_session_update(
     parent_agent_id: &str,
     update: &Value,
-    suppress_catchup: &mut bool,
     synthesized_wakeup_tools: &HashSet<String>,
     seg_state: &mut AgyStreamSegmentState,
     tool_cache: &mut HashMap<String, ToolCallDetail>,
     subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    last_ask_question_raw: &mut Option<Vec<QuestionItem>>,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) {
     let Some(kind) = update.get("sessionUpdate").and_then(|v| v.as_str()) else {
@@ -990,10 +1102,6 @@ async fn handle_acp_session_update(
     };
 
     if kind == "user_message_chunk" {
-        *suppress_catchup = false;
-        return;
-    }
-    if *suppress_catchup {
         return;
     }
 
@@ -1012,6 +1120,19 @@ async fn handle_acp_session_update(
             if chunk.is_empty() {
                 return;
             }
+            let (warnings, cleaned_text) = split_acp_runtime_warnings(chunk);
+            for warning_msg in warnings {
+                warn!(notice = %warning_msg, "Antigravity ACP stream warning");
+                let _ = evt_tx
+                    .send(DriverEvent::Notice {
+                        level: "warning".into(),
+                        message: warning_msg,
+                    })
+                    .await;
+            }
+            if cleaned_text.is_empty() {
+                return;
+            }
             seg_state.active_thought_id = None;
             let mid = if let Some(explicit) = update
                 .get("messageId")
@@ -1028,7 +1149,7 @@ async fn handle_acp_session_update(
                 id
             };
             let entry = seg_state.msg_accum.entry(mid.clone()).or_default();
-            entry.push_str(chunk);
+            entry.push_str(&cleaned_text);
             let _ = evt_tx
                 .send(DriverEvent::AssistantText {
                     item_id: mid,
@@ -1097,6 +1218,13 @@ async fn handle_acp_session_update(
                         streaming: false,
                     })
                     .await;
+            }
+            if let Some(q_arr) = update
+                .pointer("/rawInput/questions")
+                .and_then(|v| v.as_array())
+                && !q_arr.is_empty()
+            {
+                *last_ask_question_raw = Some(parse_raw_question_items(q_arr));
             }
             let status = match update.get("status").and_then(|v| v.as_str()) {
                 Some("completed") => ToolCallStatus::Completed,
@@ -1210,7 +1338,7 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
                     if item.get("type").and_then(|t| t.as_str()) == Some("diff") {
                         let old_t = item.get("oldText").and_then(|v| v.as_str()).unwrap_or("");
                         let new_t = item.get("newText").and_then(|v| v.as_str()).unwrap_or("");
-                        Some(format!("--- old\n+++ new\n-{old_t}\n+{new_t}"))
+                        crate::build_compact_unified_diff(&path, old_t, new_t)
                     } else {
                         None
                     }
@@ -1273,6 +1401,52 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
     }
 }
 
+/// Parses structured `ask_question` raw input items shared by permission-wrapped
+/// questions and `session/update` tool-call fallbacks.
+fn parse_raw_question_items(q_arr: &[Value]) -> Vec<QuestionItem> {
+    let mut parsed_questions = Vec::with_capacity(q_arr.len());
+    for (i, q) in q_arr.iter().enumerate() {
+        let question = q
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let opts = q
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| {
+                        item.as_str()
+                            .or_else(|| item.get("label").and_then(|l| l.as_str()))
+                            .or_else(|| item.get("value").and_then(|l| l.as_str()))
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let multi = q
+            .get("is_multi_select")
+            .or_else(|| q.get("multiSelect"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let header = q
+            .get("header")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|h| !h.is_empty() && *h != question.trim())
+            .map(ToOwned::to_owned);
+        parsed_questions.push(QuestionItem {
+            id: format!("q{i}"),
+            header,
+            question,
+            options: opts,
+            is_multi_select: multi,
+        });
+    }
+    parsed_questions
+}
+
 async fn handle_acp_permission_request(
     val: &Value,
     mode: &SessionMode,
@@ -1298,42 +1472,7 @@ async fn handle_acp_permission_request(
     if let Some(q_arr) = raw_questions_arr
         && !q_arr.is_empty()
     {
-        let mut parsed_questions = Vec::new();
-        for (i, q) in q_arr.iter().enumerate() {
-            let question = q
-                .get("question")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let opts = q
-                .get("options")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|item| {
-                            item.as_str()
-                                .or_else(|| item.get("label").and_then(|l| l.as_str()))
-                                .map(ToOwned::to_owned)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let multi = q
-                .get("is_multi_select")
-                .or_else(|| q.get("multiSelect"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            parsed_questions.push(QuestionItem {
-                id: format!("q{i}"),
-                header: q
-                    .get("header")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
-                question,
-                options: opts,
-                is_multi_select: multi,
-            });
-        }
+        let parsed_questions = parse_raw_question_items(q_arr);
         let req_id = format!("q_{}", uuid::Uuid::new_v4().simple());
         pending_perms.insert(
             req_id.clone(),
@@ -1444,63 +1583,330 @@ async fn handle_acp_permission_request(
         .await;
 }
 
-async fn handle_acp_elicitation_request(
-    val: &Value,
-    active_turn_id: &Option<String>,
-    pending_elicits: &mut HashMap<String, PendingElicitation>,
-    evt_tx: &mpsc::Sender<DriverEvent>,
-) {
-    let rpc_id = val["id"].clone();
-    let Some(props) = val
-        .pointer("/params/requestedSchema/properties")
-        .and_then(|v| v.as_object())
-    else {
-        return;
-    };
+fn schema_scalar_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
 
-    let mut questions = Vec::new();
-    let mut field_keys = Vec::new();
-    for (key, prop) in props {
-        if key.ends_with("_other") {
-            continue;
-        }
-        let is_multi = prop.get("type").and_then(|v| v.as_str()) == Some("array");
-        let enum_arr = if is_multi {
-            prop.pointer("/items/enum").and_then(|v| v.as_array())
-        } else {
-            prop.get("enum").and_then(|v| v.as_array())
-        };
-        let options: Vec<String> = enum_arr
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_str())
-                    .filter(|s| *s != "Other")
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let q_text = prop
-            .get("description")
-            .or_else(|| prop.get("title"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(key)
-            .to_string();
-
-        field_keys.push((key.clone(), is_multi));
-        questions.push(QuestionItem {
-            id: key.clone(),
-            header: prop
+/// Parses MCP/ACP `oneOf` / `anyOf` option entries into `(label, wire_value)` pairs.
+fn parse_schema_choice_entries(arr: &[Value]) -> Vec<ElicitationOptionMapping> {
+    arr.iter()
+        .filter_map(|item| {
+            let wire_val = item
+                .get("const")
+                .and_then(schema_scalar_to_string)
+                .or_else(|| {
+                    item.get("enum")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(schema_scalar_to_string)
+                })?;
+            let label = item
                 .get("title")
+                .or_else(|| item.get("description"))
                 .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned),
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| wire_val.clone());
+            Some(ElicitationOptionMapping {
+                label,
+                wire_value: wire_val,
+            })
+        })
+        .collect()
+}
+
+/// Parses JSON Schema `enum` + optional legacy `enumNames` arrays into option mappings.
+fn parse_schema_enum_entries(
+    enum_arr: &[Value],
+    names_arr: Option<&[Value]>,
+) -> Vec<ElicitationOptionMapping> {
+    enum_arr
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, val)| {
+            let wire_val = schema_scalar_to_string(val)?;
+            let label = names_arr
+                .and_then(|names| names.get(idx))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| wire_val.clone());
+            Some(ElicitationOptionMapping {
+                label,
+                wire_value: wire_val,
+            })
+        })
+        .collect()
+}
+
+/// Extracts selectable options from either multi-select (`items.anyOf` / `items.oneOf` / `items.enum`)
+/// or single-select (`oneOf` / `anyOf` / `enum`) JSON Schema property definitions.
+fn extract_elicitation_options(prop: &Value, is_multi: bool) -> Vec<ElicitationOptionMapping> {
+    if is_multi {
+        if let Some(arr) = prop
+            .pointer("/items/anyOf")
+            .or_else(|| prop.pointer("/items/oneOf"))
+            .and_then(|v| v.as_array())
+        {
+            let parsed = parse_schema_choice_entries(arr);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+        if let Some(arr) = prop.pointer("/items/enum").and_then(|v| v.as_array()) {
+            let names = prop
+                .pointer("/items/enumNames")
+                .and_then(|v| v.as_array())
+                .map(Vec::as_slice);
+            let parsed = parse_schema_enum_entries(arr, names);
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+
+    if let Some(arr) = prop
+        .get("oneOf")
+        .or_else(|| prop.get("anyOf"))
+        .and_then(|v| v.as_array())
+    {
+        let parsed = parse_schema_choice_entries(arr);
+        if !parsed.is_empty() {
+            return parsed;
+        }
+    }
+
+    if let Some(arr) = prop.get("enum").and_then(|v| v.as_array()) {
+        let names = prop
+            .get("enumNames")
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice);
+        return parse_schema_enum_entries(arr, names);
+    }
+
+    Vec::new()
+}
+
+/// Computes a natural sort key (`q1`, `q2`, ..., `q10`) so `BTreeMap`-backed schema maps keep field order.
+fn natural_field_sort_key(key: &str) -> (&str, Option<u64>, &str) {
+    let digit_start = key
+        .rfind(|c: char| !c.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    let prefix = &key[..digit_start];
+    let num = (!key[digit_start..].is_empty())
+        .then(|| key[digit_start..].parse::<u64>().ok())
+        .flatten();
+    (prefix, num, key)
+}
+
+/// Parses an ACP `elicitation/create` parameter object into Orbit `QuestionItem`s plus field metadata
+/// needed to map user selections and custom answers back to the exact schema wire format.
+fn parse_elicitation_request(
+    params: &Value,
+    fallback_questions: Option<&[QuestionItem]>,
+) -> Option<(Vec<QuestionItem>, Vec<ElicitationFieldMeta>)> {
+    let props = params
+        .pointer("/requestedSchema/properties")
+        .and_then(|v| v.as_object())?;
+
+    let mut required_order: HashMap<&str, usize> = HashMap::new();
+    if let Some(req_arr) = params
+        .pointer("/requestedSchema/required")
+        .and_then(|v| v.as_array())
+    {
+        for (idx, item) in req_arr.iter().enumerate() {
+            if let Some(k) = item.as_str() {
+                required_order.entry(k).or_insert(idx);
+            }
+        }
+    }
+
+    let mut base_keys: Vec<&str> = props
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !k.ends_with("_other"))
+        .collect();
+    base_keys.sort_by_key(|k| {
+        (
+            required_order.get(k).copied().unwrap_or(usize::MAX),
+            natural_field_sort_key(k),
+        )
+    });
+
+    let mut questions = Vec::with_capacity(base_keys.len());
+    let mut fields = Vec::with_capacity(base_keys.len());
+
+    for (idx, key) in base_keys.iter().enumerate() {
+        let Some(prop) = props.get(*key) else {
+            continue;
+        };
+        let is_multi = prop.get("type").and_then(|v| v.as_str()) == Some("array");
+        let title = prop
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let desc = prop
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let (header, q_text) = match (title, desc) {
+            (Some(t), Some(d)) if t != d => (Some(t.to_string()), d.to_string()),
+            _ => (None, desc.or(title).unwrap_or(key).to_string()),
+        };
+
+        let mut raw_opts = extract_elicitation_options(prop, is_multi);
+        if raw_opts.is_empty()
+            && let Some(fb) = fallback_questions
+            && let Some(matched) = fb
+                .iter()
+                .find(|item| !item.question.trim().is_empty() && item.question.trim() == q_text)
+                .or_else(|| (fb.len() == base_keys.len()).then(|| &fb[idx]))
+        {
+            raw_opts = matched
+                .options
+                .iter()
+                .map(|opt| ElicitationOptionMapping {
+                    label: opt.clone(),
+                    wire_value: opt.clone(),
+                })
+                .collect();
+        }
+
+        let other_key = format!("{key}_other");
+        let mut other_option_value = None;
+        let mut other_field_key = None;
+        if props.contains_key(&other_key) {
+            other_field_key = Some(other_key);
+            let mut filtered = Vec::with_capacity(raw_opts.len());
+            for opt in raw_opts {
+                let is_other_sentinel = opt.wire_value.eq_ignore_ascii_case("other")
+                    || opt.wire_value == "__other__"
+                    || opt.label.eq_ignore_ascii_case("other");
+                if is_other_sentinel {
+                    if other_option_value.is_none() {
+                        other_option_value = Some(opt.wire_value);
+                    }
+                } else {
+                    filtered.push(opt);
+                }
+            }
+            raw_opts = filtered;
+        }
+
+        let display_options = raw_opts.iter().map(|o| o.label.clone()).collect();
+        fields.push(ElicitationFieldMeta {
+            key: (*key).to_string(),
+            is_multi,
+            options: raw_opts,
+            other_option_value,
+            other_field_key,
+        });
+        questions.push(QuestionItem {
+            id: (*key).to_string(),
+            header,
             question: q_text,
-            options,
+            options: display_options,
             is_multi_select: is_multi,
         });
     }
 
+    (!questions.is_empty()).then_some((questions, fields))
+}
+
+/// Converts user UI answers (labels or free-text) into the wire `content` object expected by ACP
+/// `elicitation/create`, routing free-text through `<key>_other` when declared in the schema.
+fn build_elicitation_response_content(
+    fields: &[ElicitationFieldMeta],
+    answers: &[Vec<String>],
+) -> serde_json::Map<String, Value> {
+    let mut content = serde_json::Map::new();
+    for (idx, field) in fields.iter().enumerate() {
+        let raw_vals = answers.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+        let mut mapped_values: Vec<String> = Vec::new();
+        let mut custom_texts: Vec<String> = Vec::new();
+
+        for ans in raw_vals {
+            let trimmed = ans.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some(found) = field
+                .options
+                .iter()
+                .find(|o| o.wire_value == trimmed || o.label == trimmed)
+            {
+                if !mapped_values.contains(&found.wire_value) {
+                    mapped_values.push(found.wire_value.clone());
+                }
+            } else {
+                custom_texts.push(trimmed.to_string());
+            }
+        }
+
+        if !custom_texts.is_empty() {
+            let joined_custom = custom_texts.join(", ");
+            if let (Some(other_val), Some(other_key)) =
+                (&field.other_option_value, &field.other_field_key)
+            {
+                if !field.is_multi {
+                    mapped_values.clear();
+                }
+                if !mapped_values.contains(other_val) {
+                    mapped_values.push(other_val.clone());
+                }
+                content.insert(other_key.clone(), Value::String(joined_custom));
+            } else if field.is_multi {
+                for c in custom_texts {
+                    if !mapped_values.contains(&c) {
+                        mapped_values.push(c);
+                    }
+                }
+            } else {
+                mapped_values.clear();
+                mapped_values.push(joined_custom);
+            }
+        }
+
+        if field.is_multi {
+            content.insert(
+                field.key.clone(),
+                Value::Array(mapped_values.into_iter().map(Value::String).collect()),
+            );
+        } else {
+            content.insert(
+                field.key.clone(),
+                Value::String(mapped_values.into_iter().next().unwrap_or_default()),
+            );
+        }
+    }
+    content
+}
+
+async fn handle_acp_elicitation_request(
+    val: &Value,
+    active_turn_id: &Option<String>,
+    fallback_questions: Option<&[QuestionItem]>,
+    pending_elicits: &mut HashMap<String, PendingElicitation>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let rpc_id = val["id"].clone();
+    let Some((questions, fields)) = parse_elicitation_request(&val["params"], fallback_questions)
+    else {
+        return;
+    };
+
     let req_id = format!("elicit_{}", uuid::Uuid::new_v4().simple());
-    pending_elicits.insert(req_id.clone(), PendingElicitation { rpc_id, field_keys });
+    pending_elicits.insert(req_id.clone(), PendingElicitation { rpc_id, fields });
 
     let _ = evt_tx
         .send(DriverEvent::StatusChanged(
@@ -1555,7 +1961,232 @@ enum WakeupStep {
         status: ToolCallStatus,
         detail: ToolCallDetail,
     },
+    Notice {
+        level: String,
+        message: String,
+    },
+    Failed {
+        message: String,
+    },
     Settled,
+}
+
+const WAKEUP_ERROR_STALL_TIMEOUT: Duration = Duration::from_secs(90);
+const WAKEUP_ERROR_EXHAUSTED_TIMEOUT: Duration = Duration::from_secs(15);
+const WAKEUP_ERROR_EXHAUSTED_COUNT: u32 = 8;
+
+/// Split provider-injected runtime warning lines (e.g. `\n⚠ API error (attempt 1): ...` or
+/// `\n⚠ The stream was interrupted...`) out of an ACP `agent_message_chunk` so they surface as
+/// visible `Notice` alerts rather than getting merged/folded as assistant prose.
+fn split_acp_runtime_warnings(chunk: &str) -> (Vec<String>, String) {
+    if !chunk.contains('⚠') {
+        return (Vec::new(), chunk.to_string());
+    }
+
+    let mut warnings = Vec::new();
+    let mut kept_lines = Vec::new();
+
+    for segment in chunk.split_inclusive('\n') {
+        let trimmed = segment.trim();
+        if let Some(rest) = trimmed.strip_prefix('⚠') {
+            let clean = rest.trim();
+            if is_acp_runtime_warning_body(clean) {
+                warnings.push(clean.to_string());
+                continue;
+            }
+        }
+        kept_lines.push(segment);
+    }
+
+    if warnings.is_empty() {
+        return (Vec::new(), chunk.to_string());
+    }
+
+    let kept = kept_lines.concat();
+    if kept.trim().is_empty() {
+        (warnings, String::new())
+    } else {
+        (warnings, kept)
+    }
+}
+
+fn is_acp_runtime_warning_body(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.starts_with("api error")
+        || lower.starts_with("the stream was interrupted")
+        || lower.starts_with("rate limit")
+        || lower.starts_with("request failed")
+        || lower.starts_with("connection ")
+        || lower.starts_with("network ")
+        || lower.starts_with("retrying")
+        || lower.starts_with("error:")
+}
+
+/// Unwrap double-encoded JSON string arguments emitted in `transcript.jsonl` `tool_calls[].args`.
+fn unquote_transcript_arg(val: &Value) -> Option<String> {
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        if trimmed.starts_with('"')
+            && trimmed.ends_with('"')
+            && trimmed.len() >= 2
+            && let Ok(parsed) = serde_json::from_str::<String>(trimmed)
+        {
+            return Some(parsed);
+        }
+        return Some(s.to_string());
+    }
+    if val.is_number() || val.is_boolean() {
+        return Some(val.to_string());
+    }
+    None
+}
+
+fn transcript_arg_str(args: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let obj = args?.as_object()?;
+    for key in keys {
+        if let Some(val) = obj.get(*key).and_then(unquote_transcript_arg)
+            && !val.trim().is_empty()
+        {
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn transcript_arg_u32(args: Option<&Value>, keys: &[&str]) -> Option<u32> {
+    let obj = args?.as_object()?;
+    for key in keys {
+        if let Some(v) = obj.get(*key) {
+            if let Some(n) = v.as_u64() {
+                return u32::try_from(n).ok();
+            }
+            if let Some(s) = unquote_transcript_arg(v)
+                && let Ok(n) = s.trim().parse::<u32>()
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn map_transcript_tool_detail(tool_name: &str, args: Option<&Value>) -> ToolCallDetail {
+    let lower = tool_name.to_ascii_lowercase();
+
+    if matches!(
+        lower.as_str(),
+        "run_command" | "execute_command" | "bash" | "shell" | "terminal"
+    ) {
+        let cmd = transcript_arg_str(args, &["CommandLine", "command", "cmd"])
+            .unwrap_or_else(|| tool_name.to_string());
+        let cwd = transcript_arg_str(args, &["Cwd", "cwd"]);
+        return ToolCallDetail::Shell {
+            command: cmd,
+            cwd,
+            exit_code: None,
+            output_preview: None,
+        };
+    }
+
+    if matches!(lower.as_str(), "read_file" | "view_file" | "open_file") {
+        let path = transcript_arg_str(args, &["Path", "AbsolutePath", "file_path", "path"])
+            .unwrap_or_else(|| tool_name.to_string());
+        let start_line = transcript_arg_u32(args, &["StartLine", "start_line", "offset"]);
+        let end_line = transcript_arg_u32(args, &["EndLine", "end_line"]);
+        return ToolCallDetail::FileRead {
+            path,
+            start_line,
+            end_line,
+        };
+    }
+
+    if matches!(
+        lower.as_str(),
+        "edit_file"
+            | "write_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "write_to_file"
+    ) {
+        let path = transcript_arg_str(args, &["Path", "TargetFile", "file_path", "path"])
+            .unwrap_or_else(|| tool_name.to_string());
+        let unified_diff = match (
+            transcript_arg_str(args, &["Target", "old_string"]),
+            transcript_arg_str(args, &["Replacement", "new_string", "Content"]),
+        ) {
+            (Some(old_t), Some(new_t)) => crate::build_compact_unified_diff(&path, &old_t, &new_t),
+            (None, Some(new_t)) if lower.starts_with("write") => {
+                crate::build_compact_unified_diff(&path, "", &new_t)
+            }
+            _ => None,
+        };
+        return ToolCallDetail::FileEdit { path, unified_diff };
+    }
+
+    if matches!(
+        lower.as_str(),
+        "search_web" | "grep_search" | "find_by_name" | "grep" | "glob" | "search"
+    ) {
+        let query = transcript_arg_str(args, &["query", "Query", "Pattern", "pattern"])
+            .unwrap_or_else(|| tool_name.to_string());
+        let scope = transcript_arg_str(
+            args,
+            &["domain", "SearchPath", "SearchDirectory", "path", "scope"],
+        );
+        return ToolCallDetail::Search { query, scope };
+    }
+
+    if lower.contains("subagent") {
+        let role = transcript_arg_str(args, &["Role", "TypeName", "role"])
+            .unwrap_or_else(|| "subagent".into());
+        let prompt = transcript_arg_str(args, &["Prompt", "prompt"]).unwrap_or_default();
+        return ToolCallDetail::Subagent {
+            child_agent_id: None,
+            role,
+            prompt_preview: truncate_preview(&prompt, 240),
+        };
+    }
+
+    ToolCallDetail::Generic {
+        tool_name: tool_name.to_string(),
+        arguments_json: args
+            .map(|v| truncate_preview(&v.to_string(), 400))
+            .unwrap_or_default(),
+    }
+}
+
+fn attach_transcript_tool_result(mut detail: ToolCallDetail, content: &str) -> ToolCallDetail {
+    let preview = (!content.trim().is_empty()).then(|| truncate_preview(content.trim(), 800));
+    match &mut detail {
+        ToolCallDetail::Shell {
+            output_preview,
+            exit_code,
+            ..
+        } => {
+            if preview.is_some() {
+                *output_preview = preview;
+            }
+            if let Some(code_line) = content
+                .lines()
+                .find(|l| l.starts_with("Command exited with code "))
+                && let Some(num_str) = code_line
+                    .strip_prefix("Command exited with code ")
+                    .map(|s| s.trim_end_matches('.').trim())
+                && let Ok(code) = num_str.parse::<i32>()
+            {
+                *exit_code = Some(code);
+            }
+        }
+        ToolCallDetail::Generic { arguments_json, .. } => {
+            if arguments_json.is_empty()
+                && let Some(p) = preview
+            {
+                *arguments_json = p;
+            }
+        }
+        _ => {}
+    }
+    detail
 }
 
 struct AgyTranscriptMonitor {
@@ -1564,7 +2195,10 @@ struct AgyTranscriptMonitor {
     byte_offset: u64,
     seen_steps: HashSet<u64>,
     in_wakeup: bool,
-    pending_tools: Vec<String>,
+    pending_tools: Vec<(String, ToolCallDetail)>,
+    consecutive_errors: u32,
+    last_error_at: Option<Instant>,
+    last_error_message: Option<String>,
 }
 
 impl AgyTranscriptMonitor {
@@ -1581,6 +2215,9 @@ impl AgyTranscriptMonitor {
             seen_steps: HashSet::new(),
             in_wakeup: false,
             pending_tools: Vec::new(),
+            consecutive_errors: 0,
+            last_error_at: None,
+            last_error_message: None,
         }
     }
 
@@ -1598,10 +2235,42 @@ impl AgyTranscriptMonitor {
         let _ = self.read_new_lines(true);
         self.in_wakeup = false;
         self.pending_tools.clear();
+        self.consecutive_errors = 0;
+        self.last_error_at = None;
+        self.last_error_message = None;
     }
 
     fn poll_post_turn_wakeup(&mut self) -> Vec<WakeupStep> {
-        self.read_new_lines(false)
+        let mut out = self.read_new_lines(false);
+        self.check_error_stall(&mut out, Instant::now());
+        out
+    }
+
+    fn check_error_stall(&mut self, out: &mut Vec<WakeupStep>, now: Instant) {
+        if !self.in_wakeup || self.consecutive_errors == 0 {
+            return;
+        }
+        let Some(last_err) = self.last_error_at else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(last_err);
+        let timed_out = elapsed >= WAKEUP_ERROR_STALL_TIMEOUT
+            || (self.consecutive_errors >= WAKEUP_ERROR_EXHAUSTED_COUNT
+                && elapsed >= WAKEUP_ERROR_EXHAUSTED_TIMEOUT);
+        if timed_out {
+            let reason = self
+                .last_error_message
+                .take()
+                .unwrap_or_else(|| "Background task stalled after repeated API errors".into());
+            let attempts = self.consecutive_errors;
+            self.in_wakeup = false;
+            self.pending_tools.clear();
+            self.consecutive_errors = 0;
+            self.last_error_at = None;
+            out.push(WakeupStep::Failed {
+                message: format!("Background wakeup stopped after {attempts} error(s): {reason}"),
+            });
+        }
     }
 
     fn read_new_lines(&mut self, silent: bool) -> Vec<WakeupStep> {
@@ -1682,11 +2351,36 @@ impl AgyTranscriptMonitor {
             if step_type == "SYSTEM_MESSAGE" || content.contains("<SYSTEM_MESSAGE>") {
                 if !self.in_wakeup {
                     self.in_wakeup = true;
+                    self.consecutive_errors = 0;
+                    self.last_error_at = None;
+                    self.last_error_message = None;
                     out.push(WakeupStep::Started {
                         source: "background_task".into(),
                     });
                 }
+            } else if step_type == "ERROR_MESSAGE" {
+                let err_msg = step
+                    .get("error")
+                    .or_else(|| step.get("content"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Upstream API request failed during background task");
+                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+                self.last_error_at = Some(Instant::now());
+                self.last_error_message = Some(err_msg.to_string());
+                out.push(WakeupStep::Notice {
+                    level: if self.consecutive_errors >= WAKEUP_ERROR_EXHAUSTED_COUNT {
+                        "error".into()
+                    } else {
+                        "warning".into()
+                    },
+                    message: err_msg.to_string(),
+                });
             } else if self.in_wakeup && step_type == "PLANNER_RESPONSE" {
+                self.consecutive_errors = 0;
+                self.last_error_at = None;
+                self.last_error_message = None;
                 if let Some(th) = step.get("thinking").and_then(|v| v.as_str())
                     && !th.trim().is_empty()
                 {
@@ -1708,35 +2402,32 @@ impl AgyTranscriptMonitor {
                     .unwrap_or_default();
                 if calls.is_empty() && status == "DONE" {
                     self.in_wakeup = false;
+                    self.pending_tools.clear();
                     out.push(WakeupStep::Settled);
                 } else {
-                    for c in calls {
+                    for (call_idx, c) in calls.into_iter().enumerate() {
                         let cid = c
                             .get("id")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("wake_tool")
-                            .to_string();
-                        let tname = c
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("tool")
-                            .to_string();
-                        self.pending_tools.push(cid.clone());
+                            .filter(|s| !s.trim().is_empty())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| format!("wake_tool_{step_idx}_{call_idx}"));
+                        let tname = c.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                        let detail = map_transcript_tool_detail(tname, c.get("args"));
+                        self.pending_tools.push((cid.clone(), detail.clone()));
                         out.push(WakeupStep::Tool {
                             call_id: cid,
                             status: ToolCallStatus::Running,
-                            detail: ToolCallDetail::Generic {
-                                tool_name: tname,
-                                arguments_json: c
-                                    .get("args")
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_default(),
-                            },
+                            detail,
                         });
                     }
                 }
             } else if self.in_wakeup && step_type == "GENERIC" && !self.pending_tools.is_empty() {
-                let cid = self.pending_tools.remove(0);
+                self.consecutive_errors = 0;
+                self.last_error_at = None;
+                self.last_error_message = None;
+                let (cid, orig_detail) = self.pending_tools.remove(0);
+                let detail = attach_transcript_tool_result(orig_detail, content);
                 out.push(WakeupStep::Tool {
                     call_id: cid,
                     status: if status == "ERROR" {
@@ -1744,10 +2435,7 @@ impl AgyTranscriptMonitor {
                     } else {
                         ToolCallStatus::Completed
                     },
-                    detail: ToolCallDetail::Generic {
-                        tool_name: "result".into(),
-                        arguments_json: truncate_preview(content, 400),
-                    },
+                    detail,
                 });
             }
         }
@@ -2310,5 +2998,459 @@ pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderMode
         models,
         configured_default_model: default_model_id,
         configured_default_effort: default_effort,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_elicitation_supports_one_of_any_of_enum_names_natural_order_and_fallback() {
+        let params = json!({
+            "requestedSchema": {
+                "type": "object",
+                "required": ["q2", "q1", "q10"],
+                "properties": {
+                    "q10": {
+                        "type": "string",
+                        "title": "Same text",
+                        "description": "Same text",
+                        "enum": ["alpha", "beta"],
+                        "enumNames": ["Alpha Option", "Beta Option"]
+                    },
+                    "q1": {
+                        "type": "string",
+                        "title": "Layout Style",
+                        "description": "Pick layout style",
+                        "oneOf": [
+                            { "const": "opt_a", "title": "(Recommended) Single group" },
+                            { "const": "opt_b", "title": "Split groups" },
+                            { "const": "__other__", "title": "Other" }
+                        ]
+                    },
+                    "q1_other": {
+                        "type": "string",
+                        "title": "Custom answer"
+                    },
+                    "q2": {
+                        "type": "array",
+                        "description": "Select targets",
+                        "items": {
+                            "anyOf": [
+                                { "const": "desktop", "title": "Desktop" },
+                                { "const": "ios", "title": "iOS" },
+                                { "const": "other", "title": "Other" }
+                            ]
+                        }
+                    },
+                    "q2_other": {
+                        "type": "string"
+                    }
+                }
+            }
+        });
+
+        let (questions, fields) = parse_elicitation_request(&params, None).expect("parse ok");
+        let ids: Vec<&str> = questions.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(ids, vec!["q2", "q1", "q10"]);
+
+        // Multi-select `items.anyOf` with sibling `_other` sentinel stripped from visible options
+        assert!(questions[0].is_multi_select);
+        assert_eq!(questions[0].options, vec!["Desktop", "iOS"]);
+        assert_eq!(fields[0].other_option_value.as_deref(), Some("other"));
+        assert_eq!(fields[0].other_field_key.as_deref(), Some("q2_other"));
+
+        // Single-select `oneOf` with header != question and `__other__` stripped
+        assert!(!questions[1].is_multi_select);
+        assert_eq!(questions[1].header.as_deref(), Some("Layout Style"));
+        assert_eq!(questions[1].question, "Pick layout style");
+        assert_eq!(
+            questions[1].options,
+            vec!["(Recommended) Single group", "Split groups"]
+        );
+        assert_eq!(fields[1].other_option_value.as_deref(), Some("__other__"));
+
+        // Identical title & description deduplicates `header`
+        assert_eq!(questions[2].header, None);
+        assert_eq!(questions[2].question, "Same text");
+        assert_eq!(questions[2].options, vec!["Alpha Option", "Beta Option"]);
+
+        // Fallback when schema properties omit options
+        let no_opts_params = json!({
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "q1": { "type": "string", "title": "Choose strategy" }
+                }
+            }
+        });
+        let fb = vec![QuestionItem {
+            id: "q0".into(),
+            header: None,
+            question: "Choose strategy".into(),
+            options: vec!["Fast".into(), "Safe".into()],
+            is_multi_select: false,
+        }];
+        let (fb_qs, _) =
+            parse_elicitation_request(&no_opts_params, Some(&fb)).expect("fallback parse ok");
+        assert_eq!(fb_qs[0].options, vec!["Fast", "Safe"]);
+
+        // Natural numeric sort (`q1`, `q2`, `q10`) when `required` is absent
+        let natural_params = json!({
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "q10": { "type": "string" },
+                    "q2": { "type": "string" },
+                    "q1": { "type": "string" }
+                }
+            }
+        });
+        let (nat_qs, _) = parse_elicitation_request(&natural_params, None).expect("natural order");
+        let nat_ids: Vec<&str> = nat_qs.iter().map(|q| q.id.as_str()).collect();
+        assert_eq!(nat_ids, vec!["q1", "q2", "q10"]);
+    }
+
+    #[test]
+    fn build_elicitation_response_maps_labels_and_routes_custom_other() {
+        let fields = vec![
+            ElicitationFieldMeta {
+                key: "q1".into(),
+                is_multi: false,
+                options: vec![
+                    ElicitationOptionMapping {
+                        label: "Option A".into(),
+                        wire_value: "const_a".into(),
+                    },
+                    ElicitationOptionMapping {
+                        label: "Option B".into(),
+                        wire_value: "const_b".into(),
+                    },
+                ],
+                other_option_value: Some("__other__".into()),
+                other_field_key: Some("q1_other".into()),
+            },
+            ElicitationFieldMeta {
+                key: "q2".into(),
+                is_multi: true,
+                options: vec![
+                    ElicitationOptionMapping {
+                        label: "Desktop".into(),
+                        wire_value: "desktop".into(),
+                    },
+                    ElicitationOptionMapping {
+                        label: "iOS".into(),
+                        wire_value: "ios".into(),
+                    },
+                ],
+                other_option_value: Some("other".into()),
+                other_field_key: Some("q2_other".into()),
+            },
+            ElicitationFieldMeta {
+                key: "q3".into(),
+                is_multi: false,
+                options: vec![],
+                other_option_value: None,
+                other_field_key: None,
+            },
+        ];
+
+        // Preset label maps to const `wire_value`; multi-select mixes preset + custom; plain free text
+        let content_mixed = build_elicitation_response_content(
+            &fields,
+            &[
+                vec!["Option A".into()],
+                vec!["Desktop".into(), "HarmonyOS".into()],
+                vec!["Keep concise".into()],
+            ],
+        );
+        assert_eq!(content_mixed.get("q1"), Some(&json!("const_a")));
+        assert!(!content_mixed.contains_key("q1_other"));
+        assert_eq!(content_mixed.get("q2"), Some(&json!(["desktop", "other"])));
+        assert_eq!(content_mixed.get("q2_other"), Some(&json!("HarmonyOS")));
+        assert_eq!(content_mixed.get("q3"), Some(&json!("Keep concise")));
+
+        // Single-select custom answer routes sentinel into `q1` and text into `q1_other`
+        let content_custom_single = build_elicitation_response_content(
+            &fields,
+            &[vec!["Use custom folding".into()], vec![], vec![]],
+        );
+        assert_eq!(content_custom_single.get("q1"), Some(&json!("__other__")));
+        assert_eq!(
+            content_custom_single.get("q1_other"),
+            Some(&json!("Use custom folding"))
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_update_streams_without_user_message_chunk_and_skips_wakeup_dups() {
+        let mut synthesized_wakeup_tools = HashSet::new();
+        synthesized_wakeup_tools.insert("call_wakeup_dup".to_string());
+        let mut seg_state = AgyStreamSegmentState {
+            turn_tag: "turn_test".into(),
+            ..AgyStreamSegmentState::default()
+        };
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let mut last_ask_raw = None;
+        let (evt_tx, mut evt_rx) = mpsc::channel(16);
+
+        handle_acp_session_update(
+            "ag_test",
+            &json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "text": "Inspecting code" }
+            }),
+            &synthesized_wakeup_tools,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+
+        handle_acp_session_update(
+            "ag_test",
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_wakeup_dup",
+                "title": "Duplicate tool",
+                "status": "completed"
+            }),
+            &synthesized_wakeup_tools,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+
+        handle_acp_session_update(
+            "ag_test",
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_live",
+                "kind": "read",
+                "title": "Read file",
+                "status": "completed",
+                "rawInput": { "Path": "src/main.rs" }
+            }),
+            &synthesized_wakeup_tools,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+
+        handle_acp_session_update(
+            "ag_test",
+            &json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "text": "Done!" }
+            }),
+            &synthesized_wakeup_tools,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+
+        let ev1 = evt_rx.try_recv().expect("thinking emitted");
+        assert!(
+            matches!(ev1, DriverEvent::ThinkingText { ref text, .. } if text == "Inspecting code")
+        );
+
+        let ev2 = evt_rx.try_recv().expect("live tool emitted");
+        assert!(matches!(ev2, DriverEvent::ToolCall { ref call_id, .. } if call_id == "call_live"));
+
+        let ev3 = evt_rx.try_recv().expect("assistant text emitted");
+        assert!(
+            matches!(ev3, DriverEvent::AssistantText { ref text, streaming: true, .. } if text == "Done!")
+        );
+
+        assert!(evt_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn compact_unified_diff_shrinks_large_file_edits_and_formats_multiline_hunks() {
+        let mut lines: Vec<String> = (1..=1500).map(|i| format!("line_{i}")).collect();
+        let old_doc = lines.join("\n") + "\n";
+        lines[749] = "line_750_updated_a".into();
+        lines.insert(750, "line_750_inserted_b".into());
+        let new_doc = lines.join("\n") + "\n";
+
+        let diff = crate::build_compact_unified_diff("crates/demo/lib.rs", &old_doc, &new_doc)
+            .expect("non-empty diff");
+        assert!(
+            diff.len() < 1024,
+            "expected compact diff, got {} bytes",
+            diff.len()
+        );
+        assert!(diff.contains("--- a/crates/demo/lib.rs"));
+        assert!(diff.contains("+++ b/crates/demo/lib.rs"));
+        assert!(diff.contains("@@"));
+        assert!(diff.contains("-line_750\n"));
+        assert!(diff.contains("+line_750_updated_a\n+line_750_inserted_b\n"));
+    }
+
+    #[tokio::test]
+    async fn acp_runtime_warning_chunks_route_to_notice_not_assistant_text() {
+        let synthesized_wakeup_tools = HashSet::new();
+        let mut seg_state = AgyStreamSegmentState {
+            turn_tag: "turn_net".into(),
+            ..AgyStreamSegmentState::default()
+        };
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let mut last_ask_raw = None;
+        let (evt_tx, mut evt_rx) = mpsc::channel(16);
+
+        handle_acp_session_update(
+            "ag_test",
+            &json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "text": "\n⚠ API error (attempt 1): request failed: read: connection reset by peer\n\n⚠ The stream was interrupted. Please continue the task you were working on.\n"
+                }
+            }),
+            &synthesized_wakeup_tools,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+
+        let ev1 = evt_rx.try_recv().expect("first warning notice");
+        assert!(matches!(
+            ev1,
+            DriverEvent::Notice { ref level, ref message }
+                if level == "warning" && message.starts_with("API error (attempt 1):")
+        ));
+        let ev2 = evt_rx.try_recv().expect("second warning notice");
+        assert!(matches!(
+            ev2,
+            DriverEvent::Notice { ref level, ref message }
+                if level == "warning" && message.starts_with("The stream was interrupted")
+        ));
+        assert!(evt_rx.try_recv().is_err());
+        assert!(seg_state.msg_accum.is_empty());
+    }
+
+    #[test]
+    fn transcript_monitor_maps_structured_wakeup_tools_and_surfaces_network_errors() {
+        let dir = std::env::temp_dir().join(format!("orbit_wake_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let transcript_path = dir.join("transcript.jsonl");
+        let lines = [
+            json!({
+                "step_index": 10,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": "<SYSTEM_MESSAGE>background task done</SYSTEM_MESSAGE>"
+            }),
+            json!({
+                "step_index": 11,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "thinking": "Running check",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "run_command",
+                        "args": { "CommandLine": "\"cargo test --workspace\"" }
+                    },
+                    {
+                        "name": "read_file",
+                        "args": { "Path": "\"src/lib.rs\"", "StartLine": "1", "EndLine": "50" }
+                    }
+                ]
+            }),
+            json!({
+                "step_index": 12,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Command exited with code 0.\nok"
+            }),
+            json!({
+                "step_index": 13,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Showing lines 1-50"
+            }),
+            json!({
+                "step_index": 14,
+                "type": "ERROR_MESSAGE",
+                "status": "DONE",
+                "error": "API error (attempt 1): dial tcp 1.2.3.4:443: i/o timeout"
+            }),
+        ];
+        let payload = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&transcript_path, payload).expect("write transcript");
+
+        let mut monitor = AgyTranscriptMonitor {
+            full_path: dir.join("missing.jsonl"),
+            compact_path: transcript_path,
+            byte_offset: 0,
+            seen_steps: HashSet::new(),
+            in_wakeup: false,
+            pending_tools: Vec::new(),
+            consecutive_errors: 0,
+            last_error_at: None,
+            last_error_message: None,
+        };
+
+        let steps = monitor.poll_post_turn_wakeup();
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, WakeupStep::Started { .. }))
+        );
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            WakeupStep::Tool {
+                call_id,
+                status: ToolCallStatus::Completed,
+                detail: ToolCallDetail::Shell { command, exit_code: Some(0), .. }
+            } if call_id == "wake_tool_11_0" && command == "cargo test --workspace"
+        )));
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            WakeupStep::Tool {
+                call_id,
+                status: ToolCallStatus::Completed,
+                detail: ToolCallDetail::FileRead { path, start_line: Some(1), end_line: Some(50) }
+            } if call_id == "wake_tool_11_1" && path == "src/lib.rs"
+        )));
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            WakeupStep::Notice { level, message }
+                if level == "warning" && message.contains("i/o timeout")
+        )));
+
+        // Simulate stall past WAKEUP_ERROR_STALL_TIMEOUT -> should emit Failed and exit in_wakeup
+        let mut stall_out = Vec::new();
+        let future_now = Instant::now() + WAKEUP_ERROR_STALL_TIMEOUT + Duration::from_secs(1);
+        monitor.check_error_stall(&mut stall_out, future_now);
+        assert!(!monitor.in_wakeup);
+        assert!(stall_out.iter().any(|s| matches!(
+            s,
+            WakeupStep::Failed { message } if message.contains("i/o timeout")
+        )));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

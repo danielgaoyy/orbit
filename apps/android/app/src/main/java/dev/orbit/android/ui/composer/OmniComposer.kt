@@ -1,18 +1,26 @@
 package dev.orbit.android.ui.composer
 
+import android.content.Context
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -20,19 +28,41 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.PlaylistAdd
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowUpward
+import androidx.compose.material.icons.outlined.AttachFile
+import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.Code
-import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.ContentCut
+import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.Difference
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.EditNote
+import androidx.compose.material.icons.outlined.FindInPage
+import androidx.compose.material.icons.outlined.FormatQuote
+import androidx.compose.material.icons.outlined.GppMaybe
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.PhotoCamera
+import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.PlayArrow
+import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.VerifiedUser
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -40,67 +70,128 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import dev.orbit.android.store.ComposerDraftState
 import dev.orbit.android.store.OrbitFormatters
+import dev.orbit.android.store.OrbitSlashCommand
+import dev.orbit.android.store.OrbitSlashCommandId
 import dev.orbit.android.store.QueuedPromptItem
+import dev.orbit.android.store.StagedAttachmentItem
+import dev.orbit.android.ui.theme.OrbitCompactDropdownMenu
+import dev.orbit.android.ui.theme.OrbitMenuOptionRow
+import dev.orbit.android.ui.theme.OrbitMenuSectionHeader
+import dev.orbit.android.ui.theme.OrbitProviderIcon
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
+import dev.orbit.android.ui.theme.orbitSemanticFileIcon
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uniffi.orbit_ffi_uniffi.FfiHostDetail
-import uniffi.orbit_ffi_uniffi.FfiProviderKind
 import uniffi.orbit_ffi_uniffi.FfiSessionMode
+import java.io.File
 
-private val MentionTailRegex = Regex("(?:^|\\s)@([^\\s@]*)$")
+private sealed class AutocompleteTrigger {
+    data class Slash(val range: IntRange, val query: String) : AutocompleteTrigger()
+    data class Mention(val range: IntRange, val query: String) : AutocompleteTrigger()
+}
 
-private data class InlineSlashOption(
-    val command: String,
-    val description: String,
-)
+private val SLASH_TRIGGER_REGEX = Regex("""(?:^|\s)(/[^\s/]*)$""")
+private val MENTION_TRIGGER_REGEX = Regex("""(?:^|\s)(@[^\s]*)$""")
 
-private val InlineSlashOptions = listOf(
-    InlineSlashOption("/plan", "Draft step-by-step plan first"),
-    InlineSlashOption("/review", "Audit working tree changes"),
-    InlineSlashOption("/compact", "Compress session context"),
-)
+private fun detectAutocompleteTrigger(
+    text: String,
+    hasActiveSlashDirective: Boolean,
+): AutocompleteTrigger? {
+    val atMatch = MENTION_TRIGGER_REGEX.find(text)
+    val slashMatch = if (!hasActiveSlashDirective) SLASH_TRIGGER_REGEX.find(text) else null
 
-private sealed interface InlineMentionCandidate {
-    val key: String
-    val label: String
-    val subtitle: String?
+    val atGroup = atMatch?.groups?.get(1)
+    val slashGroup = slashMatch?.groups?.get(1)
 
-    data class Builtin(
-        override val key: String,
-        override val label: String,
-        override val subtitle: String,
-        val icon: ImageVector,
-    ) : InlineMentionCandidate
-
-    data class WorkspaceFile(
-        val path: String,
-    ) : InlineMentionCandidate {
-        override val key: String = "file:$path"
-        override val label: String = "@${OrbitFormatters.shortPath(path)}"
-        override val subtitle: String = path
+    return when {
+        atGroup != null && slashGroup != null -> {
+            if (atGroup.range.first >= slashGroup.range.first) {
+                AutocompleteTrigger.Mention(atGroup.range, atGroup.value.drop(1))
+            } else {
+                AutocompleteTrigger.Slash(slashGroup.range, slashGroup.value.drop(1))
+            }
+        }
+        atGroup != null -> AutocompleteTrigger.Mention(atGroup.range, atGroup.value.drop(1))
+        slashGroup != null -> AutocompleteTrigger.Slash(slashGroup.range, slashGroup.value.drop(1))
+        else -> null
     }
 }
 
-private fun stripTrailingMentionToken(text: String): String {
-    val atIdx = text.lastIndexOf('@')
-    return if (atIdx < 0) text else text.substring(0, atIdx)
+private fun slashCommandIcon(id: OrbitSlashCommandId): ImageVector = when (id) {
+    OrbitSlashCommandId.PLAN -> Icons.Outlined.Checklist
+    OrbitSlashCommandId.REVIEW -> Icons.Outlined.FindInPage
+    OrbitSlashCommandId.DIFF -> Icons.Outlined.Difference
+    OrbitSlashCommandId.COMPACT -> Icons.Outlined.ContentCut
+    OrbitSlashCommandId.SUPERVISED -> Icons.Outlined.Shield
+    OrbitSlashCommandId.AUTO -> Icons.Outlined.VerifiedUser
+    OrbitSlashCommandId.FULL -> Icons.Outlined.GppMaybe
+    OrbitSlashCommandId.TERMINAL -> Icons.Outlined.Terminal
+    OrbitSlashCommandId.NEW_SESSION -> Icons.Outlined.EditNote
+    OrbitSlashCommandId.SETTINGS -> Icons.Outlined.Settings
+}
+
+private data class ReadUriResult(
+    val filename: String,
+    val mimeType: String?,
+    val bytes: ByteArray,
+)
+
+private fun readAttachmentFromUri(
+    context: Context,
+    uri: Uri,
+    fallbackName: String,
+): ReadUriResult? {
+    val cr = context.contentResolver
+    var displayName: String? = null
+    runCatching {
+        cr.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) {
+                    displayName = cursor.getString(idx)
+                }
+            }
+        }
+    }
+    val bytes = runCatching {
+        cr.openInputStream(uri)?.use { it.readBytes() }
+    }.getOrNull() ?: return null
+    val resolvedName = displayName?.takeIf { it.isNotBlank() }
+        ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+        ?: fallbackName
+    val mime = cr.getType(uri)
+    return ReadUriResult(filename = resolvedName, mimeType = mime, bytes = bytes)
 }
 
 @Composable
@@ -135,725 +226,897 @@ fun OmniComposer(
     onEditQueuedPrompt: (String) -> Unit,
     onSendQueuedPromptNow: (String) -> Unit,
     onRemoveQueuedPrompt: (String) -> Unit,
+    onAttachImageBytes: (filename: String, mimeType: String?, bytes: ByteArray) -> Unit = { _, _, _ -> },
+    onAttachFileBytes: (filename: String, mimeType: String?, bytes: ByteArray) -> Unit = { _, _, _ -> },
+    onRemoveStagedAttachment: (String) -> Unit = {},
+    onRegisterInlineMention: (token: String, kind: String, path: String?, staged: Boolean, label: String) -> Unit = { _, _, _, _, _ -> },
+    onExecuteSlashCommand: (OrbitSlashCommand) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
     val haptics = LocalHapticFeedback.current
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    var plusMenuExpanded by remember { mutableStateOf(false) }
     var modeMenuExpanded by remember { mutableStateOf(false) }
+    var pendingCameraFile by remember { mutableStateOf<File?>(null) }
 
-    // 1. Detect `/` prefix (`/<query>`) while typing
-    val slashQuery: String? = remember(draft.text, hasHost) {
-        if (!hasHost) {
-            null
-        } else if (draft.text.startsWith("/") && !draft.text.contains(' ') && !draft.text.contains('\n')) {
-            draft.text.removePrefix("/").lowercase()
-        } else {
-            null
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val res = withContext(Dispatchers.IO) {
+                readAttachmentFromUri(context, uri, "photo.jpg")
+            }
+            if (res != null) {
+                onAttachImageBytes(res.filename, res.mimeType, res.bytes)
+            }
         }
     }
 
-    val matchingSlashOptions = remember(slashQuery) {
-        if (slashQuery == null) {
+    val cameraLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture(),
+    ) { saved ->
+        val file = pendingCameraFile
+        pendingCameraFile = null
+        if (!saved || file == null || !file.exists()) {
+            file?.delete()
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            val bytes = withContext(Dispatchers.IO) {
+                runCatching { file.readBytes() }.also { file.delete() }.getOrNull()
+            }
+            if (bytes != null && bytes.isNotEmpty()) {
+                onAttachImageBytes(file.name, "image/jpeg", bytes)
+            }
+        }
+    }
+
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val res = withContext(Dispatchers.IO) {
+                readAttachmentFromUri(context, uri, "attachment.txt")
+            }
+            if (res != null) {
+                val isImage = res.mimeType?.startsWith("image/") == true
+                if (isImage) {
+                    onAttachImageBytes(res.filename, res.mimeType, res.bytes)
+                } else {
+                    onAttachFileBytes(res.filename, res.mimeType, res.bytes)
+                }
+            }
+        }
+    }
+
+    val trigger = remember(draft.text, draft.activeSlashCommand) {
+        detectAutocompleteTrigger(
+            text = draft.text,
+            hasActiveSlashDirective = draft.activeSlashCommand != null,
+        )
+    }
+
+    val filteredSlashCommands = remember(trigger) {
+        if (trigger is AutocompleteTrigger.Slash) {
+            OrbitSlashCommand.filter(trigger.query)
+        } else {
+            emptyList()
+        }
+    }
+
+    val mentionQuery = (trigger as? AutocompleteTrigger.Mention)?.query?.trim().orEmpty()
+    val filteredMentionFiles = remember(trigger, workspaceFiles, activeCwd) {
+        if (trigger !is AutocompleteTrigger.Mention) {
             emptyList()
         } else {
-            InlineSlashOptions.filter { opt ->
-                val bare = opt.command.removePrefix("/")
-                bare.startsWith(slashQuery) || bare.contains(slashQuery)
+            val q = mentionQuery.lowercase()
+            val mapped = workspaceFiles.map { raw ->
+                raw to OrbitFormatters.stripWorkspacePrefix(raw, activeCwd)
             }
-        }
-    }
-
-    // 2. Detect trailing `@<query>` token while typing
-    val mentionQuery: String? = remember(draft.text, hasHost) {
-        if (!hasHost || slashQuery != null) {
-            null
-        } else {
-            MentionTailRegex.find(draft.text)?.groupValues?.getOrNull(1)?.lowercase()
-        }
-    }
-
-    LaunchedEffect(mentionQuery != null) {
-        if (mentionQuery != null && workspaceFiles.isEmpty()) {
-            onRequestRefreshFiles()
-        }
-    }
-
-    val matchingMentionCandidates = remember(mentionQuery, workspaceFiles) {
-        val q = mentionQuery ?: return@remember emptyList<InlineMentionCandidate>()
-        val builtins = buildList {
-            if (q.isEmpty() || "diff".contains(q) || "git-diff".contains(q)) {
-                add(
-                    InlineMentionCandidate.Builtin(
-                        key = "builtin:diff",
-                        label = "@diff",
-                        subtitle = "Uncommitted working tree diff",
-                        icon = Icons.Outlined.Code,
-                    )
-                )
+            val matches = if (q.isEmpty()) {
+                mapped
+            } else {
+                mapped.filter { (raw, rel) ->
+                    raw.lowercase().contains(q) || rel.lowercase().contains(q)
+                }
             }
-            if (q.isEmpty() || "staged".contains(q) || "index".contains(q)) {
-                add(
-                    InlineMentionCandidate.Builtin(
-                        key = "builtin:staged",
-                        label = "@staged",
-                        subtitle = "Staged git index changes",
-                        icon = Icons.Outlined.Code,
-                    )
-                )
-            }
-            if (q.isEmpty() || "terminal".contains(q) || "pty".contains(q)) {
-                add(
-                    InlineMentionCandidate.Builtin(
-                        key = "builtin:terminal",
-                        label = "@terminal",
-                        subtitle = "Active PTY terminal output",
-                        icon = Icons.Outlined.Terminal,
-                    )
-                )
-            }
+            matches.take(40)
         }
-        val remainingSlots = (6 - builtins.size).coerceAtLeast(0)
-        val matchedFiles = if (remainingSlots == 0) {
-            emptyList()
-        } else if (q.isEmpty()) {
-            workspaceFiles.take(remainingSlots)
-        } else {
-            workspaceFiles
-                .asSequence()
-                .filter { it.lowercase().contains(q) }
-                .sortedWith(
-                    compareBy<String> { path ->
-                        val base = OrbitFormatters.shortPath(path).lowercase()
-                        when {
-                            base.startsWith(q) -> 0
-                            base.contains(q) -> 1
-                            else -> 2
-                        }
-                    }.thenBy { it.length }
-                )
-                .take(remainingSlots)
-                .toList()
-        }.map { InlineMentionCandidate.WorkspaceFile(it) }
-
-        (builtins + matchedFiles).take(6)
     }
 
     val catalog = remember(hostDetail, draft.provider) {
         OrbitFormatters.catalogFor(hostDetail, draft.provider)
     }
-    val modelShort = remember(catalog, draft.model) {
-        OrbitFormatters.modelLabel(catalog, draft.model)
-    }
-    val compactEffort = remember(draft.effort) {
-        draft.effort?.let { OrbitFormatters.compactEffortLabel(it) }
-    }
-    val modelPillText = buildString {
-        append(modelShort)
-        if (!compactEffort.isNullOrBlank()) {
-            append(" · ")
-            append(compactEffort)
+    val modelLabel = remember(catalog, draft.model) {
+        val raw = OrbitFormatters.modelLabel(catalog, draft.model)
+        if (draft.provider.name == "CLAUDE_CODE") {
+            raw.removePrefix("Claude ").trim().ifEmpty { raw }
+        } else {
+            raw
         }
     }
-    val providerDotColor = when (draft.provider) {
-        FfiProviderKind.ANTIGRAVITY -> colors.primary
-        FfiProviderKind.CODEX -> colors.directAdded
-        FfiProviderKind.CLAUDE_CODE -> colors.warning
-    }
+    val effortTag = draft.effort?.let { OrbitFormatters.compactEffortLabel(it) }
+    val normalizedMode = OrbitFormatters.normalizeSessionMode(draft.mode)
 
-    val modeLabel = OrbitFormatters.sessionModeLabel(draft.mode)
-    val modeTint = when (draft.mode) {
-        FfiSessionMode.FullAccess -> colors.warning
-        FfiSessionMode.Plan -> colors.primary
-        FfiSessionMode.AcceptEdits -> colors.directAdded
-        else -> colors.fgSecondary
-    }
-
-    val capsuleShape = RoundedCornerShape(20.dp)
-    val showSlashPopover = matchingSlashOptions.isNotEmpty()
-    val showMentionPopover = !showSlashPopover && matchingMentionCandidates.isNotEmpty()
+    val containerShape = RoundedCornerShape(24.dp)
 
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .imePadding()
+            .background(colors.canvas)
             .navigationBarsPadding()
+            .imePadding()
             .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.sm),
-        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
     ) {
-        // Floating `/` Slash Directive Autocomplete Card
-        AnimatedVisibility(
-            visible = showSlashPopover,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
-        ) {
-            val popoverShape = RoundedCornerShape(OrbitSpacing.lg)
-            Surface(
-                shape = popoverShape,
-                color = colors.elevated,
-                shadowElevation = OrbitSpacing.sm,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(OrbitSpacing.hairline, colors.hairline, popoverShape),
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(OrbitSpacing.xs),
-                ) {
-                    matchingSlashOptions.forEach { wf ->
-                        val itemShape = RoundedCornerShape(OrbitSpacing.md)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 44.dp)
-                                .clip(itemShape)
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onSelectSlash(wf.command)
-                                    onTextChange("")
-                                }
-                                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.xs),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Terminal,
-                                contentDescription = null,
-                                tint = colors.primary,
-                                modifier = Modifier.size(OrbitSpacing.iconSm),
-                            )
-                            Text(
-                                text = wf.command,
-                                style = typography.codeMedium,
-                                color = colors.primary,
-                                maxLines = 1,
-                                softWrap = false,
-                            )
-                            Text(
-                                text = wf.description,
-                                style = typography.meta,
-                                color = colors.fgSecondary,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f),
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        // Floating `@` Mention Autocomplete Card (Top 6 matches from @diff, @staged, @terminal, workspaceFiles)
-        AnimatedVisibility(
-            visible = showMentionPopover,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
-        ) {
-            val popoverShape = RoundedCornerShape(OrbitSpacing.lg)
-            Surface(
-                shape = popoverShape,
-                color = colors.elevated,
-                shadowElevation = OrbitSpacing.sm,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(OrbitSpacing.hairline, colors.hairline, popoverShape),
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(OrbitSpacing.xs),
-                ) {
-                    matchingMentionCandidates.forEach { cand ->
-                        val itemShape = RoundedCornerShape(OrbitSpacing.md)
-                        val iconVec = when (cand) {
-                            is InlineMentionCandidate.Builtin -> cand.icon
-                            is InlineMentionCandidate.WorkspaceFile -> Icons.Outlined.Description
-                        }
-                        val iconColor = when (cand) {
-                            is InlineMentionCandidate.Builtin -> if (cand.label == "@terminal") {
-                                colors.warning
-                            } else {
-                                colors.directAdded
-                            }
-                            is InlineMentionCandidate.WorkspaceFile -> colors.fgMuted
-                        }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 40.dp)
-                                .clip(itemShape)
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    val stripped = stripTrailingMentionToken(draft.text)
-                                    onTextChange(stripped)
-                                    when (cand) {
-                                        is InlineMentionCandidate.Builtin -> when (cand.label) {
-                                            "@diff" -> onAttachGitDiff()
-                                            "@staged" -> onAttachStagedDiff()
-                                            "@terminal" -> onAttachTerminal()
-                                        }
-                                        is InlineMentionCandidate.WorkspaceFile -> onAddFileMention(cand.path)
-                                    }
-                                }
-                                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.xs),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-                        ) {
-                            Icon(
-                                imageVector = iconVec,
-                                contentDescription = null,
-                                tint = iconColor,
-                                modifier = Modifier.size(OrbitSpacing.iconSm),
-                            )
-                            Text(
-                                text = cand.label,
-                                style = typography.codeMedium,
-                                color = colors.fgPrimary,
-                                maxLines = 1,
-                                softWrap = false,
-                            )
-                            cand.subtitle?.let { sub ->
-                                Text(
-                                    text = sub,
-                                    style = typography.meta,
-                                    color = colors.fgMuted,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Compact Queued Prompts Tray (Edit, Send Now, × remove)
-        AnimatedVisibility(
-            visible = queuedPrompts.isNotEmpty(),
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
-        ) {
-            val trayShape = RoundedCornerShape(OrbitSpacing.lg)
+        // Queued Prompts Dock
+        if (queuedPrompts.isNotEmpty()) {
+            val queueShape = RoundedCornerShape(14.dp)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(trayShape)
-                    .background(colors.elevated, trayShape)
-                    .border(OrbitSpacing.hairline, colors.hairline, trayShape)
-                    .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+                    .clip(queueShape)
+                    .background(colors.elevated, queueShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, queueShape)
+                    .padding(OrbitSpacing.sm),
                 verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
             ) {
                 Text(
                     text = "Queued (${queuedPrompts.size})",
                     style = typography.metaSemiBold,
-                    color = colors.fgMuted,
+                    color = colors.fgSecondary,
+                    modifier = Modifier.padding(horizontal = OrbitSpacing.xs),
                 )
-                queuedPrompts.forEachIndexed { idx, item ->
-                    if (idx > 0) {
-                        HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
-                    }
+                queuedPrompts.forEach { item ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(min = 44.dp),
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colors.subtleFill, RoundedCornerShape(10.dp))
+                            .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
                     ) {
                         Text(
                             text = item.previewText,
-                            style = typography.subhead,
+                            style = typography.meta,
                             color = colors.fgPrimary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f),
                         )
-                        Text(
-                            text = "Edit",
-                            style = typography.metaMedium,
-                            color = colors.fgSecondary,
+                        Icon(
+                            imageVector = Icons.Outlined.Edit,
+                            contentDescription = "Edit queued prompt",
+                            tint = colors.fgSecondary,
                             modifier = Modifier
-                                .clip(RoundedCornerShape(OrbitSpacing.xs))
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onEditQueuedPrompt(item.id)
-                                }
-                                .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.sm),
-                        )
-                        Text(
-                            text = "Send Now",
-                            style = typography.metaSemiBold,
-                            color = colors.primary,
-                            maxLines = 1,
-                            softWrap = false,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(OrbitSpacing.xs))
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onSendQueuedPromptNow(item.id)
-                                }
-                                .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.sm),
-                        )
-                        Box(
-                            modifier = Modifier
-                                .size(44.dp)
+                                .size(22.dp)
                                 .clip(CircleShape)
-                                .clickable {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onRemoveQueuedPrompt(item.id)
-                                },
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Close,
-                                contentDescription = "Remove queued prompt",
-                                tint = colors.fgMuted,
-                                modifier = Modifier.size(OrbitSpacing.iconSm),
-                            )
-                        }
+                                .clickable { onEditQueuedPrompt(item.id) }
+                                .padding(3.dp),
+                        )
+                        Icon(
+                            imageVector = Icons.Outlined.PlayArrow,
+                            contentDescription = "Send queued prompt now",
+                            tint = colors.primary,
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clip(CircleShape)
+                                .clickable { onSendQueuedPromptNow(item.id) }
+                                .padding(3.dp),
+                        )
+                        Icon(
+                            imageVector = Icons.Outlined.DeleteOutline,
+                            contentDescription = "Remove queued prompt",
+                            tint = colors.fgMuted,
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clip(CircleShape)
+                                .clickable { onRemoveQueuedPrompt(item.id) }
+                                .padding(3.dp),
+                        )
                     }
                 }
             }
         }
 
-        Column(
+        // Native Floating Autocomplete Panel (`/` commands or `@` context & files)
+        val hasAutocompleteItems = when (trigger) {
+            is AutocompleteTrigger.Slash -> filteredSlashCommands.isNotEmpty()
+            is AutocompleteTrigger.Mention -> true
+            null -> false
+        }
+
+        AnimatedVisibility(
+            visible = trigger != null && hasAutocompleteItems,
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) {
+            val panelShape = RoundedCornerShape(14.dp)
+            Surface(
+                shape = panelShape,
+                color = colors.elevated,
+                tonalElevation = 2.dp,
+                shadowElevation = 4.dp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(OrbitSpacing.hairline, colors.hairline, panelShape),
+            ) {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 240.dp),
+                    contentPadding = PaddingValues(vertical = OrbitSpacing.xs),
+                ) {
+                    when (trigger) {
+                        is AutocompleteTrigger.Slash -> {
+                            items(
+                                items = filteredSlashCommands,
+                                key = { "slash:${it.id.name}" },
+                            ) { cmd ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            val updated = draft.text
+                                                .removeRange(trigger.range)
+                                                .trimStart()
+                                            onTextChange(updated)
+                                            onExecuteSlashCommand(cmd)
+                                        }
+                                        .padding(horizontal = OrbitSpacing.md, vertical = 9.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        imageVector = slashCommandIcon(cmd.id),
+                                        contentDescription = null,
+                                        tint = colors.fgSecondary,
+                                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                                    )
+                                    Text(
+                                        text = cmd.command,
+                                        style = typography.codeMedium,
+                                        color = colors.fgPrimary,
+                                    )
+                                    Text(
+                                        text = cmd.description,
+                                        style = typography.meta,
+                                        color = colors.fgMuted,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                }
+                            }
+                        }
+
+                        is AutocompleteTrigger.Mention -> {
+                            val qLower = mentionQuery.lowercase()
+                            val showWorkingDiff = qLower.isEmpty() || "working-diff".contains(qLower) || "diff".contains(qLower)
+                            val showStagedDiff = qLower.isEmpty() || "staged-diff".contains(qLower) || "diff".contains(qLower)
+                            val showTerminal = qLower.isEmpty() || "terminal".contains(qLower)
+
+                            if (showWorkingDiff) {
+                                item(key = "mention:working-diff") {
+                                    MentionAutocompleteRow(
+                                        icon = Icons.Outlined.Difference,
+                                        title = "@working-diff",
+                                        subtitle = "Working Tree Diff",
+                                        onClick = {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            val replaced = draft.text.replaceRange(trigger.range, "@working-diff ")
+                                            onTextChange(replaced)
+                                            onRegisterInlineMention(
+                                                "@working-diff",
+                                                "git_diff",
+                                                null,
+                                                false,
+                                                "Working Tree Diff",
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                            if (showStagedDiff) {
+                                item(key = "mention:staged-diff") {
+                                    MentionAutocompleteRow(
+                                        icon = Icons.Outlined.Difference,
+                                        title = "@staged-diff",
+                                        subtitle = "Staged Diff",
+                                        onClick = {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            val replaced = draft.text.replaceRange(trigger.range, "@staged-diff ")
+                                            onTextChange(replaced)
+                                            onRegisterInlineMention(
+                                                "@staged-diff",
+                                                "git_diff",
+                                                null,
+                                                true,
+                                                "Staged Diff",
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                            if (showTerminal) {
+                                item(key = "mention:terminal") {
+                                    MentionAutocompleteRow(
+                                        icon = Icons.Outlined.Terminal,
+                                        title = "@terminal",
+                                        subtitle = "Active Terminal Output",
+                                        onClick = {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            val replaced = draft.text.replaceRange(trigger.range, "@terminal ")
+                                            onTextChange(replaced)
+                                            onRegisterInlineMention(
+                                                "@terminal",
+                                                "terminal",
+                                                null,
+                                                false,
+                                                "Terminal",
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                            if ((showWorkingDiff || showStagedDiff || showTerminal) && filteredMentionFiles.isNotEmpty()) {
+                                item(key = "mention:divider") {
+                                    HorizontalDivider(
+                                        thickness = OrbitSpacing.hairline,
+                                        color = colors.hairline,
+                                        modifier = Modifier.padding(vertical = 2.dp),
+                                    )
+                                }
+                            }
+                            items(
+                                items = filteredMentionFiles,
+                                key = { (raw, _) -> "file:$raw" },
+                            ) { (rawPath, relPath) ->
+                                val base = OrbitFormatters.shortPath(rawPath)
+                                val token = "@$base"
+                                MentionAutocompleteRow(
+                                    icon = orbitSemanticFileIcon(base),
+                                    title = base,
+                                    subtitle = relPath,
+                                    onClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        val replaced = draft.text.replaceRange(trigger.range, "$token ")
+                                        onTextChange(replaced)
+                                        onRegisterInlineMention(token, "file", rawPath, false, base)
+                                    },
+                                )
+                            }
+                            if (filteredMentionFiles.isEmpty() && !showWorkingDiff && !showStagedDiff && !showTerminal) {
+                                item(key = "mention:empty") {
+                                    Text(
+                                        text = "No matching workspace files",
+                                        style = typography.meta,
+                                        color = colors.fgMuted,
+                                        modifier = Modifier.padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+                                    )
+                                }
+                            }
+                        }
+
+                        null -> Unit
+                    }
+                }
+            }
+        }
+
+        // Main Composer Surface Card
+        Surface(
+            shape = containerShape,
+            color = colors.elevated,
+            tonalElevation = 1.dp,
+            shadowElevation = 2.dp,
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(capsuleShape)
-                .background(colors.elevated, capsuleShape)
-                .border(OrbitSpacing.hairline, colors.hairline, capsuleShape)
-                .padding(top = OrbitSpacing.md, bottom = OrbitSpacing.xs),
+                .border(OrbitSpacing.hairline, colors.hairline, containerShape),
         ) {
-            // Context Tray (chips for @file, @diff, @staged, @terminal, /slash, quotes)
-            if (draft.hasContextAttachments) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                // Non-slash Context & Staged Attachment Strip above input
+                val showContextStrip = draft.stagedAttachments.isNotEmpty() ||
+                    draft.isStagingAttachment ||
+                    draft.mentionedFiles.isNotEmpty() ||
+                    draft.includeGitDiff ||
+                    draft.includeStagedDiff ||
+                    draft.includeTerminal ||
+                    draft.quotedSnippets.isNotEmpty()
+
+                if (showContextStrip) {
+                    LazyRow(
+                        modifier = Modifier.padding(
+                            start = OrbitSpacing.md,
+                            end = OrbitSpacing.md,
+                            top = OrbitSpacing.sm,
+                        ),
+                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (draft.isStagingAttachment) {
+                            item(key = "staging_spinner") {
+                                Box(
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(colors.subtleFill, RoundedCornerShape(8.dp)),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(14.dp),
+                                        strokeWidth = 2.dp,
+                                        color = colors.fgSecondary,
+                                    )
+                                }
+                            }
+                        }
+
+                        items(
+                            items = draft.stagedAttachments,
+                            key = { "staged:${it.id}" },
+                        ) { att ->
+                            if (att.isImage && att.previewBytes != null) {
+                                StagedImageThumbnailChip(
+                                    item = att,
+                                    onRemove = { onRemoveStagedAttachment(att.id) },
+                                )
+                            } else {
+                                RemovableComposerChip(
+                                    icon = orbitSemanticFileIcon(att.filename),
+                                    label = att.filename,
+                                    onRemove = { onRemoveStagedAttachment(att.id) },
+                                )
+                            }
+                        }
+
+                        items(
+                            items = draft.mentionedFiles,
+                            key = { "ref:$it" },
+                        ) { path ->
+                            val short = OrbitFormatters.shortPath(path)
+                            RemovableComposerChip(
+                                icon = orbitSemanticFileIcon(short),
+                                label = short,
+                                onRemove = { onRemoveFileMention(path) },
+                            )
+                        }
+
+                        if (draft.includeGitDiff) {
+                            item(key = "ctx:diff") {
+                                RemovableComposerChip(
+                                    icon = Icons.Outlined.Difference,
+                                    label = "Working Diff",
+                                    onRemove = onToggleGitDiff,
+                                )
+                            }
+                        }
+
+                        if (draft.includeStagedDiff) {
+                            item(key = "ctx:staged") {
+                                RemovableComposerChip(
+                                    icon = Icons.Outlined.Difference,
+                                    label = "Staged Diff",
+                                    onRemove = onToggleStagedDiff,
+                                )
+                            }
+                        }
+
+                        if (draft.includeTerminal) {
+                            item(key = "ctx:term") {
+                                RemovableComposerChip(
+                                    icon = Icons.Outlined.Terminal,
+                                    label = "Terminal",
+                                    onRemove = onToggleTerminal,
+                                )
+                            }
+                        }
+
+                        items(
+                            items = draft.quotedSnippets,
+                            key = { "quote:${it.id}" },
+                        ) { snippet ->
+                            RemovableComposerChip(
+                                icon = Icons.Outlined.FormatQuote,
+                                label = snippet.badgeLabel,
+                                onRemove = { onRemoveQuotedSnippet(snippet.id) },
+                            )
+                        }
+                    }
+                }
+
+                // Inline Input Row (`/` directive prefix lives INSIDE the input row!)
+                val placeholderText = "Ask anything, @ to mention, / for actions"
+
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
+                        .heightIn(min = 34.dp, max = 132.dp)
                         .padding(
                             start = OrbitSpacing.lg,
                             end = OrbitSpacing.lg,
-                            bottom = OrbitSpacing.sm,
+                            top = if (showContextStrip) 6.dp else 10.dp,
+                            bottom = 2.dp,
                         ),
+                    verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    draft.activeSlashCommand?.let { cmd ->
-                        RemovableContextChip(
-                            label = cmd,
-                            accent = colors.primary,
-                            onRemove = onClearSlash,
-                        )
-                    }
-                    if (draft.includeGitDiff) {
-                        RemovableContextChip(
-                            label = "@diff",
-                            accent = colors.directAdded,
-                            onRemove = onToggleGitDiff,
-                        )
-                    }
-                    if (draft.includeStagedDiff) {
-                        RemovableContextChip(
-                            label = "@staged",
-                            accent = colors.directAdded,
-                            onRemove = onToggleStagedDiff,
-                        )
-                    }
-                    if (draft.includeTerminal) {
-                        RemovableContextChip(
-                            label = "@terminal",
-                            accent = colors.warning,
-                            onRemove = onToggleTerminal,
-                        )
-                    }
-                    draft.mentionedFiles.forEach { file ->
-                        RemovableContextChip(
-                            label = "@${OrbitFormatters.shortPath(file)}",
-                            accent = colors.fgPrimary,
-                            onRemove = { onRemoveFileMention(file) },
-                        )
-                    }
-                    draft.quotedSnippets.forEach { q ->
-                        RemovableContextChip(
-                            label = q.badgeLabel,
-                            accent = colors.relay,
-                            onRemove = { onRemoveQuotedSnippet(q.id) },
-                        )
-                    }
-                }
-            }
-
-            // Multi-line auto-growing BasicTextField (maxLines = 6)
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = OrbitSpacing.lg),
-            ) {
-                if (draft.text.isEmpty()) {
-                    val placeholder = when {
-                        !hasHost -> "Pair a host to start coding..."
-                        isNewSession -> "New session in ${OrbitFormatters.shortPath(activeCwd)}..."
-                        isAgentRunning -> "Queue follow-up or reference @file..."
-                        else -> "Reply, type /workflow, or @file..."
-                    }
-                    Text(
-                        text = placeholder,
-                        style = typography.body,
-                        color = colors.fgMuted,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                BasicTextField(
-                    value = draft.text,
-                    onValueChange = onTextChange,
-                    enabled = hasHost,
-                    textStyle = typography.body.copy(color = colors.fgPrimary),
-                    cursorBrush = SolidColor(colors.primary),
-                    maxLines = 6,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = OrbitSpacing.xl),
-                )
-            }
-
-            // Bottom Control Row ([+]  [Provider · Model · Effort]  [Mode]  ... [Send/Stop])
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = OrbitSpacing.xs),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Row(
-                    modifier = Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    // [+] Context / Slash Picker (48dp touch target)
-                    Box(
-                        modifier = Modifier
-                            .size(OrbitSpacing.touchTarget)
-                            .clip(CircleShape)
-                            .clickable(enabled = hasHost) {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onOpenContextPicker()
-                            },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Add,
-                            contentDescription = "Attach context or slash workflow",
-                            tint = colors.fgSecondary,
-                            modifier = Modifier.size(OrbitSpacing.iconMd),
-                        )
-                    }
-
-                    // [● Model · Effort] Compact Zero-Truncation Pill
-                    Row(
-                        modifier = Modifier
-                            .weight(1f, fill = false)
-                            .heightIn(min = OrbitSpacing.touchTarget)
-                            .clip(RoundedCornerShape(OrbitSpacing.md))
-                            .clickable(enabled = hasHost) {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onOpenModelSelector()
-                            }
-                            .padding(horizontal = OrbitSpacing.sm),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(6.dp)
-                                .background(providerDotColor, CircleShape)
-                        )
-                        Text(
-                            text = modelPillText,
-                            style = typography.metaMedium,
-                            color = colors.fgSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-
-                    // [Mode] Shield Selector Pill
-                    Box {
+                    if (!draft.activeSlashCommand.isNullOrBlank()) {
+                        val slashChipShape = RoundedCornerShape(8.dp)
                         Row(
                             modifier = Modifier
-                                .heightIn(min = OrbitSpacing.touchTarget)
-                                .clip(RoundedCornerShape(OrbitSpacing.md))
-                                .clickable(enabled = hasHost) {
+                                .clip(slashChipShape)
+                                .background(colors.subtleFill, slashChipShape)
+                                .border(OrbitSpacing.hairline, colors.hairline, slashChipShape)
+                                .clickable {
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    modeMenuExpanded = true
+                                    onClearSlash()
+                                }
+                                .padding(horizontal = OrbitSpacing.sm, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text(
+                                text = draft.activeSlashCommand,
+                                style = typography.codeMedium,
+                                color = colors.fgPrimary,
+                            )
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier.weight(1f),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (draft.activeSlashCommand.isNullOrBlank() && draft.text.isEmpty()) {
+                            Text(
+                                text = placeholderText,
+                                style = typography.body,
+                                color = colors.fgMuted.copy(alpha = 0.6f),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        BasicTextField(
+                            value = draft.text,
+                            onValueChange = onTextChange,
+                            enabled = hasHost,
+                            textStyle = typography.body.copy(color = colors.fgPrimary),
+                            cursorBrush = SolidColor(colors.primary),
+                            maxLines = 5,
+                            keyboardOptions = KeyboardOptions(
+                                capitalization = KeyboardCapitalization.Sentences,
+                                imeAction = ImeAction.Default,
+                            ),
+                            keyboardActions = KeyboardActions(
+                                onSend = {
+                                    if (draft.canSend) {
+                                        if (isAgentRunning) onQueue() else onSend()
+                                    }
+                                }
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onPreviewKeyEvent { event ->
+                                    if (event.type == KeyEventType.KeyDown &&
+                                        event.key == Key.Backspace &&
+                                        draft.text.isEmpty() &&
+                                        draft.activeSlashCommand != null
+                                    ) {
+                                        onClearSlash()
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                },
+                        )
+                    }
+                }
+
+                // Bottom Toolbar
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 8.dp, end = 8.dp, bottom = 6.dp)
+                        .height(36.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    // Left Cluster: `+` Attachment Menu, Model Pill, Permission Pill
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // `+` Attachment Menu Button (ONLY Photos, Camera, Files)
+                        Box {
+                            Box(
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(colors.subtleFill, CircleShape)
+                                    .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
+                                    .clickable(enabled = hasHost) {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        plusMenuExpanded = true
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Add,
+                                    contentDescription = "Add attachment",
+                                    tint = if (hasHost) colors.fgPrimary else colors.fgMuted,
+                                    modifier = Modifier.size(OrbitSpacing.iconMd),
+                                )
+                            }
+
+                            DropdownMenu(
+                                expanded = plusMenuExpanded,
+                                onDismissRequest = { plusMenuExpanded = false },
+                                containerColor = colors.elevated,
+                            ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "Photos",
+                                            style = typography.subheadMedium,
+                                            color = colors.fgPrimary,
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.Outlined.PhotoLibrary,
+                                            contentDescription = null,
+                                            tint = colors.fgSecondary,
+                                            modifier = Modifier.size(OrbitSpacing.iconSm),
+                                        )
+                                    },
+                                    onClick = {
+                                        plusMenuExpanded = false
+                                        photoPickerLauncher.launch(
+                                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                        )
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "Camera",
+                                            style = typography.subheadMedium,
+                                            color = colors.fgPrimary,
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.Outlined.PhotoCamera,
+                                            contentDescription = null,
+                                            tint = colors.fgSecondary,
+                                            modifier = Modifier.size(OrbitSpacing.iconSm),
+                                        )
+                                    },
+                                    onClick = {
+                                        plusMenuExpanded = false
+                                        runCatching {
+                                            val camDir = File(context.cacheDir, "orbit_camera").apply { mkdirs() }
+                                            val outFile = File(camDir, "orbit_cam_${System.currentTimeMillis()}.jpg")
+                                            val uri = FileProvider.getUriForFile(
+                                                context,
+                                                "${context.packageName}.fileprovider",
+                                                outFile,
+                                            )
+                                            pendingCameraFile = outFile
+                                            cameraLauncher.launch(uri)
+                                        }
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "Files",
+                                            style = typography.subheadMedium,
+                                            color = colors.fgPrimary,
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = Icons.Outlined.AttachFile,
+                                            contentDescription = null,
+                                            tint = colors.fgSecondary,
+                                            modifier = Modifier.size(OrbitSpacing.iconSm),
+                                        )
+                                    },
+                                    onClick = {
+                                        plusMenuExpanded = false
+                                        filePickerLauncher.launch(arrayOf("*/*"))
+                                    },
+                                )
+                            }
+                        }
+
+                        // Model Pill with OrbitProviderIcon
+                        val pillShape = RoundedCornerShape(10.dp)
+                        Row(
+                            modifier = Modifier
+                                .height(30.dp)
+                                .widthIn(max = 224.dp)
+                                .clip(pillShape)
+                                .background(colors.subtleFill, pillShape)
+                                .border(OrbitSpacing.hairline, colors.hairline, pillShape)
+                                .clickable {
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onOpenModelSelector()
                                 }
                                 .padding(horizontal = OrbitSpacing.sm),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
                         ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Shield,
-                                contentDescription = "Session permission mode",
-                                tint = modeTint,
-                                modifier = Modifier.size(OrbitSpacing.iconSm),
+                            OrbitProviderIcon(
+                                provider = draft.provider,
+                                size = 14.dp,
                             )
                             Text(
-                                text = modeLabel,
+                                text = modelLabel,
                                 style = typography.metaMedium,
-                                color = modeTint,
+                                color = colors.fgPrimary,
                                 maxLines = 1,
-                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false),
+                            )
+                            if (effortTag != null) {
+                                Text(
+                                    text = effortTag,
+                                    style = typography.meta,
+                                    color = colors.fgMuted,
+                                    maxLines = 1,
+                                )
+                            }
+                            Icon(
+                                imageVector = Icons.Outlined.KeyboardArrowDown,
+                                contentDescription = null,
+                                tint = colors.fgMuted,
+                                modifier = Modifier.size(14.dp),
                             )
                         }
+                    }
 
-                        DropdownMenu(
-                            expanded = modeMenuExpanded,
-                            onDismissRequest = { modeMenuExpanded = false },
-                            containerColor = colors.elevated,
-                        ) {
-                            val modes = listOf(
-                                FfiSessionMode.Default to "Ask before commands and edits",
-                                FfiSessionMode.Plan to "Read-only research and planning",
-                                FfiSessionMode.AcceptEdits to "Auto-apply file edits, ask for shell",
-                                FfiSessionMode.FullAccess to "Execute tools without prompts",
-                            )
-                            modes.forEach { (m, desc) ->
-                                val selected = m == draft.mode
-                                DropdownMenuItem(
-                                    text = {
-                                        Column {
-                                            Text(
-                                                text = OrbitFormatters.sessionModeLabel(m),
-                                                style = typography.subheadSemiBold,
-                                                color = if (selected) colors.primary else colors.fgPrimary,
-                                            )
-                                            Text(
-                                                text = desc,
-                                                style = typography.meta,
-                                                color = colors.fgSecondary,
-                                            )
-                                        }
-                                    },
-                                    onClick = {
+                    // Right Action Cluster: Access Permissions Shield + Send / Queue / Stop
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // Compact Access Permissions Shield Button + Unified Menu
+                        Box {
+                            val modeIcon = when (normalizedMode) {
+                                FfiSessionMode.AcceptEdits -> Icons.Outlined.VerifiedUser
+                                FfiSessionMode.FullAccess -> Icons.Outlined.GppMaybe
+                                else -> Icons.Outlined.Shield
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .clickable {
                                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        onSelectMode(m)
+                                        modeMenuExpanded = true
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = modeIcon,
+                                    contentDescription = "Access Permissions: ${OrbitFormatters.sessionModeLabel(normalizedMode)}",
+                                    tint = colors.fgSecondary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            }
+
+                            OrbitCompactDropdownMenu(
+                                expanded = modeMenuExpanded,
+                                onDismissRequest = { modeMenuExpanded = false },
+                                width = 296.dp,
+                            ) {
+                                OrbitMenuSectionHeader(title = "Access Permissions")
+                                OrbitMenuOptionRow(
+                                    title = "Always Ask",
+                                    subtitle = "Require approval before file edits and commands",
+                                    icon = Icons.Outlined.Shield,
+                                    selected = normalizedMode == FfiSessionMode.Default,
+                                    onClick = {
                                         modeMenuExpanded = false
-                                    }
+                                        onSelectMode(FfiSessionMode.Default)
+                                    },
+                                )
+                                OrbitMenuOptionRow(
+                                    title = "Accept Edits",
+                                    subtitle = "Auto-approve file edits, ask before commands",
+                                    icon = Icons.Outlined.VerifiedUser,
+                                    selected = normalizedMode == FfiSessionMode.AcceptEdits,
+                                    onClick = {
+                                        modeMenuExpanded = false
+                                        onSelectMode(FfiSessionMode.AcceptEdits)
+                                    },
+                                )
+                                OrbitMenuOptionRow(
+                                    title = "Full Access",
+                                    subtitle = "Edit files and run commands without prompts",
+                                    icon = Icons.Outlined.GppMaybe,
+                                    selected = normalizedMode == FfiSessionMode.FullAccess,
+                                    onClick = {
+                                        modeMenuExpanded = false
+                                        onSelectMode(FfiSessionMode.FullAccess)
+                                    },
                                 )
                             }
                         }
-                    }
-
-                    // Compact subtle Stop button next to Mode shield when running & draft is non-empty
-                    if (isAgentRunning && draft.canSend) {
-                        val stopPillShape = RoundedCornerShape(OrbitSpacing.md)
-                        Row(
-                            modifier = Modifier
-                                .heightIn(min = OrbitSpacing.xxl)
-                                .clip(stopPillShape)
-                                .background(colors.diffRemovedBg, stopPillShape)
-                                .border(
-                                    OrbitSpacing.hairline,
-                                    colors.dangerRemoved.copy(alpha = 0.45f),
-                                    stopPillShape,
+                        if (isAgentRunning) {
+                            if (draft.canSend) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(32.dp)
+                                        .clip(CircleShape)
+                                        .background(colors.primary, CircleShape)
+                                        .clickable {
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            onQueue()
+                                        },
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Outlined.PlaylistAdd,
+                                        contentDescription = "Queue prompt",
+                                        tint = colors.onPrimary,
+                                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                                    )
+                                }
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(colors.subtleFill, CircleShape)
+                                    .border(OrbitSpacing.hairline, colors.hairline, CircleShape)
+                                    .clickable {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        onInterrupt()
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Stop,
+                                    contentDescription = "Stop agent",
+                                    tint = colors.dangerRemoved,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
                                 )
-                                .clickable(enabled = hasHost) {
-                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    onInterrupt()
-                                }
-                                .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Stop,
-                                contentDescription = "Interrupt session",
-                                tint = colors.dangerRemoved,
-                                modifier = Modifier.size(OrbitSpacing.iconSm),
-                            )
-                            Text(
-                                text = "Stop",
-                                style = typography.metaMedium,
-                                color = colors.dangerRemoved,
-                                maxLines = 1,
-                                softWrap = false,
-                            )
-                        }
-                    }
-                }
-
-                // Primary Action Button:
-                // - Running + empty draft -> Stop (■)
-                // - Running + non-empty draft -> Queue
-                // - Idle -> Send (↑)
-                val showStop = isAgentRunning && !draft.canSend
-                val showQueue = isAgentRunning && draft.canSend
-                val enabled = hasHost && (showStop || draft.canSend)
-
-                if (showQueue) {
-                    val queueShape = RoundedCornerShape(18.dp)
-                    Box(
-                        modifier = Modifier
-                            .height(OrbitSpacing.touchTarget)
-                            .padding(end = OrbitSpacing.xs)
-                            .clip(queueShape)
-                            .clickable(enabled = enabled) {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onQueue()
-                            },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .height(36.dp)
-                                .background(colors.primary, queueShape)
-                                .padding(horizontal = OrbitSpacing.md),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                text = "Queue",
-                                style = typography.metaSemiBold,
-                                color = Color.White,
-                                maxLines = 1,
-                                softWrap = false,
-                            )
-                        }
-                    }
-                } else {
-                    val circleFill = when {
-                        showStop -> colors.dangerRemoved
-                        enabled -> colors.primary
-                        else -> colors.subtleFill
-                    }
-                    val iconTint = if (showStop || enabled) Color.White else colors.fgMuted
-
-                    Box(
-                        modifier = Modifier
-                            .size(OrbitSpacing.touchTarget)
-                            .clip(CircleShape)
-                            .clickable(enabled = enabled) {
-                                if (showStop) {
-                                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    onInterrupt()
-                                } else {
-                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    onSend()
-                                }
-                            },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .background(circleFill, CircleShape),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Icon(
-                                imageVector = if (showStop) Icons.Outlined.Stop else Icons.Outlined.ArrowUpward,
-                                contentDescription = if (showStop) "Interrupt session" else "Send prompt",
-                                tint = iconTint,
-                                modifier = Modifier.size(OrbitSpacing.iconMd),
-                            )
+                            }
+                        } else {
+                            val enabled = hasHost && draft.canSend
+                            Box(
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(if (enabled) colors.primary else colors.subtleFill, CircleShape)
+                                    .clickable(enabled = enabled) {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        onSend()
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.ArrowUpward,
+                                    contentDescription = "Send prompt",
+                                    tint = if (enabled) colors.onPrimary else colors.fgMuted,
+                                    modifier = Modifier.size(OrbitSpacing.iconMd),
+                                )
+                            }
                         }
                     }
                 }
@@ -863,36 +1126,147 @@ fun OmniComposer(
 }
 
 @Composable
-private fun RemovableContextChip(
+private fun MentionAutocompleteRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+) {
+    val colors = OrbitTheme.colors
+    val typography = OrbitTheme.typography
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = OrbitSpacing.md, vertical = 9.dp),
+        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = colors.fgSecondary,
+            modifier = Modifier.size(OrbitSpacing.iconSm),
+        )
+        Text(
+            text = title,
+            style = typography.codeMedium,
+            color = colors.fgPrimary,
+            maxLines = 1,
+        )
+        Text(
+            text = subtitle,
+            style = typography.meta,
+            color = colors.fgMuted,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
+private fun StagedImageThumbnailChip(
+    item: StagedAttachmentItem,
+    onRemove: () -> Unit,
+) {
+    val colors = OrbitTheme.colors
+    val bitmap = remember(item.id, item.previewBytes) {
+        item.previewBytes?.let { bytes ->
+            runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap() }.getOrNull()
+        }
+    }
+    val thumbShape = RoundedCornerShape(10.dp)
+    Box(modifier = Modifier.size(48.dp)) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = item.filename,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(thumbShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, thumbShape),
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .clip(thumbShape)
+                    .background(colors.subtleFill, thumbShape)
+                    .border(OrbitSpacing.hairline, colors.hairline, thumbShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.PhotoLibrary,
+                    contentDescription = item.filename,
+                    tint = colors.fgSecondary,
+                    modifier = Modifier.size(OrbitSpacing.iconMd),
+                )
+            }
+        }
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(2.dp)
+                .size(16.dp)
+                .clip(CircleShape)
+                .background(Color.Black.copy(alpha = 0.68f), CircleShape)
+                .clickable(onClick = onRemove),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Close,
+                contentDescription = "Remove ${item.filename}",
+                tint = Color.White,
+                modifier = Modifier.size(11.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun RemovableComposerChip(
+    icon: ImageVector,
     label: String,
-    accent: Color,
     onRemove: () -> Unit,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val shape = RoundedCornerShape(OrbitSpacing.sm)
-
+    val shape = RoundedCornerShape(8.dp)
     Row(
         modifier = Modifier
+            .heightIn(min = 28.dp)
             .clip(shape)
             .background(colors.subtleFill, shape)
             .border(OrbitSpacing.hairline, colors.hairline, shape)
-            .clickable { onRemove() }
-            .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
+            .padding(start = OrbitSpacing.sm, end = 6.dp, top = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+        horizontalArrangement = Arrangement.spacedBy(5.dp),
     ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = colors.fgSecondary,
+            modifier = Modifier.size(13.dp),
+        )
         Text(
             text = label,
             style = typography.metaMedium,
-            color = accent,
+            color = colors.fgPrimary,
             maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 140.dp),
         )
+        Spacer(modifier = Modifier.size(1.dp))
         Icon(
             imageVector = Icons.Outlined.Close,
             contentDescription = "Remove $label",
             tint = colors.fgMuted,
-            modifier = Modifier.size(12.dp),
+            modifier = Modifier
+                .size(14.dp)
+                .clip(CircleShape)
+                .clickable(onClick = onRemove),
         )
     }
 }

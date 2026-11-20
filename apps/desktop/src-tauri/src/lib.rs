@@ -4,6 +4,18 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_LOCAL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_unique_local_tag(prefix: &str) -> String {
+    let seq = NEXT_LOCAL_ID.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{prefix}-{ts}-{seq}")
+}
 
 use crate::updater::{
     AppUpdateProgress, CURRENT_APP_VERSION, ReleaseUpdateInfo, check_latest_release,
@@ -12,22 +24,25 @@ use crate::updater::{
 
 use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
-    AgentTimelineDeltaView, AgentTimelineView, ClientProjectView, CoreEventSubscriber,
-    CoreNotification, CreateAgentRequest, FleetOverviewView, GitReviewView, HostCardView,
-    HostDetailView, OrbitAppCore,
+    AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest, ClientProjectView,
+    CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView, GitReviewView,
+    HostCardView, HostDetailView, OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent,
+    WorkspaceFileView,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
-    open_in_external_editor, pick_local_directory, provision_relay_over_ssh, resolve_user_home,
-    stage_local_attachment, upgrade_remote_daemon_over_ssh,
+    open_external_url, open_in_external_editor, pick_local_directory, provision_relay_over_ssh,
+    resolve_user_home, stage_local_attachment, upgrade_remote_daemon_over_ssh,
 };
+use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentProfile, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode,
     WorkspaceIsolation, WorktreeCreateMode,
 };
-use tauri::{State, ipc::Channel};
+use orbit_providers::{SideQuestionSpec, run_side_question};
+use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
 
 struct DesktopAppState {
     core: Arc<OrbitAppCore>,
@@ -681,6 +696,20 @@ fn refresh_pending_permissions(state: State<'_, DesktopAppState>, host_id: Strin
 }
 
 #[tauri::command]
+async fn rewind_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    to_before_seq: u64,
+    restore_files: bool,
+) -> Result<RewindAgentResultView, String> {
+    state
+        .core
+        .rewind_agent_on_host(&host_id, &agent_id, to_before_seq, restore_files)
+        .await
+}
+
+#[tauri::command]
 fn resolve_permission(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -824,6 +853,167 @@ fn get_workspace_files(
 }
 
 #[tauri::command]
+async fn read_workspace_file(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<WorkspaceFileView, String> {
+    state
+        .core
+        .read_workspace_file_on_host(&host_id, &cwd, &path)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn ask_side_question(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: Option<String>,
+    cwd: String,
+    provider: ProviderKind,
+    model: Option<String>,
+    question: String,
+    context_summary: String,
+    on_event: Channel<SideQuestionStreamEvent>,
+) -> Result<String, String> {
+    if state.core.is_local_host(&host_id) {
+        let req_id = next_unique_local_tag("sq");
+        let resolved_cwd = if cwd.trim().is_empty() || cwd.trim() == "~" {
+            resolve_user_home().unwrap_or_else(|| PathBuf::from("."))
+        } else if let Some(rest) = cwd.trim().strip_prefix("~/") {
+            resolve_user_home()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| PathBuf::from(cwd.trim()))
+        } else {
+            PathBuf::from(cwd.trim())
+        };
+        let req_id_bg = req_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let ch_delta = on_event.clone();
+            let req_for_delta = req_id_bg.clone();
+            let forward = tokio::spawn(async move {
+                while let Some(text_delta) = delta_rx.recv().await {
+                    if ch_delta
+                        .send(SideQuestionStreamEvent::Delta {
+                            request_id: req_for_delta.clone(),
+                            text_delta,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+
+            let result = run_side_question(
+                SideQuestionSpec {
+                    provider,
+                    cwd: resolved_cwd,
+                    model,
+                    question,
+                    context_summary,
+                },
+                delta_tx,
+            )
+            .await;
+
+            let _ = forward.await;
+            let done_ev = match result {
+                Ok(full_text) => SideQuestionStreamEvent::Done {
+                    request_id: req_id_bg,
+                    full_text,
+                    error: None,
+                },
+                Err(err) => SideQuestionStreamEvent::Done {
+                    request_id: req_id_bg,
+                    full_text: String::new(),
+                    error: Some(err),
+                },
+            };
+            let _ = on_event.send(done_ev);
+        });
+        return Ok(req_id);
+    }
+
+    let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<SideQuestionStreamEvent>();
+    let req_id = state
+        .core
+        .ask_side_question_on_host(
+            AskSideQuestionRequest {
+                host_id,
+                agent_id,
+                cwd,
+                provider,
+                model,
+                question,
+                context_summary,
+            },
+            ev_tx,
+        )
+        .await?;
+
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = ev_rx.recv().await {
+            let is_done = matches!(ev, SideQuestionStreamEvent::Done { .. });
+            let _ = on_event.send(ev);
+            if is_done {
+                break;
+            }
+        }
+    });
+
+    Ok(req_id)
+}
+
+#[tauri::command]
+fn parse_markdown_preview(markdown: String, streaming: bool) -> Vec<RichBlockView> {
+    parse_markdown_blocks(&markdown, streaming)
+}
+
+#[tauri::command]
+fn open_browser_popout_window(
+    app: AppHandle,
+    url: String,
+    title: Option<String>,
+) -> Result<(), String> {
+    let trimmed = url.trim();
+    let parsed = Url::parse(trimmed).map_err(|e| format!("Invalid URL `{trimmed}`: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Only http:// and https:// URLs are supported".into());
+    }
+
+    let label = next_unique_local_tag("orbit-browser");
+    let win_title = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(trimmed);
+
+    WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
+        .title(win_title)
+        .inner_size(1120.0, 760.0)
+        .min_inner_size(420.0, 360.0)
+        .on_navigation(|target| matches!(target.scheme(), "http" | "https" | "about"))
+        .build()
+        .map_err(|e| format!("Failed to open browser window: {e}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn open_external_browser_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    let parsed = Url::parse(trimmed).map_err(|e| format!("Invalid URL `{trimmed}`: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Only http:// and https:// URLs can be opened externally".into());
+    }
+    open_external_url(parsed.as_str())
+}
+
+#[tauri::command]
 fn stage_attachment(filename: String, bytes: Vec<u8>) -> Result<StagedAttachmentInfo, String> {
     stage_local_attachment(&filename, &bytes)
 }
@@ -888,11 +1078,46 @@ async fn perform_app_self_update(
     perform_one_click_update(release, on_progress).await
 }
 
+fn init_desktop_file_logging() {
+    let log_path = resolve_user_home()
+        .map(|home| home.join(".orbit").join("logs").join("desktop.log"))
+        .unwrap_or_else(|| PathBuf::from("orbit-desktop.log"));
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    if let Ok(writer) = orbit_client_core::logging::RotatingLogWriter::open(
+        log_path,
+        orbit_client_core::logging::DEFAULT_LOG_MAX_BYTES,
+        orbit_client_core::logging::DEFAULT_LOG_MAX_BACKUPS,
+        cfg!(debug_assertions),
+    ) {
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(env_filter)
+            .with_writer(move || writer.clone())
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .try_init();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    init_desktop_file_logging();
     let db_path = default_desktop_db_path();
+    tracing::info!(
+        version = CURRENT_APP_VERSION,
+        db_path = %db_path.display(),
+        "Starting Orbit Desktop"
+    );
     let core = OrbitAppCore::open(&db_path, true)
-        .or_else(|_| OrbitAppCore::open_in_memory())
+        .or_else(|err| {
+            tracing::error!(error = %err, "Failed to open desktop replica SQLite; falling back to in-memory store");
+            OrbitAppCore::open_in_memory()
+        })
         .expect("failed to initialize OrbitAppCore");
     core.connect_all_hosts();
 
@@ -960,6 +1185,7 @@ pub fn run() {
             open_provider_subagent_timeline,
             get_provider_subagent_timeline,
             refresh_pending_permissions,
+            rewind_agent,
             resolve_permission,
             answer_question,
             fetch_git_status,
@@ -976,6 +1202,11 @@ pub fn run() {
             open_in_editor,
             pick_project_folder,
             get_workspace_files,
+            read_workspace_file,
+            ask_side_question,
+            parse_markdown_preview,
+            open_browser_popout_window,
+            open_external_browser_url,
             stage_attachment,
             stage_host_attachment,
             provision_ssh_relay,

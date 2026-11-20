@@ -41,7 +41,7 @@
 		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>Scan `orbit pair` QR codes to securely connect to your hosts.</string>
+	<string>Scan `orbit pair` QR codes and take photos to attach to your coding agents.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

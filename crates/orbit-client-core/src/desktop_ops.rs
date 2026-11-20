@@ -1533,6 +1533,243 @@ pub fn stage_local_attachment(
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalFileReadPayload {
+    pub resolved_path: String,
+    pub content_kind: String,
+    pub mime_type: Option<String>,
+    pub content: String,
+    pub size_bytes: u64,
+    pub truncated: bool,
+}
+
+fn local_image_mime_for_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "ico" => Some("image/x-icon"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+/// Local filesystem fallback when reading a workspace file on the current machine against an older daemon.
+pub fn read_local_workspace_file(
+    cwd: &str,
+    raw_path: &str,
+    max_bytes: Option<u64>,
+) -> Result<LocalFileReadPayload, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use std::io::Read;
+    use std::path::Component;
+
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err("File path cannot be empty".into());
+    }
+
+    let resolved_cwd = if cwd.trim().is_empty() || cwd.trim() == "~" {
+        resolve_user_home().unwrap_or_else(|| PathBuf::from("."))
+    } else if let Some(rest) = cwd.trim().strip_prefix("~/") {
+        resolve_user_home()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(cwd.trim()))
+    } else {
+        PathBuf::from(cwd.trim())
+    };
+    let canonical_cwd = fs::canonicalize(&resolved_cwd)
+        .map_err(|e| format!("Workspace directory unavailable: {e}"))?;
+
+    let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
+        resolve_user_home()
+            .map(|h| h.join(rest))
+            .ok_or_else(|| "Cannot resolve home directory".to_string())?
+    } else {
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            if p.components()
+                .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+            {
+                return Err(format!("Path `{trimmed}` escapes the workspace directory"));
+            }
+            canonical_cwd.join(p)
+        }
+    };
+
+    let canonical =
+        fs::canonicalize(&candidate).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+    let mut allowed = canonical.starts_with(&canonical_cwd);
+    if !allowed {
+        let orbit_home = std::env::var_os("ORBIT_HOME")
+            .map(PathBuf::from)
+            .or_else(|| resolve_user_home().map(|h| h.join(".orbit")));
+        if let Some(home) = orbit_home
+            && let Ok(canon_att) = fs::canonicalize(home.join("attachments"))
+            && canonical.starts_with(&canon_att)
+        {
+            allowed = true;
+        }
+    }
+    if !allowed {
+        return Err(format!(
+            "Access denied: `{trimmed}` is outside the workspace directory"
+        ));
+    }
+
+    let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("`{trimmed}` is not a regular file"));
+    }
+
+    let size_bytes = meta.len();
+    let cap = max_bytes
+        .unwrap_or(2 * 1024 * 1024)
+        .clamp(4096, 4 * 1024 * 1024);
+    let resolved_path = canonical.to_string_lossy().to_string();
+
+    if let Some(mime) = local_image_mime_for_path(&canonical) {
+        if size_bytes > cap {
+            return Ok(LocalFileReadPayload {
+                resolved_path,
+                content_kind: "binary".into(),
+                mime_type: Some(mime.into()),
+                content: String::new(),
+                size_bytes,
+                truncated: true,
+            });
+        }
+        let img_file = fs::File::open(&canonical)
+            .map_err(|e| format!("Failed opening image `{trimmed}`: {e}"))?;
+        let mut bytes = Vec::with_capacity((size_bytes as usize).min(cap as usize));
+        img_file
+            .take(cap.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("Failed reading image `{trimmed}`: {e}"))?;
+        if (bytes.len() as u64) > cap {
+            return Ok(LocalFileReadPayload {
+                resolved_path,
+                content_kind: "binary".into(),
+                mime_type: Some(mime.into()),
+                content: String::new(),
+                size_bytes: bytes.len() as u64,
+                truncated: true,
+            });
+        }
+        return Ok(LocalFileReadPayload {
+            resolved_path,
+            content_kind: "image".into(),
+            mime_type: Some(mime.into()),
+            content: B64.encode(&bytes),
+            size_bytes: bytes.len() as u64,
+            truncated: false,
+        });
+    }
+
+    let file =
+        fs::File::open(&canonical).map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
+    let mut buf = Vec::with_capacity((cap as usize).min(size_bytes as usize));
+    file.take(cap)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
+
+    let truncated = size_bytes > cap;
+    let probe_len = buf.len().min(8192);
+    if buf[..probe_len].contains(&0) {
+        return Ok(LocalFileReadPayload {
+            resolved_path,
+            content_kind: "binary".into(),
+            mime_type: None,
+            content: String::new(),
+            size_bytes,
+            truncated,
+        });
+    }
+
+    let text = match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(err) => {
+            let is_incomplete_tail = err.utf8_error().error_len().is_none();
+            let valid_up_to = err.utf8_error().valid_up_to();
+            let raw = err.into_bytes();
+            if truncated && is_incomplete_tail {
+                String::from_utf8_lossy(&raw[..valid_up_to]).into_owned()
+            } else {
+                return Ok(LocalFileReadPayload {
+                    resolved_path,
+                    content_kind: "binary".into(),
+                    mime_type: None,
+                    content: String::new(),
+                    size_bytes,
+                    truncated,
+                });
+            }
+        }
+    };
+
+    Ok(LocalFileReadPayload {
+        resolved_path,
+        content_kind: "text".into(),
+        mime_type: Some("text/plain".into()),
+        content: text,
+        size_bytes,
+        truncated,
+    })
+}
+
+fn validate_external_http_url(raw_url: &str) -> Result<&str, String> {
+    let trimmed = raw_url.trim();
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .ok_or_else(|| "Only http:// and https:// URLs can be opened externally".to_string())?;
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("URL contains invalid control or whitespace characters".into());
+    }
+    let host_part = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host_part.is_empty() {
+        return Err("URL must include a valid host".into());
+    }
+    Ok(trimmed)
+}
+
+/// Open an `http://` or `https://` URL in the user's default system browser without shell expansion.
+pub fn open_external_url(raw_url: &str) -> Result<(), String> {
+    let validated = validate_external_http_url(raw_url)?;
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(validated)
+            .spawn()
+            .map_err(|e| format!("Failed to open browser: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(validated)
+            .spawn()
+            .map_err(|e| format!("Failed to open browser: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", validated])
+            .spawn()
+            .map_err(|e| format!("Failed to open browser: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err("External URL launch is unsupported on this platform".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

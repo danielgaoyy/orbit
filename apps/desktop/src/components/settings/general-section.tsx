@@ -56,7 +56,7 @@ export function GeneralSection() {
   const preferredEditor = useOrbitSelector((s) => s.preferredEditor);
   const mod = modSymbol();
 
-  const [appVersion, setAppVersion] = useState("0.3.3");
+  const [appVersion, setAppVersion] = useState("0.3.7");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseUpdateInfo | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
@@ -164,8 +164,8 @@ export function GeneralSection() {
           </SettingRow>
 
           <SettingRow
-            title="Auto-collapse completed steps"
-            description="Fold intermediate tool calls and thoughts once a reply arrives."
+            title="Collapse thinking and tool calls"
+            description="Fold all thinking and tool calls into a single live summary row; click anytime to expand all."
           >
             <ToggleSwitch
               checked={coalesceExploration}

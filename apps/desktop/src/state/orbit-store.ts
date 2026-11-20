@@ -4,7 +4,13 @@ import {
   resolveActiveModelSpec,
   resolveSupportedEffortForModel,
 } from "@/lib/model-catalog";
-import { isLocalHostCard } from "@/lib/projects";
+import {
+  type UnifiedProjectEntry,
+  buildUnifiedProjects,
+  isLocalHostCard,
+  matchesProjectDirectory,
+  projectPathScopeKey,
+} from "@/lib/projects";
 import {
   type AgentCardView,
   type AgentTimelineDeltaView,
@@ -17,12 +23,15 @@ import {
   type PromptBadge,
   type ProviderKind,
   type ReasoningEffort,
+  type RichBlockView,
   type SessionMode,
   type SshHostItem,
   type TimelineItemView,
+  type WorkspaceFileView,
   orbitIpc,
   timelineItemLogicalKey,
 } from "@/lib/orbit-ipc";
+import { buildSideQuestionContextSummary } from "@/lib/session-insights";
 
 export type SlashDirective =
   | "plan"
@@ -116,6 +125,49 @@ export interface TerminalTabSession {
   title: string;
 }
 
+export type SidePanelTabKind =
+  | "review"
+  | "files"
+  | "file"
+  | "terminal"
+  | "browser"
+  | "side_question"
+  | "subagent";
+
+export interface SidePanelTab {
+  id: string;
+  kind: SidePanelTabKind;
+  title: string;
+  filePath?: string;
+  hostId?: string;
+  cwd?: string;
+  focusLine?: number | null;
+  url?: string;
+  subagentCallId?: string;
+  subagentRole?: string;
+  subagentPrompt?: string;
+  childAgentId?: string | null;
+}
+
+export interface FileViewCacheEntry {
+  status: "loading" | "ready" | "error";
+  data?: WorkspaceFileView;
+  error?: string;
+}
+
+export interface SideQuestionEntry {
+  id: string;
+  question: string;
+  answer: string;
+  blocks: RichBlockView[];
+  status: "streaming" | "done" | "error";
+  error: string | null;
+  createdAtMs: number;
+  providerLabel: string;
+}
+
+export type OverviewSectionId = "review" | "files" | "terminal" | "tasks" | "subagents";
+
 export type ReviewScope = "working_tree" | "session_turns";
 export type DiffLayoutMode = "unified" | "split";
 export type ThemeMode = "system" | "light" | "dark";
@@ -144,6 +196,17 @@ export interface ArchivedThreadEntry {
 
 export function threadScopeKey(hostId: string, agentId: string): string {
   return `${hostId}::${agentId}`;
+}
+
+export function fileCacheKey(hostId: string, cwd: string, path: string): string {
+  return `${hostId}::${cwd}::${path}`;
+}
+
+export function sideQuestionScopeKey(s: Pick<OrbitUiState, "selectedHostId" | "selectedAgentId" | "isDraftNewSession">): string {
+  if (s.isDraftNewSession || !s.selectedAgentId) {
+    return `draft::${s.selectedHostId ?? "none"}`;
+  }
+  return `${s.selectedHostId ?? "none"}::${s.selectedAgentId}`;
 }
 
 export interface OrbitUiState {
@@ -177,23 +240,42 @@ export interface OrbitUiState {
 
   // Incremental timelines keyed by `hostId::agentId`
   timelines: Record<string, CachedTimelineEntry>;
+  rewoundSessions: Record<string, true>;
 
-  // Git & Review Inspector
-  inspectorOpen: boolean;
-  inspectorWidth: number;
+  // Unified Right Side Panel (Multi-Tab Workbench: Review, Open File, Files, Terminal, Browser, Side Question, Subagent)
+  sidePanelOpen: boolean;
+  sidePanelWidth: number;
+  sidePanelTabs: SidePanelTab[];
+  activeSidePanelTabId: string | null;
+  fileViewCache: Record<string, FileViewCacheEntry>;
+  sideQuestionsByScope: Record<string, SideQuestionEntry[]>;
+  sideQuestionDrafts: Record<string, string>;
+  sideQuestionFocusNonce: number;
+
+  // Git & Review State (rendered inside Review tab)
   reviewScope: ReviewScope;
   diffStaged: boolean;
   diffLayout: DiffLayoutMode;
   selectedDiffPath: string | null;
   gitReviews: Record<string, GitReviewView>;
 
+  // Main Stage Overview Panel
+  overviewDesktopOpenPref: boolean;
+  overviewPopoverOpen: boolean;
+  stageCanDockOverview: boolean;
+  overviewCollapsedSections: Record<OverviewSectionId, boolean>;
+  quickOpenFilesOpen: boolean;
+
   // Sidebar & Layout
   sidebarOpen: boolean;
   sidebarDesktopOpenPref: boolean;
+  sidebarAutoYieldedForSidePanel: boolean;
   isCompactViewport: boolean;
+  isTightForDualSidebars: boolean;
   sidebarWidth: number;
   collapsedHostIds: Record<string, boolean>;
   collapsedProjectIds: Record<string, boolean>;
+  hiddenProjectKeys: Record<string, boolean>;
   pinnedThreadKeys: string[];
   threadCustomTitles: Record<string, string>;
   archivedThreads: Record<string, ArchivedThreadEntry>;
@@ -201,9 +283,7 @@ export interface OrbitUiState {
   sidebarProjectSort: SidebarProjectSort;
   sidebarThreadFilter: SidebarThreadFilter;
 
-  // Persistent Multi-Slot Terminal Dock
-  terminalOpen: boolean;
-  terminalHeight: number;
+  // Persistent Multi-Slot PTY Sessions (rendered inside Side Panel Terminal tab)
   terminalTabs: TerminalTabSession[];
   activeTerminalTabKey: string | null;
   terminalFocused: boolean;
@@ -220,6 +300,9 @@ export interface OrbitUiState {
   externalEditors: ExternalEditorInfo[];
   toastNotice: string | null;
   lastArchivedUndo: UndoArchiveEntry | null;
+  appVersion: string | null;
+  isBrowserOffline: boolean;
+  dismissedVersionMismatchHosts: Record<string, string>;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -250,6 +333,7 @@ interface PersistedPrefs {
   terminalScrollback?: number;
   sidebarOpen?: boolean;
   sidebarWidth?: number;
+  hiddenProjectKeys?: Record<string, boolean>;
   pinnedThreadKeys?: string[];
   threadCustomTitles?: Record<string, string>;
   archivedThreads?: Record<string, ArchivedThreadEntry>;
@@ -257,7 +341,9 @@ interface PersistedPrefs {
   sidebarProjectSort?: SidebarProjectSort;
   sidebarThreadFilter?: SidebarThreadFilter;
   inspectorWidth?: number;
-  terminalHeight?: number;
+  sidePanelWidth?: number;
+  overviewDesktopOpenPref?: boolean;
+  overviewCollapsedSections?: Partial<Record<OverviewSectionId, boolean>>;
   diffLayout?: DiffLayoutMode;
   draftProvider?: ProviderKind;
   draftModels?: Partial<Record<ProviderKind, string | null>>;
@@ -302,14 +388,16 @@ function writePrefsNow(snap: OrbitUiState): void {
       terminalScrollback: snap.terminalScrollback,
       sidebarOpen: snap.sidebarDesktopOpenPref,
       sidebarWidth: snap.sidebarWidth,
+      hiddenProjectKeys: snap.hiddenProjectKeys,
       pinnedThreadKeys: snap.pinnedThreadKeys,
       threadCustomTitles: snap.threadCustomTitles,
       archivedThreads: snap.archivedThreads,
       seenAgentSeqs: snap.seenAgentSeqs,
       sidebarProjectSort: snap.sidebarProjectSort,
       sidebarThreadFilter: snap.sidebarThreadFilter,
-      inspectorWidth: snap.inspectorWidth,
-      terminalHeight: snap.terminalHeight,
+      sidePanelWidth: snap.sidePanelWidth,
+      overviewDesktopOpenPref: snap.overviewDesktopOpenPref,
+      overviewCollapsedSections: snap.overviewCollapsedSections,
       diffLayout: snap.diffLayout,
       draftProvider: snap.draftProvider,
       draftModels: snap.draftModels,
@@ -403,10 +491,14 @@ function sanitizeSavedModel(slug: string | null | undefined): string | null {
 
 const COMPACT_VIEWPORT_COLLAPSE_PX = 800;
 const COMPACT_VIEWPORT_EXPAND_PX = 824;
+const DUAL_SIDEBAR_YIELD_PX = 1040;
+const DUAL_SIDEBAR_RESTORE_PX = 1080;
 
 const initialDesktopSidebarOpenPref = initialPrefs.sidebarOpen ?? true;
 const initialIsCompactViewport =
   typeof window !== "undefined" ? window.innerWidth < COMPACT_VIEWPORT_COLLAPSE_PX : false;
+const initialIsTightForDualSidebars =
+  typeof window !== "undefined" ? window.innerWidth < DUAL_SIDEBAR_YIELD_PX : false;
 
 let state: OrbitUiState = {
   fleet: { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] },
@@ -443,18 +535,40 @@ let state: OrbitUiState = {
   promptHistory: initialPrefs.promptHistory ?? [],
 
   timelines: {},
+  rewoundSessions: {},
 
-  inspectorOpen: false,
-  inspectorWidth: initialPrefs.inspectorWidth ?? 440,
+  sidePanelOpen: false,
+  sidePanelWidth: initialPrefs.sidePanelWidth ?? initialPrefs.inspectorWidth ?? 480,
+  sidePanelTabs: [],
+  activeSidePanelTabId: null,
+  fileViewCache: {},
+  sideQuestionsByScope: {},
+  sideQuestionDrafts: {},
+  sideQuestionFocusNonce: 0,
+
   reviewScope: "working_tree",
   diffStaged: false,
   diffLayout: initialPrefs.diffLayout ?? "unified",
   selectedDiffPath: null,
   gitReviews: {},
 
+  overviewDesktopOpenPref: initialPrefs.overviewDesktopOpenPref ?? true,
+  overviewPopoverOpen: false,
+  stageCanDockOverview: false,
+  overviewCollapsedSections: {
+    review: initialPrefs.overviewCollapsedSections?.review ?? false,
+    files: initialPrefs.overviewCollapsedSections?.files ?? false,
+    terminal: initialPrefs.overviewCollapsedSections?.terminal ?? false,
+    tasks: initialPrefs.overviewCollapsedSections?.tasks ?? false,
+    subagents: initialPrefs.overviewCollapsedSections?.subagents ?? false,
+  },
+  quickOpenFilesOpen: false,
+
   sidebarOpen: initialIsCompactViewport ? false : initialDesktopSidebarOpenPref,
   sidebarDesktopOpenPref: initialDesktopSidebarOpenPref,
+  sidebarAutoYieldedForSidePanel: false,
   isCompactViewport: initialIsCompactViewport,
+  isTightForDualSidebars: initialIsTightForDualSidebars,
   sidebarWidth:
     initialPrefs.sidebarWidth &&
     initialPrefs.sidebarWidth !== 248 &&
@@ -464,6 +578,7 @@ let state: OrbitUiState = {
       : 256,
   collapsedHostIds: {},
   collapsedProjectIds: {},
+  hiddenProjectKeys: initialPrefs.hiddenProjectKeys ?? {},
   pinnedThreadKeys: initialPrefs.pinnedThreadKeys ?? [],
   threadCustomTitles: initialPrefs.threadCustomTitles ?? {},
   archivedThreads: initialPrefs.archivedThreads ?? {},
@@ -471,8 +586,6 @@ let state: OrbitUiState = {
   sidebarProjectSort: initialPrefs.sidebarProjectSort ?? "recent",
   sidebarThreadFilter: initialPrefs.sidebarThreadFilter ?? "all",
 
-  terminalOpen: false,
-  terminalHeight: initialPrefs.terminalHeight ?? 260,
   terminalTabs: [],
   activeTerminalTabKey: null,
   terminalFocused: false,
@@ -488,6 +601,9 @@ let state: OrbitUiState = {
   externalEditors: [],
   toastNotice: null,
   lastArchivedUndo: null,
+  appVersion: null,
+  isBrowserOffline: typeof navigator !== "undefined" ? !navigator.onLine : false,
+  dismissedVersionMismatchHosts: {},
 
   theme: initialTheme,
   resolvedTheme: initialResolvedTheme,
@@ -665,7 +781,7 @@ function mergeTimelineDelta(
   }
 
   return {
-    latestSeq: Math.max(existing?.latestSeq ?? 0, delta.latest_seq),
+    latestSeq: fullReset ? delta.latest_seq : Math.max(existing?.latestSeq ?? 0, delta.latest_seq),
     agent: delta.agent ?? existing?.agent ?? null,
     items: baseItems,
   };
@@ -842,6 +958,23 @@ async function drainPromptQueueIfIdle(hostId: string, detail: HostDetailView): P
   }
 }
 
+function omitRecordKeys<T>(
+  record: Record<string, T>,
+  keysToRemove: ReadonlySet<string>,
+): Record<string, T> {
+  if (keysToRemove.size === 0) return record;
+  let mutated = false;
+  const next: Record<string, T> = {};
+  for (const [k, v] of Object.entries(record)) {
+    if (keysToRemove.has(k)) {
+      mutated = true;
+    } else {
+      next[k] = v;
+    }
+  }
+  return mutated ? next : record;
+}
+
 function resolveSettingsSectionTarget(
   s: OrbitUiState,
   section?: SettingsSectionTarget,
@@ -980,11 +1113,17 @@ export const orbitActions = {
     if (initialized) return;
     initialized = true;
 
-    const [editors, sshList] = await Promise.all([
+    const [editors, sshList, version] = await Promise.all([
       orbitIpc.listExternalEditors(),
       orbitIpc.listSshHosts(),
+      orbitIpc.getAppVersion().catch(() => null),
     ]);
-    setState((s) => ({ ...s, externalEditors: editors, sshHosts: sshList }));
+    setState((s) => ({
+      ...s,
+      externalEditors: editors,
+      sshHosts: sshList,
+      appVersion: version,
+    }));
 
     await orbitActions.reloadFleetAndHosts(true);
 
@@ -1064,6 +1203,39 @@ export const orbitActions = {
       };
     });
     syncAttentionIndicators(state.fleet, state.hostDetails);
+  },
+
+  setBrowserOffline(offline: boolean): void {
+    const prev = state.isBrowserOffline;
+    if (prev === offline) return;
+    setState((s) => ({ ...s, isBrowserOffline: offline }));
+    if (!offline) {
+      notifyToast("Back online");
+      for (const h of state.fleet.hosts) {
+        if (h.connection_state === "disconnected") {
+          void orbitActions.reconnectHost(h.host_id);
+        }
+      }
+    }
+  },
+
+  dismissVersionMismatch(hostId: string, daemonVersion: string): void {
+    setState((s) => ({
+      ...s,
+      dismissedVersionMismatchHosts: {
+        ...s.dismissedVersionMismatchHosts,
+        [hostId]: daemonVersion,
+      },
+    }));
+  },
+
+  async reconnectHost(hostId: string): Promise<void> {
+    try {
+      await orbitIpc.updateHostConfig({ hostId, reconnect: true });
+      await orbitActions.reloadFleetAndHosts(false);
+    } catch (err) {
+      notifyToast(`Reconnect failed: ${String(err)}`);
+    }
   },
 
   async reloadFleetAndHosts(initialBootstrap = false): Promise<void> {
@@ -1148,6 +1320,14 @@ export const orbitActions = {
     if (state.selectedHostId) {
       if (initialBootstrap) {
         void orbitIpc.refreshQuotas(state.selectedHostId);
+        if (state.selectedWorkspaceCwd && state.selectedWorkspaceCwd !== "~") {
+          void orbitActions.refreshGit(
+            state.selectedHostId,
+            state.selectedWorkspaceCwd,
+            null,
+            state.diffStaged,
+          );
+        }
       }
       if (state.selectedAgentId && !state.isDraftNewSession) {
         const tlKey = `${state.selectedHostId}::${state.selectedAgentId}`;
@@ -1343,8 +1523,9 @@ export const orbitActions = {
             prevAgent.updated_at_rfc3339 !== nextAgent.updated_at_rfc3339 ||
             JSON.stringify(prevAgent.mode) !== JSON.stringify(nextAgent.mode));
 
+        const isReset = sinceSeq === 0 || Boolean(delta.reset);
         const hasChanges =
-          sinceSeq === 0 ||
+          isReset ||
           delta.upserted_items.length > 0 ||
           Object.keys(delta.resolved_permissions).length > 0 ||
           Object.keys(delta.resolved_questions).length > 0 ||
@@ -1352,7 +1533,7 @@ export const orbitActions = {
 
         if (hasChanges) {
           setState((s) => {
-            const merged = mergeTimelineDelta(s.timelines[tlKey], delta, sinceSeq === 0);
+            const merged = mergeTimelineDelta(s.timelines[tlKey], delta, isReset);
             const isViewing =
               s.workspacePanel === "conversation" &&
               !s.isDraftNewSession &&
@@ -1360,7 +1541,7 @@ export const orbitActions = {
               s.selectedAgentId === agentId;
             const prevSeen = s.seenAgentSeqs[tlKey] ?? 0;
             const nextSeenSeqs =
-              isViewing && merged.latestSeq > prevSeen
+              isViewing && (isReset || merged.latestSeq > prevSeen)
                 ? { ...s.seenAgentSeqs, [tlKey]: merged.latestSeq }
                 : s.seenAgentSeqs;
             return {
@@ -1429,7 +1610,7 @@ export const orbitActions = {
       void orbitIpc.openAgentTimeline(hostId, firstAgent.agent_id);
       void orbitActions.pullTimelineDelta(hostId, firstAgent.agent_id, false);
     }
-    if (state.inspectorOpen) {
+    if (nextCwd && nextCwd !== "~") {
       void orbitActions.refreshGit(hostId, nextCwd, null, state.diffStaged);
     }
   },
@@ -1476,7 +1657,7 @@ export const orbitActions = {
     void orbitIpc.markAgentRead(hostId, agentId);
     void orbitIpc.listProviderSubagents(hostId, agentId);
     void orbitActions.pullTimelineDelta(hostId, agentId, false);
-    if (state.inspectorOpen) {
+    if (nextCwd && nextCwd !== "~") {
       void orbitActions.refreshGit(hostId, nextCwd, null, state.diffStaged);
     }
   },
@@ -1557,7 +1738,7 @@ export const orbitActions = {
 
   setSelectedWorkspaceCwd(cwd: string): void {
     setState((s) => ({ ...s, selectedWorkspaceCwd: cwd, selectedDiffPath: null }));
-    if (state.inspectorOpen && state.selectedHostId) {
+    if (state.selectedHostId && cwd && cwd !== "~") {
       void orbitActions.refreshGit(state.selectedHostId, cwd, null, state.diffStaged);
     }
   },
@@ -1574,7 +1755,7 @@ export const orbitActions = {
         avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
     }));
     void orbitActions.ensureWorkspaceFiles(hostId, cwd);
-    if (state.inspectorOpen) {
+    if (cwd && cwd !== "~") {
       void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
     }
   },
@@ -1940,6 +2121,26 @@ export const orbitActions = {
     const key = composerScopeKey(state);
     const rawDraft = (state.composerDrafts[key] ?? "").trim();
     const storedDirective = state.slashDirectives[key] ?? null;
+
+    // Intercept `/btw` side questions before touching main conversation state or in-flight turns
+    if (!storedDirective) {
+      const btwMatch = /^\/btw(?:\s+([\s\S]*))?$/i.exec(rawDraft);
+      if (btwMatch) {
+        const sideQ = (btwMatch[1] ?? "").trim();
+        setState((s) => ({
+          ...s,
+          composerDrafts: { ...s.composerDrafts, [key]: "" },
+        }));
+        if (sideQ) {
+          orbitActions.openSideQuestionTab();
+          void orbitActions.submitSideQuestion(sideQ);
+        } else {
+          orbitActions.openSideQuestionTab();
+        }
+        return;
+      }
+    }
+
     const inlineParsed = storedDirective
       ? { directive: null, rest: rawDraft }
       : parseLeadingSlashDirective(rawDraft);
@@ -2267,7 +2468,7 @@ export const orbitActions = {
     const detail = state.hostDetails[hostId];
     const activeAgent = detail?.agents.find((a) => a.agent_id === agentId);
 
-    if (activeAgent?.is_running) {
+    if (activeAgent?.is_running || activeAgent?.is_awaiting_permission) {
       if (steerImmediately) {
         await orbitIpc.sendPrompt(hostId, agentId, assembledWirePrompt, {
           displayPrompt: cleanUserText,
@@ -2524,6 +2725,94 @@ export const orbitActions = {
     }
   },
 
+  async rewindAgent(
+    hostId: string,
+    agentId: string,
+    toBeforeSeq: number,
+    restoreFiles: boolean,
+    fallbackPromptText?: string,
+  ): Promise<boolean> {
+    const tKey = threadScopeKey(hostId, agentId);
+    // Clear queued follow-ups before calling the daemon so transitioning to Idle never auto-dispatches stale prompts
+    setState((s) => {
+      if (!s.queuedPrompts[tKey]?.length) return s;
+      const nextQueued = { ...s.queuedPrompts };
+      delete nextQueued[tKey];
+      return { ...s, queuedPrompts: nextQueued };
+    });
+
+    try {
+      const res = await orbitIpc.rewindAgent(hostId, agentId, toBeforeSeq, restoreFiles);
+      const restoredDraft = (res.restored_prompt ?? fallbackPromptText ?? "").trim();
+      const cwd = res.agent?.cwd || state.selectedWorkspaceCwd;
+
+      const openFileTabsToReload: Array<{ hostId: string; cwd: string; path: string }> = [];
+      setState((s) => {
+        let nextFileCache = s.fileViewCache;
+        if (restoreFiles && res.restored_files > 0 && cwd && cwd !== "~") {
+          const prefix = `${hostId}::${cwd}::`;
+          nextFileCache = {};
+          for (const [k, v] of Object.entries(s.fileViewCache)) {
+            if (!k.startsWith(prefix)) {
+              nextFileCache[k] = v;
+            }
+          }
+          for (const tab of s.sidePanelTabs) {
+            if (tab.kind === "file" && tab.filePath) {
+              const tabHost = tab.hostId ?? s.selectedHostId;
+              const tabCwd = tab.cwd ?? s.selectedWorkspaceCwd;
+              if (tabHost === hostId && tabCwd === cwd) {
+                openFileTabsToReload.push({ hostId: tabHost, cwd: tabCwd, path: tab.filePath });
+              }
+            }
+          }
+        }
+        return {
+          ...s,
+          fileViewCache: nextFileCache,
+          rewoundSessions: { ...s.rewoundSessions, [tKey]: true },
+          composerDrafts: restoredDraft
+            ? { ...s.composerDrafts, [tKey]: restoredDraft }
+            : s.composerDrafts,
+        };
+      });
+
+      await Promise.all([
+        orbitActions.pullTimelineDelta(hostId, agentId, true),
+        orbitActions.reloadHostDetail(hostId, true),
+      ]);
+
+      for (const tabInfo of openFileTabsToReload) {
+        void orbitActions.loadWorkspaceFile(tabInfo.hostId, tabInfo.cwd, tabInfo.path, true);
+      }
+
+      if (cwd && cwd !== "~") {
+        void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
+      }
+
+      if (res.notice) {
+        notifyToast(res.notice);
+      } else if (restoreFiles && res.restored_files > 0) {
+        notifyToast(
+          `Rewound conversation · Restored ${res.restored_files} ${res.restored_files === 1 ? "file" : "files"}`,
+        );
+      } else {
+        notifyToast("Rewound conversation to this point");
+      }
+
+      setTimeout(() => {
+        for (const fn of composerFocusListeners) {
+          fn();
+        }
+      }, 16);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      notifyToast(msg || "Failed to rewind conversation");
+      return false;
+    }
+  },
+
   archiveThread(hostId: string, agentId: string): void {
     const tKey = threadScopeKey(hostId, agentId);
     const wasSelected =
@@ -2660,6 +2949,7 @@ export const orbitActions = {
         return {
           ...s,
           sidebarOpen: nextOpen,
+          sidebarAutoYieldedForSidePanel: false,
           sidebarDesktopOpenPref: s.isCompactViewport ? s.sidebarDesktopOpenPref : nextOpen,
         };
       },
@@ -2671,14 +2961,43 @@ export const orbitActions = {
     const nextCompact = state.isCompactViewport
       ? viewportWidth < COMPACT_VIEWPORT_EXPAND_PX
       : viewportWidth < COMPACT_VIEWPORT_COLLAPSE_PX;
+    const nextTight = state.isTightForDualSidebars
+      ? viewportWidth < DUAL_SIDEBAR_RESTORE_PX
+      : viewportWidth < DUAL_SIDEBAR_YIELD_PX;
 
-    if (nextCompact === state.isCompactViewport) return;
+    if (
+      nextCompact === state.isCompactViewport &&
+      nextTight === state.isTightForDualSidebars
+    ) {
+      return;
+    }
 
-    setState((s) => ({
-      ...s,
-      isCompactViewport: nextCompact,
-      sidebarOpen: nextCompact ? false : s.sidebarDesktopOpenPref,
-    }));
+    setState((s) => {
+      let nextSidebarOpen = s.sidebarOpen;
+      let nextYielded = s.sidebarAutoYieldedForSidePanel;
+
+      if (nextCompact) {
+        nextSidebarOpen = false;
+        nextYielded = false;
+      } else if (nextTight && s.sidePanelOpen && s.sidebarOpen) {
+        nextSidebarOpen = false;
+        nextYielded = true;
+      } else if (!nextTight && s.sidebarAutoYieldedForSidePanel) {
+        nextSidebarOpen = s.sidebarDesktopOpenPref;
+        nextYielded = false;
+      } else if (s.isCompactViewport && !nextCompact) {
+        nextSidebarOpen = nextTight && s.sidePanelOpen ? false : s.sidebarDesktopOpenPref;
+        nextYielded = nextTight && s.sidePanelOpen && s.sidebarDesktopOpenPref;
+      }
+
+      return {
+        ...s,
+        isCompactViewport: nextCompact,
+        isTightForDualSidebars: nextTight,
+        sidebarOpen: nextSidebarOpen,
+        sidebarAutoYieldedForSidePanel: nextYielded,
+      };
+    });
   },
 
   setSidebarWidth(w: number): void {
@@ -2714,14 +3033,22 @@ export const orbitActions = {
         name: (name ?? basenameFromPath(cleanPath)) || cleanPath,
         directories: [cleanPath],
       });
-      setState((s) => ({
-        ...s,
-        remoteFolderPickerHostId: null,
-        collapsedProjectIds: {
-          ...s.collapsedProjectIds,
-          [created.project_id]: false,
-        },
-      }));
+      const keysToUnhide = new Set<string>([projectPathScopeKey(hostId, cleanPath)]);
+      if (created.directories[0]) {
+        keysToUnhide.add(projectPathScopeKey(hostId, created.directories[0]));
+      }
+      setState(
+        (s) => ({
+          ...s,
+          remoteFolderPickerHostId: null,
+          hiddenProjectKeys: omitRecordKeys(s.hiddenProjectKeys, keysToUnhide),
+          collapsedProjectIds: {
+            ...s.collapsedProjectIds,
+            [created.project_id]: false,
+          },
+        }),
+        true,
+      );
       await orbitActions.reloadFleetOnly();
       orbitActions.startNewThreadDraft(hostId, created.directories[0] ?? cleanPath);
     } catch (err) {
@@ -2778,38 +3105,851 @@ export const orbitActions = {
     }
   },
 
-  toggleInspector(openOverride?: boolean): void {
-    const nextOpen = openOverride ?? !state.inspectorOpen;
-    setState((s) => ({ ...s, inspectorOpen: nextOpen }));
-    if (nextOpen && state.selectedHostId && state.selectedWorkspaceCwd) {
+  async deleteProject(project: UnifiedProjectEntry): Promise<void> {
+    const hostId = project.host.host_id;
+    try {
+      const running = project.conversations.filter(
+        ({ agent }) => agent.is_running || agent.is_awaiting_permission,
+      );
+      if (running.length > 0) {
+        await Promise.allSettled(
+          running.map(({ agent }) => orbitIpc.interruptAgent(hostId, agent.agent_id)),
+        );
+      }
+
+      if (project.conversations.length > 0) {
+        await Promise.allSettled(
+          project.conversations.map(({ agent }) => orbitIpc.archiveAgent(hostId, agent.agent_id)),
+        );
+      }
+
+      const removedPinnedIds = new Set<string>();
+      if (project.pinnedProject?.project_id) {
+        removedPinnedIds.add(project.pinnedProject.project_id);
+      }
+      for (const pinned of state.fleet.projects ?? []) {
+        if (
+          pinned.host_id === hostId &&
+          pinned.directories.some((dir) => matchesProjectDirectory(project.directories, dir))
+        ) {
+          removedPinnedIds.add(pinned.project_id);
+        }
+      }
+      if (removedPinnedIds.size > 0) {
+        await Promise.all(
+          Array.from(removedPinnedIds).map((pid) => orbitIpc.removeProject(pid)),
+        );
+      }
+
+      const deletedAgentIds = new Set(project.conversations.map((c) => c.agent.agent_id));
+      const deletedThreadKeys = new Set(
+        project.conversations.map((c) => threadScopeKey(hostId, c.agent.agent_id)),
+      );
+
+      setState((s) => {
+        const nextHidden = { ...s.hiddenProjectKeys };
+        nextHidden[projectPathScopeKey(hostId, project.primaryCwd)] = true;
+        for (const dir of project.directories) {
+          nextHidden[projectPathScopeKey(hostId, dir)] = true;
+        }
+
+        const nextCollapsed = { ...s.collapsedProjectIds };
+        delete nextCollapsed[project.id];
+
+        const wasSelectedAgent =
+          !s.isDraftNewSession &&
+          s.selectedHostId === hostId &&
+          s.selectedAgentId !== null &&
+          deletedAgentIds.has(s.selectedAgentId);
+        const wasSelectedProjectCwd =
+          s.selectedHostId === hostId &&
+          matchesProjectDirectory(project.directories, s.selectedWorkspaceCwd);
+
+        let nextHostId = s.selectedHostId;
+        let nextAgentId = s.selectedAgentId;
+        let nextCwd = s.selectedWorkspaceCwd;
+        let nextDraft = s.isDraftNewSession;
+
+        if (wasSelectedAgent || wasSelectedProjectCwd) {
+          const remainingPinned = (s.fleet.projects ?? []).filter(
+            (p) => !removedPinnedIds.has(p.project_id),
+          );
+          const hostDetail = s.hostDetails[hostId];
+          const remainingHostDetails = hostDetail
+            ? {
+                ...s.hostDetails,
+                [hostId]: {
+                  ...hostDetail,
+                  agents: hostDetail.agents.filter((a) => !deletedAgentIds.has(a.agent_id)),
+                },
+              }
+            : s.hostDetails;
+          const remainingProjects = buildUnifiedProjects(
+            s.fleet.hosts,
+            remainingPinned,
+            remainingHostDetails,
+            nextHidden,
+          );
+          const nextProject =
+            remainingProjects.find(
+              (p) =>
+                p.id !== project.id &&
+                !(
+                  p.host.host_id === hostId &&
+                  matchesProjectDirectory(project.directories, p.primaryCwd)
+                ),
+            ) ?? null;
+
+          if (nextProject) {
+            nextHostId = nextProject.host.host_id;
+            nextCwd = nextProject.primaryCwd;
+            nextAgentId = null;
+            nextDraft = true;
+          } else {
+            nextAgentId = null;
+            nextCwd = "";
+            nextDraft = true;
+          }
+        }
+
+        return {
+          ...s,
+          selectedHostId: nextHostId,
+          selectedAgentId: nextAgentId,
+          selectedWorkspaceCwd: nextCwd,
+          isDraftNewSession: nextDraft,
+          hiddenProjectKeys: nextHidden,
+          collapsedProjectIds: nextCollapsed,
+          pinnedThreadKeys:
+            deletedThreadKeys.size > 0
+              ? s.pinnedThreadKeys.filter((k) => !deletedThreadKeys.has(k))
+              : s.pinnedThreadKeys,
+          archivedThreads: omitRecordKeys(s.archivedThreads, deletedThreadKeys),
+          threadCustomTitles: omitRecordKeys(s.threadCustomTitles, deletedThreadKeys),
+          seenAgentSeqs: omitRecordKeys(s.seenAgentSeqs, deletedThreadKeys),
+          timelines: omitRecordKeys(s.timelines, deletedThreadKeys),
+          composerDrafts: omitRecordKeys(s.composerDrafts, deletedThreadKeys),
+          slashDirectives: omitRecordKeys(s.slashDirectives, deletedThreadKeys),
+          inlineMentions: omitRecordKeys(s.inlineMentions, deletedThreadKeys),
+          contextItems: omitRecordKeys(s.contextItems, deletedThreadKeys),
+          pastedAttachments: omitRecordKeys(s.pastedAttachments, deletedThreadKeys),
+          diffQuotes: omitRecordKeys(s.diffQuotes, deletedThreadKeys),
+          queuedPrompts: omitRecordKeys(s.queuedPrompts, deletedThreadKeys),
+        };
+      }, true);
+
+      await orbitActions.reloadFleetOnly();
+      await orbitActions.reloadHostDetail(hostId, false);
+      notifyToast("Project deleted");
+    } catch (err) {
+      notifyToast(`Failed to delete project: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  // =========================================================================
+  // Unified Right Side Panel (Multi-Tab Workbench) & Stage Overview Actions
+  // =========================================================================
+
+  toggleSidePanel(openOverride?: boolean): void {
+    const nextOpen = openOverride ?? !state.sidePanelOpen;
+    if (nextOpen && state.sidePanelTabs.length === 0) {
+      orbitActions.openReviewTab();
+      return;
+    }
+
+    setState((s) => {
+      let nextSidebarOpen = s.sidebarOpen;
+      let nextYielded = s.sidebarAutoYieldedForSidePanel;
+
+      if (nextOpen) {
+        if (s.isTightForDualSidebars && s.sidebarOpen) {
+          nextSidebarOpen = false;
+          nextYielded = true;
+        }
+      } else if (s.sidebarAutoYieldedForSidePanel && !s.isCompactViewport) {
+        nextSidebarOpen = s.sidebarDesktopOpenPref;
+        nextYielded = false;
+      }
+
+      return {
+        ...s,
+        sidePanelOpen: nextOpen,
+        overviewPopoverOpen: nextOpen ? false : s.overviewPopoverOpen,
+        sidebarOpen: nextSidebarOpen,
+        sidebarAutoYieldedForSidePanel: nextYielded,
+        activeSidePanelTabId:
+          nextOpen && !s.activeSidePanelTabId
+            ? (s.sidePanelTabs[0]?.id ?? null)
+            : s.activeSidePanelTabId,
+      };
+    });
+  },
+
+  setSidePanelWidth(w: number): void {
+    setState((s) => ({ ...s, sidePanelWidth: Math.min(780, Math.max(360, w)) }), true);
+  },
+
+  focusSidePanelTab(tabId: string): void {
+    const target = state.sidePanelTabs.find((t) => t.id === tabId);
+    if (!target) return;
+    setState((s) => {
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        activeSidePanelTabId: tabId,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+
+    if (target.kind === "review" && state.selectedHostId && state.selectedWorkspaceCwd) {
       void orbitActions.refreshGit(
         state.selectedHostId,
         state.selectedWorkspaceCwd,
         state.selectedDiffPath,
         state.diffStaged,
       );
+    } else if (target.kind === "files" && state.selectedHostId && state.selectedWorkspaceCwd) {
+      void orbitActions.ensureWorkspaceFiles(state.selectedHostId, state.selectedWorkspaceCwd);
+    } else if (target.kind === "terminal" && state.selectedHostId) {
+      const hostTabs = state.terminalTabs.filter((t) => t.hostId === state.selectedHostId);
+      if (hostTabs.length === 0) {
+        orbitActions.spawnNewTerminalTab(state.selectedHostId, state.selectedWorkspaceCwd || "~");
+      } else if (!hostTabs.some((t) => t.key === state.activeTerminalTabKey)) {
+        setState((s) => ({ ...s, activeTerminalTabKey: hostTabs[0].key }));
+      }
     }
   },
 
-  openInspectorForFile(path: string, scope: ReviewScope = "session_turns"): void {
-    setState((s) => ({
-      ...s,
-      inspectorOpen: true,
-      reviewScope: scope,
-      selectedDiffPath: path,
-    }));
-    if (scope === "working_tree" && state.selectedHostId && state.selectedWorkspaceCwd) {
+  closeSidePanelTab(tabId: string): void {
+    setState((s) => {
+      const idx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
+      if (idx < 0) return s;
+      const remaining = s.sidePanelTabs.filter((t) => t.id !== tabId);
+      const nextActive =
+        s.activeSidePanelTabId === tabId
+          ? (remaining[Math.min(idx, remaining.length - 1)]?.id ?? null)
+          : s.activeSidePanelTabId;
+      const nextOpen = remaining.length === 0 ? false : s.sidePanelOpen;
+      const restoreSidebar =
+        !nextOpen && s.sidebarAutoYieldedForSidePanel && !s.isCompactViewport;
+      return {
+        ...s,
+        sidePanelTabs: remaining,
+        activeSidePanelTabId: nextActive,
+        sidePanelOpen: nextOpen,
+        sidebarOpen: restoreSidebar ? s.sidebarDesktopOpenPref : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: restoreSidebar
+          ? false
+          : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+  },
+
+  openReviewTab(opts?: { path?: string | null; scope?: ReviewScope }): void {
+    const tabId = "tab:review";
+    setState((s) => {
+      const exists = s.sidePanelTabs.some((t) => t.id === tabId);
+      const nextTabs = exists
+        ? s.sidePanelTabs
+        : [...s.sidePanelTabs, { id: tabId, kind: "review" as const, title: "Review" }];
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        reviewScope: opts?.scope ?? s.reviewScope,
+        selectedDiffPath: opts?.path !== undefined ? opts.path : s.selectedDiffPath,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+
+    const effectiveScope = opts?.scope ?? state.reviewScope;
+    const effectivePath = opts?.path !== undefined ? opts.path : state.selectedDiffPath;
+    if (
+      effectiveScope === "working_tree" &&
+      state.selectedHostId &&
+      state.selectedWorkspaceCwd
+    ) {
       void orbitActions.refreshGit(
         state.selectedHostId,
         state.selectedWorkspaceCwd,
-        path,
+        effectivePath,
         state.diffStaged,
       );
     }
   },
 
-  setInspectorWidth(w: number): void {
-    setState((s) => ({ ...s, inspectorWidth: Math.min(760, Math.max(340, w)) }), true);
+  toggleReviewTab(openOverride?: boolean): void {
+    const tabId = "tab:review";
+    const isCurrentlyActive = state.sidePanelOpen && state.activeSidePanelTabId === tabId;
+    if (openOverride === false || (openOverride === undefined && isCurrentlyActive)) {
+      orbitActions.toggleSidePanel(false);
+      return;
+    }
+    orbitActions.openReviewTab();
+  },
+
+  /** Backward-compatible alias for diff navigation hooks */
+  toggleInspector(openOverride?: boolean): void {
+    orbitActions.toggleReviewTab(openOverride);
+  },
+
+  /** Backward-compatible alias for jumping straight to a file diff in Review tab */
+  openInspectorForFile(path: string, scope: ReviewScope = "session_turns"): void {
+    orbitActions.openReviewTab({ path, scope });
+  },
+
+  openFilesExplorerTab(): void {
+    const tabId = "tab:files";
+    setState((s) => {
+      const exists = s.sidePanelTabs.some((t) => t.id === tabId);
+      const nextTabs = exists
+        ? s.sidePanelTabs
+        : [...s.sidePanelTabs, { id: tabId, kind: "files" as const, title: "Files" }];
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+
+    if (state.selectedHostId && state.selectedWorkspaceCwd) {
+      void orbitActions.ensureWorkspaceFiles(state.selectedHostId, state.selectedWorkspaceCwd);
+    }
+  },
+
+  openFileInSidePanel(
+    rawPath: string,
+    opts?: { focusLine?: number | null; hostId?: string; cwd?: string },
+  ): void {
+    const hostId = opts?.hostId ?? state.selectedHostId;
+    const cwd = opts?.cwd ?? state.selectedWorkspaceCwd ?? "~";
+    const cleanPath = rawPath.trim();
+    if (!hostId || !cleanPath) return;
+
+    const tabId = `tab:file:${hostId}::${cwd}::${cleanPath}`;
+    const title = basenameFromPath(cleanPath) || cleanPath;
+
+    setState((s) => {
+      const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
+      let nextTabs = s.sidePanelTabs;
+      if (existingIdx >= 0) {
+        if (opts?.focusLine !== undefined) {
+          nextTabs = [...s.sidePanelTabs];
+          nextTabs[existingIdx] = {
+            ...nextTabs[existingIdx],
+            focusLine: opts.focusLine,
+          };
+        }
+      } else {
+        nextTabs = [
+          ...s.sidePanelTabs,
+          {
+            id: tabId,
+            kind: "file" as const,
+            title,
+            filePath: cleanPath,
+            hostId,
+            cwd,
+            focusLine: opts?.focusLine ?? null,
+          },
+        ];
+      }
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        quickOpenFilesOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+
+    void orbitActions.loadWorkspaceFile(hostId, cwd, cleanPath, false);
+  },
+
+  async loadWorkspaceFile(
+    hostId: string,
+    cwd: string,
+    path: string,
+    forceReload = false,
+  ): Promise<void> {
+    const cKey = fileCacheKey(hostId, cwd, path);
+    const existing = state.fileViewCache[cKey];
+    if (!forceReload && (existing?.status === "loading" || existing?.status === "ready")) {
+      return;
+    }
+
+    setState((s) => ({
+      ...s,
+      fileViewCache: {
+        ...s.fileViewCache,
+        [cKey]: { status: "loading", data: existing?.data },
+      },
+    }));
+
+    try {
+      const data = await orbitIpc.readWorkspaceFile(hostId, cwd, path);
+      setState((s) => {
+        // Maintain a bounded 20-entry LRU file cache so large files never grow memory unboundedly
+        const nextCache: Record<string, FileViewCacheEntry> = {};
+        const entries = Object.entries(s.fileViewCache).filter(([k]) => k !== cKey);
+        const startIdx = Math.max(0, entries.length - 19);
+        for (let i = startIdx; i < entries.length; i += 1) {
+          const [k, v] = entries[i];
+          nextCache[k] = v;
+        }
+        nextCache[cKey] = { status: "ready", data };
+        return {
+          ...s,
+          fileViewCache: nextCache,
+        };
+      });
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        fileViewCache: {
+          ...s.fileViewCache,
+          [cKey]: { status: "error", error: String(err) },
+        },
+      }));
+    }
+  },
+
+  openTerminalTab(opts?: { spawnIfEmpty?: boolean }): void {
+    const tabId = "tab:terminal";
+    setState((s) => {
+      const exists = s.sidePanelTabs.some((t) => t.id === tabId);
+      const nextTabs = exists
+        ? s.sidePanelTabs
+        : [...s.sidePanelTabs, { id: tabId, kind: "terminal" as const, title: "Terminal" }];
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+
+    if (opts?.spawnIfEmpty !== false && state.selectedHostId) {
+      const hostTabs = state.terminalTabs.filter((t) => t.hostId === state.selectedHostId);
+      if (hostTabs.length === 0) {
+        orbitActions.spawnNewTerminalTab(state.selectedHostId, state.selectedWorkspaceCwd || "~");
+      } else if (!hostTabs.some((t) => t.key === state.activeTerminalTabKey)) {
+        setState((s) => ({ ...s, activeTerminalTabKey: hostTabs[0].key }));
+      }
+    }
+  },
+
+  toggleTerminalTab(openOverride?: boolean): void {
+    const tabId = "tab:terminal";
+    const isCurrentlyActive = state.sidePanelOpen && state.activeSidePanelTabId === tabId;
+    if (openOverride === false || (openOverride === undefined && isCurrentlyActive)) {
+      orbitActions.toggleSidePanel(false);
+      return;
+    }
+    orbitActions.openTerminalTab();
+  },
+
+  openBrowserTab(initialUrl?: string): void {
+    const tabId = "tab:browser";
+    const rawUrl = initialUrl?.trim() ?? "";
+    let cleanUrl = "";
+    if (rawUrl) {
+      try {
+        const parsed = new URL(rawUrl);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          cleanUrl = parsed.toString();
+        }
+      } catch {
+        cleanUrl = "";
+      }
+    }
+    setState((s) => {
+      const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
+      let nextTabs = s.sidePanelTabs;
+      if (existingIdx >= 0) {
+        if (cleanUrl) {
+          nextTabs = [...s.sidePanelTabs];
+          nextTabs[existingIdx] = {
+            ...nextTabs[existingIdx],
+            url: cleanUrl,
+          };
+        }
+      } else {
+        nextTabs = [
+          ...s.sidePanelTabs,
+          {
+            id: tabId,
+            kind: "browser" as const,
+            title: "Browser",
+            url: cleanUrl,
+          },
+        ];
+      }
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+  },
+
+  updateBrowserTabUrl(tabId: string, url: string): void {
+    let safeUrl = "";
+    if (url.trim()) {
+      try {
+        const parsed = new URL(url.trim());
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+        safeUrl = parsed.toString();
+      } catch {
+        return;
+      }
+    }
+    setState((s) => {
+      const idx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
+      if (idx < 0) return s;
+      const nextTabs = [...s.sidePanelTabs];
+      nextTabs[idx] = { ...nextTabs[idx], url: safeUrl };
+      return { ...s, sidePanelTabs: nextTabs };
+    });
+  },
+
+  openSideQuestionTab(): void {
+    const tabId = "tab:side_question";
+    setState((s) => {
+      const exists = s.sidePanelTabs.some((t) => t.id === tabId);
+      const nextTabs = exists
+        ? s.sidePanelTabs
+        : [
+            ...s.sidePanelTabs,
+            { id: tabId, kind: "side_question" as const, title: "Side Question" },
+          ];
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        sideQuestionFocusNonce: s.sideQuestionFocusNonce + 1,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+  },
+
+  toggleSideQuestionTab(openOverride?: boolean): void {
+    const tabId = "tab:side_question";
+    const isCurrentlyActive = state.sidePanelOpen && state.activeSidePanelTabId === tabId;
+    if (openOverride === false || (openOverride === undefined && isCurrentlyActive)) {
+      orbitActions.toggleSidePanel(false);
+      return;
+    }
+    orbitActions.openSideQuestionTab();
+  },
+
+  setSideQuestionDraft(text: string): void {
+    const scope = sideQuestionScopeKey(state);
+    setState((s) => ({
+      ...s,
+      sideQuestionDrafts: { ...s.sideQuestionDrafts, [scope]: text },
+    }));
+  },
+
+  clearSideQuestions(): void {
+    const scope = sideQuestionScopeKey(state);
+    setState((s) => {
+      const next = { ...s.sideQuestionsByScope };
+      delete next[scope];
+      return { ...s, sideQuestionsByScope: next };
+    });
+  },
+
+  promoteSideQuestionToComposer(text: string): void {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const key = composerScopeKey(state);
+    const existing = (state.composerDrafts[key] ?? "").trim();
+    const nextDraft = existing ? `${existing}\n\n${trimmed}` : trimmed;
+    setState((s) => ({
+      ...s,
+      composerDrafts: { ...s.composerDrafts, [key]: nextDraft },
+    }));
+    orbitActions.focusComposer();
+    notifyToast("Copied to main Composer");
+  },
+
+  async submitSideQuestion(rawQuestion?: string): Promise<void> {
+    const hostId = state.selectedHostId;
+    if (!hostId) {
+      notifyToast("Connect an Orbit host first");
+      return;
+    }
+
+    const scope = sideQuestionScopeKey(state);
+    const question = (rawQuestion ?? state.sideQuestionDrafts[scope] ?? "").trim();
+    if (!question) return;
+
+    const detail = state.hostDetails[hostId];
+    const currentAgent =
+      !state.isDraftNewSession && state.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === state.selectedAgentId) ??
+          state.timelines[`${hostId}::${state.selectedAgentId}`]?.agent ??
+          null
+        : null;
+
+    const provider = currentAgent?.provider ?? state.draftProvider;
+    const model = currentAgent?.model ?? state.draftModels[provider] ?? null;
+    const cwd = currentAgent?.cwd || state.selectedWorkspaceCwd || "~";
+    const providerLabel =
+      currentAgent?.provider_label ??
+      (provider === "claude_code"
+        ? "Claude Code"
+        : provider === "antigravity"
+          ? "Antigravity"
+          : "Codex");
+
+    const gitReview = state.gitReviews[`${hostId}::${cwd}`] ?? null;
+    const branchName =
+      gitReview?.status?.branch ??
+      detail?.workspaces.find((w) => w.cwd === cwd)?.git_branch ??
+      null;
+    const items =
+      !state.isDraftNewSession && state.selectedAgentId
+        ? (state.timelines[`${hostId}::${state.selectedAgentId}`]?.items ?? [])
+        : [];
+
+    const contextSummary = buildSideQuestionContextSummary({
+      cwd,
+      branchName,
+      items,
+      gitReview,
+    });
+
+    const entryId = `sq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const newEntry: SideQuestionEntry = {
+      id: entryId,
+      question,
+      answer: "",
+      blocks: [],
+      status: "streaming",
+      error: null,
+      createdAtMs: Date.now(),
+      providerLabel,
+    };
+
+    orbitActions.openSideQuestionTab();
+    setState((s) => ({
+      ...s,
+      sideQuestionDrafts: { ...s.sideQuestionDrafts, [scope]: "" },
+      sideQuestionsByScope: {
+        ...s.sideQuestionsByScope,
+        [scope]: [...(s.sideQuestionsByScope[scope] ?? []), newEntry],
+      },
+    }));
+
+    let accumText = "";
+    let parseTimer: ReturnType<typeof setTimeout> | null = null;
+    let parseRevision = 0;
+
+    const patchEntry = (mutator: (entry: SideQuestionEntry) => SideQuestionEntry) => {
+      setState((s) => {
+        const list = s.sideQuestionsByScope[scope];
+        if (!list) return s;
+        const idx = list.findIndex((item) => item.id === entryId);
+        if (idx < 0) return s;
+        const nextList = [...list];
+        nextList[idx] = mutator(nextList[idx]);
+        return {
+          ...s,
+          sideQuestionsByScope: {
+            ...s.sideQuestionsByScope,
+            [scope]: nextList,
+          },
+        };
+      });
+    };
+
+    const scheduleMarkdownParse = (text: string, streaming: boolean) => {
+      const rev = ++parseRevision;
+      if (parseTimer) {
+        clearTimeout(parseTimer);
+        parseTimer = null;
+      }
+      const run = () => {
+        void orbitIpc
+          .parseMarkdownPreview(text, streaming)
+          .then((blocks) => {
+            if (rev !== parseRevision && streaming) return;
+            if (blocks.length > 0) {
+              patchEntry((e) => ({ ...e, blocks }));
+            }
+          })
+          .catch(() => {});
+      };
+      if (streaming) {
+        parseTimer = setTimeout(run, 85);
+      } else {
+        run();
+      }
+    };
+
+    try {
+      await orbitIpc.askSideQuestion(
+        {
+          hostId,
+          agentId: currentAgent?.agent_id ?? null,
+          cwd,
+          provider,
+          model,
+          question,
+          contextSummary,
+        },
+        (ev) => {
+          if (ev.kind === "delta") {
+            accumText += ev.text_delta;
+            patchEntry((e) => ({ ...e, answer: accumText, status: "streaming" }));
+            scheduleMarkdownParse(accumText, true);
+          } else if (ev.kind === "done") {
+            const finalText = ev.full_text || accumText;
+            const hasError = Boolean(ev.error && ev.error.trim().length > 0);
+            patchEntry((e) => ({
+              ...e,
+              answer: finalText,
+              status: hasError ? "error" : "done",
+              error: ev.error,
+            }));
+            if (finalText.trim()) {
+              scheduleMarkdownParse(finalText, false);
+            }
+          }
+        },
+      );
+    } catch (err) {
+      patchEntry((e) => ({
+        ...e,
+        status: "error",
+        error: String(err),
+      }));
+    }
+  },
+
+  openSubagentTab(params: {
+    callId: string;
+    role: string;
+    promptPreview: string;
+    childAgentId: string | null;
+  }): void {
+    const tabId = `tab:subagent:${params.childAgentId || params.callId}`;
+    const hostId = state.selectedHostId;
+    setState((s) => {
+      const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
+      let nextTabs = s.sidePanelTabs;
+      const tabObj: SidePanelTab = {
+        id: tabId,
+        kind: "subagent",
+        title: params.role || "Subagent",
+        hostId: hostId ?? undefined,
+        subagentCallId: params.callId,
+        subagentRole: params.role,
+        subagentPrompt: params.promptPreview,
+        childAgentId: params.childAgentId,
+      };
+      if (existingIdx >= 0) {
+        nextTabs = [...s.sidePanelTabs];
+        nextTabs[existingIdx] = tabObj;
+      } else {
+        nextTabs = [...s.sidePanelTabs, tabObj];
+      }
+      const shouldYield = !s.sidePanelOpen && s.isTightForDualSidebars && s.sidebarOpen;
+      return {
+        ...s,
+        sidePanelOpen: true,
+        overviewPopoverOpen: false,
+        sidePanelTabs: nextTabs,
+        activeSidePanelTabId: tabId,
+        sidebarOpen: shouldYield ? false : s.sidebarOpen,
+        sidebarAutoYieldedForSidePanel: shouldYield ? true : s.sidebarAutoYieldedForSidePanel,
+      };
+    });
+
+    if (hostId && params.childAgentId) {
+      void orbitIpc.openAgentTimeline(hostId, params.childAgentId);
+      void orbitActions.pullTimelineDelta(hostId, params.childAgentId, false);
+    }
+  },
+
+  setStageCanDockOverview(canDock: boolean): void {
+    if (state.stageCanDockOverview === canDock) return;
+    setState((s) => ({
+      ...s,
+      stageCanDockOverview: canDock,
+      overviewPopoverOpen: canDock ? false : s.overviewPopoverOpen,
+    }));
+  },
+
+  toggleOverviewPanel(openOverride?: boolean): void {
+    if (!state.stageCanDockOverview) {
+      const nextPop = openOverride ?? !state.overviewPopoverOpen;
+      setState((s) => ({ ...s, overviewPopoverOpen: nextPop }));
+      return;
+    }
+    setState(
+      (s) => ({
+        ...s,
+        overviewDesktopOpenPref: openOverride ?? !s.overviewDesktopOpenPref,
+      }),
+      true,
+    );
+  },
+
+  setOverviewPopoverOpen(open: boolean): void {
+    setState((s) => ({ ...s, overviewPopoverOpen: open }));
+  },
+
+  toggleOverviewSection(section: OverviewSectionId): void {
+    setState(
+      (s) => ({
+        ...s,
+        overviewCollapsedSections: {
+          ...s.overviewCollapsedSections,
+          [section]: !s.overviewCollapsedSections[section],
+        },
+      }),
+      true,
+    );
+  },
+
+  setQuickOpenFilesOpen(open: boolean): void {
+    setState((s) => ({ ...s, quickOpenFilesOpen: open }));
+    if (open && state.selectedHostId && state.selectedWorkspaceCwd) {
+      void orbitActions.ensureWorkspaceFiles(state.selectedHostId, state.selectedWorkspaceCwd);
+    }
   },
 
   setReviewScope(scope: ReviewScope): void {
@@ -2879,23 +4019,6 @@ export const orbitActions = {
     }));
   },
 
-  toggleTerminalDock(openOverride?: boolean): void {
-    const nextOpen = openOverride ?? !state.terminalOpen;
-    setState((s) => ({ ...s, terminalOpen: nextOpen }));
-    if (nextOpen && state.selectedHostId) {
-      const hostTabs = state.terminalTabs.filter((t) => t.hostId === state.selectedHostId);
-      if (hostTabs.length === 0) {
-        orbitActions.spawnNewTerminalTab(state.selectedHostId, state.selectedWorkspaceCwd || "~");
-      } else if (!hostTabs.some((t) => t.key === state.activeTerminalTabKey)) {
-        setState((s) => ({ ...s, activeTerminalTabKey: hostTabs[0].key }));
-      }
-    }
-  },
-
-  setTerminalHeight(h: number): void {
-    setState((s) => ({ ...s, terminalHeight: Math.min(540, Math.max(160, h)) }), true);
-  },
-
   setTerminalFocused(focused: boolean): void {
     if (state.terminalFocused === focused) return;
     setState((s) => ({ ...s, terminalFocused: focused }));
@@ -2910,7 +4033,8 @@ export const orbitActions = {
       (t) => t.hostId === hostId && t.terminalId === terminalId,
     );
     if (existing) {
-      setState((s) => ({ ...s, activeTerminalTabKey: existing.key, terminalOpen: true }));
+      setState((s) => ({ ...s, activeTerminalTabKey: existing.key }));
+      orbitActions.openTerminalTab({ spawnIfEmpty: false });
       return;
     }
     const usedSlots = new Set(
@@ -2923,13 +4047,13 @@ export const orbitActions = {
     const tabKey = `${hostId}::slot-${slot}`;
     setState((s) => ({
       ...s,
-      terminalOpen: true,
       terminalTabs: [
         ...s.terminalTabs,
         { key: tabKey, hostId, terminalId, slot, cwd, title },
       ],
       activeTerminalTabKey: tabKey,
     }));
+    orbitActions.openTerminalTab({ spawnIfEmpty: false });
     void orbitIpc.attachTerminal(hostId, terminalId, slot);
   },
 
@@ -2948,7 +4072,6 @@ export const orbitActions = {
         ...s,
         terminalTabs: remaining,
         activeTerminalTabKey: nextActive,
-        terminalOpen: remaining.length === 0 ? false : s.terminalOpen,
       };
     });
   },

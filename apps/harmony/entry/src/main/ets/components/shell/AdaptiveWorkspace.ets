@@ -1,27 +1,65 @@
-import { basenameOfPath, formatCompactTopBarConnectionLabel } from '../../model/OrbitTypes';
+import { SymbolGlyphModifier } from '@kit.ArkUI';
+import {
+  DividerShowType,
+  HdsNavigation,
+  HdsNavigationTitleMode,
+  ScrollEffectType
+} from '@kit.UIDesignKit';
+import { HostCardDto, basenameOfPath, formatCompactTopBarConnectionLabel } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { orbitLogWarn } from '../../model/OrbitLogger';
 import {
   OrbitTokens,
   orbitTextMeta,
-  orbitTextMono,
   orbitTextSubhead
 } from '../../theme/OrbitTokens';
+import {
+  dismissHarmonyKeyboard,
+  resolveHostStatusColor,
+  resolveSelectedHost
+} from '../common/OrbitCommonControls';
 import { FleetSidebar } from './FleetSidebar';
 import { StreamStage } from '../stage/StreamStage';
 import { StickyDecisionDock } from '../stage/StickyDecisionDock';
 import { OmniComposer } from '../composer/OmniComposer';
-import { ModelPickerSheet } from '../composer/ModelPickerSheet';
 import { ContextPickerSheet } from '../composer/ContextPickerSheet';
 import { GitDiffSheet } from '../sheets/GitDiffSheet';
 import { PtyTerminalSheet } from '../sheets/PtyTerminalSheet';
 import { HostSettingsSheet } from '../sheets/HostSettingsSheet';
+import { DirectoryBrowserSheet } from '../sheets/DirectoryBrowserSheet';
 
 @ComponentV2
 export struct AdaptiveWorkspace {
-  private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  private mainNavStack: NavPathStack = new NavPathStack();
+
+  @Monitor('store.toastRevision')
+  onToastRevisionChanged(_mon: IMonitor): void {
+    const msg = this.store.toastMessage.trim();
+    if (msg.length === 0) {
+      return;
+    }
+    try {
+      this.getUIContext().getPromptAction().openToast({
+        message: msg,
+        duration: 2000
+      }).catch((err: Object) => {
+        orbitLogWarn('OrbitToast', 'openToast failed', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitToast', 'PromptAction unavailable', err as Object);
+    }
+  }
 
   private isPhoneLayout(): boolean {
     return this.store.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN;
+  }
+
+  private resolvedSideBarWidth(): number {
+    if (this.isPhoneLayout()) {
+      return Math.min(320, Math.max(280, Math.floor(this.store.windowWidthVp * 0.82)));
+    }
+    return OrbitTokens.SIDEBAR_FOLD_WIDTH;
   }
 
   private canShowInlineDiff(): boolean {
@@ -32,6 +70,30 @@ export struct AdaptiveWorkspace {
     return this.store.hosts.length > 0;
   }
 
+  private selectedHost(): HostCardDto | null {
+    const resolved = resolveSelectedHost(this.store);
+    if (resolved !== null) {
+      return resolved;
+    }
+    return this.store.hosts.length > 0 ? this.store.hosts[0] : null;
+  }
+
+  private hasActiveConversation(): boolean {
+    return this.hasPairedHosts() && this.store.currentAgent !== null;
+  }
+
+  private isDraftTitle(): boolean {
+    return this.hasPairedHosts() && this.store.currentAgent === null;
+  }
+
+  private isConnectionHealthy(): boolean {
+    const host = this.selectedHost();
+    if (host === null) {
+      return false;
+    }
+    return host.connection_state === 'online_direct' || host.connection_state === 'online_relay';
+  }
+
   private topBarTitle(): string {
     if (!this.hasPairedHosts()) {
       return 'Orbit';
@@ -39,22 +101,13 @@ export struct AdaptiveWorkspace {
     if (this.store.currentAgent !== null && this.store.currentAgent.title.trim().length > 0) {
       return this.store.currentAgent.title.trim();
     }
-    return 'New Session';
+    return 'New Conversation';
   }
 
   private topBarConnectionLabel(): string {
-    const detail = this.store.currentHostDetail;
-    if (detail !== null) {
-      return formatCompactTopBarConnectionLabel(
-        detail.host.connection_state,
-        detail.host.via_ssh_tunnel
-      );
-    }
-    for (let i = 0; i < this.store.hosts.length; i++) {
-      const h = this.store.hosts[i];
-      if (h.host_id === this.store.selectedHostId) {
-        return formatCompactTopBarConnectionLabel(h.connection_state, h.via_ssh_tunnel);
-      }
+    const host = this.selectedHost();
+    if (host !== null) {
+      return formatCompactTopBarConnectionLabel(host.connection_state, host.via_ssh_tunnel);
     }
     return 'Offline';
   }
@@ -66,29 +119,63 @@ export struct AdaptiveWorkspace {
     return '~';
   }
 
-  private topStatusDotColor(): string {
-    const ag = this.store.currentAgent;
-    if (ag !== null) {
-      if (ag.is_awaiting_permission) {
-        return this.store.palette.statusWarning;
-      }
-      if (ag.is_running) {
-        return this.store.palette.accentPrimary;
-      }
-      if (ag.status.state === 'error') {
-        return this.store.palette.statusDanger;
-      }
+  private topStatusDotColor(): ResourceColor {
+    return resolveHostStatusColor(this.selectedHost(), this.store);
+  }
+
+  private topBarSubtitle(): string {
+    const host = this.selectedHost();
+    if (host === null) {
+      return 'No Host Paired';
     }
-    const detail = this.store.currentHostDetail;
-    if (detail !== null) {
-      if (detail.host.connection_state === 'online_direct') {
-        return this.store.palette.statusDirect;
-      }
-      if (detail.host.connection_state === 'online_relay') {
-        return this.store.palette.statusRelay;
-      }
+    const repo = this.topBarWorkspaceLabel();
+    const rawHost = host.display_name.trim();
+    const hostName = rawHost.length > 0 ? rawHost : host.host_id;
+    const isMultiHost = this.store.hosts.length > 1;
+    if (!this.isConnectionHealthy()) {
+      const target = isMultiHost ? hostName : repo;
+      return `${this.topBarConnectionLabel()} · ${target}`;
     }
-    return this.store.palette.fgMuted;
+    if (isMultiHost) {
+      return `${hostName} / ${repo}`;
+    }
+    const branch = this.store.resolveWorkspaceBranch(this.store.activeCwd);
+    if (branch.length > 0) {
+      return `${repo} · ${branch}`;
+    }
+    return repo;
+  }
+
+  private diffFileSubtitle(): string | undefined {
+    const count = this.store.totalDiffFileCount();
+    if (count <= 0) {
+      return undefined;
+    }
+    return count === 1 ? '1 file' : `${count} files`;
+  }
+
+  private terminalSubtitle(): string | undefined {
+    const count = this.store.activeTerminalCount();
+    return count > 0 ? `${count} active` : undefined;
+  }
+
+  private openFolderFromHeader(): void {
+    dismissHarmonyKeyboard(this.getUIContext());
+    this.store.browseDirectory(this.store.activeCwd === '~' ? null : this.store.activeCwd);
+  }
+
+  private buildSheetOptions(
+    detents: [(SheetSize | Length), (SheetSize | Length)?, (SheetSize | Length)?],
+    onClose: () => void,
+    bgColor?: ResourceColor
+  ): SheetOptions {
+    return {
+      detents: detents,
+      dragBar: true,
+      showClose: false,
+      backgroundColor: bgColor !== undefined ? bgColor : this.store.palette.drawer,
+      onDisappear: onClose
+    };
   }
 
   @Builder
@@ -102,11 +189,6 @@ export struct AdaptiveWorkspace {
   }
 
   @Builder
-  private buildModelPickerSheet() {
-    ModelPickerSheet()
-  }
-
-  @Builder
   private buildContextPickerSheet() {
     ContextPickerSheet()
   }
@@ -117,235 +199,251 @@ export struct AdaptiveWorkspace {
   }
 
   @Builder
-  private renderTopBar() {
-    Column() {
-      Row({ space: OrbitTokens.SPACE_XS }) {
-        Stack({ alignContent: Alignment.TopEnd }) {
-          Row() {
-            Text(this.isPhoneLayout() ? '☰' : '◧')
-              .attributeModifier(
-                orbitTextSubhead(
-                  !this.isPhoneLayout() && this.store.isSidebarCollapsed
-                    ? this.store.palette.fgSecondary
-                    : this.store.palette.fgPrimary,
-                  FontWeight.Bold
-                )
-              )
-          }
-          .width(OrbitTokens.HIT_MIN)
-          .height(OrbitTokens.HIT_MIN)
-          .justifyContent(FlexAlign.Center)
+  private buildDirectoryBrowserSheet() {
+    DirectoryBrowserSheet()
+  }
 
-          if (this.store.totalPendingApprovals > 0) {
-            Row()
-              .width(OrbitTokens.DOT_SIZE)
-              .height(OrbitTokens.DOT_SIZE)
-              .borderRadius(3)
-              .backgroundColor(this.store.palette.statusWarning)
-              .margin({ top: 10, right: 10 })
-          }
+  @Builder
+  private renderTitleMenu() {
+    Menu() {
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.folder'))
+          .fontColor([this.store.palette.iconPrimary]),
+        content: 'Open Folder'
+      })
+        .onClick(() => {
+          this.openFolderFromHeader();
+        })
+
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.square_and_square'))
+          .fontColor([this.store.palette.iconPrimary]),
+        content: 'Copy Path'
+      })
+        .onClick(() => {
+          this.store.copyToClipboard(this.store.activeCwd, 'Copied path');
+        })
+    }
+  }
+
+  @Builder
+  private renderMoreMenu() {
+    Menu() {
+      MenuItemGroup() {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_left_arrow_right'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: this.canShowInlineDiff() && this.store.showInlineDiffInspector
+            ? 'Hide Diff Review'
+            : 'Diff Review',
+          labelInfo: this.diffFileSubtitle()
+        })
+          .labelFontColor(this.store.palette.fgMuted)
+          .onClick(() => {
+            this.store.toggleTopBarGitDiff();
+          })
+
+        if (this.canShowInlineDiff() && this.store.showInlineDiffInspector) {
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.arrow_up_left_and_arrow_down_right'))
+              .fontColor([this.store.palette.iconPrimary]),
+            content: 'Full Diff'
+          })
+            .onClick(() => {
+              this.store.openFullGitDiffSheet();
+            })
         }
-        .width(OrbitTokens.HIT_MIN)
-        .height(OrbitTokens.HIT_MIN)
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.code_square'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Terminal',
+          labelInfo: this.terminalSubtitle()
+        })
+          .labelFontColor(this.store.palette.fgMuted)
+          .onClick(() => {
+            this.store.openPtyTerminal();
+          })
+      }
+
+      if (this.hasActiveConversation()) {
+        MenuItemGroup() {
+          MenuItem({
+            symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.archivebox'))
+              .fontColor([this.store.palette.statusDanger]),
+            content: 'Archive'
+          })
+            .contentFontColor(this.store.palette.statusDanger)
+            .onClick(() => {
+              if (this.store.currentAgent !== null) {
+                this.store.archiveSession(this.store.currentAgent.agent_id);
+              }
+            })
+        }
+      }
+    }
+  }
+
+  @Builder
+  private renderHdsTitleBarContent() {
+    Row({ space: OrbitTokens.SPACE_SM }) {
+      Badge({
+        count: (this.isPhoneLayout() || this.store.isSidebarCollapsed) ? this.store.totalPendingApprovals : 0,
+        style: {
+          badgeColor: this.store.palette.statusWarning,
+          badgeSize: 8
+        },
+        position: BadgePosition.RightTop
+      }) {
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.open_sidebar'))
+            .fontSize(20)
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+            .fontColor([
+              !this.isPhoneLayout() && this.store.isSidebarCollapsed
+                ? this.store.palette.iconSecondary
+                : this.store.palette.iconPrimary
+            ])
+        }
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding(0)
+        .backgroundColor(this.store.palette.subtleSurface)
         .accessibilityText(
           this.isPhoneLayout()
             ? (this.store.sidebarOpen ? 'Close navigation drawer' : 'Open navigation drawer')
             : (this.store.isSidebarCollapsed ? 'Expand fleet sidebar' : 'Collapse fleet sidebar')
         )
         .onClick(() => {
+          dismissHarmonyKeyboard(this.getUIContext());
           this.store.toggleSidebar();
         })
-
-        if (this.hasPairedHosts()) {
-          Column({ space: 2 }) {
-            Text(this.topBarTitle())
-              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .width('100%')
-
-            Row({ space: OrbitTokens.SPACE_XS }) {
-              Row()
-                .width(OrbitTokens.DOT_SIZE)
-                .height(OrbitTokens.DOT_SIZE)
-                .borderRadius(3)
-                .backgroundColor(this.topStatusDotColor())
-
-              Text(`${this.topBarConnectionLabel()} · ${this.topBarWorkspaceLabel()}`)
-                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Normal))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .flexShrink(1)
-            }
-            .width('100%')
-            .alignItems(VerticalAlign.Center)
-          }
-          .layoutWeight(1)
-          .justifyContent(FlexAlign.Center)
-          .alignItems(HorizontalAlign.Start)
-        } else {
-          Row({ space: OrbitTokens.SPACE_SM }) {
-            Text(this.topBarTitle())
-              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
-          }
-          .layoutWeight(1)
-          .height(OrbitTokens.HIT_MIN)
-          .alignItems(VerticalAlign.Center)
-        }
-
-        if (this.hasPairedHosts()) {
-          Row({ space: OrbitTokens.SPACE_XS }) {
-            if (this.store.totalDiffAdditions() > 0 || this.store.totalDiffDeletions() > 0) {
-              Text(`+${this.store.totalDiffAdditions()}`)
-                .attributeModifier(
-                  orbitTextMeta(this.store.palette.statusDirect, FontWeight.Medium)
-                )
-              Text(`-${this.store.totalDiffDeletions()}`)
-                .attributeModifier(
-                  orbitTextMeta(this.store.palette.statusDanger, FontWeight.Medium)
-                )
-            } else {
-              Text('Diff')
-                .attributeModifier(
-                  orbitTextMeta(
-                    this.canShowInlineDiff() && this.store.showInlineDiffInspector
-                      ? this.store.palette.accentPrimary
-                      : this.store.palette.fgSecondary,
-                    FontWeight.Medium
-                  )
-                )
-            }
-          }
-          .height(OrbitTokens.HIT_MIN)
-          .constraintSize({ minWidth: OrbitTokens.HIT_MIN })
-          .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-          .backgroundColor(
-            this.canShowInlineDiff() && this.store.showInlineDiffInspector
-              ? this.store.palette.accentPrimarySoft
-              : Color.Transparent
-          )
-          .borderRadius(OrbitTokens.PILL_RADIUS)
-          .justifyContent(FlexAlign.Center)
-          .alignItems(VerticalAlign.Center)
-          .accessibilityText('Inspect Git working tree diff')
-          .onClick(() => {
-            this.store.toggleTopBarGitDiff();
-          })
-
-          Row() {
-            Text('>_')
-              .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Bold))
-          }
-          .width(OrbitTokens.HIT_MIN)
-          .height(OrbitTokens.HIT_MIN)
-          .justifyContent(FlexAlign.Center)
-          .accessibilityText('Open PTY terminal')
-          .onClick(() => {
-            this.store.openPtyTerminal();
-          })
-
-          Row() {
-            Text('+')
-              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
-          }
-          .width(OrbitTokens.HIT_MIN)
-          .height(OrbitTokens.HIT_MIN)
-          .justifyContent(FlexAlign.Center)
-          .accessibilityText('Start new session')
-          .onClick(() => {
-            this.store.startNewSessionDraft();
-          })
-        } else {
-          Row() {
-            Text('Settings')
-              .attributeModifier(orbitTextSubhead(this.store.palette.fgSecondary, FontWeight.Medium))
-          }
-          .height(OrbitTokens.HIT_MIN)
-          .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-          .alignItems(VerticalAlign.Center)
-          .onClick(() => {
-            this.store.openHostSettings();
-          })
-        }
       }
-      .width('100%')
-      .height(OrbitTokens.TOP_BAR_HEIGHT)
-      .padding({ left: OrbitTokens.SPACE_XS, right: OrbitTokens.SPACE_XS })
-      .alignItems(VerticalAlign.Center)
+
+      if (this.hasPairedHosts() && this.isDraftTitle()) {
+        Blank()
+          .layoutWeight(1)
+      } else if (this.hasPairedHosts()) {
+        Column({ space: 2 }) {
+          Row({ space: 4 }) {
+            Text(this.topBarTitle())
+              .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .flexShrink(1)
+
+            SymbolGlyph($r('sys.symbol.chevron_down'))
+              .fontSize(12)
+              .fontColor([this.store.palette.fgMuted])
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+
+          Row({ space: OrbitTokens.SPACE_XS }) {
+            Row()
+              .width(OrbitTokens.DOT_SIZE)
+              .height(OrbitTokens.DOT_SIZE)
+              .borderRadius(3)
+              .backgroundColor(this.topStatusDotColor())
+
+            Text(this.topBarSubtitle())
+              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Normal))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .flexShrink(1)
+          }
+          .width('100%')
+          .alignItems(VerticalAlign.Center)
+        }
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Start)
+        .bindMenu(this.renderTitleMenu())
+      } else {
+        Column({ space: 2 }) {
+          Text('Orbit')
+            .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Medium))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+
+          Text('No Host Paired')
+            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Normal))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .width('100%')
+        }
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Start)
+        .accessibilityText('Pair Host')
+        .onClick(() => {
+          this.store.scanQrAndPair(this.getUIContext().getHostContext());
+        })
+      }
+
+      if (this.hasPairedHosts()) {
+        Row({ space: OrbitTokens.SPACE_SM }) {
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            SymbolGlyph($r('sys.symbol.more'))
+              .fontSize(20)
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+              .fontColor([this.store.palette.iconPrimary])
+          }
+          .width(OrbitTokens.HIT_COMPACT)
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding(0)
+          .backgroundColor(this.store.palette.subtleSurface)
+          .accessibilityText('More actions')
+          .bindMenu(this.renderMoreMenu())
+
+          if (this.hasActiveConversation()) {
+            Button({ type: ButtonType.Circle, stateEffect: true }) {
+              SymbolGlyph($r('sys.symbol.square_and_pencil'))
+                .fontSize(19)
+                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                .fontColor([this.store.palette.iconPrimary])
+            }
+            .width(OrbitTokens.HIT_COMPACT)
+            .height(OrbitTokens.HIT_COMPACT)
+            .padding(0)
+            .backgroundColor(this.store.palette.subtleSurface)
+            .accessibilityText('New Conversation')
+            .onClick(() => {
+              dismissHarmonyKeyboard(this.getUIContext());
+              this.store.startNewSessionDraft();
+            })
+          }
+        }
+        .alignItems(VerticalAlign.Center)
+      } else {
+        Button({ type: ButtonType.Circle, stateEffect: true }) {
+          SymbolGlyph($r('sys.symbol.gearshape'))
+            .fontSize(20)
+            .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+            .fontColor([this.store.palette.iconPrimary])
+        }
+        .width(OrbitTokens.HIT_COMPACT)
+        .height(OrbitTokens.HIT_COMPACT)
+        .padding(0)
+        .backgroundColor(this.store.palette.subtleSurface)
+        .accessibilityText('Settings')
+        .onClick(() => {
+          this.store.openHostSettings();
+        })
+      }
     }
     .width('100%')
-    .backgroundColor(this.store.palette.canvas)
-    .border({
-      width: { bottom: OrbitTokens.HAIRLINE },
-      color: this.store.palette.hairline
-    })
-  }
-
-  @Builder
-  private renderToastBanner() {
-    if (this.store.toastMessage.length > 0) {
-      Row({ space: OrbitTokens.SPACE_SM }) {
-        Row()
-          .width(OrbitTokens.DOT_SIZE)
-          .height(OrbitTokens.DOT_SIZE)
-          .borderRadius(3)
-          .backgroundColor(
-            this.store.toastIsError
-              ? this.store.palette.statusDanger
-              : this.store.palette.statusDirect
-          )
-
-        Text(this.store.toastMessage)
-          .attributeModifier(
-            orbitTextMeta(
-              this.store.toastIsError
-                ? this.store.palette.statusDanger
-                : this.store.palette.fgPrimary,
-              FontWeight.Medium
-            )
-          )
-          .maxLines(2)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .flexShrink(1)
-      }
-      .constraintSize({ maxWidth: 420 })
-      .padding({
-        left: OrbitTokens.SPACE_MD,
-        right: OrbitTokens.SPACE_MD,
-        top: OrbitTokens.SPACE_SM,
-        bottom: OrbitTokens.SPACE_SM
+    .height(OrbitTokens.TOP_BAR_HEIGHT)
+    .padding({ left: OrbitTokens.SPACE_LG, right: OrbitTokens.SPACE_LG })
+    .alignItems(VerticalAlign.Center)
+    .parallelGesture(
+      TapGesture({ count: 1 }).onAction(() => {
+        if (this.store.keyboardHeightVp > 0) {
+          dismissHarmonyKeyboard(this.getUIContext());
+        }
       })
-      .margin({
-        top: 56,
-        left: OrbitTokens.SPACE_LG,
-        right: OrbitTokens.SPACE_LG
-      })
-      .backgroundColor(
-        this.store.toastIsError
-          ? this.store.palette.statusDangerSoft
-          : this.store.palette.elevated
-      )
-      .borderRadius(OrbitTokens.COMPOSER_RADIUS)
-      .border({
-        width: OrbitTokens.HAIRLINE,
-        color: this.store.toastIsError
-          ? this.store.palette.statusDanger
-          : this.store.palette.hairline
-      })
-      .shadow({
-        radius: 12,
-        color: '#24000000',
-        offsetX: 0,
-        offsetY: 4
-      })
-      .alignItems(VerticalAlign.Center)
-      .onClick(() => {
-        this.store.dismissToast();
-      })
-    }
+    )
   }
 
   build() {
@@ -358,12 +456,22 @@ export struct AdaptiveWorkspace {
         FleetSidebar()
 
         Stack({ alignContent: Alignment.Top }) {
-          Column() {
-            this.renderTopBar()
-
+          HdsNavigation(this.mainNavStack) {
             Row() {
               Column() {
-                StreamStage()
+                Column() {
+                  StreamStage()
+                }
+                .width('100%')
+                .layoutWeight(1)
+                .parallelGesture(
+                  TapGesture({ count: 1 }).onAction(() => {
+                    if (this.store.keyboardHeightVp > 0) {
+                      dismissHarmonyKeyboard(this.getUIContext());
+                    }
+                  })
+                )
+
                 if (this.hasPairedHosts()) {
                   StickyDecisionDock()
                   OmniComposer()
@@ -373,9 +481,6 @@ export struct AdaptiveWorkspace {
               .height('100%')
               .backgroundColor(this.store.palette.canvas)
 
-              // Side-by-side GitDiffInspector (360vp):
-              // Enabled on Mate XT 3-Screen / Landscape MatePad (>= 1024vp) OR whenever
-              // (viewportWidth - effectiveSidebarWidth) >= 780vp (e.g. Zen Stage with collapsed sidebar).
               if (
                 this.canShowInlineDiff() &&
                 this.hasPairedHosts() &&
@@ -387,22 +492,61 @@ export struct AdaptiveWorkspace {
                 .width(OrbitTokens.DIFF_PANE_EXPANDED_WIDTH)
                 .height('100%')
                 .border({
-                  width: { left: 1 },
+                  width: { left: OrbitTokens.HAIRLINE },
                   color: this.store.palette.hairline
                 })
               }
             }
             .width('100%')
-            .layoutWeight(1)
+            .height('100%')
+            .padding({
+              left: this.store.safeLeftVp,
+              right: this.store.safeRightVp
+            })
           }
+          .titleMode(HdsNavigationTitleMode.MINI)
+          .mode(NavigationMode.Stack)
+          .hideBackButton(true)
+          .titleBar({
+            avoidLayoutSafeArea: true,
+            enableComponentSafeArea: true,
+            style: {
+              scrollEffectOpts: {
+                enableScrollEffect: true,
+                scrollEffectType: ScrollEffectType.COMMON_BLUR
+              },
+              originalStyle: {
+                backgroundStyle: {
+                  backgroundColor: this.store.palette.canvas
+                }
+              }
+            },
+            content: {
+              stackBuilder: (): void => {
+                this.renderHdsTitleBarContent();
+              },
+              divider: {
+                showType: this.isDraftTitle() ? DividerShowType.OFF : DividerShowType.AUTO
+              }
+            }
+          })
           .width('100%')
           .height('100%')
+          .backgroundColor(this.store.palette.canvas)
 
-          this.renderToastBanner()
+          if (this.isPhoneLayout() && this.store.sidebarOpen) {
+            Column()
+              .width('100%')
+              .height('100%')
+              .backgroundColor(this.store.palette.scrim)
+              .onClick(() => {
+                dismissHarmonyKeyboard(this.getUIContext());
+                this.store.sidebarOpen = false;
+              })
+          }
         }
         .width('100%')
         .height('100%')
-        .padding({ top: this.store.safeTopVp })
         .backgroundColor(this.store.palette.canvas)
       }
       .showControlButton(false)
@@ -411,11 +555,11 @@ export struct AdaptiveWorkspace {
           ? this.store.sidebarOpen
           : !this.store.isSidebarCollapsed
       )
-      .sideBarWidth(OrbitTokens.SIDEBAR_FOLD_WIDTH)
-      .minSideBarWidth(220)
-      .maxSideBarWidth(320)
+      .sideBarWidth(this.resolvedSideBarWidth())
+      .minSideBarWidth(240)
+      .maxSideBarWidth(340)
       .divider({
-        strokeWidth: 1,
+        strokeWidth: this.isPhoneLayout() ? 0 : OrbitTokens.HAIRLINE,
         color: this.store.palette.hairline
       })
       .onChange((isOpen: boolean) => {
@@ -429,80 +573,66 @@ export struct AdaptiveWorkspace {
       .width('100%')
       .height('100%')
 
+      // Transparent pass-through bindSheet anchors with `$$` two-way binding
       Column()
-        .width(0)
-        .height(0)
-        .bindSheet(this.store.showGitDiffSheet, () => {
-          this.buildGitDiffSheet();
-        }, {
-          detents: [SheetSize.LARGE, SheetSize.MEDIUM],
-          dragBar: true,
-          showClose: false,
-          backgroundColor: this.store.palette.canvas,
-          onDisappear: () => {
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showGitDiffSheet, this.buildGitDiffSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
             this.store.showGitDiffSheet = false;
-          }
-        })
+          },
+          this.store.palette.drawer
+        ))
 
       Column()
-        .width(0)
-        .height(0)
-        .bindSheet(this.store.showPtySheet, () => {
-          this.buildPtyTerminalSheet();
-        }, {
-          detents: [SheetSize.LARGE, SheetSize.MEDIUM],
-          dragBar: true,
-          showClose: false,
-          backgroundColor: this.store.palette.canvas,
-          onDisappear: () => {
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showPtySheet, this.buildPtyTerminalSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
             this.store.showPtySheet = false;
-          }
-        })
+          },
+          this.store.palette.drawer
+        ))
 
       Column()
-        .width(0)
-        .height(0)
-        .bindSheet(this.store.showModelPickerSheet, () => {
-          this.buildModelPickerSheet();
-        }, {
-          detents: [SheetSize.MEDIUM, SheetSize.LARGE],
-          dragBar: true,
-          showClose: false,
-          backgroundColor: this.store.palette.canvas,
-          onDisappear: () => {
-            this.store.showModelPickerSheet = false;
-          }
-        })
-
-      Column()
-        .width(0)
-        .height(0)
-        .bindSheet(this.store.showContextPickerSheet, () => {
-          this.buildContextPickerSheet();
-        }, {
-          detents: [SheetSize.MEDIUM, SheetSize.LARGE],
-          dragBar: true,
-          showClose: false,
-          backgroundColor: this.store.palette.canvas,
-          onDisappear: () => {
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showContextPickerSheet, this.buildContextPickerSheet(), this.buildSheetOptions(
+          [SheetSize.MEDIUM, SheetSize.LARGE],
+          () => {
             this.store.showContextPickerSheet = false;
-          }
-        })
+          },
+          this.store.palette.drawer
+        ))
 
       Column()
-        .width(0)
-        .height(0)
-        .bindSheet(this.store.showHostSettingsSheet, () => {
-          this.buildHostSettingsSheet();
-        }, {
-          detents: [SheetSize.LARGE, SheetSize.MEDIUM],
-          dragBar: true,
-          showClose: false,
-          backgroundColor: this.store.palette.canvas,
-          onDisappear: () => {
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showHostSettingsSheet, this.buildHostSettingsSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE],
+          () => {
             this.store.showHostSettingsSheet = false;
-          }
-        })
+          },
+          this.store.palette.drawer
+        ))
+
+      Column()
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.None)
+        .bindSheet($$this.store.showDirBrowser, this.buildDirectoryBrowserSheet(), this.buildSheetOptions(
+          [SheetSize.LARGE, SheetSize.MEDIUM],
+          () => {
+            this.store.showDirBrowser = false;
+          },
+          this.store.palette.drawer
+        ))
     }
     .width('100%')
     .height('100%')

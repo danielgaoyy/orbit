@@ -1370,8 +1370,13 @@ fn finalize_turn(
             _ => {}
         }
 
-        if let TimelineItemView::Notice { ref message, .. } = *it {
-            if !contains_ascii_case_insensitive(message, "compact") {
+        if let TimelineItemView::Notice {
+            ref level,
+            ref message,
+            ..
+        } = *it
+        {
+            if level == "error" || !contains_ascii_case_insensitive(message, "compact") {
                 notices.push(it.clone());
             }
             continue;
@@ -1519,15 +1524,25 @@ fn build_live_segments(body_items: &[TimelineItemView]) -> Vec<TurnLiveSegmentVi
                     item: it.clone(),
                 });
             }
-            TimelineItemView::Notice { seq, message, .. } => {
-                if contains_ascii_case_insensitive(message, "compact") {
+            TimelineItemView::Notice {
+                seq,
+                level,
+                message,
+                ..
+            } => {
+                if level != "error" && contains_ascii_case_insensitive(message, "compact") {
                     flush_steps(&mut raw_segments, &mut step_buf, true, Some(it));
                     raw_segments.push(TurnLiveSegmentView::Compaction {
                         key: format!("compact-{seq}"),
                         label: message.clone(),
                     });
                 } else {
-                    flush_steps(&mut raw_segments, &mut step_buf, false, Some(it));
+                    flush_steps(
+                        &mut raw_segments,
+                        &mut step_buf,
+                        level == "wakeup",
+                        Some(it),
+                    );
                     raw_segments.push(TurnLiveSegmentView::Notice {
                         key: format!("notice-{seq}"),
                         item: it.clone(),

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
@@ -10,9 +11,9 @@ use orbit_protocol::{
     ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, OrchestrationConfig,
     PendingPermissionSummary, PromptBadge, ProviderKind, ProviderSubagentDescriptor,
     ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec, SessionMode,
-    TerminalSummary, TimelineEvent, TimelinePayload, WorkspaceIsolation, WorkspaceScriptInfo,
-    WorkspaceScriptKind, WorkspaceScriptStatus, WorkspaceSetupProgress, WorkspaceSetupStatus,
-    WorkspaceSummary, WorktreeCreateMode,
+    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    WorkspaceIsolation, WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus,
+    WorkspaceSetupProgress, WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, SessionLaunchConfig, find_provider_executable,
@@ -27,13 +28,26 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::git::inspect_git_status;
+use crate::git::{
+    capture_git_tree_snapshot, inspect_git_status, restore_git_tree_snapshot,
+    reverse_apply_file_edit_diffs,
+};
 use crate::messaging::{CoalescedDispatchBatch, sanitize_human_prompt_for_wire};
 use crate::workspace_runtime::{
     WorkspaceScriptRegistry, allocate_ephemeral_port, build_service_proxy_host,
     create_worktree_with_mode, load_workspace_manifest_with_fallback, run_worktree_setup_hooks,
     teardown_and_remove_worktree,
 };
+
+#[derive(Debug, Clone)]
+pub struct RewindAgentOutcome {
+    pub agent: AgentSummary,
+    pub to_before_seq: u64,
+    pub events: Vec<TimelineEvent>,
+    pub restored_files: u32,
+    pub restored_prompt: Option<String>,
+    pub notice: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -49,6 +63,17 @@ pub enum DaemonBroadcast {
     ConnectedHostRemoved(String),
     ProviderSubagentUpdated(ProviderSubagentDescriptor),
     ProviderSubagentTimelineLive(ProviderSubagentEvent),
+    AgentRewound {
+        origin_session_id: Uuid,
+        outcome: RewindAgentOutcome,
+    },
+}
+
+struct LiveAgentEntry {
+    generation: u64,
+    cmd_tx: mpsc::Sender<DriverCommand>,
+    done_notify: Arc<tokio::sync::Notify>,
+    ingest_abort: tokio::task::AbortHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +141,9 @@ pub struct AgentOrchestrator {
     orch_config: Arc<RwLock<OrchestrationConfig>>,
     store: Arc<OrbitStore>,
     pub scripts: Arc<WorkspaceScriptRegistry>,
-    live_agents: RwLock<HashMap<String, mpsc::Sender<DriverCommand>>>,
+    live_agents: RwLock<HashMap<String, LiveAgentEntry>>,
+    agent_generations: RwLock<HashMap<String, u64>>,
+    pending_questions: RwLock<HashMap<String, Vec<String>>>,
     live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
     /// Pending permissions keyed by `(agent_id, request_id)`
     pending_permissions: RwLock<HashMap<(String, String), PendingPermissionSummary>>,
@@ -145,10 +172,55 @@ impl AgentOrchestrator {
             store,
             scripts,
             live_agents: RwLock::new(HashMap::new()),
+            agent_generations: RwLock::new(HashMap::new()),
+            pending_questions: RwLock::new(HashMap::new()),
             live_terminals: RwLock::new(HashMap::new()),
             pending_permissions: RwLock::new(HashMap::new()),
             broadcast_tx,
         })
+    }
+
+    async fn current_generation(&self, agent_id: &str) -> u64 {
+        self.agent_generations
+            .read()
+            .await
+            .get(agent_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    async fn bump_generation(&self, agent_id: &str) -> u64 {
+        let mut guard = self.agent_generations.write().await;
+        let next = guard.get(agent_id).copied().unwrap_or(0).saturating_add(1);
+        guard.insert(agent_id.to_string(), next);
+        next
+    }
+
+    async fn live_agent_tx(&self, agent_id: &str) -> Option<mpsc::Sender<DriverCommand>> {
+        self.live_agents
+            .read()
+            .await
+            .get(agent_id)
+            .map(|e| e.cmd_tx.clone())
+    }
+
+    /// Increment generation to fence off stale startup/ingestion tasks, shut down any live driver,
+    /// and wait (bounded) for the old driver ingestion loop to drain before mutating files or store.
+    async fn stop_and_wait_driver(&self, agent_id: &str) -> u64 {
+        let next_gen = self.bump_generation(agent_id).await;
+        let removed = self.live_agents.write().await.remove(agent_id);
+        if let Some(entry) = removed {
+            let notified = entry.done_notify.notified();
+            let _ = entry.cmd_tx.send(DriverCommand::Shutdown).await;
+            if tokio::time::timeout(Duration::from_secs(3), notified)
+                .await
+                .is_err()
+            {
+                entry.ingest_abort.abort();
+            }
+        }
+        self.clear_pending_requests(agent_id).await;
+        next_gen
     }
 
     /// Activate live shim reattachment and startup agent recovery once the Daemon HTTP/WS listener
@@ -239,8 +311,9 @@ impl AgentOrchestrator {
                 && let Some(executable) = find_provider_executable(ag.provider)
             {
                 let resume_ref = self.store.get_persistence_ref(&ag.agent_id).ok().flatten();
+                let launch_gen = self.bump_generation(&ag.agent_id).await;
                 if self
-                    .spawn_and_wire_driver(&ag, executable, resume_ref, true)
+                    .spawn_and_wire_driver(&ag, executable, resume_ref, true, launch_gen)
                     .await
                     .is_ok()
                 {
@@ -798,6 +871,7 @@ impl AgentOrchestrator {
             parent_agent_id: spec.parent_agent_id,
             parent_host_id: spec.parent_host_id,
             latest_seq: 0,
+            timeline_epoch: 0,
             created_at: now,
             updated_at: now,
             archived_at: None,
@@ -815,9 +889,12 @@ impl AgentOrchestrator {
         let _ = self
             .broadcast_tx
             .send(DaemonBroadcast::AgentUpdated(summary.clone()));
+        let launch_gen = self.bump_generation(&agent_id).await;
 
         let initial_prompt = spec.initial_prompt;
-        let initial_turn_id = if !initial_prompt.trim().is_empty() {
+        // Persist the initial user prompt IMMEDIATELY (`< 1ms`) so `AgentCreated` returns right away
+        // and the user sees their clean message + badges at 0ms without blocking the socket!
+        let initial_turn = if !initial_prompt.trim().is_empty() {
             let tid = format!("turn_{}", Uuid::new_v4().simple());
             let visible_text = spec
                 .initial_display_prompt
@@ -832,8 +909,9 @@ impl AgentOrchestrator {
                     badges: spec.initial_badges,
                 },
             )?;
+            let prompt_seq = ev.seq;
             let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
-            Some(tid)
+            Some((tid, prompt_seq))
         } else {
             None
         };
@@ -842,12 +920,28 @@ impl AgentOrchestrator {
         let summary_bg = summary.clone();
         let ag_id_bg = agent_id.clone();
         tokio::spawn(async move {
+            if let Some((ref turn_id, prompt_seq)) = initial_turn
+                && mgr.current_generation(&ag_id_bg).await == launch_gen
+                && let Some(tree_oid) = capture_git_tree_snapshot(Path::new(&summary_bg.cwd)).await
+                && mgr.current_generation(&ag_id_bg).await == launch_gen
+            {
+                let _ =
+                    mgr.store
+                        .save_turn_checkpoint(&ag_id_bg, prompt_seq, Some(turn_id), &tree_oid);
+            }
+            if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                return;
+            }
             match mgr
-                .spawn_and_wire_driver(&summary_bg, executable, None, false)
+                .spawn_and_wire_driver(&summary_bg, executable, None, false, launch_gen)
                 .await
             {
                 Ok(cmd_tx) => {
-                    if let Some(turn_id) = initial_turn_id {
+                    if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                        let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+                        return;
+                    }
+                    if let Some((turn_id, _)) = initial_turn {
                         let wire = sanitize_human_prompt_for_wire(&initial_prompt, &turn_id);
                         let _ = cmd_tx
                             .send(DriverCommand::SendPrompt {
@@ -859,6 +953,9 @@ impl AgentOrchestrator {
                     }
                 }
                 Err(e) => {
+                    if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                        return;
+                    }
                     if let Ok(ev) = mgr.store.append_timeline_event(
                         &ag_id_bg,
                         1,
@@ -1029,11 +1126,8 @@ impl AgentOrchestrator {
         message_id: Option<String>,
     ) -> anyhow::Result<()> {
         let cmd_tx = self
-            .live_agents
-            .read()
+            .live_agent_tx(agent_id)
             .await
-            .get(agent_id)
-            .cloned()
             .ok_or_else(|| anyhow::anyhow!("agent session not active"))?;
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let msg_id = message_id.unwrap_or_else(|| format!("u_{}", Uuid::new_v4().simple()));
@@ -1048,9 +1142,18 @@ impl AgentOrchestrator {
                 badges,
             },
         )?;
+        let prompt_seq = ev.seq;
         let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
 
         let sanitized = sanitize_human_prompt_for_wire(&prompt, &msg_id);
+        // Capture a zero-side-effect pre-turn workspace tree snapshot before the agent mutates files.
+        if let Ok(Some(ag)) = self.store.get_agent(agent_id)
+            && let Some(tree_oid) = capture_git_tree_snapshot(Path::new(&ag.cwd)).await
+        {
+            let _ =
+                self.store
+                    .save_turn_checkpoint(agent_id, prompt_seq, Some(&turn_id), &tree_oid);
+        }
         let wire_prompt = match handoff_context {
             Some(ctx) => format!("{ctx}\n\n[Latest User Request]\n{sanitized}"),
             None => sanitized,
@@ -1068,7 +1171,7 @@ impl AgentOrchestrator {
     }
 
     fn build_handoff_context(&self, agent_id: &str) -> Option<String> {
-        let (events, _) = self.store.fetch_timeline_since(agent_id, 0, 80).ok()?;
+        let (events, _) = self.store.fetch_timeline_since(agent_id, 0, 200).ok()?;
         let mut turns = Vec::new();
         for ev in events {
             match ev.payload {
@@ -1085,7 +1188,7 @@ impl AgentOrchestrator {
                     streaming: false,
                     ..
                 } => {
-                    let clipped: String = text.chars().take(600).collect();
+                    let clipped: String = text.chars().take(1200).collect();
                     turns.push(format!("Assistant: {clipped}"));
                 }
                 _ => {}
@@ -1094,7 +1197,7 @@ impl AgentOrchestrator {
         if turns.is_empty() {
             return None;
         }
-        let start = turns.len().saturating_sub(6);
+        let start = turns.len().saturating_sub(12);
         Some(format!(
             "[Prior Conversation Context in this Workspace]\n{}",
             turns[start..].join("\n\n")
@@ -1102,15 +1205,57 @@ impl AgentOrchestrator {
     }
 
     pub async fn interrupt_agent(&self, agent_id: &str) -> anyhow::Result<()> {
-        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx.send(DriverCommand::Interrupt).await;
+        }
+        let cancelled_perms: Vec<String> = {
+            let mut guard = self.pending_permissions.write().await;
+            let req_ids: Vec<String> = guard
+                .keys()
+                .filter(|(aid, _)| aid == agent_id)
+                .map(|(_, rid)| rid.clone())
+                .collect();
+            guard.retain(|(aid, _), _| aid != agent_id);
+            req_ids
+        };
+        for request_id in cancelled_perms {
+            if let Ok(ev) = self.store.append_timeline_event(
+                agent_id,
+                1,
+                None,
+                TimelinePayload::PermissionResolved {
+                    request_id,
+                    decision: "cancelled".into(),
+                },
+            ) {
+                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            }
+        }
+        let cancelled_questions = self
+            .pending_questions
+            .write()
+            .await
+            .remove(agent_id)
+            .unwrap_or_default();
+        for request_id in cancelled_questions {
+            if let Ok(ev) = self.store.append_timeline_event(
+                agent_id,
+                1,
+                None,
+                TimelinePayload::QuestionResolved {
+                    request_id,
+                    answers: Vec::new(),
+                },
+            ) {
+                let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            }
         }
         Ok(())
     }
 
     pub async fn set_session_mode(&self, agent_id: &str, mode: SessionMode) -> anyhow::Result<()> {
         self.store.update_agent_mode(agent_id, &mode)?;
-        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx.send(DriverCommand::SetMode { mode }).await;
         }
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
@@ -1129,7 +1274,7 @@ impl AgentOrchestrator {
     ) -> anyhow::Result<()> {
         self.store
             .update_agent_config(agent_id, model.as_deref(), effort)?;
-        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx.send(DriverCommand::SetConfig { model, effort }).await;
         }
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
@@ -1146,7 +1291,7 @@ impl AgentOrchestrator {
         model: Option<String>,
     ) -> anyhow::Result<()> {
         self.store.update_agent_model(agent_id, model.as_deref())?;
-        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx
                 .send(DriverCommand::SetConfig {
                     model,
@@ -1179,7 +1324,7 @@ impl AgentOrchestrator {
             mode.as_ref(),
             labels.as_ref(),
         )?;
-        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
             if let Some(md) = mode {
                 let _ = tx.send(DriverCommand::SetMode { mode: md }).await;
             }
@@ -1212,12 +1357,9 @@ impl AgentOrchestrator {
             )
         })?;
 
-        if let Some(tx) = self.live_agents.write().await.remove(agent_id) {
-            let _ = tx.send(DriverCommand::Shutdown).await;
-        }
+        let _ = self.stop_and_wait_driver(agent_id).await;
         kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
         kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
-
         self.store
             .switch_agent_provider(agent_id, provider, model.as_deref(), effort)?;
 
@@ -1240,6 +1382,40 @@ impl AgentOrchestrator {
         Ok(())
     }
 
+    async fn record_pending_request(
+        map: &RwLock<HashMap<String, Vec<String>>>,
+        agent_id: &str,
+        request_id: &str,
+    ) {
+        let mut guard = map.write().await;
+        let list = guard.entry(agent_id.to_string()).or_default();
+        if !list.iter().any(|id| id == request_id) {
+            list.push(request_id.to_string());
+        }
+    }
+
+    async fn remove_pending_request(
+        map: &RwLock<HashMap<String, Vec<String>>>,
+        agent_id: &str,
+        request_id: &str,
+    ) {
+        let mut guard = map.write().await;
+        if let Some(list) = guard.get_mut(agent_id) {
+            list.retain(|id| id != request_id);
+            if list.is_empty() {
+                guard.remove(agent_id);
+            }
+        }
+    }
+
+    async fn clear_pending_requests(&self, agent_id: &str) {
+        self.pending_permissions
+            .write()
+            .await
+            .retain(|(aid, _), _| aid != agent_id);
+        self.pending_questions.write().await.remove(agent_id);
+    }
+
     pub async fn resolve_permission(
         &self,
         agent_id: &str,
@@ -1250,7 +1426,7 @@ impl AgentOrchestrator {
             .write()
             .await
             .remove(&(agent_id.to_string(), request_id.clone()));
-        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
             tx.send(DriverCommand::ResolvePermission {
                 request_id: request_id.clone(),
                 decision: decision.clone(),
@@ -1288,13 +1464,15 @@ impl AgentOrchestrator {
             .write()
             .await
             .remove(&(agent_id.to_string(), request_id.clone()));
-        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
             tx.send(DriverCommand::AnswerQuestion {
                 request_id: request_id.clone(),
                 answers: answers.clone(),
             })
             .await
             .map_err(|_| anyhow::anyhow!("agent session not active"))?;
+
+            Self::remove_pending_request(&self.pending_questions, agent_id, &request_id).await;
 
             if let Ok(ev) = self.store.append_timeline_event(
                 agent_id,
@@ -1321,13 +1499,7 @@ impl AgentOrchestrator {
             let parent_ws_id = existing.as_ref().map(|a| a.workspace_id.clone());
 
             // 1. Stop live runtime & clear pending permissions
-            if let Some(tx) = self.live_agents.write().await.remove(agent_id) {
-                let _ = tx.send(DriverCommand::Shutdown).await;
-            }
-            self.pending_permissions
-                .write()
-                .await
-                .retain(|(aid, _), _| aid != agent_id);
+            let _ = self.stop_and_wait_driver(agent_id).await;
 
             // 2. Retire any heartbeats bound to this agent
             if let Ok(removed_hbs) = self.store.delete_heartbeats_for_agent(agent_id) {
@@ -1391,15 +1563,9 @@ impl AgentOrchestrator {
     }
 
     pub async fn kill_agent(&self, agent_id: &str) -> anyhow::Result<()> {
-        if let Some(tx) = self.live_agents.write().await.remove(agent_id) {
-            let _ = tx.send(DriverCommand::Shutdown).await;
-        }
+        let _ = self.stop_and_wait_driver(agent_id).await;
         kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
         kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
-        self.pending_permissions
-            .write()
-            .await
-            .retain(|(aid, _), _| aid != agent_id);
         self.store
             .update_agent_status(agent_id, &AgentStatus::Closed)?;
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
@@ -1443,10 +1609,11 @@ impl AgentOrchestrator {
 
     /// Release an idle resumable provider runtime without archiving or altering `last_activity_at`/`attention`.
     pub async fn close_idle_runtime(&self, agent_id: &str) -> bool {
-        let Some(tx) = self.live_agents.write().await.remove(agent_id) else {
+        let had_live = self.live_agents.read().await.contains_key(agent_id);
+        if !had_live {
             return false;
-        };
-        let _ = tx.send(DriverCommand::Shutdown).await;
+        }
+        let _ = self.stop_and_wait_driver(agent_id).await;
         let _ = self
             .store
             .update_agent_status(agent_id, &AgentStatus::Closed);
@@ -1492,11 +1659,125 @@ impl AgentOrchestrator {
             .any(|(aid, _)| aid == agent_id)
     }
 
+    /// Rewind an agent to strictly before `to_before_seq`:
+    /// 1. Increments the agent's lifecycle generation, gracefully stops any live provider driver,
+    ///    and awaits its shutdown/ingestion drain before touching workspace files or SQLite.
+    /// 2. Optionally restores workspace files via the pre-turn Git tree snapshot (or falls back
+    ///    to reverse-applying recorded `FileEdit` unified diffs for pre-checkpoint turns).
+    /// 3. Atomically truncates SQLite `timeline_events` & `turn_checkpoints`, increments
+    ///    `timeline_epoch`, clears `persistence_ref`, and broadcasts `DaemonBroadcast::AgentRewound`
+    ///    to all other connected clients.
+    pub async fn rewind_agent(
+        &self,
+        agent_id: &str,
+        to_before_seq: u64,
+        restore_files: bool,
+        origin_session_id: Uuid,
+    ) -> anyhow::Result<RewindAgentOutcome> {
+        if to_before_seq == 0 {
+            anyhow::bail!("invalid rewind target sequence");
+        }
+        let existing = self
+            .store
+            .get_agent(agent_id)?
+            .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+
+        let _ = self.stop_and_wait_driver(agent_id).await;
+
+        let mut restored_files: u32 = 0;
+        let mut notice: Option<String> = None;
+
+        if restore_files {
+            let cwd_path = PathBuf::from(&existing.cwd);
+            let checkpoint_oid = self.store.get_turn_checkpoint(agent_id, to_before_seq)?;
+
+            let from_events = self
+                .store
+                .fetch_timeline_from(agent_id, to_before_seq)
+                .unwrap_or_default();
+            let fallback_edits: Vec<(String, String)> = from_events
+                .iter()
+                .filter_map(|ev| match &ev.payload {
+                    TimelinePayload::ToolCall {
+                        status: ToolCallStatus::Completed,
+                        detail:
+                            ToolCallDetail::FileEdit {
+                                path,
+                                unified_diff: Some(diff),
+                            },
+                        ..
+                    } if !diff.trim().is_empty() => Some((path.clone(), diff.clone())),
+                    _ => None,
+                })
+                .collect();
+
+            if let Some(tree_oid) = checkpoint_oid {
+                match restore_git_tree_snapshot(&cwd_path, &tree_oid).await {
+                    Ok(count) => {
+                        restored_files = count;
+                    }
+                    Err(err) => {
+                        if !fallback_edits.is_empty() {
+                            restored_files =
+                                reverse_apply_file_edit_diffs(&cwd_path, &fallback_edits).await;
+                            notice = Some(format!(
+                                "Checkpoint unavailable ({err}); reverted {restored_files} file(s) from recorded diffs."
+                            ));
+                        } else {
+                            notice = Some(format!(
+                                "Conversation rewound, but workspace checkpoint could not be restored: {err}"
+                            ));
+                        }
+                    }
+                }
+            } else if !fallback_edits.is_empty() {
+                let expected_paths: std::collections::HashSet<&str> =
+                    fallback_edits.iter().map(|(p, _)| p.as_str()).collect();
+                restored_files = reverse_apply_file_edit_diffs(&cwd_path, &fallback_edits).await;
+                if (restored_files as usize) < expected_paths.len() {
+                    notice = Some(format!(
+                        "Reverted {restored_files} of {} edited file(s) from recorded diffs (some files changed externally).",
+                        expected_paths.len()
+                    ));
+                }
+            } else {
+                notice = Some(
+                    "Conversation rewound. No pre-turn file checkpoint was recorded for this earlier turn."
+                        .into(),
+                );
+            }
+        }
+
+        let rewound = self
+            .store
+            .rewind_agent_timeline(agent_id, to_before_seq)?
+            .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+
+        let outcome = RewindAgentOutcome {
+            agent: rewound.agent.clone(),
+            to_before_seq,
+            events: rewound.events,
+            restored_files,
+            restored_prompt: rewound.restored_prompt,
+            notice,
+        };
+
+        let _ = self.broadcast_tx.send(DaemonBroadcast::AgentRewound {
+            origin_session_id,
+            outcome: outcome.clone(),
+        });
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::AgentUpdated(rewound.agent));
+
+        Ok(outcome)
+    }
+
     async fn get_or_resume_driver(
         self: &Arc<Self>,
         agent_id: &str,
     ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
-        if let Some(tx) = self.live_agents.read().await.get(agent_id).cloned() {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
             return Ok(tx);
         }
 
@@ -1508,8 +1789,9 @@ impl AgentOrchestrator {
         let executable = find_provider_executable(summary.provider).ok_or_else(|| {
             anyhow::anyhow!("{} CLI not installed", summary.provider.display_name())
         })?;
+        let launch_gen = self.bump_generation(agent_id).await;
 
-        self.spawn_and_wire_driver(&summary, executable, resume_ref, false)
+        self.spawn_and_wire_driver(&summary, executable, resume_ref, false, launch_gen)
             .await
     }
 
@@ -1519,6 +1801,7 @@ impl AgentOrchestrator {
         executable: PathBuf,
         resume_session_id: Option<String>,
         reattach_existing_shim: bool,
+        expected_gen: u64,
     ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
         let primary_sock = self.shim_socket_path("a", &summary.agent_id);
         let legacy_sock = self.legacy_shim_socket_path("agent", &summary.agent_id);
@@ -1616,27 +1899,61 @@ impl AgentOrchestrator {
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
 
-        let cmd_tx = handle.cmd_tx.clone();
-        self.live_agents
-            .write()
-            .await
-            .insert(summary.agent_id.clone(), cmd_tx.clone());
+        if self.current_generation(&summary.agent_id).await != expected_gen {
+            let _ = handle.cmd_tx.send(DriverCommand::Shutdown).await;
+            anyhow::bail!("agent session was reset during startup");
+        }
 
+        let cmd_tx = handle.cmd_tx.clone();
+        let done_notify = Arc::new(tokio::sync::Notify::new());
+        let done_notify_bg = Arc::clone(&done_notify);
         let mgr = Arc::clone(self);
         let ag_id = summary.agent_id.clone();
         let mut evt_rx = handle.evt_rx;
 
-        tokio::spawn(async move {
+        let ingest_task = tokio::spawn(async move {
             while let Some(evt) = evt_rx.recv().await {
-                mgr.ingest_driver_event(&ag_id, evt).await;
+                if mgr.current_generation(&ag_id).await != expected_gen {
+                    continue;
+                }
+                mgr.ingest_driver_event(&ag_id, expected_gen, evt).await;
             }
-            mgr.live_agents.write().await.remove(&ag_id);
+            let mut live_guard = mgr.live_agents.write().await;
+            if live_guard
+                .get(&ag_id)
+                .is_some_and(|e| e.generation == expected_gen)
+            {
+                live_guard.remove(&ag_id);
+            }
+            drop(live_guard);
+            if mgr.current_generation(&ag_id).await == expected_gen {
+                mgr.clear_pending_requests(&ag_id).await;
+            }
+            done_notify_bg.notify_waiters();
         });
+
+        self.live_agents.write().await.insert(
+            summary.agent_id.clone(),
+            LiveAgentEntry {
+                generation: expected_gen,
+                cmd_tx: cmd_tx.clone(),
+                done_notify,
+                ingest_abort: ingest_task.abort_handle(),
+            },
+        );
 
         Ok(cmd_tx)
     }
 
-    async fn ingest_driver_event(self: &Arc<Self>, agent_id: &str, evt: DriverEvent) {
+    async fn ingest_driver_event(
+        self: &Arc<Self>,
+        agent_id: &str,
+        expected_gen: u64,
+        evt: DriverEvent,
+    ) {
+        if self.current_generation(agent_id).await != expected_gen {
+            return;
+        }
         match evt {
             DriverEvent::SessionInitialized {
                 persistence_ref,
@@ -1687,10 +2004,7 @@ impl AgentOrchestrator {
                 });
                 match &status {
                     AgentStatus::Idle => {
-                        self.pending_permissions
-                            .write()
-                            .await
-                            .retain(|(aid, _), _| aid != agent_id);
+                        self.clear_pending_requests(agent_id).await;
                         if was_active {
                             let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                             if prev.as_ref().is_some_and(|a| !a.background) {
@@ -1701,7 +2015,16 @@ impl AgentOrchestrator {
                             should_check_auto_archive = true;
                         }
                     }
-                    AgentStatus::Error { .. } => {
+                    AgentStatus::Error {
+                        message,
+                        recoverable,
+                    } => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            recoverable,
+                            error = %message,
+                            "Agent transitioned to Error state"
+                        );
                         let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                         if prev.as_ref().is_some_and(|a| !a.background) {
                             let _ = self
@@ -1776,16 +2099,33 @@ impl AgentOrchestrator {
             DriverEvent::QuestionRequest {
                 request_id,
                 questions,
-            } => TimelinePayload::QuestionRequest {
-                request_id,
-                questions: questions as Vec<QuestionItem>,
-            },
-            DriverEvent::Notice { level, message } => TimelinePayload::Notice { level, message },
-            DriverEvent::Exited { .. } => {
-                self.pending_permissions
-                    .write()
-                    .await
-                    .retain(|(aid, _), _| aid != agent_id);
+            } => {
+                Self::record_pending_request(&self.pending_questions, agent_id, &request_id).await;
+                TimelinePayload::QuestionRequest {
+                    request_id,
+                    questions: questions as Vec<QuestionItem>,
+                }
+            }
+            DriverEvent::Notice { level, message } => {
+                if level == "error" || level == "warning" {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        level = %level,
+                        notice = %message,
+                        "Agent emitted runtime notice"
+                    );
+                }
+                TimelinePayload::Notice { level, message }
+            }
+            DriverEvent::Exited { code } => {
+                if code != Some(0) {
+                    tracing::warn!(
+                        agent_id = %agent_id,
+                        exit_code = ?code,
+                        "Agent driver process exited"
+                    );
+                }
+                self.clear_pending_requests(agent_id).await;
                 should_check_auto_archive = true;
                 TimelinePayload::StatusChanged {
                     status: AgentStatus::Closed,

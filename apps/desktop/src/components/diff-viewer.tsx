@@ -1,5 +1,5 @@
 import { memo, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, MessageSquarePlus } from "lucide-react";
+import { ChevronDown, ChevronRight, FileCode2, MessageSquarePlus } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { DiffFileView, DiffLineView } from "@/lib/orbit-ipc";
 import type { DiffLayoutMode } from "@/state/orbit-store";
@@ -60,10 +60,12 @@ const SingleFileDiffCard = memo(function SingleFileDiffCard({
   file,
   layout,
   onQuoteLine,
+  onOpenFile,
 }: {
   file: DiffFileView;
   layout: DiffLayoutMode;
   onQuoteLine?: (path: string, lineNumber: number | null, code: string) => void;
+  onOpenFile?: (path: string) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
 
@@ -82,12 +84,12 @@ const SingleFileDiffCard = memo(function SingleFileDiffCard({
       style={{ contain: "content" }}
       className="border-border overflow-hidden rounded-lg border bg-zinc-50/80 text-zinc-800 dark:bg-[#0B0F17] dark:text-zinc-200"
     >
-      <button
-        type="button"
-        onClick={() => setCollapsed((v) => !v)}
-        className="border-border flex w-full cursor-pointer items-center justify-between gap-2 border-b bg-black/[0.02] px-3 py-2 text-left transition-colors hover:bg-black/[0.045] dark:bg-white/[0.025] dark:hover:bg-white/[0.045]"
-      >
-        <div className="flex min-w-0 items-center gap-1.5">
+      <div className="border-border group/diffhdr flex w-full items-center justify-between gap-2 border-b bg-black/[0.02] px-3 py-2 transition-colors hover:bg-black/[0.045] dark:bg-white/[0.025] dark:hover:bg-white/[0.045]">
+        <button
+          type="button"
+          onClick={() => setCollapsed((v) => !v)}
+          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+        >
           {collapsed ? (
             <ChevronRight className="text-muted-foreground h-[14px] w-[14px] shrink-0" />
           ) : (
@@ -96,7 +98,7 @@ const SingleFileDiffCard = memo(function SingleFileDiffCard({
           <span className="text-foreground truncate font-mono text-[12.5px] font-medium">
             {file.path}
           </span>
-        </div>
+        </button>
         <div className="tabular-nums flex shrink-0 items-center gap-2 font-mono text-[12px]">
           {file.additions > 0 && (
             <span className="text-emerald-600 dark:text-emerald-400">+{file.additions}</span>
@@ -104,8 +106,18 @@ const SingleFileDiffCard = memo(function SingleFileDiffCard({
           {file.deletions > 0 && (
             <span className="text-rose-600 dark:text-rose-400">-{file.deletions}</span>
           )}
+          {onOpenFile && (
+            <button
+              type="button"
+              title="Open full file"
+              onClick={() => onOpenFile(file.path)}
+              className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md opacity-70 transition-all hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.08]"
+            >
+              <FileCode2 className="h-[13.5px] w-[13.5px] stroke-[1.75]" />
+            </button>
+          )}
         </div>
-      </button>
+      </div>
 
       {!collapsed &&
         (layout === "unified" ? (
@@ -249,10 +261,12 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   files,
   layout = "unified",
   onQuoteLine,
+  onOpenFile,
 }: {
   files: DiffFileView[];
   layout?: DiffLayoutMode;
   onQuoteLine?: (path: string, lineNumber: number | null, code: string) => void;
+  onOpenFile?: (path: string) => void;
 }) {
   if (files.length === 0) {
     return (
@@ -270,6 +284,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
           file={file}
           layout={layout}
           onQuoteLine={onQuoteLine}
+          onOpenFile={onOpenFile}
         />
       ))}
     </div>

@@ -2,9 +2,12 @@ import { useEffect, useRef } from "react";
 import {
   FileSearch,
   FoldVertical,
+  FolderTree,
   GitCompareArrows,
+  Globe,
   Layers,
   ListTodo,
+  MessageCircleQuestion,
   Send,
   Settings,
   Shield,
@@ -22,12 +25,15 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 
 export type SlashCommandId =
+  | "btw"
   | "plan"
   | "auto"
   | "supervised"
   | "full"
   | "review"
   | "diff"
+  | "files"
+  | "browser"
   | "compact"
   | "orbit"
   | "orbit-handoff"
@@ -51,6 +57,15 @@ export function getSlashCommands(): SlashCommandDef[] {
   const mod = modSymbol();
   return [
     {
+      id: "btw",
+      command: "/btw",
+      label: "Ask a Side Question",
+      description: "Read-only Q&A in Side Panel without interrupting or altering main chat",
+      shortcut: `${mod};`,
+      icon: MessageCircleQuestion,
+      keywords: ["btw", "side", "question", "ask", "quick"],
+    },
+    {
       id: "plan",
       command: "/plan",
       label: "Draft Implementation Plan",
@@ -69,11 +84,28 @@ export function getSlashCommands(): SlashCommandDef[] {
     {
       id: "diff",
       command: "/diff",
-      label: "Toggle Diff Inspector",
-      description: "Open or close the side-by-side Git & Turn Diff panel",
+      label: "Toggle Diff Review",
+      description: "Open or focus the Git & Turn Diff Review tab in Side Panel",
       shortcut: `${mod}D`,
       icon: GitCompareArrows,
       keywords: ["diff", "inspector", "changes"],
+    },
+    {
+      id: "files",
+      command: "/files",
+      label: "Browse Workspace Files",
+      description: "Open the workspace file explorer in Side Panel",
+      shortcut: `${mod}P`,
+      icon: FolderTree,
+      keywords: ["files", "open", "explorer", "tree", "code"],
+    },
+    {
+      id: "browser",
+      command: "/browser",
+      label: "Open Preview Browser",
+      description: "Open the built-in web & dev server preview tab",
+      icon: Globe,
+      keywords: ["browser", "preview", "web", "localhost", "url"],
     },
     {
       id: "compact",
@@ -143,7 +175,7 @@ export function getSlashCommands(): SlashCommandDef[] {
       id: "terminal",
       command: "/terminal",
       label: "Toggle PTY Terminal",
-      description: "Show or hide the persistent multi-slot terminal dock",
+      description: "Open or hide the persistent multi-slot terminal tab",
       shortcut: `${mod}J`,
       icon: SquareTerminal,
       keywords: ["terminal", "pty", "shell", "console"],

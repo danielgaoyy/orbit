@@ -29,8 +29,12 @@ export function ShortcutsSection() {
       { group: "Navigation", action: "Switch Conversation 1–9", keys: `${mod}1 .. ${mod}9` },
 
       { group: "Panels", action: "Toggle Sidebar", keys: `${mod}B` },
+      { group: "Panels", action: "Toggle Right Side Panel", keys: `${mod}\\` },
+      { group: "Panels", action: "Toggle Stage Overview", keys: `${mod}⌥O` },
+      { group: "Panels", action: "Quick Open File", keys: `${mod}P` },
       { group: "Panels", action: "Toggle Diff Review", keys: `${mod}D` },
       { group: "Panels", action: "Toggle Terminal", keys: `${mod}J / ⌃\`` },
+      { group: "Panels", action: "Side Question (/btw)", keys: `${mod};` },
       { group: "Panels", action: "Open in External Editor", keys: `${mod}O` },
 
       {
@@ -44,7 +48,7 @@ export function ShortcutsSection() {
         keys: enterToSend ? "⇧Enter" : "Enter",
       },
       { group: "Composer", action: "Cycle Access Permissions", keys: "⇧Tab" },
-      { group: "Composer", action: "Steer Running Agent", keys: "⌥Enter" },
+      { group: "Composer", action: "Steer Running Agent", keys: `${mod}Enter` },
       { group: "Composer", action: "Stop Generation", keys: "Esc Esc" },
 
       { group: "Approvals", action: "Allow Request", keys: `${mod}Y` },

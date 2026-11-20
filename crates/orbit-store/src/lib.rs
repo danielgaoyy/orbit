@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const AGENT_SELECT_COLS: &str = "agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
     status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
     parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
-    attention_state, last_activity_at";
+    attention_state, last_activity_at, timeline_epoch";
 
 /// Extra host configuration metadata persisted alongside `StoredHostProfile`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -59,12 +59,21 @@ pub struct StoredClientProject {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct RewoundTimeline {
+    pub agent: AgentSummary,
+    pub events: Vec<TimelineEvent>,
+    pub restored_prompt: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("json serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     #[error("store mutex poisoned")]
     LockPoisoned,
 }
@@ -114,6 +123,7 @@ impl OrbitStore {
                 parent_agent_id TEXT,
                 persistence_ref TEXT,
                 latest_seq      INTEGER NOT NULL DEFAULT 0,
+                timeline_epoch  INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL
             );
@@ -129,6 +139,15 @@ impl OrbitStore {
 
             CREATE INDEX IF NOT EXISTS idx_timeline_agent_seq
                 ON timeline_events(agent_id, seq);
+
+            CREATE TABLE IF NOT EXISTS turn_checkpoints (
+                agent_id   TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
+                prompt_seq INTEGER NOT NULL,
+                turn_id    TEXT,
+                tree_oid   TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, prompt_seq)
+            );
 
             CREATE TABLE IF NOT EXISTS terminals (
                 terminal_id TEXT PRIMARY KEY,
@@ -180,10 +199,19 @@ impl OrbitStore {
                 payload_json TEXT NOT NULL,
                 PRIMARY KEY (agent_id, seq)
             );
+
+            CREATE TABLE IF NOT EXISTS client_replica_cursors (
+                agent_id       TEXT PRIMARY KEY,
+                contiguous_seq INTEGER NOT NULL DEFAULT 0
+            );
             ",
         )?;
         // Non-destructive forward-compatible column migrations for pre-existing databases
         let _ = conn.execute("ALTER TABLE agents ADD COLUMN effort_json TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE agents ADD COLUMN timeline_epoch INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE client_hosts ADD COLUMN meta_json TEXT", []);
         // One-time schema v2 migration: self-heal legacy pre-v0.2.4 client replica caches once
         let user_ver: i64 = conn
@@ -291,10 +319,10 @@ impl OrbitStore {
             INSERT INTO agents (
                 agent_id, workspace_id, cwd, title, provider_json, model, effort_json,
                 mode_json, status_json, parent_agent_id, parent_host_id, persistence_ref,
-                latest_seq, created_at, updated_at, archived_at, background, auto_archive,
+                latest_seq, timeline_epoch, created_at, updated_at, archived_at, background, auto_archive,
                 profile_id, labels_json, attention_state, last_activity_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
             ON CONFLICT(agent_id) DO UPDATE SET
                 title = excluded.title,
                 model = excluded.model,
@@ -305,6 +333,7 @@ impl OrbitStore {
                 parent_host_id = excluded.parent_host_id,
                 persistence_ref = COALESCE(excluded.persistence_ref, agents.persistence_ref),
                 latest_seq = MAX(agents.latest_seq, excluded.latest_seq),
+                timeline_epoch = MAX(agents.timeline_epoch, excluded.timeline_epoch),
                 updated_at = excluded.updated_at,
                 archived_at = excluded.archived_at,
                 background = excluded.background,
@@ -328,6 +357,7 @@ impl OrbitStore {
                 agent.parent_host_id,
                 persistence_ref,
                 agent.latest_seq as i64,
+                agent.timeline_epoch as i64,
                 agent.created_at.to_rfc3339(),
                 agent.updated_at.to_rfc3339(),
                 agent.archived_at.map(|t| t.to_rfc3339()),
@@ -533,6 +563,109 @@ impl OrbitStore {
         Ok(())
     }
 
+    /// Batch-upsert a page of replica timeline events in a single SQLite transaction.
+    pub fn upsert_replica_timeline_events_batch(
+        &self,
+        events: &[TimelineEvent],
+    ) -> Result<(), StoreError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        for ev in events {
+            let payload_json = serde_json::to_string(&ev.payload)?;
+            let ts_str = ev.timestamp.to_rfc3339();
+            if let Some((json_key, id_val)) = coalesce_identity(&ev.payload) {
+                let boundary_seq = query_coalesce_boundary_seq(
+                    &tx,
+                    "client_replica_events",
+                    &ev.agent_id,
+                    &ev.payload,
+                    Some(ev.seq),
+                );
+                let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
+                let _ = tx.execute(
+                    "DELETE FROM client_replica_events
+                     WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND payload_json LIKE ?4",
+                    params![ev.agent_id, boundary_seq, ev.seq as i64, pattern],
+                );
+            }
+            tx.execute(
+                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(agent_id, seq) DO UPDATE SET
+                    payload_json = excluded.payload_json",
+                params![
+                    ev.agent_id,
+                    ev.seq as i64,
+                    ev.epoch,
+                    ev.turn_id,
+                    ts_str,
+                    payload_json
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_replica_contiguous_seq(&self, agent_id: &str) -> Result<u64, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let seq: Option<i64> = conn
+            .query_row(
+                "SELECT contiguous_seq FROM client_replica_cursors WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(seq.unwrap_or(0).max(0) as u64)
+    }
+
+    pub fn set_replica_contiguous_seq(&self, agent_id: &str, seq: u64) -> Result<(), StoreError> {
+        let seq_i64 = i64::try_from(seq)
+            .map_err(|_| StoreError::InvalidArgument("contiguous_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO client_replica_cursors (agent_id, contiguous_seq)
+             VALUES (?1, ?2)
+             ON CONFLICT(agent_id) DO UPDATE SET contiguous_seq = excluded.contiguous_seq",
+            params![agent_id, seq_i64],
+        )?;
+        Ok(())
+    }
+
+    /// Replace all cached replica events for an agent after an authoritative server-side rewind.
+    pub fn replace_replica_timeline(
+        &self,
+        agent_id: &str,
+        events: &[TimelineEvent],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM client_replica_events WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        tx.execute(
+            "DELETE FROM client_replica_cursors WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        for ev in events {
+            let seq_i64 = i64::try_from(ev.seq)
+                .map_err(|_| StoreError::InvalidArgument("sequence number exceeds i64".into()))?;
+            let payload_json = serde_json::to_string(&ev.payload)?;
+            let ts_str = ev.timestamp.to_rfc3339();
+            tx.execute(
+                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![agent_id, seq_i64, ev.epoch, ev.turn_id, ts_str, payload_json],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn fetch_replica_timeline(
         &self,
         agent_id: &str,
@@ -681,6 +814,19 @@ impl OrbitStore {
         since_seq: u64,
         limit: usize,
     ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
+        self.fetch_timeline_since_budgeted(agent_id, since_seq, limit, usize::MAX)
+    }
+
+    /// Fetch timeline events strictly after `since_seq` bounded by both event count and an
+    /// approximate uncompressed JSON byte budget (`max_bytes`), always yielding at least one event
+    /// when any exist so oversized single events never stall catchup pagination.
+    pub fn fetch_timeline_since_budgeted(
+        &self,
+        agent_id: &str,
+        since_seq: u64,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<(Vec<TimelineEvent>, bool), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let fetch_limit = (limit.saturating_add(1)) as i64;
         let mut stmt = conn.prepare(
@@ -692,6 +838,8 @@ impl OrbitStore {
         )?;
 
         let mut events = Vec::new();
+        let mut approx_bytes: usize = 0;
+        let mut has_more = false;
         let rows = stmt.query_map(params![agent_id, since_seq as i64, fetch_limit], |row| {
             let seq = row.get::<_, i64>(0)? as u64;
             let epoch = row.get::<_, u32>(1)?;
@@ -704,7 +852,15 @@ impl OrbitStore {
 
         for row in rows {
             let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = row?;
+            let row_bytes = payload_str.len().saturating_add(128);
+            if events.len() >= limit
+                || (!events.is_empty() && approx_bytes.saturating_add(row_bytes) > max_bytes)
+            {
+                has_more = true;
+                break;
+            }
             let payload: TimelinePayload = serde_json::from_str(&payload_str)?;
+            approx_bytes = approx_bytes.saturating_add(row_bytes);
             events.push(TimelineEvent {
                 seq,
                 epoch,
@@ -715,11 +871,219 @@ impl OrbitStore {
             });
         }
 
-        let has_more = events.len() > limit;
-        if has_more {
-            events.truncate(limit);
-        }
         Ok((events, has_more))
+    }
+
+    /// Persist a pre-turn workspace tree snapshot keyed by `(agent_id, prompt_seq)`.
+    pub fn save_turn_checkpoint(
+        &self,
+        agent_id: &str,
+        prompt_seq: u64,
+        turn_id: Option<&str>,
+        tree_oid: &str,
+    ) -> Result<(), StoreError> {
+        let prompt_seq_i64 = i64::try_from(prompt_seq)
+            .map_err(|_| StoreError::InvalidArgument("prompt_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO turn_checkpoints (agent_id, prompt_seq, turn_id, tree_oid, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(agent_id, prompt_seq) DO UPDATE SET
+                turn_id = excluded.turn_id,
+                tree_oid = excluded.tree_oid,
+                created_at = excluded.created_at",
+            params![
+                agent_id,
+                prompt_seq_i64,
+                turn_id,
+                tree_oid,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_turn_checkpoint(
+        &self,
+        agent_id: &str,
+        prompt_seq: u64,
+    ) -> Result<Option<String>, StoreError> {
+        let prompt_seq_i64 = i64::try_from(prompt_seq)
+            .map_err(|_| StoreError::InvalidArgument("prompt_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.query_row(
+            "SELECT tree_oid FROM turn_checkpoints WHERE agent_id = ?1 AND prompt_seq = ?2",
+            params![agent_id, prompt_seq_i64],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Fetch all daemon timeline events at or after `from_seq` (used before rewind to inspect edits).
+    pub fn fetch_timeline_from(
+        &self,
+        agent_id: &str,
+        from_seq: u64,
+    ) -> Result<Vec<TimelineEvent>, StoreError> {
+        let from_seq_i64 = i64::try_from(from_seq)
+            .map_err(|_| StoreError::InvalidArgument("from_seq exceeds i64".into()))?;
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM timeline_events
+             WHERE agent_id = ?1 AND seq >= ?2
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![agent_id, from_seq_i64], |row| {
+            let seq = row.get::<_, i64>(0)? as u64;
+            let epoch = row.get::<_, u32>(1)?;
+            let ag_id: String = row.get(2)?;
+            let turn_id: Option<String> = row.get(3)?;
+            let ts_str: String = row.get(4)?;
+            let payload_str: String = row.get(5)?;
+            Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = row?;
+            let payload: TimelinePayload = serde_json::from_str(&payload_str)?;
+            events.push(TimelineEvent {
+                seq,
+                epoch,
+                agent_id: ag_id,
+                turn_id,
+                timestamp: parse_ts(&ts_str),
+                payload,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Atomically truncate `timeline_events` and `turn_checkpoints` from `to_before_seq` onward,
+    /// increment `timeline_epoch`, clear `persistence_ref` so the next prompt starts cleanly from
+    /// the rewound history, and return the updated `AgentSummary`, remaining events, and removed
+    /// prompt text (if any).
+    pub fn rewind_agent_timeline(
+        &self,
+        agent_id: &str,
+        to_before_seq: u64,
+    ) -> Result<Option<RewoundTimeline>, StoreError> {
+        let to_before_i64 = i64::try_from(to_before_seq)
+            .map_err(|_| StoreError::InvalidArgument("to_before_seq exceeds i64".into()))?;
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+
+        let target_payload_str: Option<String> = tx
+            .query_row(
+                "SELECT payload_json FROM timeline_events WHERE agent_id = ?1 AND seq = ?2",
+                params![agent_id, to_before_i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let restored_prompt = target_payload_str.and_then(|s| {
+            serde_json::from_str::<TimelinePayload>(&s)
+                .ok()
+                .and_then(|p| match p {
+                    TimelinePayload::UserPrompt { text, .. } => Some(text),
+                    _ => None,
+                })
+        });
+
+        tx.execute(
+            "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq >= ?2",
+            params![agent_id, to_before_i64],
+        )?;
+        tx.execute(
+            "DELETE FROM turn_checkpoints WHERE agent_id = ?1 AND prompt_seq >= ?2",
+            params![agent_id, to_before_i64],
+        )?;
+
+        let new_latest_seq: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM timeline_events WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let status_json = serde_json::to_string(&AgentStatus::Idle)?;
+        let now_str = Utc::now().to_rfc3339();
+
+        let updated_rows = tx.execute(
+            "UPDATE agents
+             SET latest_seq = ?1,
+                 timeline_epoch = timeline_epoch + 1,
+                 persistence_ref = NULL,
+                 status_json = ?2,
+                 updated_at = ?3
+             WHERE agent_id = ?4",
+            params![new_latest_seq, status_json, now_str, agent_id],
+        )?;
+        if updated_rows == 0 {
+            return Ok(None);
+        }
+
+        let agent = tx
+            .query_row(
+                "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
+                        status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
+                        timeline_epoch
+                 FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                map_agent_row,
+            )
+            .optional()?;
+        let Some(agent) = agent else {
+            return Ok(None);
+        };
+
+        let mut remaining = Vec::new();
+        let mut approx_bytes: usize = 0;
+        let max_inline_bytes = orbit_protocol::MAX_WIRE_TIMELINE_PAGE_BYTES;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+                 FROM timeline_events
+                 WHERE agent_id = ?1
+                 ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map(params![agent_id], |row| {
+                let seq = row.get::<_, i64>(0)? as u64;
+                let epoch = row.get::<_, u32>(1)?;
+                let ag_id: String = row.get(2)?;
+                let turn_id: Option<String> = row.get(3)?;
+                let ts_str: String = row.get(4)?;
+                let payload_str: String = row.get(5)?;
+                Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
+            })?;
+            for row in rows {
+                let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = row?;
+                let row_bytes = payload_str.len().saturating_add(128);
+                if !remaining.is_empty()
+                    && approx_bytes.saturating_add(row_bytes) > max_inline_bytes
+                {
+                    break;
+                }
+                let payload: TimelinePayload = serde_json::from_str(&payload_str)?;
+                approx_bytes = approx_bytes.saturating_add(row_bytes);
+                remaining.push(TimelineEvent {
+                    seq,
+                    epoch,
+                    agent_id: ag_id,
+                    turn_id,
+                    timestamp: parse_ts(&ts_str),
+                    payload,
+                });
+            }
+        }
+
+        tx.commit()?;
+        Ok(Some(RewoundTimeline {
+            agent,
+            events: remaining,
+            restored_prompt,
+        }))
     }
 
     pub fn get_persistence_ref(&self, agent_id: &str) -> Result<Option<String>, StoreError> {
@@ -930,6 +1294,26 @@ impl OrbitStore {
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
         Ok(())
     }
+
+    /// Purge legacy daemon-schema `timeline_events` / `turn_checkpoints` rows that accumulated in
+    /// older client replica databases (`desktop-client.sqlite`) before `client_replica_events` was
+    /// introduced. Only call this on client-side replica DBs — never on the daemon's `orbit.db`.
+    pub fn purge_legacy_client_timeline_events(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let legacy_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM timeline_events", [], |row| row.get(0))
+            .unwrap_or(0);
+        if legacy_count <= 0 {
+            return Ok(0);
+        }
+        conn.execute("DELETE FROM turn_checkpoints", [])?;
+        conn.execute("DELETE FROM timeline_events", [])?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        if legacy_count >= 100 {
+            let _ = conn.execute_batch("VACUUM;");
+        }
+        Ok(legacy_count as usize)
+    }
 }
 
 fn query_coalesce_boundary_seq(
@@ -1039,6 +1423,7 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
     let labels_str: String = row.get(18)?;
     let attention_str: String = row.get(19)?;
     let last_activity_opt: Option<String> = row.get(20)?;
+    let timeline_epoch: u64 = row.get::<_, i64>(21).unwrap_or(0).max(0) as u64;
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
@@ -1068,6 +1453,7 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         parent_agent_id: row.get(8)?,
         parent_host_id,
         latest_seq: row.get::<_, i64>(9)? as u64,
+        timeline_epoch,
         created_at: parse_ts(&created_str),
         updated_at: parse_ts(&updated_str),
         archived_at: archived_opt.as_deref().map(parse_ts),
@@ -1127,6 +1513,7 @@ mod tests {
                     parent_agent_id: None,
                     parent_host_id: None,
                     latest_seq: 0,
+                    timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
                     archived_at: None,
@@ -1221,6 +1608,7 @@ mod tests {
             parent_agent_id: None,
             parent_host_id: None,
             latest_seq: 0,
+            timeline_epoch: 0,
             created_at: now,
             updated_at: now,
             archived_at: None,
@@ -1373,5 +1761,348 @@ mod tests {
 
         parent.title = "Updated".into();
         let _ = parent;
+    }
+
+    #[test]
+    fn rewind_timeline_truncates_events_checkpoints_and_clears_persistence_ref() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_1".into(),
+                title: "orbit".into(),
+                cwd: "/workspace/orbit".into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+            })
+            .expect("upsert ws");
+
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_rw".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/workspace/orbit".into(),
+                    title: "Rewind Test".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                },
+                Some("prov_sess_1"),
+            )
+            .expect("upsert agent");
+
+        let p1 = store
+            .append_timeline_event(
+                "ag_rw",
+                1,
+                Some("t1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "m1".into(),
+                    text: "Turn 1".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("p1");
+        store
+            .save_turn_checkpoint("ag_rw", p1.seq, Some("t1"), "tree_aaa")
+            .expect("cp1");
+        let a1 = store
+            .append_timeline_event(
+                "ag_rw",
+                1,
+                Some("t1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "Done 1".into(),
+                    streaming: false,
+                },
+            )
+            .expect("a1");
+        let p2 = store
+            .append_timeline_event(
+                "ag_rw",
+                1,
+                Some("t2"),
+                TimelinePayload::UserPrompt {
+                    message_id: "m2".into(),
+                    text: "Turn 2".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("p2");
+        store
+            .save_turn_checkpoint("ag_rw", p2.seq, Some("t2"), "tree_bbb")
+            .expect("cp2");
+        let _a2 = store
+            .append_timeline_event(
+                "ag_rw",
+                1,
+                Some("t2"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "Done 2".into(),
+                    streaming: false,
+                },
+            )
+            .expect("a2");
+
+        // Verify replica replacement too
+        store.upsert_replica_timeline_event(&p1).expect("rep p1");
+        store.upsert_replica_timeline_event(&p2).expect("rep p2");
+
+        let rewound = store
+            .rewind_agent_timeline("ag_rw", p2.seq)
+            .expect("rewind")
+            .expect("agent exists");
+        let updated_agent = rewound.agent;
+        let remaining = rewound.events;
+        let restored_prompt = rewound.restored_prompt;
+        assert_eq!(restored_prompt.as_deref(), Some("Turn 2"));
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].seq, p1.seq);
+        assert_eq!(remaining[1].seq, a1.seq);
+        assert_eq!(updated_agent.latest_seq, a1.seq);
+        assert_eq!(updated_agent.timeline_epoch, 1);
+        assert_eq!(
+            store.get_persistence_ref("ag_rw").expect("pref"),
+            None,
+            "persistence_ref must be cleared after rewind"
+        );
+        assert_eq!(
+            store
+                .get_turn_checkpoint("ag_rw", p1.seq)
+                .expect("cp1")
+                .as_deref(),
+            Some("tree_aaa")
+        );
+        assert_eq!(
+            store.get_turn_checkpoint("ag_rw", p2.seq).expect("cp2"),
+            None
+        );
+
+        store
+            .replace_replica_timeline("ag_rw", &remaining)
+            .expect("replace replica");
+        let rep = store
+            .fetch_replica_timeline("ag_rw", 50)
+            .expect("fetch replica");
+        assert_eq!(rep.len(), 2);
+        assert_eq!(rep[1].seq, a1.seq);
+    }
+
+    #[test]
+    fn purge_legacy_client_timeline_events_preserves_replica_rows() {
+        let store = OrbitStore::open_in_memory().expect("mem db");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_leg".into(),
+                title: "demo".into(),
+                cwd: "/tmp/demo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_leg".into(),
+                    workspace_id: "ws_leg".into(),
+                    cwd: "/tmp/demo".into(),
+                    title: "Legacy".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                },
+                None,
+            )
+            .expect("ag");
+
+        let ev = store
+            .append_timeline_event(
+                "ag_leg",
+                1,
+                None,
+                TimelinePayload::UserPrompt {
+                    message_id: "m1".into(),
+                    text: "legacy row".into(),
+                    badges: vec![],
+                },
+            )
+            .expect("append");
+        store.upsert_replica_timeline_event(&ev).expect("replica");
+
+        let purged = store.purge_legacy_client_timeline_events().expect("purge");
+        assert_eq!(purged, 1);
+        assert!(
+            store
+                .fetch_timeline_from("ag_leg", 0)
+                .expect("fetch")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .fetch_replica_timeline("ag_leg", 50)
+                .expect("replica")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn budgeted_timeline_pagination_and_replica_cursor_reset() {
+        let store = OrbitStore::open_in_memory().expect("in-memory store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_pg".into(),
+                title: "ws".into(),
+                cwd: "/tmp/pg".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_pg".into(),
+                    workspace_id: "ws_pg".into(),
+                    cwd: "/tmp/pg".into(),
+                    title: "Big".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                },
+                None,
+            )
+            .expect("ag");
+
+        let big_text = "x".repeat(2000);
+        let mut seqs = Vec::new();
+        for idx in 0..5 {
+            let ev = store
+                .append_timeline_event(
+                    "ag_pg",
+                    1,
+                    None,
+                    TimelinePayload::AssistantMessage {
+                        item_id: format!("m_{idx}"),
+                        text: big_text.clone(),
+                        streaming: false,
+                    },
+                )
+                .expect("append");
+            seqs.push(ev.seq);
+        }
+
+        // Budget of 5000 bytes (~2 events per page) must paginate across multiple chunks
+        let (p1, more1) = store
+            .fetch_timeline_since_budgeted("ag_pg", 0, 100, 5000)
+            .expect("p1");
+        assert!(more1);
+        assert_eq!(p1.len(), 2);
+
+        let (p2, more2) = store
+            .fetch_timeline_since_budgeted("ag_pg", p1[1].seq, 100, 5000)
+            .expect("p2");
+        assert!(more2);
+        assert_eq!(p2.len(), 2);
+
+        let (p3, more3) = store
+            .fetch_timeline_since_budgeted("ag_pg", p2[1].seq, 100, 5000)
+            .expect("p3");
+        assert!(!more3);
+        assert_eq!(p3.len(), 1);
+        assert_eq!(p3[0].seq, seqs[4]);
+
+        // Even if a single event exceeds max_bytes, at least 1 event is always yielded
+        let (oversized, has_more) = store
+            .fetch_timeline_since_budgeted("ag_pg", 0, 100, 100)
+            .expect("oversized");
+        assert_eq!(oversized.len(), 1);
+        assert!(has_more);
+
+        // Replica cursor tracks contiguous sync and resets on replace_replica_timeline
+        assert_eq!(store.get_replica_contiguous_seq("ag_pg").expect("get"), 0);
+        store
+            .upsert_replica_timeline_events_batch(&p1)
+            .expect("batch");
+        store
+            .set_replica_contiguous_seq("ag_pg", p1[1].seq)
+            .expect("set");
+        assert_eq!(
+            store.get_replica_contiguous_seq("ag_pg").expect("get"),
+            p1[1].seq
+        );
+        store.replace_replica_timeline("ag_pg", &[]).expect("wipe");
+        assert_eq!(store.get_replica_contiguous_seq("ag_pg").expect("get"), 0);
     }
 }

@@ -1,6 +1,137 @@
 import SwiftUI
 import UIKit
 
+// MARK: - Native Auto-Sizing Selectable TextView (Genuine iOS Range Selection)
+
+struct OrbitSelectableTextView: UIViewRepresentable {
+    let attributedText: NSAttributedString
+    var stretchesToProposedWidth: Bool = true
+    var maxLines: Int = 0
+    var isDarkAppearance: Bool = false
+    var linkColor: UIColor = .systemBlue
+    var onQuoteSelection: ((String) -> Void)? = nil
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    func makeUIView(context: Context) -> UITextView {
+        let view = UITextView()
+        view.isEditable = false
+        view.isSelectable = true
+        view.isScrollEnabled = false
+        view.showsVerticalScrollIndicator = false
+        view.showsHorizontalScrollIndicator = false
+        view.backgroundColor = .clear
+        view.textContainerInset = .zero
+        view.textContainer.lineFragmentPadding = 0
+        view.dataDetectorTypes = []
+        view.tintColor = .systemBlue
+        view.adjustsFontForContentSizeCategory = false
+        view.delegate = context.coordinator
+        view.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        view.setContentHuggingPriority(stretchesToProposedWidth ? .defaultLow : .required, for: .horizontal)
+        syncContentIfNeeded(on: view, coordinator: context.coordinator)
+        return view
+    }
+
+    func updateUIView(_ uiView: UITextView, context: Context) {
+        context.coordinator.parent = self
+        uiView.setContentHuggingPriority(stretchesToProposedWidth ? .defaultLow : .required, for: .horizontal)
+        syncContentIfNeeded(on: uiView, coordinator: context.coordinator)
+    }
+
+    @available(iOS 16.0, *)
+    func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
+        context.coordinator.parent = self
+        syncContentIfNeeded(on: uiView, coordinator: context.coordinator)
+
+        if let proposedWidth = proposal.width {
+            let safeProposed = max(1, proposedWidth)
+            if stretchesToProposedWidth {
+                let fitted = uiView.sizeThatFits(CGSize(width: safeProposed, height: .greatestFiniteMagnitude))
+                return CGSize(width: safeProposed, height: max(1, ceil(fitted.height)))
+            } else {
+                let measured = attributedText.boundingRect(
+                    with: CGSize(width: safeProposed, height: .greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading],
+                    context: nil
+                )
+                let tightWidth = min(safeProposed, max(1, ceil(measured.width) + 2))
+                let fitted = uiView.sizeThatFits(CGSize(width: tightWidth, height: .greatestFiniteMagnitude))
+                return CGSize(width: tightWidth, height: max(1, ceil(fitted.height)))
+            }
+        } else {
+            let fitted = uiView.sizeThatFits(CGSize(width: CGFloat.greatestFiniteMagnitude, height: .greatestFiniteMagnitude))
+            return CGSize(width: max(1, ceil(fitted.width) + 2), height: max(1, ceil(fitted.height)))
+        }
+    }
+
+    private func syncContentIfNeeded(on uiView: UITextView, coordinator: Coordinator) {
+        if coordinator.lastIsDark != isDarkAppearance {
+            uiView.overrideUserInterfaceStyle = isDarkAppearance ? .dark : .light
+            coordinator.lastIsDark = isDarkAppearance
+        }
+        if coordinator.lastMaxLines != maxLines {
+            uiView.textContainer.maximumNumberOfLines = maxLines
+            uiView.textContainer.lineBreakMode = maxLines > 0 ? .byTruncatingTail : .byWordWrapping
+            coordinator.lastMaxLines = maxLines
+        }
+        if coordinator.lastLinkColor != linkColor {
+            uiView.linkTextAttributes = [
+                .foregroundColor: linkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ]
+            coordinator.lastLinkColor = linkColor
+        }
+        if coordinator.lastAttributedText == nil || !coordinator.lastAttributedText!.isEqual(to: attributedText) {
+            uiView.attributedText = attributedText
+            coordinator.lastAttributedText = attributedText.copy() as? NSAttributedString
+            uiView.invalidateIntrinsicContentSize()
+        }
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: OrbitSelectableTextView
+        var lastAttributedText: NSAttributedString?
+        var lastMaxLines: Int?
+        var lastIsDark: Bool?
+        var lastLinkColor: UIColor?
+
+        init(parent: OrbitSelectableTextView) {
+            self.parent = parent
+        }
+
+        func textView(
+            _ textView: UITextView,
+            editMenuForTextIn range: NSRange,
+            suggestedActions: [UIMenuElement]
+        ) -> UIMenu? {
+            guard let onQuote = parent.onQuoteSelection,
+                  range.length > 0,
+                  let text = textView.attributedText?.string,
+                  let swiftRange = Range(range, in: text) else {
+                return nil
+            }
+            let selected = String(text[swiftRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !selected.isEmpty else { return nil }
+
+            let quoteAction = UIAction(
+                title: "Quote",
+                image: UIImage(systemName: "text.quote")
+            ) { _ in
+                onQuote(selected)
+                textView.selectedTextRange = nil
+            }
+            var actions = suggestedActions
+            actions.insert(quoteAction, at: min(1, actions.count))
+            return UIMenu(children: actions)
+        }
+    }
+}
+
+// MARK: - Markdown Models & RichMarkdownView
+
 private struct MarkdownTableModel: Equatable {
     let headers: [[FfiInlineSpan]]
     let rows: [[[FfiInlineSpan]]]
@@ -11,13 +142,18 @@ private struct MarkdownTableModel: Equatable {
 }
 
 private enum MarkdownRenderSegment {
-    case block(FfiRichBlock)
+    case prose([FfiRichBlock])
+    case checkListItem(checked: Bool, spans: [FfiInlineSpan])
+    case blockQuote([FfiInlineSpan])
+    case horizontalRule
+    case codeBlock(language: String, rawCode: String, lines: [FfiHighlightedLine])
     case table(MarkdownTableModel)
 }
 
 struct RichMarkdownView: View {
     let blocks: [FfiRichBlock]
     var fallbackText: String = ""
+    var onQuoteSelection: ((String) -> Void)? = nil
 
     @Environment(\.orbitPalette) private var palette
 
@@ -26,9 +162,18 @@ struct RichMarkdownView: View {
             return parseFallbackSegments(from: fallbackText)
         }
         var out: [MarkdownRenderSegment] = []
+        var proseBuffer: [FfiRichBlock] = []
+
+        func flushProseBuffer() {
+            guard !proseBuffer.isEmpty else { return }
+            out.append(.prose(proseBuffer))
+            proseBuffer.removeAll()
+        }
+
         var idx = 0
         while idx < blocks.count {
             if case let .table(_, headers, rows) = blocks[idx] {
+                flushProseBuffer()
                 let model = MarkdownTableModel(
                     headers: headers.map(\.spans),
                     rows: rows.map { $0.cells.map(\.spans) }
@@ -45,40 +190,57 @@ struct RichMarkdownView: View {
                     next += 1
                 }
                 if let model = normalizeTableModel(from: rawRows) {
+                    flushProseBuffer()
                     out.append(.table(model))
                     idx = next
                     continue
                 }
             }
-            out.append(.block(blocks[idx]))
+
+            let block = blocks[idx]
+            switch block {
+            case .heading, .paragraph:
+                proseBuffer.append(block)
+            case let .listItem(_, _, checked, spans):
+                if let checked = checked {
+                    flushProseBuffer()
+                    out.append(.checkListItem(checked: checked, spans: spans))
+                } else {
+                    proseBuffer.append(block)
+                }
+            case let .blockQuote(spans):
+                flushProseBuffer()
+                out.append(.blockQuote(spans))
+            case .horizontalRule:
+                flushProseBuffer()
+                out.append(.horizontalRule)
+            case let .codeBlock(language, rawCode, lines):
+                flushProseBuffer()
+                out.append(.codeBlock(language: language, rawCode: rawCode, lines: lines))
+            case .table:
+                break
+            }
             idx += 1
         }
+        flushProseBuffer()
         return out
     }
 
     var body: some View {
         if segments.isEmpty {
             if !fallbackText.isEmpty {
-                Text(fallbackText)
-                    .orbitBodyStyle()
-                    .foregroundStyle(palette.fgPrimary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                OrbitSelectableTextView(
+                    attributedText: buildPlainNSAttributed(fallbackText, color: UIColor(palette.fgPrimary)),
+                    stretchesToProposedWidth: true,
+                    isDarkAppearance: palette.isDark,
+                    linkColor: UIColor(palette.primary),
+                    onQuoteSelection: onQuoteSelection
+                )
             }
         } else {
-            VStack(alignment: .leading, spacing: OrbitSpacing.md) {
+            VStack(alignment: .leading, spacing: 10) {
                 ForEach(Array(segments.enumerated()), id: \.offset) { _, segment in
-                    switch segment {
-                    case let .block(block):
-                        blockView(block)
-                    case let .table(tableModel):
-                        MarkdownTableView(
-                            model: tableModel,
-                            buildAttributed: { spans, baseColor, isHeader in
-                                buildTableCellAttributed(spans, baseColor: baseColor, isHeader: isHeader)
-                            }
-                        )
-                    }
+                    segmentView(segment)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -86,60 +248,55 @@ struct RichMarkdownView: View {
     }
 
     @ViewBuilder
-    private func blockView(_ block: FfiRichBlock) -> some View {
-        switch block {
-        case let .heading(level, spans):
-            Text(buildInlineAttributed(spans, baseColor: palette.fgPrimary, isHeading: true, headingLevel: level))
-                .font(level <= 2 ? OrbitTypography.title : OrbitTypography.body(.semibold))
-                .lineSpacing(OrbitTypography.subheadLineSpacing)
-                .foregroundStyle(palette.fgPrimary)
-                .padding(.top, OrbitSpacing.xs)
-                .textSelection(.enabled)
+    private func segmentView(_ segment: MarkdownRenderSegment) -> some View {
+        switch segment {
+        case let .prose(proseBlocks):
+            OrbitSelectableTextView(
+                attributedText: buildMergedProseNSAttributed(proseBlocks),
+                stretchesToProposedWidth: true,
+                isDarkAppearance: palette.isDark,
+                linkColor: UIColor(palette.primary),
+                onQuoteSelection: onQuoteSelection
+            )
 
-        case let .paragraph(spans):
-            Text(buildInlineAttributed(spans, baseColor: palette.fgPrimary))
-                .orbitBodyStyle()
-                .foregroundStyle(palette.fgPrimary)
-                .textSelection(.enabled)
-
-        case let .listItem(ordered, index, checked, spans):
+        case let .checkListItem(checked, spans):
             HStack(alignment: .firstTextBaseline, spacing: OrbitSpacing.sm) {
-                if let checked = checked {
-                    Image(systemName: checked ? "checkmark.square.fill" : "square")
-                        .font(OrbitTypography.iconSmall)
-                        .foregroundStyle(checked ? palette.primary : palette.fgMuted)
-                } else if ordered {
-                    Text("\(index).")
-                        .font(OrbitTypography.meta(.medium))
-                        .foregroundStyle(palette.fgSecondary)
-                        .frame(minWidth: 16, alignment: .trailing)
-                } else {
-                    Text("•")
-                        .font(OrbitTypography.body(.semibold))
-                        .foregroundStyle(palette.fgSecondary)
-                        .frame(minWidth: 12, alignment: .center)
-                }
+                Image(systemName: checked ? "checkmark.square.fill" : "square")
+                    .font(OrbitTypography.iconSmall)
+                    .foregroundStyle(checked ? palette.primary : palette.fgMuted)
 
-                Text(buildInlineAttributed(spans, baseColor: palette.fgPrimary))
-                    .orbitBodyStyle()
-                    .foregroundStyle(palette.fgPrimary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                OrbitSelectableTextView(
+                    attributedText: buildInlineNSAttributed(
+                        spans,
+                        baseColor: UIColor(palette.fgPrimary),
+                        paragraphStyle: bodyParagraphStyle(spacingAfter: 0)
+                    ),
+                    stretchesToProposedWidth: true,
+                    isDarkAppearance: palette.isDark,
+                    linkColor: UIColor(palette.primary),
+                    onQuoteSelection: onQuoteSelection
+                )
             }
 
         case let .blockQuote(spans):
             HStack(alignment: .top, spacing: OrbitSpacing.md) {
-                RoundedRectangle(cornerRadius: 1)
-                    .fill(palette.primary.opacity(0.5))
-                    .frame(width: 2)
+                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                    .fill(palette.fgMuted.opacity(0.35))
+                    .frame(width: 2.5)
 
-                Text(buildInlineAttributed(spans, baseColor: palette.fgSecondary))
-                    .orbitBodyStyle()
-                    .foregroundStyle(palette.fgSecondary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                OrbitSelectableTextView(
+                    attributedText: buildInlineNSAttributed(
+                        spans,
+                        baseColor: UIColor(palette.fgSecondary),
+                        paragraphStyle: bodyParagraphStyle(spacingAfter: 0)
+                    ),
+                    stretchesToProposedWidth: true,
+                    isDarkAppearance: palette.isDark,
+                    linkColor: UIColor(palette.primary),
+                    onQuoteSelection: onQuoteSelection
+                )
             }
-            .padding(.vertical, OrbitSpacing.xs)
+            .padding(.vertical, 2)
 
         case .horizontalRule:
             OrbitHairline()
@@ -148,12 +305,9 @@ struct RichMarkdownView: View {
         case let .codeBlock(language, rawCode, lines):
             CodeBlockView(language: language, rawCode: rawCode, lines: lines)
 
-        case let .table(_, headers, rows):
+        case let .table(tableModel):
             MarkdownTableView(
-                model: MarkdownTableModel(
-                    headers: headers.map(\.spans),
-                    rows: rows.map { $0.cells.map(\.spans) }
-                ),
+                model: tableModel,
                 buildAttributed: { spans, baseColor, isHeader in
                     buildTableCellAttributed(spans, baseColor: baseColor, isHeader: isHeader)
                 }
@@ -213,7 +367,6 @@ struct RichMarkdownView: View {
     private func normalizeTableModel(from rawRows: [[[FfiInlineSpan]]]) -> MarkdownTableModel? {
         guard let first = rawRows.first, !first.isEmpty else { return nil }
 
-        // In pulldown-cmark, TableHead does not emit TagEnd::TableRow, so row 0 may hold Header (N) + Row1 (N) = 2N cells
         if rawRows.count >= 2 {
             let secondCount = rawRows[1].count
             if secondCount >= 2 && first.count == secondCount * 2 {
@@ -245,7 +398,7 @@ struct RichMarkdownView: View {
             textBuffer.removeAll()
             guard !joined.isEmpty else { return }
             segments.append(
-                .block(
+                .prose([
                     .paragraph(spans: [
                         FfiInlineSpan(
                             text: joined,
@@ -256,7 +409,7 @@ struct RichMarkdownView: View {
                             linkUrl: nil
                         )
                     ])
-                )
+                ])
             )
         }
 
@@ -312,7 +465,159 @@ struct RichMarkdownView: View {
         }
     }
 
-    // MARK: - Inline Attributed String Builders
+    // MARK: - NSAttributedString Builders for Rich Prose Range Selection
+
+    private var inlineCodeFill: Color {
+        palette.isDark ? Color.white.opacity(0.08) : Color.black.opacity(0.048)
+    }
+
+    private func uiFont(size: CGFloat, weight: UIFont.Weight, italic: Bool = false, monospaced: Bool = false) -> UIFont {
+        let base = monospaced
+            ? UIFont.monospacedSystemFont(ofSize: size, weight: weight)
+            : UIFont.systemFont(ofSize: size, weight: weight)
+        guard italic else { return base }
+        if let desc = base.fontDescriptor.withSymbolicTraits(base.fontDescriptor.symbolicTraits.union(.traitItalic)) {
+            return UIFont(descriptor: desc, size: size)
+        }
+        return base
+    }
+
+    private func bodyParagraphStyle(spacingAfter: CGFloat) -> NSParagraphStyle {
+        let p = NSMutableParagraphStyle()
+        p.lineSpacing = OrbitTypography.bodyLineSpacing
+        p.paragraphSpacing = spacingAfter
+        return p
+    }
+
+    private func buildPlainNSAttributed(_ text: String, color: UIColor) -> NSAttributedString {
+        NSAttributedString(
+            string: text,
+            attributes: [
+                .font: uiFont(size: 15, weight: .regular),
+                .foregroundColor: color,
+                .paragraphStyle: bodyParagraphStyle(spacingAfter: 0)
+            ]
+        )
+    }
+
+    private func buildMergedProseNSAttributed(_ proseBlocks: [FfiRichBlock]) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let uiPrimary = UIColor(palette.fgPrimary)
+        let uiSecondary = UIColor(palette.fgSecondary)
+
+        for (idx, block) in proseBlocks.enumerated() {
+            let isFirst = idx == 0
+            let isLast = idx == proseBlocks.count - 1
+            if !isFirst {
+                out.append(NSAttributedString(string: "\n"))
+            }
+
+            switch block {
+            case let .heading(level, spans):
+                let p = NSMutableParagraphStyle()
+                p.lineSpacing = OrbitTypography.subheadLineSpacing
+                p.paragraphSpacingBefore = isFirst ? 0 : (level <= 2 ? 12 : 8)
+                p.paragraphSpacing = isLast ? 0 : 6
+                let headingSize: CGFloat = level == 1 ? 18 : (level == 2 ? 16 : 15)
+                out.append(buildInlineNSAttributed(
+                    spans,
+                    baseColor: uiPrimary,
+                    baseSize: headingSize,
+                    isHeading: true,
+                    paragraphStyle: p
+                ))
+
+            case let .paragraph(spans):
+                let p = bodyParagraphStyle(spacingAfter: isLast ? 0 : 10)
+                out.append(buildInlineNSAttributed(
+                    spans,
+                    baseColor: uiPrimary,
+                    baseSize: 15,
+                    isHeading: false,
+                    paragraphStyle: p
+                ))
+
+            case let .listItem(ordered, index, _, spans):
+                let p = NSMutableParagraphStyle()
+                p.firstLineHeadIndent = 4
+                p.headIndent = 20
+                p.tabStops = [NSTextTab(textAlignment: .left, location: 20)]
+                p.lineSpacing = OrbitTypography.bodyLineSpacing
+                p.paragraphSpacing = isLast ? 0 : 6
+
+                let marker = ordered ? "\(index).\t" : "•\t"
+                let markerFont = ordered
+                    ? uiFont(size: 13, weight: .medium)
+                    : uiFont(size: 15, weight: .semibold)
+                out.append(NSAttributedString(
+                    string: marker,
+                    attributes: [
+                        .font: markerFont,
+                        .foregroundColor: uiSecondary,
+                        .paragraphStyle: p
+                    ]
+                ))
+                out.append(buildInlineNSAttributed(
+                    spans,
+                    baseColor: uiPrimary,
+                    baseSize: 15,
+                    isHeading: false,
+                    paragraphStyle: p
+                ))
+
+            default:
+                break
+            }
+        }
+        return out
+    }
+
+    private func buildInlineNSAttributed(
+        _ spans: [FfiInlineSpan],
+        baseColor: UIColor,
+        baseSize: CGFloat = 15,
+        isHeading: Bool = false,
+        paragraphStyle: NSParagraphStyle
+    ) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let uiPrimary = UIColor(palette.fgPrimary)
+        let uiCodeFill = UIColor(inlineCodeFill)
+        let uiLink = UIColor(palette.primary)
+
+        for span in spans {
+            var attrs: [NSAttributedString.Key: Any] = [
+                .paragraphStyle: paragraphStyle
+            ]
+            if span.inlineCode {
+                attrs[.font] = uiFont(size: 13, weight: .regular, monospaced: true)
+                attrs[.foregroundColor] = uiPrimary
+                attrs[.backgroundColor] = uiCodeFill
+            } else if isHeading {
+                attrs[.font] = uiFont(size: baseSize, weight: .semibold, italic: span.italic)
+                attrs[.foregroundColor] = baseColor
+            } else {
+                attrs[.font] = uiFont(
+                    size: baseSize,
+                    weight: span.bold ? .semibold : .regular,
+                    italic: span.italic
+                )
+                attrs[.foregroundColor] = baseColor
+            }
+
+            if span.strikethrough {
+                attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+            }
+            if let rawUrl = span.linkUrl, let url = URL(string: rawUrl) {
+                attrs[.link] = url
+                attrs[.foregroundColor] = uiLink
+                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            }
+            out.append(NSAttributedString(string: span.text, attributes: attrs))
+        }
+        return out
+    }
+
+    // MARK: - SwiftUI AttributedString Builder for Tables
 
     private func buildTableCellAttributed(
         _ spans: [FfiInlineSpan],
@@ -323,9 +628,9 @@ struct RichMarkdownView: View {
         for span in spans {
             var part = AttributedString(span.text)
             if span.inlineCode {
-                part.font = OrbitTypography.code(.medium)
+                part.font = .system(size: 13, weight: .regular, design: .monospaced)
                 part.foregroundColor = palette.fgPrimary
-                part.backgroundColor = palette.subtleFill
+                part.backgroundColor = inlineCodeFill
             } else if isHeader {
                 part.font = OrbitTypography.subhead(.semibold)
                 part.foregroundColor = baseColor
@@ -355,51 +660,6 @@ struct RichMarkdownView: View {
         }
         return result
     }
-
-    private func buildInlineAttributed(
-        _ spans: [FfiInlineSpan],
-        baseColor: Color,
-        isHeading: Bool = false,
-        headingLevel: UInt8 = 3
-    ) -> AttributedString {
-        var result = AttributedString()
-        for span in spans {
-            var part = AttributedString(span.text)
-            if span.inlineCode {
-                part.font = OrbitTypography.code(.medium)
-                part.foregroundColor = palette.fgPrimary
-                part.backgroundColor = palette.subtleFill
-            } else if isHeading {
-                part.font = headingLevel <= 2 ? OrbitTypography.title : OrbitTypography.body(.semibold)
-                part.foregroundColor = baseColor
-            } else if span.bold && span.italic {
-                part.font = OrbitTypography.bodyItalic(.semibold)
-                part.foregroundColor = baseColor
-            } else if span.bold {
-                part.font = OrbitTypography.body(.semibold)
-                part.foregroundColor = baseColor
-            } else if span.italic {
-                part.font = OrbitTypography.bodyItalic(.regular)
-                part.foregroundColor = baseColor
-            } else {
-                part.font = OrbitTypography.body(.regular)
-                part.foregroundColor = baseColor
-            }
-
-            if span.strikethrough {
-                part.strikethroughStyle = .single
-            }
-
-            if let rawUrl = span.linkUrl, let url = URL(string: rawUrl) {
-                part.link = url
-                part.foregroundColor = palette.primary
-                part.underlineStyle = .single
-            }
-
-            result.append(part)
-        }
-        return result
-    }
 }
 
 // MARK: - Horizontal-Scrolling GFM Markdown Table View
@@ -420,7 +680,6 @@ private struct MarkdownTableView: View {
 
         ScrollView(.horizontal, showsIndicators: true) {
             Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
-                // Header Row
                 GridRow {
                     ForEach(0..<colCount, id: \.self) { col in
                         HStack(spacing: 0) {
@@ -439,7 +698,6 @@ private struct MarkdownTableView: View {
                 }
                 .background(palette.subtleFill)
 
-                // Body Rows
                 ForEach(Array(model.rows.enumerated()), id: \.offset) { rowIdx, row in
                     OrbitHairline()
                         .gridCellUnsizedAxes(.horizontal)
@@ -466,9 +724,9 @@ private struct MarkdownTableView: View {
             .textSelection(.enabled)
         }
         .background(palette.code)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(palette.hairline, lineWidth: 0.5)
         )
     }
@@ -508,17 +766,16 @@ struct CodeBlockView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Header bar with language, line count (>= 8), # line-number toggle, and 44x44pt Copy hit area
             HStack(spacing: OrbitSpacing.xs) {
-                HStack(spacing: OrbitSpacing.sm) {
+                HStack(spacing: 6) {
                     Text(displayLanguage)
                         .font(OrbitTypography.code(.medium))
                         .foregroundStyle(palette.fgMuted)
 
                     if effectiveLineCount >= 8 {
-                        Text("\(effectiveLineCount) lines")
+                        Text("· \(effectiveLineCount) lines")
                             .font(OrbitTypography.meta(.regular))
-                            .foregroundStyle(palette.fgMuted)
+                            .foregroundStyle(palette.fgMuted.opacity(0.85))
                     }
                 }
 
@@ -531,15 +788,14 @@ struct CodeBlockView: View {
                     }
                 } label: {
                     Text("#")
-                        .font(OrbitTypography.code(.semibold))
+                        .font(OrbitTypography.code(.medium))
                         .foregroundStyle(showLineNumbers ? palette.primary : palette.fgMuted)
-                        .padding(.horizontal, OrbitSpacing.sm)
-                        .padding(.vertical, 2)
+                        .frame(width: 24, height: 24)
                         .background(
                             Capsule()
-                                .fill(showLineNumbers ? palette.primary.opacity(0.12) : Color.clear)
+                                .fill(showLineNumbers ? palette.primary.opacity(0.10) : Color.clear)
                         )
-                        .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
+                        .frame(width: 32, height: 32)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -548,23 +804,20 @@ struct CodeBlockView: View {
                 Button {
                     copyCode()
                 } label: {
-                    HStack(spacing: OrbitSpacing.xs) {
-                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                            .font(OrbitTypography.iconMicro)
-                        Text(copied ? "Copied" : "Copy")
-                            .font(OrbitTypography.meta(.medium))
-                    }
-                    .foregroundStyle(copied ? palette.direct : palette.fgSecondary)
-                    .padding(.horizontal, OrbitSpacing.sm)
-                    .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget, alignment: .trailing)
-                    .contentShape(Rectangle())
+                    Image(systemName: copied ? "checkmark" : "square.on.square")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(copied ? palette.direct : palette.fgMuted)
+                        .orbitSymbolReplaceTransition()
+                        .frame(width: 34, height: 34)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Copy Code Block")
+                .accessibilityLabel(copied ? "Copied Code Block" : "Copy Code Block")
             }
             .padding(.leading, OrbitSpacing.md)
             .padding(.trailing, OrbitSpacing.xs)
-            .frame(height: 36)
+            .frame(height: 34)
+            .background(palette.isDark ? Color.white.opacity(0.025) : Color.black.opacity(0.022))
 
             OrbitHairline()
 
@@ -588,11 +841,13 @@ struct CodeBlockView: View {
                         }
                         .padding(OrbitSpacing.md)
                     } else {
-                        Text(rawCode)
-                            .orbitCodeStyle()
-                            .foregroundStyle(palette.fgPrimary)
-                            .textSelection(.enabled)
-                            .padding(OrbitSpacing.md)
+                        OrbitSelectableTextView(
+                            attributedText: buildFallbackCodeNSAttributed(),
+                            stretchesToProposedWidth: false,
+                            isDarkAppearance: palette.isDark,
+                            linkColor: UIColor(palette.primary)
+                        )
+                        .padding(OrbitSpacing.md)
                     }
                 } else {
                     if showLineNumbers {
@@ -612,22 +867,21 @@ struct CodeBlockView: View {
                         }
                         .padding(OrbitSpacing.md)
                     } else {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(lines, id: \.lineNumber) { line in
-                                Text(buildHighlightedLine(line))
-                                    .font(OrbitTypography.code(.regular))
-                            }
-                        }
-                        .textSelection(.enabled)
+                        OrbitSelectableTextView(
+                            attributedText: buildHighlightedCodeNSAttributed(),
+                            stretchesToProposedWidth: false,
+                            isDarkAppearance: palette.isDark,
+                            linkColor: UIColor(palette.primary)
+                        )
                         .padding(OrbitSpacing.md)
                     }
                 }
             }
         }
         .background(palette.code)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(palette.hairline, lineWidth: 0.5)
         )
     }
@@ -644,6 +898,56 @@ struct CodeBlockView: View {
                 copied = false
             }
         }
+    }
+
+    private func codeUIFont(bold: Bool, italic: Bool) -> UIFont {
+        let base = UIFont.monospacedSystemFont(ofSize: 12, weight: bold ? .semibold : .regular)
+        guard italic,
+              let desc = base.fontDescriptor.withSymbolicTraits(base.fontDescriptor.symbolicTraits.union(.traitItalic)) else {
+            return base
+        }
+        return UIFont(descriptor: desc, size: 12)
+    }
+
+    private func codeParagraphStyle() -> NSParagraphStyle {
+        let p = NSMutableParagraphStyle()
+        p.lineSpacing = OrbitTypography.metaLineSpacing
+        return p
+    }
+
+    private func buildFallbackCodeNSAttributed() -> NSAttributedString {
+        NSAttributedString(
+            string: rawCode.hasSuffix("\n") ? String(rawCode.dropLast()) : rawCode,
+            attributes: [
+                .font: codeUIFont(bold: false, italic: false),
+                .foregroundColor: UIColor(palette.fgPrimary),
+                .paragraphStyle: codeParagraphStyle()
+            ]
+        )
+    }
+
+    private func buildHighlightedCodeNSAttributed() -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let p = codeParagraphStyle()
+        let uiPrimary = UIColor(palette.fgPrimary)
+
+        for (idx, line) in lines.enumerated() {
+            if idx > 0 {
+                out.append(NSAttributedString(string: "\n", attributes: [.font: codeUIFont(bold: false, italic: false), .paragraphStyle: p]))
+            }
+            for token in line.tokens {
+                let fg = token.fgHex.isEmpty ? uiPrimary : UIColor(adjustedTokenColor(hex: token.fgHex))
+                out.append(NSAttributedString(
+                    string: token.text,
+                    attributes: [
+                        .font: codeUIFont(bold: token.bold, italic: token.italic),
+                        .foregroundColor: fg,
+                        .paragraphStyle: p
+                    ]
+                ))
+            }
+        }
+        return out
     }
 
     private func buildHighlightedLine(_ line: FfiHighlightedLine) -> AttributedString {
@@ -670,7 +974,6 @@ struct CodeBlockView: View {
     }
 
     private func adjustedTokenColor(hex: String) -> Color {
-        // Syntect token hexes are tuned for dark code surfaces; if in Light theme and token is very light, fall back to readable contrast
         if !palette.isDark {
             let clean = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
             var rgb: UInt64 = 0

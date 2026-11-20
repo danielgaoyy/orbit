@@ -17,6 +17,10 @@ export function normalizeProjectPath(path: string): string {
   return path.replace(/\/+$/, "") || "/";
 }
 
+export function projectPathScopeKey(hostId: string, dirPath: string): string {
+  return `${hostId}::${normalizeProjectPath(dirPath)}`;
+}
+
 export function isBareHomeDir(path: string): boolean {
   const clean = normalizeProjectPath(path);
   if (clean === "~" || clean === "/") return true;
@@ -93,6 +97,7 @@ export function buildUnifiedProjects(
   hosts: HostCardView[],
   pinnedProjects: ClientProjectView[],
   hostDetails: Record<string, HostDetailView>,
+  hiddenProjectKeys?: Record<string, boolean>,
 ): UnifiedProjectEntry[] {
   const hostMap = new Map(hosts.map((h) => [h.host_id, h]));
   const entries: UnifiedProjectEntry[] = [];
@@ -206,6 +211,7 @@ export function buildUnifiedProjects(
       for (const dp of detail.discovered_projects.slice(0, 4)) {
         const cleanPath = normalizeProjectPath(dp.path);
         if (isBareHomeDir(cleanPath) && detail.discovered_projects.length > 1) continue;
+        if (hiddenProjectKeys?.[projectPathScopeKey(host.host_id, cleanPath)]) continue;
         const id = `${host.host_id}::${cleanPath}`;
         if (entriesByKey.has(id)) continue;
         const entry: UnifiedProjectEntry = {

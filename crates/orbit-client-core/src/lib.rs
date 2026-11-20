@@ -10,6 +10,7 @@
 pub mod app_core;
 pub mod catalog;
 pub mod desktop_ops;
+pub mod logging;
 pub mod render;
 pub mod stage;
 
@@ -147,6 +148,8 @@ pub enum ClientCoreError {
     ChannelClosed,
     #[error("lock poisoned")]
     LockPoisoned,
+    #[error("{0}")]
+    Transport(String),
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ClientCoreError {
@@ -361,17 +364,25 @@ async fn connect_direct_with_host_id(
         let _hold = tunnel_keep_reader;
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
-                Message::Text(txt) => {
-                    if let Ok(wire) = serde_json::from_str::<WireMessage>(&txt) {
+                Message::Text(txt) => match serde_json::from_str::<WireMessage>(&txt) {
+                    Ok(wire) => {
                         sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
                         let _ = events_in.send(ClientInboundEvent::Wire(wire));
                     }
-                }
+                    Err(err) => {
+                        tracing::warn!(host_id = %owned_host_id, error = %err, bytes = txt.len(), "failed to decode direct JSON wire message");
+                    }
+                },
                 Message::Binary(bin) if !bin.is_empty() => {
                     if bin[0] == DIRECT_BIN_ZSTD_WIRE {
-                        if let Ok(wire) = WireMessage::decode_zstd(&bin[1..]) {
-                            sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
-                            let _ = events_in.send(ClientInboundEvent::Wire(wire));
+                        match WireMessage::decode_zstd(&bin[1..]) {
+                            Ok(wire) => {
+                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
+                                let _ = events_in.send(ClientInboundEvent::Wire(wire));
+                            }
+                            Err(err) => {
+                                tracing::warn!(host_id = %owned_host_id, error = %err, compressed_bytes = bin.len(), "failed to decode direct zstd wire message");
+                            }
                         }
                     } else if let Ok(term) = TerminalBinaryFrame::decode(&bin) {
                         let _ = events_in.send(ClientInboundEvent::Terminal(term));
@@ -518,12 +529,15 @@ async fn connect_via_relay_with_host_id(
                         continue;
                     }
                     match plain[0] {
-                        E2EE_FRAME_WIRE => {
-                            if let Ok(wire) = WireMessage::decode_zstd(&plain[1..]) {
+                        E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
+                            Ok(wire) => {
                                 sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
                                 let _ = events_in.send(ClientInboundEvent::Wire(wire));
                             }
-                        }
+                            Err(err) => {
+                                tracing::warn!(host_id = %owned_host_id, error = %err, compressed_bytes = plain.len(), "failed to decode E2EE zstd wire message");
+                            }
+                        },
                         E2EE_FRAME_TERMINAL => {
                             if let Ok(term) = TerminalBinaryFrame::decode(&plain[1..]) {
                                 let _ = events_in.send(ClientInboundEvent::Terminal(term));
@@ -821,9 +835,7 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
             }
         }
         WireMessage::TimelineCatchup { events, .. } => {
-            for ev in events {
-                let _ = store.upsert_replica_timeline_event(ev);
-            }
+            let _ = store.upsert_replica_timeline_events_batch(events);
         }
         WireMessage::TimelineLive { event } => {
             let _ = store.upsert_replica_timeline_event(event);

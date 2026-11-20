@@ -1,35 +1,49 @@
+import { SymbolGlyphModifier } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
+import { camera, cameraPicker } from '@kit.CameraKit';
+import { picker } from '@kit.CoreFileKit';
+import { KeyCode } from '@kit.InputKit';
+import { photoAccessHelper } from '@kit.MediaLibraryKit';
 import {
+  ComposerAttachmentItem,
   ComposerMentionCandidate,
   GitFileEntryDto,
+  OrbitSlashCommand,
   PromptBadgeDto,
   QueuedPromptItem,
   QuotedDiffSnippet,
-  SlashCommandItem,
-  basenameOfPath
+  basenameOfPath,
+  filterOrbitSlashCommands,
+  formatModeLabel,
+  normalizeModeSlug,
+  stripWorkspacePrefix
 } from '../../model/OrbitTypes';
 import { OrbitHarmonyStore } from '../../model/OrbitHarmonyStore';
+import { orbitLogWarn } from '../../model/OrbitLogger';
 import {
   OrbitTokens,
+  orbitButtonMeta,
   orbitComposerArea,
+  orbitSurface,
   orbitTextMeta,
   orbitTextMono,
-  orbitTextSubhead
+  orbitTextSubhead,
+  orbitTintColorFilter,
+  resolveSemanticFileSymbol
 } from '../../theme/OrbitTokens';
+import { dismissHarmonyKeyboard } from '../common/OrbitCommonControls';
+import { ModelPickerSheet, OrbitProviderBrandIcon } from './ModelPickerSheet';
 
 interface ScoredFileCandidate {
   score: number;
   item: ComposerMentionCandidate;
 }
 
-interface ParsedMentionTrigger {
+interface AutocompleteTriggerState {
+  kind: string; // 'slash' | 'mention'
+  startIndex: number;
+  endIndex: number;
   query: string;
-  strippedText: string;
-  rawToken: string;
-}
-
-interface ParsedSlashTrigger {
-  query: string;
-  strippedText: string;
   rawToken: string;
 }
 
@@ -38,6 +52,45 @@ export struct OmniComposer {
   @Local dismissedTriggerToken: string = '';
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+
+  @Computed
+  get activeTrigger(): AutocompleteTriggerState | null {
+    return this.detectTrigger();
+  }
+
+  @Computed
+  get slashCandidates(): OrbitSlashCommand[] {
+    const trig = this.activeTrigger;
+    if (trig === null || trig.kind !== 'slash') {
+      return [];
+    }
+    return this.filteredSlashCommands(trig);
+  }
+
+  @Computed
+  get mentionCandidates(): ComposerMentionCandidate[] {
+    const trig = this.activeTrigger;
+    if (trig === null || trig.kind !== 'mention') {
+      return [];
+    }
+    return this.filteredMentionCandidates(trig);
+  }
+
+  private permissionModeIcon(mode: string): Resource {
+    const slug = normalizeModeSlug(mode);
+    if (slug === 'accept_edits') {
+      return $r('app.media.ic_shield_check');
+    }
+    if (slug === 'full_access') {
+      return $r('app.media.ic_shield_off');
+    }
+    return $r('app.media.ic_shield');
+  }
+
+  @Builder
+  private buildModelPickerSheet() {
+    ModelPickerSheet()
+  }
 
   private isAgentRunning(): boolean {
     return this.store.isActiveAgentRunning();
@@ -51,81 +104,73 @@ export struct OmniComposer {
     return ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r';
   }
 
-  private parseSlashTrigger(): ParsedSlashTrigger | null {
+  private detectTrigger(): AutocompleteTriggerState | null {
     const text = this.store.composerText;
-    if (!text.startsWith('/')) {
+    if (text.length === 0) {
       return null;
     }
-    let firstSpace = -1;
-    for (let i = 0; i < text.length; i++) {
-      if (this.isWhitespaceChar(text.charAt(i))) {
-        firstSpace = i;
-        break;
-      }
-    }
-    // Only show slash popover while actively typing the leading /<query> token
-    if (firstSpace >= 0) {
-      return null;
-    }
-    const rawToken = text;
-    if (this.dismissedTriggerToken.length > 0 && this.dismissedTriggerToken === rawToken) {
-      return null;
-    }
-    return {
-      query: text.substring(1).toLowerCase(),
-      strippedText: '',
-      rawToken: rawToken
-    };
-  }
 
-  private filteredSlashCommands(): SlashCommandItem[] {
-    const trig = this.parseSlashTrigger();
-    if (trig === null) {
-      return [];
-    }
-    const q = trig.query;
-    const all = this.store.slashCommands;
-    const out: SlashCommandItem[] = [];
-    for (let i = 0; i < all.length; i++) {
-      const cmd = all[i];
-      const slug = cmd.command.substring(1).toLowerCase();
-      if (
-        q.length === 0 ||
-        slug.indexOf(q) >= 0 ||
-        cmd.title.toLowerCase().indexOf(q) >= 0 ||
-        cmd.description.toLowerCase().indexOf(q) >= 0
-      ) {
-        out.push(cmd);
-      }
-    }
-    return out;
-  }
-
-  private parseTrailingMention(): ParsedMentionTrigger | null {
-    const text = this.store.composerText;
+    let atTrigger: AutocompleteTriggerState | null = null;
     const lastAt = text.lastIndexOf('@');
-    if (lastAt < 0) {
-      return null;
-    }
-    if (lastAt > 0 && !this.isWhitespaceChar(text.charAt(lastAt - 1))) {
-      return null;
-    }
-    const query = text.substring(lastAt + 1);
-    for (let i = 0; i < query.length; i++) {
-      if (this.isWhitespaceChar(query.charAt(i))) {
-        return null;
+    if (lastAt >= 0 && (lastAt === 0 || this.isWhitespaceChar(text.charAt(lastAt - 1)))) {
+      const q = text.substring(lastAt + 1);
+      let hasSpace = false;
+      for (let i = 0; i < q.length; i++) {
+        if (this.isWhitespaceChar(q.charAt(i))) {
+          hasSpace = true;
+          break;
+        }
+      }
+      if (!hasSpace) {
+        const tok = `@${q}`;
+        if (this.dismissedTriggerToken !== tok) {
+          atTrigger = {
+            kind: 'mention',
+            startIndex: lastAt,
+            endIndex: text.length,
+            query: q.toLowerCase(),
+            rawToken: tok
+          };
+        }
       }
     }
-    const rawToken = `@${query}`;
-    if (this.dismissedTriggerToken.length > 0 && this.dismissedTriggerToken === rawToken) {
-      return null;
+
+    let slashTrigger: AutocompleteTriggerState | null = null;
+    if (this.store.activeSlashDirective.length === 0) {
+      const lastSlash = text.lastIndexOf('/');
+      if (lastSlash >= 0 && (lastSlash === 0 || this.isWhitespaceChar(text.charAt(lastSlash - 1)))) {
+        const q = text.substring(lastSlash + 1);
+        let hasInvalid = false;
+        for (let i = 0; i < q.length; i++) {
+          const ch = q.charAt(i);
+          if (this.isWhitespaceChar(ch) || ch === '/') {
+            hasInvalid = true;
+            break;
+          }
+        }
+        if (!hasInvalid) {
+          const tok = `/${q}`;
+          if (this.dismissedTriggerToken !== tok) {
+            slashTrigger = {
+              kind: 'slash',
+              startIndex: lastSlash,
+              endIndex: text.length,
+              query: q.toLowerCase(),
+              rawToken: tok
+            };
+          }
+        }
+      }
     }
-    const stripped = text.substring(0, lastAt).replace(/[ \t]+$/, '');
-    return {
-      query: query.toLowerCase(),
-      strippedText: stripped,
-      rawToken: rawToken
-    };
+
+    if (atTrigger !== null && slashTrigger !== null) {
+      return atTrigger.startIndex >= slashTrigger.startIndex ? atTrigger : slashTrigger;
+    }
+    return atTrigger !== null ? atTrigger : slashTrigger;
+  }
+
+  private filteredSlashCommands(trig: AutocompleteTriggerState): OrbitSlashCommand[] {
+    return filterOrbitSlashCommands(trig.query);
   }
 
   private fileMatchScore(relPath: string, base: string, q: string): number {
@@ -152,384 +197,395 @@ export struct OmniComposer {
         qi++;
       }
     }
-    return qi === q.length ? 40 : 0;
+    return qi === q.length ? 36 : -1;
   }
 
-  private mentionCandidates(): ComposerMentionCandidate[] {
-    const trig = this.parseTrailingMention();
-    if (trig === null) {
-      return [];
-    }
+  private filteredMentionCandidates(trig: AutocompleteTriggerState): ComposerMentionCandidate[] {
     const q = trig.query;
-    const results: ComposerMentionCandidate[] = [];
+    const out: ComposerMentionCandidate[] = [];
 
-    const builtins: ComposerMentionCandidate[] = [
-      {
-        key: 'special:diff',
-        kind: 'diff',
-        tokenLabel: '@diff',
-        title: 'Working Tree Diff',
-        subtitle: 'Uncommitted changes',
-        filePath: '',
-        gitStatus: ''
-      },
-      {
-        key: 'special:staged',
-        kind: 'staged',
-        tokenLabel: '@staged',
-        title: 'Staged Diff',
-        subtitle: 'Git index staged changes',
-        filePath: '',
-        gitStatus: ''
-      },
-      {
-        key: 'special:terminal',
-        kind: 'terminal',
-        tokenLabel: '@terminal',
-        title: 'Terminal Output',
-        subtitle: 'Recent active PTY lines',
-        filePath: '',
-        gitStatus: ''
-      }
-    ];
+    const workingItem: ComposerMentionCandidate = {
+      key: 'builtin_working_diff',
+      kind: 'git_diff',
+      tokenLabel: '@working-diff',
+      title: '@working-diff',
+      subtitle: 'Working Tree Diff',
+      filePath: '',
+      gitStatus: ''
+    };
+    const stagedItem: ComposerMentionCandidate = {
+      key: 'builtin_staged_diff',
+      kind: 'staged',
+      tokenLabel: '@staged-diff',
+      title: '@staged-diff',
+      subtitle: 'Staged Diff',
+      filePath: '',
+      gitStatus: ''
+    };
+    const termItem: ComposerMentionCandidate = {
+      key: 'builtin_terminal',
+      kind: 'terminal',
+      tokenLabel: '@terminal',
+      title: '@terminal',
+      subtitle: 'Active Terminal Output',
+      filePath: '',
+      gitStatus: ''
+    };
 
-    for (let i = 0; i < builtins.length; i++) {
-      const b = builtins[i];
-      const slug = b.tokenLabel.substring(1).toLowerCase();
-      if (
-        q.length === 0 ||
-        slug.indexOf(q) >= 0 ||
-        b.title.toLowerCase().indexOf(q) >= 0 ||
-        b.subtitle.toLowerCase().indexOf(q) >= 0 ||
-        (b.kind === 'terminal' && 'pty'.indexOf(q) >= 0)
-      ) {
-        results.push(b);
-      }
+    if (q.length === 0 || 'working-diff'.indexOf(q) >= 0 || 'diff'.indexOf(q) >= 0) {
+      out.push(workingItem);
+    }
+    if (q.length === 0 || 'staged-diff'.indexOf(q) >= 0 || 'diff'.indexOf(q) >= 0) {
+      out.push(stagedItem);
+    }
+    if (q.length === 0 || 'terminal'.indexOf(q) >= 0 || 'pty'.indexOf(q) >= 0) {
+      out.push(termItem);
     }
 
     const gitStatusMap: Map<string, string> = new Map<string, string>();
-    const allPaths: string[] = [];
-    const seenPaths: Set<string> = new Set<string>();
-    const stFiles: GitFileEntryDto[] = this.store.gitStatus?.files ?? [];
-    for (let i = 0; i < stFiles.length; i++) {
-      const gf = stFiles[i];
-      gitStatusMap.set(gf.path, gf.untracked ? 'U' : gf.status.length > 0 ? gf.status : 'M');
-      if (!seenPaths.has(gf.path)) {
-        seenPaths.add(gf.path);
-        allPaths.push(gf.path);
-      }
-    }
-    for (let i = 0; i < this.store.workspaceFiles.length; i++) {
-      const fp = this.store.workspaceFiles[i];
-      if (!seenPaths.has(fp)) {
-        seenPaths.add(fp);
-        allPaths.push(fp);
+    if (this.store.gitStatus !== null) {
+      const entries: GitFileEntryDto[] = this.store.gitStatus.files;
+      for (let i = 0; i < entries.length; i++) {
+        gitStatusMap.set(entries[i].path, entries[i].status);
       }
     }
 
     const scored: ScoredFileCandidate[] = [];
-    for (let i = 0; i < allPaths.length; i++) {
-      const path = allPaths[i];
-      const base = basenameOfPath(path);
-      const baseScore = this.fileMatchScore(path, base, q);
-      if (baseScore <= 0) {
+    const seen: Map<string, boolean> = new Map<string, boolean>();
+    const files: string[] = this.store.workspaceFiles;
+    for (let i = 0; i < files.length; i++) {
+      const rawPath = files[i];
+      if (rawPath.length === 0 || seen.has(rawPath)) {
         continue;
       }
-      const statusBadge = gitStatusMap.get(path) ?? '';
-      const slashIdx = path.lastIndexOf('/');
-      const dir = slashIdx > 0 ? path.substring(0, slashIdx) : '';
-      const totalScore = baseScore + (statusBadge.length > 0 ? 18 : 0);
-      scored.push({
-        score: totalScore,
-        item: {
-          key: `file:${path}`,
-          kind: 'file',
-          tokenLabel: `@${base}`,
-          title: base,
-          subtitle: dir,
-          filePath: path,
-          gitStatus: statusBadge
-        }
-      });
-    }
-
-    scored.sort((a: ScoredFileCandidate, b: ScoredFileCandidate) => b.score - a.score);
-    for (let i = 0; i < scored.length && results.length < 6; i++) {
-      results.push(scored[i].item);
-    }
-    return results.slice(0, 6);
-  }
-
-  private providerDotColor(): string {
-    const prov = this.store.composerProvider.trim().toLowerCase();
-    if (prov === 'codex') {
-      return this.store.palette.statusDirect;
-    }
-    if (prov === 'claude_code' || prov === 'claude') {
-      return this.store.palette.statusRelay;
-    }
-    return this.store.palette.accentPrimary;
-  }
-
-  private modeToneColor(): string {
-    const mode = this.store.composerMode;
-    if (mode === 'full_access') {
-      return this.store.palette.statusWarning;
-    }
-    if (mode === 'accept_edits') {
-      return this.store.palette.statusDirect;
-    }
-    if (mode === 'plan') {
-      return this.store.palette.accentPrimary;
-    }
-    return this.store.palette.fgSecondary;
-  }
-
-  private hasAttachedChips(): boolean {
-    return (
-      this.store.composerBadges.length > 0 ||
-      this.store.quotedSnippets.length > 0 ||
-      this.store.worktreeBranch.trim().length > 0
-    );
-  }
-
-  @Builder
-  private renderContextChipsTray() {
-    if (this.hasAttachedChips()) {
-      Scroll() {
-        Row({ space: OrbitTokens.SPACE_SM }) {
-          if (this.store.worktreeBranch.trim().length > 0) {
-            Row({ space: OrbitTokens.SPACE_XS }) {
-              Text(`⎇ ${this.store.worktreeBranch.trim()}`)
-                .attributeModifier(
-                  orbitTextMono(this.store.palette.statusRelay, FontWeight.Medium)
-                )
-              Text('×')
-                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-            }
-            .height(28)
-            .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-            .backgroundColor(this.store.palette.statusRelaySoft)
-            .borderRadius(OrbitTokens.PILL_RADIUS)
-            .accessibilityText(`Remove worktree branch ${this.store.worktreeBranch.trim()}`)
-            .onClick(() => {
-              this.store.worktreeBranch = '';
-            })
+      seen.set(rawPath, true);
+      const relPath = stripWorkspacePrefix(rawPath, this.store.activeCwd);
+      const base = basenameOfPath(rawPath);
+      const score = this.fileMatchScore(relPath, base, q);
+      if (score > 0) {
+        const gitSt = gitStatusMap.get(rawPath) ?? gitStatusMap.get(relPath) ?? '';
+        scored.push({
+          score: score + (gitSt.length > 0 ? 12 : 0),
+          item: {
+            key: `file_${rawPath}`,
+            kind: 'file',
+            tokenLabel: `@${base}`,
+            title: base,
+            subtitle: relPath,
+            filePath: rawPath,
+            gitStatus: gitSt
           }
-
-          ForEach(
-            this.store.composerBadges,
-            (badge: PromptBadgeDto) => {
-              Row({ space: OrbitTokens.SPACE_XS }) {
-                Text(badge.label)
-                  .attributeModifier(
-                    orbitTextMono(this.store.palette.accentPrimary, FontWeight.Medium)
-                  )
-                Text('×')
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-              }
-              .height(28)
-              .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-              .backgroundColor(this.store.palette.accentPrimarySoft)
-              .borderRadius(OrbitTokens.PILL_RADIUS)
-              .accessibilityText(`Remove context ${badge.label}`)
-              .onClick(() => {
-                this.store.removeComposerBadge(badge.label);
-              })
-            },
-            (badge: PromptBadgeDto) => badge.label
-          )
-
-          ForEach(
-            this.store.quotedSnippets,
-            (snip: QuotedDiffSnippet) => {
-              Row({ space: OrbitTokens.SPACE_XS }) {
-                Text(`❝ ${snip.lineLabel}`)
-                  .attributeModifier(
-                    orbitTextMono(this.store.palette.statusDirect, FontWeight.Medium)
-                  )
-                Text('×')
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-              }
-              .height(28)
-              .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-              .backgroundColor(this.store.palette.statusDirectSoft)
-              .borderRadius(OrbitTokens.PILL_RADIUS)
-              .accessibilityText(`Remove quoted snippet ${snip.lineLabel}`)
-              .onClick(() => {
-                this.store.removeQuotedSnippet(snip.id);
-              })
-            },
-            (snip: QuotedDiffSnippet) => snip.id
-          )
-        }
+        });
       }
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
-      .width('100%')
-      .padding({
-        left: OrbitTokens.SPACE_MD,
-        right: OrbitTokens.SPACE_MD,
-        top: OrbitTokens.SPACE_SM
+    }
+
+    scored.sort((a: ScoredFileCandidate, b: ScoredFileCandidate) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+      return a.item.title.localeCompare(b.item.title);
+    });
+
+    const maxFiles = Math.min(40, scored.length);
+    for (let i = 0; i < maxFiles; i++) {
+      out.push(scored[i].item);
+    }
+    return out;
+  }
+
+  private async pickPhotos(): Promise<void> {
+    try {
+      const opts = new photoAccessHelper.PhotoSelectOptions();
+      opts.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
+      opts.maxSelectNumber = 4;
+      const photoPicker = new photoAccessHelper.PhotoViewPicker();
+      const result = await photoPicker.select(opts);
+      const uris: string[] = result.photoUris;
+      for (let i = 0; i < uris.length; i++) {
+        await this.store.attachPhotoUri(uris[i]);
+      }
+    } catch (e) {
+      orbitLogWarn('OrbitComposer', 'PhotoViewPicker error', e as Object);
+    }
+  }
+
+  private async launchCamera(): Promise<void> {
+    try {
+      const hostCtx = this.getUIContext().getHostContext() as common.Context;
+      const profile: cameraPicker.PickerProfile = {
+        cameraPosition: camera.CameraPosition.CAMERA_POSITION_BACK
+      };
+      const result = await cameraPicker.pick(hostCtx, [cameraPicker.PickerMediaType.PHOTO], profile);
+      if (result.resultCode === 0 && result.resultUri.length > 0) {
+        await this.store.attachPhotoUri(result.resultUri);
+      }
+    } catch (e) {
+      orbitLogWarn('OrbitComposer', 'cameraPicker error', e as Object);
+    }
+  }
+
+  private async pickFiles(): Promise<void> {
+    try {
+      const hostCtx = this.getUIContext().getHostContext() as common.Context;
+      const docOpts = new picker.DocumentSelectOptions();
+      docOpts.maxSelectNumber = 4;
+      const docPicker = new picker.DocumentViewPicker(hostCtx);
+      const uris: string[] = await docPicker.select(docOpts);
+      for (let i = 0; i < uris.length; i++) {
+        await this.store.attachDocumentUri(uris[i]);
+      }
+    } catch (e) {
+      orbitLogWarn('OrbitComposer', 'DocumentViewPicker error', e as Object);
+    }
+  }
+
+  private candidateSymbol(candidate: ComposerMentionCandidate): Resource {
+    if (candidate.kind === 'git_diff' || candidate.kind === 'staged') {
+      return $r('sys.symbol.arrow_left_arrow_right');
+    }
+    if (candidate.kind === 'terminal') {
+      return $r('sys.symbol.code');
+    }
+    return resolveSemanticFileSymbol(candidate.title);
+  }
+
+  private selectSlashCommand(cmd: OrbitSlashCommand, trig: AutocompleteTriggerState): void {
+    const text = this.store.composerText;
+    const before = text.substring(0, trig.startIndex);
+    const after = text.substring(trig.endIndex).trimStart();
+    const cleaned = `${before}${after}`.trimStart();
+    this.store.composerText = cleaned;
+    this.dismissedTriggerToken = '';
+    this.store.executeSlashCommand(cmd);
+  }
+
+  private selectMentionCandidate(
+    candidate: ComposerMentionCandidate,
+    trig: AutocompleteTriggerState
+  ): void {
+    const text = this.store.composerText;
+    const before = text.substring(0, trig.startIndex);
+    const after = text.substring(trig.endIndex);
+    const token = candidate.tokenLabel;
+    this.store.composerText = `${before}${token} ${after}`;
+    this.dismissedTriggerToken = '';
+    if (candidate.kind === 'git_diff') {
+      this.store.registerInlineMention(token, 'git_diff', '', false, 'Working Tree Diff');
+    } else if (candidate.kind === 'staged') {
+      this.store.registerInlineMention(token, 'git_diff', '', true, 'Staged Diff');
+    } else if (candidate.kind === 'terminal') {
+      this.store.registerInlineMention(token, 'terminal', '', false, 'Terminal');
+    } else if (candidate.kind === 'file') {
+      this.store.registerInlineMention(token, 'file', candidate.filePath, false, candidate.title);
+    }
+  }
+
+  private badgeSymbol(kind: string, label: string): Resource {
+    if (kind === 'image') {
+      return $r('sys.symbol.picture');
+    }
+    if (kind === 'diff' || kind === 'staged' || kind === 'git_diff') {
+      return $r('sys.symbol.arrow_left_arrow_right');
+    }
+    if (kind === 'terminal') {
+      return $r('sys.symbol.code');
+    }
+    if (kind === 'quote') {
+      return $r('sys.symbol.quote');
+    }
+    return resolveSemanticFileSymbol(label.startsWith('@') ? label.substring(1) : label);
+  }
+
+  @Builder
+  private renderPlusAttachmentMenu() {
+    Menu() {
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.picture'))
+          .fontColor([this.store.palette.iconPrimary]),
+        content: 'Photos'
       })
+        .onClick(() => {
+          this.pickPhotos();
+        })
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.camera'))
+          .fontColor([this.store.palette.iconPrimary]),
+        content: 'Camera'
+      })
+        .onClick(() => {
+          this.launchCamera();
+        })
+      MenuItem({
+        symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.paperclip'))
+          .fontColor([this.store.palette.iconPrimary]),
+        content: 'Files'
+      })
+        .onClick(() => {
+          this.pickFiles();
+        })
     }
   }
 
   @Builder
-  private renderInlineSlashPopover() {
-    if (this.filteredSlashCommands().length > 0) {
-      Column({ space: OrbitTokens.SPACE_XS }) {
-        Row() {
-          Text('SLASH DIRECTIVES')
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-          Blank()
-          Stack({ alignContent: Alignment.Center }) {
-            Text('×')
-              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-          }
-          .width(OrbitTokens.HIT_MIN)
-          .height(OrbitTokens.HIT_MIN)
-          .accessibilityText('Dismiss slash directives popover')
+  private renderPermissionModeMenu() {
+    Menu() {
+      MenuItemGroup({ header: 'Access Permissions' }) {
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.security_shield'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Always Ask',
+          labelInfo: 'Ask before edits',
+          symbolEndIcon: normalizeModeSlug(this.store.composerMode) === 'default'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .labelFontColor(this.store.palette.fgMuted)
           .onClick(() => {
-            const trig = this.parseSlashTrigger();
-            if (trig !== null) {
-              this.dismissedTriggerToken = trig.rawToken;
-            }
+            this.store.setSessionMode('default');
           })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.checkmark_shield'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Accept Edits',
+          labelInfo: 'Auto-approve edits',
+          symbolEndIcon: normalizeModeSlug(this.store.composerMode) === 'accept_edits'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .labelFontColor(this.store.palette.fgMuted)
+          .onClick(() => {
+            this.store.setSessionMode('accept_edits');
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.shield_checkered'))
+            .fontColor([this.store.palette.statusWarning]),
+          content: 'Full Access',
+          labelInfo: 'No prompts',
+          symbolEndIcon: normalizeModeSlug(this.store.composerMode) === 'full_access'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .labelFontColor(this.store.palette.fgMuted)
+          .onClick(() => {
+            this.store.setSessionMode('full_access');
+          })
+      }
+    }
+  }
+
+  @Builder
+  private renderAutocompletePopover() {
+    if (this.activeTrigger !== null) {
+      if (this.activeTrigger.kind === 'slash' && this.slashCandidates.length > 0) {
+        Column() {
+          List({ space: 0 }) {
+            ForEach(
+              this.slashCandidates,
+              (cmd: OrbitSlashCommand) => {
+                ListItem() {
+                  Button({ type: ButtonType.Normal, stateEffect: true }) {
+                    Row({ space: OrbitTokens.SPACE_SM }) {
+                      SymbolGlyph(cmd.symbol)
+                        .fontSize(16)
+                        .fontColor([this.store.palette.iconSecondary])
+                      Text(cmd.command)
+                        .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Medium))
+                      Text(cmd.description)
+                        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                        .layoutWeight(1)
+                    }
+                    .width('100%')
+                    .alignItems(VerticalAlign.Center)
+                  }
+                  .width('100%')
+                  .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+                  .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+                  .backgroundColor(Color.Transparent)
+                  .onClick(() => {
+                    const curTrig = this.activeTrigger;
+                    if (curTrig !== null) {
+                      this.selectSlashCommand(cmd, curTrig);
+                    }
+                  })
+                }
+              },
+              (cmd: OrbitSlashCommand) => `slash_${cmd.id}`
+            )
+          }
+          .width('100%')
+          .constraintSize({ maxHeight: 232 })
+          .scrollBar(BarState.Off)
         }
         .width('100%')
-        .padding({ left: OrbitTokens.SPACE_SM })
-        .alignItems(VerticalAlign.Center)
-
-        ForEach(
-          this.filteredSlashCommands(),
-          (cmd: SlashCommandItem) => {
-            Row({ space: OrbitTokens.SPACE_SM }) {
-              Text(cmd.command)
-                .attributeModifier(orbitTextMono(this.store.palette.accentPrimary, FontWeight.Bold))
-                .width(72)
-
-              Text(cmd.description)
-                .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .layoutWeight(1)
-            }
-            .width('100%')
-            .height(36)
-            .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-            .borderRadius(OrbitTokens.PILL_RADIUS)
-            .alignItems(VerticalAlign.Center)
-            .onClick(() => {
-              const trig = this.parseSlashTrigger();
-              this.store.applyInlineSlashCommand(cmd, trig !== null ? trig.strippedText : '');
-              this.dismissedTriggerToken = '';
-            })
-          },
-          (cmd: SlashCommandItem) => cmd.command
+        .borderRadius(OrbitTokens.RADIUS_LG)
+        .clip(true)
+        .attributeModifier(
+          orbitSurface(
+            this.store.palette.listCard,
+            this.store.palette.hairline,
+            OrbitTokens.HAIRLINE,
+            ShadowStyle.OUTER_DEFAULT_MD
+          )
         )
-      }
-      .width('100%')
-      .padding(OrbitTokens.SPACE_SM)
-      .backgroundColor(this.store.palette.elevated)
-      .borderRadius(OrbitTokens.CARD_RADIUS)
-      .border({
-        width: OrbitTokens.HAIRLINE,
-        color: this.store.palette.hairline
-      })
-      .shadow({
-        radius: 12,
-        color: '#22000000',
-        offsetX: 0,
-        offsetY: -2
-      })
-    }
-  }
-
-  @Builder
-  private renderInlineMentionPopover() {
-    if (this.parseSlashTrigger() === null && this.mentionCandidates().length > 0) {
-      Column({ space: OrbitTokens.SPACE_XS }) {
-        Row() {
-          Text('ATTACH @ CONTEXT')
-            .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
-          Blank()
-          Stack({ alignContent: Alignment.Center }) {
-            Text('×')
-              .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
+      } else if (this.activeTrigger.kind === 'mention' && this.mentionCandidates.length > 0) {
+        Column() {
+          List({ space: 0 }) {
+            ForEach(
+              this.mentionCandidates,
+              (cand: ComposerMentionCandidate) => {
+                ListItem() {
+                  Button({ type: ButtonType.Normal, stateEffect: true }) {
+                    Row({ space: OrbitTokens.SPACE_SM }) {
+                      SymbolGlyph(this.candidateSymbol(cand))
+                        .fontSize(16)
+                        .fontColor([this.store.palette.iconSecondary])
+                      Text(cand.title)
+                        .attributeModifier(orbitTextMono(this.store.palette.fgPrimary, FontWeight.Medium))
+                        .maxLines(1)
+                      Text(cand.subtitle)
+                        .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                        .layoutWeight(1)
+                    }
+                    .width('100%')
+                    .alignItems(VerticalAlign.Center)
+                  }
+                  .width('100%')
+                  .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
+                  .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
+                  .backgroundColor(Color.Transparent)
+                  .onClick(() => {
+                    const curTrig = this.activeTrigger;
+                    if (curTrig !== null) {
+                      this.selectMentionCandidate(cand, curTrig);
+                    }
+                  })
+                }
+              },
+              (cand: ComposerMentionCandidate) => cand.key
+            )
           }
-          .width(OrbitTokens.HIT_MIN)
-          .height(OrbitTokens.HIT_MIN)
-          .accessibilityText('Dismiss context mention popover')
-          .onClick(() => {
-            const trig = this.parseTrailingMention();
-            if (trig !== null) {
-              this.dismissedTriggerToken = trig.rawToken;
-            }
-          })
+          .width('100%')
+          .constraintSize({ maxHeight: 232 })
+          .scrollBar(BarState.Off)
         }
         .width('100%')
-        .padding({ left: OrbitTokens.SPACE_SM })
-        .alignItems(VerticalAlign.Center)
-
-        ForEach(
-          this.mentionCandidates(),
-          (item: ComposerMentionCandidate) => {
-            Row({ space: OrbitTokens.SPACE_SM }) {
-              Text(item.tokenLabel)
-                .attributeModifier(
-                  orbitTextMono(
-                    item.kind === 'file'
-                      ? this.store.palette.fgPrimary
-                      : this.store.palette.accentPrimary,
-                    FontWeight.Medium
-                  )
-                )
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .constraintSize({ maxWidth: '52%' })
-
-              Text(item.kind === 'file' ? item.subtitle : item.title)
-                .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-                .layoutWeight(1)
-
-              if (item.gitStatus.length > 0) {
-                Text(item.gitStatus)
-                  .attributeModifier(
-                    orbitTextMono(this.store.palette.statusWarning, FontWeight.Bold)
-                  )
-              }
-            }
-            .width('100%')
-            .height(36)
-            .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-            .borderRadius(OrbitTokens.PILL_RADIUS)
-            .alignItems(VerticalAlign.Center)
-            .onClick(() => {
-              const trig = this.parseTrailingMention();
-              this.store.attachInlineMention(item, trig !== null ? trig.strippedText : '');
-              this.dismissedTriggerToken = '';
-            })
-          },
-          (item: ComposerMentionCandidate) => item.key
+        .borderRadius(OrbitTokens.RADIUS_LG)
+        .clip(true)
+        .attributeModifier(
+          orbitSurface(
+            this.store.palette.listCard,
+            this.store.palette.hairline,
+            OrbitTokens.HAIRLINE,
+            ShadowStyle.OUTER_DEFAULT_MD
+          )
         )
       }
-      .width('100%')
-      .padding(OrbitTokens.SPACE_SM)
-      .backgroundColor(this.store.palette.elevated)
-      .borderRadius(OrbitTokens.CARD_RADIUS)
-      .border({
-        width: OrbitTokens.HAIRLINE,
-        color: this.store.palette.hairline
-      })
-      .shadow({
-        radius: 12,
-        color: '#22000000',
-        offsetX: 0,
-        offsetY: -2
-      })
     }
   }
 
@@ -537,72 +593,75 @@ export struct OmniComposer {
   private renderQueuedPromptsTray() {
     if (this.store.activeQueuedPrompts.length > 0) {
       Column({ space: OrbitTokens.SPACE_XS }) {
+        Row() {
+          Text(`Queued (${this.store.activeQueuedPrompts.length})`)
+            .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
+          Blank()
+        }
+        .width('100%')
+        .padding({ left: OrbitTokens.SPACE_XS, right: OrbitTokens.SPACE_XS })
+
         ForEach(
           this.store.activeQueuedPrompts,
-          (qItem: QueuedPromptItem, idx: number) => {
-            Row({ space: OrbitTokens.SPACE_XS }) {
-              Text(`#${idx + 1}`)
-                .attributeModifier(orbitTextMono(this.store.palette.accentPrimary, FontWeight.Bold))
-
-              Text(qItem.displayPrompt)
-                .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Normal))
+          (qItem: QueuedPromptItem) => {
+            Row({ space: OrbitTokens.SPACE_SM }) {
+              Text(
+                qItem.displayPrompt.length > 0
+                  ? qItem.displayPrompt
+                  : qItem.badges.map((b: PromptBadgeDto) => b.label).join(' ')
+              )
+                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
                 .layoutWeight(1)
 
-              Row() {
-                Text('Edit')
+              Row({ space: OrbitTokens.SPACE_XS }) {
+                Button('Edit', { type: ButtonType.Capsule, stateEffect: true })
                   .attributeModifier(
-                    orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium)
+                    orbitButtonMeta(this.store.palette.fgSecondary, this.store.palette.subtleSurface)
                   )
-              }
-              .height(28)
-              .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-              .backgroundColor(this.store.palette.subtleSurface)
-              .borderRadius(OrbitTokens.PILL_RADIUS)
-              .alignItems(VerticalAlign.Center)
-              .onClick(() => {
-                this.store.editQueuedPrompt(qItem.id);
-              })
+                  .height(34)
+                  .padding({ left: 10, right: 10 })
+                  .onClick(() => {
+                    this.store.editQueuedPrompt(qItem.id);
+                  })
 
-              Row() {
-                Text('Send Now')
+                Button('Send', { type: ButtonType.Capsule, stateEffect: true })
                   .attributeModifier(
-                    orbitTextMeta(this.store.palette.accentPrimary, FontWeight.Medium)
+                    orbitButtonMeta(this.store.palette.onAccent, this.store.palette.accentPrimaryFill)
                   )
-              }
-              .height(28)
-              .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-              .backgroundColor(this.store.palette.accentPrimarySoft)
-              .borderRadius(OrbitTokens.PILL_RADIUS)
-              .alignItems(VerticalAlign.Center)
-              .onClick(() => {
-                this.store.sendQueuedPromptNow(qItem.id);
-              })
+                  .height(34)
+                  .padding({ left: 10, right: 10 })
+                  .onClick(() => {
+                    this.store.sendQueuedPromptNow(qItem.id);
+                  })
 
-              Stack({ alignContent: Alignment.Center }) {
-                Text('×')
-                  .attributeModifier(orbitTextMeta(this.store.palette.fgMuted, FontWeight.Bold))
+                Button({ type: ButtonType.Circle, stateEffect: true }) {
+                  SymbolGlyph($r('sys.symbol.xmark'))
+                    .fontSize(13)
+                    .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                    .fontColor([this.store.palette.iconSecondary])
+                }
+                .width(36)
+                .height(36)
+                .padding(0)
+                .backgroundColor(Color.Transparent)
+                .accessibilityText('Remove queued prompt')
+                .onClick(() => {
+                  this.store.removeQueuedPrompt(qItem.id);
+                })
               }
-              .width(OrbitTokens.HIT_MIN)
-              .height(OrbitTokens.HIT_MIN)
-              .accessibilityText('Remove queued prompt')
-              .onClick(() => {
-                this.store.removeQueuedPrompt(qItem.id);
-              })
             }
             .width('100%')
-            .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
             .padding({
               left: OrbitTokens.SPACE_MD,
-              right: 0
+              right: OrbitTokens.SPACE_XS,
+              top: 4,
+              bottom: 4
             })
-            .backgroundColor(this.store.palette.elevated)
-            .borderRadius(OrbitTokens.CARD_RADIUS)
-            .border({
-              width: OrbitTokens.HAIRLINE,
-              color: this.store.palette.hairline
-            })
+            .backgroundColor(this.store.palette.listCard)
+            .borderRadius(OrbitTokens.RADIUS_MD)
+            .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
             .alignItems(VerticalAlign.Center)
           },
           (qItem: QueuedPromptItem) => qItem.id
@@ -612,198 +671,447 @@ export struct OmniComposer {
     }
   }
 
+  @Builder
+  private renderAttachmentAndContextStrip() {
+    if (
+      this.store.isStagingAttachment ||
+      this.store.stagedAttachments.length > 0 ||
+      this.store.composerBadges.length > 0 ||
+      this.store.quotedSnippets.length > 0
+    ) {
+      Scroll() {
+        Row({ space: OrbitTokens.SPACE_XS }) {
+          if (this.store.isStagingAttachment) {
+            Row() {
+              LoadingProgress()
+                .width(18)
+                .height(18)
+                .color(this.store.palette.iconSecondary)
+            }
+            .width(OrbitTokens.HIT_COMPACT)
+            .height(OrbitTokens.HIT_COMPACT)
+            .justifyContent(FlexAlign.Center)
+            .borderRadius(OrbitTokens.RADIUS_MD)
+            .backgroundColor(this.store.palette.subtleSurface)
+          }
+
+          ForEach(
+            this.store.stagedAttachments,
+            (att: ComposerAttachmentItem) => {
+              if (att.isImage && att.localUri.length > 0) {
+                Stack({ alignContent: Alignment.TopEnd }) {
+                  Image(att.localUri)
+                    .width(52)
+                    .height(52)
+                    .objectFit(ImageFit.Cover)
+                    .borderRadius(OrbitTokens.RADIUS_MD)
+                    .border({ width: OrbitTokens.HAIRLINE, color: this.store.palette.hairline })
+                  Button({ type: ButtonType.Circle, stateEffect: true }) {
+                    SymbolGlyph($r('sys.symbol.xmark'))
+                      .fontSize(10)
+                      .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                      .fontColor([$r('sys.color.font_on_primary')])
+                  }
+                  .width(22)
+                  .height(22)
+                  .padding(0)
+                  .margin(2)
+                  .backgroundColor(this.store.palette.overlayPillBg)
+                  .accessibilityText(`Remove ${att.filename}`)
+                  .onClick(() => {
+                    this.store.removeStagedAttachment(att.id);
+                  })
+                }
+                .width(52)
+                .height(52)
+              } else {
+                Row({ space: 4 }) {
+                  SymbolGlyph(resolveSemanticFileSymbol(att.filename))
+                    .fontSize(14)
+                    .fontColor([this.store.palette.iconSecondary])
+                  Text(att.filename)
+                    .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Medium))
+                    .maxLines(1)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    .constraintSize({ maxWidth: 140 })
+                  Button({ type: ButtonType.Circle, stateEffect: true }) {
+                    SymbolGlyph($r('sys.symbol.xmark'))
+                      .fontSize(11)
+                      .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                      .fontColor([this.store.palette.iconSecondary])
+                  }
+                  .width(28)
+                  .height(28)
+                  .padding(0)
+                  .backgroundColor(Color.Transparent)
+                  .accessibilityText(`Remove ${att.filename}`)
+                  .onClick(() => {
+                    this.store.removeStagedAttachment(att.id);
+                  })
+                }
+                .constraintSize({ minHeight: 34 })
+                .padding({ left: 10, right: 4 })
+                .borderRadius(OrbitTokens.RADIUS_SM)
+                .backgroundColor(this.store.palette.subtleSurface)
+                .alignItems(VerticalAlign.Center)
+              }
+            },
+            (att: ComposerAttachmentItem) => att.id
+          )
+
+          ForEach(
+            this.store.composerBadges,
+            (badge: PromptBadgeDto) => {
+              Row({ space: 4 }) {
+                SymbolGlyph(this.badgeSymbol(badge.kind, badge.label))
+                  .fontSize(14)
+                  .fontColor([this.store.palette.iconSecondary])
+                Text(badge.label)
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Medium))
+                  .maxLines(1)
+                Button({ type: ButtonType.Circle, stateEffect: true }) {
+                  SymbolGlyph($r('sys.symbol.xmark'))
+                    .fontSize(11)
+                    .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                    .fontColor([this.store.palette.iconSecondary])
+                }
+                .width(28)
+                .height(28)
+                .padding(0)
+                .backgroundColor(Color.Transparent)
+                .accessibilityText(`Remove ${badge.label}`)
+                .onClick(() => {
+                  this.store.removeComposerBadge(badge.label);
+                })
+              }
+              .constraintSize({ minHeight: 34 })
+              .padding({ left: 10, right: 4 })
+              .borderRadius(OrbitTokens.RADIUS_SM)
+              .backgroundColor(this.store.palette.subtleSurface)
+              .alignItems(VerticalAlign.Center)
+            },
+            (badge: PromptBadgeDto) => `${badge.kind}_${badge.label}`
+          )
+
+          ForEach(
+            this.store.quotedSnippets,
+            (snip: QuotedDiffSnippet) => {
+              Row({ space: 4 }) {
+                SymbolGlyph($r('sys.symbol.quote'))
+                  .fontSize(13)
+                  .fontColor([this.store.palette.iconSecondary])
+                Text(snip.lineLabel)
+                  .attributeModifier(orbitTextMeta(this.store.palette.fgPrimary, FontWeight.Medium))
+                  .maxLines(1)
+                Button({ type: ButtonType.Circle, stateEffect: true }) {
+                  SymbolGlyph($r('sys.symbol.xmark'))
+                    .fontSize(11)
+                    .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                    .fontColor([this.store.palette.iconSecondary])
+                }
+                .width(28)
+                .height(28)
+                .padding(0)
+                .backgroundColor(Color.Transparent)
+                .accessibilityText(`Remove ${snip.lineLabel}`)
+                .onClick(() => {
+                  this.store.removeQuotedSnippet(snip.id);
+                })
+              }
+              .constraintSize({ minHeight: 34 })
+              .padding({ left: 10, right: 4 })
+              .borderRadius(OrbitTokens.RADIUS_SM)
+              .backgroundColor(this.store.palette.subtleSurface)
+              .alignItems(VerticalAlign.Center)
+            },
+            (snip: QuotedDiffSnippet) => snip.id
+          )
+        }
+        .padding({
+          left: OrbitTokens.SPACE_MD,
+          right: OrbitTokens.SPACE_MD,
+          top: OrbitTokens.SPACE_SM
+        })
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .width('100%')
+    }
+  }
+
+  private inputPlaceholder(): string {
+    if (this.store.activeSlashDirective.length > 0) {
+      return '';
+    }
+    return 'Ask anything, @ to mention, / for actions';
+  }
+
   build() {
     Column({ space: OrbitTokens.SPACE_SM }) {
-      this.renderInlineSlashPopover()
-      this.renderInlineMentionPopover()
+      this.renderAutocompletePopover()
       this.renderQueuedPromptsTray()
 
+      // Main HarmonyOS 7 Floating Composer Card
       Column() {
-        this.renderContextChipsTray()
-
-        TextArea({
-          placeholder: 'Ask anything, @ for files & diff, / for commands…',
-          text: this.store.composerText
-        })
-          .attributeModifier(
-            orbitComposerArea(this.store.palette.fgPrimary, this.store.palette.fgMuted)
-          )
-          .width('100%')
-          .constraintSize({ minHeight: OrbitTokens.HIT_MIN, maxHeight: 132 })
-          .padding({
-            left: OrbitTokens.SPACE_MD,
-            right: OrbitTokens.SPACE_MD,
-            top: OrbitTokens.SPACE_SM,
-            bottom: OrbitTokens.SPACE_XS
-          })
-          .onChange((val: string) => {
-            if (val !== this.store.composerText) {
-              this.dismissedTriggerToken = '';
-            }
-            this.store.composerText = val;
-            if (val.indexOf('@') >= 0) {
-              this.store.ensureWorkspaceFilesLoaded();
-            }
-          })
+        this.renderAttachmentAndContextStrip()
 
         Row({ space: OrbitTokens.SPACE_XS }) {
-          Stack({ alignContent: Alignment.Center }) {
-            Row() {
-              Text('+')
-                .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Bold))
-            }
-            .width(28)
-            .height(28)
-            .justifyContent(FlexAlign.Center)
-            .backgroundColor(this.store.palette.subtleSurface)
-            .borderRadius(14)
-          }
-          .width(OrbitTokens.HIT_MIN)
-          .height(OrbitTokens.HIT_MIN)
-          .accessibilityText('Attach files, diff, or slash command')
-          .onClick(() => {
-            this.store.openContextPicker();
-          })
-
-          Row({ space: OrbitTokens.SPACE_XS }) {
-            Row()
-              .width(OrbitTokens.DOT_SIZE)
-              .height(OrbitTokens.DOT_SIZE)
-              .borderRadius(3)
-              .backgroundColor(this.providerDotColor())
-            Text(this.store.currentModelPillLabel())
-              .attributeModifier(orbitTextMeta(this.store.palette.fgSecondary, FontWeight.Medium))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .flexShrink(1)
-          }
-          .height(OrbitTokens.HIT_MIN)
-          .padding({ left: OrbitTokens.SPACE_XS, right: OrbitTokens.SPACE_XS })
-          .alignItems(VerticalAlign.Center)
-          .flexShrink(1)
-          .onClick(() => {
-            this.store.showModelPickerSheet = true;
-            this.store.triggerHaptic(8);
-          })
-
-          Row({ space: OrbitTokens.SPACE_XS }) {
-            Row()
-              .width(OrbitTokens.DOT_SIZE)
-              .height(OrbitTokens.DOT_SIZE)
-              .borderRadius(3)
-              .backgroundColor(this.modeToneColor())
-            Text(this.store.currentModePillLabel())
-              .attributeModifier(orbitTextMeta(this.modeToneColor(), FontWeight.Medium))
-              .maxLines(1)
-          }
-          .height(OrbitTokens.HIT_MIN)
-          .padding({ left: OrbitTokens.SPACE_XS, right: OrbitTokens.SPACE_XS })
-          .alignItems(VerticalAlign.Center)
-          .onClick(() => {
-            this.store.cycleSessionMode();
-          })
-
-          Blank()
-
-          if (this.isAgentRunning() && this.canSend()) {
-            Stack({ alignContent: Alignment.Center }) {
-              Row({ space: OrbitTokens.SPACE_XS }) {
-                Text('■')
-                  .attributeModifier(orbitTextMeta(this.store.palette.statusDanger, FontWeight.Bold))
-                Text('Stop')
-                  .attributeModifier(
-                    orbitTextMeta(this.store.palette.statusDanger, FontWeight.Medium)
-                  )
-              }
-              .height(32)
-              .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
-              .backgroundColor(this.store.palette.statusDangerSoft)
-              .borderRadius(16)
-              .alignItems(VerticalAlign.Center)
-            }
-            .height(OrbitTokens.HIT_MIN)
-            .constraintSize({ minWidth: OrbitTokens.HIT_MIN })
-            .accessibilityText('Stop active agent')
-            .onClick(() => {
-              this.store.interruptCurrentAgent();
-            })
-
-            Stack({ alignContent: Alignment.Center }) {
-              Row() {
-                Text('Queue')
-                  .attributeModifier(orbitTextMeta(this.store.palette.onAccent, FontWeight.Bold))
-              }
-              .height(32)
-              .padding({ left: OrbitTokens.SPACE_MD, right: OrbitTokens.SPACE_MD })
-              .backgroundColor(this.store.palette.accentPrimaryFill)
-              .borderRadius(16)
-              .alignItems(VerticalAlign.Center)
-            }
-            .height(OrbitTokens.HIT_MIN)
-            .constraintSize({ minWidth: OrbitTokens.HIT_MIN })
-            .margin({ right: OrbitTokens.SPACE_XS })
-            .accessibilityText('Queue next prompt')
-            .onClick(() => {
-              this.store.enqueueCurrentDraft();
-            })
-          } else {
-            Stack({ alignContent: Alignment.Center }) {
-              Row() {
-                Text(this.isAgentRunning() ? '■' : '↑')
-                  .attributeModifier(
-                    orbitTextSubhead(
-                      this.isAgentRunning() || this.canSend()
-                        ? this.store.palette.onAccent
-                        : this.store.palette.fgMuted,
-                      FontWeight.Bold
-                    )
-                  )
-              }
-              .width(34)
-              .height(34)
-              .justifyContent(FlexAlign.Center)
-              .borderRadius(17)
-              .backgroundColor(
-                this.isAgentRunning()
-                  ? this.store.palette.statusDanger
-                  : this.canSend()
-                    ? this.store.palette.accentPrimaryFill
-                    : this.store.palette.subtleSurface
+          if (this.store.activeSlashDirective.length > 0) {
+            Button(this.store.activeSlashDirective, { type: ButtonType.Capsule, stateEffect: true })
+              .attributeModifier(
+                orbitButtonMeta(this.store.palette.fgPrimary, this.store.palette.subtleSurface)
               )
+              .fontFamily(OrbitTokens.FAMILY_MONO)
+              .height(32)
+              .padding({ left: 10, right: 10 })
+              .margin({ left: OrbitTokens.SPACE_MD })
+              .onClick(() => {
+                this.store.clearSlashDirective();
+              })
+          }
+
+          TextArea({
+            placeholder: this.inputPlaceholder(),
+            text: this.store.composerText
+          })
+            .attributeModifier(
+              orbitComposerArea(this.store.palette.fgPrimary, this.store.palette.fgMuted)
+            )
+            .layoutWeight(1)
+            .constraintSize({ minHeight: 38, maxHeight: 132 })
+            .padding({
+              left: this.store.activeSlashDirective.length > 0 ? OrbitTokens.SPACE_XS : OrbitTokens.SPACE_LG,
+              right: OrbitTokens.SPACE_LG,
+              top: 10,
+              bottom: 2
+            })
+            .onChange((val: string) => {
+              if (val !== this.store.composerText) {
+                this.dismissedTriggerToken = '';
+              }
+              this.store.composerText = val;
+              if (val.indexOf('@') >= 0) {
+                this.store.ensureWorkspaceFilesLoaded();
+              }
+            })
+            .onKeyEvent((event: KeyEvent) => {
+              if (
+                event.type === KeyType.Down &&
+                event.keyCode === KeyCode.KEYCODE_DEL &&
+                this.store.composerText.length === 0 &&
+                this.store.activeSlashDirective.length > 0
+              ) {
+                this.store.clearSlashDirective();
+              }
+            })
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
+        // Bottom Control Bar: native Buttons (>= 40vp hit targets), only Send/Queue/Stop carries fill
+        Row({ space: 0 }) {
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            SymbolGlyph($r('sys.symbol.plus'))
+              .fontSize(18)
+              .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+              .fontColor([
+                this.store.selectedHostId.length > 0
+                  ? this.store.palette.iconSecondary
+                  : this.store.palette.fgMuted
+              ])
+          }
+          .width(OrbitTokens.HIT_COMPACT)
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding(0)
+          .backgroundColor(Color.Transparent)
+          .accessibilityText('Attach photos, camera, or files')
+          .bindMenu(this.renderPlusAttachmentMenu())
+
+          // Model + Effort Trigger with Fixed-Width Ghost Anchor for Stable Popover Alignment
+          Stack({ alignContent: Alignment.Start }) {
+            Row()
+              .width(148)
+              .height(OrbitTokens.HIT_COMPACT)
+              .hitTestBehavior(HitTestMode.None)
+              .bindPopup(this.store.showModelPickerSheet, {
+                builder: this.buildModelPickerSheet(),
+                placement: Placement.Top,
+                enableArrow: true,
+                arrowPointPosition: ArrowPointPosition.CENTER,
+                targetSpace: 8,
+                radius: 20,
+                shadow: ShadowStyle.OUTER_DEFAULT_MD,
+                backgroundBlurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+                popupColor: this.store.palette.listCard,
+                mask: true,
+                autoCancel: true,
+                focusable: true,
+                onStateChange: (event) => {
+                  if (!event.isVisible) {
+                    this.store.showModelPickerSheet = false;
+                  }
+                }
+              })
+
+            Button({ type: ButtonType.Normal, stateEffect: true }) {
+              Row({ space: 6 }) {
+                OrbitProviderBrandIcon({ provider: this.store.composerProvider, iconSize: 16 })
+                Text(this.store.currentModelDisplayLabel())
+                  .attributeModifier(orbitTextSubhead(this.store.palette.fgPrimary, FontWeight.Normal))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .flexShrink(1)
+                if (this.store.currentEffortDisplayLabel().length > 0) {
+                  Text(this.store.currentEffortDisplayLabel())
+                    .attributeModifier(orbitTextSubhead(this.store.palette.fgMuted, FontWeight.Normal))
+                    .maxLines(1)
+                    .flexShrink(0)
+                }
+                SymbolGlyph($r('sys.symbol.chevron_down'))
+                  .fontSize(11)
+                  .fontColor([this.store.palette.fgMuted])
+              }
+              .alignItems(VerticalAlign.Center)
             }
-            .width(OrbitTokens.HIT_MIN)
-            .height(OrbitTokens.HIT_MIN)
-            .accessibilityText(this.isAgentRunning() ? 'Stop active agent' : 'Send prompt')
+            .height(OrbitTokens.HIT_COMPACT)
+            .constraintSize({ maxWidth: '100%' })
+            .padding({ left: 2, right: 8 })
+            .borderRadius(OrbitTokens.RADIUS_MD)
+            .backgroundColor(Color.Transparent)
+            .accessibilityText(`Model: ${this.store.currentModelPillLabel()}`)
             .onClick(() => {
-              if (this.isAgentRunning()) {
+              dismissHarmonyKeyboard(this.getUIContext());
+              this.store.triggerHaptic(6);
+              this.store.showModelPickerSheet = !this.store.showModelPickerSheet;
+              if (
+                this.store.showModelPickerSheet &&
+                this.store.modelsForProvider(this.store.composerProvider).length === 0
+              ) {
+                this.store.refreshModelsAndQuotas(false);
+              }
+            })
+          }
+          .height(OrbitTokens.HIT_COMPACT)
+          .layoutWeight(1)
+
+          // Access Permissions Shield Button + Native Menu
+          Button({ type: ButtonType.Circle, stateEffect: true }) {
+            Image(this.permissionModeIcon(this.store.composerMode))
+              .width(17)
+              .height(17)
+              .objectFit(ImageFit.Contain)
+              .interpolation(ImageInterpolation.High)
+              .draggable(false)
+              .colorFilter(orbitTintColorFilter(this.store.palette.tintMutedHex))
+          }
+          .width(OrbitTokens.HIT_COMPACT)
+          .height(OrbitTokens.HIT_COMPACT)
+          .padding(0)
+          .backgroundColor(Color.Transparent)
+          .accessibilityText(`Access Permissions: ${formatModeLabel(normalizeModeSlug(this.store.composerMode))}`)
+          .bindMenu(this.renderPermissionModeMenu())
+
+          // Right Action Cluster: Send / Queue / Stop
+          if (this.isAgentRunning()) {
+            if (this.canSend()) {
+              Row({ space: 2 }) {
+                Button({ type: ButtonType.Capsule, stateEffect: true }) {
+                  Row({ space: 4 }) {
+                    SymbolGlyph($r('sys.symbol.stop_circle_fill'))
+                      .fontSize(15)
+                      .fontColor([this.store.palette.statusDanger])
+                    Text('Stop')
+                      .attributeModifier(orbitTextMeta(this.store.palette.statusDanger, FontWeight.Medium))
+                  }
+                }
+                .height(OrbitTokens.HIT_COMPACT)
+                .padding({ left: 8, right: 8 })
+                .backgroundColor(Color.Transparent)
+                .accessibilityText('Stop agent')
+                .onClick(() => {
+                  this.store.interruptCurrentAgent();
+                })
+
+                Button({ type: ButtonType.Circle, stateEffect: true }) {
+                  SymbolGlyph($r('sys.symbol.arrow_up_to_line'))
+                    .fontSize(16)
+                    .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                    .fontColor([this.store.palette.onAccent])
+                }
+                .width(OrbitTokens.HIT_COMPACT)
+                .height(OrbitTokens.HIT_COMPACT)
+                .padding(0)
+                .backgroundColor(this.store.palette.accentPrimaryFill)
+                .accessibilityText('Queue prompt')
+                .onClick(() => {
+                  this.store.enqueueCurrentDraft();
+                })
+              }
+            } else {
+              Button({ type: ButtonType.Circle, stateEffect: true }) {
+                Row()
+                  .width(12)
+                  .height(12)
+                  .borderRadius(OrbitTokens.RADIUS_XS)
+                  .backgroundColor(this.store.palette.statusDanger)
+              }
+              .width(OrbitTokens.HIT_COMPACT)
+              .height(OrbitTokens.HIT_COMPACT)
+              .padding(0)
+              .backgroundColor(this.store.palette.subtleSurface)
+              .accessibilityText('Stop agent')
+              .onClick(() => {
                 this.store.interruptCurrentAgent();
-              } else {
+              })
+            }
+          } else {
+            Button({ type: ButtonType.Circle, stateEffect: true }) {
+              SymbolGlyph($r('sys.symbol.arrow_up'))
+                .fontSize(16)
+                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
+                .fontColor([
+                  this.canSend() ? this.store.palette.onAccent : this.store.palette.fgMuted
+                ])
+            }
+            .width(OrbitTokens.HIT_COMPACT)
+            .height(OrbitTokens.HIT_COMPACT)
+            .padding(0)
+            .backgroundColor(
+              this.canSend()
+                ? this.store.palette.accentPrimaryFill
+                : this.store.palette.subtleSurface
+            )
+            .accessibilityText('Send prompt')
+            .onClick(() => {
+              if (this.canSend()) {
                 this.store.submitComposerPrompt();
               }
             })
           }
         }
         .width('100%')
-        .padding({ left: OrbitTokens.SPACE_XS, right: OrbitTokens.SPACE_XS, bottom: 2 })
+        .padding({ left: 6, right: 6, bottom: 6 })
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
-      .backgroundColor(this.store.palette.elevated)
-      .borderRadius(OrbitTokens.COMPOSER_RADIUS)
-      .border({
-        width: OrbitTokens.HAIRLINE,
-        color: this.store.palette.hairline
-      })
+      .borderRadius(OrbitTokens.RADIUS_XXL)
+      .attributeModifier(
+        orbitSurface(
+          this.store.palette.listCard,
+          this.store.palette.hairline,
+          OrbitTokens.HAIRLINE,
+          ShadowStyle.OUTER_DEFAULT_SM
+        )
+      )
     }
     .width('100%')
     .padding({
       left: OrbitTokens.SPACE_LG,
       right: OrbitTokens.SPACE_LG,
       top: OrbitTokens.SPACE_SM,
-      bottom: Math.max(
-        OrbitTokens.SPACE_SM,
-        this.store.keyboardHeightVp > 0 ? this.store.keyboardHeightVp : this.store.safeBottomVp
-      )
+      bottom: this.store.keyboardHeightVp > 0
+        ? OrbitTokens.SPACE_SM
+        : Math.max(OrbitTokens.SPACE_SM, this.store.safeBottomVp)
     })
   }
 }

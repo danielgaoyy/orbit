@@ -83,9 +83,10 @@ struct NativePtySheet: View {
                         }
                     }
                 } label: {
-                    Image(systemName: copiedSnapshot ? "checkmark" : "doc.on.doc")
+                    Image(systemName: copiedSnapshot ? "checkmark" : "square.on.square")
                         .font(OrbitTypography.iconSmall)
                         .foregroundStyle(copiedSnapshot ? palette.direct : palette.fgSecondary)
+                        .orbitSymbolReplaceTransition()
                         .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
                         .contentShape(Rectangle())
                 }

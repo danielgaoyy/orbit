@@ -2,13 +2,14 @@ import { useEffect, useState } from "react";
 import { PanelLeft } from "lucide-react";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
-import { ReviewInspector } from "@/components/inspector/review-inspector";
+import { ConnectionStatusBanner } from "@/components/layout/connection-status-banner";
 import { TopBar } from "@/components/layout/top-bar";
 import { SettingsView } from "@/components/settings/settings-view";
+import { QuickOpenFileDialog } from "@/components/side-panel/quick-open-file-dialog";
+import { WorkspaceSidePanel } from "@/components/side-panel/workspace-side-panel";
 import { FleetSidebar } from "@/components/sidebar/fleet-sidebar";
 import { RemoteFolderPickerDialog } from "@/components/sidebar/remote-folder-picker-dialog";
 import { StreamStage } from "@/components/stage/stream-stage";
-import { TerminalDock } from "@/components/terminal/terminal-dock";
 import { SimpleTooltip, TooltipProvider } from "@/components/ui/overlays";
 import { modSymbol, useGlobalErgonomicKeybindings } from "@/lib/keybindings";
 import { isMacDesktop } from "@/lib/orbit-ipc";
@@ -48,6 +49,19 @@ export default function App() {
     return () => window.cancelAnimationFrame(raf);
   }, []);
 
+  // Track OS/WebView internet connectivity so offline states surface immediately even with a local daemon
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const syncOnline = () => orbitActions.setBrowserOffline(!navigator.onLine);
+    syncOnline();
+    window.addEventListener("offline", syncOnline);
+    window.addEventListener("online", syncOnline);
+    return () => {
+      window.removeEventListener("offline", syncOnline);
+      window.removeEventListener("online", syncOnline);
+    };
+  }, []);
+
   // Deterministic responsive viewport sync (`< 800px` auto-collapses, `>= 824px` restores desktop preference)
   useEffect(() => {
     orbitActions.updateViewportWidth(window.innerWidth);
@@ -79,7 +93,7 @@ export default function App() {
       const id = window.setTimeout(() => {
         setSettingsMounted(false);
         setSettingsClosing(false);
-      }, 120);
+      }, 165);
       return () => window.clearTimeout(id);
     }
   }, [isSettingsOpen, settingsMounted]);
@@ -116,7 +130,7 @@ export default function App() {
       const id = window.setTimeout(() => {
         setRenderedToast(null);
         setToastExiting(false);
-      }, 145);
+      }, 170);
       return () => window.clearTimeout(id);
     }
   }, [toastNotice, renderedToast]);
@@ -148,6 +162,9 @@ export default function App() {
       {/* Dedicated Full-Window Settings Center (`⌘,`) with Smooth Enter/Exit */}
       {settingsMounted && <SettingsView closing={settingsClosing} />}
 
+      {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow pointer events during resize */}
+      {isResizingSidebar && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
+
       {/* Main Workspace Shell */}
       <div className="bg-canvas text-foreground relative flex h-screen w-screen overflow-hidden">
         {/* Single Stationary Titlebar Sidebar Toggle (`[◫]`, `⌘B`) — optically centered with macOS traffic lights & title */}
@@ -177,16 +194,17 @@ export default function App() {
         {/* 1. Collapsible & Resizable Single Unified Fleet Sidebar (`⌘B` — Single Source of Truth) */}
         <div
           inert={!sidebarOpen}
+          data-open={sidebarOpen ? "true" : "false"}
+          data-ready={transitionsReady ? "true" : "false"}
+          data-resizing={isResizingSidebar ? "true" : "false"}
           style={{
             width: `${sidebarWidth}px`,
             marginLeft: sidebarOpen ? "0px" : `-${sidebarWidth}px`,
+            opacity: sidebarOpen ? 1 : 0,
           }}
           className={cn(
-            "relative h-full shrink-0 overflow-hidden",
+            "orbit-panel-left relative h-full shrink-0 overflow-hidden",
             !sidebarOpen && "pointer-events-none",
-            transitionsReady &&
-              !isResizingSidebar &&
-              "transition-[margin-left] duration-[190ms] ease-[cubic-bezier(0.22,1,0.36,1)]",
           )}
         >
           <FleetSidebar />
@@ -199,24 +217,26 @@ export default function App() {
           )}
         </div>
 
-        {/* 2. Center Narrative Stage + Omni-Composer + Persistent Bottom PTY Dock (`⌘J`) */}
+        {/* 2. Center Narrative Stage + In-Stage Overview + Unified Right Side Panel */}
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <TopBar />
-
           <div className="flex min-h-0 flex-1 overflow-hidden">
-            <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-              {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
-              <TerminalDock />
-            </main>
+            <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+              <TopBar />
+              <ConnectionStatusBanner />
+              <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
+              </main>
+            </div>
 
-            {/* 3. Contextual Right-Hand Diff Review Inspector (`⌘D`) */}
-            <ReviewInspector />
+            {/* 3. Unified Multi-Tab Right Side Panel (Open File, Review, Terminal, Browser, Side Question, Subagent) */}
+            <WorkspaceSidePanel />
           </div>
         </div>
       </div>
 
-      {/* Global Command Palette (`⌘K`) & Remote Folder Browser */}
+      {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`) & Remote Folder Browser */}
       <CommandPalette />
+      <QuickOpenFileDialog />
       <RemoteFolderPickerDialog />
 
       {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit & Undo Archive */}

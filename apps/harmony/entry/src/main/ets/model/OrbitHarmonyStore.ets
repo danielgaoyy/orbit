@@ -1,13 +1,10 @@
 import { OrbitHarmonyCore } from 'liborbit_ohos.so';
-import { common } from '@kit.AbilityKit';
-import { scanBarcode, scanCore } from '@kit.ScanKit';
-import { vibrator } from '@kit.SensorServiceKit';
-import { pasteboard } from '@kit.BasicServicesKit';
-import { hilog } from '@kit.PerformanceAnalysisKit';
+import { ConfigurationConstant, common } from '@kit.AbilityKit';
 import {
   AgentCardDto,
   AgentStageDto,
   ClientProjectDto,
+  ComposerAttachmentItem,
   ComposerMentionCandidate,
   CoreNotificationDto,
   DiffFileDto,
@@ -17,14 +14,17 @@ import {
   GitStatusSnapshotDto,
   HostCardDto,
   HostDetailDto,
+  InlineMentionRegistration,
+  LaunchpadProjectDto,
   ModelOptionDto,
+  OrbitSlashCommand,
   PromptBadgeDto,
   ProviderModelCatalogDto,
   ProviderModelSpecDto,
   QueuedPromptItem,
   QuotedDiffSnippet,
-  SlashCommandItem,
   StageTurnDto,
+  StagedAttachmentDto,
   TerminalRowDto,
   TerminalScreenDto,
   ThinkingOptionSpecDto,
@@ -32,8 +32,10 @@ import {
   ToolStepDescriptorDto,
   basenameOfPath,
   cwdPathsEquivalent,
+  filterOrbitSlashCommands,
+  formatEffortLabel,
   formatModeLabel,
-  formatShortEffortLabel,
+  getOrbitSlashCommands,
   normalizeModeSlug
 } from './OrbitTypes';
 import {
@@ -42,6 +44,25 @@ import {
   OrbitTokens,
   resolveOrbitPalette
 } from '../theme/OrbitTokens';
+import { orbitLogWarn } from './OrbitLogger';
+import { OrbitPreferencesStore } from './OrbitPreferences';
+import {
+  readAuthorizedClipboardText,
+  readUriBytesAsync,
+  scanPairingQrCode,
+  triggerNativeHaptic,
+  writeClipboardText
+} from './OrbitDeviceBridge';
+
+interface DraftModelSelection {
+  model: string;
+  effort: string;
+}
+
+interface ParsedLeadingSlash {
+  directive: string;
+  rest: string;
+}
 
 interface BuiltPromptPayload {
   wirePrompt: string;
@@ -50,33 +71,16 @@ interface BuiltPromptPayload {
   badgesJson: string | null;
 }
 
-const DEFAULT_SLASH_COMMANDS: SlashCommandItem[] = [
-  {
-    command: '/plan',
-    title: 'Architecture Plan',
-    description: 'Draft step-by-step plan before editing',
-    modeOverride: 'plan'
-  },
-  {
-    command: '/review',
-    title: 'Code Review',
-    description: 'Attach working tree diff for engineering review',
-    modeOverride: ''
-  },
-  {
-    command: '/compact',
-    title: 'Compact Context',
-    description: 'Summarize and compress session context',
-    modeOverride: ''
-  }
-];
-
 @ObservedV2
 export class OrbitHarmonyStore {
   private static instance: OrbitHarmonyStore | null = null;
   private core: OrbitHarmonyCore | null = null;
+  private appContext: common.ApplicationContext | null = null;
+  private prefsStore: OrbitPreferencesStore = new OrbitPreferencesStore();
   private pendingDeepLink: string = '';
-  private isNewSessionDraft: boolean = false;
+  @Trace public isNewSessionDraft: boolean = false;
+  private draftSelectionByProvider: Map<string, DraftModelSelection> = new Map<string, DraftModelSelection>();
+  private hasUserCustomizedDraftModel: boolean = false;
 
   // Theme & Window Safe Area State
   @Trace public themeMode: string = 'system';
@@ -84,6 +88,8 @@ export class OrbitHarmonyStore {
   @Trace public palette: OrbitThemePalette = LIGHT_PALETTE;
   @Trace public safeTopVp: number = 0;
   @Trace public safeBottomVp: number = 0;
+  @Trace public safeLeftVp: number = 0;
+  @Trace public safeRightVp: number = 0;
   @Trace public keyboardHeightVp: number = 0;
   @Trace public windowWidthVp: number = 390;
   @Trace public windowHeightVp: number = 844;
@@ -98,6 +104,15 @@ export class OrbitHarmonyStore {
   @Trace public showContextPickerSheet: boolean = false;
   @Trace public showHostSettingsSheet: boolean = false;
   @Trace public showDirBrowser: boolean = false;
+  @Trace public sidebarProjectSort: string = 'recent';
+  @Trace public sidebarThreadFilter: string = 'all';
+  @Trace public collapsedProjectIds: string[] = [];
+  @Trace public pinnedThreadKeys: string[] = [];
+  @Trace public seenSeqRevision: number = 0;
+  private seenSeqByThreadKey: Map<string, number> = new Map<string, number>();
+  private pinnedThreadsFilePath: string = '';
+  private draftPrefsFilePath: string = '';
+  @Trace public draftUseWorktree: boolean = false;
 
   // Multi-Host Fleet & Workspace State
   @Trace public nativeAvailable: boolean = false;
@@ -123,9 +138,13 @@ export class OrbitHarmonyStore {
   @Trace public composerText: string = '';
   @Trace public composerProvider: string = 'antigravity';
   @Trace public composerModel: string = '';
-  @Trace public composerEffort: string = 'high';
+  @Trace public composerEffort: string = '';
   @Trace public composerMode: string = 'accept_edits';
+  @Trace public activeSlashDirective: string = '';
   @Trace public composerBadges: PromptBadgeDto[] = [];
+  @Trace public stagedAttachments: ComposerAttachmentItem[] = [];
+  @Trace public inlineMentions: InlineMentionRegistration[] = [];
+  @Trace public isStagingAttachment: boolean = false;
   @Trace public quotedSnippets: QuotedDiffSnippet[] = [];
   @Trace public worktreeBranch: string = '';
   @Trace public workspaceFiles: string[] = [];
@@ -151,8 +170,7 @@ export class OrbitHarmonyStore {
   @Trace public statusNote: string = '';
   @Trace public toastMessage: string = '';
   @Trace public toastIsError: boolean = false;
-  @Trace public clipboardPairingUri: string = '';
-  private dismissedClipboardUri: string = '';
+  @Trace public toastRevision: number = 0;
   private toastTimerId: number = -1;
 
   public static getInstance(): OrbitHarmonyStore {
@@ -162,11 +180,15 @@ export class OrbitHarmonyStore {
     return OrbitHarmonyStore.instance;
   }
 
-  public get slashCommands(): SlashCommandItem[] {
-    return DEFAULT_SLASH_COMMANDS;
-  }
-
   public initialize(dbPath: string): void {
+    if (this.pinnedThreadsFilePath.length === 0 && dbPath.length > 0) {
+      this.pinnedThreadsFilePath = `${dbPath}.pinned_threads.json`;
+      this.loadPinnedThreadsFromDisk();
+    }
+    if (this.draftPrefsFilePath.length === 0 && dbPath.length > 0) {
+      this.draftPrefsFilePath = `${dbPath}.draft_prefs.json`;
+      this.loadDraftPrefsFromDisk();
+    }
     if (this.core !== null) {
       if (this.pendingDeepLink.length > 0) {
         const uri = this.pendingDeepLink;
@@ -202,9 +224,45 @@ export class OrbitHarmonyStore {
 
   // Theme & Layout Management
 
-  public setThemeMode(mode: string): void {
-    this.themeMode = mode;
+  public bindContext(ctx: common.Context): void {
+    this.prefsStore.init(ctx);
+  }
+
+  public bindApplicationContext(ctx: common.ApplicationContext): void {
+    this.appContext = ctx;
+  }
+
+  public applyPersistedThemeMode(): void {
+    const saved = this.prefsStore.getThemeMode();
+    this.themeMode = saved;
     this.palette = resolveOrbitPalette(this.themeMode, this.systemIsDark);
+    this.syncAppColorMode(saved);
+  }
+
+  private syncAppColorMode(normalized: string): void {
+    if (this.appContext === null) {
+      return;
+    }
+    try {
+      const targetMode = normalized === 'light'
+        ? ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT
+        : (normalized === 'dark'
+          ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+          : ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+      this.appContext.setColorMode(targetMode);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'Failed to apply color mode', err as Object);
+    }
+  }
+
+  public setThemeMode(mode: string): void {
+    const normalized = mode === 'light'
+      ? 'light'
+      : (mode === 'dark' || mode === 'graphite' || mode === 'oled' ? 'dark' : 'system');
+    this.themeMode = normalized;
+    this.palette = resolveOrbitPalette(this.themeMode, this.systemIsDark);
+    this.prefsStore.setThemeMode(normalized);
+    this.syncAppColorMode(normalized);
     this.triggerHaptic(8);
   }
 
@@ -224,6 +282,7 @@ export class OrbitHarmonyStore {
     }
     this.toastIsError = isError;
     this.toastMessage = clean;
+    this.toastRevision += 1;
     if (isError) {
       this.lastError = clean;
     } else {
@@ -235,12 +294,20 @@ export class OrbitHarmonyStore {
     }, 2600);
   }
 
-  public dismissToast(): void {
+  public onMemoryPressure(): void {
+    if (!this.showGitDiffSheet && !this.showInlineDiffInspector) {
+      this.gitDiffFiles = [];
+    }
+    if (!this.showPtySheet) {
+      this.terminalRows = [];
+    }
+  }
+
+  public dispose(): void {
     if (this.toastTimerId !== -1) {
       clearTimeout(this.toastTimerId);
       this.toastTimerId = -1;
     }
-    this.toastMessage = '';
   }
 
   public effectiveSidebarWidth(): number {
@@ -277,6 +344,224 @@ export class OrbitHarmonyStore {
     this.triggerHaptic(8);
   }
 
+  private loadPinnedThreadsFromDisk(): void {
+    this.pinnedThreadKeys = this.prefsStore.loadPinnedThreads(this.pinnedThreadsFilePath);
+  }
+
+  private savePinnedThreadsToDisk(): void {
+    this.prefsStore.savePinnedThreads(this.pinnedThreadKeys);
+  }
+
+  public threadKey(hostId: string, agentId: string): string {
+    return `${hostId}::${agentId}`;
+  }
+
+  public otherHostsPendingApprovals(): number {
+    let total = 0;
+    for (let i = 0; i < this.hosts.length; i++) {
+      if (this.hosts[i].host_id !== this.selectedHostId) {
+        total += this.hosts[i].pending_approval_count;
+      }
+    }
+    return total;
+  }
+
+  public setSidebarProjectSort(sort: string): void {
+    this.sidebarProjectSort = sort;
+    this.saveDraftPrefsToDisk();
+    this.triggerHaptic(6);
+  }
+
+  public setSidebarThreadFilter(filter: string): void {
+    this.sidebarThreadFilter = filter;
+    this.saveDraftPrefsToDisk();
+    this.triggerHaptic(6);
+  }
+
+  private loadDraftPrefsFromDisk(): void {
+    const loaded = this.prefsStore.loadDraftPrefs(this.draftPrefsFilePath);
+    if (loaded === null) {
+      return;
+    }
+    if (loaded.sidebarProjectSort === 'recent' || loaded.sidebarProjectSort === 'alphabetical') {
+      this.sidebarProjectSort = loaded.sidebarProjectSort;
+    }
+    if (loaded.sidebarThreadFilter === 'all' || loaded.sidebarThreadFilter === 'active_unread') {
+      this.sidebarThreadFilter = loaded.sidebarThreadFilter;
+    }
+    if (loaded.permissionMode === 'worktree') {
+      this.draftUseWorktree = true;
+    }
+  }
+
+  private saveDraftPrefsToDisk(): void {
+    this.prefsStore.saveDraftPrefs({
+      provider: this.composerProvider,
+      model: this.composerModel,
+      effort: this.composerEffort,
+      permissionMode: this.draftUseWorktree ? 'worktree' : 'local',
+      sidebarProjectSort: this.sidebarProjectSort,
+      sidebarThreadFilter: this.sidebarThreadFilter
+    });
+  }
+
+  public setDraftUseWorktree(useWorktree: boolean): void {
+    this.draftUseWorktree = useWorktree;
+    this.saveDraftPrefsToDisk();
+    this.triggerHaptic(6);
+  }
+
+  public activeGitBranch(): string {
+    return this.resolveWorkspaceBranch(this.activeCwd);
+  }
+
+  private isBareHomePath(rawPath: string): boolean {
+    let clean = rawPath.trim();
+    while (clean.length > 1 && clean.endsWith('/')) {
+      clean = clean.substring(0, clean.length - 1);
+    }
+    if (clean.length === 0 || clean === '~' || clean === '/root') {
+      return true;
+    }
+    const parts = clean.split('/').filter((seg: string) => seg.length > 0);
+    return parts.length === 2 && (parts[0] === 'Users' || parts[0] === 'home');
+  }
+
+  public launchpadProjects(): LaunchpadProjectDto[] {
+    const hid = this.selectedHostId;
+    if (hid.length === 0) {
+      return [];
+    }
+    const detail = this.currentHostDetail;
+    const results: LaunchpadProjectDto[] = [];
+
+    const appendIfUnique = (id: string, name: string, path: string, branch: string): void => {
+      const clean = path.trim();
+      if (clean.length === 0) {
+        return;
+      }
+      for (let i = 0; i < results.length; i++) {
+        if (cwdPathsEquivalent(results[i].path, clean)) {
+          return;
+        }
+      }
+      const resolvedName = name.trim().length > 0 ? name.trim() : basenameOfPath(clean);
+      const resolvedBranch = branch.trim().length > 0
+        ? branch.trim()
+        : this.resolveWorkspaceBranch(clean);
+      results.push({
+        id: id,
+        name: resolvedName,
+        path: clean,
+        branch: resolvedBranch
+      });
+    };
+
+    for (let i = 0; i < this.projects.length; i++) {
+      const proj = this.projects[i];
+      if (proj.host_id === hid && proj.directories.length > 0) {
+        appendIfUnique(proj.project_id, proj.name, proj.directories[0], '');
+      }
+    }
+
+    if (detail !== null) {
+      for (let i = 0; i < detail.workspaces.length; i++) {
+        const ws = detail.workspaces[i];
+        if (!ws.is_worktree && !this.isBareHomePath(ws.cwd)) {
+          appendIfUnique(
+            `${hid}::ws::${ws.workspace_id}`,
+            ws.title.trim().length > 0 ? ws.title : basenameOfPath(ws.cwd),
+            ws.cwd,
+            ws.git_branch ?? ''
+          );
+        }
+      }
+
+      for (let i = 0; i < detail.discovered_projects.length; i++) {
+        const dp = detail.discovered_projects[i];
+        if (!this.isBareHomePath(dp.path) && dp.path.indexOf('/worktrees/') < 0) {
+          appendIfUnique(
+            `${hid}::dp::${dp.path}`,
+            dp.name,
+            dp.path,
+            dp.git_branch ?? ''
+          );
+        }
+      }
+    }
+
+    if (this.activeCwd.trim().length > 0 && !this.isBareHomePath(this.activeCwd)) {
+      appendIfUnique(
+        `${hid}::active::${this.activeCwd}`,
+        basenameOfPath(this.activeCwd),
+        this.activeCwd,
+        this.activeGitBranch()
+      );
+    }
+
+    if (results.length === 0 && detail !== null && detail.discovered_projects.length > 0) {
+      const firstDp = detail.discovered_projects[0];
+      appendIfUnique(
+        `${hid}::dp::${firstDp.path}`,
+        firstDp.name,
+        firstDp.path,
+        firstDp.git_branch ?? ''
+      );
+    }
+
+    return results;
+  }
+
+  public isProjectCollapsed(projectId: string): boolean {
+    return this.collapsedProjectIds.indexOf(projectId) >= 0;
+  }
+
+  public toggleProjectCollapsed(projectId: string): void {
+    if (this.collapsedProjectIds.indexOf(projectId) >= 0) {
+      this.collapsedProjectIds = this.collapsedProjectIds.filter((id: string) => id !== projectId);
+    } else {
+      this.collapsedProjectIds = this.collapsedProjectIds.concat([projectId]);
+    }
+    this.triggerHaptic(6);
+  }
+
+  public isThreadPinned(hostId: string, agentId: string): boolean {
+    return this.pinnedThreadKeys.indexOf(this.threadKey(hostId, agentId)) >= 0;
+  }
+
+  public togglePinThread(hostId: string, agentId: string): void {
+    const key = this.threadKey(hostId, agentId);
+    if (this.pinnedThreadKeys.indexOf(key) >= 0) {
+      this.pinnedThreadKeys = this.pinnedThreadKeys.filter((k: string) => k !== key);
+    } else {
+      this.pinnedThreadKeys = this.pinnedThreadKeys.concat([key]);
+    }
+    this.savePinnedThreadsToDisk();
+    this.triggerHaptic(8);
+  }
+
+  public isThreadUnread(hostId: string, agent: AgentCardDto): boolean {
+    const rev = this.seenSeqRevision;
+    if (rev < 0) {
+      return false;
+    }
+    if (
+      this.selectedHostId === hostId &&
+      !this.isNewSessionDraft &&
+      this.selectedAgentId === agent.agent_id
+    ) {
+      return false;
+    }
+    if (agent.is_running || agent.is_awaiting_permission) {
+      return false;
+    }
+    const seen = this.seenSeqByThreadKey.get(this.threadKey(hostId, agent.agent_id));
+    if (seen === undefined) {
+      return false;
+    }
+    return agent.latest_seq > seen;
+  }
+
   public updateWindowSize(widthVp: number, heightVp: number): void {
     if (heightVp > 0) {
       this.windowHeightVp = heightVp;
@@ -311,10 +596,18 @@ export class OrbitHarmonyStore {
     }
   }
 
-  public updateSafeArea(topVp: number, bottomVp: number, keyboardVp: number): void {
+  public updateSafeArea(
+    topVp: number,
+    bottomVp: number,
+    keyboardVp: number,
+    leftVp: number = 0,
+    rightVp: number = 0
+  ): void {
     this.safeTopVp = Math.max(0, Math.round(topVp));
     this.safeBottomVp = Math.max(0, Math.round(bottomVp));
     this.keyboardHeightVp = Math.max(0, Math.round(keyboardVp));
+    this.safeLeftVp = Math.max(0, Math.round(leftVp));
+    this.safeRightVp = Math.max(0, Math.round(rightVp));
   }
 
   // Lifecycle & Network Hooks
@@ -330,8 +623,8 @@ export class OrbitHarmonyStore {
         if (this.selectedAgentId.length > 0) {
           this.reloadStage();
         }
-      } catch (_) {
-        // Ignore transient foreground error
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'onAppForeground failed', err as Object);
       }
     }
   }
@@ -340,8 +633,8 @@ export class OrbitHarmonyStore {
     if (this.core !== null) {
       try {
         this.core.onAppBackground();
-      } catch (_) {
-        // Ignore transient background error
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'onAppBackground failed', err as Object);
       }
     }
   }
@@ -350,8 +643,8 @@ export class OrbitHarmonyStore {
     if (this.core !== null) {
       try {
         this.core.onNetworkChanged();
-      } catch (_) {
-        // Ignore transient network callback error
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'onNetworkChanged failed', err as Object);
       }
     }
   }
@@ -371,85 +664,43 @@ export class OrbitHarmonyStore {
   // Haptics, Clipboard & Native ScanKit QR Pairing
 
   public triggerHaptic(durationMs: number = 12): void {
-    try {
-      const effect: vibrator.VibrateTime = {
-        type: 'time',
-        duration: durationMs
-      };
-      const attr: vibrator.VibrateAttribute = {
-        id: 0,
-        usage: 'touch'
-      };
-      vibrator.startVibration(effect, attr).catch(() => {});
-    } catch (_) {
-      // Haptics optional on emulators / previewer
-    }
+    triggerNativeHaptic(durationMs);
   }
 
   public copyToClipboard(content: string, label: string = 'Copied to clipboard'): void {
     if (content.length === 0) {
       return;
     }
-    try {
-      const sysBoard = pasteboard.getSystemPasteboard();
-      const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, content);
-      sysBoard.setData(data).then(() => {
-        this.showToast(label, false);
-        this.triggerHaptic(10);
-      }).catch(() => {
-        this.showToast('Failed to copy to clipboard', true);
-      });
-    } catch (_) {
+    if (writeClipboardText(content)) {
+      this.showToast(label, false);
+      this.triggerHaptic(10);
+    } else {
       this.showToast('Failed to copy to clipboard', true);
     }
   }
 
   public pasteAuthorizedPairingUri(onFilled?: (uri: string) => void): void {
-    try {
-      const sysBoard = pasteboard.getSystemPasteboard();
-      sysBoard.getData().then((data: pasteboard.PasteData) => {
-        const primary = data.getPrimaryText();
-        if (primary === undefined || primary === null) {
-          this.showToast('Clipboard is empty', true);
-          return;
+    readAuthorizedClipboardText().then((raw: string) => {
+      if (raw.length === 0) {
+        this.showToast('Clipboard is empty', true);
+        return;
+      }
+      const match = /orbit:\/\/pair[^\s"'<>]*/.exec(raw);
+      if (match !== null && match[0].length > 'orbit://pair'.length) {
+        const candidate = match[0].trim();
+        if (onFilled !== undefined) {
+          onFilled(candidate);
         }
-        const raw = primary.trim();
-        const match = /orbit:\/\/pair[^\s"'<>]*/.exec(raw);
-        if (match !== null && match[0].length > 'orbit://pair'.length) {
-          const candidate = match[0].trim();
-          if (onFilled !== undefined) {
-            onFilled(candidate);
-          }
-          this.pairHost(candidate);
-        } else if (raw.length > 0 && onFilled !== undefined) {
-          onFilled(raw);
-        } else {
-          this.showToast('No orbit://pair URI found in clipboard', true);
-        }
-      }).catch(() => {
-        this.showToast('Unable to read clipboard', true);
-      });
-    } catch (_) {
-      // Pasteboard unavailable in previewer
-    }
-  }
-
-  public dismissClipboardPairingBanner(): void {
-    if (this.clipboardPairingUri.length > 0) {
-      this.dismissedClipboardUri = this.clipboardPairingUri;
-      this.clipboardPairingUri = '';
-      this.triggerHaptic(6);
-    }
-  }
-
-  public pairFromClipboard(): void {
-    const uri = this.clipboardPairingUri.trim();
-    if (uri.length === 0) {
-      return;
-    }
-    this.dismissedClipboardUri = uri;
-    this.clipboardPairingUri = '';
-    this.pairHost(uri);
+        this.pairHost(candidate);
+      } else if (onFilled !== undefined) {
+        onFilled(raw);
+      } else {
+        this.showToast('No orbit://pair URI found in clipboard', true);
+      }
+    }).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'pasteAuthorizedPairingUri failed', err);
+      this.showToast('Unable to read clipboard', true);
+    });
   }
 
   public openHostSettings(): void {
@@ -458,37 +709,20 @@ export class OrbitHarmonyStore {
   }
 
   public scanQrAndPair(context: common.Context | undefined): void {
-    if (context === undefined) {
-      this.showToast('Unable to acquire UI context for QR scanner', true);
-      return;
-    }
-    if (
-      canIUse('SystemCapability.Multimedia.Scan.ScanBarcode') &&
-      canIUse('SystemCapability.Multimedia.Scan.Core')
-    ) {
-      try {
-        const options: scanBarcode.ScanOptions = {
-          scanTypes: [scanCore.ScanType.QR_CODE],
-          enableMultiMode: false,
-          enableAlbum: true
-        };
-        scanBarcode.startScanForResult(context, options)
-          .then((result: scanBarcode.ScanResult) => {
-            const scanned = result.originalValue.trim();
-            if (scanned.length > 0) {
-              this.triggerHaptic(18);
-              this.pairHost(scanned);
-            }
-          })
-          .catch((_err: Error) => {
-            // User canceled scan or ScanKit unavailable on simulator
-          });
-      } catch (e) {
-        this.showToast(`QR Scanner unavailable: ${(e as Error).message}`, true);
+    scanPairingQrCode(context).then((outcome) => {
+      if (outcome.cancelled) {
+        return;
       }
-    } else {
-      this.showToast('System QR scanner is not supported on this device', true);
-    }
+      if (outcome.uri.length > 0) {
+        this.triggerHaptic(18);
+        this.pairHost(outcome.uri);
+      } else if (outcome.errorMessage.length > 0) {
+        this.showToast(outcome.errorMessage, true);
+      }
+    }).catch((err: Object) => {
+      orbitLogWarn('OrbitStore', 'scanQrAndPair failed', err);
+      this.showToast('QR Scanner unavailable', true);
+    });
   }
 
   // Core Event Loop
@@ -518,15 +752,13 @@ export class OrbitHarmonyStore {
         ev.host_id === this.selectedHostId &&
         this.selectedHostId.length > 0
       ) {
-        // Do NOT require raw string equality cwd === this.activeCwd (~/... vs /Users/...).
-        // Always refresh gitReview and workspaceFiles using this.activeCwd.
         this.reloadGitDiff(this.activeCwd);
         this.reloadWorkspaceFiles();
       } else if (ev.kind === 'terminal_changed' && ev.host_id === this.selectedHostId) {
         this.reloadTerminal();
       }
-    } catch (_) {
-      // Ignore malformed notification payload
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'Malformed core notification payload', err as Object);
     }
   }
 
@@ -733,12 +965,14 @@ export class OrbitHarmonyStore {
       }
 
       if (this.selectedAgentId.length > 0) {
+        let matchedAgent: AgentCardDto | null = null;
         for (let i = 0; i < detail.agents.length; i++) {
           if (detail.agents[i].agent_id === this.selectedAgentId) {
-            this.currentAgent = detail.agents[i];
+            matchedAgent = detail.agents[i];
             break;
           }
         }
+        this.currentAgent = matchedAgent;
       } else if (
         !this.isNewSessionDraft &&
         detail.agents.length > 0 &&
@@ -748,11 +982,74 @@ export class OrbitHarmonyStore {
         this.selectAgent(detail.agents[0].agent_id);
       }
 
+      if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
+        const available = detail.host.available_providers;
+        const targetProvider =
+          available.length > 0 && !available.includes(this.composerProvider)
+            ? available[0]
+            : this.composerProvider;
+        this.syncDefaultModelAndEffort(targetProvider);
+      }
+
+      const remappedMap = detail.replaced_optimistic_agents;
+      let seenChanged = false;
+      if (remappedMap !== undefined) {
+        const optIds = Object.keys(remappedMap);
+        let pinnedChanged = false;
+        let nextPinned = this.pinnedThreadKeys;
+        for (let i = 0; i < optIds.length; i++) {
+          const optId = optIds[i];
+          const confirmedId = remappedMap[optId];
+          if (confirmedId.length === 0 || optId === confirmedId) {
+            continue;
+          }
+          const oldKey = this.threadKey(hostId, optId);
+          const newKey = this.threadKey(hostId, confirmedId);
+          if (nextPinned.indexOf(oldKey) >= 0) {
+            nextPinned = nextPinned.filter((k: string) => k !== oldKey);
+            if (nextPinned.indexOf(newKey) < 0) {
+              nextPinned = nextPinned.concat([newKey]);
+            }
+            pinnedChanged = true;
+          }
+          const prevOptSeen = this.seenSeqByThreadKey.get(oldKey);
+          if (prevOptSeen !== undefined) {
+            this.seenSeqByThreadKey.delete(oldKey);
+            const curNewSeen = this.seenSeqByThreadKey.get(newKey) ?? 0;
+            this.seenSeqByThreadKey.set(newKey, Math.max(curNewSeen, prevOptSeen));
+            seenChanged = true;
+          }
+        }
+        if (pinnedChanged) {
+          this.pinnedThreadKeys = nextPinned;
+          this.savePinnedThreadsToDisk();
+        }
+      }
+
+      for (let i = 0; i < detail.agents.length; i++) {
+        const ag = detail.agents[i];
+        const key = this.threadKey(hostId, ag.agent_id);
+        const prevSeen = this.seenSeqByThreadKey.get(key);
+        if (!this.isNewSessionDraft && ag.agent_id === this.selectedAgentId) {
+          const nextSeen = prevSeen !== undefined ? Math.max(prevSeen, ag.latest_seq) : ag.latest_seq;
+          if (prevSeen !== nextSeen) {
+            this.seenSeqByThreadKey.set(key, nextSeen);
+            seenChanged = true;
+          }
+        } else if (prevSeen === undefined) {
+          this.seenSeqByThreadKey.set(key, ag.latest_seq);
+          seenChanged = true;
+        }
+      }
+      if (seenChanged) {
+        this.seenSeqRevision += 1;
+      }
+
       for (let i = 0; i < detail.agents.length; i++) {
         this.drainQueuedPromptsForAgentIfIdle(hostId, detail.agents[i]);
       }
     } catch (e) {
-      hilog.warn(0x0B17, 'OrbitStore', 'reloadHost failed: %{public}s', String(e));
+      orbitLogWarn('OrbitStore', 'reloadHost failed', e as Object);
     }
   }
 
@@ -762,9 +1059,13 @@ export class OrbitHarmonyStore {
     }
     this.activeCwd = cwd;
     if (this.core !== null && this.selectedHostId.length > 0) {
-      this.core.fetchGitStatus(this.selectedHostId, cwd);
-      this.core.fetchGitDiff(this.selectedHostId, cwd, null, this.gitStagedMode);
-      this.core.fetchWorkspaceFiles(this.selectedHostId, cwd);
+      try {
+        this.core.fetchGitStatus(this.selectedHostId, cwd);
+        this.core.fetchGitDiff(this.selectedHostId, cwd, null, this.gitStagedMode);
+        this.core.fetchWorkspaceFiles(this.selectedHostId, cwd);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'setActiveCwd fetch failed', err as Object);
+      }
       this.reloadGitDiff(cwd);
       this.reloadWorkspaceFiles();
     }
@@ -780,6 +1081,7 @@ export class OrbitHarmonyStore {
     this.sessionDiffs = [];
     this.expandedTurnKeys = [];
     this.expandedToolIds = [];
+    this.syncDefaultModelAndEffort(this.composerProvider);
     this.syncActiveQueuedPrompts();
     if (cwd !== undefined && cwd.length > 0) {
       this.setActiveCwd(cwd);
@@ -798,6 +1100,20 @@ export class OrbitHarmonyStore {
     this.selectedAgentId = agentId;
     this.expandedTurnKeys = [];
     this.expandedToolIds = [];
+    if (this.selectedHostId.length > 0) {
+      const key = this.threadKey(this.selectedHostId, agentId);
+      const prevSeen = this.seenSeqByThreadKey.get(key) ?? 0;
+      let matchedSeq = prevSeen;
+      const agents = this.currentHostDetail?.agents ?? [];
+      for (let i = 0; i < agents.length; i++) {
+        if (agents[i].agent_id === agentId) {
+          matchedSeq = Math.max(matchedSeq, agents[i].latest_seq);
+          break;
+        }
+      }
+      this.seenSeqByThreadKey.set(key, matchedSeq);
+      this.seenSeqRevision += 1;
+    }
     this.syncActiveQueuedPrompts();
     if (this.windowWidthVp < OrbitTokens.BP_FOLDABLE_MIN) {
       this.sidebarOpen = false;
@@ -826,13 +1142,30 @@ export class OrbitHarmonyStore {
         this.currentAgent = stage.agent;
         this.activeCwd = stage.agent.cwd;
         this.composerProvider = stage.agent.provider;
-        this.composerModel = stage.agent.model ?? '';
-        this.composerEffort = stage.agent.effort ?? 'high';
+        const resolved = this.resolveDefaultModelAndEffort(
+          stage.agent.provider,
+          stage.agent.model ?? '',
+          stage.agent.effort ?? ''
+        );
+        this.composerModel = (stage.agent.model !== null && stage.agent.model !== undefined && stage.agent.model.trim().length > 0)
+          ? stage.agent.model
+          : resolved.model;
+        this.composerEffort = (stage.agent.effort !== null && stage.agent.effort !== undefined && stage.agent.effort.trim().length > 0)
+          ? stage.agent.effort
+          : resolved.effort;
         this.composerMode = normalizeModeSlug(stage.agent.mode);
+        if (!this.isNewSessionDraft && this.selectedAgentId === stage.agent.agent_id) {
+          const key = this.threadKey(this.selectedHostId, stage.agent.agent_id);
+          const prevSeen = this.seenSeqByThreadKey.get(key);
+          if (prevSeen === undefined || stage.agent.latest_seq > prevSeen) {
+            this.seenSeqByThreadKey.set(key, stage.agent.latest_seq);
+            this.seenSeqRevision += 1;
+          }
+        }
         this.drainQueuedPromptsForAgentIfIdle(this.selectedHostId, stage.agent);
       }
     } catch (e) {
-      hilog.warn(0x0B17, 'OrbitStore', 'reloadStage failed: %{public}s', String(e));
+      orbitLogWarn('OrbitStore', 'reloadStage failed', e as Object);
     }
   }
 
@@ -975,6 +1308,17 @@ export class OrbitHarmonyStore {
     this.triggerHaptic(8);
   }
 
+  public refreshModelsAndQuotas(forceModels: boolean = true): void {
+    if (this.core === null || this.selectedHostId.length === 0) {
+      return;
+    }
+    this.core.refreshQuotas(this.selectedHostId);
+    this.core.refreshProviderModels(this.selectedHostId, forceModels);
+    this.reloadHost(this.selectedHostId);
+    this.showToast('Refreshing models…', false);
+    this.triggerHaptic(8);
+  }
+
   public removeHost(hostId: string): void {
     if (this.core === null || hostId.length === 0) {
       return;
@@ -1046,8 +1390,8 @@ export class OrbitHarmonyStore {
     try {
       this.core.removeProject(projectId);
       this.reloadFleet();
-    } catch (_) {
-      // Ignore project removal error
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'removePinnedProject failed', err as Object);
     }
   }
 
@@ -1056,7 +1400,11 @@ export class OrbitHarmonyStore {
       return;
     }
     this.showDirBrowser = true;
-    this.core.listDirectory(this.selectedHostId, path);
+    try {
+      this.core.listDirectory(this.selectedHostId, path);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'browseDirectory failed', err as Object);
+    }
   }
 
   // Composer Context, Provider/Model/Effort & Prompt Submission
@@ -1070,8 +1418,8 @@ export class OrbitHarmonyStore {
         this.core.workspaceFilesJson(this.selectedHostId, this.activeCwd)
       ) as string[];
       this.workspaceFiles = files;
-    } catch (_) {
-      // Ignore parse error
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'reloadWorkspaceFiles failed', err as Object);
     }
   }
 
@@ -1082,7 +1430,11 @@ export class OrbitHarmonyStore {
       this.selectedHostId.length > 0 &&
       this.activeCwd.length > 0
     ) {
-      this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      try {
+        this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'ensureWorkspaceFilesLoaded failed', err as Object);
+      }
       this.reloadWorkspaceFiles();
     }
   }
@@ -1146,29 +1498,173 @@ export class OrbitHarmonyStore {
     }
   }
 
-  public applySlashCommand(item: SlashCommandItem): void {
-    if (item.modeOverride.length > 0) {
-      this.setSessionMode(item.modeOverride);
+  public registerInlineMention(
+    token: string,
+    kind: string,
+    path: string = '',
+    staged: boolean = false,
+    label: string = ''
+  ): void {
+    if (token.trim().length === 0) {
+      return;
     }
-    if (item.command === '/review') {
-      this.addUniqueComposerBadge('diff', '@diff');
-    }
-    const next: PromptBadgeDto[] = [];
-    for (let i = 0; i < this.composerBadges.length; i++) {
-      if (this.composerBadges[i].kind !== 'command') {
-        next.push(this.composerBadges[i]);
+    const next: InlineMentionRegistration[] = [];
+    for (let i = 0; i < this.inlineMentions.length; i++) {
+      if (this.inlineMentions[i].token !== token) {
+        next.push(this.inlineMentions[i]);
       }
     }
-    const badge: PromptBadgeDto = { kind: 'command', label: item.command };
-    next.push(badge);
-    this.composerBadges = next;
-    this.showContextPickerSheet = false;
-    this.triggerHaptic(10);
+    next.push({
+      token: token,
+      kind: kind,
+      path: path,
+      staged: staged,
+      label: label
+    });
+    this.inlineMentions = next;
+    if (kind === 'terminal' && this.terminalRows.length === 0 && this.core !== null && this.selectedHostId.length > 0) {
+      this.reloadTerminal();
+    }
+    this.triggerHaptic(8);
   }
 
-  public applyInlineSlashCommand(item: SlashCommandItem, strippedText: string): void {
-    this.composerText = strippedText;
-    this.applySlashCommand(item);
+  public setSlashDirective(slash: string): void {
+    this.activeSlashDirective = slash.trim();
+    this.triggerHaptic(8);
+  }
+
+  public clearSlashDirective(): void {
+    if (this.activeSlashDirective.length > 0) {
+      this.activeSlashDirective = '';
+      this.triggerHaptic(6);
+    }
+  }
+
+  public applyQuickWorkflow(slash: string): void {
+    const clean = slash.trim().toLowerCase();
+    if (clean === '/compact') {
+      this.submitSlashCompact('');
+      return;
+    }
+    this.setSlashDirective(clean);
+  }
+
+  public executeSlashCommand(
+    cmd: OrbitSlashCommand,
+    onOpenTerminal?: () => void,
+    onOpenSettings?: () => void
+  ): void {
+    if (cmd.id === 'plan') {
+      this.setSlashDirective('/plan');
+      return;
+    }
+    if (cmd.id === 'review') {
+      this.setSlashDirective('/review');
+      return;
+    }
+    if (cmd.id === 'diff') {
+      this.toggleTopBarGitDiff();
+      return;
+    }
+    if (cmd.id === 'compact') {
+      this.submitSlashCompact('');
+      return;
+    }
+    if (cmd.id === 'supervised') {
+      this.setSessionMode('default');
+      this.showToast('Permissions: Always Ask', false);
+      return;
+    }
+    if (cmd.id === 'auto') {
+      this.setSessionMode('accept_edits');
+      this.showToast('Permissions: Accept Edits', false);
+      return;
+    }
+    if (cmd.id === 'full') {
+      this.setSessionMode('full_access');
+      this.showToast('Permissions: Full Access', false);
+      return;
+    }
+    if (cmd.id === 'terminal') {
+      if (onOpenTerminal !== undefined) {
+        onOpenTerminal();
+      } else {
+        this.showPtySheet = !this.showPtySheet;
+      }
+      return;
+    }
+    if (cmd.id === 'new') {
+      this.startNewSessionDraft();
+      return;
+    }
+    if (cmd.id === 'settings') {
+      if (onOpenSettings !== undefined) {
+        onOpenSettings();
+      } else {
+        this.showHostSettingsSheet = true;
+      }
+    }
+  }
+
+  public async attachPhotoUri(uri: string): Promise<void> {
+    await this.stageUriAttachment(uri, 'photo.jpg', 'image/jpeg', true);
+  }
+
+  public async attachDocumentUri(uri: string): Promise<void> {
+    await this.stageUriAttachment(uri, 'attachment.txt', 'application/octet-stream', false);
+  }
+
+  public removeStagedAttachment(id: string): void {
+    const next: ComposerAttachmentItem[] = [];
+    for (let i = 0; i < this.stagedAttachments.length; i++) {
+      if (this.stagedAttachments[i].id !== id) {
+        next.push(this.stagedAttachments[i]);
+      }
+    }
+    this.stagedAttachments = next;
+    this.triggerHaptic(6);
+  }
+
+  private async stageUriAttachment(
+    uri: string,
+    fallbackName: string,
+    fallbackMime: string,
+    forceImage: boolean
+  ): Promise<void> {
+    if (uri.trim().length === 0) {
+      return;
+    }
+    if (this.core === null || this.selectedHostId.length === 0) {
+      this.showToast('Select a host first to attach files', true);
+      return;
+    }
+    this.isStagingAttachment = true;
+    try {
+      const loaded = await readUriBytesAsync(uri, fallbackName, fallbackMime);
+      const isImage = forceImage || loaded.mimeType.startsWith('image/');
+      const rawJson = await this.core.stageAttachmentJson(
+        this.selectedHostId,
+        loaded.filename,
+        loaded.mimeType,
+        loaded.bytes
+      );
+      const staged = JSON.parse(rawJson) as StagedAttachmentDto;
+      const item: ComposerAttachmentItem = {
+        id: `att_${Date.now()}_${this.stagedAttachments.length}`,
+        path: staged.path,
+        filename: staged.filename.length > 0 ? staged.filename : loaded.filename,
+        sizeBytes: staged.size_bytes,
+        isImage: isImage,
+        localUri: isImage ? uri : ''
+      };
+      this.stagedAttachments = this.stagedAttachments.concat([item]);
+      this.triggerHaptic(10);
+    } catch (e) {
+      orbitLogWarn('OrbitStore', 'stageUriAttachment failed', e as Object);
+      this.showToast((e as Error).message || 'Failed to attach file', true);
+    } finally {
+      this.isStagingAttachment = false;
+    }
   }
 
   public removeComposerBadge(label: string): void {
@@ -1247,28 +1743,174 @@ export class OrbitHarmonyStore {
   }
 
   public setSessionMode(mode: string): void {
-    this.composerMode = mode;
-    if (this.core !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0) {
-      this.core.setSessionMode(this.selectedHostId, this.selectedAgentId, mode);
+    const normalized = mode === 'plan' || mode.length === 0 ? 'default' : mode;
+    this.composerMode = normalized;
+    if (this.core !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+      this.core.setSessionMode(this.selectedHostId, this.selectedAgentId, normalized);
     }
     this.triggerHaptic(8);
   }
 
   public cycleSessionMode(): void {
-    const order: string[] = ['default', 'plan', 'accept_edits', 'full_access'];
-    const curIdx = order.indexOf(this.composerMode);
-    const nextMode = order[(curIdx + 1) % order.length];
+    const order: string[] = ['default', 'accept_edits', 'full_access'];
+    const normalized = normalizeModeSlug(this.composerMode);
+    const curIdx = order.indexOf(normalized);
+    const nextMode = curIdx >= 0 ? order[(curIdx + 1) % order.length] : 'accept_edits';
     this.setSessionMode(nextMode);
+  }
+
+  public catalogForProvider(provider: string): ProviderModelCatalogDto | null {
+    const detail = this.currentHostDetail;
+    if (detail === null) {
+      return null;
+    }
+    for (let i = 0; i < detail.provider_catalogs.length; i++) {
+      if (detail.provider_catalogs[i].provider === provider) {
+        return detail.provider_catalogs[i];
+      }
+    }
+    return null;
+  }
+
+  public resolveDefaultModelAndEffort(
+    provider: string,
+    desiredModel: string,
+    desiredEffort: string
+  ): DraftModelSelection {
+    const models = this.modelsForProvider(provider);
+    const catalog = this.catalogForProvider(provider);
+
+    let resolvedModel = '';
+    if (desiredModel.trim().length > 0) {
+      const cleanDesired = desiredModel.trim();
+      const existsInCatalog = models.length === 0 || models.some((m: ProviderModelSpecDto) => m.id === cleanDesired);
+      if (existsInCatalog) {
+        resolvedModel = cleanDesired;
+      }
+    }
+    if (resolvedModel.length === 0 && catalog !== null && catalog.configured_default_model !== null && catalog.configured_default_model.trim().length > 0) {
+      resolvedModel = catalog.configured_default_model.trim();
+    }
+    if (resolvedModel.length === 0) {
+      for (let i = 0; i < models.length; i++) {
+        if (models[i].is_default) {
+          resolvedModel = models[i].id;
+          break;
+        }
+      }
+    }
+    if (resolvedModel.length === 0 && models.length > 0) {
+      resolvedModel = models[0].id;
+    }
+
+    let spec: ProviderModelSpecDto | null = null;
+    for (let i = 0; i < models.length; i++) {
+      if (models[i].id === resolvedModel) {
+        spec = models[i];
+        break;
+      }
+    }
+    if (spec === null && models.length > 0) {
+      spec = models[0];
+    }
+
+    const options = spec !== null ? spec.thinking_options : [];
+    let resolvedEffort = '';
+    if (options.length === 0) {
+      resolvedEffort = (spec !== null && spec.default_effort !== undefined && spec.default_effort !== null)
+        ? spec.default_effort
+        : '';
+      return { model: resolvedModel, effort: resolvedEffort };
+    }
+
+    // Match Desktop & iOS resolution priority:
+    // 1. Explicit desiredEffort
+    // 2. Model spec default_effort
+    // 3. Catalog configured_default_effort
+    // 4. Option marked is_default
+    // 5. First supported option
+    const candidates: string[] = [];
+    if (desiredEffort.trim().length > 0) {
+      candidates.push(desiredEffort.trim().toLowerCase());
+    }
+    if (spec !== null && spec.default_effort !== undefined && spec.default_effort !== null && spec.default_effort.trim().length > 0) {
+      candidates.push(spec.default_effort.trim().toLowerCase());
+    }
+    if (catalog !== null && catalog.configured_default_effort !== undefined && catalog.configured_default_effort !== null && catalog.configured_default_effort.trim().length > 0) {
+      candidates.push(catalog.configured_default_effort.trim().toLowerCase());
+    }
+
+    for (let c = 0; c < candidates.length; c++) {
+      for (let o = 0; o < options.length; o++) {
+        if (options[o].effort.trim().toLowerCase() === candidates[c]) {
+          return { model: resolvedModel, effort: options[o].effort };
+        }
+      }
+    }
+    for (let o = 0; o < options.length; o++) {
+      if (options[o].is_default) {
+        return { model: resolvedModel, effort: options[o].effort };
+      }
+    }
+    return { model: resolvedModel, effort: options[0].effort };
+  }
+
+  public syncDefaultModelAndEffort(provider?: string): void {
+    const targetProvider = provider !== undefined && provider.length > 0 ? provider : this.composerProvider;
+    const saved = this.draftSelectionByProvider.get(targetProvider);
+    const desiredModel = (this.hasUserCustomizedDraftModel && this.composerProvider === targetProvider)
+      ? this.composerModel
+      : (saved !== undefined ? saved.model : '');
+    const desiredEffort = (this.hasUserCustomizedDraftModel && this.composerProvider === targetProvider)
+      ? this.composerEffort
+      : (saved !== undefined ? saved.effort : '');
+    const resolved = this.resolveDefaultModelAndEffort(targetProvider, desiredModel, desiredEffort);
+    this.composerProvider = targetProvider;
+    this.composerModel = resolved.model;
+    this.composerEffort = resolved.effort;
+  }
+
+  public switchDraftProvider(provider: string): void {
+    if (provider.length === 0) {
+      return;
+    }
+    const prevSel: DraftModelSelection = {
+      model: this.composerModel,
+      effort: this.composerEffort
+    };
+    this.draftSelectionByProvider.set(this.composerProvider, prevSel);
+    this.hasUserCustomizedDraftModel = true;
+    const saved = this.draftSelectionByProvider.get(provider);
+    const resolved = this.resolveDefaultModelAndEffort(
+      provider,
+      saved !== undefined ? saved.model : '',
+      saved !== undefined ? saved.effort : ''
+    );
+    this.draftSelectionByProvider.set(provider, resolved);
+    this.applyProviderModelEffort(provider, resolved.model, resolved.effort);
+  }
+
+  public selectEffort(effort: string): void {
+    this.applyProviderModelEffort(this.composerProvider, this.composerModel, effort);
+  }
+
+  public applyModelSelection(modelId: string, effort: string): void {
+    this.applyProviderModelEffort(this.composerProvider, modelId, effort);
   }
 
   public applyProviderModelEffort(provider: string, model: string, effort: string): void {
     const prevProvider = this.composerProvider;
+    const resolved = this.resolveDefaultModelAndEffort(provider, model, effort);
     this.composerProvider = provider;
-    this.composerModel = model;
-    this.composerEffort = effort;
-    if (this.core !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0) {
-      const modelOpt = model.trim().length > 0 ? model.trim() : null;
-      const effortOpt = effort.trim().length > 0 ? effort.trim() : null;
+    this.composerModel = resolved.model;
+    this.composerEffort = resolved.effort;
+    if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
+      this.hasUserCustomizedDraftModel = true;
+      this.draftSelectionByProvider.set(provider, resolved);
+    }
+    if (this.core !== null && this.selectedHostId.length > 0 && this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
+      const modelOpt = resolved.model.trim().length > 0 ? resolved.model.trim() : null;
+      const effortOpt = resolved.effort.trim().length > 0 ? resolved.effort.trim() : null;
       if (prevProvider !== provider) {
         this.core.switchAgentProvider(
           this.selectedHostId,
@@ -1284,13 +1926,19 @@ export class OrbitHarmonyStore {
     this.triggerHaptic(10);
   }
 
-  public currentModelPillLabel(): string {
+  public currentModelDisplayLabel(): string {
     let modelLabel = this.composerModel.trim();
+    const specs = this.modelsForProvider(this.composerProvider);
     if (modelLabel.length === 0) {
-      const specs = this.modelsForProvider(this.composerProvider);
-      modelLabel = specs.length > 0 ? specs[0].label : 'Default';
+      let defaultLabel = specs.length > 0 ? specs[0].label : 'Default';
+      for (let i = 0; i < specs.length; i++) {
+        if (specs[i].is_default) {
+          defaultLabel = specs[i].label;
+          break;
+        }
+      }
+      modelLabel = defaultLabel;
     } else {
-      const specs = this.modelsForProvider(this.composerProvider);
       for (let i = 0; i < specs.length; i++) {
         if (specs[i].id === modelLabel) {
           modelLabel = specs[i].label;
@@ -1298,7 +1946,49 @@ export class OrbitHarmonyStore {
         }
       }
     }
-    return `${modelLabel} · ${formatShortEffortLabel(this.composerEffort)}`;
+    if (this.composerProvider === 'claude_code' && modelLabel.startsWith('Claude ')) {
+      modelLabel = modelLabel.substring('Claude '.length).trim();
+    }
+    return modelLabel;
+  }
+
+  public currentEffortDisplayLabel(): string {
+    const specs = this.modelsForProvider(this.composerProvider);
+    let activeSpec: ProviderModelSpecDto | null = null;
+    const rawModel = this.composerModel.trim();
+    if (rawModel.length > 0) {
+      for (let i = 0; i < specs.length; i++) {
+        if (specs[i].id === rawModel) {
+          activeSpec = specs[i];
+          break;
+        }
+      }
+    } else {
+      for (let i = 0; i < specs.length; i++) {
+        if (specs[i].is_default) {
+          activeSpec = specs[i];
+          break;
+        }
+      }
+      if (activeSpec === null && specs.length > 0) {
+        activeSpec = specs[0];
+      }
+    }
+    if (activeSpec !== null && activeSpec.thinking_options.length === 0) {
+      return '';
+    }
+    const resolved = this.resolveDefaultModelAndEffort(
+      this.composerProvider,
+      this.composerModel,
+      this.composerEffort
+    );
+    return formatEffortLabel(resolved.effort);
+  }
+
+  public currentModelPillLabel(): string {
+    const modelLabel = this.currentModelDisplayLabel();
+    const effortTag = this.currentEffortDisplayLabel();
+    return effortTag.length > 0 ? `${modelLabel} ${effortTag}` : modelLabel;
   }
 
   public currentModePillLabel(): string {
@@ -1403,7 +2093,14 @@ export class OrbitHarmonyStore {
   }
 
   public isActiveAgentRunning(): boolean {
-    if (this.currentAgent === null || this.selectedAgentId.length === 0) {
+    if (this.isNewSessionDraft || this.selectedAgentId.length === 0) {
+      return false;
+    }
+    const turnActive = this.stageTurns.some((t: StageTurnDto) => t.has_active_item);
+    if (turnActive) {
+      return true;
+    }
+    if (this.currentAgent === null) {
       return false;
     }
     return (
@@ -1416,6 +2113,8 @@ export class OrbitHarmonyStore {
   public hasComposerDraftContent(): boolean {
     return (
       this.composerText.trim().length > 0 ||
+      this.activeSlashDirective.length > 0 ||
+      this.stagedAttachments.length > 0 ||
       this.composerBadges.length > 0 ||
       this.quotedSnippets.length > 0
     );
@@ -1444,14 +2143,178 @@ export class OrbitHarmonyStore {
     return tail.join('\n');
   }
 
+  private parseLeadingSlashDirective(rawText: string): ParsedLeadingSlash {
+    const trimmed = rawText.trim();
+    const candidates: string[] = ['/plan', '/review', '/compact'];
+    const lower = trimmed.toLowerCase();
+    for (let i = 0; i < candidates.length; i++) {
+      const cmd = candidates[i];
+      if (lower === cmd) {
+        return { directive: cmd, rest: '' };
+      }
+      if (lower.startsWith(`${cmd} `) || lower.startsWith(`${cmd}\n`) || lower.startsWith(`${cmd}\t`)) {
+        return {
+          directive: cmd,
+          rest: trimmed.substring(cmd.length).trim()
+        };
+      }
+    }
+    return { directive: '', rest: trimmed };
+  }
+
+  private buildHiddenWorkflowInstruction(directive: string): string {
+    const clean = directive.toLowerCase();
+    if (clean === '/plan') {
+      return [
+        '<WORKFLOW_INSTRUCTION command="/plan">',
+        'You are invoked with the /plan workflow.',
+        'First inspect and verify the relevant codebase files, architecture, and constraints.',
+        'Clarify any critical ambiguities if needed, then present a concise, structured, step-by-step implementation plan.',
+        'Do NOT modify files or run mutating commands until the user approves the plan.',
+        '</WORKFLOW_INSTRUCTION>'
+      ].join('\n');
+    }
+    if (clean === '/review') {
+      return [
+        '<WORKFLOW_INSTRUCTION command="/review">',
+        'You are invoked with the /review workflow.',
+        'Perform a thorough engineering code review of the attached changes.',
+        'Focus on correctness bugs, regressions, edge cases, concurrency/state hazards, security, and adherence to project conventions.',
+        'Cite exact file paths and line numbers, prioritize findings by severity, and do NOT modify files unless asked.',
+        '</WORKFLOW_INSTRUCTION>'
+      ].join('\n');
+    }
+    return [
+      '<WORKFLOW_INSTRUCTION command="/compact">',
+      'Summarize and compact our conversation context into a concise, high-signal checkpoint:',
+      '1. Core goal & user preferences',
+      '2. Key architectural decisions & completed changes (with file paths)',
+      '3. Open issues & immediate next steps',
+      '</WORKFLOW_INSTRUCTION>'
+    ].join('\n');
+  }
+
+  public submitSlashCompact(extraFocus: string = ''): void {
+    if (this.core === null || this.selectedHostId.length === 0 || this.isNewSessionDraft || this.selectedAgentId.length === 0) {
+      this.showToast('Start an active session first to compact context', false);
+      return;
+    }
+    const provider = this.currentAgent !== null ? this.currentAgent.provider : this.composerProvider;
+    const cleanFocus = extraFocus.trim();
+    const badges: PromptBadgeDto[] = [{ kind: 'slash', label: '/compact' }];
+    let wirePrompt = '';
+    if (provider === 'claude_code' || provider === 'antigravity') {
+      wirePrompt = cleanFocus.length > 0 ? `/compact ${cleanFocus}` : '/compact';
+    } else {
+      wirePrompt = cleanFocus.length > 0
+        ? `${this.buildHiddenWorkflowInstruction('/compact')}\n\n<USER_REQUEST>\n${cleanFocus}\n</USER_REQUEST>`
+        : this.buildHiddenWorkflowInstruction('/compact');
+    }
+    try {
+      this.core.sendPromptWithMeta(
+        this.selectedHostId,
+        this.selectedAgentId,
+        wirePrompt,
+        cleanFocus,
+        JSON.stringify(badges)
+      );
+      this.reloadStage();
+      this.triggerHaptic(12);
+    } catch (e) {
+      this.showToast((e as Error).message, true);
+    }
+  }
+
   private buildPromptPayload(
     rawInput: string,
     sourceBadges: PromptBadgeDto[],
-    sourceQuotes: QuotedDiffSnippet[]
+    sourceQuotes: QuotedDiffSnippet[],
+    sourceAttachments: ComposerAttachmentItem[] = [],
+    sourceInlineMentions: InlineMentionRegistration[] = [],
+    explicitSlashDirective: string = ''
   ): BuiltPromptPayload {
-    const badges: PromptBadgeDto[] = [];
+    const rawTrimmed = rawInput.trim();
+    let effectiveDirective = explicitSlashDirective.trim();
+    let cleanUserText = rawTrimmed;
+    if (effectiveDirective.length === 0) {
+      const parsed = this.parseLeadingSlashDirective(rawTrimmed);
+      effectiveDirective = parsed.directive;
+      cleanUserText = parsed.rest;
+    }
+
+    const filePaths: string[] = [];
+    let includeWorkingDiff = false;
+    let includeStagedDiff = false;
+    let includeTerminal = false;
+
     for (let i = 0; i < sourceBadges.length; i++) {
-      badges.push(sourceBadges[i]);
+      const b = sourceBadges[i];
+      if (b.kind === 'file') {
+        const cleanPath = b.label.startsWith('@') ? b.label.substring(1) : b.label;
+        if (!filePaths.includes(cleanPath)) {
+          filePaths.push(cleanPath);
+        }
+      } else if (b.kind === 'diff') {
+        includeWorkingDiff = true;
+      } else if (b.kind === 'staged') {
+        includeStagedDiff = true;
+      } else if (b.kind === 'terminal') {
+        includeTerminal = true;
+      } else if (b.kind === 'command' && effectiveDirective.length === 0) {
+        effectiveDirective = b.label;
+      }
+    }
+
+    for (let i = 0; i < sourceInlineMentions.length; i++) {
+      const m = sourceInlineMentions[i];
+      if (!cleanUserText.includes(m.token)) {
+        continue;
+      }
+      if (m.kind === 'file' && m.path.length > 0) {
+        if (!filePaths.includes(m.path)) {
+          filePaths.push(m.path);
+        }
+      } else if (m.kind === 'git_diff') {
+        if (m.staged) {
+          includeStagedDiff = true;
+        } else {
+          includeWorkingDiff = true;
+        }
+      } else if (m.kind === 'terminal') {
+        includeTerminal = true;
+      }
+    }
+
+    const autoReviewDiff = effectiveDirective === '/review' && !includeWorkingDiff && !includeStagedDiff;
+    if (autoReviewDiff) {
+      includeWorkingDiff = true;
+    }
+
+    const badges: PromptBadgeDto[] = [];
+    if (effectiveDirective.length > 0) {
+      badges.push({ kind: 'slash', label: effectiveDirective });
+    }
+    for (let i = 0; i < sourceAttachments.length; i++) {
+      const att = sourceAttachments[i];
+      badges.push({
+        kind: att.isImage ? 'image' : 'file',
+        label: att.filename
+      });
+    }
+    for (let i = 0; i < filePaths.length; i++) {
+      const shortName = basenameOfPath(filePaths[i]);
+      if (!cleanUserText.includes(`@${shortName}`)) {
+        badges.push({ kind: 'file', label: `@${shortName}` });
+      }
+    }
+    if (includeWorkingDiff && !autoReviewDiff && !cleanUserText.includes('@working-diff')) {
+      badges.push({ kind: 'git_diff', label: 'Working Tree Diff' });
+    }
+    if (includeStagedDiff && !cleanUserText.includes('@staged-diff')) {
+      badges.push({ kind: 'git_diff', label: 'Staged Diff' });
+    }
+    if (includeTerminal && !cleanUserText.includes('@terminal')) {
+      badges.push({ kind: 'terminal', label: 'Terminal' });
     }
     for (let i = 0; i < sourceQuotes.length; i++) {
       badges.push({
@@ -1460,84 +2323,76 @@ export class OrbitHarmonyStore {
       });
     }
 
-    const contextParts: string[] = [];
-    let commandDirective = '';
-    for (let i = 0; i < sourceBadges.length; i++) {
-      const b = sourceBadges[i];
-      if (b.kind === 'file') {
-        const cleanPath = b.label.startsWith('@') ? b.label.substring(1) : b.label;
-        contextParts.push(`Context file: ${cleanPath}`);
-      } else if (b.kind === 'diff') {
-        contextParts.push('Please inspect the current unstaged git working tree diff in this workspace.');
-      } else if (b.kind === 'staged') {
-        contextParts.push('Please inspect the staged git index diff (git diff --cached) in this workspace.');
-      } else if (b.kind === 'terminal') {
-        const termSnap = this.extractRecentTerminalText();
-        if (termSnap.length > 0) {
-          contextParts.push(`Recent PTY terminal output:\n\`\`\`text\n${termSnap}\n\`\`\``);
-        } else {
-          contextParts.push('Please inspect the active PTY terminal session context in this workspace.');
-        }
-      } else if (b.kind === 'command') {
-        commandDirective = b.label;
-        if (b.label === '/plan') {
-          contextParts.push(
-            'First draft a clear, step-by-step engineering plan before making file edits.'
-          );
-        } else if (b.label === '/review') {
-          contextParts.push(
-            'Perform a thorough code review of the current working tree changes, calling out bugs, edge cases, and concrete improvements.'
-          );
-        } else if (!rawInput.startsWith(b.label) && b.label !== '/compact') {
-          contextParts.push(`Command intent: ${b.label}`);
-        }
+    const wireParts: string[] = [];
+    if (effectiveDirective.length > 0) {
+      wireParts.push(this.buildHiddenWorkflowInstruction(effectiveDirective));
+    }
+
+    const imagePaths: string[] = [];
+    const attachedFilePaths: string[] = [];
+    for (let i = 0; i < sourceAttachments.length; i++) {
+      if (sourceAttachments[i].isImage) {
+        imagePaths.push(sourceAttachments[i].path);
+      } else {
+        attachedFilePaths.push(sourceAttachments[i].path);
+      }
+    }
+    if (imagePaths.length > 0) {
+      const imgLines: string[] = [];
+      for (let i = 0; i < imagePaths.length; i++) {
+        imgLines.push(`Attached image file: \`${imagePaths[i]}\``);
+      }
+      wireParts.push(imgLines.join('\n'));
+    }
+
+    const allFiles: string[] = [];
+    for (let i = 0; i < filePaths.length; i++) {
+      allFiles.push(filePaths[i]);
+    }
+    for (let i = 0; i < attachedFilePaths.length; i++) {
+      allFiles.push(attachedFilePaths[i]);
+    }
+    if (allFiles.length > 0) {
+      const refs: string[] = [];
+      for (let i = 0; i < allFiles.length; i++) {
+        refs.push(`\`@${allFiles[i]}\``);
+      }
+      wireParts.push(`Referenced workspace files: ${refs.join(', ')}`);
+    }
+
+    if (includeWorkingDiff) {
+      wireParts.push(`Context: Inspect working tree git changes in ${this.activeCwd}.`);
+    }
+    if (includeStagedDiff) {
+      wireParts.push(`Context: Inspect staged git changes in ${this.activeCwd}.`);
+    }
+    if (includeTerminal) {
+      const termSnap = this.extractRecentTerminalText();
+      if (termSnap.length > 0) {
+        wireParts.push(`Active terminal output:\n\`\`\`text\n${termSnap}\n\`\`\``);
+      } else {
+        wireParts.push(`Please inspect the active PTY terminal session context in ${this.activeCwd}.`);
       }
     }
 
-    let hasQuotedReply = false;
     for (let i = 0; i < sourceQuotes.length; i++) {
       const snip = sourceQuotes[i];
       if (snip.kind === 'reply') {
-        hasQuotedReply = true;
         const quotedLines = snip.content.split('\n').join('\n> ');
-        contextParts.push(`Quoted assistant reply (${snip.lineLabel}):\n> ${quotedLines}`);
+        wireParts.push(`Quoted assistant context (${snip.lineLabel}):\n> ${quotedLines}`);
       } else {
         const prefix = snip.kind === 'added' ? '+' : snip.kind === 'removed' ? '-' : ' ';
-        contextParts.push(
-          `Referenced diff (${snip.lineLabel}):\n\`\`\`diff\n${prefix}${snip.content}\n\`\`\``
-        );
+        wireParts.push(`Reference \`${snip.lineLabel}\`:\n\`\`\`diff\n${prefix}${snip.content}\n\`\`\``);
       }
     }
 
-    let wirePrompt = rawInput;
-    if (commandDirective === '/compact' && rawInput.length === 0) {
-      wirePrompt = '/compact';
-    } else if (contextParts.length > 0) {
-      wirePrompt = rawInput.length > 0
-        ? `${contextParts.join('\n\n')}\n\n${rawInput}`
-        : contextParts.join('\n\n');
-    }
-
-    let displayPrompt = rawInput;
-    if (displayPrompt.length === 0) {
-      if (commandDirective.length > 0) {
-        displayPrompt = commandDirective === '/review'
-          ? 'Review working tree changes'
-          : commandDirective === '/plan'
-            ? 'Draft implementation plan'
-            : commandDirective;
-      } else if (hasQuotedReply) {
-        displayPrompt = 'Follow up on quoted reply';
-      } else if (sourceQuotes.length > 0) {
-        displayPrompt = 'Review referenced diff lines';
-      } else if (sourceBadges.length > 0) {
-        displayPrompt = `Inspect ${sourceBadges[0].label}`;
-      }
+    if (cleanUserText.length > 0) {
+      wireParts.push(cleanUserText);
     }
 
     return {
-      wirePrompt: wirePrompt.trim(),
-      displayPrompt: displayPrompt.trim(),
+      wirePrompt: wireParts.join('\n\n').trim(),
+      displayPrompt: cleanUserText,
       badges: badges,
       badgesJson: badges.length > 0 ? JSON.stringify(badges) : null
     };
@@ -1545,11 +2400,17 @@ export class OrbitHarmonyStore {
 
   public enqueueCurrentDraft(): void {
     const rawInput = this.composerText.trim();
-    if (
-      rawInput.length === 0 &&
-      this.composerBadges.length === 0 &&
-      this.quotedSnippets.length === 0
-    ) {
+    if (!this.hasComposerDraftContent()) {
+      return;
+    }
+    const explicitSlash: ParsedLeadingSlash = { directive: this.activeSlashDirective, rest: rawInput };
+    const parsed: ParsedLeadingSlash = this.activeSlashDirective.length === 0
+      ? this.parseLeadingSlashDirective(rawInput)
+      : explicitSlash;
+    if (parsed.directive === '/compact') {
+      this.composerText = '';
+      this.activeSlashDirective = '';
+      this.submitSlashCompact(parsed.rest);
       return;
     }
     if (this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
@@ -1564,8 +2425,23 @@ export class OrbitHarmonyStore {
     for (let i = 0; i < this.quotedSnippets.length; i++) {
       copiedQuotes.push(this.quotedSnippets[i]);
     }
+    const copiedAttachments: ComposerAttachmentItem[] = [];
+    for (let i = 0; i < this.stagedAttachments.length; i++) {
+      copiedAttachments.push(this.stagedAttachments[i]);
+    }
+    const copiedMentions: InlineMentionRegistration[] = [];
+    for (let i = 0; i < this.inlineMentions.length; i++) {
+      copiedMentions.push(this.inlineMentions[i]);
+    }
 
-    const payload = this.buildPromptPayload(rawInput, copiedBadges, copiedQuotes);
+    const payload = this.buildPromptPayload(
+      rawInput,
+      copiedBadges,
+      copiedQuotes,
+      copiedAttachments,
+      copiedMentions,
+      this.activeSlashDirective
+    );
     const key = this.agentQueueKey(this.selectedHostId, this.selectedAgentId);
     const existing = this.queuedPromptsByAgent.get(key);
     const nextList: QueuedPromptItem[] = [];
@@ -1582,8 +2458,10 @@ export class OrbitHarmonyStore {
       displayPrompt: payload.displayPrompt,
       wirePrompt: payload.wirePrompt,
       badgesJson: payload.badgesJson,
-      badges: copiedBadges,
+      badges: payload.badges,
       quotedSnippets: copiedQuotes,
+      stagedAttachments: copiedAttachments,
+      inlineMentions: copiedMentions,
       createdAtMs: nowMs
     };
     nextList.push(item);
@@ -1591,7 +2469,10 @@ export class OrbitHarmonyStore {
     this.syncActiveQueuedPrompts();
 
     this.composerText = '';
+    this.activeSlashDirective = '';
     this.composerBadges = [];
+    this.stagedAttachments = [];
+    this.inlineMentions = [];
     this.quotedSnippets = [];
     this.showToast('Queued next prompt', false);
     this.triggerHaptic(12);
@@ -1681,6 +2562,24 @@ export class OrbitHarmonyStore {
       mergedQuotes.push(target.quotedSnippets[i]);
     }
     this.quotedSnippets = mergedQuotes;
+
+    const mergedAttachments: ComposerAttachmentItem[] = [];
+    for (let i = 0; i < this.stagedAttachments.length; i++) {
+      mergedAttachments.push(this.stagedAttachments[i]);
+    }
+    for (let i = 0; i < target.stagedAttachments.length; i++) {
+      mergedAttachments.push(target.stagedAttachments[i]);
+    }
+    this.stagedAttachments = mergedAttachments;
+
+    const mergedMentions: InlineMentionRegistration[] = [];
+    for (let i = 0; i < this.inlineMentions.length; i++) {
+      mergedMentions.push(this.inlineMentions[i]);
+    }
+    for (let i = 0; i < target.inlineMentions.length; i++) {
+      mergedMentions.push(target.inlineMentions[i]);
+    }
+    this.inlineMentions = mergedMentions;
     this.triggerHaptic(8);
   }
 
@@ -1737,10 +2636,12 @@ export class OrbitHarmonyStore {
   public submitComposerPrompt(overridePrompt?: string): void {
     const rawInput = (overridePrompt !== undefined ? overridePrompt : this.composerText).trim();
     if (
-      rawInput.length === 0 &&
-      this.composerBadges.length === 0 &&
-      this.quotedSnippets.length === 0
+      overridePrompt === undefined &&
+      !this.hasComposerDraftContent()
     ) {
+      return;
+    }
+    if (overridePrompt !== undefined && rawInput.length === 0) {
       return;
     }
     if (this.core === null || this.selectedHostId.length === 0) {
@@ -1753,15 +2654,33 @@ export class OrbitHarmonyStore {
       return;
     }
 
+    const explicitSlash: ParsedLeadingSlash = { directive: this.activeSlashDirective, rest: rawInput };
+    const parsed: ParsedLeadingSlash = this.activeSlashDirective.length === 0
+      ? this.parseLeadingSlashDirective(rawInput)
+      : explicitSlash;
+    if (overridePrompt === undefined && parsed.directive === '/compact') {
+      this.composerText = '';
+      this.activeSlashDirective = '';
+      this.submitSlashCompact(parsed.rest);
+      return;
+    }
+
     if (overridePrompt === undefined && this.isActiveAgentRunning()) {
       this.enqueueCurrentDraft();
       return;
     }
 
-    const payload = this.buildPromptPayload(rawInput, this.composerBadges, this.quotedSnippets);
+    const payload = this.buildPromptPayload(
+      rawInput,
+      overridePrompt === undefined ? this.composerBadges : [],
+      overridePrompt === undefined ? this.quotedSnippets : [],
+      overridePrompt === undefined ? this.stagedAttachments : [],
+      overridePrompt === undefined ? this.inlineMentions : [],
+      overridePrompt === undefined ? this.activeSlashDirective : ''
+    );
 
     try {
-      if (this.selectedAgentId.length > 0) {
+      if (this.selectedAgentId.length > 0 && !this.isNewSessionDraft) {
         this.core.sendPromptWithMeta(
           this.selectedHostId,
           this.selectedAgentId,
@@ -1773,7 +2692,9 @@ export class OrbitHarmonyStore {
       } else {
         const modelOpt = this.composerModel.trim().length > 0 ? this.composerModel.trim() : null;
         const effortOpt = this.composerEffort.trim().length > 0 ? this.composerEffort.trim() : null;
-        const wtOpt = this.worktreeBranch.trim().length > 0 ? this.worktreeBranch.trim() : null;
+        const wtOpt = this.worktreeBranch.trim().length > 0
+          ? this.worktreeBranch.trim()
+          : (this.draftUseWorktree ? 'auto' : null);
         const optId = this.core.createAgentFull(
           this.selectedHostId,
           this.activeCwd,
@@ -1781,21 +2702,27 @@ export class OrbitHarmonyStore {
           this.composerProvider,
           modelOpt,
           effortOpt,
-          this.composerMode,
+          normalizeModeSlug(this.composerMode),
           payload.wirePrompt,
           payload.displayPrompt,
           payload.badgesJson,
           wtOpt
         );
         this.selectedAgentId = optId;
+        this.isNewSessionDraft = false;
         this.syncActiveQueuedPrompts();
         this.reloadHost(this.selectedHostId);
         this.reloadStage();
       }
-      this.composerText = '';
-      this.composerBadges = [];
-      this.quotedSnippets = [];
-      this.worktreeBranch = '';
+      if (overridePrompt === undefined) {
+        this.composerText = '';
+        this.activeSlashDirective = '';
+        this.composerBadges = [];
+        this.stagedAttachments = [];
+        this.inlineMentions = [];
+        this.quotedSnippets = [];
+        this.worktreeBranch = '';
+      }
       this.triggerHaptic(14);
     } catch (e) {
       this.showToast((e as Error).message, true);
@@ -1811,18 +2738,30 @@ export class OrbitHarmonyStore {
     }
     this.reloadFleet();
     if (this.selectedHostId.length > 0) {
-      this.core.connectHost(this.selectedHostId);
-      this.core.refreshHost(this.selectedHostId);
+      try {
+        this.core.connectHost(this.selectedHostId);
+        this.core.refreshHost(this.selectedHostId);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'pullRefreshStage host refresh failed', err as Object);
+      }
       this.reloadHost(this.selectedHostId);
       if (this.selectedAgentId.length > 0) {
-        this.core.openAgentTimeline(this.selectedHostId, this.selectedAgentId);
+        try {
+          this.core.openAgentTimeline(this.selectedHostId, this.selectedAgentId);
+        } catch (err) {
+          orbitLogWarn('OrbitStore', 'pullRefreshStage timeline open failed', err as Object);
+        }
         this.reloadStage();
       }
       this.refreshGitReview(
         this.gitStagedMode,
         this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null
       );
-      this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      try {
+        this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'pullRefreshStage workspace files failed', err as Object);
+      }
       this.reloadWorkspaceFiles();
     }
   }
@@ -1832,12 +2771,20 @@ export class OrbitHarmonyStore {
     if (this.core === null || this.selectedHostId.length === 0) {
       return;
     }
-    this.core.refreshHost(this.selectedHostId);
+    try {
+      this.core.refreshHost(this.selectedHostId);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'pullRefreshGitReview host refresh failed', err as Object);
+    }
     this.refreshGitReview(
       this.gitStagedMode,
       this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null
     );
-    this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+    try {
+      this.core.fetchWorkspaceFiles(this.selectedHostId, this.activeCwd);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'pullRefreshGitReview workspace files failed', err as Object);
+    }
     this.reloadWorkspaceFiles();
   }
 
@@ -1845,24 +2792,30 @@ export class OrbitHarmonyStore {
     if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
-    this.core.interruptAgent(this.selectedHostId, this.selectedAgentId);
-    this.triggerHaptic(16);
-  }
-
-  public archiveAgent(agentId: string): void {
-    this.archiveSession(agentId);
+    try {
+      this.core.interruptAgent(this.selectedHostId, this.selectedAgentId);
+      this.triggerHaptic(16);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'interruptCurrentAgent failed', err as Object);
+      this.showToast('Failed to stop agent', true);
+    }
   }
 
   public archiveSession(agentId: string): void {
     if (this.core === null || this.selectedHostId.length === 0 || agentId.length === 0) {
       return;
     }
-    this.core.archiveAgent(this.selectedHostId, agentId);
-    if (this.selectedAgentId === agentId) {
-      this.startNewSessionDraft();
+    try {
+      this.core.archiveAgent(this.selectedHostId, agentId);
+      if (this.selectedAgentId === agentId) {
+        this.startNewSessionDraft();
+      }
+      this.reloadHost(this.selectedHostId);
+      this.triggerHaptic(12);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'archiveSession failed', err as Object);
+      this.showToast('Failed to archive session', true);
     }
-    this.reloadHost(this.selectedHostId);
-    this.triggerHaptic(12);
   }
 
   // Sticky Decision Dock Actions
@@ -1871,23 +2824,33 @@ export class OrbitHarmonyStore {
     if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
-    this.core.resolvePermission(this.selectedHostId, this.selectedAgentId, requestId, decision);
-    this.triggerHaptic(14);
-    this.reloadStage();
+    try {
+      this.core.resolvePermission(this.selectedHostId, this.selectedAgentId, requestId, decision);
+      this.triggerHaptic(14);
+      this.reloadStage();
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'resolvePermission failed', err as Object);
+      this.showToast('Failed to send approval decision', true);
+    }
   }
 
   public answerQuestion(requestId: string, answers: string[][]): void {
     if (this.core === null || this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       return;
     }
-    this.core.answerQuestion(
-      this.selectedHostId,
-      this.selectedAgentId,
-      requestId,
-      JSON.stringify(answers)
-    );
-    this.triggerHaptic(14);
-    this.reloadStage();
+    try {
+      this.core.answerQuestion(
+        this.selectedHostId,
+        this.selectedAgentId,
+        requestId,
+        JSON.stringify(answers)
+      );
+      this.triggerHaptic(14);
+      this.reloadStage();
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'answerQuestion failed', err as Object);
+      this.showToast('Failed to submit answer', true);
+    }
   }
 
   // Git Working Tree Diff Actions
@@ -1938,8 +2901,12 @@ export class OrbitHarmonyStore {
     if (this.core === null || this.selectedHostId.length === 0) {
       return;
     }
-    this.core.fetchGitStatus(this.selectedHostId, this.activeCwd);
-    this.core.fetchGitDiff(this.selectedHostId, this.activeCwd, path, staged);
+    try {
+      this.core.fetchGitStatus(this.selectedHostId, this.activeCwd);
+      this.core.fetchGitDiff(this.selectedHostId, this.activeCwd, path, staged);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'refreshGitReview failed', err as Object);
+    }
     this.reloadGitDiff(this.activeCwd);
   }
 
@@ -1952,27 +2919,27 @@ export class OrbitHarmonyStore {
       const gr = JSON.parse(this.core.gitReviewJson(this.selectedHostId, cwd, pathOpt)) as GitReviewDto;
       this.gitStatus = gr.status;
       this.gitDiffFiles = gr.diff_files;
-    } catch (_) {
-      // Ignore parse error
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'reloadGitDiff failed', err as Object);
     }
   }
 
-  public totalDiffAdditions(): number {
+  public totalDiffFileCount(): number {
     const source = this.gitDiffFiles.length > 0 ? this.gitDiffFiles : this.sessionDiffs;
-    let sum = 0;
-    for (let i = 0; i < source.length; i++) {
-      sum += source[i].additions;
-    }
-    return sum;
+    return source.length;
   }
 
-  public totalDiffDeletions(): number {
-    const source = this.gitDiffFiles.length > 0 ? this.gitDiffFiles : this.sessionDiffs;
-    let sum = 0;
-    for (let i = 0; i < source.length; i++) {
-      sum += source[i].deletions;
-    }
-    return sum;
+  public activeTerminalCount(): number {
+    return this.currentHostDetail !== null ? this.currentHostDetail.terminals.length : 0;
+  }
+
+  public openFullGitDiffSheet(): void {
+    this.refreshGitReview(
+      this.gitStagedMode,
+      this.gitSelectedPath.length > 0 ? this.gitSelectedPath : null
+    );
+    this.showGitDiffSheet = true;
+    this.triggerHaptic(8);
   }
 
   // Detached PTY Multi-Terminal Operations
@@ -2035,32 +3002,45 @@ export class OrbitHarmonyStore {
     if (this.core === null || this.selectedHostId.length === 0) {
       return;
     }
-    this.core.startTerminal(
-      this.selectedHostId,
-      this.activeCwd,
-      this.terminalCols,
-      this.terminalGridRows
-    );
-    this.triggerHaptic(10);
+    try {
+      this.core.startTerminal(
+        this.selectedHostId,
+        this.activeCwd,
+        this.terminalCols,
+        this.terminalGridRows
+      );
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'startNewTerminal failed', err as Object);
+      this.showToast('Failed to start terminal', true);
+    }
   }
 
-  public attachTerminal(terminalId: string, _slot: number = 1): void {
+  public attachTerminal(terminalId: string, slot: number = 1): void {
     if (this.core === null || this.selectedHostId.length === 0 || terminalId.length === 0) {
       return;
     }
-    this.core.attachTerminal(this.selectedHostId, terminalId, 1);
-    this.reloadHost(this.selectedHostId);
-    this.reloadTerminal();
-    this.triggerHaptic(8);
+    try {
+      this.core.attachTerminal(this.selectedHostId, terminalId, Math.max(1, slot));
+      this.reloadHost(this.selectedHostId);
+      this.reloadTerminal();
+      this.triggerHaptic(8);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'attachTerminal failed', err as Object);
+    }
   }
 
   public killTerminal(terminalId: string): void {
     if (this.core === null || this.selectedHostId.length === 0 || terminalId.length === 0) {
       return;
     }
-    this.core.killTerminal(this.selectedHostId, terminalId);
-    this.reloadHost(this.selectedHostId);
-    this.triggerHaptic(10);
+    try {
+      this.core.killTerminal(this.selectedHostId, terminalId);
+      this.reloadHost(this.selectedHostId);
+      this.triggerHaptic(10);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'killTerminal failed', err as Object);
+    }
   }
 
   public resizeTerminalIfChanged(cols: number, rows: number): void {
@@ -2072,8 +3052,12 @@ export class OrbitHarmonyStore {
     this.terminalCols = clampedCols;
     this.terminalGridRows = clampedRows;
     if (this.core !== null && this.selectedHostId.length > 0) {
-      this.core.resizeTerminal(this.selectedHostId, clampedCols, clampedRows);
-      this.reloadTerminal();
+      try {
+        this.core.resizeTerminal(this.selectedHostId, clampedCols, clampedRows);
+        this.reloadTerminal();
+      } catch (err) {
+        orbitLogWarn('OrbitStore', 'resizeTerminal failed', err as Object);
+      }
     }
   }
 
@@ -2089,8 +3073,8 @@ export class OrbitHarmonyStore {
       if (screen !== null) {
         this.terminalRows = screen.rows_data;
       }
-    } catch (_) {
-      // Ignore parse error
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'reloadTerminal failed', err as Object);
     }
   }
 
@@ -2147,6 +3131,10 @@ export class OrbitHarmonyStore {
       out = `\x1b${rawKeys}`;
       this.altSticky = false;
     }
-    this.core.sendTerminalKeys(this.selectedHostId, out);
+    try {
+      this.core.sendTerminalKeys(this.selectedHostId, out);
+    } catch (err) {
+      orbitLogWarn('OrbitStore', 'sendTerminalKeys failed', err as Object);
+    }
   }
 }

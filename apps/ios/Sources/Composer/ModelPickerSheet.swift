@@ -1,308 +1,384 @@
 import SwiftUI
 
-struct ModelPickerSheet: View {
+private struct ModelPickerRowData: Identifiable, Equatable {
+    let id: String
+    let label: String
+    let defaultEffort: FfiReasoningEffort?
+    let thinkingOptions: [FfiThinkingOptionSpec]
+}
+
+/// Compact native iOS 26 Liquid Glass Popover for selecting Agent Engine, Model, and Thinking Effort.
+struct ModelPickerPopoverView: View {
     @ObservedObject var store: OrbitIosStore
+
     @Environment(\.dismiss) private var dismiss
     @Environment(\.orbitPalette) private var palette
+    @State private var browsedProvider: FfiProviderKind = .claudeCode
 
-    @State private var currentProvider: FfiProviderKind = .claudeCode
+    private static let allProviders: [FfiProviderKind] = [.claudeCode, .codex, .antigravity]
 
-    private let allProviders: [FfiProviderKind] = [.claudeCode, .codex, .antigravity]
+    private static let defaultCustomThinkingOptions: [FfiThinkingOptionSpec] = [
+        .low, .medium, .high, .xhigh, .max
+    ].map { effort in
+        FfiThinkingOptionSpec(
+            effort: effort,
+            label: formatEffortLabel(effort: effort),
+            description: defaultEffortDescription(effort: effort),
+            isDefault: effort == .medium
+        )
+    }
+
+    private var detectedProviders: [FfiProviderKind] {
+        let installed = Set(store.activeHost?.availableProviders ?? [])
+        let filtered = Self.allProviders.filter { installed.contains($0) }
+        return filtered.isEmpty ? [store.selectedProvider] : filtered
+    }
+
+    private var canSwitchAgentEngine: Bool {
+        store.isDraftNewSession || store.activeAgent == nil
+    }
+
+    private var showAgentSwitcher: Bool {
+        canSwitchAgentEngine && detectedProviders.count > 1
+    }
+
+    private var effectiveBrowsedProvider: FfiProviderKind {
+        guard canSwitchAgentEngine else { return store.selectedProvider }
+        if detectedProviders.contains(browsedProvider) {
+            return browsedProvider
+        }
+        return detectedProviders.first ?? store.selectedProvider
+    }
 
     private var catalog: FfiProviderModelCatalog {
-        store.catalog(for: currentProvider)
+        store.catalog(for: effectiveBrowsedProvider)
     }
 
-    private var activeSpec: FfiProviderModelSpec? {
-        if let mid = store.selectedModel, currentProvider == store.selectedProvider {
-            return catalog.models.first(where: { $0.id == mid })
+    private var browsedRows: [ModelPickerRowData] {
+        var rows: [ModelPickerRowData] = []
+        let catalogModels = catalog.models
+
+        if effectiveBrowsedProvider == store.selectedProvider,
+           let rawModel = store.selectedModel,
+           !rawModel.isEmpty,
+           !catalogModels.contains(where: { $0.id.caseInsensitiveCompare(rawModel) == .orderedSame }) {
+            rows.append(
+                ModelPickerRowData(
+                    id: rawModel,
+                    label: formatCatalogModelLabel(catalog: catalog, rawModelId: rawModel),
+                    defaultEffort: .medium,
+                    thinkingOptions: Self.defaultCustomThinkingOptions
+                )
+            )
         }
-        if let defId = catalog.configuredDefaultModel {
-            return catalog.models.first(where: { $0.id == defId })
+
+        for spec in catalogModels {
+            let cleanLabel: String
+            if effectiveBrowsedProvider == .claudeCode,
+               spec.label.lowercased().hasPrefix("claude ") {
+                cleanLabel = String(spec.label.dropFirst("claude ".count))
+            } else {
+                cleanLabel = spec.label
+            }
+            rows.append(
+                ModelPickerRowData(
+                    id: spec.id,
+                    label: cleanLabel,
+                    defaultEffort: spec.defaultEffort,
+                    thinkingOptions: spec.thinkingOptions
+                )
+            )
         }
-        return catalog.models.first(where: { $0.isDefault }) ?? catalog.models.first
+        return rows
     }
 
-    private func activeEffortDescription(spec: FfiProviderModelSpec) -> String {
-        let selected = store.selectedEffort ?? spec.defaultEffort ?? catalog.configuredDefaultEffort
-        guard let effort = selected else { return "" }
-        if let opt = spec.thinkingOptions.first(where: { $0.effort == effort }),
-           let desc = opt.description, !desc.isEmpty {
-            return desc
+    private var resolvedSelectedModelIdOnBrowsed: String? {
+        if effectiveBrowsedProvider == store.selectedProvider,
+           let selected = store.selectedModel,
+           let matched = browsedRows.first(where: { $0.id.caseInsensitiveCompare(selected) == .orderedSame }) {
+            return matched.id
         }
-        return defaultEffortDescription(effort: effort)
+        if effectiveBrowsedProvider == store.selectedProvider,
+           let selected = store.selectedModel,
+           !selected.isEmpty {
+            return selected
+        }
+        if let defId = catalog.configuredDefaultModel,
+           let matched = browsedRows.first(where: { $0.id.caseInsensitiveCompare(defId) == .orderedSame }) {
+            return matched.id
+        }
+        if let defSpec = catalog.models.first(where: { $0.isDefault }) {
+            return defSpec.id
+        }
+        return browsedRows.first?.id
+    }
+
+    private var activeRowForThinking: ModelPickerRowData? {
+        guard let targetId = resolvedSelectedModelIdOnBrowsed else { return browsedRows.first }
+        return browsedRows.first(where: { $0.id.caseInsensitiveCompare(targetId) == .orderedSame })
+            ?? browsedRows.first
+    }
+
+    private var activeSpecForThinking: FfiProviderModelSpec? {
+        guard let targetId = activeRowForThinking?.id else { return nil }
+        return catalog.models.first(where: { $0.id.caseInsensitiveCompare(targetId) == .orderedSame })
+    }
+
+    private func resolvedEffort(for row: ModelPickerRowData) -> FfiReasoningEffort? {
+        guard !row.thinkingOptions.isEmpty else { return nil }
+        let isActiveOnProvider = (effectiveBrowsedProvider == store.selectedProvider)
+            && (resolvedSelectedModelIdOnBrowsed?.caseInsensitiveCompare(row.id) == .orderedSame)
+        let desired = isActiveOnProvider ? store.selectedEffort : row.defaultEffort
+        let spec = catalog.models.first(where: { $0.id.caseInsensitiveCompare(row.id) == .orderedSame })
+        if let supported = resolveSupportedEffortForModel(
+            spec: spec,
+            desired: desired,
+            catalogDefault: catalog.configuredDefaultEffort
+        ) {
+            return supported
+        }
+        if let d = desired, row.thinkingOptions.contains(where: { $0.effort == d }) {
+            return d
+        }
+        if let def = row.defaultEffort, row.thinkingOptions.contains(where: { $0.effort == def }) {
+            return def
+        }
+        return row.thinkingOptions.first?.effort
+    }
+
+    private var providerSelectionBinding: Binding<FfiProviderKind> {
+        Binding(
+            get: { effectiveBrowsedProvider },
+            set: { nextProvider in
+                browsedProvider = nextProvider
+                store.switchDraftProvider(nextProvider)
+            }
+        )
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            sheetHeader
-            OrbitHairline()
-
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: OrbitSpacing.md) {
-                    providerSelectorSection
-                    if let spec = activeSpec, !spec.thinkingOptions.isEmpty {
-                        reasoningEffortStripSection(spec: spec)
+        VStack(alignment: .leading, spacing: 10) {
+            if showAgentSwitcher {
+                Picker("Agent", selection: providerSelectionBinding) {
+                    ForEach(detectedProviders, id: \.self) { provider in
+                        Image(uiImage: OrbitProviderIcon.uiImage(for: provider, size: 17))
+                            .accessibilityLabel(OrbitFormatters.providerLabel(provider))
+                            .tag(provider)
                     }
-                    modelsSection
                 }
-                .padding(OrbitSpacing.lg)
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 12)
+            }
+
+            providerHeaderRow
+                .padding(.horizontal, 12)
+
+            ViewThatFits(in: .vertical) {
+                modelRowsStack
+                ScrollView(.vertical, showsIndicators: true) {
+                    modelRowsStack
+                }
+                .frame(height: 268)
+            }
+            .frame(maxHeight: 268)
+
+            if let row = activeRowForThinking, !row.thinkingOptions.isEmpty {
+                OrbitHairline()
+                    .padding(.horizontal, 12)
+                thinkingSection(for: row)
+                    .padding(.horizontal, 12)
             }
         }
-        .background(palette.canvas.ignoresSafeArea())
+        .padding(.vertical, 12)
+        .frame(width: 304)
         .onAppear {
-            currentProvider = store.selectedProvider
+            browsedProvider = store.selectedProvider
             store.refreshProviderModels(force: false)
         }
     }
 
-    private var sheetHeader: some View {
-        HStack {
-            Text("Model & Reasoning")
-                .font(OrbitTypography.title)
-                .foregroundStyle(palette.fgPrimary)
+    // MARK: - Provider Header Row (matches Desktop 24pt header + subtle refresh)
 
-            Spacer()
+    private var providerHeaderRow: some View {
+        HStack(spacing: 6) {
+            if !showAgentSwitcher {
+                OrbitProviderIcon(provider: effectiveBrowsedProvider, size: 14)
+            }
+
+            Text(OrbitFormatters.providerLabel(effectiveBrowsedProvider))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(palette.fgMuted)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
 
             Button {
                 store.hapticLight()
                 store.refreshProviderModels(force: true)
             } label: {
                 Image(systemName: "arrow.clockwise")
-                    .font(OrbitTypography.iconSmall)
-                    .foregroundStyle(palette.fgSecondary)
-                    .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(palette.fgMuted)
+                    .frame(width: 24, height: 24, alignment: .trailing)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Refresh Model Catalog")
-
-            Button {
-                dismiss()
-            } label: {
-                Text("Done")
-                    .font(OrbitTypography.subhead(.semibold))
-                    .foregroundStyle(palette.primary)
-                    .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
         }
-        .padding(.horizontal, OrbitSpacing.lg)
-        .frame(height: 52)
+        .frame(height: 24)
+        .padding(.horizontal, 10)
     }
 
-    // MARK: - 1. Provider Selector
+    // MARK: - Compact Desktop-Style Model List
 
-    private var providerSelectorSection: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-            Text("PROVIDER")
-                .font(OrbitTypography.meta(.semibold))
-                .foregroundStyle(palette.fgMuted)
+    private var modelRowsStack: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(browsedRows) { row in
+                let isModelActive = (effectiveBrowsedProvider == store.selectedProvider)
+                    && (resolvedSelectedModelIdOnBrowsed?.caseInsensitiveCompare(row.id) == .orderedSame)
+                let rowEffort = resolvedEffort(for: row)
 
-            HStack(spacing: OrbitSpacing.sm) {
-                ForEach(allProviders, id: \.self) { provider in
-                    let isSelected = currentProvider == provider
-                    let isInstalled = store.activeHost?.availableProviders.contains(provider) ?? true
-
-                    Button {
-                        currentProvider = provider
-                        let nextCat = store.catalog(for: provider)
-                        let defModel = nextCat.configuredDefaultModel
-                            ?? nextCat.models.first(where: { $0.isDefault })?.id
-                            ?? nextCat.models.first?.id
+                Button {
+                    if isModelActive {
+                        store.hapticLight()
+                        dismiss()
+                    } else {
                         store.applyModelSelection(
-                            provider: provider,
-                            modelId: defModel,
-                            effort: store.selectedEffort
+                            provider: effectiveBrowsedProvider,
+                            modelId: row.id,
+                            effort: resolvedEffort(for: row)
                         )
-                    } label: {
-                        HStack(spacing: 6) {
-                            OrbitProviderIcon(provider: provider, size: 15)
-                                .opacity(isInstalled ? 1.0 : 0.45)
+                        if row.thinkingOptions.isEmpty {
+                            dismiss()
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text(row.label)
+                                .font(.system(size: 14, weight: isModelActive ? .medium : .regular))
+                                .foregroundStyle(isModelActive ? palette.fgPrimary : palette.fgPrimary.opacity(0.86))
+                                .lineLimit(1)
 
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(OrbitFormatters.providerShortLabel(provider))
-                                    .font(OrbitTypography.subhead(isSelected ? .medium : .regular))
-                                    .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgSecondary)
+                            if let rowEffort {
+                                Text(formatEffortLabel(effort: rowEffort))
+                                    .font(.system(size: 12.5, weight: .regular))
+                                    .foregroundStyle(palette.fgPrimary.opacity(0.46))
                                     .lineLimit(1)
-
-                                if !isInstalled {
-                                    Text("Offline")
-                                        .font(OrbitTypography.meta(.regular))
-                                        .foregroundStyle(palette.fgMuted)
-                                        .lineLimit(1)
-                                }
                             }
                         }
-                        .padding(.horizontal, OrbitSpacing.sm)
-                        .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
-                        .background(isSelected ? palette.elevated : palette.subtleFill)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(
-                                    isSelected ? palette.primary : palette.hairline,
-                                    lineWidth: isSelected ? 1.0 : 0.5
-                                )
-                        )
-                        .contentShape(Rectangle())
+
+                        Spacer(minLength: 6)
+
+                        if isModelActive {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                        }
                     }
-                    .buttonStyle(.plain)
+                    .padding(.horizontal, 10)
+                    .frame(height: 38)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(isModelActive ? palette.activeRowFill.opacity(0.85) : Color.clear)
+                    )
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
             }
         }
+        .padding(.horizontal, 12)
     }
 
-    // MARK: - 2. Compact Reasoning Effort Strip (Above Model List)
+    // MARK: - Pinned Native Thinking Control
 
-    private func reasoningEffortStripSection(spec: FfiProviderModelSpec) -> some View {
-        let activeDesc = activeEffortDescription(spec: spec)
-        let effectiveSelected = store.selectedEffort ?? spec.defaultEffort ?? catalog.configuredDefaultEffort
+    private func thinkingSection(for row: ModelPickerRowData) -> some View {
+        let options = row.thinkingOptions
+        let activeEffort = resolvedEffort(for: row) ?? options[0].effort
+        let effortDesc = activeEffortDescription(options: options, effort: activeEffort)
+        let useCompactSegmentLabel = options.count >= 4
 
-        return VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-            HStack(spacing: OrbitSpacing.sm) {
-                Text("REASONING")
-                    .font(OrbitTypography.meta(.semibold))
+        let effortBinding = Binding<FfiReasoningEffort>(
+            get: { activeEffort },
+            set: { nextEffort in
+                store.applyModelSelection(
+                    provider: effectiveBrowsedProvider,
+                    modelId: row.id,
+                    effort: nextEffort
+                )
+            }
+        )
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Thinking")
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(palette.fgMuted)
 
-                Spacer(minLength: OrbitSpacing.xs)
+                Spacer(minLength: 6)
 
-                if !activeDesc.isEmpty {
-                    Text(activeDesc)
-                        .font(OrbitTypography.meta(.regular))
-                        .foregroundStyle(palette.fgSecondary)
+                if !effortDesc.isEmpty {
+                    Text(effortDesc)
+                        .font(.system(size: 11.5, weight: .regular))
+                        .foregroundStyle(palette.fgMuted)
                         .lineLimit(1)
                 }
             }
+            .padding(.horizontal, 10)
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: OrbitSpacing.xs) {
-                    ForEach(spec.thinkingOptions, id: \.effort) { option in
-                        let isSelected = effectiveSelected == option.effort
-                        let pillTitle = option.label.isEmpty
-                            ? formatEffortLabel(effort: option.effort)
-                            : option.label
-
-                        Button {
-                            store.applyModelSelection(
-                                provider: currentProvider,
-                                modelId: spec.id,
-                                effort: option.effort
-                            )
-                        } label: {
-                            Text(pillTitle)
-                                .font(OrbitTypography.subhead(isSelected ? .semibold : .medium))
-                                .foregroundStyle(isSelected ? palette.onPrimary : palette.fgPrimary)
-                                .padding(.horizontal, OrbitSpacing.md)
-                                .padding(.vertical, 7)
-                                .background(
-                                    Capsule()
-                                        .fill(isSelected ? palette.primary : palette.elevated)
-                                )
-                                .overlay(
-                                    Capsule()
-                                        .strokeBorder(
-                                            isSelected ? palette.primary : palette.hairline,
-                                            lineWidth: 0.5
-                                        )
-                                )
-                                .frame(minHeight: OrbitSpacing.hitTarget)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
+            if options.count <= 5 {
+                Picker("Thinking", selection: effortBinding) {
+                    ForEach(options, id: \.effort) { opt in
+                        Text(thinkingSegmentTitle(for: opt, compact: useCompactSegmentLabel))
+                            .tag(opt.effort)
                     }
+                }
+                .pickerStyle(.segmented)
+            } else {
+                Menu {
+                    Picker("Thinking", selection: effortBinding) {
+                        ForEach(options, id: \.effort) { opt in
+                            Text(thinkingSegmentTitle(for: opt, compact: false))
+                                .tag(opt.effort)
+                        }
+                    }
+                } label: {
+                    HStack {
+                        Text(formatEffortLabel(effort: activeEffort))
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundStyle(palette.fgPrimary)
+                        Spacer()
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
+                    .background(
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .fill(palette.subtleFill)
+                    )
+                    .contentShape(Rectangle())
                 }
             }
         }
     }
 
-    // MARK: - 3. Models List
-
-    private var modelsSection: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.xs) {
-            Text("MODEL")
-                .font(OrbitTypography.meta(.semibold))
-                .foregroundStyle(palette.fgMuted)
-
-            VStack(spacing: OrbitSpacing.xs) {
-                ForEach(catalog.models, id: \.id) { spec in
-                    let isSelected = (currentProvider == store.selectedProvider)
-                        && (store.selectedModel == spec.id || (store.selectedModel == nil && spec.id == activeSpec?.id))
-                    let rowEffort: FfiReasoningEffort? = {
-                        guard !spec.thinkingOptions.isEmpty else { return nil }
-                        if isSelected {
-                            return store.selectedEffort ?? spec.defaultEffort ?? catalog.configuredDefaultEffort
-                        }
-                        return spec.defaultEffort ?? spec.thinkingOptions.first?.effort
-                    }()
-
-                    Button {
-                        store.applyModelSelection(
-                            provider: currentProvider,
-                            modelId: spec.id,
-                            effort: store.selectedEffort ?? spec.defaultEffort
-                        )
-                    } label: {
-                        HStack(spacing: OrbitSpacing.md) {
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Text(spec.label)
-                                        .font(.system(size: 14, weight: isSelected ? .medium : .regular))
-                                        .foregroundStyle(isSelected ? palette.fgPrimary : palette.fgPrimary.opacity(0.84))
-                                        .lineLimit(1)
-
-                                    if let rowEffort {
-                                        Text(formatEffortLabel(effort: rowEffort))
-                                            .font(.system(size: 12.5, weight: .regular))
-                                            .foregroundStyle(palette.fgMuted)
-                                            .lineLimit(1)
-                                    }
-
-                                    if spec.isDefault {
-                                        Text("Default")
-                                            .font(OrbitTypography.meta(.medium))
-                                            .foregroundStyle(palette.fgMuted)
-                                            .padding(.horizontal, OrbitSpacing.sm)
-                                            .padding(.vertical, 1)
-                                            .background(palette.subtleFill)
-                                            .clipShape(Capsule())
-                                    }
-                                }
-
-                                if !spec.description.isEmpty {
-                                    Text(spec.description)
-                                        .font(OrbitTypography.subhead(.regular))
-                                        .foregroundStyle(palette.fgSecondary)
-                                        .lineLimit(2)
-                                }
-                            }
-
-                            Spacer()
-
-                            if isSelected {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 13.5, weight: .semibold))
-                                    .foregroundStyle(palette.fgPrimary)
-                            }
-                        }
-                        .padding(.horizontal, OrbitSpacing.md)
-                        .padding(.vertical, OrbitSpacing.sm + 2)
-                        .frame(minHeight: OrbitSpacing.hitTarget)
-                        .background(isSelected ? palette.activeRowFill : palette.elevated)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(
-                                    isSelected ? palette.primary.opacity(0.28) : palette.hairline,
-                                    lineWidth: 0.5
-                                )
-                        )
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
+    private func thinkingSegmentTitle(for option: FfiThinkingOptionSpec, compact: Bool) -> String {
+        if compact {
+            return OrbitFormatters.compactEffortLabel(option.effort)
         }
+        return option.label.isEmpty ? formatEffortLabel(effort: option.effort) : option.label
+    }
+
+    private func activeEffortDescription(
+        options: [FfiThinkingOptionSpec],
+        effort: FfiReasoningEffort
+    ) -> String {
+        if let matched = options.first(where: { $0.effort == effort }),
+           let desc = matched.description, !desc.isEmpty {
+            return desc
+        }
+        return defaultEffortDescription(effort: effort)
     }
 }

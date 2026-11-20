@@ -5,7 +5,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -29,19 +28,29 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.Archive
-import androidx.compose.material.icons.outlined.Bookmark
-import androidx.compose.material.icons.outlined.BookmarkBorder
+import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Difference
+import androidx.compose.material.icons.outlined.FilterList
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.Forum
+import androidx.compose.material.icons.outlined.KeyboardArrowDown
+import androidx.compose.material.icons.outlined.MarkChatUnread
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.QrCodeScanner
-import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.SortByAlpha
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.UnfoldMore
+import androidx.compose.material.icons.outlined.WarningAmber
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
@@ -51,10 +60,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
@@ -64,16 +73,81 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.orbit.android.store.OrbitFormatters
+import dev.orbit.android.store.OrbitSidebarProjectSort
+import dev.orbit.android.store.OrbitSidebarThreadFilter
 import dev.orbit.android.store.OrbitUiState
-import dev.orbit.android.ui.stage.BreathingDot
+import dev.orbit.android.ui.theme.OrbitCompactDropdownMenu
+import dev.orbit.android.ui.theme.OrbitComposeIcon
+import dev.orbit.android.ui.theme.OrbitCopyIcon
+import dev.orbit.android.ui.theme.OrbitMenuActionRow
+import dev.orbit.android.ui.theme.OrbitMenuDivider
+import dev.orbit.android.ui.theme.OrbitMenuOptionRow
+import dev.orbit.android.ui.theme.OrbitMenuScrollContainer
+import dev.orbit.android.ui.theme.OrbitMenuSectionHeader
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 import uniffi.orbit_ffi_uniffi.FfiAgentCard
+import uniffi.orbit_ffi_uniffi.FfiClientProject
 import uniffi.orbit_ffi_uniffi.FfiConnectionState
 import uniffi.orbit_ffi_uniffi.FfiDiscoveredProject
 import uniffi.orbit_ffi_uniffi.FfiHostCard
 import uniffi.orbit_ffi_uniffi.FfiProviderKind
 import uniffi.orbit_ffi_uniffi.FfiWorkspaceSummary
+
+private const val MAX_VISIBLE_THREADS_PER_PROJECT = 5
+private const val FALLBACK_UNPINNED_DISCOVERED_LIMIT = 4
+
+private data class SidebarProjectGroup(
+    val projectId: String,
+    val pinnedProjectId: String?,
+    val name: String,
+    val primaryDir: String,
+    val branch: String?,
+    val isHomeWorkspace: Boolean,
+    val lastActivityMs: Long,
+    val threads: List<FfiAgentCard>,
+)
+
+private val HOME_USER_REGEX = Regex("^/(Users|home)/[^/]+$")
+
+private fun canonicalPathKey(path: String): String {
+    val trimmed = path.trim()
+    if (trimmed.isEmpty() || trimmed == "~") return "~"
+    if (trimmed == "/") return "/"
+    return trimmed.trimEnd('/')
+}
+
+private fun isHomePath(path: String): Boolean {
+    val norm = canonicalPathKey(path)
+    return norm == "~" || norm == "/root" || HOME_USER_REGEX.matches(norm)
+}
+
+private fun resolveWorktreeBasePath(
+    rawPath: String,
+    knownRepoBases: List<String>,
+): String {
+    val clean = canonicalPathKey(rawPath)
+    if (clean == "~" || clean == "/") return clean
+
+    val exactParent = knownRepoBases.firstOrNull { base ->
+        clean == base || clean.startsWith("$base/")
+    }
+    if (exactParent != null) return exactParent
+
+    val worktreeIdx = clean.indexOf("/worktrees/")
+    if (worktreeIdx >= 0) {
+        val after = clean.substring(worktreeIdx + "/worktrees/".length)
+        val seg = after.substringBefore('/')
+        if (seg.isNotEmpty()) {
+            val matchedRepo = knownRepoBases.firstOrNull { base ->
+                val repoName = OrbitFormatters.shortPath(base)
+                seg == repoName || seg.startsWith("$repoName-")
+            }
+            if (matchedRepo != null) return matchedRepo
+        }
+    }
+    return clean
+}
 
 private fun resolveLiveWorkspaceBranch(
     cwd: String,
@@ -85,193 +159,346 @@ private fun resolveLiveWorkspaceBranch(
     if (!liveGitBranch.isNullOrBlank() && OrbitFormatters.pathsEquivalent(cwd, activeCwd)) {
         return liveGitBranch
     }
-    discoveredProjects.firstOrNull { OrbitFormatters.pathsEquivalent(it.path, cwd) }
-        ?.gitBranch?.takeIf { it.isNotBlank() }
-        ?.let { return it }
     workspaces.firstOrNull { OrbitFormatters.pathsEquivalent(it.cwd, cwd) }
-        ?.gitBranch?.takeIf { it.isNotBlank() }
+        ?.gitBranch
+        ?.takeIf { it.isNotBlank() }
+        ?.let { return it }
+    discoveredProjects.firstOrNull { OrbitFormatters.pathsEquivalent(it.path, cwd) }
+        ?.gitBranch
+        ?.takeIf { it.isNotBlank() }
         ?.let { return it }
     return null
 }
 
-private enum class DrawerFilterChip(val label: String) {
-    ALL("All"),
-    ACTIVE("Active"),
-    APPROVALS("Approvals"),
+private fun agentTimestampMs(agent: FfiAgentCard): Long =
+    OrbitFormatters.parseRfc3339EpochMs(agent.updatedAtRfc3339) ?: 0L
+
+private fun hostStatusColor(
+    state: FfiConnectionState,
+    colors: dev.orbit.android.ui.theme.OrbitColors,
+): Color = when (state) {
+    FfiConnectionState.ONLINE_DIRECT -> colors.directAdded
+    FfiConnectionState.ONLINE_RELAY -> colors.relay
+    FfiConnectionState.CONNECTING_DIRECT, FfiConnectionState.CONNECTING_RELAY -> colors.warning
+    FfiConnectionState.DISCONNECTED -> colors.dangerRemoved
+}
+
+private fun buildUnifiedProjects(
+    ui: OrbitUiState,
+    hostProjects: List<FfiClientProject>,
+    discoveredProjects: List<FfiDiscoveredProject>,
+    workspaces: List<FfiWorkspaceSummary>,
+    agents: List<FfiAgentCard>,
+    normalizedQuery: String,
+): List<SidebarProjectGroup> {
+    val hostId = ui.selectedHostId ?: return emptyList()
+    val liveBranch = ui.gitReview?.branch
+
+    // Build list of known non-worktree repository base paths so worktrees nest cleanly under parent repos.
+    val nonWorktreeBases = linkedSetOf<String>()
+    hostProjects.forEach { proj ->
+        proj.directories.forEach { dir ->
+            val key = canonicalPathKey(dir)
+            if (!isHomePath(key) && !key.contains("/worktrees/")) {
+                nonWorktreeBases.add(key)
+            }
+        }
+    }
+    discoveredProjects.forEach { disc ->
+        val key = canonicalPathKey(disc.path)
+        if (!isHomePath(key) && !key.contains("/worktrees/")) {
+            nonWorktreeBases.add(key)
+        }
+    }
+    val orderedKnownBases = nonWorktreeBases.sortedByDescending { it.length }
+
+    // Map canonical directory path -> target pinned project group ID (if pinned)
+    val dirToPinnedProjectId = linkedMapOf<String, String>()
+    hostProjects.forEach { proj ->
+        proj.directories.forEach { dir ->
+            dirToPinnedProjectId[canonicalPathKey(dir)] = proj.projectId
+        }
+    }
+
+    // Group agents into either a pinned project or resolved base workspace path
+    val threadsByPinnedId = linkedMapOf<String, MutableList<FfiAgentCard>>()
+    val threadsByBasePath = linkedMapOf<String, MutableList<FfiAgentCard>>()
+
+    agents.forEach { agent ->
+        val resolvedBase = resolveWorktreeBasePath(agent.cwd, orderedKnownBases)
+        val pinnedMatch = dirToPinnedProjectId[canonicalPathKey(agent.cwd)]
+            ?: dirToPinnedProjectId[resolvedBase]
+        if (pinnedMatch != null) {
+            threadsByPinnedId.getOrPut(pinnedMatch) { mutableListOf() }.add(agent)
+        } else {
+            threadsByBasePath.getOrPut(resolvedBase) { mutableListOf() }.add(agent)
+        }
+    }
+
+    val rawGroups = mutableListOf<SidebarProjectGroup>()
+    val coveredBases = hashSetOf<String>()
+
+    // 1. User-pinned projects always preserved (including empty ones unless filtered out below)
+    hostProjects.forEach { proj ->
+        proj.directories.forEach { coveredBases.add(canonicalPathKey(it)) }
+        val primary = proj.directories.firstOrNull() ?: "~"
+        val groupAgents = threadsByPinnedId[proj.projectId].orEmpty()
+        val discMatch = discoveredProjects.firstOrNull { d ->
+            proj.directories.any { OrbitFormatters.pathsEquivalent(it, d.path) }
+        }
+        val maxAgentTs = groupAgents.maxOfOrNull(::agentTimestampMs) ?: 0L
+        val discTs = (discMatch?.lastModifiedUnix ?: 0L) * 1000L
+        rawGroups += SidebarProjectGroup(
+            projectId = proj.projectId,
+            pinnedProjectId = proj.projectId,
+            name = proj.name,
+            primaryDir = primary,
+            branch = resolveLiveWorkspaceBranch(
+                cwd = primary,
+                activeCwd = ui.activeCwd,
+                liveGitBranch = liveBranch,
+                discoveredProjects = discoveredProjects,
+                workspaces = workspaces,
+            ),
+            isHomeWorkspace = isHomePath(primary),
+            lastActivityMs = maxOf(maxAgentTs, discTs, proj.updatedAtMs),
+            threads = groupAgents,
+        )
+    }
+
+    // 2. Active workspaces & directories that already own conversations
+    val unpinnedDiscoveredByPath = discoveredProjects.associateBy {
+        resolveWorktreeBasePath(it.path, orderedKnownBases)
+    }
+    val candidateUnpinnedBases = linkedSetOf<String>()
+    threadsByBasePath.keys.forEach { base ->
+        if (!coveredBases.contains(base)) candidateUnpinnedBases.add(base)
+    }
+    workspaces.forEach { ws ->
+        val base = resolveWorktreeBasePath(ws.cwd, orderedKnownBases)
+        if (!coveredBases.contains(base) && !isHomePath(base)) {
+            candidateUnpinnedBases.add(base)
+        }
+    }
+    if (ui.activeCwd.isNotBlank() && !isHomePath(ui.activeCwd)) {
+        val activeBase = resolveWorktreeBasePath(ui.activeCwd, orderedKnownBases)
+        if (!coveredBases.contains(activeBase)) {
+            candidateUnpinnedBases.add(activeBase)
+        }
+    }
+
+    // 3. Fallback up to top 4 recently modified non-home discovered repos when sidebar is sparse
+    discoveredProjects
+        .asSequence()
+        .map { it to resolveWorktreeBasePath(it.path, orderedKnownBases) }
+        .filter { (_, base) -> !isHomePath(base) && !coveredBases.contains(base) }
+        .sortedByDescending { (disc, _) -> disc.lastModifiedUnix }
+        .take(FALLBACK_UNPINNED_DISCOVERED_LIMIT)
+        .forEach { (_, base) -> candidateUnpinnedBases.add(base) }
+
+    candidateUnpinnedBases.forEach { base ->
+        val groupThreads = threadsByBasePath[base].orEmpty()
+        val isHome = isHomePath(base)
+        // Skip empty Home directory entry unless active and nothing else exists
+        if (isHome && groupThreads.isEmpty()) return@forEach
+
+        val disc = unpinnedDiscoveredByPath[base]
+        val ws = workspaces.firstOrNull { OrbitFormatters.pathsEquivalent(it.cwd, base) }
+        val maxAgentTs = groupThreads.maxOfOrNull(::agentTimestampMs) ?: 0L
+        val discTs = (disc?.lastModifiedUnix ?: 0L) * 1000L
+        val displayName = when {
+            isHome -> "Workspace (~)"
+            disc?.name?.isNotBlank() == true -> disc.name
+            ws?.title?.isNotBlank() == true -> ws.title
+            else -> OrbitFormatters.shortPath(base)
+        }
+
+        rawGroups += SidebarProjectGroup(
+            projectId = "dir::$base",
+            pinnedProjectId = null,
+            name = displayName,
+            primaryDir = base,
+            branch = resolveLiveWorkspaceBranch(
+                cwd = base,
+                activeCwd = ui.activeCwd,
+                liveGitBranch = liveBranch,
+                discoveredProjects = discoveredProjects,
+                workspaces = workspaces,
+            ),
+            isHomeWorkspace = isHome,
+            lastActivityMs = maxOf(maxAgentTs, discTs),
+            threads = groupThreads,
+        )
+    }
+
+    // Apply conversation filter + search query + recent sort
+    val filteredGroups = rawGroups.mapNotNull { group ->
+        val filterPassThreads = when (ui.sidebarThreadFilter) {
+            OrbitSidebarThreadFilter.ALL -> group.threads
+            OrbitSidebarThreadFilter.ACTIVE_AND_UNREAD -> group.threads.filter { ag ->
+                ag.isAwaitingPermission || ag.isRunning || ui.isThreadUnread(hostId, ag)
+            }
+        }
+
+        val sortedThreads = filterPassThreads.sortedWith(
+            compareByDescending<FfiAgentCard> { agentTimestampMs(it) }
+                .thenByDescending { it.updatedAtRfc3339 }
+        )
+
+        val visibleThreads = if (normalizedQuery.isEmpty()) {
+            sortedThreads
+        } else {
+            val projectMatches = group.name.lowercase().contains(normalizedQuery) ||
+                group.primaryDir.lowercase().contains(normalizedQuery) ||
+                (group.branch?.lowercase()?.contains(normalizedQuery) == true)
+            val threadMatches = sortedThreads.filter { ag ->
+                ag.title.lowercase().contains(normalizedQuery) ||
+                    ag.cwd.lowercase().contains(normalizedQuery) ||
+                    ag.providerLabel.lowercase().contains(normalizedQuery) ||
+                    OrbitFormatters.providerLabel(ag.provider).lowercase().contains(normalizedQuery)
+            }
+            when {
+                threadMatches.isNotEmpty() -> threadMatches
+                projectMatches -> sortedThreads
+                else -> return@mapNotNull null
+            }
+        }
+
+        if (ui.sidebarThreadFilter == OrbitSidebarThreadFilter.ACTIVE_AND_UNREAD && visibleThreads.isEmpty()) {
+            return@mapNotNull null
+        }
+
+        val recomputedTs = maxOf(
+            group.lastActivityMs,
+            visibleThreads.maxOfOrNull(::agentTimestampMs) ?: 0L,
+        )
+        group.copy(lastActivityMs = recomputedTs, threads = visibleThreads)
+    }
+
+    // Sort projects (non-home repos & non-empty before home/empty)
+    return when (ui.sidebarProjectSort) {
+        OrbitSidebarProjectSort.RECENT -> filteredGroups.sortedWith(
+            compareBy<SidebarProjectGroup> { it.isHomeWorkspace }
+                .thenBy { it.threads.isEmpty() }
+                .thenByDescending { it.lastActivityMs }
+                .thenBy { it.name.lowercase() }
+        )
+
+        OrbitSidebarProjectSort.NAME -> filteredGroups.sortedWith(
+            compareBy<SidebarProjectGroup> { it.isHomeWorkspace }
+                .thenBy { it.name.lowercase() }
+        )
+    }
 }
 
 @Composable
 fun FleetDrawerContent(
     ui: OrbitUiState,
     onSearchQueryChange: (String) -> Unit,
+    onSetProjectSort: (OrbitSidebarProjectSort) -> Unit,
+    onSetThreadFilter: (OrbitSidebarThreadFilter) -> Unit,
+    onToggleProjectCollapsed: (String) -> Unit,
+    onTogglePinThread: (String, String) -> Unit,
     onSelectHost: (String) -> Unit,
-    onRefreshHost: () -> Unit,
+    onConnectLocalDaemon: () -> Unit,
     onSelectProjectDir: (String) -> Unit,
-    onPinProject: (name: String, directory: String) -> Unit,
+    onPinProject: (String, String) -> Unit,
     onUnpinProject: (String) -> Unit,
     onOpenDirectoryBrowser: () -> Unit,
     onSelectAgent: (String) -> Unit,
     onArchiveAgent: (String) -> Unit,
     onNewSession: () -> Unit,
-    onNewSessionInWorkspace: (cwd: String, provider: FfiProviderKind?) -> Unit,
-    onInspectGitDiffAtCwd: (cwd: String) -> Unit,
-    onOpenTerminalAtCwd: (cwd: String) -> Unit,
-    onCopiedPath: (path: String) -> Unit,
+    onNewSessionInWorkspace: (String, FfiProviderKind?) -> Unit,
+    onInspectGitDiffAtCwd: (String) -> Unit,
+    onOpenTerminalAtCwd: (String) -> Unit,
+    onCopiedPath: () -> Unit,
     onOpenPairHost: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val context = LocalContext.current
     val haptics = LocalHapticFeedback.current
+    val context = LocalContext.current
 
-    val copyPathToClipboard: (String) -> Unit = { rawPath ->
-        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        cm?.setPrimaryClip(ClipData.newPlainText("workspace_path", rawPath))
-        onCopiedPath(rawPath)
+    fun copyPathToClipboard(path: String) {
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        clipboard?.setPrimaryClip(ClipData.newPlainText("Workspace Path", path))
+        onCopiedPath()
     }
 
+    val hostId = ui.selectedHostId
     val searchQuery = ui.drawerSearchQuery
-    var activeFilter by rememberSaveable(ui.selectedHostId) { mutableStateOf(DrawerFilterChip.ALL) }
     val normalizedQuery = remember(searchQuery) { searchQuery.trim().lowercase() }
-
     val agents = ui.hostDetail?.agents.orEmpty()
-    val totalApprovalsCount = remember(agents) { agents.count { it.isAwaitingPermission } }
-
-    val queryFilteredAgents = remember(agents, normalizedQuery) {
-        if (normalizedQuery.isEmpty()) {
-            agents
-        } else {
-            agents.filter { ag ->
-                ag.title.lowercase().contains(normalizedQuery) ||
-                    ag.cwd.lowercase().contains(normalizedQuery) ||
-                    ag.providerLabel.lowercase().contains(normalizedQuery) ||
-                    OrbitFormatters.providerLabel(ag.provider).lowercase().contains(normalizedQuery)
-            }
-        }
-    }
-
-    val needsApprovalAgents = remember(queryFilteredAgents, activeFilter) {
-        when (activeFilter) {
-            DrawerFilterChip.ALL, DrawerFilterChip.APPROVALS ->
-                queryFilteredAgents.filter { it.isAwaitingPermission }
-            DrawerFilterChip.ACTIVE -> emptyList()
-        }
-    }
-    val activeAgents = remember(queryFilteredAgents, activeFilter) {
-        when (activeFilter) {
-            DrawerFilterChip.ALL -> queryFilteredAgents.filter { it.isRunning && !it.isAwaitingPermission }
-            DrawerFilterChip.ACTIVE -> queryFilteredAgents.filter { it.isRunning }
-            DrawerFilterChip.APPROVALS -> emptyList()
-        }
-    }
-    val recentAgents = remember(queryFilteredAgents, activeFilter) {
-        when (activeFilter) {
-            DrawerFilterChip.ALL -> queryFilteredAgents.filter { !it.isRunning && !it.isAwaitingPermission }
-            DrawerFilterChip.ACTIVE, DrawerFilterChip.APPROVALS -> emptyList()
-        }
-    }
-
-    val hostProjects = remember(ui.projects, ui.selectedHostId) {
-        ui.projects.filter { it.hostId == ui.selectedHostId }
-    }
-    val pinnedPaths = remember(hostProjects) {
-        hostProjects.flatMap { it.directories }.toSet()
+    val hostProjects = remember(ui.projects, hostId) {
+        ui.projects.filter { it.hostId == hostId }
     }
     val allDiscovered = ui.hostDetail?.discoveredProjects.orEmpty()
     val allWorkspaces = ui.hostDetail?.workspaces.orEmpty()
-    val liveActiveBranch = ui.gitReview?.branch
 
-    val filteredHostProjects = remember(
+    var expandedMoreProjectIds by remember(hostId) { mutableStateOf(emptySet<String>()) }
+    var filterMenuExpanded by remember { mutableStateOf(false) }
+    var hostMenuExpanded by remember { mutableStateOf(false) }
+
+    val projectGroups = remember(
+        ui.selectedHostId,
         hostProjects,
-        normalizedQuery,
-        ui.activeCwd,
-        liveActiveBranch,
         allDiscovered,
         allWorkspaces,
+        agents,
+        ui.activeCwd,
+        ui.gitReview?.branch,
+        ui.sidebarProjectSort,
+        ui.sidebarThreadFilter,
+        ui.seenSeqByThreadKey,
+        normalizedQuery,
     ) {
-        if (normalizedQuery.isEmpty()) {
-            hostProjects
+        buildUnifiedProjects(
+            ui = ui,
+            hostProjects = hostProjects,
+            discoveredProjects = allDiscovered,
+            workspaces = allWorkspaces,
+            agents = agents,
+            normalizedQuery = normalizedQuery,
+        )
+    }
+
+    val needsAttentionAgents = remember(agents, normalizedQuery) {
+        if (normalizedQuery.isNotEmpty()) {
+            emptyList()
         } else {
-            hostProjects.filter { proj ->
-                proj.name.lowercase().contains(normalizedQuery) ||
-                    proj.directories.any { dir ->
-                        val resolvedBr = resolveLiveWorkspaceBranch(
-                            cwd = dir,
-                            activeCwd = ui.activeCwd,
-                            liveGitBranch = liveActiveBranch,
-                            discoveredProjects = allDiscovered,
-                            workspaces = allWorkspaces,
-                        )
-                        dir.lowercase().contains(normalizedQuery) ||
-                            (resolvedBr?.lowercase()?.contains(normalizedQuery) == true)
-                    }
-            }
+            agents
+                .filter { it.isAwaitingPermission }
+                .sortedWith(
+                    compareByDescending<FfiAgentCard> { agentTimestampMs(it) }
+                        .thenByDescending { it.updatedAtRfc3339 }
+                )
         }
     }
-    val extraWorkspaces = remember(allWorkspaces, pinnedPaths, allDiscovered) {
-        allWorkspaces.filter { ws ->
-            pinnedPaths.none { OrbitFormatters.pathsEquivalent(it, ws.cwd) } &&
-                allDiscovered.none { OrbitFormatters.pathsEquivalent(it.path, ws.cwd) }
-        }
-    }
-    val filteredExtraWorkspaces = remember(
-        extraWorkspaces,
-        normalizedQuery,
-        ui.activeCwd,
-        liveActiveBranch,
-        allDiscovered,
-        allWorkspaces,
-    ) {
-        if (normalizedQuery.isEmpty()) {
-            extraWorkspaces
+
+    val pinnedAgents = remember(hostId, agents, ui.pinnedThreadKeys, ui.sidebarThreadFilter, ui.seenSeqByThreadKey, normalizedQuery) {
+        if (hostId == null || normalizedQuery.isNotEmpty()) {
+            emptyList()
         } else {
-            extraWorkspaces.filter { ws ->
-                val resolvedBr = resolveLiveWorkspaceBranch(
-                    cwd = ws.cwd,
-                    activeCwd = ui.activeCwd,
-                    liveGitBranch = liveActiveBranch,
-                    discoveredProjects = allDiscovered,
-                    workspaces = allWorkspaces,
+            agents
+                .filter { ag ->
+                    ui.isThreadPinned(hostId, ag.agentId) &&
+                        (ui.sidebarThreadFilter == OrbitSidebarThreadFilter.ALL ||
+                            ag.isAwaitingPermission ||
+                            ag.isRunning ||
+                            ui.isThreadUnread(hostId, ag))
+                }
+                .sortedWith(
+                    compareByDescending<FfiAgentCard> { agentTimestampMs(it) }
+                        .thenByDescending { it.updatedAtRfc3339 }
                 )
-                ws.title.lowercase().contains(normalizedQuery) ||
-                    ws.cwd.lowercase().contains(normalizedQuery) ||
-                    (resolvedBr?.lowercase()?.contains(normalizedQuery) == true)
-            }
         }
     }
-    val discoveredRepos = remember(
-        allDiscovered,
-        pinnedPaths,
-        normalizedQuery,
-        ui.activeCwd,
-        liveActiveBranch,
-        allWorkspaces,
-    ) {
-        allDiscovered
-            .filterNot { repo -> pinnedPaths.any { OrbitFormatters.pathsEquivalent(it, repo.path) } }
-            .filter { repo ->
-                val resolvedBr = resolveLiveWorkspaceBranch(
-                    cwd = repo.path,
-                    activeCwd = ui.activeCwd,
-                    liveGitBranch = liveActiveBranch,
-                    discoveredProjects = allDiscovered,
-                    workspaces = allWorkspaces,
-                )
-                normalizedQuery.isEmpty() ||
-                    repo.name.lowercase().contains(normalizedQuery) ||
-                    repo.path.lowercase().contains(normalizedQuery) ||
-                    (resolvedBr?.lowercase()?.contains(normalizedQuery) == true)
-            }
-            .take(12)
-    }
-    val showProjectsSection = activeFilter == DrawerFilterChip.ALL ||
-        (normalizedQuery.isNotEmpty() && (
-            filteredHostProjects.isNotEmpty() ||
-                filteredExtraWorkspaces.isNotEmpty() ||
-                discoveredRepos.isNotEmpty()
-            ))
+
+    val hasActiveFilterOrCustomSort =
+        ui.sidebarProjectSort != OrbitSidebarProjectSort.RECENT ||
+            ui.sidebarThreadFilter != OrbitSidebarThreadFilter.ALL
 
     Column(
         modifier = modifier
@@ -280,505 +507,608 @@ fun FleetDrawerContent(
             .statusBarsPadding()
             .navigationBarsPadding(),
     ) {
-        // Drawer Top Header
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(min = OrbitSpacing.topBarHeight)
-                .padding(horizontal = OrbitSpacing.lg),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Text(
-                text = "Orbit",
-                style = typography.title,
-                color = colors.fgPrimary,
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (ui.selectedHostId != null) {
-                    Box(
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clip(CircleShape)
-                            .clickable {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onRefreshHost()
-                            },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Refresh,
-                            contentDescription = "Refresh host",
-                            tint = colors.fgSecondary,
-                            modifier = Modifier.size(OrbitSpacing.iconSm),
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clip(CircleShape)
-                            .clickable {
-                                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onNewSession()
-                            },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Add,
-                            contentDescription = "New Session",
-                            tint = colors.fgPrimary,
-                            modifier = Modifier.size(OrbitSpacing.iconMd),
-                        )
-                    }
-                }
-            }
-        }
-
-        HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
-
-        // Scrollable Fleet, Workspaces, and Grouped Sessions
-        LazyColumn(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.md),
-            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-        ) {
-            // 1. Multi-Host Fleet Switcher
-            item(key = "fleet_section_header") {
-                DrawerSectionLabel(title = "Hosts (${ui.hosts.size})")
-            }
-
-            if (ui.hosts.isEmpty()) {
-                item(key = "fleet_empty") {
-                    Text(
-                        text = "No hosts paired yet.",
-                        style = typography.subhead,
-                        color = colors.fgMuted,
-                        modifier = Modifier.padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                    )
-                }
-            } else {
-                items(ui.hosts, key = { it.hostId }) { host ->
-                    HostSwitcherCard(
-                        host = host,
-                        selected = host.hostId == ui.selectedHostId,
-                        onClick = {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onSelectHost(host.hostId)
-                        },
-                    )
-                }
-            }
-
-            // 2. Search & Filter Strip + Projects & Grouped Sessions
-            if (ui.selectedHostId != null) {
-                item(key = "drawer_search_and_filters") {
-                    Spacer(modifier = Modifier.height(OrbitSpacing.sm))
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-                    ) {
-                        val searchShape = RoundedCornerShape(OrbitSpacing.sm)
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = 44.dp)
-                                .clip(searchShape)
-                                .background(colors.subtleFill, searchShape)
-                                .border(OrbitSpacing.hairline, colors.hairline, searchShape)
-                                .padding(start = OrbitSpacing.sm),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.Search,
-                                contentDescription = null,
-                                tint = colors.fgMuted,
-                                modifier = Modifier.size(OrbitSpacing.iconSm),
-                            )
-                            Box(modifier = Modifier.weight(1f)) {
-                                if (searchQuery.isEmpty()) {
-                                    Text(
-                                        text = "Search sessions or repos…",
-                                        style = typography.subhead,
-                                        color = colors.fgMuted,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                                BasicTextField(
-                                    value = searchQuery,
-                                    onValueChange = { onSearchQueryChange(it) },
-                                    singleLine = true,
-                                    textStyle = typography.subhead.copy(color = colors.fgPrimary),
-                                    cursorBrush = SolidColor(colors.primary),
-                                    modifier = Modifier.fillMaxWidth(),
-                                )
-                            }
-                            if (searchQuery.isNotEmpty()) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(44.dp)
-                                        .clip(CircleShape)
-                                        .clickable {
-                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            onSearchQueryChange("")
-                                        },
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Outlined.Close,
-                                        contentDescription = "Clear search",
-                                        tint = colors.fgMuted,
-                                        modifier = Modifier.size(OrbitSpacing.iconSm),
-                                    )
-                                }
-                            } else {
-                                Spacer(modifier = Modifier.width(OrbitSpacing.sm))
-                            }
-                        }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            DrawerFilterChip.entries.forEach { chip ->
-                                val selected = activeFilter == chip
-                                val pillShape = RoundedCornerShape(OrbitSpacing.sm)
-                                val hasWarningDot = chip == DrawerFilterChip.APPROVALS && totalApprovalsCount > 0
-                                val borderColor = when {
-                                    selected && hasWarningDot -> colors.warning.copy(alpha = 0.7f)
-                                    selected -> colors.primary.copy(alpha = 0.65f)
-                                    else -> colors.hairline
-                                }
-                                val labelColor = when {
-                                    selected && hasWarningDot -> colors.warning
-                                    selected -> colors.primary
-                                    else -> colors.fgSecondary
-                                }
-                                Row(
-                                    modifier = Modifier
-                                        .heightIn(min = OrbitSpacing.xxl)
-                                        .clip(pillShape)
-                                        .background(if (selected) colors.elevated else Color.Transparent, pillShape)
-                                        .border(OrbitSpacing.hairline, borderColor, pillShape)
-                                        .clickable {
-                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            activeFilter = chip
-                                        }
-                                        .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                                ) {
-                                    if (hasWarningDot) {
-                                        Box(
-                                            modifier = Modifier
-                                                .size(6.dp)
-                                                .background(colors.warning, CircleShape)
-                                        )
-                                    }
-                                    Text(
-                                        text = chip.label,
-                                        style = if (selected) typography.metaSemiBold else typography.metaMedium,
-                                        color = labelColor,
-                                        maxLines = 1,
-                                        softWrap = false,
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (showProjectsSection) {
-                    item(key = "projects_header") {
-                        Spacer(modifier = Modifier.height(OrbitSpacing.sm))
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(
-                                text = "Projects",
-                                style = typography.metaSemiBold,
-                                color = colors.fgMuted,
-                            )
-                            Row(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(OrbitSpacing.xs))
-                                    .clickable { onOpenDirectoryBrowser() }
-                                    .padding(horizontal = OrbitSpacing.xs, vertical = OrbitSpacing.xs),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.FolderOpen,
-                                    contentDescription = null,
-                                    tint = colors.primary,
-                                    modifier = Modifier.size(OrbitSpacing.iconSm),
-                                )
-                                Text(
-                                    text = "Browse",
-                                    style = typography.metaMedium,
-                                    color = colors.primary,
-                                )
-                            }
-                        }
-                    }
-
-                    // Pinned Projects
-                    items(filteredHostProjects, key = { "pin_${it.projectId}" }) { proj ->
-                        val primaryDir = proj.directories.firstOrNull() ?: "~"
-                        val isCurrent = OrbitFormatters.pathsEquivalent(primaryDir, ui.activeCwd)
-                        val liveBranch = resolveLiveWorkspaceBranch(
-                            cwd = primaryDir,
-                            activeCwd = ui.activeCwd,
-                            liveGitBranch = liveActiveBranch,
-                            discoveredProjects = allDiscovered,
-                            workspaces = allWorkspaces,
-                        )
-                        WorkspaceDrawerRow(
-                            title = proj.name,
-                            subtitle = liveBranch?.let { "$it · ${OrbitFormatters.shortPath(primaryDir)}" }
-                                ?: primaryDir,
-                            useCodeSubtitle = true,
-                            isCurrent = isCurrent,
-                            isPinned = true,
-                            onSelect = { onSelectProjectDir(primaryDir) },
-                            onNewSessionHere = { onNewSessionInWorkspace(primaryDir, null) },
-                            onTogglePin = { onUnpinProject(proj.projectId) },
-                            onInspectGitDiff = { onInspectGitDiffAtCwd(primaryDir) },
-                            onOpenTerminalHere = { onOpenTerminalAtCwd(primaryDir) },
-                            onCopyPath = { copyPathToClipboard(primaryDir) },
-                        )
-                    }
-
-                    // Active Workspaces / Worktrees not in pinned or discovered
-                    items(filteredExtraWorkspaces, key = { "ws_${it.workspaceId}" }) { ws ->
-                        val wsTitle = ws.title.ifBlank { OrbitFormatters.shortPath(ws.cwd) }
-                        val isCurrent = OrbitFormatters.pathsEquivalent(ws.cwd, ui.activeCwd)
-                        val liveBranch = resolveLiveWorkspaceBranch(
-                            cwd = ws.cwd,
-                            activeCwd = ui.activeCwd,
-                            liveGitBranch = liveActiveBranch,
-                            discoveredProjects = allDiscovered,
-                            workspaces = allWorkspaces,
-                        )
-                        WorkspaceDrawerRow(
-                            title = wsTitle,
-                            subtitle = liveBranch,
-                            useCodeSubtitle = false,
-                            isCurrent = isCurrent,
-                            isPinned = false,
-                            onSelect = { onSelectProjectDir(ws.cwd) },
-                            onNewSessionHere = { onNewSessionInWorkspace(ws.cwd, null) },
-                            onTogglePin = { onPinProject(wsTitle, ws.cwd) },
-                            onInspectGitDiff = { onInspectGitDiffAtCwd(ws.cwd) },
-                            onOpenTerminalHere = { onOpenTerminalAtCwd(ws.cwd) },
-                            onCopyPath = { copyPathToClipboard(ws.cwd) },
-                        )
-                    }
-
-                    // Discovered Git Repos
-                    items(discoveredRepos, key = { "disc_${it.path}" }) { repo ->
-                        val isCurrent = OrbitFormatters.pathsEquivalent(repo.path, ui.activeCwd)
-                        val liveBranch = resolveLiveWorkspaceBranch(
-                            cwd = repo.path,
-                            activeCwd = ui.activeCwd,
-                            liveGitBranch = liveActiveBranch,
-                            discoveredProjects = allDiscovered,
-                            workspaces = allWorkspaces,
-                        )
-                        WorkspaceDrawerRow(
-                            title = repo.name,
-                            subtitle = liveBranch,
-                            useCodeSubtitle = false,
-                            isCurrent = isCurrent,
-                            isPinned = false,
-                            onSelect = { onSelectProjectDir(repo.path) },
-                            onNewSessionHere = { onNewSessionInWorkspace(repo.path, null) },
-                            onTogglePin = { onPinProject(repo.name, repo.path) },
-                            onInspectGitDiff = { onInspectGitDiffAtCwd(repo.path) },
-                            onOpenTerminalHere = { onOpenTerminalAtCwd(repo.path) },
-                            onCopyPath = { copyPathToClipboard(repo.path) },
-                        )
-                    }
-                }
-
-                // 3. Sessions: Needs Approval / Active / Recent
-                if (needsApprovalAgents.isNotEmpty()) {
-                    item(key = "sec_needs_approval") {
-                        Spacer(modifier = Modifier.height(OrbitSpacing.sm))
-                        DrawerSectionLabel(
-                            title = "Needs Approval (${needsApprovalAgents.size})",
-                            accent = colors.warning,
-                        )
-                    }
-                    items(needsApprovalAgents, key = { "appr_${it.agentId}" }) { ag ->
-                        AgentSessionDrawerRow(
-                            agent = ag,
-                            selected = !ui.isNewSessionMode && ag.agentId == ui.selectedAgentId,
-                            onSelect = { onSelectAgent(ag.agentId) },
-                            onNewSessionInWorkspace = { onNewSessionInWorkspace(ag.cwd, ag.provider) },
-                            onOpenTerminalHere = { onOpenTerminalAtCwd(ag.cwd) },
-                            onCopyWorkspacePath = { copyPathToClipboard(ag.cwd) },
-                            onArchive = { onArchiveAgent(ag.agentId) },
-                        )
-                    }
-                }
-
-                if (activeAgents.isNotEmpty()) {
-                    item(key = "sec_active") {
-                        Spacer(modifier = Modifier.height(OrbitSpacing.sm))
-                        DrawerSectionLabel(title = "Active (${activeAgents.size})")
-                    }
-                    items(activeAgents, key = { "act_${it.agentId}" }) { ag ->
-                        AgentSessionDrawerRow(
-                            agent = ag,
-                            selected = !ui.isNewSessionMode && ag.agentId == ui.selectedAgentId,
-                            onSelect = { onSelectAgent(ag.agentId) },
-                            onNewSessionInWorkspace = { onNewSessionInWorkspace(ag.cwd, ag.provider) },
-                            onOpenTerminalHere = { onOpenTerminalAtCwd(ag.cwd) },
-                            onCopyWorkspacePath = { copyPathToClipboard(ag.cwd) },
-                            onArchive = { onArchiveAgent(ag.agentId) },
-                        )
-                    }
-                }
-
-                if (activeFilter == DrawerFilterChip.ALL) {
-                    item(key = "sec_recent") {
-                        Spacer(modifier = Modifier.height(OrbitSpacing.sm))
-                        DrawerSectionLabel(title = "Recent (${recentAgents.size})")
-                    }
-                }
-
-                val noMatchingSessions = recentAgents.isEmpty() &&
-                    activeAgents.isEmpty() &&
-                    needsApprovalAgents.isEmpty()
-
-                if (noMatchingSessions) {
-                    item(key = "empty_sessions") {
-                        val isFiltered = normalizedQuery.isNotEmpty() || activeFilter != DrawerFilterChip.ALL
-                        val emptyHint = when {
-                            normalizedQuery.isNotEmpty() -> "No matching sessions."
-                            activeFilter == DrawerFilterChip.ACTIVE -> "No active sessions right now."
-                            activeFilter == DrawerFilterChip.APPROVALS -> "No pending approvals."
-                            else -> "No sessions yet. Start one from the composer."
-                        }
-                        Column(
-                            modifier = Modifier.padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-                            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-                        ) {
-                            Text(
-                                text = emptyHint,
-                                style = typography.meta,
-                                color = colors.fgMuted,
-                            )
-                            if (isFiltered) {
-                                Text(
-                                    text = "Reset filters",
-                                    style = typography.metaMedium,
-                                    color = colors.primary,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(OrbitSpacing.xs))
-                                        .clickable {
-                                            onSearchQueryChange("")
-                                            activeFilter = DrawerFilterChip.ALL
-                                        }
-                                        .padding(vertical = OrbitSpacing.xs),
-                                )
-                            }
-                        }
-                    }
-                } else {
-                    items(recentAgents, key = { "rec_${it.agentId}" }) { ag ->
-                        AgentSessionDrawerRow(
-                            agent = ag,
-                            selected = !ui.isNewSessionMode && ag.agentId == ui.selectedAgentId,
-                            onSelect = { onSelectAgent(ag.agentId) },
-                            onNewSessionInWorkspace = { onNewSessionInWorkspace(ag.cwd, ag.provider) },
-                            onOpenTerminalHere = { onOpenTerminalAtCwd(ag.cwd) },
-                            onCopyWorkspacePath = { copyPathToClipboard(ag.cwd) },
-                            onArchive = { onArchiveAgent(ag.agentId) },
-                        )
-                    }
-                }
-            }
-        }
-
-        HorizontalDivider(thickness = OrbitSpacing.hairline, color = colors.hairline)
-
-        // Bottom Actions: Pair Host + Settings (concise, non-truncating)
+        // 1. Single-Row M3 Top Bar: [ Search Pill ] + [ Quick Compose Circle ]
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+            verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
         ) {
-            val btnShape = RoundedCornerShape(OrbitSpacing.md)
             Row(
                 modifier = Modifier
                     .weight(1f)
-                    .heightIn(min = OrbitSpacing.touchTarget)
-                    .clip(btnShape)
-                    .background(colors.subtleFill, btnShape)
-                    .border(OrbitSpacing.hairline, colors.hairline, btnShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onOpenPairHost()
-                    }
-                    .padding(horizontal = OrbitSpacing.sm),
+                    .heightIn(min = 44.dp)
+                    .clip(RoundedCornerShape(22.dp))
+                    .background(colors.subtleFill)
+                    .padding(start = OrbitSpacing.md, end = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
+                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
             ) {
                 Icon(
-                    imageVector = Icons.Outlined.QrCodeScanner,
+                    imageVector = Icons.Outlined.Search,
                     contentDescription = null,
+                    tint = colors.fgMuted,
+                    modifier = Modifier.size(18.dp),
+                )
+                Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                    if (searchQuery.isEmpty()) {
+                        Text(
+                            text = "Search",
+                            style = typography.subhead,
+                            color = colors.fgMuted,
+                            maxLines = 1,
+                        )
+                    }
+                    BasicTextField(
+                        value = searchQuery,
+                        onValueChange = onSearchQueryChange,
+                        singleLine = true,
+                        textStyle = typography.subhead.copy(color = colors.fgPrimary),
+                        cursorBrush = SolidColor(colors.primary),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                if (searchQuery.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .clickable { onSearchQueryChange("") },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Close,
+                            contentDescription = "Clear search",
+                            tint = colors.fgMuted,
+                            modifier = Modifier.size(16.dp),
+                        )
+                    }
+                }
+            }
+
+            val canCompose = ui.selectedHostId != null
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(colors.subtleFill)
+                    .alpha(if (canCompose) 1f else 0.45f)
+                    .clickable(enabled = canCompose) {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onNewSession()
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = OrbitComposeIcon,
+                    contentDescription = "New session",
                     tint = colors.fgPrimary,
                     modifier = Modifier.size(OrbitSpacing.iconSm),
                 )
-                Spacer(modifier = Modifier.width(OrbitSpacing.xs))
-                Text(
-                    text = "Pair Host",
-                    style = typography.subheadMedium,
-                    color = colors.fgPrimary,
-                    maxLines = 1,
-                    softWrap = false,
-                )
             }
+        }
 
-            Row(
+        // 2. Unified Tree Scrollable Area
+        if (ui.hosts.isEmpty()) {
+            Box(
                 modifier = Modifier
                     .weight(1f)
-                    .heightIn(min = OrbitSpacing.touchTarget)
-                    .clip(btnShape)
-                    .background(colors.subtleFill, btnShape)
-                    .border(OrbitSpacing.hairline, colors.hairline, btnShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onOpenSettings()
+                    .fillMaxWidth()
+                    .padding(OrbitSpacing.lg),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(colors.elevated)
+                        .padding(OrbitSpacing.lg),
+                    verticalArrangement = Arrangement.spacedBy(OrbitSpacing.md),
+                ) {
+                    Text(
+                        text = "No Hosts Paired",
+                        style = typography.bodySemiBold,
+                        color = colors.fgPrimary,
+                    )
+                    Text(
+                        text = "Pair a remote Orbit daemon via QR code or connect a local daemon to browse repositories and sessions.",
+                        style = typography.subhead,
+                        color = colors.fgSecondary,
+                    )
+                    if (ui.localDaemonUri != null) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 44.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(colors.primary)
+                                .clickable { onConnectLocalDaemon() }
+                                .padding(horizontal = OrbitSpacing.md),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center,
+                        ) {
+                            Text(
+                                text = "Connect Local Daemon",
+                                style = typography.subheadSemiBold,
+                                color = colors.onPrimary,
+                            )
+                        }
                     }
-                    .padding(horizontal = OrbitSpacing.sm),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 44.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colors.subtleFill)
+                            .clickable { onOpenPairHost() }
+                            .padding(horizontal = OrbitSpacing.md),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center,
+                    ) {
+                        Text(
+                            text = "Pair Remote Host (QR / URI)",
+                            style = typography.subheadSemiBold,
+                            color = colors.fgPrimary,
+                        )
+                    }
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentPadding = PaddingValues(
+                    top = OrbitSpacing.xs,
+                    bottom = OrbitSpacing.md,
+                ),
+            ) {
+                // Conditional Needs Attention
+                if (needsAttentionAgents.isNotEmpty() && hostId != null) {
+                    item(key = "sec_needs_attention") {
+                        DrawerSectionHeaderRow(
+                            title = "Needs Attention",
+                            accent = colors.warning,
+                        )
+                    }
+                    items(needsAttentionAgents, key = { "attn_${it.agentId}" }) { agent ->
+                        ConversationTreeRow(
+                            agent = agent,
+                            selected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId,
+                            isUnread = ui.isThreadUnread(hostId, agent),
+                            isPinned = ui.isThreadPinned(hostId, agent.agentId),
+                            showWorkspaceHint = true,
+                            indentStart = 12.dp,
+                            onSelect = { onSelectAgent(agent.agentId) },
+                            onTogglePin = { onTogglePinThread(hostId, agent.agentId) },
+                            onNewSessionInWorkspace = { onNewSessionInWorkspace(agent.cwd, agent.provider) },
+                            onInspectGitDiff = { onInspectGitDiffAtCwd(agent.cwd) },
+                            onOpenTerminalHere = { onOpenTerminalAtCwd(agent.cwd) },
+                            onCopyWorkspacePath = { copyPathToClipboard(agent.cwd) },
+                            onArchive = { onArchiveAgent(agent.agentId) },
+                        )
+                    }
+                }
+
+                // Conditional Pinned Conversations
+                if (pinnedAgents.isNotEmpty() && hostId != null) {
+                    item(key = "sec_pinned") {
+                        Spacer(modifier = Modifier.height(OrbitSpacing.sm))
+                        DrawerSectionHeaderRow(title = "Pinned")
+                    }
+                    items(pinnedAgents, key = { "pin_${it.agentId}" }) { agent ->
+                        ConversationTreeRow(
+                            agent = agent,
+                            selected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId,
+                            isUnread = ui.isThreadUnread(hostId, agent),
+                            isPinned = true,
+                            showWorkspaceHint = true,
+                            indentStart = 12.dp,
+                            onSelect = { onSelectAgent(agent.agentId) },
+                            onTogglePin = { onTogglePinThread(hostId, agent.agentId) },
+                            onNewSessionInWorkspace = { onNewSessionInWorkspace(agent.cwd, agent.provider) },
+                            onInspectGitDiff = { onInspectGitDiffAtCwd(agent.cwd) },
+                            onOpenTerminalHere = { onOpenTerminalAtCwd(agent.cwd) },
+                            onCopyWorkspacePath = { copyPathToClipboard(agent.cwd) },
+                            onArchive = { onArchiveAgent(agent.agentId) },
+                        )
+                    }
+                }
+
+                // Projects Header Row: "Projects" + [ Filter/Sort ] + [ Open Folder ]
+                item(key = "sec_projects_header") {
+                    if (needsAttentionAgents.isNotEmpty() || pinnedAgents.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(OrbitSpacing.sm))
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = OrbitSpacing.lg, end = OrbitSpacing.xs),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "Projects",
+                            style = typography.metaMedium,
+                            color = colors.fgMuted,
+                            modifier = Modifier.weight(1f),
+                        )
+
+                        Box {
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clip(CircleShape)
+                                    .clickable { filterMenuExpanded = true },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.FilterList,
+                                    contentDescription = "Sort and filter conversations",
+                                    tint = if (hasActiveFilterOrCustomSort) colors.primary else colors.fgSecondary,
+                                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                                )
+                            }
+                            OrbitCompactDropdownMenu(
+                                expanded = filterMenuExpanded,
+                                onDismissRequest = { filterMenuExpanded = false },
+                                width = 232.dp,
+                            ) {
+                                OrbitMenuSectionHeader(title = "Sort by")
+                                OrbitSidebarProjectSort.entries.forEach { sort ->
+                                    OrbitMenuOptionRow(
+                                        title = sort.label,
+                                        icon = when (sort) {
+                                            OrbitSidebarProjectSort.RECENT -> Icons.Outlined.Schedule
+                                            OrbitSidebarProjectSort.NAME -> Icons.Outlined.SortByAlpha
+                                        },
+                                        selected = ui.sidebarProjectSort == sort,
+                                        onClick = {
+                                            filterMenuExpanded = false
+                                            onSetProjectSort(sort)
+                                        },
+                                    )
+                                }
+                                OrbitMenuDivider()
+                                OrbitMenuSectionHeader(title = "Show")
+                                OrbitSidebarThreadFilter.entries.forEach { filter ->
+                                    OrbitMenuOptionRow(
+                                        title = filter.label,
+                                        icon = when (filter) {
+                                            OrbitSidebarThreadFilter.ALL -> Icons.Outlined.Forum
+                                            OrbitSidebarThreadFilter.ACTIVE_AND_UNREAD -> Icons.Outlined.MarkChatUnread
+                                        },
+                                        selected = ui.sidebarThreadFilter == filter,
+                                        onClick = {
+                                            filterMenuExpanded = false
+                                            onSetThreadFilter(filter)
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clip(CircleShape)
+                                .alpha(if (hostId != null) 1f else 0.4f)
+                                .clickable(enabled = hostId != null) { onOpenDirectoryBrowser() },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.CreateNewFolder,
+                                contentDescription = "Open remote folder",
+                                tint = colors.fgSecondary,
+                                modifier = Modifier.size(OrbitSpacing.iconSm),
+                            )
+                        }
+                    }
+                }
+
+                // Projects → Conversations Tree
+                if (projectGroups.isEmpty()) {
+                    item(key = "empty_projects") {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = OrbitSpacing.lg, vertical = OrbitSpacing.md),
+                            verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                        ) {
+                            val emptyMessage = when {
+                                normalizedQuery.isNotEmpty() -> "No matching projects or conversations."
+                                ui.sidebarThreadFilter == OrbitSidebarThreadFilter.ACTIVE_AND_UNREAD ->
+                                    "No active or unread conversations."
+                                else -> "No repositories discovered yet."
+                            }
+                            Text(
+                                text = emptyMessage,
+                                style = typography.subhead,
+                                color = colors.fgMuted,
+                            )
+                            if (normalizedQuery.isNotEmpty()) {
+                                Text(
+                                    text = "Clear search",
+                                    style = typography.subheadSemiBold,
+                                    color = colors.primary,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable { onSearchQueryChange("") }
+                                        .padding(vertical = 6.dp),
+                                )
+                            } else if (ui.sidebarThreadFilter != OrbitSidebarThreadFilter.ALL) {
+                                Text(
+                                    text = "Show all conversations",
+                                    style = typography.subheadSemiBold,
+                                    color = colors.primary,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable { onSetThreadFilter(OrbitSidebarThreadFilter.ALL) }
+                                        .padding(vertical = 6.dp),
+                                )
+                            }
+                        }
+                    }
+                } else if (hostId != null) {
+                    projectGroups.forEach { group ->
+                        val isCollapsed = normalizedQuery.isEmpty() &&
+                            ui.collapsedProjectIds.contains(group.projectId)
+                        val isActiveProject = OrbitFormatters.pathsEquivalent(group.primaryDir, ui.activeCwd)
+
+                        item(key = "proj_${group.projectId}") {
+                            ProjectTreeHeaderRow(
+                                group = group,
+                                isCollapsed = isCollapsed,
+                                isActiveWorkspace = isActiveProject && ui.isNewSessionMode,
+                                onToggleCollapse = { onToggleProjectCollapsed(group.projectId) },
+                                onNewSessionHere = { onNewSessionInWorkspace(group.primaryDir, null) },
+                                onSelectWorkspace = { onSelectProjectDir(group.primaryDir) },
+                                onTogglePin = {
+                                    val pinnedId = group.pinnedProjectId
+                                    if (pinnedId != null) {
+                                        onUnpinProject(pinnedId)
+                                    } else {
+                                        onPinProject(group.name, group.primaryDir)
+                                    }
+                                },
+                                onInspectGitDiff = { onInspectGitDiffAtCwd(group.primaryDir) },
+                                onOpenTerminalHere = { onOpenTerminalAtCwd(group.primaryDir) },
+                                onCopyPath = { copyPathToClipboard(group.primaryDir) },
+                            )
+                        }
+
+                        if (!isCollapsed) {
+                            val isMoreExpanded = normalizedQuery.isNotEmpty() ||
+                                expandedMoreProjectIds.contains(group.projectId)
+                            val visibleThreads = if (isMoreExpanded) {
+                                group.threads
+                            } else {
+                                group.threads.take(MAX_VISIBLE_THREADS_PER_PROJECT)
+                            }
+                            val hiddenCount = (group.threads.size - MAX_VISIBLE_THREADS_PER_PROJECT).coerceAtLeast(0)
+
+                            items(visibleThreads, key = { "thread_${group.projectId}_${it.agentId}" }) { agent ->
+                                ConversationTreeRow(
+                                    agent = agent,
+                                    selected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId,
+                                    isUnread = ui.isThreadUnread(hostId, agent),
+                                    isPinned = ui.isThreadPinned(hostId, agent.agentId),
+                                    showWorkspaceHint = false,
+                                    indentStart = 20.dp,
+                                    onSelect = { onSelectAgent(agent.agentId) },
+                                    onTogglePin = { onTogglePinThread(hostId, agent.agentId) },
+                                    onNewSessionInWorkspace = { onNewSessionInWorkspace(agent.cwd, agent.provider) },
+                                    onInspectGitDiff = { onInspectGitDiffAtCwd(agent.cwd) },
+                                    onOpenTerminalHere = { onOpenTerminalAtCwd(agent.cwd) },
+                                    onCopyWorkspacePath = { copyPathToClipboard(agent.cwd) },
+                                    onArchive = { onArchiveAgent(agent.agentId) },
+                                )
+                            }
+
+                            if (hiddenCount > 0) {
+                                item(key = "more_${group.projectId}") {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = OrbitSpacing.sm)
+                                            .heightIn(min = 44.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .clickable {
+                                                expandedMoreProjectIds = if (isMoreExpanded) {
+                                                    expandedMoreProjectIds - group.projectId
+                                                } else {
+                                                    expandedMoreProjectIds + group.projectId
+                                                }
+                                            }
+                                            .padding(start = 42.dp, end = OrbitSpacing.md),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Text(
+                                            text = if (isMoreExpanded) "Show less" else "Show $hiddenCount more…",
+                                            style = typography.metaMedium,
+                                            color = colors.fgMuted,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Thumb-Zone Bottom Utility Bar: [ Host Switcher Pill ] + [ Settings Circle ]
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+        ) {
+            Box(modifier = Modifier.weight(1f)) {
+                val activeHost = ui.selectedHost
+                val dotColor = if (activeHost != null) {
+                    hostStatusColor(activeHost.connectionState, colors)
+                } else {
+                    colors.fgMuted
+                }
+                val statusSummary = if (activeHost != null) {
+                    val connLabel = OrbitFormatters.topBarConnectionLabel(
+                        activeHost.connectionState,
+                        activeHost.viaSshTunnel,
+                    )
+                    val ping = activeHost.lastPingMs?.let { " · ${it}ms" }.orEmpty()
+                    "$connLabel$ping"
+                } else {
+                    "Tap to pair host"
+                }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 44.dp)
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(colors.subtleFill)
+                        .clickable {
+                            if (ui.hosts.isEmpty()) {
+                                onOpenPairHost()
+                            } else {
+                                hostMenuExpanded = true
+                            }
+                        }
+                        .padding(horizontal = OrbitSpacing.md, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(dotColor),
+                    )
+                    Text(
+                        text = activeHost?.displayName ?: "No Host",
+                        style = typography.subheadSemiBold,
+                        color = colors.fgPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = statusSummary,
+                        style = typography.meta,
+                        color = colors.fgMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (ui.otherHostsPendingApprovals > 0u) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(colors.warning.copy(alpha = 0.18f))
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
+                        ) {
+                            Text(
+                                text = ui.otherHostsPendingApprovals.toString(),
+                                style = typography.metaSemiBold,
+                                color = colors.warning,
+                            )
+                        }
+                    }
+                    Icon(
+                        imageVector = Icons.Outlined.UnfoldMore,
+                        contentDescription = "Switch host",
+                        tint = colors.fgMuted,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+
+                OrbitCompactDropdownMenu(
+                    expanded = hostMenuExpanded,
+                    onDismissRequest = { hostMenuExpanded = false },
+                    width = 264.dp,
+                ) {
+                    OrbitMenuSectionHeader(title = "Hosts")
+                    OrbitMenuScrollContainer(maxHeight = 220.dp) {
+                        ui.hosts.forEach { host ->
+                            val isSelected = host.hostId == ui.selectedHostId
+                            val hostDot = hostStatusColor(host.connectionState, colors)
+                            val hostSub = buildString {
+                                append(OrbitFormatters.topBarConnectionLabel(host.connectionState, host.viaSshTunnel))
+                                host.lastPingMs?.let { append(" · ${it}ms") }
+                            }
+                            OrbitMenuOptionRow(
+                                title = host.displayName,
+                                subtitle = hostSub,
+                                selected = isSelected,
+                                leading = {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(7.dp)
+                                            .clip(CircleShape)
+                                            .background(hostDot),
+                                    )
+                                },
+                                trailingBadge = if (host.pendingApprovalCount > 0u) {
+                                    {
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(CircleShape)
+                                                .background(colors.warning.copy(alpha = 0.16f))
+                                                .padding(horizontal = 6.dp, vertical = 1.dp),
+                                        ) {
+                                            Text(
+                                                text = host.pendingApprovalCount.toString(),
+                                                style = typography.metaSemiBold,
+                                                color = colors.warning,
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    null
+                                },
+                                onClick = {
+                                    hostMenuExpanded = false
+                                    onSelectHost(host.hostId)
+                                },
+                            )
+                        }
+                    }
+                    OrbitMenuDivider()
+                    OrbitMenuActionRow(
+                        title = "Pair New Host",
+                        icon = Icons.Outlined.QrCodeScanner,
+                        onClick = {
+                            hostMenuExpanded = false
+                            onOpenPairHost()
+                        },
+                    )
+                    if (ui.localDaemonUri != null) {
+                        OrbitMenuActionRow(
+                            title = "Connect Local Host",
+                            icon = Icons.Outlined.Add,
+                            onClick = {
+                                hostMenuExpanded = false
+                                onConnectLocalDaemon()
+                            },
+                        )
+                    }
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(colors.subtleFill)
+                    .clickable { onOpenSettings() },
+                contentAlignment = Alignment.Center,
             ) {
                 Icon(
                     imageVector = Icons.Outlined.Settings,
-                    contentDescription = null,
+                    contentDescription = "Settings and hosts",
                     tint = colors.fgPrimary,
-                    modifier = Modifier.size(OrbitSpacing.iconSm),
-                )
-                Spacer(modifier = Modifier.width(OrbitSpacing.xs))
-                Text(
-                    text = "Settings",
-                    style = typography.subheadMedium,
-                    color = colors.fgPrimary,
-                    maxLines = 1,
-                    softWrap = false,
+                    modifier = Modifier.size(19.dp),
                 )
             }
         }
@@ -786,125 +1116,35 @@ fun FleetDrawerContent(
 }
 
 @Composable
-private fun DrawerSectionLabel(
+private fun DrawerSectionHeaderRow(
     title: String,
-    accent: Color = OrbitTheme.colors.fgMuted,
-) {
-    Text(
-        text = title,
-        style = OrbitTheme.typography.metaSemiBold,
-        color = accent,
-        modifier = Modifier.padding(horizontal = OrbitSpacing.sm, vertical = OrbitSpacing.xs),
-    )
-}
-
-@Composable
-private fun HostSwitcherCard(
-    host: FfiHostCard,
-    selected: Boolean,
-    onClick: () -> Unit,
+    accent: Color? = null,
 ) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
-    val shape = RoundedCornerShape(OrbitSpacing.md)
-
-    val statusColor = when (host.connectionState) {
-        FfiConnectionState.ONLINE_DIRECT -> colors.directAdded
-        FfiConnectionState.ONLINE_RELAY -> colors.relay
-        FfiConnectionState.CONNECTING_DIRECT, FfiConnectionState.CONNECTING_RELAY -> colors.warning
-        FfiConnectionState.DISCONNECTED -> colors.fgMuted
-    }
-    val routeBadge = OrbitFormatters.connectionLabel(host.connectionState, host.viaSshTunnel)
-
-    Column(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(shape)
-            .background(if (selected) colors.elevated else Color.Transparent, shape)
-            .border(
-                OrbitSpacing.hairline,
-                if (selected) colors.primary.copy(alpha = 0.65f) else colors.hairline,
-                shape
-            )
-            .clickable { onClick() }
-            .padding(horizontal = OrbitSpacing.md, vertical = OrbitSpacing.sm),
-        verticalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
+            .padding(horizontal = OrbitSpacing.lg, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-                modifier = Modifier.weight(1f),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(6.dp)
-                        .background(statusColor, CircleShape)
-                )
-                Text(
-                    text = host.displayName,
-                    style = typography.subheadSemiBold,
-                    color = colors.fgPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
-            ) {
-                host.lastPingMs?.let { rtt ->
-                    Text(
-                        text = "${rtt}ms",
-                        style = typography.meta,
-                        color = colors.fgMuted,
-                    )
-                }
-                Text(
-                    text = routeBadge,
-                    style = typography.metaMedium,
-                    color = statusColor,
-                )
-            }
-        }
-
-        if (host.pendingApprovalCount > 0u || host.agentCount > 0u) {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "${host.agentCount} ${if (host.agentCount == 1u) "session" else "sessions"}",
-                    style = typography.meta,
-                    color = colors.fgMuted,
-                )
-                if (host.pendingApprovalCount > 0u) {
-                    Text(
-                        text = "${host.pendingApprovalCount} awaiting approval",
-                        style = typography.metaMedium,
-                        color = colors.warning,
-                    )
-                }
-            }
-        }
+        Text(
+            text = title,
+            style = typography.metaMedium,
+            color = accent ?: colors.fgMuted,
+        )
     }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun WorkspaceDrawerRow(
-    title: String,
-    subtitle: String?,
-    useCodeSubtitle: Boolean,
-    isCurrent: Boolean,
-    isPinned: Boolean,
-    onSelect: () -> Unit,
+private fun ProjectTreeHeaderRow(
+    group: SidebarProjectGroup,
+    isCollapsed: Boolean,
+    isActiveWorkspace: Boolean,
+    onToggleCollapse: () -> Unit,
     onNewSessionHere: () -> Unit,
+    onSelectWorkspace: () -> Unit,
     onTogglePin: () -> Unit,
     onInspectGitDiff: () -> Unit,
     onOpenTerminalHere: () -> Unit,
@@ -913,75 +1153,65 @@ private fun WorkspaceDrawerRow(
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
     val haptics = LocalHapticFeedback.current
-    val rowShape = RoundedCornerShape(OrbitSpacing.sm)
     var menuExpanded by remember { mutableStateOf(false) }
 
-    Box(modifier = Modifier.fillMaxWidth()) {
+    Box(modifier = Modifier.padding(horizontal = OrbitSpacing.sm, vertical = 1.dp)) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .heightIn(min = 44.dp)
-                .clip(rowShape)
-                .background(if (isCurrent) colors.subtleFill else Color.Transparent, rowShape)
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (isActiveWorkspace) colors.subtleFill else Color.Transparent)
                 .combinedClickable(
-                    onClick = {
-                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSelect()
-                    },
+                    onClick = onToggleCollapse,
                     onLongClick = {
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                         menuExpanded = true
                     },
                 )
-                .padding(start = OrbitSpacing.sm),
+                .padding(start = 6.dp, end = 0.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            if (isPinned) {
-                Icon(
-                    imageVector = Icons.Outlined.Bookmark,
-                    contentDescription = null,
-                    tint = colors.primary,
-                    modifier = Modifier.size(OrbitSpacing.iconSm),
-                )
-            }
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(vertical = OrbitSpacing.xs),
-            ) {
-                Text(
-                    text = title,
-                    style = typography.subheadMedium,
-                    color = colors.fgPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                subtitle?.takeIf { it.isNotBlank() }?.let { sub ->
-                    Text(
-                        text = sub,
-                        style = if (useCodeSubtitle) typography.code else typography.meta,
-                        color = colors.fgMuted,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
+            Icon(
+                imageVector = if (isCollapsed) {
+                    Icons.AutoMirrored.Outlined.KeyboardArrowRight
+                } else {
+                    Icons.Outlined.KeyboardArrowDown
+                },
+                contentDescription = if (isCollapsed) "Expand project" else "Collapse project",
+                tint = colors.fgMuted,
+                modifier = Modifier.size(16.dp),
+            )
+            Icon(
+                imageVector = if (isCollapsed) Icons.Outlined.Folder else Icons.Outlined.FolderOpen,
+                contentDescription = null,
+                tint = if (isActiveWorkspace) colors.primary else colors.fgSecondary,
+                modifier = Modifier.size(16.dp),
+            )
+            Text(
+                text = group.name,
+                style = if (isActiveWorkspace) typography.subheadSemiBold else typography.subheadMedium,
+                color = colors.fgPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
             Box(
                 modifier = Modifier
                     .size(44.dp)
                     .clip(CircleShape)
                     .clickable {
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onTogglePin()
+                        onNewSessionHere()
                     },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
-                    imageVector = if (isPinned) Icons.Outlined.Close else Icons.Outlined.BookmarkBorder,
-                    contentDescription = if (isPinned) "Unpin workspace" else "Pin workspace",
-                    tint = colors.fgMuted,
-                    modifier = Modifier.size(OrbitSpacing.iconSm),
+                    imageVector = Icons.Outlined.Add,
+                    contentDescription = "New session in ${group.name}",
+                    tint = colors.fgSecondary,
+                    modifier = Modifier.size(18.dp),
                 )
             }
         }
@@ -1007,16 +1237,10 @@ private fun WorkspaceDrawerRow(
                 },
             )
             DropdownMenuItem(
-                text = {
-                    Text(
-                        text = if (isPinned) "Unpin Workspace" else "Pin Workspace",
-                        style = typography.subheadMedium,
-                        color = colors.fgPrimary,
-                    )
-                },
+                text = { Text("Select Workspace", style = typography.subheadMedium, color = colors.fgPrimary) },
                 leadingIcon = {
                     Icon(
-                        imageVector = if (isPinned) Icons.Outlined.Close else Icons.Outlined.BookmarkBorder,
+                        imageVector = Icons.Outlined.FolderOpen,
                         contentDescription = null,
                         tint = colors.fgSecondary,
                         modifier = Modifier.size(OrbitSpacing.iconSm),
@@ -1024,7 +1248,7 @@ private fun WorkspaceDrawerRow(
                 },
                 onClick = {
                     menuExpanded = false
-                    onTogglePin()
+                    onSelectWorkspace()
                 },
             )
             DropdownMenuItem(
@@ -1043,7 +1267,7 @@ private fun WorkspaceDrawerRow(
                 },
             )
             DropdownMenuItem(
-                text = { Text("Open Terminal Here", style = typography.subheadMedium, color = colors.fgPrimary) },
+                text = { Text("Open Terminal", style = typography.subheadMedium, color = colors.fgPrimary) },
                 leadingIcon = {
                     Icon(
                         imageVector = Icons.Outlined.Terminal,
@@ -1058,10 +1282,31 @@ private fun WorkspaceDrawerRow(
                 },
             )
             DropdownMenuItem(
+                text = {
+                    Text(
+                        text = if (group.pinnedProjectId != null) "Unpin Project" else "Pin Project",
+                        style = typography.subheadMedium,
+                        color = colors.fgPrimary,
+                    )
+                },
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Outlined.PushPin,
+                        contentDescription = null,
+                        tint = colors.fgSecondary,
+                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                    )
+                },
+                onClick = {
+                    menuExpanded = false
+                    onTogglePin()
+                },
+            )
+            DropdownMenuItem(
                 text = { Text("Copy Path", style = typography.subheadMedium, color = colors.fgPrimary) },
                 leadingIcon = {
                     Icon(
-                        imageVector = Icons.Outlined.ContentCopy,
+                        imageVector = OrbitCopyIcon,
                         contentDescription = null,
                         tint = colors.fgSecondary,
                         modifier = Modifier.size(OrbitSpacing.iconSm),
@@ -1078,11 +1323,17 @@ private fun WorkspaceDrawerRow(
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun AgentSessionDrawerRow(
+private fun ConversationTreeRow(
     agent: FfiAgentCard,
     selected: Boolean,
+    isUnread: Boolean,
+    isPinned: Boolean,
+    showWorkspaceHint: Boolean,
+    indentStart: androidx.compose.ui.unit.Dp,
     onSelect: () -> Unit,
+    onTogglePin: () -> Unit,
     onNewSessionInWorkspace: () -> Unit,
+    onInspectGitDiff: () -> Unit,
     onOpenTerminalHere: () -> Unit,
     onCopyWorkspacePath: () -> Unit,
     onArchive: () -> Unit,
@@ -1090,20 +1341,17 @@ private fun AgentSessionDrawerRow(
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
     val haptics = LocalHapticFeedback.current
-    val shape = RoundedCornerShape(OrbitSpacing.sm)
     var menuExpanded by remember { mutableStateOf(false) }
 
-    Box(modifier = Modifier.fillMaxWidth()) {
+    val unreadBlue = if (colors.isDark) Color(0xFF60A5FA) else Color(0xFF2563EB)
+
+    Box(modifier = Modifier.padding(horizontal = OrbitSpacing.sm, vertical = 1.dp)) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = OrbitSpacing.touchTarget)
-                .clip(shape)
-                .background(if (selected) colors.elevated else Color.Transparent, shape)
-                .then(
-                    if (selected) Modifier.border(OrbitSpacing.hairline, colors.hairline, shape)
-                    else Modifier
-                )
+                .heightIn(min = 44.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (selected) colors.subtleFill else Color.Transparent)
                 .combinedClickable(
                     onClick = {
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -1114,59 +1362,74 @@ private fun AgentSessionDrawerRow(
                         menuExpanded = true
                     },
                 )
-                .padding(start = OrbitSpacing.sm),
+                .padding(start = indentStart, end = OrbitSpacing.md, top = 7.dp, bottom = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            when {
-                agent.isAwaitingPermission -> {
-                    Box(
-                        modifier = Modifier
-                            .size(6.dp)
-                            .background(colors.warning, CircleShape)
-                    )
-                }
-                agent.isRunning -> {
-                    BreathingDot(color = colors.primary)
+            // 4-state left gutter: Waiting Approval | Running | Unread Blue Dot | Empty (zero idle dots)
+            Box(
+                modifier = Modifier.width(16.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                when {
+                    agent.isAwaitingPermission -> {
+                        Icon(
+                            imageVector = Icons.Outlined.WarningAmber,
+                            contentDescription = "Awaiting permission",
+                            tint = colors.warning,
+                            modifier = Modifier.size(14.dp),
+                        )
+                    }
+
+                    agent.isRunning -> {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(13.dp),
+                            strokeWidth = 1.75.dp,
+                            color = colors.fgSecondary,
+                        )
+                    }
+
+                    isUnread -> {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(unreadBlue),
+                        )
+                    }
+
+                    else -> Spacer(modifier = Modifier.size(1.dp))
                 }
             }
 
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(vertical = OrbitSpacing.xs),
-            ) {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = agent.title.ifBlank { "Untitled Session" },
-                    style = if (selected) typography.subheadSemiBold else typography.subheadMedium,
+                    text = agent.title.ifBlank { OrbitFormatters.providerLabel(agent.provider) },
+                    style = if (selected) typography.subheadSemiBold else typography.subhead,
                     color = colors.fgPrimary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                if (showWorkspaceHint) {
+                    Text(
+                        text = OrbitFormatters.shortPath(agent.cwd),
+                        style = typography.meta,
+                        color = colors.fgMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+
+            val compactTime = remember(agent.updatedAtRfc3339) {
+                OrbitFormatters.compactRelativeTime(agent.updatedAtRfc3339)
+            }
+            if (compactTime.isNotEmpty()) {
                 Text(
-                    text = "${OrbitFormatters.shortPath(agent.cwd)} · ${agent.providerLabel}",
+                    text = compactTime,
                     style = typography.meta,
                     color = colors.fgMuted,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-
-            Box(
-                modifier = Modifier
-                    .size(44.dp)
-                    .clip(CircleShape)
-                    .clickable {
-                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                        onArchive()
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.Archive,
-                    contentDescription = "Archive session",
-                    tint = colors.fgMuted,
-                    modifier = Modifier.size(OrbitSpacing.iconSm),
                 )
             }
         }
@@ -1176,6 +1439,27 @@ private fun AgentSessionDrawerRow(
             onDismissRequest = { menuExpanded = false },
             containerColor = colors.elevated,
         ) {
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        text = if (isPinned) "Unpin Conversation" else "Pin Conversation",
+                        style = typography.subheadMedium,
+                        color = colors.fgPrimary,
+                    )
+                },
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Outlined.PushPin,
+                        contentDescription = null,
+                        tint = colors.fgSecondary,
+                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                    )
+                },
+                onClick = {
+                    menuExpanded = false
+                    onTogglePin()
+                },
+            )
             DropdownMenuItem(
                 text = { Text("New Session in Workspace", style = typography.subheadMedium, color = colors.fgPrimary) },
                 leadingIcon = {
@@ -1192,7 +1476,22 @@ private fun AgentSessionDrawerRow(
                 },
             )
             DropdownMenuItem(
-                text = { Text("Open Terminal Here", style = typography.subheadMedium, color = colors.fgPrimary) },
+                text = { Text("Inspect Git Diff", style = typography.subheadMedium, color = colors.fgPrimary) },
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Outlined.Difference,
+                        contentDescription = null,
+                        tint = colors.fgSecondary,
+                        modifier = Modifier.size(OrbitSpacing.iconSm),
+                    )
+                },
+                onClick = {
+                    menuExpanded = false
+                    onInspectGitDiff()
+                },
+            )
+            DropdownMenuItem(
+                text = { Text("Open Terminal", style = typography.subheadMedium, color = colors.fgPrimary) },
                 leadingIcon = {
                     Icon(
                         imageVector = Icons.Outlined.Terminal,
@@ -1210,7 +1509,7 @@ private fun AgentSessionDrawerRow(
                 text = { Text("Copy Workspace Path", style = typography.subheadMedium, color = colors.fgPrimary) },
                 leadingIcon = {
                     Icon(
-                        imageVector = Icons.Outlined.ContentCopy,
+                        imageVector = OrbitCopyIcon,
                         contentDescription = null,
                         tint = colors.fgSecondary,
                         modifier = Modifier.size(OrbitSpacing.iconSm),

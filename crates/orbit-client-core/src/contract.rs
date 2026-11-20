@@ -3,7 +3,7 @@
 //! - Mobile UniFFI (`crates/orbit-ffi-uniffi`)
 //! - HarmonyOS N-API (`crates/orbit-ffi-ohos`)
 
-use orbit_protocol::{PromptBadge, ProviderKind, ReasoningEffort, SessionMode};
+use orbit_protocol::{NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort, SessionMode};
 use serde::{Deserialize, Serialize};
 
 use crate::HostRouteMode;
@@ -65,6 +65,12 @@ pub struct CreateSessionRequest {
     pub initial_badges: Vec<PromptBadge>,
     #[serde(default)]
     pub worktree_branch: Option<String>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub handle: Option<String>,
+    #[serde(default)]
+    pub auto_cluster: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,4 +142,40 @@ pub struct MentionRankRequest {
     pub query: String,
     #[serde(default)]
     pub limit: usize,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub active_agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GitReposInspectionView {
+    pub path: String,
+    pub is_git_repo: bool,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub nested_git_repos: Vec<NestedGitRepo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpawnWorkspacePeerRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub extra_dirs: Vec<String>,
+    pub provider: ProviderKind,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
+    pub mode: SessionMode,
+    pub initial_prompt: String,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    #[serde(default)]
+    pub handle: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }

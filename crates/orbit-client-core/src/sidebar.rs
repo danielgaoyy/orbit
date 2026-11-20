@@ -4,10 +4,13 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::DateTime;
-use orbit_protocol::{AttentionState, DiscoveredProject, GitStatusSnapshot, WorkspaceSummary};
+use orbit_protocol::{
+    AttentionState, DiscoveredProject, GitStatusSnapshot, NestedGitRepo, WorkspaceSummary,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::app_core::{AgentCardView, ClientProjectView, cwd_paths_equivalent};
+use crate::contract::GitReposInspectionView;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +18,7 @@ pub enum SidebarProjectSort {
     #[default]
     Recent,
     Alphabetical,
+    Manual,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +40,27 @@ pub struct SidebarConversationView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidebarWorkspaceGroupView {
+    pub workspace_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_goal: Option<String>,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    pub is_worktree: bool,
+    #[serde(default)]
+    pub board_revision: u64,
+    #[serde(default)]
+    pub has_conflict: bool,
+    pub peer_count: u32,
+    pub running_count: u32,
+    pub unread_count: u32,
+    pub is_multi_agent: bool,
+    pub conversations: Vec<SidebarConversationView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidebarProjectGroupView {
     pub id: String,
     pub host_id: String,
@@ -43,10 +68,18 @@ pub struct SidebarProjectGroupView {
     pub primary_cwd: String,
     pub directories: Vec<String>,
     pub git_branch: Option<String>,
+    #[serde(default)]
+    pub is_git_repo: bool,
+    #[serde(default)]
+    pub nested_git_repos: Vec<NestedGitRepo>,
     pub pinned_project_id: Option<String>,
     pub is_home_workspace: bool,
     pub sort_weight_ms: i64,
+    #[serde(default)]
+    pub sort_order_key: String,
     pub conversations: Vec<SidebarConversationView>,
+    #[serde(default)]
+    pub workspaces: Vec<SidebarWorkspaceGroupView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +89,10 @@ pub struct LaunchpadProjectView {
     pub name: String,
     pub path: String,
     pub branch: Option<String>,
+    #[serde(default)]
+    pub is_git_repo: bool,
+    #[serde(default)]
+    pub nested_git_repos: Vec<NestedGitRepo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,12 +110,15 @@ pub struct SidebarHostInput<'a> {
     pub discovered_projects: &'a [DiscoveredProject],
     pub agents: Vec<(AgentCardView, i64)>,
     pub active_git_branch: Option<String>,
+    pub git_repos_by_cwd: &'a HashMap<String, GitReposInspectionView>,
+    pub workspace_conflict_ids: &'a HashSet<String>,
 }
 
 pub struct FleetSidebarParams<'a> {
     pub revision: u64,
     pub hosts: Vec<SidebarHostInput<'a>>,
     pub pinned_projects: &'a [ClientProjectView],
+    pub project_order: &'a [String],
     pub sort: SidebarProjectSort,
     pub filter: SidebarThreadFilter,
     pub query: &'a str,
@@ -146,6 +186,47 @@ pub fn matches_project_directory(directories: &[String], cwd: &str) -> bool {
         }
     }
     false
+}
+
+fn path_is_inside_directory(dir: &str, candidate: &str) -> bool {
+    let clean_dir = normalize_project_path(dir);
+    let clean_cand = normalize_project_path(candidate);
+    if clean_dir == "~" || clean_dir == "/" || is_bare_home_dir(&clean_dir) {
+        return false;
+    }
+    clean_cand == clean_dir
+        || cwd_paths_equivalent(&clean_dir, &clean_cand)
+        || clean_cand.starts_with(&format!("{clean_dir}/"))
+}
+
+fn resolve_git_capability_for_path(
+    git_repos_by_cwd: &HashMap<String, GitReposInspectionView>,
+    discovered_projects: &[DiscoveredProject],
+    workspaces: &[WorkspaceSummary],
+    raw_path: &str,
+) -> (bool, Vec<NestedGitRepo>) {
+    let clean = normalize_project_path(raw_path);
+    if let Some(insp) = git_repos_by_cwd.get(&clean).or_else(|| {
+        git_repos_by_cwd
+            .iter()
+            .find(|(k, _)| cwd_paths_equivalent(k, &clean))
+            .map(|(_, v)| v)
+    }) {
+        return (insp.is_git_repo, insp.nested_git_repos.clone());
+    }
+    if let Some(dp) = discovered_projects
+        .iter()
+        .find(|p| cwd_paths_equivalent(&p.path, &clean))
+    {
+        return (dp.is_git_repo, dp.nested_git_repos.clone());
+    }
+    if workspaces
+        .iter()
+        .any(|w| !w.is_worktree && cwd_paths_equivalent(&w.cwd, &clean) && w.git_branch.is_some())
+    {
+        return (true, Vec::new());
+    }
+    (false, Vec::new())
 }
 
 fn resolve_worktree_base_path(raw_path: &str, known_repo_bases: &[String]) -> String {
@@ -265,6 +346,10 @@ fn matches_agent_query(agent: &AgentCardView, q_lower: &str) -> bool {
             .to_lowercase()
             .contains(q_lower)
         || agent.provider_label.to_lowercase().contains(q_lower)
+        || agent
+            .handle
+            .as_deref()
+            .is_some_and(|h| h.to_lowercase().contains(q_lower))
 }
 
 pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
@@ -318,6 +403,11 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
         }
         non_worktree_bases.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
+        let ws_by_id: HashMap<&str, &WorkspaceSummary> = host
+            .workspaces
+            .iter()
+            .map(|w| (w.workspace_id.as_str(), w))
+            .collect();
         let ws_worktree_map: HashMap<String, bool> = host
             .workspaces
             .iter()
@@ -351,6 +441,12 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 host.active_git_branch.as_deref(),
                 &primary,
             );
+            let (is_git_repo, nested_git_repos) = resolve_git_capability_for_path(
+                host.git_repos_by_cwd,
+                host.discovered_projects,
+                host.workspaces,
+                &primary,
+            );
             let group = SidebarProjectGroupView {
                 id: proj.project_id.clone(),
                 host_id: host_id.to_string(),
@@ -359,9 +455,13 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 primary_cwd: primary,
                 directories: dirs,
                 git_branch: branch,
+                is_git_repo,
+                nested_git_repos,
                 pinned_project_id: Some(proj.project_id.clone()),
                 sort_weight_ms: proj.updated_at_ms.max(1),
+                sort_order_key: proj.project_id.clone(),
                 conversations: Vec::new(),
+                workspaces: Vec::new(),
             };
             group_idx_by_id.insert(group.id.clone(), host_groups.len());
             host_groups.push(group);
@@ -388,10 +488,14 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
             }
 
             let clean_cwd = normalize_project_path(&agent.cwd);
-            let is_worktree = ws_worktree_map
-                .get(&clean_cwd)
-                .copied()
-                .unwrap_or_else(|| clean_cwd.contains("/worktrees/"));
+            let ws_meta = ws_by_id.get(agent.workspace_id.as_str()).copied();
+            let is_worktree = agent.worktree_branch.is_some()
+                || agent.labels.contains_key("orbit.worktree_branch")
+                || ws_meta.is_some_and(|w| w.is_worktree)
+                || ws_worktree_map
+                    .get(&clean_cwd)
+                    .copied()
+                    .unwrap_or_else(|| clean_cwd.contains("/worktrees/"));
 
             let conv = SidebarConversationView {
                 host_id: host_id.to_string(),
@@ -420,19 +524,74 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 pinned_with_order.push((*pinned_order, conv.clone()));
             }
 
-            let mut matched_idx = host_groups
-                .iter()
-                .position(|g| matches_project_directory(&g.directories, &clean_cwd));
+            // Prefer explicit Mission Workspace `project_root` (so nested-repo worktrees fold cleanly
+            // under their parent non-git project), then direct directory match, then source_cwd match.
+            let ws_project_root = ws_meta
+                .and_then(|w| w.project_root.as_deref())
+                .map(normalize_project_path)
+                .filter(|p| !p.is_empty() && !is_bare_home_dir(p));
+            let ws_source_cwd = agent
+                .labels
+                .get("orbit.worktree_source_cwd")
+                .map(String::as_str)
+                .or_else(|| ws_meta.and_then(|w| w.source_cwd.as_deref()))
+                .map(normalize_project_path)
+                .filter(|p| !p.is_empty() && !is_bare_home_dir(p));
 
-            if matched_idx.is_none() && is_worktree {
-                let candidate_repo = host
-                    .workspaces
-                    .iter()
-                    .find(|w| {
-                        !w.is_worktree
-                            && matches_project_directory(std::slice::from_ref(&w.cwd), &clean_cwd)
+            let mut matched_idx = ws_project_root
+                .as_deref()
+                .and_then(|root| {
+                    host_groups
+                        .iter()
+                        .position(|g| matches_project_directory(&g.directories, root))
+                })
+                .or_else(|| {
+                    host_groups
+                        .iter()
+                        .position(|g| matches_project_directory(&g.directories, &clean_cwd))
+                })
+                .or_else(|| {
+                    ws_source_cwd.as_deref().and_then(|src| {
+                        host_groups
+                            .iter()
+                            .position(|g| matches_project_directory(&g.directories, src))
                     })
-                    .map(|w| w.cwd.clone())
+                })
+                .or_else(|| {
+                    // Fold nested git repo worktrees under enclosing pinned/known project directories
+                    // (pick the most specific / longest matching directory).
+                    ws_source_cwd.as_deref().and_then(|src| {
+                        host_groups
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(idx, g)| {
+                                g.directories
+                                    .iter()
+                                    .filter(|d| path_is_inside_directory(d, src))
+                                    .map(|d| (idx, d.len()))
+                                    .max_by_key(|(_, len)| *len)
+                            })
+                            .max_by_key(|(_, len)| *len)
+                            .map(|(idx, _)| idx)
+                    })
+                });
+
+            if matched_idx.is_none() && (is_worktree || ws_project_root.is_some()) {
+                let candidate_repo = ws_project_root
+                    .clone()
+                    .or_else(|| ws_source_cwd.clone())
+                    .or_else(|| {
+                        host.workspaces
+                            .iter()
+                            .find(|w| {
+                                !w.is_worktree
+                                    && matches_project_directory(
+                                        std::slice::from_ref(&w.cwd),
+                                        &clean_cwd,
+                                    )
+                            })
+                            .map(|w| w.cwd.clone())
+                    })
                     .or_else(|| {
                         host.discovered_projects
                             .iter()
@@ -462,6 +621,12 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                             host.active_git_branch.as_deref(),
                             &clean_repo,
                         );
+                        let (is_git_repo, nested_git_repos) = resolve_git_capability_for_path(
+                            host.git_repos_by_cwd,
+                            host.discovered_projects,
+                            host.workspaces,
+                            &clean_repo,
+                        );
                         let is_home = is_bare_home_dir(&clean_repo);
                         let name = if is_home {
                             "Workspace (~)".to_string()
@@ -471,16 +636,20 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         let idx = host_groups.len();
                         group_idx_by_id.insert(id.clone(), idx);
                         host_groups.push(SidebarProjectGroupView {
-                            id,
+                            id: id.clone(),
                             host_id: host_id.to_string(),
                             name,
                             is_home_workspace: is_home,
                             primary_cwd: clean_repo.clone(),
                             directories: vec![clean_repo],
                             git_branch: branch,
+                            is_git_repo,
+                            nested_git_repos,
                             pinned_project_id: None,
                             sort_weight_ms: 0,
+                            sort_order_key: id,
                             conversations: Vec::new(),
+                            workspaces: Vec::new(),
                         });
                         matched_idx = Some(idx);
                     }
@@ -501,6 +670,12 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         host.active_git_branch.as_deref(),
                         &clean_cwd,
                     );
+                    let (is_git_repo, nested_git_repos) = resolve_git_capability_for_path(
+                        host.git_repos_by_cwd,
+                        host.discovered_projects,
+                        host.workspaces,
+                        &clean_cwd,
+                    );
                     let is_home = is_bare_home_dir(&clean_cwd);
                     let name = if is_home {
                         "Workspace (~)".to_string()
@@ -510,16 +685,20 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                     let idx = host_groups.len();
                     group_idx_by_id.insert(id.clone(), idx);
                     host_groups.push(SidebarProjectGroupView {
-                        id,
+                        id: id.clone(),
                         host_id: host_id.to_string(),
                         name,
                         is_home_workspace: is_home,
                         primary_cwd: clean_cwd.clone(),
                         directories: vec![clean_cwd],
                         git_branch: branch,
+                        is_git_repo,
+                        nested_git_repos,
                         pinned_project_id: None,
                         sort_weight_ms: 0,
+                        sort_order_key: id,
                         conversations: Vec::new(),
+                        workspaces: Vec::new(),
                     });
                     idx
                 }
@@ -555,22 +734,26 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 };
                 group_idx_by_id.insert(id.clone(), host_groups.len());
                 host_groups.push(SidebarProjectGroupView {
-                    id,
+                    id: id.clone(),
                     host_id: host_id.to_string(),
                     name,
                     is_home_workspace: is_bare_home_dir(&clean_path),
                     primary_cwd: clean_path.clone(),
                     directories: vec![clean_path],
                     git_branch: dp.git_branch.clone(),
+                    is_git_repo: dp.is_git_repo,
+                    nested_git_repos: dp.nested_git_repos.clone(),
                     pinned_project_id: None,
                     sort_weight_ms: dp.last_modified_unix * 1000,
+                    sort_order_key: id,
                     conversations: Vec::new(),
+                    workspaces: Vec::new(),
                 });
                 added += 1;
             }
         }
 
-        // Apply conversation filter + search query to host groups
+        // Apply conversation filter + search query + Mission Workspace grouping to host groups
         for mut group in host_groups {
             group
                 .conversations
@@ -592,7 +775,17 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 let thread_matches: Vec<SidebarConversationView> = group
                     .conversations
                     .iter()
-                    .filter(|c| matches_agent_query(&c.agent, &q_lower))
+                    .filter(|c| {
+                        matches_agent_query(&c.agent, &q_lower)
+                            || ws_by_id
+                                .get(c.agent.workspace_id.as_str())
+                                .is_some_and(|w| {
+                                    w.title.to_lowercase().contains(&q_lower)
+                                        || w.mission_goal
+                                            .as_deref()
+                                            .is_some_and(|g| g.to_lowercase().contains(&q_lower))
+                                })
+                    })
                     .cloned()
                     .collect();
                 if !thread_matches.is_empty() {
@@ -616,6 +809,58 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
             {
                 group.sort_weight_ms = max_thread_ts;
             }
+
+            // Build Mission Workspace groups preserving recency order of conversations
+            let mut ws_order: Vec<String> = Vec::new();
+            let mut ws_buckets: HashMap<String, Vec<SidebarConversationView>> = HashMap::new();
+            for conv in &group.conversations {
+                let ws_id = conv.agent.workspace_id.clone();
+                if !ws_buckets.contains_key(&ws_id) {
+                    ws_order.push(ws_id.clone());
+                }
+                ws_buckets.entry(ws_id).or_default().push(conv.clone());
+            }
+            group.workspaces = ws_order
+                .into_iter()
+                .filter_map(|ws_id| {
+                    let convs = ws_buckets.remove(&ws_id)?;
+                    let first = convs.first()?;
+                    let ws_meta = ws_by_id.get(ws_id.as_str()).copied();
+                    let peer_count = convs.len() as u32;
+                    let running_count = convs
+                        .iter()
+                        .filter(|c| c.agent.is_running || c.agent.is_awaiting_permission)
+                        .count() as u32;
+                    let unread_count = convs.iter().filter(|c| c.is_unread).count() as u32;
+                    let title = ws_meta
+                        .map(|w| w.title.clone())
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| first.agent.title.clone());
+                    let git_branch = ws_meta
+                        .and_then(|w| w.git_branch.clone())
+                        .or_else(|| first.agent.worktree_branch.clone());
+                    let is_worktree = ws_meta.is_some_and(|w| w.is_worktree)
+                        || convs.iter().all(|c| c.is_worktree);
+                    let has_conflict = host.workspace_conflict_ids.contains(&ws_id);
+                    Some(SidebarWorkspaceGroupView {
+                        workspace_id: ws_id,
+                        title,
+                        mission_goal: ws_meta.and_then(|w| w.mission_goal.clone()),
+                        cwd: ws_meta
+                            .map(|w| w.cwd.clone())
+                            .unwrap_or_else(|| first.agent.cwd.clone()),
+                        git_branch,
+                        is_worktree,
+                        board_revision: ws_meta.map(|w| w.board_revision).unwrap_or(0),
+                        has_conflict,
+                        peer_count,
+                        running_count,
+                        unread_count,
+                        is_multi_agent: peer_count > 1,
+                        conversations: convs,
+                    })
+                })
+                .collect();
 
             all_groups.push(group);
         }
@@ -654,12 +899,20 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         &clean,
                     )
                 });
+                let (is_git_repo, nested_git_repos) = resolve_git_capability_for_path(
+                    host.git_repos_by_cwd,
+                    host.discovered_projects,
+                    host.workspaces,
+                    &clean,
+                );
                 host_lp.push(LaunchpadProjectView {
                     id,
                     host_id: host_id.to_string(),
                     name: resolved_name,
                     path: clean,
                     branch: resolved_branch,
+                    is_git_repo,
+                    nested_git_repos,
                 });
             };
 
@@ -742,6 +995,39 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             });
         }
+        SidebarProjectSort::Manual => {
+            let order_index: HashMap<&str, usize> = params
+                .project_order
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.as_str(), i))
+                .collect();
+            let lookup_order = |g: &SidebarProjectGroupView| -> Option<usize> {
+                order_index
+                    .get(g.sort_order_key.as_str())
+                    .or_else(|| order_index.get(g.id.as_str()))
+                    .or_else(|| {
+                        let fallback_key = format!("{}::{}", g.host_id, g.primary_cwd);
+                        order_index.get(fallback_key.as_str())
+                    })
+                    .copied()
+            };
+            all_groups.sort_by(|a, b| {
+                let oa = lookup_order(a);
+                let ob = lookup_order(b);
+                match (oa, ob) {
+                    (Some(ia), Some(ib)) => ia.cmp(&ib),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a
+                        .is_home_workspace
+                        .cmp(&b.is_home_workspace)
+                        .then_with(|| b.conversations.is_empty().cmp(&a.conversations.is_empty()))
+                        .then_with(|| b.sort_weight_ms.cmp(&a.sort_weight_ms))
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                }
+            });
+        }
     }
 
     needs_attention.sort_by(|a, b| {
@@ -816,8 +1102,12 @@ mod tests {
             updated_at_rfc3339: updated_at_rfc3339.to_string(),
             is_pinned,
             seen_seq: if is_unread { 2 } else { 5 },
+            read_seq: if is_unread { 2 } else { 5 },
             is_unread,
             queued_prompts: Vec::new(),
+            handle: None,
+            cluster_suggestion: None,
+            worktree_branch: None,
         }
     }
 
@@ -834,7 +1124,9 @@ mod tests {
             WorkspaceSummary {
                 workspace_id: "ws_home".into(),
                 title: "Home".into(),
+                mission_goal: None,
                 cwd: "/Users/jess".into(),
+                project_root: None,
                 git_branch: None,
                 is_worktree: false,
                 updated_at: chrono::Utc::now(),
@@ -844,11 +1136,16 @@ mod tests {
                 archived_at: None,
                 background: false,
                 setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
             },
             WorkspaceSummary {
                 workspace_id: "ws_wt".into(),
                 title: "Orbit Worktree".into(),
+                mission_goal: None,
                 cwd: "/Users/jess/.orbit/worktrees/orbit-wt-1".into(),
+                project_root: None,
                 git_branch: Some("feat/ui".into()),
                 is_worktree: true,
                 updated_at: chrono::Utc::now(),
@@ -858,6 +1155,9 @@ mod tests {
                 archived_at: None,
                 background: false,
                 setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
             },
         ];
         let discovered = vec![
@@ -866,6 +1166,7 @@ mod tests {
                 name: "orbit".into(),
                 git_branch: Some("main".into()),
                 is_git_repo: true,
+                nested_git_repos: Vec::new(),
                 last_modified_unix: 100,
             },
             DiscoveredProject {
@@ -873,9 +1174,12 @@ mod tests {
                 name: "jess".into(),
                 git_branch: None,
                 is_git_repo: false,
+                nested_git_repos: Vec::new(),
                 last_modified_unix: 90,
             },
         ];
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
 
         let view = build_fleet_sidebar(FleetSidebarParams {
             revision: 1,
@@ -910,8 +1214,11 @@ mod tests {
                     ),
                 ],
                 active_git_branch: Some("main".into()),
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
             }],
             pinned_projects: &pinned,
+            project_order: &[],
             sort: SidebarProjectSort::Recent,
             filter: SidebarThreadFilter::All,
             query: "",
@@ -964,8 +1271,11 @@ mod tests {
                     ),
                 ],
                 active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
             }],
             pinned_projects: &pinned,
+            project_order: &[],
             sort: SidebarProjectSort::Alphabetical,
             filter: SidebarThreadFilter::ActiveUnread,
             query: "other",
@@ -982,7 +1292,9 @@ mod tests {
         let workspaces = vec![WorkspaceSummary {
             workspace_id: "ws_1".into(),
             title: "Orbit".into(),
+            mission_goal: None,
             cwd: "/Users/jess/Code/orbit".into(),
+            project_root: None,
             git_branch: Some("main".into()),
             is_worktree: false,
             updated_at: chrono::Utc::now(),
@@ -992,6 +1304,9 @@ mod tests {
             archived_at: None,
             background: false,
             setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
         }];
         let mut parent = sample_agent(
             "parent",
@@ -1037,6 +1352,8 @@ mod tests {
         );
         sub_same_ws.parent_agent_id = Some("parent".into());
 
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
         let view = build_fleet_sidebar(FleetSidebarParams {
             revision: 3,
             hosts: vec![SidebarHostInput {
@@ -1045,8 +1362,11 @@ mod tests {
                 discovered_projects: &[],
                 agents: vec![(parent, 0), (bg, 10), (archived, 20), (sub_same_ws, 30)],
                 active_git_branch: Some("main".into()),
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
             }],
             pinned_projects: &[],
+            project_order: &[],
             sort: SidebarProjectSort::Recent,
             filter: SidebarThreadFilter::All,
             query: "",
@@ -1063,5 +1383,114 @@ mod tests {
         assert_eq!(view.pinned_conversations.len(), 0);
         assert_eq!(view.needs_attention.len(), 1);
         assert_eq!(view.needs_attention[0].agent.agent_id, "sub_same");
+    }
+
+    #[test]
+    fn manual_sort_nested_worktree_folding_and_multi_agent_mission_workspace_promotion() {
+        let pinned = vec![
+            ClientProjectView {
+                project_id: "proj_alpha".into(),
+                host_id: "h1".into(),
+                name: "Alpha".into(),
+                directories: vec!["/work/alpha".into()],
+                updated_at_ms: 5_000,
+            },
+            ClientProjectView {
+                project_id: "proj_research".into(),
+                host_id: "h1".into(),
+                name: "Research".into(),
+                directories: vec!["/work/research".into()],
+                updated_at_ms: 1_000,
+            },
+        ];
+        let workspaces = vec![WorkspaceSummary {
+            workspace_id: "ws_mission".into(),
+            title: "Auth Migration".into(),
+            mission_goal: Some("Migrate JWT to OAuth2".into()),
+            cwd: "/work/research".into(),
+            project_root: Some("/work/research".into()),
+            git_branch: Some("feat/oauth".into()),
+            is_worktree: false,
+            updated_at: chrono::Utc::now(),
+            source_cwd: Some("/work/research/repos/paseo".into()),
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+            board_revision: 2,
+            title_locked: false,
+            auto_clustered: false,
+        }];
+        let mut lead = sample_agent(
+            "ag_lead",
+            "/work/research",
+            "2026-11-20T10:00:00Z",
+            false,
+            false,
+            true,
+            false,
+        );
+        lead.workspace_id = "ws_mission".into();
+        lead.handle = Some("lead".into());
+
+        let mut worker = sample_agent(
+            "ag_worker",
+            "/home/u/.orbit/worktrees/paseo-oauth-1",
+            "2026-11-20T10:05:00Z",
+            false,
+            true,
+            false,
+            false,
+        );
+        worker.workspace_id = "ws_mission".into();
+        worker.handle = Some("codex".into());
+        worker.worktree_branch = Some("feat/oauth".into());
+        worker.labels.insert(
+            "orbit.worktree_source_cwd".into(),
+            "/work/research/repos/paseo".into(),
+        );
+
+        let empty_git_repos = HashMap::new();
+        let conflicts: HashSet<String> = ["ws_mission".to_string()].into_iter().collect();
+        let manual_order = vec!["proj_research".to_string(), "proj_alpha".to_string()];
+
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 4,
+            hosts: vec![SidebarHostInput {
+                host_id: "h1",
+                workspaces: &workspaces,
+                discovered_projects: &[],
+                agents: vec![(lead, 0), (worker, 0)],
+                active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &conflicts,
+            }],
+            pinned_projects: &pinned,
+            project_order: &manual_order,
+            sort: SidebarProjectSort::Manual,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h1"),
+            active_agent_id: None,
+            active_cwd: None,
+        });
+
+        // Manual order puts Research before Alpha despite Alpha's higher updated_at
+        assert_eq!(view.projects.len(), 2);
+        assert_eq!(view.projects[0].id, "proj_research");
+        assert_eq!(view.projects[1].id, "proj_alpha");
+
+        // Both lead AND nested-repo worktree worker folded into Research under 1 multi-agent Mission Workspace
+        assert_eq!(view.projects[0].conversations.len(), 2);
+        assert_eq!(view.projects[0].workspaces.len(), 1);
+        let ws = &view.projects[0].workspaces[0];
+        assert_eq!(ws.workspace_id, "ws_mission");
+        assert!(ws.is_multi_agent);
+        assert_eq!(ws.peer_count, 2);
+        assert_eq!(ws.running_count, 1);
+        assert_eq!(ws.unread_count, 1);
+        assert!(ws.has_conflict);
+        assert_eq!(ws.board_revision, 2);
     }
 }

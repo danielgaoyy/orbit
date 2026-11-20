@@ -4,11 +4,11 @@
 //! `~/.claude.json`, and Orbit's own workspace history) AND interactive remote/local folder browsing
 //! (`list_directory_entries`) so users can add any single or multi-directory Project with clicks!
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use orbit_protocol::{DirectoryEntry, DiscoveredProject};
+use orbit_protocol::{DirectoryEntry, DiscoveredProject, NestedGitRepo};
 use orbit_store::OrbitStore;
 
 const CANDIDATE_WORKSPACE_ROOTS: &[&str] = &[
@@ -278,6 +278,11 @@ fn insert_candidate(
             existing.is_git_repo |= is_git_repo;
         }
         None => {
+            let nested_git_repos = if is_git_repo {
+                Vec::new()
+            } else {
+                discover_nested_git_repos(&canonical, &[], 2, 16)
+            };
             out.insert(
                 key.clone(),
                 DiscoveredProject {
@@ -286,6 +291,7 @@ fn insert_candidate(
                     git_branch,
                     is_git_repo,
                     last_modified_unix: mtime,
+                    nested_git_repos,
                 },
             );
         }
@@ -307,6 +313,168 @@ fn read_dir_mtime(path: &Path) -> i64 {
         return dur.as_secs() as i64;
     }
     0
+}
+
+/// Fast zero-subprocess inspection of whether `cwd` is inside a Git repository and any nested
+/// Git repositories contained within `cwd` or its `extra_dirs`.
+pub fn inspect_project_git_repos(
+    cwd: &Path,
+    extra_dirs: &[PathBuf],
+) -> (bool, Option<String>, Vec<NestedGitRepo>) {
+    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let (is_git, branch) = find_enclosing_git_head(&canonical);
+    let repos = if is_git && extra_dirs.is_empty() {
+        Vec::new()
+    } else {
+        discover_nested_git_repos(&canonical, extra_dirs, 3, 24)
+    };
+    (is_git, branch, repos)
+}
+
+/// Discover nested Git repositories within `root` (up to `max_depth` levels) and any explicit `extra_dirs`.
+pub fn discover_nested_git_repos(
+    root: &Path,
+    extra_dirs: &[PathBuf],
+    max_depth: usize,
+    limit: usize,
+) -> Vec<NestedGitRepo> {
+    let Ok(canon_root) = std::fs::canonicalize(root) else {
+        return Vec::new();
+    };
+    if !canon_root.is_dir() {
+        return Vec::new();
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<NestedGitRepo> = Vec::new();
+
+    // 1. Explicit multi-directory project members first
+    for extra in extra_dirs {
+        if out.len() >= limit {
+            break;
+        }
+        let Ok(canon_extra) = std::fs::canonicalize(extra) else {
+            continue;
+        };
+        if !canon_extra.is_dir() || canon_extra == canon_root {
+            continue;
+        }
+        let (is_git, branch) = find_enclosing_git_head(&canon_extra);
+        if is_git {
+            let path_s = canon_extra.to_string_lossy().to_string();
+            if seen.insert(path_s.clone()) {
+                let name = canon_extra
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("repo")
+                    .to_string();
+                let relative_path = canon_extra
+                    .strip_prefix(&canon_root)
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| name.clone());
+                out.push(NestedGitRepo {
+                    path: path_s,
+                    relative_path,
+                    name,
+                    git_branch: branch,
+                });
+            }
+        } else {
+            walk_nested_git_repos(
+                &canon_extra,
+                &canon_extra,
+                max_depth.min(2),
+                limit,
+                &mut seen,
+                &mut out,
+            );
+        }
+    }
+
+    // 2. Direct & nested child Git repositories inside `root`
+    walk_nested_git_repos(
+        &canon_root,
+        &canon_root,
+        max_depth,
+        limit,
+        &mut seen,
+        &mut out,
+    );
+    out.sort_by_key(|a| a.relative_path.to_lowercase());
+    out
+}
+
+fn walk_nested_git_repos(
+    root: &Path,
+    dir: &Path,
+    remaining_depth: usize,
+    limit: usize,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<NestedGitRepo>,
+) {
+    if remaining_depth == 0 || out.len() >= limit {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || IGNORED_DIR_NAMES.contains(&name) {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let (is_git, branch) = read_fast_git_head(&path);
+        if is_git {
+            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let path_s = canonical.to_string_lossy().to_string();
+            if seen.insert(path_s.clone()) {
+                let relative_path = path
+                    .strip_prefix(root)
+                    .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| name.to_string());
+                out.push(NestedGitRepo {
+                    path: path_s,
+                    relative_path,
+                    name: name.to_string(),
+                    git_branch: branch,
+                });
+            }
+            // Do not descend into an already discovered Git repo
+            continue;
+        }
+        if remaining_depth > 1 {
+            walk_nested_git_repos(root, &path, remaining_depth - 1, limit, seen, out);
+        }
+    }
+}
+
+fn find_enclosing_git_head(dir: &Path) -> (bool, Option<String>) {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    let mut cur = Some(dir);
+    for _ in 0..12 {
+        let Some(p) = cur else {
+            break;
+        };
+        if home.as_deref() == Some(p) {
+            break;
+        }
+        let (is_git, branch) = read_fast_git_head(p);
+        if is_git {
+            return (true, branch);
+        }
+        cur = p.parent();
+    }
+    (false, None)
 }
 
 fn read_fast_git_head(repo_dir: &Path) -> (bool, Option<String>) {
@@ -372,6 +540,11 @@ mod tests {
                 background: false,
                 archived_at: None,
                 updated_at: chrono::Utc::now(),
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
             })
             .expect("upsert");
 
@@ -386,6 +559,18 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "sub_repo");
         assert!(entries[0].is_git_repo);
+
+        // Inspect parent non-git folder -> reports is_git_repo=false and discovers nested sub_repo
+        let (parent_is_git, _, nested) = inspect_project_git_repos(&tmp, &[]);
+        assert!(!parent_is_git);
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].relative_path, "sub_repo");
+        assert_eq!(nested[0].git_branch.as_deref(), Some("feat/clean-ui"));
+
+        // Inspect nested git repo directly -> reports is_git_repo=true
+        let (sub_is_git, sub_branch, _) = inspect_project_git_repos(&tmp.join("sub_repo"), &[]);
+        assert!(sub_is_git);
+        assert_eq!(sub_branch.as_deref(), Some("feat/clean-ui"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

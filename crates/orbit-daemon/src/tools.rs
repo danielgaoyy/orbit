@@ -239,6 +239,8 @@ async fn execute_tool_inner(
                                 opt_str(args, "worktree_mode").as_deref(),
                             ),
                             branch: opt_str(args, "branch"),
+                            handle: opt_str(args, "handle"),
+                            auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
                         },
                         Duration::from_secs(30),
                     )
@@ -295,6 +297,8 @@ async fn execute_tool_inner(
                             .get("pr_number")
                             .and_then(|v| v.as_u64())
                             .map(|n| n as u32),
+                        handle: opt_str(args, "handle"),
+                        auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
                     })
                     .await;
                 match res {
@@ -664,6 +668,7 @@ async fn execute_tool_inner(
                             effort,
                             mode,
                             labels,
+                            handle: opt_str(args, "handle"),
                         },
                         Duration::from_secs(15),
                     )
@@ -672,7 +677,15 @@ async fn execute_tool_inner(
             }
             let updated = rt
                 .orchestrator
-                .update_agent(&agent_id, title, model, effort, mode, labels)
+                .update_agent(
+                    &agent_id,
+                    title,
+                    model,
+                    effort,
+                    mode,
+                    labels,
+                    opt_str(args, "handle"),
+                )
                 .await?;
             Ok(json!({ "agent": updated }))
         }
@@ -781,6 +794,9 @@ async fn execute_tool_inner(
                         pr_number,
                         parent_workspace_id,
                         background,
+                        project_root: opt_str(args, "project_root"),
+                        mission_goal: opt_str(args, "mission_goal"),
+                        allow_reuse_existing: true,
                     })
                     .await?
             };
@@ -1273,6 +1289,347 @@ async fn execute_tool_inner(
             Ok(json!({
                 "self": rt.host_info,
                 "connected_hosts": peers,
+            }))
+        }
+
+        // ==================== MISSION WORKSPACE COLLABORATION ====================
+        "workspace_peers" => {
+            let ws_id = opt_str(args, "workspace_id")
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`workspace_id` is required when called outside an agent session"
+                    )
+                })?;
+            let ws = rt
+                .store
+                .get_workspace(&ws_id)?
+                .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?;
+            let peers = rt
+                .store
+                .list_agents_filtered(Some(&ws_id), false, false, None)?;
+            let board = rt.orchestrator.get_workspace_board(&ws_id).ok();
+            let events = rt.orchestrator.list_workspace_events(&ws_id, 20)?;
+            let peer_cards: Vec<Value> = peers
+                .iter()
+                .map(|p| {
+                    let last_reply = rt
+                        .store
+                        .last_assistant_message_text(&p.agent_id)
+                        .ok()
+                        .flatten()
+                        .map(|s| truncate_chars(&s, 280));
+                    json!({
+                        "agent_id": p.agent_id,
+                        "handle": p.handle.as_deref().unwrap_or("peer"),
+                        "is_self": caller_agent_id == Some(p.agent_id.as_str()),
+                        "title": p.title,
+                        "provider": p.provider,
+                        "model": p.model,
+                        "mode": p.mode,
+                        "status": p.status,
+                        "cwd": p.cwd,
+                        "last_summary": last_reply,
+                        "updated_at": p.updated_at,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "workspace": ws,
+                "peers": peer_cards,
+                "board_revision": board.as_ref().map(|b| b.revision).unwrap_or(0),
+                "board_path": board.as_ref().and_then(|b| b.board_path.clone()),
+                "recent_events": events,
+            }))
+        }
+
+        "message_peer" => {
+            let ws_id = opt_str(args, "workspace_id")
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let handle_raw = str_arg(args, "handle")?;
+            let prompt = opt_str(args, "message")
+                .or_else(|| opt_str(args, "prompt"))
+                .ok_or_else(|| anyhow::anyhow!("missing required parameter `message`"))?;
+            let behavior = parse_turn_behavior(opt_str(args, "active_turn_behavior").as_deref());
+            let notify_on_finish = args
+                .get("notify_on_finish")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(caller_agent_id.is_some());
+            let clean_target = handle_raw.trim().trim_start_matches('@');
+
+            let targets: Vec<orbit_protocol::AgentSummary> = if clean_target
+                .eq_ignore_ascii_case("all")
+            {
+                rt.store
+                    .list_agents_filtered(Some(&ws_id), false, false, None)?
+                    .into_iter()
+                    .filter(|a| caller_agent_id != Some(a.agent_id.as_str()))
+                    .collect()
+            } else {
+                match rt
+                    .orchestrator
+                    .resolve_peer_in_workspace(&ws_id, clean_target)?
+                {
+                    Some(p) => vec![p],
+                    None => anyhow::bail!(
+                        "peer `@{clean_target}` not found in workspace `{ws_id}` (call `workspace_peers` to see available handles)"
+                    ),
+                }
+            };
+            if targets.is_empty() {
+                anyhow::bail!("no sibling peers available in workspace `{ws_id}`");
+            }
+
+            let sender_handle = caller
+                .as_ref()
+                .and_then(|c| c.handle.clone())
+                .unwrap_or_else(|| "peer".into());
+            let mut delivered = Vec::new();
+            for peer in targets {
+                if notify_on_finish && let Some(cid) = caller_agent_id {
+                    let _ = rt
+                        .finish_subs
+                        .register(cid.to_string(), peer.agent_id.clone(), None, false)
+                        .await;
+                }
+                let msg_id = format!("pm_{}", Uuid::new_v4().simple());
+                let qmsg = QueuedAgentMessage {
+                    recipient_id: peer.agent_id.clone(),
+                    message_id: msg_id.clone(),
+                    source: AgentPromptSource {
+                        kind: AgentMessageKind::DirectMessage,
+                        source_agent_id: caller_agent_id.map(ToOwned::to_owned),
+                        source_host_id: Some(rt.host_info.host_id.clone()),
+                        source_title: Some(format!("@{sender_handle}")),
+                        event: Some("peer_message".into()),
+                        permission_context: None,
+                    },
+                    body: prompt.clone(),
+                    active_turn_behavior: behavior,
+                    session_mode: None,
+                    unarchive: true,
+                };
+                let (mid, _) = rt.delivery.enqueue(qmsg).await?;
+                let peer_h = peer.handle.clone().unwrap_or_else(|| "peer".into());
+                if let Ok(ws_ev) = rt.store.append_workspace_event(
+                    &ws_id,
+                    caller_agent_id,
+                    Some(&sender_handle),
+                    orbit_protocol::WorkspaceEventKind::PeerMessage,
+                    &format!(
+                        "@{sender_handle} -> @{peer_h}: {}",
+                        truncate_chars(&prompt, 120)
+                    ),
+                    None,
+                ) {
+                    let _ = rt.orchestrator.broadcast_tx.send(
+                        crate::manager::DaemonBroadcast::WorkspaceEventRecorded(ws_ev),
+                    );
+                }
+                delivered.push(json!({
+                    "agent_id": peer.agent_id,
+                    "handle": peer_h,
+                    "message_id": mid,
+                }));
+            }
+            Ok(json!({
+                "ok": true,
+                "workspace_id": ws_id,
+                "delivered": delivered,
+            }))
+        }
+
+        "read_peer_context" => {
+            let ws_id = opt_str(args, "workspace_id")
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let handle_raw = str_arg(args, "handle")?;
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20)
+                .clamp(1, 100) as usize;
+            let peer = rt
+                .orchestrator
+                .resolve_peer_in_workspace(&ws_id, &handle_raw)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("peer `{handle_raw}` not found in workspace `{ws_id}`")
+                })?;
+            let (events, _) = rt.store.fetch_timeline_since(&peer.agent_id, 0, 500)?;
+            let mut edited_files: Vec<String> = Vec::new();
+            let mut entries: Vec<Value> = Vec::new();
+            for ev in &events {
+                if let TimelinePayload::ToolCall {
+                    detail: ToolCallDetail::FileEdit { path, .. },
+                    ..
+                } = &ev.payload
+                    && !edited_files.contains(path)
+                {
+                    edited_files.push(path.clone());
+                }
+            }
+            let start = events.len().saturating_sub(limit);
+            for ev in &events[start..] {
+                entries.push(summarize_timeline_event(ev));
+            }
+            let last_summary = rt
+                .store
+                .last_assistant_message_text(&peer.agent_id)?
+                .map(|s| truncate_chars(&s, 2000));
+            Ok(json!({
+                "workspace_id": ws_id,
+                "agent_id": peer.agent_id,
+                "handle": peer.handle.as_deref().unwrap_or("peer"),
+                "title": peer.title,
+                "provider": peer.provider,
+                "cwd": peer.cwd,
+                "status": peer.status,
+                "edited_files": edited_files,
+                "last_summary": last_summary,
+                "recent_entries": entries,
+            }))
+        }
+
+        "workspace_board_read" => {
+            let ws_id = opt_str(args, "workspace_id")
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let board = rt.orchestrator.get_workspace_board(&ws_id)?;
+            Ok(json!({ "board": board }))
+        }
+
+        "workspace_board_update" => {
+            let ws_id = opt_str(args, "workspace_id")
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let content = str_arg(args, "content")?;
+            let section = opt_str(args, "section");
+            let updated_by = caller
+                .as_ref()
+                .and_then(|c| c.handle.clone())
+                .or_else(|| opt_str(args, "updated_by"))
+                .unwrap_or_else(|| "peer".into());
+            let board = rt.orchestrator.update_workspace_board(
+                &ws_id,
+                &content,
+                section.as_deref(),
+                Some(&updated_by),
+                caller_agent_id,
+            )?;
+            Ok(json!({ "board": board }))
+        }
+
+        "spawn_workspace_peer" => {
+            let ws_id = opt_str(args, "workspace_id")
+                .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
+                .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
+            let ws = rt
+                .store
+                .get_workspace(&ws_id)?
+                .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?;
+            let handle = opt_str(args, "handle");
+            let profile_id = opt_str(args, "profile_id").or_else(|| opt_str(args, "profile"));
+            let local_profile = profile_id.as_deref().and_then(|pid| {
+                rt.store
+                    .get_profile(pid)
+                    .ok()
+                    .flatten()
+                    .or_else(|| rt.store.get_profile_by_name(pid).ok().flatten())
+            });
+            let (provider, inline_model) = if let Some(provider_raw) = opt_str(args, "provider") {
+                parse_provider_and_model(&provider_raw)?
+            } else if let Some(ref prof) = local_profile {
+                (prof.provider, None)
+            } else if let Some(ref c) = caller {
+                (c.provider, None)
+            } else {
+                (ProviderKind::ClaudeCode, None)
+            };
+            let model = opt_str(args, "model")
+                .or(inline_model)
+                .or_else(|| local_profile.as_ref().and_then(|p| p.model.clone()));
+            let effort = opt_str(args, "effort")
+                .and_then(|s| ReasoningEffort::from_slug(&s))
+                .or_else(|| local_profile.as_ref().and_then(|p| p.effort));
+            let mode = opt_str(args, "mode")
+                .map(|s| parse_session_mode(&s))
+                .or_else(|| local_profile.as_ref().map(|p| p.mode.clone()))
+                .unwrap_or(SessionMode::AcceptEdits);
+            let initial_prompt = opt_str(args, "initial_prompt")
+                .or_else(|| opt_str(args, "prompt"))
+                .unwrap_or_default();
+            let title = opt_str(args, "title");
+            let worktree = args
+                .get("worktree")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let notify_on_finish = args
+                .get("notify_on_finish")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(caller_agent_id.is_some());
+            let cwd = opt_str(args, "cwd")
+                .or_else(|| ws.source_cwd.clone())
+                .unwrap_or_else(|| ws.cwd.clone());
+
+            let peer = rt
+                .orchestrator
+                .create_and_start_agent(CreateAgentSpec {
+                    cwd,
+                    extra_dirs: Vec::new(),
+                    title,
+                    provider,
+                    model,
+                    effort,
+                    mode,
+                    initial_prompt,
+                    initial_display_prompt: None,
+                    initial_badges: Vec::new(),
+                    worktree,
+                    workspace_id: Some(ws_id.clone()),
+                    // Sibling peers stay top-level inside the Mission Workspace (not collapsed as hidden subagents)
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    profile_id,
+                    background: false,
+                    auto_archive: false,
+                    base_ref: opt_str(args, "base_ref"),
+                    worktree_mode: parse_worktree_mode(opt_str(args, "worktree_mode").as_deref()),
+                    branch: opt_str(args, "branch"),
+                    pr_number: None,
+                    handle,
+                    auto_cluster: Some(false),
+                })
+                .await?;
+            if notify_on_finish && let Some(cid) = caller_agent_id {
+                let _ = rt
+                    .finish_subs
+                    .register(cid.to_string(), peer.agent_id.clone(), None, false)
+                    .await;
+            }
+            Ok(json!({
+                "ok": true,
+                "workspace_id": ws_id,
+                "agent_id": peer.agent_id,
+                "handle": peer.handle,
+                "cwd": peer.cwd,
+                "agent": peer,
+            }))
+        }
+
+        "move_agent_to_workspace" => {
+            let agent_id = opt_str(args, "agent_id")
+                .or_else(|| caller_agent_id.map(ToOwned::to_owned))
+                .ok_or_else(|| anyhow::anyhow!("`agent_id` is required"))?;
+            let target_workspace_id = opt_str(args, "target_workspace_id");
+            let new_title = opt_str(args, "new_workspace_title");
+            let updated = rt
+                .orchestrator
+                .move_agent_to_workspace(&agent_id, target_workspace_id, new_title)
+                .await?;
+            Ok(json!({
+                "ok": true,
+                "agent": updated,
             }))
         }
 
@@ -1944,6 +2301,104 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
             name: "list_hosts",
             description: "List this daemon (`self`) and all connected remote Orbit hosts available for cross-machine delegation.",
             input_schema: json!({ "type": "object", "properties": {} }),
+        },
+        // --- Mission Workspace Collaboration (7) ---
+        ToolDefinition {
+            name: "workspace_peers",
+            description: "Inspect your current Mission Workspace: list all sibling peers (@handles, providers, statuses, cwds, latest summaries), Shared Blackboard revision/path, and recent workspace events/conflicts.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": { "type": "string", "description": "Optional workspace ID (defaults to caller's Mission Workspace)." }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "message_peer",
+            description: "Send a direct collaborative message to a sibling peer in the same Mission Workspace by `@handle` (e.g. `reviewer`, `backend`) or `all` to broadcast to every sibling peer.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "handle": { "type": "string", "description": "Peer @handle (e.g. `reviewer`, `impl`) or `all`." },
+                    "message": { "type": "string", "description": "Message or question for the peer." },
+                    "active_turn_behavior": { "type": "string", "enum": ["steer", "queue", "interrupt"], "default": "steer" },
+                    "notify_on_finish": { "type": "boolean", "default": true },
+                    "workspace_id": { "type": "string" }
+                },
+                "required": ["handle", "message"]
+            }),
+        },
+        ToolDefinition {
+            name: "read_peer_context",
+            description: "Read-only peek into a sibling peer's status, edited files, latest summary, and recent activity by `@handle` without interrupting or waking that peer.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "handle": { "type": "string", "description": "Peer @handle or agent_id inside the Mission Workspace." },
+                    "limit": { "type": "integer", "default": 20 },
+                    "workspace_id": { "type": "string" }
+                },
+                "required": ["handle"]
+            }),
+        },
+        ToolDefinition {
+            name: "workspace_board_read",
+            description: "Read the Mission Workspace's Shared Blackboard (`BOARD.md`) containing shared goals, API contracts, task ownership, and review findings.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": { "type": "string" }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "workspace_board_update",
+            description: "Update the Mission Workspace's Shared Blackboard (`BOARD.md`) — either a specific Markdown `## Section` (e.g. `Decisions & Contracts`, `Tasks`, `Findings`) or the full document.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "Markdown body for the section or full document." },
+                    "section": { "type": "string", "description": "Optional Markdown `## Section` heading to upsert without disturbing other sections." },
+                    "workspace_id": { "type": "string" }
+                },
+                "required": ["content"]
+            }),
+        },
+        ToolDefinition {
+            name: "spawn_workspace_peer",
+            description: "Spawn a visible sibling peer inside your current Mission Workspace with a readable `@handle` (optionally in a different provider/model family and/or an isolated git worktree while sharing the same Mission Workspace & Shared Blackboard).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "handle": { "type": "string", "description": "Short peer handle (e.g. `reviewer`, `backend`, `tester`)." },
+                    "provider": { "type": "string", "description": "`claude_code`, `codex`, `antigravity`, or `provider/model`." },
+                    "model": { "type": "string" },
+                    "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                    "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
+                    "profile_id": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "worktree": { "type": "boolean", "description": "Isolate this peer in its own git worktree while staying in the same Mission Workspace." },
+                    "branch": { "type": "string" },
+                    "base_ref": { "type": "string" },
+                    "title": { "type": "string" },
+                    "initial_prompt": { "type": "string" },
+                    "notify_on_finish": { "type": "boolean", "default": true },
+                    "workspace_id": { "type": "string" }
+                },
+                "required": ["initial_prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "move_agent_to_workspace",
+            description: "Move an agent into an existing Mission Workspace or split it out into a standalone Mission Workspace (omit `target_workspace_id`).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string" },
+                    "target_workspace_id": { "type": "string" },
+                    "new_workspace_title": { "type": "string" }
+                }
+            }),
         },
     ]
 }

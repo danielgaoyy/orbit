@@ -141,21 +141,105 @@ export interface FleetOverviewView {
   total_pending_approvals: number;
   hosts: HostCardView[];
   projects?: ClientProjectView[];
+  project_order?: string[];
 }
 
 export type ActiveTurnBehavior = "steer" | "queue" | "interrupt";
-export type AttentionState = "none" | "unread" | "needs_permission" | "error";
+export type AttentionState = "none" | "finished" | "error" | "permission" | "manual_unread";
 export type WorkspaceIsolation = "local" | "worktree";
 export type WorktreeCreateMode = "branch_off" | "checkout_branch" | "checkout_pr";
-export type WorkspaceSetupStatus = "none" | "running" | "succeeded" | "failed";
+export type WorkspaceSetupStatus = "none" | "idle" | "running" | "succeeded" | "failed";
 export type AgentMessageKind = "direct_message" | "finish_notification" | "heartbeat";
-export type ProviderSubagentStatus = "running" | "completed" | "failed" | "stopped";
+export type ProviderSubagentStatus = "running" | "completed" | "failed" | "stopped" | "canceled";
 export type ScheduleKind = "schedule" | "heartbeat";
 export type ScheduleStatus = "active" | "paused" | "completed";
 export type ScheduleRunStatus = "running" | "succeeded" | "failed" | "skipped";
 export type ConnectedHostStatus = "disabled" | "connecting" | "online" | "error";
-export type WorkspaceScriptKind = "setup" | "teardown" | "service" | "task";
+export type WorkspaceScriptKind = "command" | "setup" | "teardown" | "service" | "task";
 export type WorkspaceScriptStatus = "stopped" | "running" | "failed";
+
+export interface NestedGitRepo {
+  path: string;
+  relative_path: string;
+  name: string;
+  git_branch?: string | null;
+}
+
+export interface GitReposInspectionView {
+  path: string;
+  is_git_repo: boolean;
+  git_branch?: string | null;
+  nested_git_repos: NestedGitRepo[];
+}
+
+export interface HostProjectEntry {
+  project_id: string;
+  name: string;
+  directories: string[];
+  sort_order: number;
+  hidden: boolean;
+  updated_at_ms: number;
+}
+
+export interface HostSyncState {
+  projects: HostProjectEntry[];
+  project_order: string[];
+  project_sort_mode?: string | null;
+  updated_at_ms: number;
+}
+
+export interface WorkspaceClusterSuggestion {
+  target_workspace_id: string;
+  target_workspace_title: string;
+  confidence: number;
+  reason: string;
+  auto_applied: boolean;
+  previous_workspace_id?: string | null;
+}
+
+export interface WorkspaceBoardSnapshot {
+  workspace_id: string;
+  content: string;
+  revision: number;
+  updated_by?: string | null;
+  updated_at: string;
+  board_path?: string | null;
+}
+
+export type WorkspaceEventKind =
+  | "peer_joined"
+  | "peer_finished"
+  | "board_updated"
+  | "peer_message"
+  | "file_edited"
+  | "conflict_warning"
+  | "workspace_merged";
+
+export interface WorkspaceEventRecord {
+  seq: number;
+  workspace_id: string;
+  agent_id?: string | null;
+  agent_handle?: string | null;
+  kind: WorkspaceEventKind;
+  summary: string;
+  file_path?: string | null;
+  created_at: string;
+}
+
+export interface SpawnWorkspacePeerRequest {
+  host_id: string;
+  workspace_id: string;
+  cwd: string;
+  extra_dirs?: string[];
+  provider: ProviderKind;
+  model?: string | null;
+  effort?: ReasoningEffort | null;
+  mode: SessionMode;
+  initial_prompt: string;
+  worktree_branch?: string | null;
+  handle?: string | null;
+  profile_id?: string | null;
+}
 
 export interface PermissionCheckpointRef {
   child_agent_id: string;
@@ -201,6 +285,7 @@ export interface OrchestrationConfig {
   resume_on_startup: boolean;
   resume_prompt: string;
   installed_skills: string[];
+  auto_cluster_enabled?: boolean;
 }
 
 export interface OrchestrationSkillInfo {
@@ -319,6 +404,11 @@ export interface WorkspaceSummary {
   setup_status?: WorkspaceSetupStatus;
   background?: boolean;
   archived_at?: string | null;
+  mission_goal?: string | null;
+  project_root?: string | null;
+  board_revision?: number;
+  title_locked?: boolean;
+  auto_clustered?: boolean;
   updated_at: string;
 }
 
@@ -352,6 +442,10 @@ export interface AgentCardView {
   archived_at_rfc3339?: string | null;
   labels?: Record<string, string>;
   latest_seq: number;
+  read_seq?: number;
+  handle?: string | null;
+  cluster_suggestion?: WorkspaceClusterSuggestion | null;
+  worktree_branch?: string | null;
   updated_at_rfc3339: string;
   is_pinned: boolean;
   seen_seq: number;
@@ -418,6 +512,7 @@ export interface DiscoveredProject {
   name: string;
   git_branch: string | null;
   is_git_repo: boolean;
+  nested_git_repos?: NestedGitRepo[];
   last_modified_unix: number;
 }
 
@@ -467,6 +562,10 @@ export interface HostDetailView {
   workspace_scripts?: Record<string, WorkspaceScriptInfo[]>;
   pending_permissions?: PendingPermissionSummary[];
   provider_subagents?: Record<string, ProviderSubagentDescriptor[]>;
+  git_repos_by_cwd?: Record<string, GitReposInspectionView>;
+  workspace_boards?: Record<string, WorkspaceBoardSnapshot>;
+  workspace_events?: Record<string, WorkspaceEventRecord[]>;
+  host_sync_state?: HostSyncState | null;
 }
 
 export interface InlineSpanView {
@@ -721,6 +820,7 @@ export interface GitStatusSnapshot {
   ahead: number;
   behind: number;
   files: GitFileEntry[];
+  nested_git_repos?: NestedGitRepo[];
 }
 
 export interface GitReviewView {
@@ -1010,7 +1110,7 @@ export interface AgentStageDeltaView {
   aux_unchanged?: boolean;
 }
 
-export type SidebarProjectSort = "recent" | "alphabetical";
+export type SidebarProjectSort = "recent" | "alphabetical" | "manual";
 export type SidebarThreadFilter = "all" | "active_unread";
 
 export interface SidebarConversationView {
@@ -1022,6 +1122,22 @@ export interface SidebarConversationView {
   seen_seq: number;
 }
 
+export interface SidebarWorkspaceGroupView {
+  workspace_id: string;
+  title: string;
+  mission_goal?: string | null;
+  cwd: string;
+  git_branch?: string | null;
+  is_worktree: boolean;
+  board_revision: number;
+  has_conflict: boolean;
+  peer_count: number;
+  running_count: number;
+  unread_count: number;
+  is_multi_agent: boolean;
+  conversations: SidebarConversationView[];
+}
+
 export interface SidebarProjectGroupView {
   id: string;
   host_id: string;
@@ -1029,10 +1145,14 @@ export interface SidebarProjectGroupView {
   primary_cwd: string;
   directories: string[];
   git_branch: string | null;
+  is_git_repo?: boolean;
+  nested_git_repos?: NestedGitRepo[];
   pinned_project_id: string | null;
   is_home_workspace: boolean;
   sort_weight_ms: number;
+  sort_order_key?: string;
   conversations: SidebarConversationView[];
+  workspaces?: SidebarWorkspaceGroupView[];
 }
 
 export interface LaunchpadProjectView {
@@ -1041,6 +1161,8 @@ export interface LaunchpadProjectView {
   name: string;
   path: string;
   branch: string | null;
+  is_git_repo?: boolean;
+  nested_git_repos?: NestedGitRepo[];
 }
 
 export interface FleetSidebarView {
@@ -1119,7 +1241,8 @@ export type ComposerContextInput =
   | { kind: "workspace_file"; path: string }
   | { kind: "git_diff"; staged: boolean; label: string; diff_text?: string | null }
   | { kind: "terminal_output"; label: string; content: string }
-  | { kind: "assistant_quote"; label: string; content: string };
+  | { kind: "assistant_quote"; label: string; content: string }
+  | { kind: "workspace_peer"; handle: string; summary: string };
 
 export interface ComposerQuoteInput {
   path: string;
@@ -1171,6 +1294,8 @@ export interface MentionRankRequest {
   cwd: string;
   query: string;
   limit: number;
+  workspace_id?: string | null;
+  active_agent_id?: string | null;
 }
 
 export type CoreNotification =
@@ -1512,6 +1637,36 @@ export const orbitIpc = {
     await invoke<void>("remove_project", { projectId });
   },
 
+  reorderProjects: async (orderedKeys: string[]): Promise<string[]> => {
+    if (!isTauriRuntime()) return orderedKeys;
+    return invoke<string[]>("reorder_projects", { orderedKeys });
+  },
+
+  getProjectOrder: async (): Promise<string[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<string[]>("get_project_order");
+  },
+
+  inspectGitRepos: async (
+    hostId: string,
+    path: string,
+    extraDirs?: string[],
+  ): Promise<GitReposInspectionView> => {
+    if (!isTauriRuntime()) {
+      return { path, is_git_repo: false, git_branch: null, nested_git_repos: [] };
+    }
+    return invoke<GitReposInspectionView>("inspect_git_repos", {
+      hostId,
+      path,
+      extraDirs: extraDirs ?? [],
+    });
+  },
+
+  getGitRepos: async (hostId: string, path: string): Promise<GitReposInspectionView | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<GitReposInspectionView | null>("get_git_repos", { hostId, path });
+  },
+
   listDirectory: async (hostId: string, path: string | null): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("list_directory", { hostId, path });
@@ -1565,6 +1720,9 @@ export const orbitIpc = {
     initialBadges?: PromptBadge[];
     worktreeBranch: string | null;
     profileId?: string | null;
+    workspaceId?: string | null;
+    handle?: string | null;
+    autoCluster?: boolean | null;
   }): Promise<string> => {
     if (!isTauriRuntime()) return "";
     return invoke<string>("create_agent", {
@@ -1574,6 +1732,9 @@ export const orbitIpc = {
       initialDisplayPrompt: params.initialDisplayPrompt ?? null,
       initialBadges: params.initialBadges ?? [],
       profileId: params.profileId ?? null,
+      workspaceId: params.workspaceId ?? null,
+      handle: params.handle ?? null,
+      autoCluster: params.autoCluster ?? null,
     });
   },
 
@@ -1734,6 +1895,7 @@ export const orbitIpc = {
     effort?: ReasoningEffort | null;
     mode?: SessionMode | null;
     labels?: Record<string, string> | null;
+    handle?: string | null;
   }): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("update_agent", {
@@ -1744,7 +1906,107 @@ export const orbitIpc = {
       effort: params.effort ?? null,
       mode: params.mode ?? null,
       labels: params.labels ?? null,
+      handle: params.handle ?? null,
     });
+  },
+
+  fetchWorkspaceBoard: async (hostId: string, workspaceId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("fetch_workspace_board", { hostId, workspaceId });
+  },
+
+  getWorkspaceBoard: async (
+    hostId: string,
+    workspaceId: string,
+  ): Promise<WorkspaceBoardSnapshot | null> => {
+    if (!isTauriRuntime()) return null;
+    return invoke<WorkspaceBoardSnapshot | null>("get_workspace_board", {
+      hostId,
+      workspaceId,
+    });
+  },
+
+  updateWorkspaceBoard: async (params: {
+    hostId: string;
+    workspaceId: string;
+    content: string;
+    section?: string | null;
+    updatedBy?: string | null;
+  }): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_workspace_board", {
+      hostId: params.hostId,
+      workspaceId: params.workspaceId,
+      content: params.content,
+      section: params.section ?? null,
+      updatedBy: params.updatedBy ?? null,
+    });
+  },
+
+  fetchWorkspaceEvents: async (
+    hostId: string,
+    workspaceId: string,
+    limit?: number | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("fetch_workspace_events", {
+      hostId,
+      workspaceId,
+      limit: limit ?? null,
+    });
+  },
+
+  getWorkspaceEvents: async (
+    hostId: string,
+    workspaceId: string,
+  ): Promise<WorkspaceEventRecord[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<WorkspaceEventRecord[]>("get_workspace_events", { hostId, workspaceId });
+  },
+
+  updateWorkspaceGoal: async (
+    hostId: string,
+    workspaceId: string,
+    goal: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("update_workspace_goal", { hostId, workspaceId, goal });
+  },
+
+  moveAgentToWorkspace: async (
+    hostId: string,
+    agentId: string,
+    targetWorkspaceId?: string | null,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("move_agent_to_workspace", {
+      hostId,
+      agentId,
+      targetWorkspaceId: targetWorkspaceId ?? null,
+    });
+  },
+
+  mergeWorkspaces: async (
+    hostId: string,
+    sourceWorkspaceId: string,
+    targetWorkspaceId: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("merge_workspaces", {
+      hostId,
+      sourceWorkspaceId,
+      targetWorkspaceId,
+    });
+  },
+
+  dismissClusterSuggestion: async (hostId: string, agentId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("dismiss_cluster_suggestion", { hostId, agentId });
+  },
+
+  spawnWorkspacePeer: async (req: SpawnWorkspacePeerRequest): Promise<string> => {
+    if (!isTauriRuntime()) return "";
+    return invoke<string>("spawn_workspace_peer", { req });
   },
 
   createWorkspaceV2: async (params: {
@@ -2262,7 +2524,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.5.5";
+    if (!isTauriRuntime()) return "0.6.0";
     return invoke<string>("get_app_version");
   },
 

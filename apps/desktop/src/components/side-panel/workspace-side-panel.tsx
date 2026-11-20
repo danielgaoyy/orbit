@@ -1,8 +1,10 @@
 import { memo, useEffect, useRef } from "react";
 import {
+  Columns2,
   File,
   FileCode2,
   FileDiff,
+  FileText,
   Globe,
   Layers,
   MessageCircleQuestion,
@@ -14,11 +16,13 @@ import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { BrowserTab } from "@/components/side-panel/browser-tab";
 import { FileViewerTab } from "@/components/side-panel/file-viewer-tab";
 import { FilesExplorerTab } from "@/components/side-panel/files-explorer-tab";
+import { PeerSplitTab } from "@/components/side-panel/peer-split-tab";
 import { ReviewTab } from "@/components/side-panel/review-tab";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { SideQuestionTab } from "@/components/side-panel/side-question-tab";
 import { SubagentTab } from "@/components/side-panel/subagent-tab";
 import { TerminalTab } from "@/components/side-panel/terminal-tab";
+import { WorkspaceBoardTab } from "@/components/side-panel/workspace-board-tab";
 import { SidePanelLaunchpad } from "@/components/side-panel/side-panel-launchpad";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { modSymbol } from "@/lib/keybindings";
@@ -48,6 +52,10 @@ function SidePanelTabIcon({ tab }: { tab: SidePanelTab }) {
       return <MessageCircleQuestion className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
     case "subagent":
       return <Layers className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
+    case "board":
+      return <FileText className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
+    case "peer":
+      return <Columns2 className="h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />;
   }
 }
 
@@ -298,6 +306,10 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         {activeTab?.kind === "file" && <FileViewerTab key={activeTab.id} tab={activeTab} />}
         {activeTab?.kind === "side_question" && <SideQuestionTab />}
         {activeTab?.kind === "subagent" && <SubagentTab key={activeTab.id} tab={activeTab} />}
+        {activeTab?.kind === "board" && (
+          <WorkspaceBoardTab key={activeTab.id} tab={activeTab} />
+        )}
+        {activeTab?.kind === "peer" && <PeerSplitTab key={activeTab.id} tab={activeTab} />}
 
         {!activeTab && (
           <SidePanelLaunchpad

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowUpRight,
   Clock,
@@ -117,6 +117,8 @@ export function AutomationsView() {
   const hostDetail = useOrbitSelector((s) =>
     s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
   );
+  const gitReposCache = useOrbitSelector((s) => s.gitReposCache);
+  const sidebarView = useOrbitSelector((s) => s.sidebarView);
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
 
   const [creating, setCreating] = useState(false);
@@ -127,7 +129,39 @@ export function AutomationsView() {
   const [profileId, setProfileId] = useState<string>("");
   const [mode, setMode] = useState<SessionMode>("accept_edits");
   const [worktree, setWorktree] = useState(true);
+  const [worktreeRepoPath, setWorktreeRepoPath] = useState<string>("");
   const [archiveOnFinish, setArchiveOnFinish] = useState(true);
+
+  const cleanCwd = (selectedCwd || "").replace(/\/+$/, "") || "~";
+  const cachedInspection =
+    (selectedHostId ? gitReposCache[`${selectedHostId}::${cleanCwd}`] : undefined) ??
+    hostDetail?.git_repos_by_cwd?.[cleanCwd] ??
+    null;
+
+  useEffect(() => {
+    if (!creating || !selectedHostId || !cleanCwd || cleanCwd === "~") return;
+    if (!cachedInspection) {
+      void orbitActions.inspectGitRepos(selectedHostId, cleanCwd);
+    }
+  }, [creating, selectedHostId, cleanCwd, cachedInspection]);
+
+  const { isDirectGitRepo, nestedGitRepos } = useMemo(() => {
+    const sp = sidebarView?.projects.find(
+      (p) => p.host_id === selectedHostId && p.primary_cwd === cleanCwd,
+    );
+    const dp = hostDetail?.discovered_projects.find((p) => p.path === cleanCwd);
+    const direct =
+      cachedInspection?.is_git_repo ?? sp?.is_git_repo ?? dp?.is_git_repo ?? false;
+    const nested =
+      cachedInspection?.nested_git_repos ??
+      sp?.nested_git_repos ??
+      dp?.nested_git_repos ??
+      [];
+    return { isDirectGitRepo: direct, nestedGitRepos: nested };
+  }, [cachedInspection, sidebarView, selectedHostId, cleanCwd, hostDetail]);
+
+  const canUseWorktree = isDirectGitRepo || nestedGitRepos.length > 0;
+  const effectiveWorktree = canUseWorktree && worktree;
 
   const [expandedRunsId, setExpandedRunsId] = useState<string | null>(null);
   const [runsBySchedule, setRunsBySchedule] = useState<Record<string, ScheduleRunRecord[]>>({});
@@ -165,6 +199,10 @@ export function AutomationsView() {
       orbitActions.showToast("Fill in name, schedule expression, and prompt");
       return;
     }
+    const targetCwd =
+      effectiveWorktree && !isDirectGitRepo && nestedGitRepos.length > 0
+        ? worktreeRepoPath || nestedGitRepos[0].path
+        : selectedCwd || "~";
     await orbitIpc.createSchedule({
       hostId: selectedHostId,
       name: name.trim(),
@@ -172,11 +210,11 @@ export function AutomationsView() {
       prompt: prompt.trim(),
       target: {
         type: "new_agent",
-        cwd: selectedCwd || "~",
+        cwd: targetCwd,
         provider,
         profile_id: profileId || null,
         mode,
-        worktree,
+        worktree: effectiveWorktree,
         archive_on_finish: archiveOnFinish,
       },
     });
@@ -320,14 +358,37 @@ export function AutomationsView() {
 
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-4 text-[12.5px]">
-                <label className="inline-flex cursor-pointer items-center gap-1.5">
+                <label
+                  className={cn(
+                    "inline-flex items-center gap-1.5",
+                    canUseWorktree ? "cursor-pointer" : "text-muted-foreground cursor-not-allowed opacity-65",
+                  )}
+                >
                   <input
                     type="checkbox"
-                    checked={worktree}
+                    disabled={!canUseWorktree}
+                    checked={effectiveWorktree}
                     onChange={(e) => setWorktree(e.target.checked)}
                   />
-                  <span>Run in isolated git worktree</span>
+                  <span>
+                    {canUseWorktree
+                      ? "Run in isolated git worktree"
+                      : "Worktree unavailable (not a Git repo)"}
+                  </span>
                 </label>
+                {effectiveWorktree && !isDirectGitRepo && nestedGitRepos.length > 0 && (
+                  <select
+                    value={worktreeRepoPath || nestedGitRepos[0].path}
+                    onChange={(e) => setWorktreeRepoPath(e.target.value)}
+                    className="border-border bg-canvas text-foreground rounded-lg border px-2 py-1 text-[12px]"
+                  >
+                    {nestedGitRepos.map((repo) => (
+                      <option key={repo.path} value={repo.path}>
+                        {repo.relative_path || repo.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
                 <label className="inline-flex cursor-pointer items-center gap-1.5">
                   <input
                     type="checkbox"

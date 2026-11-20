@@ -26,6 +26,7 @@ export interface SidebarConversationRowProps {
   isUnread: boolean;
   selected: boolean;
   isChild: boolean;
+  peerHandle?: string | null;
   nowMs: number;
   menuOpen: boolean;
   isRenaming: boolean;
@@ -52,6 +53,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   isUnread,
   selected,
   isChild,
+  peerHandle,
   nowMs,
   menuOpen,
   isRenaming,
@@ -163,9 +165,14 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
               e.stopPropagation();
               onStartRename(threadKey);
             }}
-            className="truncate text-[13.5px]"
+            className="flex min-w-0 items-center gap-1.5 truncate text-[13.5px]"
           >
-            {effectiveTitle}
+            {peerHandle && (
+              <span className="bg-black/[0.06] text-foreground/75 shrink-0 rounded px-1 py-[1px] font-mono text-[10.5px] font-medium dark:bg-white/[0.09]">
+                @{peerHandle}
+              </span>
+            )}
+            <span className="truncate">{effectiveTitle}</span>
           </span>
         )}
       </div>

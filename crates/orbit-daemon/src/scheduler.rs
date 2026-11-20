@@ -446,6 +446,8 @@ impl ScheduleEngine {
                     worktree_mode: WorktreeCreateMode::BranchOff,
                     branch: None,
                     pr_number: None,
+                    handle: None,
+                    auto_cluster: Some(false),
                 };
                 match self.orchestrator.create_and_start_agent(spec).await {
                     Ok(agent) => {

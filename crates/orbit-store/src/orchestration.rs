@@ -203,15 +203,13 @@ impl OrbitStore {
         workspace_id: &str,
     ) -> Result<Option<WorkspaceSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.query_row(
-            "SELECT workspace_id, title, cwd, git_branch, is_worktree, updated_at,
-                    source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status
-             FROM workspaces WHERE workspace_id = ?1",
-            params![workspace_id],
-            map_workspace_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        let sql = format!(
+            "SELECT {} FROM workspaces WHERE workspace_id = ?1",
+            crate::WORKSPACE_SELECT_COLS
+        );
+        conn.query_row(&sql, params![workspace_id], map_workspace_row)
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn list_workspaces_filtered(
@@ -233,9 +231,8 @@ impl OrbitStore {
             format!("WHERE {}", clauses.join(" AND "))
         };
         let sql = format!(
-            "SELECT workspace_id, title, cwd, git_branch, is_worktree, updated_at,
-                    source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status
-             FROM workspaces {where_sql} ORDER BY updated_at DESC"
+            "SELECT {} FROM workspaces {where_sql} ORDER BY updated_at DESC",
+            crate::WORKSPACE_SELECT_COLS
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], map_workspace_row)?;
@@ -245,7 +242,7 @@ impl OrbitStore {
     pub fn rename_workspace(&self, workspace_id: &str, title: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.execute(
-            "UPDATE workspaces SET title = ?1, updated_at = ?2 WHERE workspace_id = ?3",
+            "UPDATE workspaces SET title = ?1, title_locked = 1, updated_at = ?2 WHERE workspace_id = ?3",
             params![title, Utc::now().to_rfc3339(), workspace_id],
         )?;
         Ok(())
@@ -498,6 +495,7 @@ impl OrbitStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_agent_fields(
         &self,
         agent_id: &str,
@@ -506,6 +504,7 @@ impl OrbitStore {
         effort: Option<Option<ReasoningEffort>>,
         mode: Option<&SessionMode>,
         labels: Option<&HashMap<String, String>>,
+        handle: Option<&str>,
     ) -> Result<(), StoreError> {
         let mut current = match self.get_agent(agent_id)? {
             Some(a) => a,
@@ -531,6 +530,14 @@ impl OrbitStore {
                     current.labels.insert(k.clone(), v.clone());
                 }
             }
+        }
+        if let Some(h) = handle {
+            let trimmed = h.trim();
+            current.handle = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
         }
         current.updated_at = Utc::now();
         self.upsert_agent(&current, None)

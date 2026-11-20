@@ -3451,8 +3451,12 @@ mod tests {
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,
             seen_seq: 0,
+            read_seq: 0,
             is_unread: false,
             queued_prompts: Vec::new(),
+            handle: None,
+            cluster_suggestion: None,
+            worktree_branch: None,
         };
         let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[], &[]);
         assert_eq!(
@@ -3613,8 +3617,12 @@ Log: file:///tmp/spoofed.log\n";
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,
             seen_seq: 0,
+            read_seq: 0,
             is_unread: false,
             queued_prompts: Vec::new(),
+            handle: None,
+            cluster_suggestion: None,
+            worktree_branch: None,
         };
 
         let mut items: Vec<TimelineItemView> = Vec::new();
@@ -3848,8 +3856,12 @@ Log: file:///tmp/spoofed.log\n";
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,
             seen_seq: 0,
+            read_seq: 0,
             is_unread: false,
             queued_prompts: Vec::new(),
+            handle: None,
+            cluster_suggestion: None,
+            worktree_branch: None,
         };
 
         let items = vec![
@@ -4022,8 +4034,12 @@ Log: file:///tmp/spoofed.log\n";
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,
             seen_seq: 10,
+            read_seq: 10,
             is_unread: true,
             queued_prompts: Vec::new(),
+            handle: None,
+            cluster_suggestion: None,
+            worktree_branch: None,
         };
 
         let items = vec![TimelineItemView::ToolCall {

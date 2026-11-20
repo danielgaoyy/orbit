@@ -190,7 +190,7 @@ pub struct HostInfo {
     pub available_providers: Vec<ProviderKind>,
 }
 
-/// Workspace record (either a direct local checkout or an isolated git worktree).
+/// Workspace record (either a direct local checkout, isolated git worktree, or multi-agent Mission Workspace).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSummary {
     pub workspace_id: String,
@@ -211,6 +211,21 @@ pub struct WorkspaceSummary {
     pub background: bool,
     #[serde(default)]
     pub setup_status: WorkspaceSetupStatus,
+    /// Optional concise one-line mission goal for a collaborative Mission Workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission_goal: Option<String>,
+    /// Logical project root path (allows peers in separate worktrees or nested repos to share one Mission Workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    /// Monotonic revision counter for the workspace's Shared Blackboard (`BOARD.md`).
+    #[serde(default)]
+    pub board_revision: u64,
+    /// Whether the user explicitly renamed this workspace (prevents auto-title overwrites).
+    #[serde(default)]
+    pub title_locked: bool,
+    /// Whether this workspace has absorbed auto-clustered sessions.
+    #[serde(default)]
+    pub auto_clustered: bool,
 }
 
 /// Auto-discovered local project / Git repository choice for zero-typing UI selection.
@@ -221,6 +236,8 @@ pub struct DiscoveredProject {
     pub git_branch: Option<String>,
     pub is_git_repo: bool,
     pub last_modified_unix: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_git_repos: Vec<NestedGitRepo>,
 }
 
 /// Directory entry for interactive remote/local folder browsing (`+ 添加工作目录`).
@@ -259,6 +276,8 @@ pub struct GitStatusSnapshot {
     pub ahead: u32,
     pub behind: u32,
     pub files: Vec<GitFileEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_git_repos: Vec<NestedGitRepo>,
 }
 
 /// Synchronized follow-up prompt queued on the host daemon for multi-device visibility & offline drain.
@@ -310,6 +329,21 @@ pub struct AgentSummary {
     pub last_activity_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<QueuedPromptView>,
+    /// Daemon-authoritative highest timeline `seq` read on ANY connected device (strictly monotonic).
+    #[serde(default)]
+    pub read_seq: u64,
+    /// Daemon-synced pinned flag for cross-device sidebar parity.
+    #[serde(default)]
+    pub is_pinned: bool,
+    /// Monotonic ordering weight for pinned conversations.
+    #[serde(default)]
+    pub pinned_order: i64,
+    /// Short collaborative handle unique within the agent's Mission Workspace (e.g. `lead`, `reviewer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    /// Optional auto-clustering recommendation or reversible auto-group banner metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_suggestion: Option<WorkspaceClusterSuggestion>,
 }
 
 /// Active detached PTY terminal summary.
@@ -624,6 +658,22 @@ pub enum WireMessage {
         request_id: Uuid,
         status: GitStatusSnapshot,
     },
+    /// Inspect whether `cwd` is a Git repository and discover nested Git repos inside it / `extra_dirs`.
+    InspectGitRepos {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default)]
+        extra_dirs: Vec<String>,
+    },
+    GitReposResponse {
+        request_id: Uuid,
+        cwd: String,
+        is_git_repo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_branch: Option<String>,
+        #[serde(default)]
+        repos: Vec<NestedGitRepo>,
+    },
     GetGitDiff {
         request_id: Uuid,
         cwd: String,
@@ -721,6 +771,12 @@ pub enum WireMessage {
         worktree_mode: WorktreeCreateMode,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branch: Option<String>,
+        /// Optional short collaborative handle within the workspace (e.g. `lead`, `reviewer`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
+        /// Override automatic clustering into an existing Mission Workspace (defaults to host config).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_cluster: Option<bool>,
     },
     AgentCreated {
         request_id: Uuid,
@@ -828,6 +884,20 @@ pub enum WireMessage {
     MarkAgentRead {
         request_id: Uuid,
         agent_id: String,
+        /// Optional explicit highest seq read by the client; defaults to daemon's current `latest_seq`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seen_seq: Option<u64>,
+    },
+    MarkAgentUnread {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    SetAgentPinned {
+        request_id: Uuid,
+        agent_id: String,
+        pinned: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned_order: Option<i64>,
     },
     UpdateAgent {
         request_id: Uuid,
@@ -842,6 +912,8 @@ pub enum WireMessage {
         mode: Option<SessionMode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         labels: Option<HashMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
     },
     ListPendingPermissions {
         request_id: Uuid,
@@ -1212,6 +1284,95 @@ pub enum WireMessage {
         error: Option<String>,
     },
 
+    // Host-Authoritative Multi-Device Sync (Projects, Project Order, Sort Mode)
+    GetHostSyncState {
+        request_id: Uuid,
+    },
+    HostSyncStateSnapshot {
+        request_id: Uuid,
+        state: HostSyncState,
+    },
+    HostSyncStateUpdated {
+        state: HostSyncState,
+    },
+    UpsertHostProject {
+        request_id: Uuid,
+        project: HostProjectEntry,
+    },
+    DeleteHostProject {
+        request_id: Uuid,
+        project_id: String,
+    },
+    SetHostProjectOrder {
+        request_id: Uuid,
+        project_order: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_sort_mode: Option<String>,
+    },
+
+    // Mission Workspace Collaboration (Shared Blackboard, Activity/Conflict Feed, Clustering & Moves)
+    GetWorkspaceBoard {
+        request_id: Uuid,
+        workspace_id: String,
+    },
+    WorkspaceBoardSnapshot {
+        request_id: Uuid,
+        board: WorkspaceBoardSnapshot,
+    },
+    UpdateWorkspaceBoard {
+        request_id: Uuid,
+        workspace_id: String,
+        /// Full Markdown replacement when `section` is `None`, or section body when `section` is `Some`.
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        section: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_by: Option<String>,
+    },
+    WorkspaceBoardUpdated {
+        board: WorkspaceBoardSnapshot,
+    },
+    ListWorkspaceEvents {
+        request_id: Uuid,
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    WorkspaceEventsSnapshot {
+        request_id: Uuid,
+        workspace_id: String,
+        events: Vec<WorkspaceEventRecord>,
+    },
+    WorkspaceEventRecorded {
+        event: WorkspaceEventRecord,
+    },
+    UpdateWorkspaceGoal {
+        request_id: Uuid,
+        workspace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mission_goal: Option<String>,
+    },
+    MoveAgentToWorkspace {
+        request_id: Uuid,
+        agent_id: String,
+        /// Target workspace ID; `None` splits the agent into a fresh standalone Mission Workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_workspace_title: Option<String>,
+    },
+    MergeWorkspaces {
+        request_id: Uuid,
+        source_workspace_id: String,
+        target_workspace_id: String,
+    },
+    DismissClusterSuggestion {
+        request_id: Uuid,
+        agent_id: String,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -1368,6 +1529,8 @@ mod tests {
             base_ref: None,
             worktree_mode: WorktreeCreateMode::BranchOff,
             branch: None,
+            handle: Some("lead".into()),
+            auto_cluster: None,
         };
         let raw_json = serde_json::to_vec(&msg).expect("serialize");
         let compressed = msg.encode_zstd(3).expect("compress");
@@ -1632,6 +1795,11 @@ mod tests {
                 attention: AttentionState::None,
                 last_activity_at: Some(now),
                 queued_prompts: Vec::new(),
+                read_seq: 12,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: Some("lead".into()),
+                cluster_suggestion: None,
             },
             to_before_seq: 42,
             events: Vec::new(),

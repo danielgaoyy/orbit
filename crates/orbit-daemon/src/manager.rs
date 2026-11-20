@@ -8,12 +8,13 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, OrchestrationConfig,
-    PendingPermissionSummary, PromptBadge, ProviderKind, ProviderSubagentDescriptor,
-    ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec, SessionMode,
-    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
-    WorkspaceIsolation, WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus,
-    WorkspaceSetupProgress, WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
+    ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, HostProjectEntry, HostSyncState,
+    OrchestrationConfig, PendingPermissionSummary, PromptBadge, ProviderKind,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec,
+    SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
+    WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus, WorkspaceSetupProgress,
+    WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, SessionLaunchConfig, find_provider_executable,
@@ -29,10 +30,15 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::git::{
-    capture_git_tree_snapshot, inspect_git_status, restore_git_tree_snapshot,
+    capture_git_tree_snapshot, inspect_git_status, resolve_git_scope, restore_git_tree_snapshot,
     reverse_apply_file_edit_diffs,
 };
 use crate::messaging::{CoalescedDispatchBatch, sanitize_human_prompt_for_wire};
+use crate::workspace_board::{
+    board_file_path, build_workspace_roster_context, default_board_template,
+    upsert_markdown_section, write_board_file,
+};
+use crate::workspace_cluster::{allocate_unique_handle, evaluate_auto_cluster, sanitize_handle};
 use crate::workspace_runtime::{
     WorkspaceScriptRegistry, allocate_ephemeral_port, build_service_proxy_host,
     create_worktree_with_mode, load_workspace_manifest_with_fallback, run_worktree_setup_hooks,
@@ -67,6 +73,9 @@ pub enum DaemonBroadcast {
         origin_session_id: Uuid,
         outcome: RewindAgentOutcome,
     },
+    HostSyncStateUpdated(HostSyncState),
+    WorkspaceBoardUpdated(WorkspaceBoardSnapshot),
+    WorkspaceEventRecorded(WorkspaceEventRecord),
 }
 
 struct LiveAgentEntry {
@@ -106,6 +115,9 @@ pub struct CreateWorkspaceSpec {
     pub pr_number: Option<u32>,
     pub parent_workspace_id: Option<String>,
     pub background: bool,
+    pub project_root: Option<String>,
+    pub mission_goal: Option<String>,
+    pub allow_reuse_existing: bool,
 }
 
 pub struct CreateAgentSpec {
@@ -130,6 +142,8 @@ pub struct CreateAgentSpec {
     pub worktree_mode: WorktreeCreateMode,
     pub branch: Option<String>,
     pub pr_number: Option<u32>,
+    pub handle: Option<String>,
+    pub auto_cluster: Option<bool>,
 }
 
 pub struct AgentOrchestrator {
@@ -147,6 +161,10 @@ pub struct AgentOrchestrator {
     live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
     /// Pending permissions keyed by `(agent_id, request_id)`
     pending_permissions: RwLock<HashMap<(String, String), PendingPermissionSummary>>,
+    /// Last `<orbit-workspace>` roster fingerprint injected per `agent_id` to avoid redundant XML bloat.
+    roster_fingerprints: RwLock<HashMap<String, String>>,
+    /// Conflict radar cooldown keyed by `(workspace_id, canonical_file_path)`.
+    conflict_cooldowns: RwLock<HashMap<(String, String), std::time::Instant>>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
 
@@ -176,6 +194,8 @@ impl AgentOrchestrator {
             pending_questions: RwLock::new(HashMap::new()),
             live_terminals: RwLock::new(HashMap::new()),
             pending_permissions: RwLock::new(HashMap::new()),
+            roster_fingerprints: RwLock::new(HashMap::new()),
+            conflict_cooldowns: RwLock::new(HashMap::new()),
             broadcast_tx,
         })
     }
@@ -369,6 +389,9 @@ impl AgentOrchestrator {
             pr_number: None,
             parent_workspace_id: None,
             background: false,
+            project_root: None,
+            mission_goal: None,
+            allow_reuse_existing: true,
         })
         .await
     }
@@ -382,6 +405,12 @@ impl AgentOrchestrator {
             spec.isolation == WorkspaceIsolation::Worktree || spec.worktree_branch.is_some();
 
         let (final_path, is_worktree, created_branch) = if use_worktree {
+            if resolve_git_scope(&src_path).await.is_none() {
+                anyhow::bail!(
+                    "not_a_git_repo: `{}` is not a Git repository. Switch to Local mode or pick a nested Git repository inside this project.",
+                    src_path.display()
+                );
+            }
             let (wt_path, br) = create_worktree_with_mode(
                 &self.home_dir,
                 &src_path,
@@ -399,6 +428,7 @@ impl AgentOrchestrator {
         let cwd_str = final_path.to_string_lossy().to_string();
         if !is_worktree
             && !spec.background
+            && spec.allow_reuse_existing
             && let Ok(Some(existing)) = self.store.find_workspace_by_cwd(&cwd_str)
         {
             return Ok(existing);
@@ -430,6 +460,11 @@ impl AgentOrchestrator {
                 .setup
                 .is_some();
 
+        let title_locked = spec.title.as_deref().is_some_and(|t| !t.trim().is_empty());
+        let project_root = spec
+            .project_root
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| Some(src_path.to_string_lossy().to_string()));
         let ws = WorkspaceSummary {
             workspace_id: format!("ws_{}", Uuid::new_v4().simple()),
             title: spec.title.unwrap_or(default_title),
@@ -451,6 +486,11 @@ impl AgentOrchestrator {
             } else {
                 WorkspaceSetupStatus::Idle
             },
+            mission_goal: spec.mission_goal,
+            project_root,
+            board_revision: 0,
+            title_locked,
+            auto_clustered: false,
         };
         self.store.upsert_workspace(&ws)?;
         let _ = self
@@ -817,10 +857,75 @@ impl AgentOrchestrator {
         let effective_background =
             spec.background || parent_agent.as_ref().is_some_and(|p| p.background);
 
+        let computed_title = spec
+            .title
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| summarize_prompt_title(&human_seed));
+
+        // Derive logical `project_root`: if `extra_dirs` holds a parent project dir that contains
+        // `spec.cwd` (e.g. a nested git repo inside a non-git parent project), anchor to that parent.
+        let expanded_cwd = crate::expand_host_path(&spec.cwd);
+        let expanded_cwd_str = expanded_cwd.to_string_lossy().to_string();
+        let inferred_project_root = spec
+            .extra_dirs
+            .iter()
+            .map(|d| crate::expand_host_path(d))
+            .find(|p| expanded_cwd.starts_with(p) && *p != expanded_cwd)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| expanded_cwd_str.clone());
+
+        let mut agent_cwd_override: Option<String> = None;
+        let mut agent_labels: HashMap<String, String> = HashMap::new();
+        let mut cluster_suggestion = None;
+
         let ws = if let Some(ref ws_id) = spec.workspace_id {
-            self.store
+            let existing_ws = self
+                .store
                 .get_workspace(ws_id)?
-                .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?
+                .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?;
+            // Support spawning an isolated worktree peer INSIDE the same logical Mission Workspace!
+            if spec.worktree {
+                let src_for_wt = if !spec.cwd.trim().is_empty() {
+                    crate::expand_host_path(&spec.cwd)
+                } else {
+                    crate::expand_host_path(
+                        existing_ws
+                            .source_cwd
+                            .as_deref()
+                            .unwrap_or(&existing_ws.cwd),
+                    )
+                };
+                if resolve_git_scope(&src_for_wt).await.is_none() {
+                    anyhow::bail!(
+                        "not_a_git_repo: `{}` is not a Git repository. Disable Worktree or pick a nested Git repository.",
+                        src_for_wt.display()
+                    );
+                }
+                let auto_branch = spec
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| auto_worktree_branch(&human_seed));
+                let (wt_path, created_br) = create_worktree_with_mode(
+                    &self.home_dir,
+                    &src_for_wt,
+                    spec.worktree_mode,
+                    Some(&auto_branch),
+                    spec.base_ref.as_deref(),
+                    spec.pr_number,
+                )
+                .await?;
+                let wt_str = wt_path.to_string_lossy().to_string();
+                agent_labels.insert(
+                    "orbit.worktree_source_cwd".into(),
+                    src_for_wt.to_string_lossy().to_string(),
+                );
+                if let Some(br) = created_br {
+                    agent_labels.insert("orbit.worktree_branch".into(), br);
+                }
+                agent_cwd_override = Some(wt_str);
+            }
+            existing_ws
         } else if spec.worktree {
             let auto_branch = spec
                 .branch
@@ -828,7 +933,7 @@ impl AgentOrchestrator {
                 .unwrap_or_else(|| auto_worktree_branch(&human_seed));
             self.create_workspace_v2(CreateWorkspaceSpec {
                 source_cwd: spec.cwd.clone(),
-                title: None,
+                title: Some(computed_title.clone()),
                 worktree_branch: Some(auto_branch),
                 base_ref: spec.base_ref.clone(),
                 isolation: WorkspaceIsolation::Worktree,
@@ -836,6 +941,9 @@ impl AgentOrchestrator {
                 pr_number: spec.pr_number,
                 parent_workspace_id: parent_agent.as_ref().map(|p| p.workspace_id.clone()),
                 background: effective_background,
+                project_root: Some(inferred_project_root.clone()),
+                mission_goal: None,
+                allow_reuse_existing: false,
             })
             .await?
         } else if let Some(ref parent) = parent_agent
@@ -844,37 +952,90 @@ impl AgentOrchestrator {
         {
             parent_ws
         } else {
-            self.create_workspace_v2(CreateWorkspaceSpec {
-                source_cwd: spec.cwd.clone(),
-                title: None,
-                worktree_branch: None,
-                base_ref: None,
-                isolation: WorkspaceIsolation::Local,
-                worktree_mode: WorktreeCreateMode::BranchOff,
-                pr_number: None,
-                parent_workspace_id: parent_agent.as_ref().map(|p| p.workspace_id.clone()),
-                background: effective_background,
-            })
-            .await?
+            // Top-level local conversation: run two-stage Auto-Clustering when enabled
+            let cfg_auto_cluster = self.orch_config.read().await.auto_cluster_enabled;
+            let should_eval_cluster = !effective_background
+                && parent_agent.is_none()
+                && spec.auto_cluster.unwrap_or(cfg_auto_cluster)
+                && !human_seed.trim().is_empty();
+
+            let git_branch_now = inspect_git_status(&expanded_cwd).await.branch;
+            let mut evaluated = if should_eval_cluster {
+                evaluate_auto_cluster(
+                    &self.store,
+                    &inferred_project_root,
+                    &expanded_cwd_str,
+                    git_branch_now.as_deref(),
+                    &human_seed,
+                    &spec.initial_badges,
+                    None,
+                    true,
+                )
+            } else {
+                None
+            };
+
+            if let Some(ref mut sug) = evaluated
+                && sug.auto_applied
+                && let Ok(Some(target_ws)) = self.store.get_workspace(&sug.target_workspace_id)
+            {
+                let _ = self.store.update_workspace_goal(
+                    &target_ws.workspace_id,
+                    None,
+                    None,
+                    None,
+                    Some(true),
+                );
+                sug.previous_workspace_id = None;
+                cluster_suggestion = evaluated;
+                self.store
+                    .get_workspace(&target_ws.workspace_id)?
+                    .unwrap_or(target_ws)
+            } else {
+                cluster_suggestion = evaluated;
+                self.create_workspace_v2(CreateWorkspaceSpec {
+                    source_cwd: spec.cwd.clone(),
+                    title: Some(computed_title.clone()),
+                    worktree_branch: None,
+                    base_ref: None,
+                    isolation: WorkspaceIsolation::Local,
+                    worktree_mode: WorktreeCreateMode::BranchOff,
+                    pr_number: None,
+                    parent_workspace_id: parent_agent.as_ref().map(|p| p.workspace_id.clone()),
+                    background: effective_background,
+                    project_root: Some(inferred_project_root.clone()),
+                    mission_goal: None,
+                    allow_reuse_existing: false,
+                })
+                .await?
+            }
         };
 
         let now = Utc::now();
         let agent_id = format!("ag_{}", Uuid::new_v4().simple());
-        let computed_title = spec
-            .title
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| summarize_prompt_title(&human_seed));
+        let final_cwd = agent_cwd_override.unwrap_or_else(|| ws.cwd.clone());
+
+        let existing_peers = self
+            .store
+            .list_agents_filtered(Some(&ws.workspace_id), false, false, None)
+            .unwrap_or_default();
+        let allocated_handle = allocate_unique_handle(
+            spec.handle.as_deref(),
+            provider,
+            profile.as_ref().map(|p| p.name.as_str()),
+            &existing_peers,
+        );
 
         let extra_strs: Vec<String> = spec
             .extra_dirs
             .into_iter()
-            .filter(|s| !s.trim().is_empty() && s.trim() != ws.cwd)
+            .filter(|s| !s.trim().is_empty() && s.trim() != final_cwd)
             .collect();
 
         let summary = AgentSummary {
             agent_id: agent_id.clone(),
             workspace_id: ws.workspace_id.clone(),
-            cwd: ws.cwd.clone(),
+            cwd: final_cwd,
             title: computed_title,
             provider,
             model,
@@ -894,14 +1055,42 @@ impl AgentOrchestrator {
                 .as_ref()
                 .map(|p| p.profile_id.clone())
                 .or(spec.profile_id),
-            labels: HashMap::new(),
+            labels: agent_labels,
             attention: AttentionState::None,
             last_activity_at: Some(now),
             queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: Some(allocated_handle.clone()),
+            cluster_suggestion,
         };
         self.store.upsert_agent(&summary, None)?;
         if !extra_strs.is_empty() {
             let _ = self.store.set_agent_extra_dirs(&agent_id, &extra_strs);
+        }
+        if !existing_peers.is_empty() && !summary.background {
+            if let Ok(ws_ev) = self.store.append_workspace_event(
+                &ws.workspace_id,
+                Some(&agent_id),
+                Some(&allocated_handle),
+                WorkspaceEventKind::PeerJoined,
+                &format!(
+                    "@{} ({}) joined workspace",
+                    allocated_handle,
+                    provider.display_name()
+                ),
+                None,
+            ) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceEventRecorded(ws_ev));
+            }
+            if let Ok(Some(refreshed_ws)) = self.store.get_workspace(&ws.workspace_id) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceUpdated(refreshed_ws));
+            }
         }
         let _ = self
             .broadcast_tx
@@ -927,6 +1116,10 @@ impl AgentOrchestrator {
                 },
             )?;
             let prompt_seq = ev.seq;
+            // Authoritative multi-device sync: human's own prompt is already read by the creator.
+            if summary.parent_agent_id.is_none() {
+                let _ = self.store.mark_agent_read_seq(&agent_id, Some(prompt_seq));
+            }
             let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
             Some((tid, prompt_seq))
         } else {
@@ -959,7 +1152,10 @@ impl AgentOrchestrator {
                         return;
                     }
                     if let Some((turn_id, _)) = initial_turn {
-                        let wire = sanitize_human_prompt_for_wire(&initial_prompt, &turn_id);
+                        let sanitized = sanitize_human_prompt_for_wire(&initial_prompt, &turn_id);
+                        let wire = mgr
+                            .augment_prompt_with_workspace_context(&ag_id_bg, sanitized)
+                            .await;
                         let _ = cmd_tx
                             .send(DriverCommand::SendPrompt {
                                 turn_id,
@@ -1228,10 +1424,14 @@ impl AgentOrchestrator {
             let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
         }
 
+        let wire_prompt = self
+            .augment_prompt_with_workspace_context(&batch.recipient_id, batch.wire_prompt)
+            .await;
+
         cmd_tx
             .send(DriverCommand::SendPrompt {
                 turn_id,
-                prompt: batch.wire_prompt,
+                prompt: wire_prompt,
                 behavior: batch.active_turn_behavior,
             })
             .await
@@ -1268,6 +1468,12 @@ impl AgentOrchestrator {
             },
         )?;
         let prompt_seq = ev.seq;
+        // Advance authoritative read_seq on human prompt so other devices never flash unread for user input
+        if let Ok(Some(read_ag)) = self.store.mark_agent_read_seq(agent_id, Some(prompt_seq)) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(read_ag));
+        }
         let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
 
         let sanitized = sanitize_human_prompt_for_wire(&prompt, &msg_id);
@@ -1279,10 +1485,13 @@ impl AgentOrchestrator {
                 self.store
                     .save_turn_checkpoint(agent_id, prompt_seq, Some(&turn_id), &tree_oid);
         }
-        let wire_prompt = match handoff_context {
+        let with_handoff = match handoff_context {
             Some(ctx) => format!("{ctx}\n\n[Latest User Request]\n{sanitized}"),
             None => sanitized,
         };
+        let wire_prompt = self
+            .augment_prompt_with_workspace_context(agent_id, with_handoff)
+            .await;
 
         cmd_tx
             .send(DriverCommand::SendPrompt {
@@ -1432,6 +1641,7 @@ impl AgentOrchestrator {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_agent(
         &self,
         agent_id: &str,
@@ -1440,7 +1650,9 @@ impl AgentOrchestrator {
         effort: Option<ReasoningEffort>,
         mode: Option<SessionMode>,
         labels: Option<HashMap<String, String>>,
+        handle: Option<String>,
     ) -> anyhow::Result<AgentSummary> {
+        let clean_handle = handle.map(|h| sanitize_handle(&h));
         self.store.update_agent_fields(
             agent_id,
             title.as_deref(),
@@ -1448,6 +1660,7 @@ impl AgentOrchestrator {
             effort.map(Some),
             mode.as_ref(),
             labels.as_ref(),
+            clean_handle.as_deref(),
         )?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             if let Some(md) = mode {
@@ -1638,9 +1851,29 @@ impl AgentOrchestrator {
             // 3. Soft-archive record in SQLite & broadcast
             self.store.archive_agent_soft(agent_id)?;
             if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+                let wt_src = updated.labels.get("orbit.worktree_source_cwd").cloned();
+                let wt_branch = updated.labels.get("orbit.worktree_branch").cloned();
+                let wt_cwd = updated.cwd.clone();
                 let _ = self
                     .broadcast_tx
                     .send(DaemonBroadcast::AgentUpdated(updated));
+                // Clean up peer-owned isolated worktree if no other active agent uses it
+                if let Some(src) = wt_src {
+                    let still_used = self
+                        .store
+                        .list_agents_filtered(None, false, true, None)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|a| a.cwd == wt_cwd);
+                    if !still_used {
+                        teardown_and_remove_worktree(
+                            Some(Path::new(&src)),
+                            Path::new(&wt_cwd),
+                            wt_branch.as_deref(),
+                        )
+                        .await;
+                    }
+                }
             }
 
             // 4. Resolve managed children: detach cross-workspace / open-tab children, cascade-archive the rest
@@ -1717,15 +1950,567 @@ impl AgentOrchestrator {
         Ok(())
     }
 
-    pub async fn mark_agent_read(&self, agent_id: &str) -> anyhow::Result<()> {
-        self.store
-            .set_agent_attention(agent_id, AttentionState::None)?;
-        if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+    pub async fn mark_agent_read(
+        &self,
+        agent_id: &str,
+        seen_seq: Option<u64>,
+    ) -> anyhow::Result<()> {
+        if let Some(updated) = self.store.mark_agent_read_seq(agent_id, seen_seq)? {
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::AgentUpdated(updated));
         }
         Ok(())
+    }
+
+    pub async fn mark_agent_unread(&self, agent_id: &str) -> anyhow::Result<()> {
+        if let Some(updated) = self.store.mark_agent_unread(agent_id)? {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
+    }
+
+    pub async fn set_agent_pinned(
+        &self,
+        agent_id: &str,
+        pinned: bool,
+        pinned_order: Option<i64>,
+    ) -> anyhow::Result<()> {
+        if let Some(updated) = self
+            .store
+            .set_agent_pinned(agent_id, pinned, pinned_order)?
+        {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
+    }
+
+    // --- Host-Authoritative Multi-Device Sync (Projects & Order) ---
+
+    pub fn get_host_sync_state(&self) -> anyhow::Result<HostSyncState> {
+        Ok(self.store.get_host_sync_state()?)
+    }
+
+    pub fn upsert_host_project(&self, project: HostProjectEntry) -> anyhow::Result<HostSyncState> {
+        let state = self.store.upsert_host_project(&project)?;
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::HostSyncStateUpdated(state.clone()));
+        Ok(state)
+    }
+
+    pub fn delete_host_project(&self, project_id: &str) -> anyhow::Result<HostSyncState> {
+        let state = self.store.delete_host_project(project_id)?;
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::HostSyncStateUpdated(state.clone()));
+        Ok(state)
+    }
+
+    pub fn set_host_project_order(
+        &self,
+        project_order: Vec<String>,
+        project_sort_mode: Option<String>,
+    ) -> anyhow::Result<HostSyncState> {
+        let state = self
+            .store
+            .set_host_project_order(&project_order, project_sort_mode.as_deref())?;
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::HostSyncStateUpdated(state.clone()));
+        Ok(state)
+    }
+
+    // --- Mission Workspace Shared Blackboard, Peer Collaboration & Conflict Radar ---
+
+    pub fn get_workspace_board(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<WorkspaceBoardSnapshot> {
+        if let Some(existing) = self.store.get_workspace_board(workspace_id)? {
+            return Ok(existing);
+        }
+        let ws = self
+            .store
+            .get_workspace(workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
+        let path_str = board_file_path(&self.home_dir, workspace_id)
+            .to_string_lossy()
+            .to_string();
+        Ok(WorkspaceBoardSnapshot {
+            workspace_id: workspace_id.to_string(),
+            content: default_board_template(&ws.title, ws.mission_goal.as_deref()),
+            revision: ws.board_revision,
+            updated_by: None,
+            updated_at: ws.updated_at,
+            board_path: Some(path_str),
+        })
+    }
+
+    pub fn update_workspace_board(
+        &self,
+        workspace_id: &str,
+        content: &str,
+        section: Option<&str>,
+        updated_by: Option<&str>,
+        editor_agent_id: Option<&str>,
+    ) -> anyhow::Result<WorkspaceBoardSnapshot> {
+        let ws = self
+            .store
+            .get_workspace(workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
+        let final_content = match section.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(sec) => {
+                let current = self
+                    .store
+                    .get_workspace_board(workspace_id)?
+                    .map(|b| b.content)
+                    .unwrap_or_else(|| {
+                        default_board_template(&ws.title, ws.mission_goal.as_deref())
+                    });
+                upsert_markdown_section(&current, sec, content)
+            }
+            None => content.to_string(),
+        };
+        let disk_path = write_board_file(&self.home_dir, workspace_id, &final_content);
+        let snap = self.store.upsert_workspace_board(
+            workspace_id,
+            &final_content,
+            updated_by,
+            disk_path.as_deref(),
+        )?;
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::WorkspaceBoardUpdated(snap.clone()));
+        let event_summary = match section.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(sec) => format!(
+                "Updated Shared Board section `{sec}` (rev {})",
+                snap.revision
+            ),
+            None => format!("Updated Shared Board (rev {})", snap.revision),
+        };
+        if let Ok(ev) = self.store.append_workspace_event(
+            workspace_id,
+            editor_agent_id,
+            updated_by,
+            WorkspaceEventKind::BoardUpdated,
+            &event_summary,
+            None,
+        ) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+        }
+        if let Ok(Some(updated_ws)) = self.store.get_workspace(workspace_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceUpdated(updated_ws));
+        }
+        Ok(snap)
+    }
+
+    pub fn list_workspace_events(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<WorkspaceEventRecord>> {
+        Ok(self.store.list_workspace_events(workspace_id, limit)?)
+    }
+
+    pub fn update_workspace_goal(
+        &self,
+        workspace_id: &str,
+        title: Option<String>,
+        mission_goal: Option<String>,
+    ) -> anyhow::Result<WorkspaceSummary> {
+        let title_locked = title.as_deref().is_some_and(|t| !t.trim().is_empty());
+        let updated = self
+            .store
+            .update_workspace_goal(
+                workspace_id,
+                title.as_deref(),
+                mission_goal.as_deref(),
+                title_locked.then_some(true),
+                None,
+            )?
+            .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::WorkspaceUpdated(updated.clone()));
+        Ok(updated)
+    }
+
+    pub async fn move_agent_to_workspace(
+        &self,
+        agent_id: &str,
+        target_workspace_id: Option<String>,
+        new_workspace_title: Option<String>,
+    ) -> anyhow::Result<AgentSummary> {
+        let agent = self
+            .store
+            .get_agent(agent_id)?
+            .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+        let target_ws = match target_workspace_id {
+            Some(ref ws_id) if !ws_id.trim().is_empty() => self
+                .store
+                .get_workspace(ws_id)?
+                .ok_or_else(|| anyhow::anyhow!("workspace `{ws_id}` not found"))?,
+            _ => {
+                let old_ws = self.store.get_workspace(&agent.workspace_id).ok().flatten();
+                let title = new_workspace_title
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| agent.title.clone());
+                self.create_workspace_v2(CreateWorkspaceSpec {
+                    source_cwd: agent.cwd.clone(),
+                    title: Some(title),
+                    worktree_branch: None,
+                    base_ref: None,
+                    isolation: WorkspaceIsolation::Local,
+                    worktree_mode: WorktreeCreateMode::BranchOff,
+                    pr_number: None,
+                    parent_workspace_id: None,
+                    background: agent.background,
+                    project_root: old_ws.and_then(|w| w.project_root),
+                    mission_goal: None,
+                    allow_reuse_existing: false,
+                })
+                .await?
+            }
+        };
+
+        // Ensure unique handle in the destination workspace
+        let dest_peers = self
+            .store
+            .list_agents_filtered(Some(&target_ws.workspace_id), false, false, None)
+            .unwrap_or_default();
+        let next_handle =
+            allocate_unique_handle(agent.handle.as_deref(), agent.provider, None, &dest_peers);
+        let _ = self.store.set_agent_handle(agent_id, Some(&next_handle));
+        let updated = self
+            .store
+            .move_agent_to_workspace(agent_id, &target_ws.workspace_id, true)?
+            .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+        // Reset cached roster fingerprint so next turn reflects the new workspace peers
+        self.roster_fingerprints.write().await.remove(agent_id);
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::AgentUpdated(updated.clone()));
+        if let Ok(ev) = self.store.append_workspace_event(
+            &target_ws.workspace_id,
+            Some(agent_id),
+            Some(&next_handle),
+            WorkspaceEventKind::PeerJoined,
+            &format!("@{} joined workspace `{}`", next_handle, target_ws.title),
+            None,
+        ) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+        }
+        if let Ok(Some(refreshed_ws)) = self.store.get_workspace(&target_ws.workspace_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceUpdated(refreshed_ws));
+        }
+        Ok(updated)
+    }
+
+    pub async fn merge_workspaces(
+        &self,
+        source_workspace_id: &str,
+        target_workspace_id: &str,
+    ) -> anyhow::Result<usize> {
+        let src_ws = self
+            .store
+            .get_workspace(source_workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("source workspace `{source_workspace_id}` not found"))?;
+        let dst_ws = self
+            .store
+            .get_workspace(target_workspace_id)?
+            .ok_or_else(|| anyhow::anyhow!("target workspace `{target_workspace_id}` not found"))?;
+        let src_agents =
+            self.store
+                .list_agents_filtered(Some(source_workspace_id), false, true, None)?;
+        let mut dst_peers =
+            self.store
+                .list_agents_filtered(Some(target_workspace_id), false, false, None)?;
+        for ag in &src_agents {
+            let unique_handle =
+                allocate_unique_handle(ag.handle.as_deref(), ag.provider, None, &dst_peers);
+            let _ = self
+                .store
+                .set_agent_handle(&ag.agent_id, Some(&unique_handle));
+            let mut moved_copy = ag.clone();
+            moved_copy.handle = Some(unique_handle);
+            dst_peers.push(moved_copy);
+            self.roster_fingerprints.write().await.remove(&ag.agent_id);
+        }
+        // Merge non-empty source board into target board if present
+        if let Ok(Some(src_board)) = self.store.get_workspace_board(source_workspace_id)
+            && !src_board.content.trim().is_empty()
+        {
+            let _ = self.update_workspace_board(
+                target_workspace_id,
+                &src_board.content,
+                Some(&format!("Merged from {}", src_ws.title)),
+                Some("workspace"),
+                None,
+            );
+        }
+        let moved = self
+            .store
+            .merge_workspaces(source_workspace_id, target_workspace_id)?;
+        if let Ok(ev) = self.store.append_workspace_event(
+            target_workspace_id,
+            None,
+            None,
+            WorkspaceEventKind::WorkspaceMerged,
+            &format!(
+                "Merged workspace `{}` ({moved} peer(s)) into `{}`",
+                src_ws.title, dst_ws.title
+            ),
+            None,
+        ) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+        }
+        for ag in src_agents {
+            if let Ok(Some(updated)) = self.store.get_agent(&ag.agent_id) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::AgentUpdated(updated));
+            }
+        }
+        if let Ok(Some(updated_src)) = self.store.get_workspace(source_workspace_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceUpdated(updated_src));
+        }
+        if let Ok(Some(updated_dst)) = self.store.get_workspace(target_workspace_id) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceUpdated(updated_dst));
+        }
+        Ok(moved)
+    }
+
+    pub fn dismiss_cluster_suggestion(&self, agent_id: &str) -> anyhow::Result<()> {
+        if let Some(updated) = self.store.set_agent_cluster_suggestion(agent_id, None)? {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::AgentUpdated(updated));
+        }
+        Ok(())
+    }
+
+    /// Resolve a sibling peer inside `workspace_id` by `@handle`, `agent_id`, or case-insensitive title prefix.
+    pub fn resolve_peer_in_workspace(
+        &self,
+        workspace_id: &str,
+        target: &str,
+    ) -> anyhow::Result<Option<AgentSummary>> {
+        let clean = target.trim().trim_start_matches('@');
+        if clean.is_empty() {
+            return Ok(None);
+        }
+        let peers = self
+            .store
+            .list_agents_filtered(Some(workspace_id), false, true, None)?;
+        if let Some(exact_id) = peers.iter().find(|a| a.agent_id == clean) {
+            return Ok(Some(exact_id.clone()));
+        }
+        if let Some(exact_handle) = peers.iter().find(|a| {
+            a.handle
+                .as_deref()
+                .is_some_and(|h| h.eq_ignore_ascii_case(clean))
+        }) {
+            return Ok(Some(exact_handle.clone()));
+        }
+        let lower = clean.to_ascii_lowercase();
+        Ok(peers
+            .into_iter()
+            .find(|a| a.title.to_ascii_lowercase().contains(&lower)))
+    }
+
+    /// Prepend a deduplicated `<orbit-workspace>` live awareness block (peers + shared board +
+    /// recent events) whenever the workspace has 2+ peers or board content that changed since the
+    /// last turn sent to `agent_id`.
+    async fn augment_prompt_with_workspace_context(
+        &self,
+        agent_id: &str,
+        prompt: String,
+    ) -> String {
+        let Ok(Some(agent)) = self.store.get_agent(agent_id) else {
+            return prompt;
+        };
+        if agent.background {
+            return prompt;
+        }
+        let Ok(Some(ws)) = self.store.get_workspace(&agent.workspace_id) else {
+            return prompt;
+        };
+        let peers = self
+            .store
+            .list_agents_filtered(Some(&ws.workspace_id), false, false, None)
+            .unwrap_or_default();
+        let events = self
+            .store
+            .list_workspace_events(&ws.workspace_id, 16)
+            .unwrap_or_default();
+        let board = self
+            .store
+            .get_workspace_board(&ws.workspace_id)
+            .ok()
+            .flatten();
+
+        let Some((xml, fingerprint)) = build_workspace_roster_context(
+            &self.store,
+            &self.home_dir,
+            &ws,
+            agent_id,
+            &peers,
+            &events,
+            board.as_ref(),
+        ) else {
+            return prompt;
+        };
+
+        let should_inject = {
+            let mut guard = self.roster_fingerprints.write().await;
+            let changed = guard.get(agent_id).map(String::as_str) != Some(fingerprint.as_str());
+            if changed {
+                guard.insert(agent_id.to_string(), fingerprint);
+            }
+            changed
+        };
+
+        if should_inject {
+            format!("{xml}\n\n{prompt}")
+        } else {
+            prompt
+        }
+    }
+
+    /// Track file edits inside a Mission Workspace and emit live Conflict Radar alerts when two
+    /// peers sharing the SAME physical working directory edit the same file within 10 minutes.
+    async fn record_file_edit_and_check_conflict(&self, agent_id: &str, raw_path: &str) {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Ok(Some(agent)) = self.store.get_agent(agent_id) else {
+            return;
+        };
+        if agent.background {
+            return;
+        }
+        let norm_path = Path::new(trimmed)
+            .strip_prefix(&agent.cwd)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| trimmed.trim_start_matches("./").replace('\\', "/"));
+
+        let handle = agent.handle.as_deref().unwrap_or("peer");
+        if let Ok(ev) = self.store.append_workspace_event(
+            &agent.workspace_id,
+            Some(agent_id),
+            Some(handle),
+            WorkspaceEventKind::FileEdited,
+            &format!("@{handle} edited `{norm_path}`"),
+            Some(&norm_path),
+        ) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+        }
+
+        // Check for active peer conflicts in the SAME workspace AND SAME physical cwd
+        let since = Utc::now() - chrono::Duration::minutes(10);
+        let Ok(other_editors) = self.store.recent_workspace_file_editors(
+            &agent.workspace_id,
+            &norm_path,
+            agent_id,
+            since,
+        ) else {
+            return;
+        };
+        if other_editors.is_empty() {
+            return;
+        }
+
+        let mut conflicting_handles: Vec<String> = Vec::new();
+        for (other_id, other_handle) in other_editors {
+            if let Ok(Some(other_ag)) = self.store.get_agent(&other_id)
+                && other_ag.archived_at.is_none()
+                && !other_ag.background
+                && other_ag.cwd == agent.cwd
+            {
+                conflicting_handles.push(
+                    other_handle
+                        .or(other_ag.handle)
+                        .unwrap_or_else(|| other_ag.title.clone()),
+                );
+            }
+        }
+        if conflicting_handles.is_empty() {
+            return;
+        }
+
+        // Throttle per (workspace_id, norm_path) to at most once every 60 seconds
+        let key = (agent.workspace_id.clone(), norm_path.clone());
+        let should_alert = {
+            let mut guard = self.conflict_cooldowns.write().await;
+            let now = std::time::Instant::now();
+            match guard.get(&key) {
+                Some(prev) if now.duration_since(*prev) < Duration::from_secs(60) => false,
+                _ => {
+                    guard.insert(key, now);
+                    true
+                }
+            }
+        };
+        if !should_alert {
+            return;
+        }
+
+        let others_str = conflicting_handles
+            .iter()
+            .map(|h| format!("@{h}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let msg = format!(
+            "Conflict Radar: @{handle} and {others_str} both edited `{norm_path}` in the same directory (`{}`). Coordinate via `message_peer` / `workspace_board_update` or fork one peer into a worktree.",
+            agent.cwd
+        );
+        if let Ok(ev) = self.store.append_workspace_event(
+            &agent.workspace_id,
+            Some(agent_id),
+            Some(handle),
+            WorkspaceEventKind::ConflictWarning,
+            &msg,
+            Some(&norm_path),
+        ) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+        }
+        if let Ok(notice_ev) = self.store.append_timeline_event(
+            agent_id,
+            1,
+            None,
+            TimelinePayload::Notice {
+                level: "warning".into(),
+                message: msg,
+            },
+        ) {
+            let _ = self
+                .broadcast_tx
+                .send(DaemonBroadcast::TimelineLive(notice_ev));
+        }
     }
 
     pub async fn list_live_agent_ids(&self) -> Vec<String> {
@@ -2217,12 +3002,20 @@ impl AgentOrchestrator {
                 status,
                 detail,
                 background_task,
-            } => TimelinePayload::ToolCall {
-                call_id,
-                status,
-                detail,
-                background_task,
-            },
+            } => {
+                if status == ToolCallStatus::Completed
+                    && let ToolCallDetail::FileEdit { ref path, .. } = detail
+                {
+                    self.record_file_edit_and_check_conflict(agent_id, path)
+                        .await;
+                }
+                TimelinePayload::ToolCall {
+                    call_id,
+                    status,
+                    detail,
+                    background_task,
+                }
+            }
             DriverEvent::PermissionRequest {
                 request_id,
                 title,
@@ -2312,7 +3105,44 @@ impl AgentOrchestrator {
 
             let auto_arch = ag.auto_archive && ag.archived_at.is_none() && drained_prompt.is_none();
             let ws_id = ag.workspace_id.clone();
+            let finished_idle = should_check_auto_archive && matches!(ag.status, AgentStatus::Idle);
+            let ag_handle = ag.handle.clone();
+            let ag_bg = ag.background;
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
+
+            if finished_idle && !ag_bg {
+                let peer_count = self
+                    .store
+                    .list_agents_filtered(Some(&ws_id), false, false, None)
+                    .map(|p| p.len())
+                    .unwrap_or(0);
+                if peer_count >= 2 {
+                    let who = ag_handle.as_deref().unwrap_or("peer");
+                    let snippet = self
+                        .store
+                        .last_assistant_message_text(agent_id)
+                        .ok()
+                        .flatten()
+                        .map(|s| {
+                            let one_line: String =
+                                s.split_whitespace().collect::<Vec<_>>().join(" ");
+                            one_line.chars().take(110).collect::<String>()
+                        })
+                        .unwrap_or_else(|| "finished turn".into());
+                    if let Ok(ev) = self.store.append_workspace_event(
+                        &ws_id,
+                        Some(agent_id),
+                        Some(who),
+                        WorkspaceEventKind::PeerFinished,
+                        &format!("@{who} finished: {snippet}"),
+                        None,
+                    ) {
+                        let _ = self
+                            .broadcast_tx
+                            .send(DaemonBroadcast::WorkspaceEventRecorded(ev));
+                    }
+                }
+            }
 
             if let Some(next_item) = drained_prompt {
                 let mgr = Arc::clone(self);

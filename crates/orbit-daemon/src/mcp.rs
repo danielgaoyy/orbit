@@ -127,7 +127,7 @@ async fn handle_single_rpc(
                         "name": "orbit-orchestrator",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "instructions": "Orbit built-in multi-agent orchestration server. Call `list_profiles` and `list_hosts` before delegating, create isolated worktrees via `create_workspace` for parallel file edits, and rely on automatic finish notifications instead of polling."
+                    "instructions": "Orbit built-in multi-agent & Mission Workspace orchestration server. Inside a Mission Workspace, use `workspace_peers`, `message_peer` (by @handle or @all), `read_peer_context`, `workspace_board_read`, `workspace_board_update`, and `spawn_workspace_peer` to collaborate naturally with sibling peers and share contracts on BOARD.md. Call `list_profiles` and `list_hosts` before cross-host delegation, create isolated worktrees via `create_workspace` or `spawn_workspace_peer(worktree=true)` for parallel file edits, and rely on automatic finish notifications instead of polling."
                 }
             }))
         }

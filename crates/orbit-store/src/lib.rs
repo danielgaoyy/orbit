@@ -1024,15 +1024,9 @@ impl OrbitStore {
             return Ok(None);
         }
 
+        let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
         let agent = tx
-            .query_row(
-                "SELECT agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
-                        status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
-                        timeline_epoch
-                 FROM agents WHERE agent_id = ?1",
-                params![agent_id],
-                map_agent_row,
-            )
+            .query_row(&select_sql, params![agent_id], map_agent_row)
             .optional()?;
         let Some(agent) = agent else {
             return Ok(None);

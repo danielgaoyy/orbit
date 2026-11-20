@@ -413,40 +413,35 @@ fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let is_mcp_stdio = matches!(cli.command, Commands::Mcp { .. });
-    if !is_mcp_stdio {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .init();
-    }
-
     let home_dir = resolve_home(cli.home);
     let json_mode = cli.json;
     let via_relay = cli.via_relay;
     let server = resolve_server_url(&home_dir, cli.server);
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let use_rotating_daemon_log = matches!(cli.command, Commands::Daemon { action: None, .. });
-    if use_rotating_daemon_log
-        && let Ok(log_writer) = orbit_client_core::logging::RotatingLogWriter::open(
-            home_dir.join("logs").join("daemon.log"),
-            orbit_client_core::logging::DEFAULT_LOG_MAX_BYTES,
-            orbit_client_core::logging::DEFAULT_LOG_MAX_BACKUPS,
-            std::io::stderr().is_terminal(),
-        )
-    {
-        tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_env_filter(env_filter)
-            .with_writer(move || log_writer.clone())
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    let is_mcp_stdio = matches!(cli.command, Commands::Mcp { .. });
+    if !is_mcp_stdio {
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let use_rotating_daemon_log = matches!(cli.command, Commands::Daemon { action: None, .. });
+        if use_rotating_daemon_log
+            && let Ok(log_writer) = orbit_client_core::logging::RotatingLogWriter::open(
+                home_dir.join("logs").join("daemon.log"),
+                orbit_client_core::logging::DEFAULT_LOG_MAX_BYTES,
+                orbit_client_core::logging::DEFAULT_LOG_MAX_BACKUPS,
+                std::io::stderr().is_terminal(),
+            )
+        {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter(env_filter)
+                .with_writer(move || log_writer.clone())
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(env_filter)
+                .init();
+        }
     }
 
     match cli.command {

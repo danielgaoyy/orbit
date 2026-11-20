@@ -2032,8 +2032,15 @@ const TurnStageSection = memo(function TurnStageSection({
               }
 
               // `step_group`
+              // Never render an already-failed trailing segment (with no running step) as active
+              // `Running ... waiting for response` — keep its failure visible while any new turn work
+              // shows cleanly in the trailing indicator below.
+              const isTrailingFailedGroup =
+                !seg.hasRunningStep && seg.summary.counts.unrecoveredFailureCount > 0;
               const isGroupActive =
-                isTurnActive && (seg.hasRunningStep || (isLastSeg && !seg.hasFollowingContent));
+                isTurnActive &&
+                (seg.hasRunningStep ||
+                  (isLastSeg && !seg.hasFollowingContent && !isTrailingFailedGroup));
               const groupThoughtMs =
                 computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
                 seg.thoughtDurationMs;
@@ -2218,9 +2225,10 @@ export function StreamStage() {
   );
 
   const latestTurn = stage.turns[stage.turns.length - 1] ?? null;
-  const isLatestTurnActive = Boolean(
-    latestTurn && (isAgentRunning || latestTurn.hasActiveItem),
-  );
+  // Single source of truth: trust authoritative backend `currentAgent.is_running` (which covers
+  // Initializing, Running, background-task waiting, and AutonomousWakeup) so stale historical
+  // running tool items can never hold an Idle/Error/Closed turn in a phantom Running state.
+  const isLatestTurnActive = Boolean(latestTurn && isAgentRunning);
 
   // Record live turn & per-thinking-block start/completion durations for the active session
   useEffect(() => {

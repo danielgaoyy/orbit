@@ -328,6 +328,7 @@ fn ensure_mock_claude_installed() -> PathBuf {
                 ProviderKind::ClaudeCode,
                 script.clone(),
             );
+            orbit_shim::set_test_parent_pid_watchdog(Some(std::process::id()));
             script
         })
         .clone()

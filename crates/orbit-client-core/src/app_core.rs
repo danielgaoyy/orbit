@@ -5192,7 +5192,16 @@ fn extract_legacy_provider_warning_text(text: &str) -> Option<String> {
 }
 
 fn format_autonomous_wakeup_notice(source: &str) -> String {
-    let cleaned = source.trim().replace('_', " ");
+    let trimmed = source.trim();
+    if let Some(rest) = trimmed.strip_prefix("waiting:") {
+        let desc = rest.trim();
+        return if desc.is_empty() {
+            "Waiting for background task(s)".to_string()
+        } else {
+            format!("Waiting for {desc}")
+        };
+    }
+    let cleaned = trimmed.replace('_', " ");
     if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("background task") {
         "Resumed from background task".to_string()
     } else {
@@ -5205,7 +5214,19 @@ fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
         AgentStatus::Initializing => ("Starting".to_string(), true, false),
         AgentStatus::Idle => ("Idle".to_string(), false, false),
         AgentStatus::Running { .. } => ("Working".to_string(), true, false),
-        AgentStatus::AutonomousWakeup { source, .. } => (format!("Waking ({source})"), true, false),
+        AgentStatus::AutonomousWakeup { source, .. } => {
+            if let Some(rest) = source.trim().strip_prefix("waiting:") {
+                let desc = rest.trim();
+                let label = if desc.is_empty() {
+                    "Background task".to_string()
+                } else {
+                    format!("Running ({desc})")
+                };
+                (label, true, false)
+            } else {
+                (format!("Waking ({source})"), true, false)
+            }
+        }
         AgentStatus::AwaitingPermission { .. } => ("Needs approval".to_string(), false, true),
         AgentStatus::Error { .. } => ("Error".to_string(), false, false),
         AgentStatus::Closed => ("Closed".to_string(), false, false),

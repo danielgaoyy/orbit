@@ -5,6 +5,7 @@ import {
   SettingGroupLabel,
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { type SshHostItem, orbitIpc } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
@@ -16,6 +17,7 @@ export function AddHostSection() {
   const [showManualUri, setShowManualUri] = useState(false);
   const [connectingSshAlias, setConnectingSshAlias] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const ime = useImeCompositionGuard();
 
   const handlePairSsh = async (ssh: SshHostItem) => {
     setErrorMsg(null);
@@ -141,7 +143,9 @@ export function AddHostSection() {
                 type="text"
                 value={pairingUri}
                 onChange={(e) => setPairingUri(e.target.value)}
+                {...ime.compositionProps}
                 onKeyDown={(e) => {
+                  if (ime.shouldIgnoreKeyDown(e)) return;
                   if (e.key === "Enter") void handlePairUri();
                 }}
                 placeholder="orbit://pair/..."

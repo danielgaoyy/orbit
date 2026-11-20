@@ -21,6 +21,7 @@ import {
   type ToolCallDetail,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import { isImeKeyEvent, useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
 import {
   isAlwaysDecision,
@@ -476,6 +477,7 @@ function StickyQuestionDockCard({
   const [customAnswers, setCustomAnswers] = useState<Record<number, string>>({});
   const [submitting, setSubmitting] = useState(false);
   const inputRefs = useRef<Array<HTMLInputElement | null>>([]);
+  const ime = useImeCompositionGuard();
 
   useEffect(() => {
     if (!submitting) return;
@@ -545,6 +547,7 @@ function StickyQuestionDockCard({
   return (
     <div
       onKeyDown={(e) => {
+        if (isImeKeyEvent(e)) return;
         if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && canSubmit && !submitting) {
           e.preventDefault();
           void handleSubmit();
@@ -677,7 +680,9 @@ function StickyQuestionDockCard({
                       disabled={submitting}
                       value={customVal}
                       onChange={(e) => handleCustomChange(qIdx, e.target.value, q.is_multi_select)}
+                      {...ime.compositionProps}
                       onKeyDown={(e) => {
+                        if (ime.shouldIgnoreKeyDown(e)) return;
                         if (e.key === "Enter" && !e.shiftKey && !(e.metaKey || e.ctrlKey)) {
                           e.preventDefault();
                           if (canSubmit) {

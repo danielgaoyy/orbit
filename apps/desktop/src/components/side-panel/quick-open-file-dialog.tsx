@@ -4,6 +4,7 @@ import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog-tabs";
 import { Kbd } from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -47,6 +48,7 @@ function QuickOpenFileInner() {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const ime = useImeCompositionGuard();
 
   useEffect(() => {
     const id = setTimeout(() => inputRef.current?.focus(), 10);
@@ -85,7 +87,9 @@ function QuickOpenFileInner() {
             setQuery(e.target.value);
             setActiveIndex(0);
           }}
+          {...ime.compositionProps}
           onKeyDown={(e) => {
+            if (ime.shouldIgnoreKeyDown(e)) return;
             if (e.key === "ArrowDown") {
               e.preventDefault();
               setActiveIndex((prev) => (matches.length ? (prev + 1) % matches.length : 0));

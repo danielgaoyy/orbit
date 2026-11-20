@@ -4,7 +4,10 @@
 
 use std::collections::HashMap;
 
-use orbit_protocol::{GitStatusSnapshot, ToolCallDetail, ToolCallStatus};
+use orbit_protocol::{
+    GitStatusSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus, ToolCallDetail,
+    ToolCallStatus,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::app_core::{AgentCardView, TimelineItemView};
@@ -223,6 +226,8 @@ pub struct SessionBackgroundTaskView {
     pub started_at_ms: Option<i64>,
     pub command: Option<String>,
     pub output_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +237,8 @@ pub struct SessionSubagentEntryView {
     pub prompt_preview: String,
     pub status: ToolCallStatus,
     pub child_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_subagent_id: Option<String>,
     pub last_seq: u64,
 }
 
@@ -1437,6 +1444,7 @@ pub fn collect_stage_auxiliary_state(
     cwd: Option<&str>,
     current_agent: Option<&AgentCardView>,
     host_agents: &[AgentCardView],
+    provider_subagents: &[ProviderSubagentDescriptor],
 ) -> (
     Vec<TimelineItemView>,
     Vec<TimelineItemView>,
@@ -1471,7 +1479,8 @@ pub fn collect_stage_auxiliary_state(
         }
     }
 
-    let insights = derive_session_insights(items, cwd, current_agent, host_agents);
+    let insights =
+        derive_session_insights(items, cwd, current_agent, host_agents, provider_subagents);
     (
         pending_permissions,
         pending_questions,
@@ -1491,7 +1500,7 @@ pub fn process_timeline_for_stage(
 ) {
     let sliced = process_timeline_turns_slice(items, 0, 0, cwd);
     let (pending_permissions, pending_questions, session_turn_diffs, _) =
-        collect_stage_auxiliary_state(items, cwd, None, &[]);
+        collect_stage_auxiliary_state(items, cwd, None, &[], &[]);
     (
         sliced.turns,
         pending_permissions,
@@ -2222,25 +2231,118 @@ fn collect_local_urls(text: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Derive compact, deduplicated session inventory (touched files, active background tasks,
-/// subagents, and detected localhost preview URLs) from the active timeline & host state.
+fn extract_legacy_log_path_from_line(line: &str) -> Option<String> {
+    for marker in ["Task logs are available at: file://", "Log: file://"] {
+        if let Some(idx) = line.find(marker) {
+            let rest = &line[idx + marker.len()..];
+            let path = rest
+                .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')'))
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('.');
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Strict header-anchored fallback parser for legacy persisted timelines written before structured
+/// `BackgroundTaskInfo` existed.
+///
+/// Only recognizes authentic Antigravity background-task headers where optional blank lines and
+/// `Created At:` metadata lines are immediately followed at column 0 by
+/// `Tool is running as a background task with task id: <session>/<task>`. Completed tool outputs
+/// (`Completed At:`, `Command exited with code`, `Showing lines `, `Command output:`), source code
+/// snippets, and embedded quotes are strictly rejected.
+pub(crate) fn parse_legacy_bg_task_metadata(
+    output_preview: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    const MARKER: &str = "Tool is running as a background task with task id:";
+    let mut lines = output_preview.lines().enumerate();
+    let mut marker_rest: Option<&str> = None;
+    let mut marker_idx: usize = 0;
+
+    for (idx, raw_line) in lines.by_ref() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            if idx >= 4 {
+                return None;
+            }
+            continue;
+        }
+        if line.starts_with("Created At:") {
+            if idx >= 4 {
+                return None;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(MARKER) {
+            marker_rest = Some(rest);
+            marker_idx = idx;
+        }
+        break;
+    }
+
+    let task_id = marker_rest?.trim().trim_end_matches('.');
+    let (session_part, task_part) = task_id.split_once('/')?;
+    if session_part.is_empty()
+        || task_part.is_empty()
+        || !task_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | ':' | '.'))
+    {
+        return None;
+    }
+
+    let mut label: Option<String> = None;
+    let mut log_path: Option<String> = None;
+    for (idx, raw_line) in lines {
+        if idx > marker_idx + 10 {
+            break;
+        }
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with("Log output:") {
+            break;
+        }
+        if label.is_none()
+            && let Some(desc) = line.strip_prefix("Task Description:")
+        {
+            let trimmed = desc.trim();
+            if !trimmed.is_empty() {
+                label = Some(trimmed.to_string());
+            }
+        }
+        if log_path.is_none()
+            && let Some(path) = extract_legacy_log_path_from_line(line)
+        {
+            log_path = Some(path);
+        }
+    }
+
+    Some((task_id.to_string(), label, log_path))
+}
+
+/// Derive compact, deduplicated session inventory (touched files, genuinely asynchronous active
+/// background tasks, subagents, and detected localhost preview URLs) from the active timeline &
+/// host state.
 pub fn derive_session_insights(
     items: &[TimelineItemView],
     cwd: Option<&str>,
     current_agent: Option<&AgentCardView>,
     host_agents: &[AgentCardView],
+    provider_subagents: &[ProviderSubagentDescriptor],
 ) -> SessionInsightsView {
     let mut file_map: HashMap<String, SessionTouchedFileView> = HashMap::new();
-    let mut running_shells: Vec<SessionBackgroundTaskView> = Vec::new();
+    let mut bg_task_order: Vec<String> = Vec::new();
+    let mut bg_task_map: HashMap<String, SessionBackgroundTaskView> = HashMap::new();
     let mut subagent_map: HashMap<String, SessionSubagentEntryView> = HashMap::new();
     let mut detected_local_urls: Vec<String> = Vec::new();
 
-    let last_user_prompt_index = items
-        .iter()
-        .rposition(|it| matches!(it, TimelineItemView::UserPrompt { .. }));
     let agent_running = current_agent.is_some_and(|a| a.is_running);
 
-    for (idx, item) in items.iter().enumerate() {
+    for item in items {
         match item {
             TimelineItemView::AssistantMessage { text, .. } => {
                 collect_local_urls(text, &mut detected_local_urls);
@@ -2251,132 +2353,224 @@ pub fn derive_session_insights(
                 status,
                 summary_title,
                 detail,
+                background_task,
                 diff_files,
                 timestamp_ms,
                 ..
-            } => match detail {
-                ToolCallDetail::FileRead { path, .. } => {
-                    let raw_path = path.trim();
-                    if raw_path.is_empty() {
-                        continue;
+            } => {
+                match detail {
+                    ToolCallDetail::FileRead { path, .. } => {
+                        let raw_path = path.trim();
+                        if !raw_path.is_empty() {
+                            let display_path = strip_workspace_prefix(raw_path, cwd);
+                            file_map
+                                .entry(display_path.clone())
+                                .and_modify(|prev| prev.last_seq = prev.last_seq.max(*seq))
+                                .or_insert_with(|| SessionTouchedFileView {
+                                    path: raw_path.to_string(),
+                                    display_path,
+                                    action: SessionTouchedFileAction::Read,
+                                    additions: 0,
+                                    deletions: 0,
+                                    last_seq: *seq,
+                                });
+                        }
                     }
-                    let display_path = strip_workspace_prefix(raw_path, cwd);
-                    file_map
-                        .entry(display_path.clone())
-                        .and_modify(|prev| prev.last_seq = prev.last_seq.max(*seq))
-                        .or_insert_with(|| SessionTouchedFileView {
-                            path: raw_path.to_string(),
-                            display_path,
-                            action: SessionTouchedFileAction::Read,
-                            additions: 0,
-                            deletions: 0,
-                            last_seq: *seq,
-                        });
-                }
-                ToolCallDetail::FileEdit { path, .. } => {
-                    let raw_path = path.trim();
-                    if raw_path.is_empty() {
-                        continue;
+                    ToolCallDetail::FileEdit { path, .. } => {
+                        let raw_path = path.trim();
+                        if !raw_path.is_empty() {
+                            let display_path = strip_workspace_prefix(raw_path, cwd);
+                            let is_create = is_file_create_detail(summary_title, detail);
+                            let add: u32 = diff_files.iter().map(|f| f.additions).sum();
+                            let del: u32 = diff_files.iter().map(|f| f.deletions).sum();
+                            file_map
+                                .entry(display_path.clone())
+                                .and_modify(|prev| {
+                                    prev.action = if prev.action
+                                        == SessionTouchedFileAction::Created
+                                        || is_create
+                                    {
+                                        SessionTouchedFileAction::Created
+                                    } else {
+                                        SessionTouchedFileAction::Edited
+                                    };
+                                    prev.additions += add;
+                                    prev.deletions += del;
+                                    prev.last_seq = prev.last_seq.max(*seq);
+                                })
+                                .or_insert_with(|| SessionTouchedFileView {
+                                    path: raw_path.to_string(),
+                                    display_path,
+                                    action: if is_create {
+                                        SessionTouchedFileAction::Created
+                                    } else {
+                                        SessionTouchedFileAction::Edited
+                                    },
+                                    additions: add,
+                                    deletions: del,
+                                    last_seq: *seq,
+                                });
+                        }
                     }
-                    let display_path = strip_workspace_prefix(raw_path, cwd);
-                    let is_create = is_file_create_detail(summary_title, detail);
-                    let add: u32 = diff_files.iter().map(|f| f.additions).sum();
-                    let del: u32 = diff_files.iter().map(|f| f.deletions).sum();
-                    file_map
-                        .entry(display_path.clone())
-                        .and_modify(|prev| {
-                            prev.action =
-                                if prev.action == SessionTouchedFileAction::Created || is_create {
-                                    SessionTouchedFileAction::Created
-                                } else {
-                                    SessionTouchedFileAction::Edited
-                                };
-                            prev.additions += add;
-                            prev.deletions += del;
-                            prev.last_seq = prev.last_seq.max(*seq);
-                        })
-                        .or_insert_with(|| SessionTouchedFileView {
-                            path: raw_path.to_string(),
-                            display_path,
-                            action: if is_create {
-                                SessionTouchedFileAction::Created
-                            } else {
-                                SessionTouchedFileAction::Edited
-                            },
-                            additions: add,
-                            deletions: del,
-                            last_seq: *seq,
-                        });
-                }
-                ToolCallDetail::Shell {
-                    command,
-                    cwd: shell_cwd,
-                    output_preview,
-                    ..
-                } => {
-                    if let Some(out) = output_preview {
-                        collect_local_urls(out, &mut detected_local_urls);
+                    ToolCallDetail::Shell { output_preview, .. } => {
+                        if let Some(out) = output_preview {
+                            collect_local_urls(out, &mut detected_local_urls);
+                        }
                     }
-                    let after_last_prompt =
-                        last_user_prompt_index.is_none_or(|prompt_idx| idx > prompt_idx);
-                    if agent_running && after_last_prompt && *status == ToolCallStatus::Running {
-                        let first_line = command
-                            .lines()
-                            .map(str::trim)
-                            .find(|l| !l.is_empty())
-                            .unwrap_or("Running command")
-                            .to_string();
-                        let subtitle = shell_cwd
+                    ToolCallDetail::Subagent {
+                        child_agent_id,
+                        role,
+                        prompt_preview,
+                    } => {
+                        let key = child_agent_id
                             .as_deref()
-                            .map(|c| strip_workspace_prefix(c, cwd))
                             .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| "Shell command".to_string());
-                        running_shells.push(SessionBackgroundTaskView {
-                            id: format!("shell:{call_id}"),
-                            kind: SessionBackgroundTaskKind::Shell,
-                            title: first_line,
-                            subtitle,
-                            status: SessionBackgroundTaskStatus::Running,
-                            started_at_ms: *timestamp_ms,
-                            command: Some(command.clone()),
-                            output_preview: output_preview.clone(),
-                        });
+                            .unwrap_or(call_id.as_str())
+                            .to_string();
+                        subagent_map.insert(
+                            key,
+                            SessionSubagentEntryView {
+                                id: call_id.clone(),
+                                role: if role.is_empty() {
+                                    "Subagent".to_string()
+                                } else {
+                                    role.clone()
+                                },
+                                prompt_preview: prompt_preview.clone(),
+                                status: *status,
+                                child_agent_id: child_agent_id.clone(),
+                                provider_subagent_id: None,
+                                last_seq: *seq,
+                            },
+                        );
+                    }
+                    ToolCallDetail::Search { .. } | ToolCallDetail::Generic { .. } => {}
+                }
+
+                // Only include genuinely asynchronous background tasks (never foreground commands,
+                // never subagents). Structured `background_task` metadata is authoritative; legacy
+                // persisted timelines fall back to strict header-anchored parsing on Shell output.
+                if agent_running
+                    && *status == ToolCallStatus::Running
+                    && !matches!(detail, ToolCallDetail::Subagent { .. })
+                {
+                    let resolved_bg = if let Some(bg) = background_task {
+                        Some((bg.task_id.clone(), bg.label.clone(), bg.log_path.clone()))
+                    } else if let ToolCallDetail::Shell {
+                        output_preview: Some(out),
+                        ..
+                    } = detail
+                    {
+                        parse_legacy_bg_task_metadata(out)
+                            .map(|(tid, lbl, lp)| (Some(tid), lbl, lp))
+                    } else {
+                        None
+                    };
+
+                    if let Some((bg_task_id, bg_label, bg_log_path)) = resolved_bg {
+                        let dedup_key = bg_task_id
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(call_id.as_str())
+                            .to_string();
+                        let clean_label =
+                            bg_label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+                        let (title, subtitle, command, output_preview) = match detail {
+                            ToolCallDetail::Shell {
+                                command,
+                                cwd: shell_cwd,
+                                output_preview,
+                                ..
+                            } => {
+                                let first_line = command
+                                    .lines()
+                                    .map(str::trim)
+                                    .find(|l| !l.is_empty())
+                                    .unwrap_or("");
+                                let title = clean_label
+                                    .or_else(|| (!first_line.is_empty()).then_some(first_line))
+                                    .or_else(|| {
+                                        (!summary_title.trim().is_empty())
+                                            .then_some(summary_title.trim())
+                                    })
+                                    .unwrap_or("Background command")
+                                    .to_string();
+                                let subtitle = if clean_label.is_some()
+                                    && !first_line.is_empty()
+                                    && first_line != title
+                                {
+                                    first_line.to_string()
+                                } else {
+                                    shell_cwd
+                                        .as_deref()
+                                        .map(|c| strip_workspace_prefix(c, cwd))
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| "Background task".to_string())
+                                };
+                                let cmd_opt = (!command.trim().is_empty()).then(|| command.clone());
+                                (title, subtitle, cmd_opt, output_preview.clone())
+                            }
+                            _ => {
+                                let title = clean_label
+                                    .or_else(|| {
+                                        (!summary_title.trim().is_empty())
+                                            .then_some(summary_title.trim())
+                                    })
+                                    .unwrap_or("Background task")
+                                    .to_string();
+                                (title, "Background task".to_string(), None, None)
+                            }
+                        };
+
+                        if let Some(existing) = bg_task_map.get_mut(&dedup_key) {
+                            if !title.is_empty() && title != "Background task" {
+                                existing.title = title;
+                            }
+                            if !subtitle.is_empty() && subtitle != "Background task" {
+                                existing.subtitle = subtitle;
+                            }
+                            if command.is_some() {
+                                existing.command = command;
+                            }
+                            if output_preview.is_some() {
+                                existing.output_preview = output_preview;
+                            }
+                            if bg_log_path.is_some() {
+                                existing.log_path = bg_log_path;
+                            }
+                            if existing.started_at_ms.is_none() {
+                                existing.started_at_ms = *timestamp_ms;
+                            }
+                        } else {
+                            bg_task_order.push(dedup_key.clone());
+                            bg_task_map.insert(
+                                dedup_key.clone(),
+                                SessionBackgroundTaskView {
+                                    id: format!("bg:{dedup_key}"),
+                                    kind: SessionBackgroundTaskKind::Shell,
+                                    title,
+                                    subtitle,
+                                    status: SessionBackgroundTaskStatus::Running,
+                                    started_at_ms: *timestamp_ms,
+                                    command,
+                                    output_preview,
+                                    log_path: bg_log_path,
+                                },
+                            );
+                        }
                     }
                 }
-                ToolCallDetail::Subagent {
-                    child_agent_id,
-                    role,
-                    prompt_preview,
-                } => {
-                    let key = child_agent_id
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(call_id.as_str())
-                        .to_string();
-                    subagent_map.insert(
-                        key,
-                        SessionSubagentEntryView {
-                            id: call_id.clone(),
-                            role: if role.is_empty() {
-                                "Subagent".to_string()
-                            } else {
-                                role.clone()
-                            },
-                            prompt_preview: prompt_preview.clone(),
-                            status: *status,
-                            child_agent_id: child_agent_id.clone(),
-                            last_seq: *seq,
-                        },
-                    );
-                }
-                ToolCallDetail::Search { .. } | ToolCallDetail::Generic { .. } => {}
-            },
+            }
             _ => {}
         }
     }
 
     if let Some(cur) = current_agent {
         for ag in host_agents {
+            if ag.archived_at_rfc3339.is_some() {
+                continue;
+            }
             if ag.parent_agent_id.as_deref() == Some(cur.agent_id.as_str()) {
                 let status = if ag.is_running {
                     ToolCallStatus::Running
@@ -2401,6 +2595,7 @@ pub fn derive_session_insights(
                             prompt_preview: ag.status_label.clone(),
                             status,
                             child_agent_id: Some(ag.agent_id.clone()),
+                            provider_subagent_id: None,
                             last_seq: ag.latest_seq,
                         },
                     );
@@ -2409,27 +2604,87 @@ pub fn derive_session_insights(
         }
     }
 
-    let mut background_tasks = running_shells;
-    if let Some(cur) = current_agent
+    for ps in provider_subagents {
+        let status = match ps.status {
+            ProviderSubagentStatus::Running => ToolCallStatus::Running,
+            ProviderSubagentStatus::Completed => ToolCallStatus::Completed,
+            ProviderSubagentStatus::Failed | ProviderSubagentStatus::Canceled => {
+                ToolCallStatus::Failed
+            }
+        };
+        let matched_key = subagent_map
+            .iter()
+            .find(|(k, v)| {
+                k.as_str() == ps.subagent_id
+                    || v.id == ps.subagent_id
+                    || v.child_agent_id.as_deref() == Some(ps.subagent_id.as_str())
+            })
+            .map(|(k, _)| k.clone());
+        if let Some(key) = matched_key
+            && let Some(existing) = subagent_map.get_mut(&key)
+        {
+            existing.status = status;
+            existing.provider_subagent_id = Some(ps.subagent_id.clone());
+            if !ps.title.trim().is_empty() && existing.role == "Subagent" {
+                existing.role = ps.title.clone();
+            }
+            if existing.prompt_preview.is_empty()
+                && let Some(sub) = ps.subtitle.as_deref().filter(|s| !s.trim().is_empty())
+            {
+                existing.prompt_preview = sub.to_string();
+            }
+        } else {
+            let key = format!("provider:{}", ps.subagent_id);
+            subagent_map.insert(
+                key.clone(),
+                SessionSubagentEntryView {
+                    id: key,
+                    role: if ps.title.trim().is_empty() {
+                        "Subagent".to_string()
+                    } else {
+                        ps.title.clone()
+                    },
+                    prompt_preview: ps.subtitle.clone().unwrap_or_default(),
+                    status,
+                    child_agent_id: None,
+                    provider_subagent_id: Some(ps.subagent_id.clone()),
+                    last_seq: ps.updated_at.timestamp_millis().max(0) as u64,
+                },
+            );
+        }
+    }
+
+    let mut background_tasks: Vec<SessionBackgroundTaskView> = bg_task_order
+        .into_iter()
+        .filter_map(|key| bg_task_map.remove(&key))
+        .collect();
+
+    // Only emit the status-label wakeup/waiting fallback when no structured background task item
+    // is already surfaced for the session.
+    if background_tasks.is_empty()
+        && let Some(cur) = current_agent
         && cur.is_running
     {
         let trimmed = cur.status_label.trim_start();
-        if starts_with_ignore_ascii_case(trimmed, "waking")
-            && trimmed["waking".len()..].trim_start().starts_with('(')
-        {
-            background_tasks.insert(
-                0,
-                SessionBackgroundTaskView {
-                    id: format!("wakeup:{}", cur.agent_id),
-                    kind: SessionBackgroundTaskKind::Wakeup,
-                    title: cur.status_label.clone(),
-                    subtitle: "Autonomous background wakeup".to_string(),
-                    status: SessionBackgroundTaskStatus::Running,
-                    started_at_ms: None,
-                    command: None,
-                    output_preview: None,
+        let is_waiting_bg = contains_ascii_case_insensitive(trimmed, "background task");
+        let is_waking = starts_with_ignore_ascii_case(trimmed, "waking")
+            && trimmed["waking".len()..].trim_start().starts_with('(');
+        if is_waiting_bg || is_waking {
+            background_tasks.push(SessionBackgroundTaskView {
+                id: format!("wakeup:{}", cur.agent_id),
+                kind: SessionBackgroundTaskKind::Wakeup,
+                title: cur.status_label.clone(),
+                subtitle: if is_waiting_bg {
+                    "Waiting for background task".to_string()
+                } else {
+                    "Autonomous background wakeup".to_string()
                 },
-            );
+                status: SessionBackgroundTaskStatus::Running,
+                started_at_ms: None,
+                command: None,
+                output_preview: None,
+                log_path: None,
+            });
         }
     }
 
@@ -2785,6 +3040,7 @@ mod tests {
             status,
             summary_title: summary_title.to_string(),
             detail,
+            background_task: None,
             step_descriptor: None,
             diff_files,
             timestamp_ms: Some(ts),
@@ -3144,7 +3400,7 @@ mod tests {
             seen_seq: 0,
             is_unread: false,
         };
-        let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[]);
+        let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[], &[]);
         assert_eq!(
             insights.detected_local_urls,
             vec![
@@ -3152,14 +3408,12 @@ mod tests {
                 "http://127.0.0.1:8080/".to_string()
             ]
         );
-        assert_eq!(insights.background_tasks.len(), 2);
+        // Foreground running shell (`cargo test --workspace`) must NOT leak into background_tasks;
+        // only the autonomous wakeup fallback is surfaced when no structured bg task is present.
+        assert_eq!(insights.background_tasks.len(), 1);
         assert_eq!(
             insights.background_tasks[0].kind,
             SessionBackgroundTaskKind::Wakeup
-        );
-        assert_eq!(
-            insights.background_tasks[1].kind,
-            SessionBackgroundTaskKind::Shell
         );
         assert_eq!(insights.subagents.len(), 1);
 
@@ -3229,5 +3483,274 @@ mod tests {
             key_of(&turns_b[0].live_segments[1])
         );
         assert_eq!(key_of(&turns_b[0].live_segments[1]), "msg-msg_1");
+    }
+
+    #[test]
+    fn parse_legacy_bg_task_metadata_strictly_anchors_header() {
+        let valid = "Created At: 2026-11-20T17:00:00+08:00\n\
+Tool is running as a background task with task id: sess_abc/task-42.\n\
+Task Description: Render video clip\n\
+Task logs are available at: file:///tmp/orbit/bg-42.log.\n\
+Log output:\n\
+Task Description: spoofed description\n\
+Log: file:///tmp/spoofed.log\n";
+        let parsed = parse_legacy_bg_task_metadata(valid).expect("valid bg task header");
+        assert_eq!(parsed.0, "sess_abc/task-42");
+        assert_eq!(parsed.1.as_deref(), Some("Render video clip"));
+        assert_eq!(parsed.2.as_deref(), Some("/tmp/orbit/bg-42.log"));
+
+        // Reject completed tool outputs, read_file outputs, source code literals, and malformed IDs
+        let negatives = [
+            "Created At: 2026-11-20T17:00:00+08:00\nCompleted At: 2026-11-20T17:00:01+08:00\nTool is running as a background task with task id: sess_abc/task-1",
+            "Showing lines 1-50 of antigravity.rs\nTool is running as a background task with task id: conv_1/task-716",
+            "Command exited with code 0.\nTool is running as a background task with task id: sess_abc/task-2",
+            "    \"Tool is running as a background task with task id: conv_1/task-716\"",
+            "let marker = \"Tool is running as a background task with task id: conv_1/task-716\";",
+            "Tool is running as a background task with task id: task-without-session",
+            "Tool is running as a background task with task id: sess_abc/bad\"quote",
+        ];
+        for sample in negatives {
+            assert!(
+                parse_legacy_bg_task_metadata(sample).is_none(),
+                "must reject false positive: {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_session_insights_separates_background_tasks_from_foreground_shells_and_subagents() {
+        use chrono::Utc;
+        use orbit_protocol::{AgentStatus, BackgroundTaskInfo, ProviderKind, SessionMode};
+
+        let make_card = |agent_id: &str,
+                         parent: Option<&str>,
+                         running: bool,
+                         status_label: &str,
+                         archived: Option<&str>| AgentCardView {
+            agent_id: agent_id.into(),
+            workspace_id: "ws_1".into(),
+            cwd: "/repo".into(),
+            title: format!("Agent {agent_id}"),
+            provider: ProviderKind::Antigravity,
+            provider_label: "Antigravity".into(),
+            model: None,
+            effort: None,
+            mode: SessionMode::FullAccess,
+            status: if running {
+                AgentStatus::Running {
+                    turn_id: "t_1".into(),
+                }
+            } else {
+                AgentStatus::Idle
+            },
+            status_label: status_label.into(),
+            is_running: running,
+            is_awaiting_permission: false,
+            parent_agent_id: parent.map(ToOwned::to_owned),
+            parent_host_id: None,
+            profile_id: None,
+            background: false,
+            auto_archive: false,
+            attention: orbit_protocol::AttentionState::None,
+            archived_at_rfc3339: archived.map(ToOwned::to_owned),
+            labels: HashMap::new(),
+            latest_seq: 50,
+            updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
+            is_pinned: false,
+            seen_seq: 0,
+            is_unread: false,
+        };
+
+        let mut items: Vec<TimelineItemView> = Vec::new();
+        // 13 foreground running shell commands (reproducing the 14-item screenshot bug)
+        for i in 1..=13 {
+            items.push(make_tool(
+                i,
+                ToolCallStatus::Running,
+                "Run shell",
+                ToolCallDetail::Shell {
+                    command: format!("grep -rn pattern_{i} src/"),
+                    cwd: Some("/repo".into()),
+                    exit_code: None,
+                    output_preview: Some("Showing lines 1-10\nTool is running as a background task with task id: fake/task-1".into()),
+                },
+                Vec::new(),
+                (i as i64) * 100,
+            ));
+        }
+
+        // 1 genuine running background shell command (structured metadata)
+        items.push(TimelineItemView::ToolCall {
+            seq: 20,
+            call_id: "bg_shell_1".into(),
+            status: ToolCallStatus::Running,
+            summary_title: "Run shell".into(),
+            detail: ToolCallDetail::Shell {
+                command: "ffmpeg -i in.mp4 out.mp4".into(),
+                cwd: Some("/repo/media".into()),
+                exit_code: None,
+                output_preview: Some("Encoding frame 120...".into()),
+            },
+            background_task: Some(BackgroundTaskInfo {
+                task_id: Some("sess_1/task-99".into()),
+                label: Some("Render demo video".into()),
+                log_path: Some("/tmp/ffmpeg.log".into()),
+            }),
+            step_descriptor: None,
+            diff_files: Vec::new(),
+            timestamp_ms: Some(2_000),
+        });
+
+        // Duplicate update for same task_id must deduplicate
+        items.push(TimelineItemView::ToolCall {
+            seq: 21,
+            call_id: "wake_tool_21".into(),
+            status: ToolCallStatus::Running,
+            summary_title: "Run shell".into(),
+            detail: ToolCallDetail::Shell {
+                command: "ffmpeg -i in.mp4 out.mp4".into(),
+                cwd: Some("/repo/media".into()),
+                exit_code: None,
+                output_preview: Some("Encoding frame 240...".into()),
+            },
+            background_task: Some(BackgroundTaskInfo {
+                task_id: Some("sess_1/task-99".into()),
+                label: Some("Render demo video".into()),
+                log_path: Some("/tmp/ffmpeg.log".into()),
+            }),
+            step_descriptor: None,
+            diff_files: Vec::new(),
+            timestamp_ms: Some(2_100),
+        });
+
+        // 1 genuine running non-shell background tool (e.g., long-running video generation tool)
+        items.push(TimelineItemView::ToolCall {
+            seq: 22,
+            call_id: "bg_gen_1".into(),
+            status: ToolCallStatus::Running,
+            summary_title: "generate_video".into(),
+            detail: ToolCallDetail::Generic {
+                tool_name: "generate_video".into(),
+                arguments_json: "{\"prompt\":\"sunset\"}".into(),
+            },
+            background_task: Some(BackgroundTaskInfo {
+                task_id: Some("sess_1/task-100".into()),
+                label: Some("Generating sunset video".into()),
+                log_path: None,
+            }),
+            step_descriptor: None,
+            diff_files: Vec::new(),
+            timestamp_ms: Some(2_200),
+        });
+
+        // Completed background task must NOT remain in active background_tasks
+        items.push(TimelineItemView::ToolCall {
+            seq: 23,
+            call_id: "bg_done".into(),
+            status: ToolCallStatus::Completed,
+            summary_title: "Run shell".into(),
+            detail: ToolCallDetail::Shell {
+                command: "cargo build".into(),
+                cwd: Some("/repo".into()),
+                exit_code: Some(0),
+                output_preview: None,
+            },
+            background_task: Some(BackgroundTaskInfo {
+                task_id: Some("sess_1/task-77".into()),
+                label: Some("Old build".into()),
+                log_path: None,
+            }),
+            step_descriptor: None,
+            diff_files: Vec::new(),
+            timestamp_ms: Some(2_300),
+        });
+
+        // Running subagent belongs strictly in subagents, never in background_tasks
+        items.push(make_tool(
+            24,
+            ToolCallStatus::Running,
+            "Subagent",
+            ToolCallDetail::Subagent {
+                child_agent_id: None,
+                role: "Code Reviewer".into(),
+                prompt_preview: "Inspect PR diff".into(),
+            },
+            Vec::new(),
+            2_400,
+        ));
+
+        let cur = make_card(
+            "parent_1",
+            None,
+            true,
+            "Waiting for 2 background tasks",
+            None,
+        );
+        let host_agents = vec![
+            cur.clone(),
+            make_card("child_active", Some("parent_1"), true, "Running", None),
+            make_card(
+                "child_archived",
+                Some("parent_1"),
+                false,
+                "Idle",
+                Some("2026-11-20T01:00:00Z"),
+            ),
+        ];
+        let provider_subs = vec![ProviderSubagentDescriptor {
+            subagent_id: "ps_researcher".into(),
+            parent_agent_id: "parent_1".into(),
+            parent_subagent_id: None,
+            title: "Native Researcher".into(),
+            subtitle: Some("Scanning codebase".into()),
+            status: ProviderSubagentStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+
+        let insights = derive_session_insights(
+            &items,
+            Some("/repo"),
+            Some(&cur),
+            &host_agents,
+            &provider_subs,
+        );
+
+        assert_eq!(insights.background_tasks.len(), 2);
+        assert_eq!(insights.background_tasks[0].title, "Render demo video");
+        assert_eq!(
+            insights.background_tasks[0].log_path.as_deref(),
+            Some("/tmp/ffmpeg.log")
+        );
+        assert_eq!(
+            insights.background_tasks[1].title,
+            "Generating sunset video"
+        );
+
+        // Subagents: timeline subagent + active Orbit child + provider-native subagent (archived excluded)
+        assert_eq!(insights.subagents.len(), 3);
+        assert!(
+            insights
+                .subagents
+                .iter()
+                .any(|s| s.provider_subagent_id.as_deref() == Some("ps_researcher"))
+        );
+        assert!(
+            insights
+                .subagents
+                .iter()
+                .all(|s| s.child_agent_id.as_deref() != Some("child_archived"))
+        );
+
+        // Once the parent agent settles to Idle, active background_tasks clears cleanly
+        let idle_cur = make_card("parent_1", None, false, "Idle", None);
+        let idle_insights = derive_session_insights(
+            &items,
+            Some("/repo"),
+            Some(&idle_cur),
+            &host_agents,
+            &provider_subs,
+        );
+        assert!(idle_insights.background_tasks.is_empty());
     }
 }

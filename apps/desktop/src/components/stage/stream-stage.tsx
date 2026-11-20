@@ -2330,6 +2330,7 @@ const EMPTY_WORK_COUNTS: WorkSummaryResultView["counts"] = {
 const TurnStageSection = memo(function TurnStageSection({
   turn,
   isTurnActive,
+  agentStatusLabel = null,
   isNetworkOffline,
   animatePromptEntrance = false,
   autoFoldCompleted,
@@ -2345,6 +2346,7 @@ const TurnStageSection = memo(function TurnStageSection({
 }: {
   turn: StageTurnView;
   isTurnActive: boolean;
+  agentStatusLabel?: string | null;
   isNetworkOffline: boolean;
   animatePromptEntrance?: boolean;
   autoFoldCompleted: boolean;
@@ -2478,10 +2480,17 @@ const TurnStageSection = memo(function TurnStageSection({
               // shows cleanly in the trailing indicator below.
               const isTrailingFailedGroup =
                 !seg.has_running_step && seg.summary.counts.unrecovered_failure_count > 0;
+              const hasRunningBgTask = seg.items.some(
+                (it) =>
+                  it.item_type === "tool_call" &&
+                  it.status === "running" &&
+                  Boolean(it.background_task),
+              );
               const isGroupActive =
                 isTurnActive &&
-                (seg.has_running_step ||
-                  (isLastSeg && !seg.has_following_content && !isTrailingFailedGroup));
+                (seg.has_following_content
+                  ? hasRunningBgTask
+                  : seg.has_running_step || (isLastSeg && !isTrailingFailedGroup));
               const groupThoughtMs =
                 computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
                 seg.thought_duration_ms ??
@@ -2530,7 +2539,19 @@ const TurnStageSection = memo(function TurnStageSection({
               <TurnActivityDisclosure
                 items={EMPTY_TIMELINE_ITEMS}
                 isWorkActive
-                liveLabel={lastSeg === null ? "Working…" : "Thinking…"}
+                liveLabel={
+                  lastSeg === null
+                    ? "Working…"
+                    : lastSeg.kind === "wakeup" && lastSeg.label.trim()
+                      ? lastSeg.label.trim().endsWith("…")
+                        ? lastSeg.label.trim()
+                        : `${lastSeg.label.trim()}…`
+                      : agentStatusLabel && /background task|waking/i.test(agentStatusLabel)
+                        ? agentStatusLabel.trim().endsWith("…")
+                          ? agentStatusLabel.trim()
+                          : `${agentStatusLabel.trim()}…`
+                        : "Thinking…"
+                }
                 liveDetail={null}
                 settledLabel=""
                 summaryCounts={EMPTY_WORK_COUNTS}
@@ -2565,6 +2586,7 @@ const TurnStageSection = memo(function TurnStageSection({
 }, (prev, next) =>
   prev.turn === next.turn &&
   prev.isTurnActive === next.isTurnActive &&
+  prev.agentStatusLabel === next.agentStatusLabel &&
   prev.isNetworkOffline === next.isNetworkOffline &&
   prev.animatePromptEntrance === next.animatePromptEntrance &&
   prev.autoFoldCompleted === next.autoFoldCompleted &&
@@ -2861,6 +2883,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   selectedAgentId,
   stageTurns,
   isLatestTurnActive,
+  agentStatusLabel,
   baselineMaxSeq,
   isNetworkOffline,
   autoFoldCompleted,
@@ -2881,6 +2904,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   selectedAgentId: string;
   stageTurns: StageTurnView[];
   isLatestTurnActive: boolean;
+  agentStatusLabel: string | null;
   baselineMaxSeq: number;
   isNetworkOffline: boolean;
   autoFoldCompleted: boolean;
@@ -3284,6 +3308,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
             <TurnStageSection
               turn={turn}
               isTurnActive={turnActive}
+              agentStatusLabel={turnActive ? agentStatusLabel : null}
               isNetworkOffline={isNetworkOffline}
               animatePromptEntrance={isFreshLivePrompt}
               autoFoldCompleted={autoFoldCompleted}
@@ -4060,6 +4085,7 @@ export function StreamStage() {
               selectedAgentId={selectedAgentId}
               stageTurns={stageTurns}
               isLatestTurnActive={isLatestTurnActive}
+              agentStatusLabel={isLatestTurnActive ? (currentAgent?.status_label ?? null) : null}
               baselineMaxSeq={baselineMaxSeq}
               isNetworkOffline={isNetworkOffline}
               autoFoldCompleted={coalesceExploration}

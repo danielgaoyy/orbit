@@ -2085,10 +2085,12 @@ impl AgentOrchestrator {
                 call_id,
                 status,
                 detail,
+                background_task,
             } => TimelinePayload::ToolCall {
                 call_id,
                 status,
                 detail,
+                background_task,
             },
             DriverEvent::PermissionRequest {
                 request_id,

@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus, QuestionItem,
-    QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload, ToolCallDetail,
-    ToolCallStatus,
+    ActiveTurnBehavior, AgentStatus, BackgroundTaskInfo, ProviderKind, ProviderModelCatalog,
+    ProviderModelSpec, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus,
+    QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload,
+    ToolCallDetail, ToolCallStatus,
 };
 use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, spawn_detached_shim};
 use serde::Deserialize;
@@ -193,6 +193,10 @@ async fn run_claude_actor(
     let mut queued_prompts: VecDeque<(String, String)> = VecDeque::new();
     let mut declared_tasks: HashMap<String, ProviderSubagentDescriptor> = HashMap::new();
     let mut tool_use_to_task: HashMap<String, String> = HashMap::new();
+    let mut bg_bash_tasks: HashMap<String, (String, ToolCallDetail, BackgroundTaskInfo)> =
+        HashMap::new();
+    let mut bg_tool_use_to_task: HashMap<String, String> = HashMap::new();
+    let mut bg_tool_uses: HashMap<String, BackgroundTaskInfo> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -458,7 +462,66 @@ async fn run_claude_actor(
                                     "task_started" => {
                                         let task_type = val.get("task_type").and_then(|v| v.as_str()).unwrap_or("local_agent");
                                         let skip_transcript = val.get("skip_transcript").and_then(|v| v.as_bool()).unwrap_or(false);
-                                        if task_type != "local_bash" && !skip_transcript {
+                                        if task_type == "local_bash" {
+                                            let task_id = val
+                                                .get("task_id")
+                                                .or_else(|| val.get("tool_use_id"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                            if !task_id.is_empty() {
+                                                let call_id = val
+                                                    .get("tool_use_id")
+                                                    .and_then(|v| v.as_str())
+                                                    .filter(|s| !s.trim().is_empty())
+                                                    .map(ToOwned::to_owned)
+                                                    .unwrap_or_else(|| format!("claude_bg_{task_id}"));
+                                                let desc = val
+                                                    .get("description")
+                                                    .or_else(|| val.get("summary"))
+                                                    .and_then(|v| v.as_str())
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                    .map(ToOwned::to_owned);
+                                                let log_path = val
+                                                    .get("output_file")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                    .map(ToOwned::to_owned);
+                                                let bg_info = BackgroundTaskInfo {
+                                                    task_id: Some(task_id.clone()),
+                                                    label: desc.clone(),
+                                                    log_path,
+                                                };
+                                                let detail = tool_cache
+                                                    .get(&call_id)
+                                                    .cloned()
+                                                    .unwrap_or_else(|| ToolCallDetail::Shell {
+                                                        command: desc
+                                                            .clone()
+                                                            .unwrap_or_else(|| "Background command".into()),
+                                                        cwd: None,
+                                                        exit_code: None,
+                                                        output_preview: None,
+                                                    });
+                                                tool_cache.insert(call_id.clone(), detail.clone());
+                                                bg_tool_use_to_task.insert(call_id.clone(), task_id.clone());
+                                                bg_tool_uses.insert(call_id.clone(), bg_info.clone());
+                                                bg_bash_tasks.insert(
+                                                    task_id,
+                                                    (call_id.clone(), detail.clone(), bg_info.clone()),
+                                                );
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::ToolCall {
+                                                        call_id,
+                                                        status: ToolCallStatus::Running,
+                                                        detail,
+                                                        background_task: Some(bg_info),
+                                                    })
+                                                    .await;
+                                            }
+                                        } else if !skip_transcript {
                                             let task_id = val
                                                 .get("task_id")
                                                 .or_else(|| val.get("tool_use_id"))
@@ -524,15 +587,80 @@ async fn run_claude_actor(
                                         }
                                     }
                                     "task_notification" => {
-                                        let lookup_id = val
+                                        let raw_task_id = val
                                             .get("task_id")
                                             .and_then(|v| v.as_str())
-                                            .map(ToOwned::to_owned)
+                                            .map(ToOwned::to_owned);
+                                        let raw_tool_use_id = val
+                                            .get("tool_use_id")
+                                            .and_then(|v| v.as_str())
+                                            .map(ToOwned::to_owned);
+                                        let bg_tid = raw_task_id
+                                            .clone()
+                                            .filter(|id| bg_bash_tasks.contains_key(id))
                                             .or_else(|| {
-                                                val.get("tool_use_id")
-                                                    .and_then(|v| v.as_str())
-                                                    .and_then(|id| tool_use_to_task.get(id).cloned())
+                                                raw_tool_use_id
+                                                    .as_deref()
+                                                    .and_then(|id| bg_tool_use_to_task.get(id).cloned())
                                             });
+                                        if let Some(tid) = bg_tid
+                                            && let Some((call_id, mut detail, mut bg_info)) =
+                                                bg_bash_tasks.remove(&tid)
+                                        {
+                                            bg_tool_use_to_task.remove(&call_id);
+                                            bg_tool_uses.remove(&call_id);
+                                            tool_cache.remove(&call_id);
+                                            if bg_info.log_path.is_none() {
+                                                bg_info.log_path = val
+                                                    .get("output_file")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(str::trim)
+                                                    .filter(|s| !s.is_empty())
+                                                    .map(ToOwned::to_owned);
+                                            }
+                                            let st = val
+                                                .get("status")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("completed");
+                                            let is_failed = matches!(
+                                                st,
+                                                "failed" | "error" | "stopped" | "canceled" | "cancelled"
+                                            );
+                                            if let Some(summary) = val
+                                                .get("summary")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::trim)
+                                                .filter(|s| !s.is_empty())
+                                                && let ToolCallDetail::Shell {
+                                                    ref mut output_preview,
+                                                    ref mut exit_code,
+                                                    ..
+                                                } = detail
+                                            {
+                                                *output_preview = Some(truncate_claude(summary, 800));
+                                                if exit_code.is_none() {
+                                                    *exit_code = Some(if is_failed { 1 } else { 0 });
+                                                }
+                                            }
+                                            let _ = evt_tx
+                                                .send(DriverEvent::ToolCall {
+                                                    call_id,
+                                                    status: if is_failed {
+                                                        ToolCallStatus::Failed
+                                                    } else {
+                                                        ToolCallStatus::Completed
+                                                    },
+                                                    detail,
+                                                    background_task: Some(bg_info),
+                                                })
+                                                .await;
+                                            continue;
+                                        }
+                                        let lookup_id = raw_task_id.or_else(|| {
+                                            raw_tool_use_id
+                                                .as_deref()
+                                                .and_then(|id| tool_use_to_task.get(id).cloned())
+                                        });
                                         if let Some(tid) = lookup_id
                                             && let Some(desc) = declared_tasks.get_mut(&tid)
                                         {
@@ -676,6 +804,7 @@ async fn run_claude_actor(
                                                             call_id: cid,
                                                             status: ToolCallStatus::Completed,
                                                             detail,
+                                                            background_task: None,
                                                         },
                                                     })
                                                     .await;
@@ -703,12 +832,34 @@ async fn run_claude_actor(
                                                 .unwrap_or("Tool");
                                             let input = &b["input"];
                                             let detail = map_claude_tool_detail(name, input, None);
+                                            let bg_info = if name == "Bash"
+                                                && input
+                                                    .get("run_in_background")
+                                                    .and_then(|v| v.as_bool())
+                                                    == Some(true)
+                                            {
+                                                let info = BackgroundTaskInfo {
+                                                    task_id: None,
+                                                    label: input
+                                                        .get("description")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(str::trim)
+                                                        .filter(|s| !s.is_empty())
+                                                        .map(ToOwned::to_owned),
+                                                    log_path: None,
+                                                };
+                                                bg_tool_uses.insert(call_id.clone(), info.clone());
+                                                Some(info)
+                                            } else {
+                                                None
+                                            };
                                             tool_cache.insert(call_id.clone(), detail.clone());
                                             let _ = evt_tx
                                                 .send(DriverEvent::ToolCall {
                                                     call_id,
                                                     status: ToolCallStatus::Running,
                                                     detail,
+                                                    background_task: bg_info,
                                                 })
                                                 .await;
                                         } else if btype == "text"
@@ -742,12 +893,30 @@ async fn run_claude_actor(
                                                 .and_then(|v| v.as_bool())
                                                 .unwrap_or(false);
                                             let out_text = extract_claude_tool_result_text(&b["content"]);
-                                            let detail = match tool_cache.remove(call_id) {
+                                            let keep_running_bg = !is_err
+                                                && (bg_tool_use_to_task.contains_key(call_id)
+                                                    || (bg_tool_uses.contains_key(call_id)
+                                                        && looks_like_claude_bg_launch(&out_text)));
+                                            let existing_bg = if keep_running_bg {
+                                                bg_tool_uses.get(call_id).cloned()
+                                            } else {
+                                                bg_tool_uses.remove(call_id)
+                                            };
+                                            let cached_detail = if keep_running_bg {
+                                                tool_cache.get(call_id).cloned()
+                                            } else {
+                                                tool_cache.remove(call_id)
+                                            };
+                                            let detail = match cached_detail {
                                                 Some(ToolCallDetail::Shell { command, cwd, .. }) => {
                                                     ToolCallDetail::Shell {
                                                         command,
                                                         cwd,
-                                                        exit_code: Some(if is_err { 1 } else { 0 }),
+                                                        exit_code: if keep_running_bg {
+                                                            None
+                                                        } else {
+                                                            Some(if is_err { 1 } else { 0 })
+                                                        },
                                                         output_preview: Some(out_text),
                                                     }
                                                 }
@@ -757,15 +926,21 @@ async fn run_claude_actor(
                                                     arguments_json: out_text,
                                                 },
                                             };
+                                            if keep_running_bg {
+                                                tool_cache.insert(call_id.to_string(), detail.clone());
+                                            }
                                             let _ = evt_tx
                                                 .send(DriverEvent::ToolCall {
                                                     call_id: call_id.to_string(),
                                                     status: if is_err {
                                                         ToolCallStatus::Failed
+                                                    } else if keep_running_bg {
+                                                        ToolCallStatus::Running
                                                     } else {
                                                         ToolCallStatus::Completed
                                                     },
                                                     detail,
+                                                    background_task: existing_bg,
                                                 })
                                                 .await;
                                         }
@@ -1128,6 +1303,14 @@ fn map_claude_tool_detail(
             arguments_json: input.to_string(),
         },
     }
+}
+
+fn looks_like_claude_bg_launch(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("running in the background")
+        || lower.contains("running in background")
+        || lower.contains("background task")
+        || lower.contains("background shell")
 }
 
 fn extract_claude_tool_result_text(v: &Value) -> String {

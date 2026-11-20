@@ -15,13 +15,14 @@ use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     ActiveTurnBehavior, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary, AttentionState,
-    ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot, ModelOption,
-    OrchestrationConfig, OrchestrationSkillInfo, PendingPermissionSummary, PermissionCheckpointRef,
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort,
-    ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, TerminalBinaryFrame,
-    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
-    WorkspaceIsolation, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
+    BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot,
+    ModelOption, OrchestrationConfig, OrchestrationSkillInfo, PendingPermissionSummary,
+    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem,
+    ReasoningEffort, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
+    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
+    ToolCallStatus, WireMessage, WorkspaceIsolation, WorkspaceScriptInfo, WorkspaceSummary,
+    WorktreeCreateMode,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -270,6 +271,8 @@ pub enum TimelineItemView {
         status: ToolCallStatus,
         summary_title: String,
         detail: ToolCallDetail,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_task: Option<BackgroundTaskInfo>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         step_descriptor: Option<crate::stage::ToolStepDescriptorView>,
         diff_files: Vec<DiffFileView>,
@@ -1087,12 +1090,18 @@ impl OrbitAppCore {
                 }
 
                 let sliced = stage::process_timeline_turns_slice(&items, 0, 0, cwd);
+                let provider_subagents = host_state
+                    .provider_subagents
+                    .get(agent_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
                 let (pending_permissions, pending_questions, session_turn_diffs, insights) =
                     stage::collect_stage_auxiliary_state(
                         &items,
                         cwd,
                         current_agent_card.as_ref(),
                         &host_agent_cards,
+                        provider_subagents,
                     );
 
                 host_state.stage_cache.insert(
@@ -1172,12 +1181,18 @@ impl OrbitAppCore {
                 }
 
                 if dirty_state.aux_dirty || dirty_state.meta_dirty {
+                    let provider_subagents = host_state
+                        .provider_subagents
+                        .get(agent_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
                     let (pending_permissions, pending_questions, session_turn_diffs, insights) =
                         stage::collect_stage_auxiliary_state(
                             &cached.items,
                             cwd,
                             current_agent_card.as_ref(),
                             &host_agent_cards,
+                            provider_subagents,
                         );
                     cached.pending_permissions = pending_permissions;
                     cached.pending_questions = pending_questions;
@@ -2983,13 +2998,15 @@ impl OrbitAppCore {
                     subagents,
                     ..
                 } => {
+                    state.mark_stage_meta_dirty(&parent_agent_id);
                     state.provider_subagents.insert(parent_agent_id, subagents);
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentUpdated { subagent } => {
+                    let parent_id = subagent.parent_agent_id.clone();
                     let list = state
                         .provider_subagents
-                        .entry(subagent.parent_agent_id.clone())
+                        .entry(parent_id.clone())
                         .or_default();
                     if let Some(slot) = list
                         .iter_mut()
@@ -2999,6 +3016,7 @@ impl OrbitAppCore {
                     } else {
                         list.push(subagent);
                     }
+                    state.mark_stage_meta_dirty(&parent_id);
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentTimelineCatchup {
@@ -6485,6 +6503,7 @@ fn render_timeline_event_view(
             call_id,
             status,
             detail,
+            background_task,
         } => {
             let (summary_title, diff_files) = summarize_tool_detail(detail);
             let step_descriptor = Some(crate::stage::describe_tool_detail(
@@ -6500,6 +6519,7 @@ fn render_timeline_event_view(
                 status: *status,
                 summary_title,
                 detail: detail.clone(),
+                background_task: background_task.clone(),
                 step_descriptor,
                 diff_files,
                 timestamp_ms: ts_ms,
@@ -6945,6 +6965,7 @@ mod tests {
                             start_line: Some(1),
                             end_line: Some(80),
                         },
+                        background_task: None,
                     },
                 },
             },
@@ -6972,6 +6993,7 @@ mod tests {
                             start_line: Some(1),
                             end_line: Some(80),
                         },
+                        background_task: None,
                     },
                 },
             },
@@ -7067,6 +7089,7 @@ mod tests {
                         start_line: None,
                         end_line: None,
                     },
+                    background_task: None,
                 },
             },
         );
@@ -8169,6 +8192,7 @@ mod tests {
                                     "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-a\n+b".into(),
                                 ),
                             },
+                            background_task: None,
                         },
                     },
                     TimelineEvent {

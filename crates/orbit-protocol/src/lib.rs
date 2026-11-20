@@ -330,6 +330,19 @@ pub enum ToolCallStatus {
     Denied,
 }
 
+/// Structured metadata identifying a genuine asynchronous background task
+/// (e.g., Antigravity `run_command` promoted to a background task, or Claude Code
+/// `Bash(run_in_background: true)` / `local_bash` task).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTaskInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+}
+
 /// Interactive multiple-choice question prompt (`ask_question` / elicitation).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionItem {
@@ -400,6 +413,8 @@ pub enum TimelinePayload {
         call_id: String,
         status: ToolCallStatus,
         detail: ToolCallDetail,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background_task: Option<BackgroundTaskInfo>,
     },
     PermissionRequest {
         request_id: String,

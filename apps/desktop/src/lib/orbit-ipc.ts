@@ -523,6 +523,12 @@ export interface PromptBadge {
   path?: string | null;
 }
 
+export interface BackgroundTaskInfo {
+  task_id?: string | null;
+  label?: string | null;
+  log_path?: string | null;
+}
+
 export type TimelineItemView =
   | {
       item_type: "user_prompt";
@@ -556,6 +562,7 @@ export type TimelineItemView =
       status: "running" | "completed" | "failed" | "denied";
       summary_title: string;
       detail: ToolCallDetail;
+      background_task?: BackgroundTaskInfo | null;
       diff_files: DiffFileView[];
       timestamp_ms?: number | null;
     }
@@ -878,6 +885,7 @@ export interface SessionBackgroundTaskView {
   started_at_ms: number | null;
   command: string | null;
   output_preview: string | null;
+  log_path?: string | null;
 }
 
 export interface SessionSubagentEntryView {
@@ -886,6 +894,7 @@ export interface SessionSubagentEntryView {
   prompt_preview: string;
   status: "running" | "completed" | "failed" | "denied";
   child_agent_id: string | null;
+  provider_subagent_id?: string | null;
   last_seq: number;
 }
 
@@ -2130,7 +2139,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.5.0";
+    if (!isTauriRuntime()) return "0.5.1";
     return invoke<string>("get_app_version");
   },
 

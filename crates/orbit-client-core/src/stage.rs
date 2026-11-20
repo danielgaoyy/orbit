@@ -1456,24 +1456,21 @@ pub fn collect_stage_auxiliary_state(
     let mut session_turn_diffs: Vec<DiffFileView> = Vec::new();
 
     for raw_item in items {
-        let item = enrich_item_descriptor(raw_item, cwd);
-        match item {
-            TimelineItemView::ToolCall { ref diff_files, .. } => {
+        match raw_item {
+            TimelineItemView::ToolCall { diff_files, .. } => {
                 for df in diff_files {
                     session_turn_diffs.push(df.clone());
                 }
             }
             TimelineItemView::PermissionRequest {
-                ref resolved_decision,
-                ..
+                resolved_decision, ..
             } if resolved_decision.is_none() => {
-                pending_permissions.push(item);
+                pending_permissions.push(raw_item.clone());
             }
             TimelineItemView::QuestionRequest {
-                ref resolved_answers,
-                ..
+                resolved_answers, ..
             } if resolved_answers.is_none() => {
-                pending_questions.push(item);
+                pending_questions.push(raw_item.clone());
             }
             _ => {}
         }

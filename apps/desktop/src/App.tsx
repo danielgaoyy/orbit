@@ -223,14 +223,27 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
     e.preventDefault();
     const startX = e.clientX;
     const startW = sidebarWidth;
+    let latestW = startW;
+    let rafId: number | null = null;
     setIsResizingSidebar(true);
     setIsResizingLeft(true);
     document.body.style.cursor = "col-resize";
 
     const onMove = (ev: MouseEvent) => {
-      orbitActions.setSidebarWidth(startW + (ev.clientX - startX));
+      latestW = startW + (ev.clientX - startX);
+      if (rafId === null) {
+        rafId = window.requestAnimationFrame(() => {
+          rafId = null;
+          orbitActions.setSidebarWidth(latestW, false);
+        });
+      }
     };
     const cleanup = () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      orbitActions.setSidebarWidth(latestW, true);
       setIsResizingSidebar(false);
       setIsResizingLeft(false);
       document.body.style.cursor = "";

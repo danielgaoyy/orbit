@@ -186,7 +186,7 @@ export const FilesExplorerTab = memo(function FilesExplorerTab() {
           <button
             type="button"
             title="Refresh file index"
-            onClick={() => void orbitActions.ensureWorkspaceFiles(hostId, cwd)}
+            onClick={() => void orbitActions.ensureWorkspaceFiles(hostId, cwd, true)}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] cursor-pointer items-center justify-center rounded-md transition-colors"
           >
             <RefreshCw className="h-[13px] w-[13px]" />

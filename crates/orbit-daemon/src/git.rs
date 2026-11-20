@@ -103,6 +103,9 @@ pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
     }
 }
 
+const MAX_GIT_DIFF_BYTES: usize = 4 * 1024 * 1024;
+const MAX_UNTRACKED_DIFF_BYTES: usize = 256 * 1024;
+
 /// Compute unified diff for an entire workspace or a single file (including untracked file preview).
 pub async fn compute_git_diff(
     cwd: &Path,
@@ -124,7 +127,17 @@ pub async fn compute_git_diff(
         .output()
         .await?;
 
-    let diff_text = String::from_utf8_lossy(&out.stdout).to_string();
+    let diff_text = if out.stdout.len() > MAX_GIT_DIFF_BYTES {
+        let mut cut = MAX_GIT_DIFF_BYTES;
+        while cut > 0 && !std::str::from_utf8(&out.stdout[..cut]).is_ok() {
+            cut -= 1;
+        }
+        let mut s = String::from_utf8_lossy(&out.stdout[..cut]).to_string();
+        s.push_str("\n... [diff truncated at 4 MiB] ...\n");
+        s
+    } else {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
     if !diff_text.trim().is_empty() || staged {
         return Ok(diff_text);
     }
@@ -133,17 +146,23 @@ pub async fn compute_git_diff(
     if let Some(p) = rel_path {
         let candidate = cwd.join(p);
         if candidate.is_file()
-            && let Ok(content) = tokio::fs::read_to_string(&candidate).await
+            && let Ok(file) = tokio::fs::File::open(&candidate).await
         {
-            let mut synth = format!("--- /dev/null\n+++ b/{p}\n");
-            let lines: Vec<&str> = content.lines().collect();
-            synth.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
-            for l in lines.into_iter().take(500) {
-                synth.push('+');
-                synth.push_str(l);
-                synth.push('\n');
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::with_capacity(64 * 1024);
+            let mut limited = file.take(MAX_UNTRACKED_DIFF_BYTES as u64);
+            if limited.read_to_end(&mut buf).await.is_ok() {
+                let content = String::from_utf8_lossy(&buf);
+                let mut synth = format!("--- /dev/null\n+++ b/{p}\n");
+                let lines: Vec<&str> = content.lines().collect();
+                synth.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
+                for l in lines.into_iter().take(500) {
+                    synth.push('+');
+                    synth.push_str(l);
+                    synth.push('\n');
+                }
+                return Ok(synth);
             }
-            return Ok(synth);
         }
     }
 
@@ -216,9 +235,14 @@ pub async fn list_workspace_files(cwd: &Path, limit: usize) -> Vec<String> {
             .collect();
     }
 
-    let mut out = Vec::new();
-    collect_shallow_files_sync(cwd, cwd, 0, limit, &mut out);
-    out
+    let cwd_owned = cwd.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        collect_shallow_files_sync(&cwd_owned, &cwd_owned, 0, limit, &mut out);
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn collect_shallow_files_sync(

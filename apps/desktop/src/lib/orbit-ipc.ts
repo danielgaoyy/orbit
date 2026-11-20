@@ -1991,9 +1991,9 @@ export const orbitIpc = {
     });
   },
 
-  getWorkspaceFiles: async (hostId: string, cwd: string): Promise<string[]> => {
+  getWorkspaceFiles: async (hostId: string, cwd: string, force = false): Promise<string[]> => {
     if (!isTauriRuntime()) return [];
-    return invoke<string[]>("get_workspace_files", { hostId, cwd });
+    return invoke<string[]>("get_workspace_files", { hostId, cwd, force });
   },
 
   readWorkspaceFile: async (

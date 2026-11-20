@@ -881,6 +881,27 @@ impl OrbitAppCore {
         }
     }
 
+    pub fn replace_subscribers(&self, options: SubscribeOptions, sub: Arc<dyn CoreEventSubscriber>) {
+        let wrapped: Arc<dyn CoreEventSubscriber> = if options.min_interval_ms == 0 {
+            if options.include_terminal_raw_bytes {
+                sub
+            } else {
+                Arc::new(StripTerminalBytesSubscriber { downstream: sub })
+            }
+        } else {
+            Arc::new(CoalescingSubscriber::new(
+                sub,
+                self.runtime.handle().clone(),
+                Duration::from_millis(options.min_interval_ms),
+                options.include_terminal_raw_bytes,
+            ))
+        };
+        if let Ok(mut guard) = self.subscribers.lock() {
+            guard.clear();
+            guard.push(wrapped);
+        }
+    }
+
     pub fn discover_local_daemon_uri(&self) -> Option<String> {
         discover_local_daemon_pairing_uri()
     }
@@ -1001,6 +1022,22 @@ impl OrbitAppCore {
         agent_id: &str,
         reader: impl FnOnce(Option<&AgentCardView>, Option<&CachedAgentStage>) -> R,
     ) -> R {
+        // Fast path: serve warm, clean stage cache under a shared read lock.
+        if let Ok(read_guard) = self.hosts.read()
+            && let Some(host_state) = read_guard.get(host_id)
+            && !host_state.stage_dirty.contains_key(agent_id)
+            && let Some(cached) = host_state.stage_cache.get(agent_id)
+        {
+            let prefs_guard = self.thread_prefs.read().ok();
+            let current_agent_card = host_state.agents.get(agent_id).map(|ag| {
+                let pref = prefs_guard
+                    .as_ref()
+                    .and_then(|p| p.get(&(host_id.to_string(), ag.agent_id.clone())));
+                agent_to_card_view(ag, pref)
+            });
+            return reader(current_agent_card.as_ref(), Some(cached));
+        }
+
         let Ok(mut guard) = self.hosts.write() else {
             return reader(None, None);
         };
@@ -1746,7 +1783,12 @@ impl OrbitAppCore {
         &self,
         req: &crate::contract::AgentStageDeltaRequest,
     ) -> crate::stage::AgentStageDeltaView {
-        self.agent_stage_delta(&req.host_id, &req.agent_id, req.since_revision)
+        self.agent_stage_delta_with_aux(
+            &req.host_id,
+            &req.agent_id,
+            req.since_revision,
+            req.since_aux_revision,
+        )
     }
 
     pub fn create_session(self: &Arc<Self>, req: crate::contract::CreateSessionRequest) -> String {
@@ -6004,7 +6046,12 @@ impl CoreEventSubscriber for CoalescingSubscriber {
                             }) => {
                                 *prev_rev = revision;
                                 if self.include_terminal_raw_bytes {
+                                    const MAX_COALESCED_TERMINAL_BYTES: usize = 128 * 1024;
                                     prev_bytes.extend_from_slice(raw_bytes);
+                                    if prev_bytes.len() > MAX_COALESCED_TERMINAL_BYTES {
+                                        let excess = prev_bytes.len() - MAX_COALESCED_TERMINAL_BYTES;
+                                        prev_bytes.drain(..excess);
+                                    }
                                 } else {
                                     prev_bytes.clear();
                                 }
@@ -6336,8 +6383,12 @@ fn payload_affects_auxiliary_state(payload: &TimelinePayload) -> bool {
     match payload {
         TimelinePayload::AssistantThinking { .. } => false,
         TimelinePayload::AssistantMessage { text, .. } => {
-            contains_ascii_case_insensitive_str(text, "http://")
-                || contains_ascii_case_insensitive_str(text, "https://")
+            (contains_ascii_case_insensitive_str(text, "http://")
+                || contains_ascii_case_insensitive_str(text, "https://"))
+                && (contains_ascii_case_insensitive_str(text, "localhost")
+                    || contains_ascii_case_insensitive_str(text, "127.0.0.1")
+                    || contains_ascii_case_insensitive_str(text, "0.0.0.0")
+                    || contains_ascii_case_insensitive_str(text, "[::1]"))
         }
         _ => true,
     }

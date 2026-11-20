@@ -119,14 +119,26 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     resizeCleanupRef.current?.();
     const startX = e.clientX;
     const startW = panelWidthPx;
+    let latestW = startW;
+    let rafId: number | null = null;
     setIsResizingRight(true);
     document.body.style.cursor = "col-resize";
 
     const onMove = (ev: MouseEvent) => {
-      const delta = startX - ev.clientX;
-      orbitActions.setSidePanelWidth(startW + delta);
+      latestW = startW + (startX - ev.clientX);
+      if (rafId === null) {
+        rafId = window.requestAnimationFrame(() => {
+          rafId = null;
+          orbitActions.setSidePanelWidth(latestW, false);
+        });
+      }
     };
     const cleanup = () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      orbitActions.setSidePanelWidth(latestW, true);
       setIsResizingRight(false);
       document.body.style.cursor = "";
       window.removeEventListener("mousemove", onMove);

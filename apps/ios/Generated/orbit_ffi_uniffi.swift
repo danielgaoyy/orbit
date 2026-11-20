@@ -929,6 +929,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func dismissClusterSuggestion(hostId: String, agentId: String) 
     
+    func enqueuePrompt(hostId: String, agentId: String, prompt: String, displayPrompt: String?, badges: [FfiPromptBadge], queueId: String?)  -> String
+    
     func fallbackProviderCatalogs()  -> [FfiProviderModelCatalog]
     
     func fetchGitDiff(hostId: String, cwd: String, path: String?, staged: Bool) 
@@ -942,6 +944,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func fleetSidebar(sort: FfiSidebarProjectSort, filter: FfiSidebarThreadFilter, query: String, activeHostId: String?, activeAgentId: String?, activeCwd: String?)  -> FfiFleetSidebar
     
     func fleetSidebarRequest(req: FfiFleetSidebarRequest)  -> FfiFleetSidebar
+    
+    func flushQueuedPromptNow(hostId: String, agentId: String, queueId: String) 
     
     func gitReview(hostId: String, cwd: String, path: String?)  -> FfiGitReview
     
@@ -989,9 +993,13 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func removeProject(projectId: String) throws 
     
+    func removeQueuedPrompt(hostId: String, agentId: String, queueId: String) 
+    
     func renderDiagram(req: FfiRenderDiagramRequest)  -> FfiRenderDiagramView
     
     func reorderProjects(orderedKeys: [String]) throws  -> [String]
+    
+    func reorderQueuedPrompts(hostId: String, agentId: String, queueIds: [String]) 
     
     func resizeTerminal(hostId: String, cols: UInt16, rows: UInt16) 
     
@@ -1048,6 +1056,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func updateHostConfigRequest(req: FfiUpdateHostConfigRequest) throws  -> FfiHostCard
     
     func updateHostRelay(hostId: String, relayUrl: String?) throws 
+    
+    func upgradeHostDaemonOverWire(hostId: String, targetVersion: String?) throws  -> String
     
     func upsertProject(projectId: String?, hostId: String, name: String, directories: [String]) throws  -> FfiClientProject
     
@@ -1369,6 +1379,21 @@ open func dismissClusterSuggestion(hostId: String, agentId: String)  {try! rustC
 }
 }
     
+open func enqueuePrompt(hostId: String, agentId: String, prompt: String, displayPrompt: String?, badges: [FfiPromptBadge], queueId: String?) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_enqueue_prompt(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterString.lower(prompt),
+        FfiConverterOptionString.lower(displayPrompt),
+        FfiConverterSequenceTypeFfiPromptBadge.lower(badges),
+        FfiConverterOptionString.lower(queueId),uniffiCallStatus
+    )
+})
+}
+    
 open func fallbackProviderCatalogs() -> [FfiProviderModelCatalog]  {
     return try!  FfiConverterSequenceTypeFfiProviderModelCatalog.lift(try! rustCall() {
         uniffiCallStatus in
@@ -1442,6 +1467,17 @@ open func fleetSidebarRequest(req: FfiFleetSidebarRequest) -> FfiFleetSidebar  {
         FfiConverterTypeFfiFleetSidebarRequest_lower(req),uniffiCallStatus
     )
 })
+}
+    
+open func flushQueuedPromptNow(hostId: String, agentId: String, queueId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_flush_queued_prompt_now(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterString.lower(queueId),uniffiCallStatus
+    )
+}
 }
     
 open func gitReview(hostId: String, cwd: String, path: String?) -> FfiGitReview  {
@@ -1670,6 +1706,17 @@ open func removeProject(projectId: String)throws   {try rustCallWithError(FfiCon
 }
 }
     
+open func removeQueuedPrompt(hostId: String, agentId: String, queueId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_remove_queued_prompt(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterString.lower(queueId),uniffiCallStatus
+    )
+}
+}
+    
 open func renderDiagram(req: FfiRenderDiagramRequest) -> FfiRenderDiagramView  {
     return try!  FfiConverterTypeFfiRenderDiagramView_lift(try! rustCall() {
         uniffiCallStatus in
@@ -1688,6 +1735,17 @@ open func reorderProjects(orderedKeys: [String])throws  -> [String]  {
         FfiConverterSequenceString.lower(orderedKeys),uniffiCallStatus
     )
 })
+}
+    
+open func reorderQueuedPrompts(hostId: String, agentId: String, queueIds: [String])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_queued_prompts(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterSequenceString.lower(queueIds),uniffiCallStatus
+    )
+}
 }
     
 open func resizeTerminal(hostId: String, cols: UInt16, rows: UInt16)  {try! rustCall() {
@@ -2003,6 +2061,17 @@ open func updateHostRelay(hostId: String, relayUrl: String?)throws   {try rustCa
 }
 }
     
+open func upgradeHostDaemonOverWire(hostId: String, targetVersion: String?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_upgrade_host_daemon_over_wire(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterOptionString.lower(targetVersion),uniffiCallStatus
+    )
+})
+}
+    
 open func upsertProject(projectId: String?, hostId: String, name: String, directories: [String])throws  -> FfiClientProject  {
     return try  FfiConverterTypeFfiClientProject_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
         uniffiCallStatus in
@@ -2285,6 +2354,7 @@ public struct FfiAgentCard: Equatable, Hashable {
     public var mode: FfiSessionMode
     public var statusLabel: String
     public var isRunning: Bool
+    public var hasBackgroundTasks: Bool
     public var isAwaitingPermission: Bool
     public var parentAgentId: String?
     public var latestSeq: UInt64
@@ -2292,10 +2362,11 @@ public struct FfiAgentCard: Equatable, Hashable {
     public var isPinned: Bool
     public var seenSeq: UInt64
     public var isUnread: Bool
+    public var queuedPrompts: [FfiQueuedPrompt]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, isAwaitingPermission: Bool, parentAgentId: String?, latestSeq: UInt64, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool) {
+    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, isAwaitingPermission: Bool, parentAgentId: String?, latestSeq: UInt64, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt]) {
         self.agentId = agentId
         self.workspaceId = workspaceId
         self.cwd = cwd
@@ -2307,6 +2378,7 @@ public struct FfiAgentCard: Equatable, Hashable {
         self.mode = mode
         self.statusLabel = statusLabel
         self.isRunning = isRunning
+        self.hasBackgroundTasks = hasBackgroundTasks
         self.isAwaitingPermission = isAwaitingPermission
         self.parentAgentId = parentAgentId
         self.latestSeq = latestSeq
@@ -2314,6 +2386,7 @@ public struct FfiAgentCard: Equatable, Hashable {
         self.isPinned = isPinned
         self.seenSeq = seenSeq
         self.isUnread = isUnread
+        self.queuedPrompts = queuedPrompts
     }
 
     
@@ -2343,13 +2416,15 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
                 mode: FfiConverterTypeFfiSessionMode.read(from: &buf), 
                 statusLabel: FfiConverterString.read(from: &buf), 
                 isRunning: FfiConverterBool.read(from: &buf), 
+                hasBackgroundTasks: FfiConverterBool.read(from: &buf), 
                 isAwaitingPermission: FfiConverterBool.read(from: &buf), 
                 parentAgentId: FfiConverterOptionString.read(from: &buf), 
                 latestSeq: FfiConverterUInt64.read(from: &buf), 
                 updatedAtRfc3339: FfiConverterString.read(from: &buf), 
                 isPinned: FfiConverterBool.read(from: &buf), 
                 seenSeq: FfiConverterUInt64.read(from: &buf), 
-                isUnread: FfiConverterBool.read(from: &buf)
+                isUnread: FfiConverterBool.read(from: &buf), 
+                queuedPrompts: FfiConverterSequenceTypeFfiQueuedPrompt.read(from: &buf)
         )
     }
 
@@ -2365,6 +2440,7 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
         FfiConverterTypeFfiSessionMode.write(value.mode, into: &buf)
         FfiConverterString.write(value.statusLabel, into: &buf)
         FfiConverterBool.write(value.isRunning, into: &buf)
+        FfiConverterBool.write(value.hasBackgroundTasks, into: &buf)
         FfiConverterBool.write(value.isAwaitingPermission, into: &buf)
         FfiConverterOptionString.write(value.parentAgentId, into: &buf)
         FfiConverterUInt64.write(value.latestSeq, into: &buf)
@@ -2372,6 +2448,7 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
         FfiConverterBool.write(value.isPinned, into: &buf)
         FfiConverterUInt64.write(value.seenSeq, into: &buf)
         FfiConverterBool.write(value.isUnread, into: &buf)
+        FfiConverterSequenceTypeFfiQueuedPrompt.write(value.queuedPrompts, into: &buf)
     }
 }
 
@@ -4109,6 +4186,8 @@ public struct FfiHostCard: Equatable, Hashable {
     public var viaSshTunnel: Bool
     public var lastPingMs: UInt32?
     public var daemonVersion: String?
+    public var daemonProtocolVersion: UInt32?
+    public var clientProtocolVersion: UInt32
     public var osArch: String?
     public var daemonPubkeyB64: String
     public var directEndpoints: [String]
@@ -4119,10 +4198,11 @@ public struct FfiHostCard: Equatable, Hashable {
     public var workspaceCount: UInt32
     public var agentCount: UInt32
     public var pendingApprovalCount: UInt32
+    public var supportsServerQueue: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(hostId: String, displayName: String, hostname: String, customName: String?, sshAlias: String?, routeMode: FfiHostRouteMode, remoteDaemonPort: UInt16, customDirectEndpoint: String?, viaSshTunnel: Bool, lastPingMs: UInt32?, daemonVersion: String?, osArch: String?, daemonPubkeyB64: String, directEndpoints: [String], relayUrl: String?, connectionState: FfiConnectionState, lastError: String?, availableProviders: [FfiProviderKind], workspaceCount: UInt32, agentCount: UInt32, pendingApprovalCount: UInt32) {
+    public init(hostId: String, displayName: String, hostname: String, customName: String?, sshAlias: String?, routeMode: FfiHostRouteMode, remoteDaemonPort: UInt16, customDirectEndpoint: String?, viaSshTunnel: Bool, lastPingMs: UInt32?, daemonVersion: String?, daemonProtocolVersion: UInt32?, clientProtocolVersion: UInt32, osArch: String?, daemonPubkeyB64: String, directEndpoints: [String], relayUrl: String?, connectionState: FfiConnectionState, lastError: String?, availableProviders: [FfiProviderKind], workspaceCount: UInt32, agentCount: UInt32, pendingApprovalCount: UInt32, supportsServerQueue: Bool) {
         self.hostId = hostId
         self.displayName = displayName
         self.hostname = hostname
@@ -4134,6 +4214,8 @@ public struct FfiHostCard: Equatable, Hashable {
         self.viaSshTunnel = viaSshTunnel
         self.lastPingMs = lastPingMs
         self.daemonVersion = daemonVersion
+        self.daemonProtocolVersion = daemonProtocolVersion
+        self.clientProtocolVersion = clientProtocolVersion
         self.osArch = osArch
         self.daemonPubkeyB64 = daemonPubkeyB64
         self.directEndpoints = directEndpoints
@@ -4144,6 +4226,7 @@ public struct FfiHostCard: Equatable, Hashable {
         self.workspaceCount = workspaceCount
         self.agentCount = agentCount
         self.pendingApprovalCount = pendingApprovalCount
+        self.supportsServerQueue = supportsServerQueue
     }
 
     
@@ -4173,6 +4256,8 @@ public struct FfiConverterTypeFfiHostCard: FfiConverterRustBuffer {
                 viaSshTunnel: FfiConverterBool.read(from: &buf), 
                 lastPingMs: FfiConverterOptionUInt32.read(from: &buf), 
                 daemonVersion: FfiConverterOptionString.read(from: &buf), 
+                daemonProtocolVersion: FfiConverterOptionUInt32.read(from: &buf), 
+                clientProtocolVersion: FfiConverterUInt32.read(from: &buf), 
                 osArch: FfiConverterOptionString.read(from: &buf), 
                 daemonPubkeyB64: FfiConverterString.read(from: &buf), 
                 directEndpoints: FfiConverterSequenceString.read(from: &buf), 
@@ -4182,7 +4267,8 @@ public struct FfiConverterTypeFfiHostCard: FfiConverterRustBuffer {
                 availableProviders: FfiConverterSequenceTypeFfiProviderKind.read(from: &buf), 
                 workspaceCount: FfiConverterUInt32.read(from: &buf), 
                 agentCount: FfiConverterUInt32.read(from: &buf), 
-                pendingApprovalCount: FfiConverterUInt32.read(from: &buf)
+                pendingApprovalCount: FfiConverterUInt32.read(from: &buf), 
+                supportsServerQueue: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -4198,6 +4284,8 @@ public struct FfiConverterTypeFfiHostCard: FfiConverterRustBuffer {
         FfiConverterBool.write(value.viaSshTunnel, into: &buf)
         FfiConverterOptionUInt32.write(value.lastPingMs, into: &buf)
         FfiConverterOptionString.write(value.daemonVersion, into: &buf)
+        FfiConverterOptionUInt32.write(value.daemonProtocolVersion, into: &buf)
+        FfiConverterUInt32.write(value.clientProtocolVersion, into: &buf)
         FfiConverterOptionString.write(value.osArch, into: &buf)
         FfiConverterString.write(value.daemonPubkeyB64, into: &buf)
         FfiConverterSequenceString.write(value.directEndpoints, into: &buf)
@@ -4208,6 +4296,7 @@ public struct FfiConverterTypeFfiHostCard: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.workspaceCount, into: &buf)
         FfiConverterUInt32.write(value.agentCount, into: &buf)
         FfiConverterUInt32.write(value.pendingApprovalCount, into: &buf)
+        FfiConverterBool.write(value.supportsServerQueue, into: &buf)
     }
 }
 
@@ -4986,6 +5075,68 @@ public func FfiConverterTypeFfiQuestionItem_lift(_ buf: RustBuffer) throws -> Ff
 #endif
 public func FfiConverterTypeFfiQuestionItem_lower(_ value: FfiQuestionItem) -> RustBuffer {
     return FfiConverterTypeFfiQuestionItem.lower(value)
+}
+
+
+public struct FfiQueuedPrompt: Equatable, Hashable {
+    public var queueId: String
+    public var displayText: String
+    public var badges: [FfiPromptBadge]
+    public var createdAtRfc3339: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(queueId: String, displayText: String, badges: [FfiPromptBadge], createdAtRfc3339: String) {
+        self.queueId = queueId
+        self.displayText = displayText
+        self.badges = badges
+        self.createdAtRfc3339 = createdAtRfc3339
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiQueuedPrompt: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiQueuedPrompt: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiQueuedPrompt {
+        return
+            try FfiQueuedPrompt(
+                queueId: FfiConverterString.read(from: &buf), 
+                displayText: FfiConverterString.read(from: &buf), 
+                badges: FfiConverterSequenceTypeFfiPromptBadge.read(from: &buf), 
+                createdAtRfc3339: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiQueuedPrompt, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.queueId, into: &buf)
+        FfiConverterString.write(value.displayText, into: &buf)
+        FfiConverterSequenceTypeFfiPromptBadge.write(value.badges, into: &buf)
+        FfiConverterString.write(value.createdAtRfc3339, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQueuedPrompt_lift(_ buf: RustBuffer) throws -> FfiQueuedPrompt {
+    return try FfiConverterTypeFfiQueuedPrompt.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQueuedPrompt_lower(_ value: FfiQueuedPrompt) -> RustBuffer {
+    return FfiConverterTypeFfiQueuedPrompt.lower(value)
 }
 
 
@@ -10695,6 +10846,31 @@ fileprivate struct FfiConverterSequenceTypeFfiQuestionItem: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiQueuedPrompt: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiQueuedPrompt]
+
+    public static func write(_ value: [FfiQueuedPrompt], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiQueuedPrompt.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiQueuedPrompt] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiQueuedPrompt]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiQueuedPrompt.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiQuotaWindow: FfiConverterRustBuffer {
     typealias SwiftType = [FfiQuotaWindow]
 
@@ -11530,6 +11706,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_dismiss_cluster_suggestion() != 28765) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_enqueue_prompt() != 38455) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fallback_provider_catalogs() != 44914) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11549,6 +11728,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fleet_sidebar_request() != 966) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_flush_queued_prompt_now() != 60554) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_review() != 29779) {
@@ -11620,10 +11802,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_project() != 26180) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_queued_prompt() != 22264) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram() != 2210) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_projects() != 42270) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_queued_prompts() != 39769) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal() != 57060) {
@@ -11708,6 +11896,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_relay() != 50634) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upgrade_host_daemon_over_wire() != 62597) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upsert_project() != 43684) {

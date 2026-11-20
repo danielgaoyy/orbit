@@ -23,8 +23,7 @@ use orbit_protocol::{
     ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
     TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
     WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceScriptInfo,
-    WorkspaceSummary, WorktreeCreateMode,
+    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -6875,6 +6874,15 @@ impl OrbitAppCore {
         res_rx
             .await
             .map_err(|_| "Remote upgrade task terminated unexpectedly".to_string())?
+    }
+
+    pub fn upgrade_host_daemon_over_wire_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        target_version: Option<String>,
+    ) -> Result<String, String> {
+        self.runtime
+            .block_on(self.upgrade_host_daemon_over_wire(host_id, target_version))
     }
 
     /// Read a workspace file from a local or remote Orbit host and pre-render syntax highlighting / Markdown AST.

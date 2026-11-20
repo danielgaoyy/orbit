@@ -29,6 +29,7 @@ import {
   PromptBadgeDto,
   ProviderModelCatalogDto,
   ProviderModelSpecDto,
+  QueuedPromptDto,
   QueuedPromptItem,
   QuotedDiffSnippet,
   RenderDiagramRequestDto,
@@ -832,26 +833,103 @@ export class OrbitHarmonyStore {
     return `${hostId}::${agentId}`;
   }
 
+  private selectedHostSupportsServerQueue(): boolean {
+    if (this.currentHostDetail !== null && this.currentHostDetail.host.host_id === this.selectedHostId) {
+      return this.currentHostDetail.host.supports_server_queue === true;
+    }
+    for (let i = 0; i < this.hosts.length; i++) {
+      if (this.hosts[i].host_id === this.selectedHostId) {
+        return this.hosts[i].supports_server_queue === true;
+      }
+    }
+    return false;
+  }
+
+  private hostSupportsServerQueueById(hostId: string): boolean {
+    if (this.currentHostDetail !== null && this.currentHostDetail.host.host_id === hostId) {
+      return this.currentHostDetail.host.supports_server_queue === true;
+    }
+    for (let i = 0; i < this.hosts.length; i++) {
+      if (this.hosts[i].host_id === hostId) {
+        return this.hosts[i].supports_server_queue === true;
+      }
+    }
+    return false;
+  }
+
   private syncActiveQueuedPrompts(): void {
     if (this.selectedHostId.length === 0 || this.selectedAgentId.length === 0) {
       this.activeQueuedPrompts = [];
       return;
     }
     const key = this.agentQueueKey(this.selectedHostId, this.selectedAgentId);
-    const list = this.queuedPromptsByAgent.get(key);
-    if (list === undefined || list.length === 0) {
+    const localList = this.queuedPromptsByAgent.get(key);
+    if (this.selectedHostSupportsServerQueue()) {
+      let activeAgent: AgentCardDto | null = null;
+      if (this.currentHostDetail !== null) {
+        for (let i = 0; i < this.currentHostDetail.agents.length; i++) {
+          if (this.currentHostDetail.agents[i].agent_id === this.selectedAgentId) {
+            activeAgent = this.currentHostDetail.agents[i];
+            break;
+          }
+        }
+      }
+      const serverList: QueuedPromptDto[] | undefined =
+        activeAgent !== null ? activeAgent.queued_prompts : undefined;
+      if (serverList === undefined || serverList.length === 0) {
+        this.activeQueuedPrompts = [];
+        return;
+      }
+      const merged: QueuedPromptItem[] = [];
+      for (let i = 0; i < serverList.length; i++) {
+        const sq = serverList[i];
+        let cached: QueuedPromptItem | null = null;
+        if (localList !== undefined) {
+          for (let j = 0; j < localList.length; j++) {
+            if (localList[j].id === sq.queue_id) {
+              cached = localList[j];
+              break;
+            }
+          }
+        }
+        if (cached !== null) {
+          merged.push(cached);
+        } else {
+          const sqBadges: PromptBadgeDto[] = sq.badges !== undefined ? sq.badges : [];
+          merged.push({
+            id: sq.queue_id,
+            hostKey: key,
+            rawText: sq.display_text,
+            displayPrompt: sq.display_text,
+            wirePrompt: sq.display_text,
+            badgesJson: sqBadges.length > 0 ? JSON.stringify(sqBadges) : null,
+            badges: sqBadges,
+            quotedSnippets: [],
+            stagedAttachments: [],
+            inlineMentions: [],
+            createdAtMs: Date.now()
+          });
+        }
+      }
+      this.activeQueuedPrompts = merged;
+      return;
+    }
+    if (localList === undefined || localList.length === 0) {
       this.activeQueuedPrompts = [];
       return;
     }
     const copy: QueuedPromptItem[] = [];
-    for (let i = 0; i < list.length; i++) {
-      copy.push(list[i]);
+    for (let i = 0; i < localList.length; i++) {
+      copy.push(localList[i]);
     }
     this.activeQueuedPrompts = copy;
   }
 
   private drainQueuedPromptsForAgentIfIdle(hostId: string, agent: AgentCardDto): void {
     if (this.core === null || hostId.length === 0 || agent.agent_id.length === 0) {
+      return;
+    }
+    if (this.hostSupportsServerQueueById(hostId)) {
       return;
     }
     if (
@@ -2441,6 +2519,20 @@ export class OrbitHarmonyStore {
     };
     nextList.push(item);
     this.queuedPromptsByAgent.set(key, nextList);
+    if (this.selectedHostSupportsServerQueue() && this.core !== null) {
+      try {
+        this.core.enqueuePrompt(
+          this.selectedHostId,
+          this.selectedAgentId,
+          item.wirePrompt,
+          item.displayPrompt,
+          item.badgesJson,
+          item.id
+        );
+      } catch (_err) {
+        // Fallback to local cache already saved above
+      }
+    }
     this.syncActiveQueuedPrompts();
 
     this.composerText = '';
@@ -2459,19 +2551,25 @@ export class OrbitHarmonyStore {
     }
     const key = this.agentQueueKey(this.selectedHostId, this.selectedAgentId);
     const existing = this.queuedPromptsByAgent.get(key);
-    if (existing === undefined) {
-      return;
-    }
-    const nextList: QueuedPromptItem[] = [];
-    for (let i = 0; i < existing.length; i++) {
-      if (existing[i].id !== itemId) {
-        nextList.push(existing[i]);
+    if (existing !== undefined) {
+      const nextList: QueuedPromptItem[] = [];
+      for (let i = 0; i < existing.length; i++) {
+        if (existing[i].id !== itemId) {
+          nextList.push(existing[i]);
+        }
+      }
+      if (nextList.length > 0) {
+        this.queuedPromptsByAgent.set(key, nextList);
+      } else {
+        this.queuedPromptsByAgent.delete(key);
       }
     }
-    if (nextList.length > 0) {
-      this.queuedPromptsByAgent.set(key, nextList);
-    } else {
-      this.queuedPromptsByAgent.delete(key);
+    if (this.selectedHostSupportsServerQueue() && this.core !== null) {
+      try {
+        this.core.removeQueuedPrompt(this.selectedHostId, this.selectedAgentId, itemId);
+      } catch (_err) {
+        // Ignore transient disconnect
+      }
     }
     this.syncActiveQueuedPrompts();
     this.triggerHaptic(8);
@@ -2482,26 +2580,36 @@ export class OrbitHarmonyStore {
       return;
     }
     const key = this.agentQueueKey(this.selectedHostId, this.selectedAgentId);
-    const existing = this.queuedPromptsByAgent.get(key);
-    if (existing === undefined) {
-      return;
-    }
     let target: QueuedPromptItem | null = null;
-    const nextList: QueuedPromptItem[] = [];
-    for (let i = 0; i < existing.length; i++) {
-      if (existing[i].id === itemId && target === null) {
-        target = existing[i];
-      } else {
-        nextList.push(existing[i]);
+    for (let i = 0; i < this.activeQueuedPrompts.length; i++) {
+      if (this.activeQueuedPrompts[i].id === itemId) {
+        target = this.activeQueuedPrompts[i];
+        break;
       }
     }
     if (target === null) {
       return;
     }
-    if (nextList.length > 0) {
-      this.queuedPromptsByAgent.set(key, nextList);
-    } else {
-      this.queuedPromptsByAgent.delete(key);
+    const existing = this.queuedPromptsByAgent.get(key);
+    if (existing !== undefined) {
+      const nextList: QueuedPromptItem[] = [];
+      for (let i = 0; i < existing.length; i++) {
+        if (existing[i].id !== itemId) {
+          nextList.push(existing[i]);
+        }
+      }
+      if (nextList.length > 0) {
+        this.queuedPromptsByAgent.set(key, nextList);
+      } else {
+        this.queuedPromptsByAgent.delete(key);
+      }
+    }
+    if (this.selectedHostSupportsServerQueue() && this.core !== null) {
+      try {
+        this.core.removeQueuedPrompt(this.selectedHostId, this.selectedAgentId, itemId);
+      } catch (_err) {
+        // Ignore transient disconnect
+      }
     }
     this.syncActiveQueuedPrompts();
 
@@ -2567,6 +2675,30 @@ export class OrbitHarmonyStore {
       return;
     }
     const key = this.agentQueueKey(this.selectedHostId, this.selectedAgentId);
+    if (this.selectedHostSupportsServerQueue()) {
+      const existingLocal = this.queuedPromptsByAgent.get(key);
+      if (existingLocal !== undefined) {
+        const restLocal: QueuedPromptItem[] = [];
+        for (let i = 0; i < existingLocal.length; i++) {
+          if (existingLocal[i].id !== itemId) {
+            restLocal.push(existingLocal[i]);
+          }
+        }
+        if (restLocal.length > 0) {
+          this.queuedPromptsByAgent.set(key, restLocal);
+        } else {
+          this.queuedPromptsByAgent.delete(key);
+        }
+      }
+      try {
+        this.core.flushQueuedPromptNow(this.selectedHostId, this.selectedAgentId, itemId);
+      } catch (_err) {
+        // Ignore transient disconnect
+      }
+      this.syncActiveQueuedPrompts();
+      this.triggerHaptic(10);
+      return;
+    }
     const existing = this.queuedPromptsByAgent.get(key);
     if (existing === undefined) {
       return;

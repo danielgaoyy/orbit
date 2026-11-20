@@ -679,6 +679,43 @@ impl OhosCoreFacade {
         Ok(())
     }
 
+    pub fn enqueue_prompt(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        prompt: &str,
+        display_prompt: Option<String>,
+        badges_json: Option<&str>,
+        queue_id: Option<String>,
+    ) -> Result<String, String> {
+        let badges = parse_badges_json(badges_json)?;
+        Ok(self
+            .inner
+            .enqueue_prompt(host_id, agent_id, prompt, display_prompt, badges, queue_id))
+    }
+
+    pub fn remove_queued_prompt(&self, host_id: &str, agent_id: &str, queue_id: &str) {
+        self.inner.remove_queued_prompt(host_id, agent_id, queue_id);
+    }
+
+    pub fn flush_queued_prompt_now(&self, host_id: &str, agent_id: &str, queue_id: &str) {
+        self.inner
+            .flush_queued_prompt_now(host_id, agent_id, queue_id);
+    }
+
+    pub fn reorder_queued_prompts(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        queue_ids_json: &str,
+    ) -> Result<(), String> {
+        let queue_ids: Vec<String> = serde_json::from_str(queue_ids_json)
+            .map_err(|e| format!("invalid queue_ids_json: {e}"))?;
+        self.inner
+            .reorder_queued_prompts(host_id, agent_id, queue_ids);
+        Ok(())
+    }
+
     pub fn interrupt_agent(&self, host_id: &str, agent_id: &str) {
         self.inner.interrupt_agent(host_id, agent_id);
     }
@@ -1527,6 +1564,52 @@ mod ohos_napi {
                     display_prompt,
                     badges_json.as_deref(),
                 )
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn enqueue_prompt(
+            &self,
+            host_id: String,
+            agent_id: String,
+            prompt: String,
+            display_prompt: Option<String>,
+            badges_json: Option<String>,
+            queue_id: Option<String>,
+        ) -> Result<String> {
+            self.facade
+                .enqueue_prompt(
+                    &host_id,
+                    &agent_id,
+                    &prompt,
+                    display_prompt,
+                    badges_json.as_deref(),
+                    queue_id,
+                )
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn remove_queued_prompt(&self, host_id: String, agent_id: String, queue_id: String) {
+            self.facade
+                .remove_queued_prompt(&host_id, &agent_id, &queue_id);
+        }
+
+        #[napi]
+        pub fn flush_queued_prompt_now(&self, host_id: String, agent_id: String, queue_id: String) {
+            self.facade
+                .flush_queued_prompt_now(&host_id, &agent_id, &queue_id);
+        }
+
+        #[napi]
+        pub fn reorder_queued_prompts(
+            &self,
+            host_id: String,
+            agent_id: String,
+            queue_ids_json: String,
+        ) -> Result<()> {
+            self.facade
+                .reorder_queued_prompts(&host_id, &agent_id, &queue_ids_json)
                 .map_err(Error::from_reason)
         }
 

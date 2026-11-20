@@ -555,8 +555,8 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public var isActiveAgentRunning: Bool {
-        if let agent = activeAgent, agent.isRunning {
-            return true
+        if let agent = activeAgent {
+            return agent.isRunning
         }
         if let lastTurn = agentStage?.turns.last, lastTurn.hasActiveItem && lastTurn.terminalReply == nil {
             return true
@@ -586,7 +586,23 @@ public final class OrbitIosStore: ObservableObject {
 
     public var activeQueuedPrompts: [QueuedPromptItem] {
         guard let key = activeAgentQueueKey else { return [] }
-        return queuedPromptsByAgent[key] ?? []
+        let localList = queuedPromptsByAgent[key] ?? []
+        if currentHostDetail?.host.supportsServerQueue == true {
+            let serverList = activeAgent?.queuedPrompts ?? []
+            return serverList.map { q in
+                if let cached = localList.first(where: { $0.id == q.queueId }) {
+                    return cached
+                }
+                return QueuedPromptItem(
+                    id: q.queueId,
+                    text: q.displayText,
+                    slashDirective: nil,
+                    attachedContexts: [],
+                    quotedDiffSnippets: []
+                )
+            }
+        }
+        return localList
     }
 
     public var activeGitBranch: String? {
@@ -2090,10 +2106,24 @@ public final class OrbitIosStore: ObservableObject {
             quotedDiffSnippets: quotedDiffSnippets
         )
         let key = "\(hid)::\(aid)"
+        let useServerQueue = currentHostDetail?.host.supportsServerQueue == true
         var queue = queuedPromptsByAgent[key] ?? []
         queue.append(item)
         queuedPromptsByAgent[key] = queue
-        lastKnownRunningByAgentKey[key] = true
+        if !useServerQueue {
+            lastKnownRunningByAgentKey[key] = true
+        }
+
+        if useServerQueue, let core = core {
+            _ = core.enqueuePrompt(
+                hostId: hid,
+                agentId: aid,
+                prompt: preview.wirePrompt,
+                displayPrompt: preview.displayPrompt,
+                badges: preview.badges,
+                queueId: item.id
+            )
+        }
 
         composerText = ""
         slashDirective = nil
@@ -2105,8 +2135,12 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func editQueuedPrompt(_ item: QueuedPromptItem) {
-        guard let key = activeAgentQueueKey else { return }
+        guard let hid = selectedHostId, let aid = selectedAgentId, let key = activeAgentQueueKey else { return }
+        let useServerQueue = currentHostDetail?.host.supportsServerQueue == true
         removeQueuedPrompt(item, inKey: key)
+        if useServerQueue, let core = core {
+            core.removeQueuedPrompt(hostId: hid, agentId: aid, queueId: item.id)
+        }
         composerText = item.text
         slashDirective = item.slashDirective
         attachedContexts = item.attachedContexts
@@ -2115,17 +2149,26 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func removeQueuedPrompt(_ item: QueuedPromptItem) {
-        guard let key = activeAgentQueueKey else { return }
+        guard let hid = selectedHostId, let aid = selectedAgentId, let key = activeAgentQueueKey else { return }
+        let useServerQueue = currentHostDetail?.host.supportsServerQueue == true
         removeQueuedPrompt(item, inKey: key)
+        if useServerQueue, let core = core {
+            core.removeQueuedPrompt(hostId: hid, agentId: aid, queueId: item.id)
+        }
         hapticLight()
     }
 
     public func sendQueuedPromptNow(_ item: QueuedPromptItem) {
         guard let hid = selectedHostId, let aid = selectedAgentId else { return }
         let key = "\(hid)::\(aid)"
+        let useServerQueue = currentHostDetail?.host.supportsServerQueue == true
         removeQueuedPrompt(item, inKey: key)
-        lastKnownRunningByAgentKey[key] = true
         hapticLight()
+        if useServerQueue, let core = core {
+            core.flushQueuedPromptNow(hostId: hid, agentId: aid, queueId: item.id)
+            return
+        }
+        lastKnownRunningByAgentKey[key] = true
         dispatchPromptInputs(
             hostId: hid,
             agentId: aid,
@@ -2147,6 +2190,9 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     private func evaluateAgentQueueDrain(hostId: String, agentId: String, isBusy: Bool) {
+        if hosts.first(where: { $0.hostId == hostId })?.supportsServerQueue == true {
+            return
+        }
         let key = "\(hostId)::\(agentId)"
         let wasRunning = lastKnownRunningByAgentKey[key] ?? false
         lastKnownRunningByAgentKey[key] = isBusy

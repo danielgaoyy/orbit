@@ -254,13 +254,30 @@ data class OrbitUiState(
         get() {
             val hId = selectedHostId ?: return emptyList()
             val aId = selectedAgentId?.takeIf { !isNewSessionMode } ?: return emptyList()
-            return queuedPromptsByAgent["$hId::$aId"].orEmpty()
+            val key = "$hId::$aId"
+            val localList = queuedPromptsByAgent[key].orEmpty()
+            if (selectedHost?.supportsServerQueue == true) {
+                val serverList = activeAgent?.queuedPrompts.orEmpty()
+                return serverList.map { q ->
+                    val cached = localList.firstOrNull { it.id == q.queueId }
+                    if (cached != null) {
+                        cached
+                    } else {
+                        QueuedPromptItem(
+                            id = q.queueId,
+                            text = q.displayText,
+                            previewText = q.displayText.lineSequence().firstOrNull()?.trim().orEmpty()
+                                .ifBlank { q.badges.joinToString(" ") { it.label } },
+                        )
+                    }
+                }
+            }
+            return localList
         }
 
     val isActiveAgentRunning: Boolean
         get() = !isNewSessionMode && (
-            agentStage?.agent?.isRunning == true ||
-                agentStage?.turns?.any { it.hasActiveItem } == true
+            agentStage?.agent?.isRunning ?: (agentStage?.turns?.any { it.hasActiveItem } == true)
             )
 
     val otherHostsPendingApprovals: UInt
@@ -2182,7 +2199,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         )
 
         val key = agentQueueKey(hostId, agentId)
-        runningAgentKeys.add(key)
+        val useServerQueue = cur.selectedHost?.supportsServerQueue == true
+        if (!useServerQueue) {
+            runningAgentKeys.add(key)
+        }
 
         _state.update { prev ->
             val updatedList = prev.queuedPromptsByAgent[key].orEmpty() + item
@@ -2202,6 +2222,21 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 toastMessage = "Queued next prompt",
             )
         }
+
+        if (useServerQueue) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching {
+                    core?.enqueuePrompt(
+                        hostId = hostId,
+                        agentId = agentId,
+                        prompt = preview.wirePrompt,
+                        displayPrompt = preview.displayPrompt,
+                        badges = preview.badges,
+                        queueId = item.id,
+                    )
+                }
+            }
+        }
     }
 
     fun removeQueuedPrompt(itemId: String) {
@@ -2209,6 +2244,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         val hostId = cur.selectedHostId ?: return
         val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: return
         val key = agentQueueKey(hostId, agentId)
+        val useServerQueue = cur.selectedHost?.supportsServerQueue == true
         _state.update { prev ->
             val remaining = prev.queuedPromptsByAgent[key].orEmpty().filterNot { it.id == itemId }
             val nextMap = if (remaining.isEmpty()) {
@@ -2218,6 +2254,11 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             }
             prev.copy(queuedPromptsByAgent = nextMap)
         }
+        if (useServerQueue) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { core?.removeQueuedPrompt(hostId, agentId, itemId) }
+            }
+        }
     }
 
     fun editQueuedPrompt(itemId: String) {
@@ -2225,7 +2266,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         val hostId = cur.selectedHostId ?: return
         val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: return
         val key = agentQueueKey(hostId, agentId)
-        val target = cur.queuedPromptsByAgent[key].orEmpty().firstOrNull { it.id == itemId } ?: return
+        val useServerQueue = cur.selectedHost?.supportsServerQueue == true
+        val target = cur.activeQueuedPrompts.firstOrNull { it.id == itemId } ?: return
         _state.update { prev ->
             val remaining = prev.queuedPromptsByAgent[key].orEmpty().filterNot { it.id == itemId }
             val nextMap = if (remaining.isEmpty()) {
@@ -2248,6 +2290,11 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                 ),
             )
         }
+        if (useServerQueue) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { core?.removeQueuedPrompt(hostId, agentId, itemId) }
+            }
+        }
     }
 
     fun sendQueuedPromptNow(itemId: String) {
@@ -2255,7 +2302,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         val hostId = cur.selectedHostId ?: return
         val agentId = cur.selectedAgentId?.takeIf { !cur.isNewSessionMode } ?: return
         val key = agentQueueKey(hostId, agentId)
-        val target = cur.queuedPromptsByAgent[key].orEmpty().firstOrNull { it.id == itemId } ?: return
+        val useServerQueue = cur.selectedHost?.supportsServerQueue == true
+        val target = cur.activeQueuedPrompts.firstOrNull { it.id == itemId } ?: return
         _state.update { prev ->
             val remaining = prev.queuedPromptsByAgent[key].orEmpty().filterNot { it.id == itemId }
             val nextMap = if (remaining.isEmpty()) {
@@ -2266,11 +2314,17 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             prev.copy(queuedPromptsByAgent = nextMap)
         }
         viewModelScope.launch(Dispatchers.IO) {
-            dispatchQueuedPromptItem(hostId, agentId, target)
+            if (useServerQueue) {
+                runCatching { core?.flushQueuedPromptNow(hostId, agentId, itemId) }
+            } else {
+                dispatchQueuedPromptItem(hostId, agentId, target)
+            }
         }
     }
 
     private fun drainNextQueuedPromptIfSettled(hostId: String, agentId: String) {
+        val host = _state.value.hosts.firstOrNull { it.hostId == hostId }
+        if (host?.supportsServerQueue == true) return
         val key = agentQueueKey(hostId, agentId)
         if (!drainingAgentKeys.add(key)) return
         viewModelScope.launch(Dispatchers.IO) {

@@ -55,6 +55,8 @@ export interface HostCardDto {
   via_ssh_tunnel: boolean;
   last_ping_ms: number | null;
   daemon_version: string | null;
+  daemon_protocol_version?: number | null;
+  client_protocol_version?: number;
   os_arch: string | null;
   daemon_pubkey_b64: string;
   direct_endpoints: string[];
@@ -65,6 +67,7 @@ export interface HostCardDto {
   workspace_count: number;
   agent_count: number;
   pending_approval_count: number;
+  supports_server_queue?: boolean;
 }
 
 export interface FleetOverviewDto {
@@ -87,6 +90,13 @@ export interface AgentStatusDto {
   recoverable?: boolean;
 }
 
+export interface QueuedPromptDto {
+  queue_id: string;
+  display_text: string;
+  badges?: PromptBadgeDto[];
+  created_at?: string;
+}
+
 export interface AgentCardDto {
   agent_id: string;
   workspace_id: string;
@@ -100,6 +110,7 @@ export interface AgentCardDto {
   status: AgentStatusDto;
   status_label: string;
   is_running: boolean;
+  has_background_tasks?: boolean;
   is_awaiting_permission: boolean;
   parent_agent_id: string | null;
   latest_seq: number;
@@ -107,6 +118,7 @@ export interface AgentCardDto {
   is_pinned?: boolean;
   seen_seq?: number;
   is_unread?: boolean;
+  queued_prompts?: QueuedPromptDto[];
 }
 
 export interface ThinkingOptionSpecDto {

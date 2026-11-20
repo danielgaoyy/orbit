@@ -1,8 +1,9 @@
-import { memo, useMemo } from "react";
+import { memo, useEffect, useMemo } from "react";
 import {
   Check,
   ChevronDown,
   Folder,
+  FolderGit2,
   FolderPlus,
   GitBranch,
   Laptop,
@@ -36,6 +37,8 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const draftUseWorktree = useOrbitSelector((s) => s.draftUseWorktree);
+  const draftWorktreeRepoPath = useOrbitSelector((s) => s.draftWorktreeRepoPath);
+  const gitReposCache = useOrbitSelector((s) => s.gitReposCache);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const hiddenProjectKeys = useOrbitSelector((s) => s.hiddenProjectKeys);
   const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
@@ -113,7 +116,65 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
     );
   }, [heroProjects, selectedHostId, selectedCwd]);
 
+  const cleanSelectedCwd = normalizeProjectPath(selectedCwd);
+  const gitCacheKey = selectedHostId ? `${selectedHostId}::${cleanSelectedCwd}` : "";
+  const cachedInspection =
+    (gitCacheKey ? gitReposCache[gitCacheKey] : undefined) ??
+    (selectedHostId ? hostDetail?.git_repos_by_cwd?.[cleanSelectedCwd] : undefined) ??
+    null;
+
+  useEffect(() => {
+    if (!selectedHostId || !cleanSelectedCwd || cleanSelectedCwd === "~") return;
+    if (cachedInspection) return;
+    void orbitActions.inspectGitRepos(
+      selectedHostId,
+      cleanSelectedCwd,
+      activeHeroProject?.directories ?? [],
+    );
+  }, [selectedHostId, cleanSelectedCwd, cachedInspection, activeHeroProject?.directories]);
+
+  const { isDirectGitRepo, nestedGitRepos } = useMemo(() => {
+    const sidebarProj = sidebarView?.projects.find(
+      (p) =>
+        p.host_id === selectedHostId &&
+        matchesProjectDirectory(p.directories, cleanSelectedCwd),
+    );
+    const lpProj = sidebarView?.launchpad_projects.find(
+      (p) => p.host_id === selectedHostId && normalizeProjectPath(p.path) === cleanSelectedCwd,
+    );
+    const discProj = hostDetail?.discovered_projects.find(
+      (p) => normalizeProjectPath(p.path) === cleanSelectedCwd,
+    );
+    const direct =
+      cachedInspection?.is_git_repo ??
+      sidebarProj?.is_git_repo ??
+      lpProj?.is_git_repo ??
+      discProj?.is_git_repo ??
+      false;
+    const nested =
+      cachedInspection?.nested_git_repos ??
+      sidebarProj?.nested_git_repos ??
+      lpProj?.nested_git_repos ??
+      discProj?.nested_git_repos ??
+      [];
+    return { isDirectGitRepo: direct, nestedGitRepos: nested };
+  }, [cachedInspection, sidebarView, selectedHostId, cleanSelectedCwd, hostDetail]);
+
+  const selectedNestedRepo = useMemo(
+    () =>
+      draftWorktreeRepoPath
+        ? nestedGitRepos.find((r) => r.path === draftWorktreeRepoPath) ?? null
+        : null,
+    [draftWorktreeRepoPath, nestedGitRepos],
+  );
+
+  const canUseWorktree = isDirectGitRepo || nestedGitRepos.length > 0;
+  const effectiveUsingWorktree =
+    draftUseWorktree && (isDirectGitRepo || Boolean(selectedNestedRepo));
+
   const activeRepoBranch = useMemo(() => {
+    if (selectedNestedRepo?.git_branch) return selectedNestedRepo.git_branch;
+    if (cachedInspection?.git_branch) return cachedInspection.git_branch;
     if (activeHeroProject?.branch) return activeHeroProject.branch;
     if (!hostDetail) return null;
     const clean = normalizeProjectPath(selectedCwd);
@@ -123,7 +184,7 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
         ?.git_branch ??
       null
     );
-  }, [activeHeroProject, hostDetail, selectedCwd]);
+  }, [selectedNestedRepo, cachedInspection, activeHeroProject, hostDetail, selectedCwd]);
 
   const activeProjectLabel = activeHeroProject?.name || basenameOfCwd(selectedCwd);
   const multiHost = fleet.hosts.length > 1;
@@ -258,97 +319,177 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
         )}
       </div>
 
-      {/* 2. Right: Clean Execution Environment Menu (Local vs Isolated Worktree) */}
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            className="text-foreground/72 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-          >
-            {draftUseWorktree ? (
-              <GitBranch className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-            ) : (
-              <Laptop className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
-            )}
-            <span>{draftUseWorktree ? "Worktree" : "Local"}</span>
-            {activeRepoBranch && (
-              <span className="text-foreground/45 max-w-28 truncate font-mono text-[12px]">
-                · {activeRepoBranch}
-              </span>
-            )}
-            <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
-          </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
-          side="bottom"
-          align="end"
-          finalFocus={false}
-          className="w-[308px] p-1.5"
+      {/* 2. Right: Clean Execution Environment Menu (Non-Git Guard + Nested Git Repo Worktree Picker) */}
+      {!canUseWorktree ? (
+        <div
+          title="Not a Git repository — running directly in local folder"
+          className="text-foreground/60 inline-flex h-8 items-center gap-1.5 rounded-full px-2.5 text-[13px] select-none"
         >
-          <DropdownMenuLabel className="flex items-center justify-between gap-2">
-            <span>Execution Environment</span>
-            {activeRepoBranch && (
-              <span className="text-muted-foreground max-w-28 truncate font-mono text-[11.5px] font-normal">
-                {activeRepoBranch}
+          <Laptop className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
+          <span>Local</span>
+        </div>
+      ) : (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              className="text-foreground/72 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+            >
+              {effectiveUsingWorktree ? (
+                <GitBranch className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
+              ) : (
+                <Laptop className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
+              )}
+              <span>
+                {effectiveUsingWorktree
+                  ? selectedNestedRepo && !isDirectGitRepo
+                    ? `Worktree · ${selectedNestedRepo.name}`
+                    : "Worktree"
+                  : "Local"}
               </span>
-            )}
-          </DropdownMenuLabel>
-
-          <DropdownMenuItem
-            onSelect={() =>
-              orbitActions.setDraftConfig({ useWorktree: false, worktreeBranch: "" })
-            }
-            className="items-start gap-3 px-2.5 py-2"
+              {activeRepoBranch && (isDirectGitRepo || effectiveUsingWorktree) && (
+                <span className="text-foreground/45 max-w-28 truncate font-mono text-[12px]">
+                  · {activeRepoBranch}
+                </span>
+              )}
+              <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            side="bottom"
+            align="end"
+            finalFocus={false}
+            className="w-[320px] p-1.5"
           >
-            <div className="flex min-w-0 flex-1 items-start gap-2.5">
-              <Laptop
-                className={cn(
-                  "mt-0.5 size-4 shrink-0 stroke-[1.75]",
-                  !draftUseWorktree ? "text-foreground" : "text-muted-foreground",
-                )}
-              />
-              <div className="flex min-w-0 flex-col gap-0.5">
-                <span className="text-foreground text-[13px] leading-tight font-medium">
-                  Local
+            <DropdownMenuLabel className="flex items-center justify-between gap-2">
+              <span>Execution Environment</span>
+              {activeRepoBranch && isDirectGitRepo && (
+                <span className="text-muted-foreground max-w-28 truncate font-mono text-[11.5px] font-normal">
+                  {activeRepoBranch}
                 </span>
-                <span className="text-muted-foreground text-[11.5px] leading-snug">
-                  Work directly in current project folder
-                </span>
-              </div>
-            </div>
-            {!draftUseWorktree && (
-              <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
-            )}
-          </DropdownMenuItem>
+              )}
+            </DropdownMenuLabel>
 
-          <DropdownMenuItem
-            onSelect={() =>
-              orbitActions.setDraftConfig({ useWorktree: true, worktreeBranch: "" })
-            }
-            className="items-start gap-3 px-2.5 py-2"
-          >
-            <div className="flex min-w-0 flex-1 items-start gap-2.5">
-              <GitBranch
-                className={cn(
-                  "mt-0.5 size-4 shrink-0 stroke-[1.75]",
-                  draftUseWorktree ? "text-foreground" : "text-muted-foreground",
-                )}
-              />
-              <div className="flex min-w-0 flex-col gap-0.5">
-                <span className="text-foreground text-[13px] leading-tight font-medium">
-                  Worktree
-                </span>
-                <span className="text-muted-foreground text-[11.5px] leading-snug">
-                  Isolated Git worktree for parallel tasks
-                </span>
+            <DropdownMenuItem
+              onSelect={() =>
+                orbitActions.setDraftConfig({
+                  useWorktree: false,
+                  worktreeBranch: "",
+                  worktreeRepoPath: null,
+                })
+              }
+              className="items-start gap-3 px-2.5 py-2"
+            >
+              <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                <Laptop
+                  className={cn(
+                    "mt-0.5 size-4 shrink-0 stroke-[1.75]",
+                    !effectiveUsingWorktree ? "text-foreground" : "text-muted-foreground",
+                  )}
+                />
+                <div className="flex min-w-0 flex-col gap-0.5">
+                  <span className="text-foreground text-[13px] leading-tight font-medium">
+                    Local
+                  </span>
+                  <span className="text-muted-foreground text-[11.5px] leading-snug">
+                    Work directly in current project folder
+                  </span>
+                </div>
               </div>
-            </div>
-            {draftUseWorktree && (
-              <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
+              {!effectiveUsingWorktree && (
+                <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
+              )}
+            </DropdownMenuItem>
+
+            {isDirectGitRepo && (
+              <DropdownMenuItem
+                onSelect={() =>
+                  orbitActions.setDraftConfig({
+                    useWorktree: true,
+                    worktreeBranch: "",
+                    worktreeRepoPath: null,
+                  })
+                }
+                className="items-start gap-3 px-2.5 py-2"
+              >
+                <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                  <GitBranch
+                    className={cn(
+                      "mt-0.5 size-4 shrink-0 stroke-[1.75]",
+                      effectiveUsingWorktree && !selectedNestedRepo
+                        ? "text-foreground"
+                        : "text-muted-foreground",
+                    )}
+                  />
+                  <div className="flex min-w-0 flex-col gap-0.5">
+                    <span className="text-foreground text-[13px] leading-tight font-medium">
+                      Worktree
+                    </span>
+                    <span className="text-muted-foreground text-[11.5px] leading-snug">
+                      Isolated Git worktree for parallel tasks
+                    </span>
+                  </div>
+                </div>
+                {effectiveUsingWorktree && !selectedNestedRepo && (
+                  <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
+                )}
+              </DropdownMenuItem>
             )}
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+
+            {nestedGitRepos.length > 0 && (
+              <>
+                <DropdownMenuSeparator />
+                <DropdownMenuLabel className="text-[11px]">
+                  {isDirectGitRepo
+                    ? "Worktree · Nested Git Repos"
+                    : "Worktree · Git Repos in Project"}
+                </DropdownMenuLabel>
+                <ScrollArea viewportClassName="max-h-48">
+                  <div className="space-y-0.5">
+                    {nestedGitRepos.map((repo) => {
+                      const active =
+                        effectiveUsingWorktree && draftWorktreeRepoPath === repo.path;
+                      return (
+                        <DropdownMenuItem
+                          key={repo.path}
+                          onSelect={() =>
+                            orbitActions.setDraftConfig({
+                              useWorktree: true,
+                              worktreeBranch: "",
+                              worktreeRepoPath: repo.path,
+                            })
+                          }
+                          className="items-start gap-2.5 px-2.5 py-1.5"
+                        >
+                          <FolderGit2
+                            className={cn(
+                              "mt-0.5 size-4 shrink-0 stroke-[1.75]",
+                              active ? "text-foreground" : "text-muted-foreground",
+                            )}
+                          />
+                          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                            <span className="text-foreground truncate text-[12.5px] leading-tight font-medium">
+                              {repo.relative_path || repo.name}
+                            </span>
+                            {repo.git_branch && (
+                              <span className="text-muted-foreground truncate font-mono text-[11px]">
+                                {repo.git_branch}
+                              </span>
+                            )}
+                          </div>
+                          {active && (
+                            <Check className="text-foreground mt-0.5 size-3.5 shrink-0" />
+                          )}
+                        </DropdownMenuItem>
+                      );
+                    })}
+                  </div>
+                </ScrollArea>
+              </>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
     </div>
   );
 });

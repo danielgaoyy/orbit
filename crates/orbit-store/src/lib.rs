@@ -3,6 +3,7 @@
 //! Replaces Paseo's scattered JSON files with ACID event-sourced timelines and `< 1ms` cursor catch-up.
 
 pub mod orchestration;
+pub mod workspace_sync;
 pub use orchestration::*;
 
 use std::collections::HashMap;
@@ -11,17 +12,24 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, AgentSummary, AttentionState, ProviderKind, ReasoningEffort, SessionMode,
-    TerminalSummary, TimelineEvent, TimelinePayload, WorkspaceSetupStatus, WorkspaceSummary,
+    AgentStatus, AgentSummary, ProviderKind, ReasoningEffort, SessionMode, TerminalSummary,
+    TimelineEvent, TimelinePayload, WorkspaceClusterSuggestion, WorkspaceSetupStatus,
+    WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+
+pub(crate) const WORKSPACE_SELECT_COLS: &str =
+    "workspace_id, title, cwd, git_branch, is_worktree, updated_at,
+    source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status,
+    mission_goal, project_root, board_revision, title_locked, auto_clustered";
 
 pub(crate) const AGENT_SELECT_COLS: &str =
     "agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
     status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
     parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
-    attention_state, last_activity_at, timeline_epoch";
+    attention_state, last_activity_at, timeline_epoch, read_seq, is_pinned, pinned_order,
+    handle, cluster_suggestion_json";
 
 /// Extra host configuration metadata persisted alongside `StoredHostProfile`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -271,6 +279,7 @@ impl OrbitStore {
             let _ = conn.execute_batch("PRAGMA user_version = 2;");
         }
         orchestration::migrate_orchestration_schema(&conn)?;
+        workspace_sync::migrate_sync_and_mission_schema(&conn)?;
         let post_orch_ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
@@ -345,9 +354,10 @@ impl OrbitStore {
             "
             INSERT INTO workspaces (
                 workspace_id, title, cwd, git_branch, is_worktree, updated_at,
-                source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status
+                source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status,
+                mission_goal, project_root, board_revision, title_locked, auto_clustered
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ON CONFLICT(workspace_id) DO UPDATE SET
                 title = excluded.title,
                 cwd = excluded.cwd,
@@ -359,7 +369,12 @@ impl OrbitStore {
                 parent_workspace_id = COALESCE(excluded.parent_workspace_id, workspaces.parent_workspace_id),
                 archived_at = excluded.archived_at,
                 background = excluded.background,
-                setup_status = excluded.setup_status
+                setup_status = excluded.setup_status,
+                mission_goal = COALESCE(excluded.mission_goal, workspaces.mission_goal),
+                project_root = COALESCE(excluded.project_root, workspaces.project_root),
+                board_revision = MAX(workspaces.board_revision, excluded.board_revision),
+                title_locked = excluded.title_locked,
+                auto_clustered = excluded.auto_clustered
             ",
             params![
                 ws.workspace_id,
@@ -374,6 +389,11 @@ impl OrbitStore {
                 ws.archived_at.map(|t| t.to_rfc3339()),
                 i32::from(ws.background),
                 setup_status_str,
+                ws.mission_goal,
+                ws.project_root,
+                ws.board_revision as i64,
+                i32::from(ws.title_locked),
+                i32::from(ws.auto_clustered),
             ],
         )?;
         Ok(())
@@ -381,15 +401,12 @@ impl OrbitStore {
 
     pub fn find_workspace_by_cwd(&self, cwd: &str) -> Result<Option<WorkspaceSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.query_row(
-            "SELECT workspace_id, title, cwd, git_branch, is_worktree, updated_at,
-                    source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status
-             FROM workspaces WHERE cwd = ?1 AND archived_at IS NULL LIMIT 1",
-            params![cwd],
-            map_workspace_row,
-        )
-        .optional()
-        .map_err(Into::into)
+        let sql = format!(
+            "SELECT {WORKSPACE_SELECT_COLS} FROM workspaces WHERE cwd = ?1 AND archived_at IS NULL LIMIT 1"
+        );
+        conn.query_row(&sql, params![cwd], map_workspace_row)
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn list_workspaces(&self) -> Result<Vec<WorkspaceSummary>, StoreError> {
@@ -414,6 +431,11 @@ impl OrbitStore {
         let attention_str = serde_json::to_string(&agent.attention)?
             .trim_matches('"')
             .to_string();
+        let cluster_suggestion_json = agent
+            .cluster_suggestion
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
 
         conn.execute(
             "
@@ -421,10 +443,12 @@ impl OrbitStore {
                 agent_id, workspace_id, cwd, title, provider_json, model, effort_json,
                 mode_json, status_json, parent_agent_id, parent_host_id, persistence_ref,
                 latest_seq, timeline_epoch, created_at, updated_at, archived_at, background, auto_archive,
-                profile_id, labels_json, attention_state, last_activity_at
+                profile_id, labels_json, attention_state, last_activity_at,
+                read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
             ON CONFLICT(agent_id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
                 title = excluded.title,
                 model = excluded.model,
                 effort_json = excluded.effort_json,
@@ -442,7 +466,12 @@ impl OrbitStore {
                 profile_id = COALESCE(excluded.profile_id, agents.profile_id),
                 labels_json = excluded.labels_json,
                 attention_state = excluded.attention_state,
-                last_activity_at = COALESCE(excluded.last_activity_at, agents.last_activity_at)
+                last_activity_at = COALESCE(excluded.last_activity_at, agents.last_activity_at),
+                read_seq = MAX(agents.read_seq, excluded.read_seq),
+                is_pinned = excluded.is_pinned,
+                pinned_order = excluded.pinned_order,
+                handle = COALESCE(excluded.handle, agents.handle),
+                cluster_suggestion_json = excluded.cluster_suggestion_json
             ",
             params![
                 agent.agent_id,
@@ -468,6 +497,11 @@ impl OrbitStore {
                 labels_json,
                 attention_str,
                 agent.last_activity_at.map(|t| t.to_rfc3339()),
+                agent.read_seq as i64,
+                i32::from(agent.is_pinned),
+                agent.pinned_order,
+                agent.handle,
+                cluster_suggestion_json,
             ],
         )?;
         Ok(())
@@ -1780,6 +1814,11 @@ pub(crate) fn map_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wor
         archived_at: archived_opt.as_deref().map(parse_ts),
         background: row.get::<_, i32>(10)? != 0,
         setup_status,
+        mission_goal: row.get(12).unwrap_or(None),
+        project_root: row.get(13).unwrap_or(None),
+        board_revision: row.get::<_, i64>(14).unwrap_or(0).max(0) as u64,
+        title_locked: row.get::<_, i32>(15).unwrap_or(0) != 0,
+        auto_clustered: row.get::<_, i32>(16).unwrap_or(0) != 0,
     })
 }
 
@@ -1799,6 +1838,11 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
     let attention_str: String = row.get(19)?;
     let last_activity_opt: Option<String> = row.get(20)?;
     let timeline_epoch: u64 = row.get::<_, i64>(21).unwrap_or(0).max(0) as u64;
+    let read_seq: u64 = row.get::<_, i64>(22).unwrap_or(0).max(0) as u64;
+    let is_pinned: bool = row.get::<_, i32>(23).unwrap_or(0) != 0;
+    let pinned_order: i64 = row.get::<_, i64>(24).unwrap_or(0);
+    let handle: Option<String> = row.get(25).unwrap_or(None);
+    let cluster_suggestion_opt: Option<String> = row.get(26).unwrap_or(None);
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
@@ -1808,12 +1852,10 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
     let mode: SessionMode = serde_json::from_str(&mode_str).unwrap_or(SessionMode::Default);
     let status: AgentStatus = serde_json::from_str(&status_str).unwrap_or(AgentStatus::Closed);
     let labels: HashMap<String, String> = serde_json::from_str(&labels_str).unwrap_or_default();
-    let attention = match attention_str.as_str() {
-        "finished" => AttentionState::Finished,
-        "error" => AttentionState::Error,
-        "permission" => AttentionState::Permission,
-        _ => AttentionState::None,
-    };
+    let attention = crate::workspace_sync::attention_state_from_str(&attention_str);
+    let cluster_suggestion: Option<WorkspaceClusterSuggestion> = cluster_suggestion_opt
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
 
     Ok(AgentSummary {
         agent_id: row.get(0)?,
@@ -1838,6 +1880,11 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         labels,
         attention,
         last_activity_at: last_activity_opt.as_deref().map(parse_ts),
+        read_seq,
+        is_pinned,
+        pinned_order,
+        handle,
+        cluster_suggestion,
     })
 }
 
@@ -1850,6 +1897,7 @@ pub(crate) fn parse_ts(s: &str) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orbit_protocol::AttentionState;
 
     #[test]
     fn sqlite_wal_timeline_cursor_catchup_and_coalescing() {
@@ -1870,6 +1918,11 @@ mod tests {
                 archived_at: None,
                 background: false,
                 setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
             })
             .expect("upsert ws");
 
@@ -1898,6 +1951,11 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                 },
                 Some("session_abc"),
             )
@@ -1965,6 +2023,11 @@ mod tests {
             archived_at: None,
             background: false,
             setup_status: WorkspaceSetupStatus::Idle,
+            mission_goal: None,
+            project_root: None,
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
         };
         store.upsert_workspace(&ws).expect("upsert ws");
 
@@ -1993,6 +2056,11 @@ mod tests {
             labels: HashMap::new(),
             attention: AttentionState::Finished,
             last_activity_at: Some(now),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
         };
         store.upsert_agent(&parent, Some("ref_p")).expect("parent");
 
@@ -2159,6 +2227,11 @@ mod tests {
                 archived_at: None,
                 background: false,
                 setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
             })
             .expect("upsert ws");
 
@@ -2187,6 +2260,11 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                 },
                 Some("prov_sess_1"),
             )
@@ -2309,6 +2387,11 @@ mod tests {
                 archived_at: None,
                 background: false,
                 setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
             })
             .expect("ws");
         store
@@ -2336,6 +2419,11 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                 },
                 None,
             )
@@ -2390,6 +2478,11 @@ mod tests {
                 archived_at: None,
                 background: false,
                 setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
             })
             .expect("ws");
         store
@@ -2417,6 +2510,11 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                 },
                 None,
             )

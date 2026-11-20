@@ -3,15 +3,20 @@ import {
   Archive,
   CheckCircle2,
   Circle,
+  Columns2,
   Copy,
+  FileText,
+  FolderInput,
   FolderOpen,
   Hash,
   Loader2,
   Pencil,
   Pin,
   PinOff,
+  Split,
   Trash2,
   Unlink,
+  UserPlus,
 } from "lucide-react";
 import {
   type AgentCardView,
@@ -32,6 +37,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/overlays";
@@ -39,6 +45,7 @@ import {
   type ArchivedThreadEntry,
   orbitActions,
   threadScopeKey,
+  useOrbitSelector,
 } from "@/state/orbit-store";
 
 export interface MenuAnchorBox {
@@ -76,8 +83,34 @@ export function SharedConversationMenu({
   onClose: () => void;
   onStartRename: (threadKey: string) => void;
 }) {
+  const hostDetail = useOrbitSelector((s) =>
+    target ? (s.hostDetails[target.host.host_id] ?? null) : null,
+  );
   if (!target) return null;
   const { threadKey, host, agent, isPinned, isUnread, anchor } = target;
+  const activeWs = hostDetail?.workspaces.find((w) => w.workspace_id === agent.workspace_id);
+  const wsPeers = (hostDetail?.agents ?? []).filter(
+    (a) => a.workspace_id === agent.workspace_id && !a.archived_at_rfc3339 && !a.background,
+  );
+  const isMultiPeerWs = wsPeers.length >= 2;
+  const projectRoot = activeWs?.project_root || activeWs?.source_cwd || activeWs?.cwd || agent.cwd;
+  const otherWorkspaces = (hostDetail?.workspaces ?? [])
+    .filter(
+      (w) =>
+        w.workspace_id !== agent.workspace_id &&
+        !w.archived_at &&
+        !w.background &&
+        (w.project_root === projectRoot ||
+          w.source_cwd === projectRoot ||
+          w.cwd === projectRoot ||
+          w.cwd === agent.cwd),
+    )
+    .slice(0, 4);
+  const availableProviders =
+    hostDetail?.host.available_providers.length
+      ? hostDetail.host.available_providers
+      : [agent.provider];
+  const altProvider = availableProviders.find((p) => p !== agent.provider) ?? agent.provider;
 
   return (
     <DropdownMenu
@@ -175,6 +208,98 @@ export function SharedConversationMenu({
             <span>Copy Agent ID</span>
           </span>
         </DropdownMenuItem>
+
+        <DropdownMenuSeparator />
+
+        <DropdownMenuItem
+          onSelect={() => {
+            orbitActions.openPeerSplitTab(
+              host.host_id,
+              agent.agent_id,
+              agent.handle ? `@${agent.handle}` : agent.title,
+            );
+          }}
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <Columns2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+            <span>Open Side-by-Side</span>
+          </span>
+        </DropdownMenuItem>
+
+        <DropdownMenuItem
+          onSelect={() => {
+            orbitActions.openWorkspaceBoardTab(
+              host.host_id,
+              agent.workspace_id,
+              activeWs?.title,
+            );
+          }}
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <FileText className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+            <span>Workspace Board</span>
+          </span>
+        </DropdownMenuItem>
+
+        <DropdownMenuItem
+          onSelect={() => {
+            void orbitActions.spawnWorkspacePeer(
+              {
+                host_id: host.host_id,
+                workspace_id: agent.workspace_id,
+                cwd: agent.cwd,
+                provider: altProvider,
+                mode: "plan",
+                handle: "reviewer",
+                initial_prompt: `Join this Mission Workspace alongside @${agent.handle || "lead"}. Read BOARD.md and inspect recent changes to provide a concise code review.`,
+              },
+              { openInSplit: true },
+            );
+          }}
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <UserPlus className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+            <span>Add Reviewer Peer</span>
+          </span>
+        </DropdownMenuItem>
+
+        {isMultiPeerWs && (
+          <DropdownMenuItem
+            onSelect={() => {
+              void orbitActions.moveAgentToWorkspace(host.host_id, agent.agent_id, null);
+            }}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <Split className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+              <span>Split to Own Workspace</span>
+            </span>
+          </DropdownMenuItem>
+        )}
+
+        {otherWorkspaces.length > 0 && (
+          <>
+            <DropdownMenuLabel className="text-[10.5px]">Move to Workspace</DropdownMenuLabel>
+            {otherWorkspaces.map((ws) => (
+              <DropdownMenuItem
+                key={ws.workspace_id}
+                onSelect={() => {
+                  void orbitActions.moveAgentToWorkspace(
+                    host.host_id,
+                    agent.agent_id,
+                    ws.workspace_id,
+                  );
+                }}
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  <FolderInput className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+                  <span className="truncate">{ws.title}</span>
+                </span>
+              </DropdownMenuItem>
+            ))}
+          </>
+        )}
+
+        <DropdownMenuSeparator />
 
         {agent.parent_agent_id && (
           <DropdownMenuItem

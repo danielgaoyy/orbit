@@ -35,6 +35,7 @@ import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.CreateNewFolder
 import androidx.compose.material.icons.outlined.Difference
+import androidx.compose.material.icons.outlined.DragHandle
 import androidx.compose.material.icons.outlined.FilterList
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.FolderOpen
@@ -453,6 +454,7 @@ fun FleetDrawerContent(
                                         icon = when (sort) {
                                             OrbitSidebarProjectSort.RECENT -> Icons.Outlined.Schedule
                                             OrbitSidebarProjectSort.NAME -> Icons.Outlined.SortByAlpha
+                                            OrbitSidebarProjectSort.MANUAL -> Icons.Outlined.DragHandle
                                         },
                                         selected = ui.sidebarProjectSort == sort,
                                         onClick = {

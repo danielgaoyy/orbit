@@ -492,6 +492,11 @@ pub enum ComposerContextInput {
         label: String,
         content: String,
     },
+    WorkspacePeer {
+        handle: String,
+        #[serde(default)]
+        summary: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -754,6 +759,23 @@ pub fn compose_prompt(
                 });
                 context_blocks.push(format!("{label}:\n```text\n{content}\n```"));
             }
+            ComposerContextInput::WorkspacePeer { handle, summary } => {
+                let clean_handle = handle.trim().trim_start_matches('@');
+                let tag = format!("@{clean_handle}");
+                if !clean_handle.is_empty() && !clean_user_text.contains(&tag) {
+                    badges.push(PromptBadge {
+                        kind: "peer".into(),
+                        label: tag.clone(),
+                        path: None,
+                    });
+                }
+                if !summary.trim().is_empty() {
+                    context_blocks.push(format!(
+                        "Referenced Mission Workspace peer `{tag}`:\n{}",
+                        summary.trim()
+                    ));
+                }
+            }
         }
     }
 
@@ -902,15 +924,94 @@ fn score_file_match(full_lower: &str, base_lower: &str, q: &str) -> i32 {
     if qi == q_bytes.len() { 36 } else { -1 }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePeerMentionInput {
+    pub handle: String,
+    pub title: String,
+    pub status_label: String,
+}
+
 pub fn rank_mention_candidates(
     query: &str,
     workspace_files: &[String],
     git_files: &[(String, String)],
     limit: usize,
 ) -> Vec<MentionCandidateView> {
+    rank_mention_candidates_with_peers(query, workspace_files, git_files, &[], limit)
+}
+
+pub fn rank_mention_candidates_with_peers(
+    query: &str,
+    workspace_files: &[String],
+    git_files: &[(String, String)],
+    workspace_peers: &[WorkspacePeerMentionInput],
+    limit: usize,
+) -> Vec<MentionCandidateView> {
     let max_items = if limit == 0 { 40 } else { limit.min(200) };
     let q = query.trim().to_ascii_lowercase();
     let mut out: Vec<MentionCandidateView> = Vec::new();
+
+    if !workspace_peers.is_empty() {
+        let mut peer_candidates: Vec<MentionCandidateView> = Vec::new();
+        for peer in workspace_peers {
+            let slug = peer
+                .handle
+                .trim()
+                .trim_start_matches('@')
+                .to_ascii_lowercase();
+            if slug.is_empty() {
+                continue;
+            }
+            let title_lower = peer.title.to_ascii_lowercase();
+            let score = if q.is_empty() {
+                992
+            } else if slug == q {
+                1040
+            } else if slug.starts_with(&q) {
+                1020
+            } else if slug.contains(&q) || title_lower.contains(&q) {
+                995
+            } else {
+                -1
+            };
+            if score >= 0 {
+                let token = format!("@{slug}");
+                peer_candidates.push(MentionCandidateView {
+                    key: format!("peer::{slug}"),
+                    kind: "workspace_peer".into(),
+                    token_label: token.clone(),
+                    title: token,
+                    subtitle: format!("{} · {}", peer.title, peer.status_label),
+                    file_path: String::new(),
+                    git_status: String::new(),
+                    score,
+                });
+            }
+        }
+        let all_score = if q.is_empty() {
+            988
+        } else if "all" == q {
+            1035
+        } else if "all".starts_with(&q) || "broadcast".contains(&q) {
+            1010
+        } else {
+            -1
+        };
+        if all_score >= 0 {
+            peer_candidates.push(MentionCandidateView {
+                key: "peer::all".into(),
+                kind: "workspace_peer".into(),
+                token_label: "@all".into(),
+                title: "@all".into(),
+                subtitle: "Broadcast to all peers in this Mission Workspace".into(),
+                file_path: String::new(),
+                git_status: String::new(),
+                score: all_score,
+            });
+        }
+        peer_candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
+        out.extend(peer_candidates);
+    }
 
     for (key, kind, token, subtitle, base_order) in [
         (

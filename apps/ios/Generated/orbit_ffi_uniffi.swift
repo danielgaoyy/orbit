@@ -893,6 +893,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func agentStageDeltaRequest(req: FfiAgentStageDeltaRequest)  -> FfiAgentStageDelta
     
+    func agentStageDeltaWithAux(hostId: String, agentId: String, sinceRevision: UInt64, sinceAuxRevision: UInt64?)  -> FfiAgentStageDelta
+    
     func agentTimeline(hostId: String, agentId: String)  -> FfiAgentTimeline
     
     func agentTimelineDelta(hostId: String, agentId: String, sinceSeq: UInt64)  -> FfiAgentTimelineDelta
@@ -925,6 +927,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func discoverLocalDaemonUri()  -> String?
     
+    func dismissClusterSuggestion(hostId: String, agentId: String) 
+    
     func fallbackProviderCatalogs()  -> [FfiProviderModelCatalog]
     
     func fetchGitDiff(hostId: String, cwd: String, path: String?, staged: Bool) 
@@ -953,6 +957,10 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func markAgentUnread(hostId: String, agentId: String) 
     
+    func mergeWorkspaces(hostId: String, sourceWorkspaceId: String, targetWorkspaceId: String) 
+    
+    func moveAgentToWorkspace(hostId: String, agentId: String, targetWorkspaceId: String?) 
+    
     func onAppBackground() 
     
     func onAppForeground() 
@@ -962,6 +970,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func openAgentTimeline(hostId: String, agentId: String) 
     
     func pairHost(pairingUri: String) throws  -> FfiHostCard
+    
+    func projectOrder()  -> [String]
     
     func rankMentionCandidates(req: FfiMentionRankRequest)  -> [FfiMentionCandidate]
     
@@ -980,6 +990,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func removeProject(projectId: String) throws 
     
     func renderDiagram(req: FfiRenderDiagramRequest)  -> FfiRenderDiagramView
+    
+    func reorderProjects(orderedKeys: [String]) throws  -> [String]
     
     func resizeTerminal(hostId: String, cols: UInt16, rows: UInt16) 
     
@@ -1151,6 +1163,19 @@ open func agentStageDeltaRequest(req: FfiAgentStageDeltaRequest) -> FfiAgentStag
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_agent_stage_delta_request(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiAgentStageDeltaRequest_lower(req),uniffiCallStatus
+    )
+})
+}
+    
+open func agentStageDeltaWithAux(hostId: String, agentId: String, sinceRevision: UInt64, sinceAuxRevision: UInt64?) -> FfiAgentStageDelta  {
+    return try!  FfiConverterTypeFfiAgentStageDelta_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_agent_stage_delta_with_aux(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterUInt64.lower(sinceRevision),
+        FfiConverterOptionUInt64.lower(sinceAuxRevision),uniffiCallStatus
     )
 })
 }
@@ -1334,6 +1359,16 @@ open func discoverLocalDaemonUri() -> String?  {
 })
 }
     
+open func dismissClusterSuggestion(hostId: String, agentId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_dismiss_cluster_suggestion(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),uniffiCallStatus
+    )
+}
+}
+    
 open func fallbackProviderCatalogs() -> [FfiProviderModelCatalog]  {
     return try!  FfiConverterSequenceTypeFfiProviderModelCatalog.lift(try! rustCall() {
         uniffiCallStatus in
@@ -1482,6 +1517,28 @@ open func markAgentUnread(hostId: String, agentId: String)  {try! rustCall() {
 }
 }
     
+open func mergeWorkspaces(hostId: String, sourceWorkspaceId: String, targetWorkspaceId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_merge_workspaces(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(sourceWorkspaceId),
+        FfiConverterString.lower(targetWorkspaceId),uniffiCallStatus
+    )
+}
+}
+    
+open func moveAgentToWorkspace(hostId: String, agentId: String, targetWorkspaceId: String?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_move_agent_to_workspace(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterOptionString.lower(targetWorkspaceId),uniffiCallStatus
+    )
+}
+}
+    
 open func onAppBackground()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_on_app_background(
@@ -1522,6 +1579,15 @@ open func pairHost(pairingUri: String)throws  -> FfiHostCard  {
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_pair_host(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(pairingUri),uniffiCallStatus
+    )
+})
+}
+    
+open func projectOrder() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_project_order(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1610,6 +1676,16 @@ open func renderDiagram(req: FfiRenderDiagramRequest) -> FfiRenderDiagramView  {
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_render_diagram(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiRenderDiagramRequest_lower(req),uniffiCallStatus
+    )
+})
+}
+    
+open func reorderProjects(orderedKeys: [String])throws  -> [String]  {
+    return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_projects(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(orderedKeys),uniffiCallStatus
     )
 })
 }
@@ -8721,6 +8797,7 @@ public enum FfiSidebarProjectSort: Equatable, Hashable {
     
     case recent
     case alphabetical
+    case manual
 
 
 
@@ -8746,6 +8823,8 @@ public struct FfiConverterTypeFfiSidebarProjectSort: FfiConverterRustBuffer {
         
         case 2: return .alphabetical
         
+        case 3: return .manual
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8760,6 +8839,10 @@ public struct FfiConverterTypeFfiSidebarProjectSort: FfiConverterRustBuffer {
         
         case .alphabetical:
             writeInt(&buf, Int32(2))
+        
+        
+        case .manual:
+            writeInt(&buf, Int32(3))
         
         }
     }
@@ -9671,6 +9754,30 @@ fileprivate struct FfiConverterOptionInt32: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -11369,6 +11476,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_stage_delta_request() != 42068) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_stage_delta_with_aux() != 40987) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_timeline() != 55851) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11417,6 +11527,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_discover_local_daemon_uri() != 31969) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_dismiss_cluster_suggestion() != 28765) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fallback_provider_catalogs() != 44914) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11459,6 +11572,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_unread() != 35735) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_merge_workspaces() != 33132) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace() != 27017) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_on_app_background() != 56418) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11472,6 +11591,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pair_host() != 37596) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_project_order() != 21866) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates() != 3280) {
@@ -11499,6 +11621,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram() != 2210) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_projects() != 42270) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal() != 57060) {

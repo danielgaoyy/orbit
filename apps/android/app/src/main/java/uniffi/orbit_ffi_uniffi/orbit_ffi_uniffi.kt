@@ -741,6 +741,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_stage_delta_request(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_stage_delta_with_aux(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_timeline(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_timeline_delta(
@@ -773,6 +775,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_discover_local_daemon_uri(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_dismiss_cluster_suggestion(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fallback_provider_catalogs(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_git_diff(
@@ -801,6 +805,10 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_unread(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_merge_workspaces(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_on_app_background(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_on_app_foreground(
@@ -810,6 +818,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_open_agent_timeline(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pair_host(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_project_order(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates(
     ): Int
@@ -828,6 +838,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_project(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_projects(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal(
     ): Int
@@ -943,6 +955,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_agent_stage_delta_request(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_agent_stage_delta_with_aux(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`sinceRevision`: Long,`sinceAuxRevision`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_agent_timeline(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_agent_timeline_delta(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`sinceSeq`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -975,6 +989,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_discover_local_daemon_uri(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_dismiss_cluster_suggestion(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fallback_provider_catalogs(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_git_diff(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`staged`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -1003,6 +1019,10 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_mark_agent_unread(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_merge_workspaces(`ptr`: Long,`hostId`: RustBuffer.ByValue,`sourceWorkspaceId`: RustBuffer.ByValue,`targetWorkspaceId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_move_agent_to_workspace(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`targetWorkspaceId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_on_app_background(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_on_app_foreground(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1012,6 +1032,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_open_agent_timeline(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_pair_host(`ptr`: Long,`pairingUri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_project_order(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rank_mention_candidates(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1030,6 +1052,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_remove_project(`ptr`: Long,`projectId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_render_diagram(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_projects(`ptr`: Long,`orderedKeys`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_resize_terminal(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cols`: Short,`rows`: Short,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1265,6 +1289,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_stage_delta_request() and 0xFFFF) != 42068) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_stage_delta_with_aux() and 0xFFFF) != 40987) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_agent_timeline() and 0xFFFF) != 55851) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1313,6 +1340,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_discover_local_daemon_uri() and 0xFFFF) != 31969) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_dismiss_cluster_suggestion() and 0xFFFF) != 28765) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fallback_provider_catalogs() and 0xFFFF) != 44914) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1355,6 +1385,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_unread() and 0xFFFF) != 35735) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_merge_workspaces() and 0xFFFF) != 33132) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace() and 0xFFFF) != 27017) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_on_app_background() and 0xFFFF) != 56418) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1368,6 +1404,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pair_host() and 0xFFFF) != 37596) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_project_order() and 0xFFFF) != 21866) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates() and 0xFFFF) != 3280) {
@@ -1395,6 +1434,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram() and 0xFFFF) != 2210) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_projects() and 0xFFFF) != 42270) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal() and 0xFFFF) != 57060) {
@@ -2393,6 +2435,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `agentStageDeltaRequest`(`req`: FfiAgentStageDeltaRequest): FfiAgentStageDelta
     
+    fun `agentStageDeltaWithAux`(`hostId`: kotlin.String, `agentId`: kotlin.String, `sinceRevision`: kotlin.ULong, `sinceAuxRevision`: kotlin.ULong?): FfiAgentStageDelta
+    
     fun `agentTimeline`(`hostId`: kotlin.String, `agentId`: kotlin.String): FfiAgentTimeline
     
     fun `agentTimelineDelta`(`hostId`: kotlin.String, `agentId`: kotlin.String, `sinceSeq`: kotlin.ULong): FfiAgentTimelineDelta
@@ -2425,6 +2469,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `discoverLocalDaemonUri`(): kotlin.String?
     
+    fun `dismissClusterSuggestion`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+    
     fun `fallbackProviderCatalogs`(): List<FfiProviderModelCatalog>
     
     fun `fetchGitDiff`(`hostId`: kotlin.String, `cwd`: kotlin.String, `path`: kotlin.String?, `staged`: kotlin.Boolean)
@@ -2453,6 +2499,10 @@ public interface OrbitMobileCoreInterface {
     
     fun `markAgentUnread`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
+    fun `mergeWorkspaces`(`hostId`: kotlin.String, `sourceWorkspaceId`: kotlin.String, `targetWorkspaceId`: kotlin.String)
+    
+    fun `moveAgentToWorkspace`(`hostId`: kotlin.String, `agentId`: kotlin.String, `targetWorkspaceId`: kotlin.String?)
+    
     fun `onAppBackground`()
     
     fun `onAppForeground`()
@@ -2462,6 +2512,8 @@ public interface OrbitMobileCoreInterface {
     fun `openAgentTimeline`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
     fun `pairHost`(`pairingUri`: kotlin.String): FfiHostCard
+    
+    fun `projectOrder`(): List<kotlin.String>
     
     fun `rankMentionCandidates`(`req`: FfiMentionRankRequest): List<FfiMentionCandidate>
     
@@ -2480,6 +2532,8 @@ public interface OrbitMobileCoreInterface {
     fun `removeProject`(`projectId`: kotlin.String)
     
     fun `renderDiagram`(`req`: FfiRenderDiagramRequest): FfiRenderDiagramView
+    
+    fun `reorderProjects`(`orderedKeys`: List<kotlin.String>): List<kotlin.String>
     
     fun `resizeTerminal`(`hostId`: kotlin.String, `cols`: kotlin.UShort, `rows`: kotlin.UShort)
     
@@ -2684,6 +2738,23 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         it,
         
         FfiConverterTypeFfiAgentStageDeltaRequest.lower(`req`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `agentStageDeltaWithAux`(`hostId`: kotlin.String, `agentId`: kotlin.String, `sinceRevision`: kotlin.ULong, `sinceAuxRevision`: kotlin.ULong?): FfiAgentStageDelta {
+            return FfiConverterTypeFfiAgentStageDelta.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_agent_stage_delta_with_aux(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterULong.lower(`sinceRevision`),
+        FfiConverterOptionalULong.lower(`sinceAuxRevision`),_status)
 }
     }
     )
@@ -2934,6 +3005,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     
 
+    override fun `dismissClusterSuggestion`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_dismiss_cluster_suggestion(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),_status)
+}
+    }
+    
+    
+
     override fun `fallbackProviderCatalogs`(): List<FfiProviderModelCatalog> {
             return FfiConverterSequenceTypeFfiProviderModelCatalog.lift(
     callWithHandle {
@@ -3138,6 +3223,36 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `mergeWorkspaces`(`hostId`: kotlin.String, `sourceWorkspaceId`: kotlin.String, `targetWorkspaceId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_merge_workspaces(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`sourceWorkspaceId`),
+        FfiConverterString.lower(`targetWorkspaceId`),_status)
+}
+    }
+    
+    
+
+    override fun `moveAgentToWorkspace`(`hostId`: kotlin.String, `agentId`: kotlin.String, `targetWorkspaceId`: kotlin.String?)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_move_agent_to_workspace(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterOptionalString.lower(`targetWorkspaceId`),_status)
+}
+    }
+    
+    
+
     override fun `onAppBackground`()
         = 
     callWithHandle {
@@ -3197,6 +3312,19 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         it,
         
         FfiConverterString.lower(`pairingUri`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `projectOrder`(): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_project_order(
+        it,
+        _status)
 }
     }
     )
@@ -3325,6 +3453,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         it,
         
         FfiConverterTypeFfiRenderDiagramRequest.lower(`req`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `reorderProjects`(`orderedKeys`: List<kotlin.String>): List<kotlin.String> {
+            return FfiConverterSequenceString.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_projects(
+        it,
+        
+        FfiConverterSequenceString.lower(`orderedKeys`),_status)
 }
     }
     )
@@ -9701,7 +9844,8 @@ public object FfiConverterTypeFfiSideQuestionEvent : FfiConverterRustBuffer<FfiS
 enum class FfiSidebarProjectSort {
     
     RECENT,
-    ALPHABETICAL;
+    ALPHABETICAL,
+    MANUAL;
 
     
 
@@ -10778,6 +10922,38 @@ public object FfiConverterOptionalInt: FfiConverterRustBuffer<kotlin.Int?> {
         } else {
             buf.put(1)
             FfiConverterInt.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalULong: FfiConverterRustBuffer<kotlin.ULong?> {
+    override fun read(buf: ByteBuffer): kotlin.ULong? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterULong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.ULong?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterULong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.ULong?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterULong.write(value, buf)
         }
     }
 }

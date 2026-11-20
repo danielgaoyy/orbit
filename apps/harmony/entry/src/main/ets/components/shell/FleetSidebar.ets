@@ -131,6 +131,18 @@ export struct FleetSidebar {
           .onClick(() => {
             this.store.setSidebarProjectSort('name');
           })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.line_3_horizontal'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Manual',
+          symbolEndIcon: this.store.sidebarProjectSort === 'manual'
+            ? new SymbolGlyphModifier($r('sys.symbol.checkmark')).fontColor([this.store.palette.accentPrimary])
+            : undefined
+        })
+          .onClick(() => {
+            this.store.setSidebarProjectSort('manual');
+          })
       }
 
       MenuItemGroup({ header: 'Show' }) {

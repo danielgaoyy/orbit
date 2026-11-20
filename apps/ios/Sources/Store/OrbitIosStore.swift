@@ -162,6 +162,7 @@ public enum OrbitDrawerFilter: String, CaseIterable, Identifiable, Equatable {
 public enum OrbitSidebarProjectSort: String, CaseIterable, Identifiable, Equatable {
     case recent
     case alphabetical
+    case manual
 
     public var id: String { rawValue }
 
@@ -169,6 +170,7 @@ public enum OrbitSidebarProjectSort: String, CaseIterable, Identifiable, Equatab
         switch self {
         case .recent: return "Recent activity"
         case .alphabetical: return "Alphabetical"
+        case .manual: return "Manual order"
         }
     }
 
@@ -176,6 +178,7 @@ public enum OrbitSidebarProjectSort: String, CaseIterable, Identifiable, Equatab
         switch self {
         case .recent: return .recent
         case .alphabetical: return .alphabetical
+        case .manual: return .manual
         }
     }
 }

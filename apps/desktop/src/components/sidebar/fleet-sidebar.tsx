@@ -1,12 +1,16 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   Archive,
   Check,
   ChevronDown,
   ChevronRight,
   Clock,
+  FileText,
   Folder,
   FolderOpen,
+  GripVertical,
+  Layers,
   ListFilter,
   Loader2,
   MoreHorizontal,
@@ -77,6 +81,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
   const collapsedProjectIds = useOrbitSelector((s) => s.collapsedProjectIds);
+  const collapsedWorkspaceIds = useOrbitSelector((s) => s.collapsedWorkspaceIds);
   const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
   const sidebarProjectSort = useOrbitSelector((s) => s.sidebarProjectSort);
@@ -90,6 +95,20 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const [projMenu, setProjMenu] = useState<ActiveProjectMenuState | null>(null);
   const [deleteProjectTarget, setDeleteProjectTarget] =
     useState<SidebarProjectGroupView | null>(null);
+  const [draggingProjectId, setDraggingProjectId] = useState<string | null>(null);
+  const [dropIndicator, setDropIndicator] = useState<{
+    targetId: string;
+    position: "before" | "after";
+  } | null>(null);
+  const projectRowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const suppressNextProjectClickRef = useRef(false);
+  const dragCleanupRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      dragCleanupRef.current?.();
+    };
+  }, []);
 
   const nowMs = useSidebarRelativeClock(sidebarOpen);
   const isMac = isMacDesktop();
@@ -505,6 +524,16 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       <Check className="h-[13.5px] w-[13.5px] shrink-0" />
                     )}
                   </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() =>
+                      orbitActions.setSidebarViewPrefs({ projectSort: "manual" })
+                    }
+                  >
+                    <span>Manual order</span>
+                    {sidebarProjectSort === "manual" && (
+                      <Check className="h-[13.5px] w-[13.5px] shrink-0" />
+                    )}
+                  </DropdownMenuItem>
 
                   <DropdownMenuSeparator />
 
@@ -554,6 +583,100 @@ export const FleetSidebar = memo(function FleetSidebar() {
               {displayProjects.map(({ project: proj, host, visibleConversations }) => {
                 const collapsed = Boolean(collapsedProjectIds[proj.id]);
                 const projMenuOpen = projMenu?.project.id === proj.id;
+                const isDraggingThis = draggingProjectId === proj.id;
+                const showDropBefore =
+                  dropIndicator?.targetId === proj.id && dropIndicator.position === "before";
+                const showDropAfter =
+                  dropIndicator?.targetId === proj.id && dropIndicator.position === "after";
+
+                const startProjectDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+                  if (e.button !== 0 || displayProjects.length < 2) return;
+                  const targetEl = e.target as HTMLElement | null;
+                  if (targetEl?.closest("[data-proj-action]")) return;
+                  const startY = e.clientY;
+                  let activeDrag = false;
+                  let currentDrop: { targetId: string; position: "before" | "after" } | null =
+                    null;
+
+                  const onMove = (ev: PointerEvent) => {
+                    if (!activeDrag) {
+                      if (Math.abs(ev.clientY - startY) < 4) return;
+                      activeDrag = true;
+                      suppressNextProjectClickRef.current = true;
+                      setDraggingProjectId(proj.id);
+                      document.body.style.cursor = "grabbing";
+                    }
+
+                    let best: { targetId: string; position: "before" | "after" } | null = null;
+                    for (const entry of displayProjects) {
+                      const el = projectRowRefs.current.get(entry.project.id);
+                      if (!el) continue;
+                      const rect = el.getBoundingClientRect();
+                      if (ev.clientY >= rect.top - 8 && ev.clientY <= rect.bottom + 8) {
+                        const mid = rect.top + rect.height / 2;
+                        best = {
+                          targetId: entry.project.id,
+                          position: ev.clientY < mid ? "before" : "after",
+                        };
+                        break;
+                      }
+                    }
+                    if (!best && displayProjects.length > 0) {
+                      const firstRect = projectRowRefs.current
+                        .get(displayProjects[0].project.id)
+                        ?.getBoundingClientRect();
+                      if (firstRect && ev.clientY < firstRect.top) {
+                        best = { targetId: displayProjects[0].project.id, position: "before" };
+                      } else {
+                        best = {
+                          targetId: displayProjects[displayProjects.length - 1].project.id,
+                          position: "after",
+                        };
+                      }
+                    }
+                    currentDrop = best;
+                    setDropIndicator(best);
+                  };
+
+                  const finish = () => {
+                    window.removeEventListener("pointermove", onMove);
+                    window.removeEventListener("pointerup", finish);
+                    window.removeEventListener("pointercancel", finish);
+                    dragCleanupRef.current = null;
+                    document.body.style.cursor = "";
+
+                    if (activeDrag) {
+                      setDraggingProjectId(null);
+                      setDropIndicator(null);
+                      if (currentDrop && currentDrop.targetId !== proj.id) {
+                        const ordered = displayProjects.map((d) => d.project);
+                        const fromIdx = ordered.findIndex((p) => p.id === proj.id);
+                        const [moved] = ordered.splice(fromIdx, 1);
+                        let toIdx = ordered.findIndex((p) => p.id === currentDrop?.targetId);
+                        if (toIdx >= 0) {
+                          if (currentDrop.position === "after") toIdx += 1;
+                          ordered.splice(toIdx, 0, moved);
+                          const keys = ordered.map(
+                            (p) =>
+                              p.sort_order_key ||
+                              p.pinned_project_id ||
+                              projectPathScopeKey(p.host_id, p.primary_cwd),
+                          );
+                          void orbitActions.reorderProjects(keys);
+                        }
+                      }
+                      window.setTimeout(() => {
+                        suppressNextProjectClickRef.current = false;
+                      }, 80);
+                    }
+                  };
+
+                  dragCleanupRef.current?.();
+                  dragCleanupRef.current = finish;
+                  window.addEventListener("pointermove", onMove);
+                  window.addEventListener("pointerup", finish);
+                  window.addEventListener("pointercancel", finish);
+                };
 
                 const hasCollapsedApproval =
                   collapsed &&
@@ -586,11 +709,40 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 const slicedConversations = isExpandedAll
                   ? visibleConversations
                   : visibleConversations.slice(0, MAX_VISIBLE_CONVERSATIONS_PER_PROJECT);
+                const slicedIdSet = new Set(slicedConversations.map((c) => c.agent.agent_id));
+
+                // Group visible conversations by Mission Workspace (single-agent workspaces stay flat rows)
+                const wsGroups = (proj.workspaces ?? [])
+                  .map((ws) => ({
+                    ...ws,
+                    visiblePeers: ws.conversations.filter((c) =>
+                      slicedIdSet.has(c.agent.agent_id),
+                    ),
+                  }))
+                  .filter((ws) => ws.visiblePeers.length > 0);
+                const useWorkspaceGrouping = wsGroups.some(
+                  (ws) => ws.is_multi_agent || ws.visiblePeers.length >= 2,
+                );
 
                 return (
-                  <div key={proj.id} className="space-y-0.5">
-                    {/* Project Header Row (`30px`) */}
+                  <div
+                    key={proj.id}
+                    ref={(el) => {
+                      if (el) projectRowRefs.current.set(proj.id, el);
+                      else projectRowRefs.current.delete(proj.id);
+                    }}
+                    className={cn(
+                      "relative space-y-0.5 transition-opacity",
+                      isDraggingThis && "opacity-45",
+                    )}
+                  >
+                    {showDropBefore && (
+                      <div className="bg-primary pointer-events-none absolute -top-1 right-1 left-1 z-20 h-[2px] rounded-full" />
+                    )}
+
+                    {/* Project Header Row (`30px`, pointer-draggable to reorder) */}
                     <div
+                      onPointerDown={startProjectDrag}
                       onContextMenu={(e) => {
                         e.preventDefault();
                         setProjMenu({
@@ -608,9 +760,12 @@ export const FleetSidebar = memo(function FleetSidebar() {
                     >
                       <button
                         type="button"
-                        title={proj.primary_cwd}
-                        onClick={() => orbitActions.toggleProjectCollapsed(proj.id)}
-                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 text-left"
+                        title={`${proj.primary_cwd}${displayProjects.length > 1 ? " · Drag to reorder" : ""}`}
+                        onClick={() => {
+                          if (suppressNextProjectClickRef.current) return;
+                          orbitActions.toggleProjectCollapsed(proj.id);
+                        }}
+                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
                       >
                         <span className="text-muted-foreground relative inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
                           {collapsed ? (
@@ -660,10 +815,20 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             projMenuOpen ? "inline-flex" : "hidden group-hover/proj:inline-flex",
                           )}
                         >
+                          {displayProjects.length > 1 && (
+                            <span
+                              title="Drag to reorder project"
+                              className="text-muted-foreground/60 inline-flex h-[22px] w-[18px] cursor-grab items-center justify-center active:cursor-grabbing"
+                            >
+                              <GripVertical className="h-[12.5px] w-[12.5px]" />
+                            </span>
+                          )}
+
                           {!singleHostMode &&
                             host.connection_state === "disconnected" && (
                               <button
                                 type="button"
+                                data-proj-action="true"
                                 title={`Reconnect ${host.display_name}`}
                                 onClick={() => {
                                   void orbitIpc.connectHost(host.host_id);
@@ -677,6 +842,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
                           <button
                             type="button"
+                            data-proj-action="true"
                             aria-label={`Project options for ${proj.name}`}
                             onClick={(e) => {
                               const r = e.currentTarget.getBoundingClientRect();
@@ -698,6 +864,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
                           <button
                             type="button"
+                            data-proj-action="true"
                             title={`New conversation in ${proj.name}`}
                             onClick={() =>
                               orbitActions.startNewThreadDraft(
@@ -713,7 +880,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       </div>
                     </div>
 
-                    {/* Project Conversations (Smooth `0fr <-> 1fr` Accordion + Capped at 6 by Default) */}
+                    {/* Project Conversations & Multi-Agent Mission Workspaces */}
                     {slicedConversations.length > 0 && (
                       <div
                         data-open={!collapsed ? "true" : "false"}
@@ -721,39 +888,183 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       >
                         <div className="orbit-collapse-inner">
                           <div className="space-y-0.5 pt-0.5">
-                            {slicedConversations.map((conv) => {
-                              const ag = conv.agent;
-                              const tKey = threadScopeKey(proj.host_id, ag.agent_id);
-                              const selected =
-                                workspacePanel === "conversation" &&
-                                !isDraftNewSession &&
-                                selectedHostId === proj.host_id &&
-                                selectedAgentId === ag.agent_id;
-                              const unread = isConvUnread(conv);
-                              const effectiveTitle = threadCustomTitles[tKey] || ag.title;
+                            {useWorkspaceGrouping
+                              ? wsGroups.map((ws) => {
+                                  if (!ws.is_multi_agent && ws.visiblePeers.length <= 1) {
+                                    const conv = ws.visiblePeers[0];
+                                    const ag = conv.agent;
+                                    const tKey = threadScopeKey(proj.host_id, ag.agent_id);
+                                    const selected =
+                                      workspacePanel === "conversation" &&
+                                      !isDraftNewSession &&
+                                      selectedHostId === proj.host_id &&
+                                      selectedAgentId === ag.agent_id;
+                                    const unread = isConvUnread(conv);
+                                    const effectiveTitle = threadCustomTitles[tKey] || ag.title;
 
-                              return (
-                                <SidebarConversationRow
-                                  key={ag.agent_id}
-                                  threadKey={tKey}
-                                  host={host}
-                                  agent={ag}
-                                  projectName={proj.name}
-                                  effectiveTitle={effectiveTitle}
-                                  isWorktree={conv.is_worktree}
-                                  isPinned={false}
-                                  isUnread={unread}
-                                  selected={selected}
-                                  isChild={Boolean(ag.parent_agent_id)}
-                                  nowMs={nowMs}
-                                  menuOpen={convMenu?.threadKey === tKey}
-                                  isRenaming={renamingThreadKey === tKey}
-                                  onOpenMenu={handleOpenConvMenu}
-                                  onStartRename={handleStartRename}
-                                  onFinishRename={handleFinishRename}
-                                />
-                              );
-                            })}
+                                    return (
+                                      <SidebarConversationRow
+                                        key={ag.agent_id}
+                                        threadKey={tKey}
+                                        host={host}
+                                        agent={ag}
+                                        projectName={proj.name}
+                                        effectiveTitle={effectiveTitle}
+                                        isWorktree={conv.is_worktree}
+                                        isPinned={false}
+                                        isUnread={unread}
+                                        selected={selected}
+                                        isChild={Boolean(ag.parent_agent_id)}
+                                        nowMs={nowMs}
+                                        menuOpen={convMenu?.threadKey === tKey}
+                                        isRenaming={renamingThreadKey === tKey}
+                                        onOpenMenu={handleOpenConvMenu}
+                                        onStartRename={handleStartRename}
+                                        onFinishRename={handleFinishRename}
+                                      />
+                                    );
+                                  }
+
+                                  const wsCollapsed = Boolean(
+                                    collapsedWorkspaceIds[ws.workspace_id],
+                                  );
+                                  const wsHasRunning = ws.visiblePeers.some(
+                                    (c) => c.agent.is_running,
+                                  );
+                                  const wsHasUnread = ws.visiblePeers.some((c) =>
+                                    isConvUnread(c),
+                                  );
+
+                                  return (
+                                    <div
+                                      key={`ws-${ws.workspace_id}`}
+                                      className="my-1 space-y-0.5 rounded-[9px] border border-black/[0.06] bg-black/[0.02] p-1 dark:border-white/[0.07] dark:bg-white/[0.025]"
+                                    >
+                                      <div className="group/ws flex h-[25px] items-center justify-between gap-1 rounded-[6px] px-1.5 transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]">
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            orbitActions.toggleWorkspaceCollapsed(
+                                              ws.workspace_id,
+                                            )
+                                          }
+                                          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+                                        >
+                                          <Layers className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0 stroke-[1.75]" />
+                                          <span className="text-foreground/85 truncate text-[12px] font-medium">
+                                            {ws.title}
+                                          </span>
+                                          <span className="bg-black/[0.06] text-muted-foreground shrink-0 rounded-full px-1.5 text-[10.5px] tabular-nums dark:bg-white/[0.08]">
+                                            {ws.visiblePeers.length}
+                                          </span>
+                                          {ws.has_conflict && (
+                                            <AlertTriangle className="h-[11.5px] w-[11.5px] shrink-0 text-amber-500" />
+                                          )}
+                                          {!ws.has_conflict && wsHasRunning && (
+                                            <Loader2 className="h-[11px] w-[11px] shrink-0 animate-spin text-sky-500" />
+                                          )}
+                                          {!ws.has_conflict &&
+                                            !wsHasRunning &&
+                                            wsCollapsed &&
+                                            wsHasUnread && (
+                                              <span className="h-[5.5px] w-[5.5px] shrink-0 rounded-full bg-sky-500" />
+                                            )}
+                                        </button>
+
+                                        <button
+                                          type="button"
+                                          title="Open Mission Board (BOARD.md)"
+                                          onClick={() =>
+                                            orbitActions.openWorkspaceBoardTab(
+                                              proj.host_id,
+                                              ws.workspace_id,
+                                              ws.title,
+                                            )
+                                          }
+                                          className="text-muted-foreground hover:text-foreground inline-flex h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded opacity-70 hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.09]"
+                                        >
+                                          <FileText className="h-[11.5px] w-[11.5px]" />
+                                        </button>
+                                      </div>
+
+                                      {!wsCollapsed && (
+                                        <div className="space-y-0.5">
+                                          {ws.visiblePeers.map((conv) => {
+                                            const ag = conv.agent;
+                                            const tKey = threadScopeKey(
+                                              proj.host_id,
+                                              ag.agent_id,
+                                            );
+                                            const selected =
+                                              workspacePanel === "conversation" &&
+                                              !isDraftNewSession &&
+                                              selectedHostId === proj.host_id &&
+                                              selectedAgentId === ag.agent_id;
+                                            const unread = isConvUnread(conv);
+                                            const effectiveTitle =
+                                              threadCustomTitles[tKey] || ag.title;
+
+                                            return (
+                                              <SidebarConversationRow
+                                                key={ag.agent_id}
+                                                threadKey={tKey}
+                                                host={host}
+                                                agent={ag}
+                                                projectName={proj.name}
+                                                effectiveTitle={effectiveTitle}
+                                                isWorktree={conv.is_worktree}
+                                                isPinned={false}
+                                                isUnread={unread}
+                                                selected={selected}
+                                                isChild={false}
+                                                peerHandle={ag.handle}
+                                                nowMs={nowMs}
+                                                menuOpen={convMenu?.threadKey === tKey}
+                                                isRenaming={renamingThreadKey === tKey}
+                                                onOpenMenu={handleOpenConvMenu}
+                                                onStartRename={handleStartRename}
+                                                onFinishRename={handleFinishRename}
+                                              />
+                                            );
+                                          })}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })
+                              : slicedConversations.map((conv) => {
+                                  const ag = conv.agent;
+                                  const tKey = threadScopeKey(proj.host_id, ag.agent_id);
+                                  const selected =
+                                    workspacePanel === "conversation" &&
+                                    !isDraftNewSession &&
+                                    selectedHostId === proj.host_id &&
+                                    selectedAgentId === ag.agent_id;
+                                  const unread = isConvUnread(conv);
+                                  const effectiveTitle = threadCustomTitles[tKey] || ag.title;
+
+                                  return (
+                                    <SidebarConversationRow
+                                      key={ag.agent_id}
+                                      threadKey={tKey}
+                                      host={host}
+                                      agent={ag}
+                                      projectName={proj.name}
+                                      effectiveTitle={effectiveTitle}
+                                      isWorktree={conv.is_worktree}
+                                      isPinned={false}
+                                      isUnread={unread}
+                                      selected={selected}
+                                      isChild={Boolean(ag.parent_agent_id)}
+                                      nowMs={nowMs}
+                                      menuOpen={convMenu?.threadKey === tKey}
+                                      isRenaming={renamingThreadKey === tKey}
+                                      onOpenMenu={handleOpenConvMenu}
+                                      onStartRename={handleStartRename}
+                                      onFinishRename={handleFinishRename}
+                                    />
+                                  );
+                                })}
 
                             {hiddenCount > 0 && !expandedMoreProjects[proj.id] && !isExpandedAll && (
                               <button
@@ -791,6 +1102,10 @@ export const FleetSidebar = memo(function FleetSidebar() {
                           </div>
                         </div>
                       </div>
+                    )}
+
+                    {showDropAfter && (
+                      <div className="bg-primary pointer-events-none absolute right-1 -bottom-1 left-1 z-20 h-[2px] rounded-full" />
                     )}
                   </div>
                 );

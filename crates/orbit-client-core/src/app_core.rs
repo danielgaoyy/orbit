@@ -4,7 +4,7 @@
 //! - Android (minSdk 29 / targetSdk 36): Kotlin + Jetpack Compose (via `orbit-ffi-uniffi`)
 //! - HarmonyOS 7+ (API 26): ArkTS + ArkUI V2 (via `orbit-ffi-ohos`)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -16,18 +16,21 @@ use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     ActiveTurnBehavior, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary, AttentionState,
     BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot,
-    ModelOption, OrchestrationConfig, OrchestrationSkillInfo, PendingPermissionSummary,
-    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem,
-    ReasoningEffort, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
+    HostProjectEntry, HostSyncState, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
+    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    QuestionItem, ReasoningEffort, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
     TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
-    ToolCallStatus, WireMessage, WorkspaceIsolation, WorkspaceScriptInfo, WorkspaceSummary,
-    WorktreeCreateMode,
+    ToolCallStatus, WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
+    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceScriptInfo,
+    WorkspaceSummary, WorktreeCreateMode,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
@@ -145,6 +148,8 @@ pub struct FleetOverviewView {
     pub total_pending_approvals: u32,
     pub hosts: Vec<HostCardView>,
     pub projects: Vec<ClientProjectView>,
+    #[serde(default)]
+    pub project_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +189,15 @@ pub struct AgentCardView {
     #[serde(default)]
     pub seen_seq: u64,
     #[serde(default)]
+    pub read_seq: u64,
+    #[serde(default)]
     pub is_unread: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_suggestion: Option<WorkspaceClusterSuggestion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
 }
 
 pub struct CreateAgentRequest<'a> {
@@ -199,6 +212,9 @@ pub struct CreateAgentRequest<'a> {
     pub initial_display_prompt: Option<String>,
     pub initial_badges: Vec<PromptBadge>,
     pub worktree_branch: Option<&'a str>,
+    pub workspace_id: Option<&'a str>,
+    pub handle: Option<String>,
+    pub auto_cluster: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +250,14 @@ pub struct HostDetailView {
     pub pending_permissions: Vec<PendingPermissionSummary>,
     #[serde(default)]
     pub provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
+    #[serde(default)]
+    pub git_repos_by_cwd: HashMap<String, GitReposInspectionView>,
+    #[serde(default)]
+    pub workspace_boards: HashMap<String, WorkspaceBoardSnapshot>,
+    #[serde(default)]
+    pub workspace_events: HashMap<String, Vec<WorkspaceEventRecord>>,
+    #[serde(default)]
+    pub host_sync_state: HostSyncState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,12 +503,16 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
     pending_rewinds:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RewindAgentResultView, String>>>,
+    pending_git_repo_inspections:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
     agent_req_by_req_id: HashMap<Uuid, String>,
     replaced_optimistic_agents: HashMap<String, String>,
     last_created_agent_id: Option<String>,
     initial_agents_hydrated: bool,
+    host_sync_supported: bool,
+    host_sync_state: HostSyncState,
     discovered_projects: Vec<DiscoveredProject>,
     directory_listing: Option<DirectoryListingView>,
     models_by_provider: HashMap<ProviderKind, Vec<ModelOption>>,
@@ -504,7 +532,10 @@ struct HostMemoryState {
     terminal_emulators: HashMap<u8, TerminalGridEmulator>,
     git_statuses: HashMap<String, GitStatusSnapshot>,
     git_diffs: HashMap<String, String>,
+    git_repos_by_cwd: HashMap<String, GitReposInspectionView>,
     workspace_files: HashMap<String, Vec<String>>,
+    workspace_boards: HashMap<String, WorkspaceBoardSnapshot>,
+    workspace_events: HashMap<String, Vec<WorkspaceEventRecord>>,
     profiles: Vec<AgentProfile>,
     schedules: Vec<ScheduleSpec>,
     schedule_runs: HashMap<String, Vec<ScheduleRunRecord>>,
@@ -544,12 +575,15 @@ impl HostMemoryState {
             pending_file_reads: HashMap::new(),
             pending_side_questions: HashMap::new(),
             pending_rewinds: HashMap::new(),
+            pending_git_repo_inspections: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
             agent_req_by_req_id: HashMap::new(),
             replaced_optimistic_agents: HashMap::new(),
             last_created_agent_id: None,
             initial_agents_hydrated: false,
+            host_sync_supported: false,
+            host_sync_state: HostSyncState::default(),
             discovered_projects: Vec::new(),
             directory_listing: None,
             models_by_provider: default_client_models_map(),
@@ -569,7 +603,10 @@ impl HostMemoryState {
             terminal_emulators,
             git_statuses: HashMap::new(),
             git_diffs: HashMap::new(),
+            git_repos_by_cwd: HashMap::new(),
             workspace_files: HashMap::new(),
+            workspace_boards: HashMap::new(),
+            workspace_events: HashMap::new(),
             profiles: Vec::new(),
             schedules: Vec::new(),
             schedule_runs: HashMap::new(),
@@ -684,6 +721,7 @@ pub struct OrbitAppCore {
     store: Arc<OrbitStore>,
     hosts: Arc<RwLock<HashMap<String, HostMemoryState>>>,
     projects: Arc<RwLock<HashMap<String, ClientProjectView>>>,
+    project_order: Arc<RwLock<Vec<String>>>,
     thread_prefs: Arc<RwLock<HashMap<(String, String), ClientThreadPref>>>,
     pin_order_seq: Arc<AtomicU64>,
     subscribers: Arc<Mutex<Vec<Arc<dyn CoreEventSubscriber>>>>,
@@ -831,11 +869,19 @@ impl OrbitAppCore {
             }
         }
 
+        let initial_project_order: Vec<String> = store
+            .get_client_kv("project_order")
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default();
+
         Ok(Arc::new(Self {
             runtime,
             store,
             hosts: Arc::new(RwLock::new(initial_hosts)),
             projects: Arc::new(RwLock::new(initial_projects)),
+            project_order: Arc::new(RwLock::new(initial_project_order)),
             thread_prefs: Arc::new(RwLock::new(initial_prefs)),
             pin_order_seq: Arc::new(AtomicU64::new(max_pin_order.saturating_add(1))),
             subscribers: Arc::new(Mutex::new(Vec::new())),
@@ -947,11 +993,18 @@ impl OrbitAppCore {
             })
             .unwrap_or_default();
 
+        let project_order = self
+            .project_order
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
         FleetOverviewView {
             revision: rev,
             total_pending_approvals,
             hosts: cards,
             projects,
+            project_order,
         }
     }
 
@@ -996,6 +1049,10 @@ impl OrbitAppCore {
             workspace_scripts: state.workspace_scripts.clone(),
             pending_permissions: state.pending_permissions.clone(),
             provider_subagents: state.provider_subagents.clone(),
+            git_repos_by_cwd: state.git_repos_by_cwd.clone(),
+            workspace_boards: state.workspace_boards.clone(),
+            workspace_events: state.workspace_events.clone(),
+            host_sync_state: state.host_sync_state.clone(),
         })
     }
 
@@ -1661,6 +1718,11 @@ impl OrbitAppCore {
             .as_ref()
             .map(|g| g.values().cloned().collect())
             .unwrap_or_default();
+        let project_order: Vec<String> = self
+            .project_order
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
 
         struct OwnedSidebarHostData {
             host_id: String,
@@ -1668,8 +1730,11 @@ impl OrbitAppCore {
             discovered_projects: Vec<DiscoveredProject>,
             agents: Vec<(AgentCardView, i64)>,
             active_git_branch: Option<String>,
+            git_repos_by_cwd: HashMap<String, GitReposInspectionView>,
+            workspace_conflict_ids: HashSet<String>,
         }
         let mut host_inputs_owned: Vec<OwnedSidebarHostData> = Vec::new();
+        let conflict_cutoff_ms = (unix_ms_now() as i64).saturating_sub(15 * 60 * 1000);
 
         if let Some(ref hg) = hosts_guard {
             for (hid, state) in hg.iter() {
@@ -1680,7 +1745,10 @@ impl OrbitAppCore {
                         let pref = prefs_guard
                             .as_ref()
                             .and_then(|p| p.get(&(hid.clone(), a.agent_id.clone())));
-                        let order = pref.map(|p| p.pinned_order).unwrap_or(0);
+                        let order = pref
+                            .map(|p| p.pinned_order)
+                            .unwrap_or(0)
+                            .max(a.pinned_order);
                         (agent_to_card_view(a, pref), order)
                     })
                     .collect();
@@ -1705,12 +1773,26 @@ impl OrbitAppCore {
                     None
                 };
 
+                let workspace_conflict_ids: HashSet<String> = state
+                    .workspace_events
+                    .iter()
+                    .filter_map(|(ws_id, evs)| {
+                        let recent_conflict = evs.iter().any(|ev| {
+                            ev.kind == WorkspaceEventKind::ConflictWarning
+                                && ev.created_at.timestamp_millis() >= conflict_cutoff_ms
+                        });
+                        recent_conflict.then(|| ws_id.clone())
+                    })
+                    .collect();
+
                 host_inputs_owned.push(OwnedSidebarHostData {
                     host_id: hid.clone(),
                     workspaces: state.workspaces.clone(),
                     discovered_projects: state.discovered_projects.clone(),
                     agents: agents_with_order,
                     active_git_branch: active_branch,
+                    git_repos_by_cwd: state.git_repos_by_cwd.clone(),
+                    workspace_conflict_ids,
                 });
             }
         }
@@ -1723,6 +1805,8 @@ impl OrbitAppCore {
                 discovered_projects: item.discovered_projects.as_slice(),
                 agents: item.agents.clone(),
                 active_git_branch: item.active_git_branch.clone(),
+                git_repos_by_cwd: &item.git_repos_by_cwd,
+                workspace_conflict_ids: &item.workspace_conflict_ids,
             })
             .collect();
 
@@ -1730,6 +1814,7 @@ impl OrbitAppCore {
             revision: rev,
             hosts: host_inputs,
             pinned_projects: &pinned_projects,
+            project_order: &project_order,
             sort,
             filter,
             query,
@@ -1812,6 +1897,9 @@ impl OrbitAppCore {
             initial_display_prompt: req.initial_display_prompt,
             initial_badges: req.initial_badges,
             worktree_branch: req.worktree_branch.as_deref(),
+            workspace_id: req.workspace_id.as_deref(),
+            handle: req.handle,
+            auto_cluster: req.auto_cluster,
         })
     }
 
@@ -1895,31 +1983,67 @@ impl OrbitAppCore {
         req: &crate::contract::MentionRankRequest,
     ) -> Vec<crate::composer::MentionCandidateView> {
         let files = self.workspace_files(&req.host_id, &req.cwd);
-        let git_files: Vec<(String, String)> = self
+        let (git_files, workspace_peers) = self
             .hosts
             .read()
             .ok()
             .and_then(|g| {
-                g.get(&req.host_id).and_then(|h| {
-                    h.git_statuses
-                        .get(&req.cwd)
-                        .or_else(|| {
-                            h.git_statuses
-                                .iter()
-                                .find(|(k, _)| cwd_paths_equivalent(k, &req.cwd))
-                                .map(|(_, v)| v)
+                let h = g.get(&req.host_id)?;
+                let gfiles = h
+                    .git_statuses
+                    .get(&req.cwd)
+                    .or_else(|| {
+                        h.git_statuses
+                            .iter()
+                            .find(|(k, _)| cwd_paths_equivalent(k, &req.cwd))
+                            .map(|(_, v)| v)
+                    })
+                    .map(|st| {
+                        st.files
+                            .iter()
+                            .map(|f| (f.path.clone(), f.status.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let target_ws_id = req.workspace_id.as_deref().or_else(|| {
+                    req.active_agent_id
+                        .as_deref()
+                        .and_then(|aid| h.agents.get(aid).map(|a| a.workspace_id.as_str()))
+                });
+                let peers: Vec<crate::composer::WorkspacePeerMentionInput> = match target_ws_id {
+                    Some(ws_id) if !ws_id.is_empty() => h
+                        .agents
+                        .values()
+                        .filter(|a| {
+                            a.workspace_id == ws_id
+                                && a.archived_at.is_none()
+                                && !a.background
+                                && req.active_agent_id.as_deref() != Some(a.agent_id.as_str())
                         })
-                        .map(|st| {
-                            st.files
-                                .iter()
-                                .map(|f| (f.path.clone(), f.status.clone()))
-                                .collect::<Vec<_>>()
+                        .filter_map(|a| {
+                            let handle = a.handle.clone()?;
+                            let card = agent_to_card_view(a, None);
+                            Some(crate::composer::WorkspacePeerMentionInput {
+                                handle,
+                                title: a.title.clone(),
+                                status_label: card.status_label,
+                            })
                         })
-                })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                Some((gfiles, peers))
             })
             .unwrap_or_default();
 
-        crate::composer::rank_mention_candidates(&req.query, &files, &git_files, req.limit)
+        crate::composer::rank_mention_candidates_with_peers(
+            &req.query,
+            &files,
+            &git_files,
+            &workspace_peers,
+            req.limit,
+        )
     }
 
     pub fn build_side_question_context(
@@ -1984,21 +2108,28 @@ impl OrbitAppCore {
         if agent_id.is_empty() || agent_id.starts_with("opt_") {
             return;
         }
-        let host_latest = self
+        let (host_latest, host_read_seq, host_attention) = self
             .hosts
             .read()
             .ok()
             .and_then(|g| {
-                g.get(host_id)
-                    .and_then(|h| h.agents.get(agent_id).map(|a| a.latest_seq))
+                g.get(host_id).and_then(|h| {
+                    h.agents
+                        .get(agent_id)
+                        .map(|a| (a.latest_seq, a.read_seq, a.attention))
+                })
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0, AttentionState::None));
         let effective_seq = if seq == 0 {
             host_latest
         } else {
             seq.max(host_latest)
         };
-        if effective_seq == 0 {
+        let has_clearable_attention = matches!(
+            host_attention,
+            AttentionState::Finished | AttentionState::Error | AttentionState::ManualUnread
+        );
+        if effective_seq == 0 && !has_clearable_attention {
             return;
         }
 
@@ -2028,6 +2159,30 @@ impl OrbitAppCore {
                 entry.updated_at_ms = entry.updated_at_ms.max(now_ms);
             }
         }
+        let needs_wire = effective_seq > host_read_seq || has_clearable_attention || changed;
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            if effective_seq > ag.read_seq {
+                ag.read_seq = effective_seq;
+                changed = true;
+            }
+            if ag.attention != AttentionState::None && ag.attention != AttentionState::Permission {
+                ag.attention = AttentionState::None;
+                changed = true;
+            }
+        }
+        if needs_wire {
+            self.dispatch_wire_or_queue(
+                host_id,
+                WireMessage::MarkAgentRead {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                    seen_seq: (effective_seq > 0).then_some(effective_seq),
+                },
+            );
+        }
         if changed {
             self.emit(|revision| CoreNotification::FleetChanged { revision });
             self.emit(|revision| CoreNotification::HostChanged {
@@ -2052,6 +2207,20 @@ impl OrbitAppCore {
                 entry.updated_at_ms = now_ms;
             }
         }
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+            && ag.attention != AttentionState::Permission
+        {
+            ag.attention = AttentionState::ManualUnread;
+        }
+        self.dispatch_wire_or_queue(
+            host_id,
+            WireMessage::MarkAgentUnread {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+            },
+        );
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
@@ -2090,6 +2259,26 @@ impl OrbitAppCore {
                 entry.pinned_order = if pinned { next_order } else { 0 };
                 entry.updated_at_ms = now_ms;
             }
+        }
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+            && ag.is_pinned != pinned
+        {
+            ag.is_pinned = pinned;
+            ag.pinned_order = if pinned { next_order } else { 0 };
+            changed = true;
+        }
+        if changed && !agent_id.starts_with("opt_") {
+            self.dispatch_wire_or_queue(
+                host_id,
+                WireMessage::SetAgentPinned {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                    pinned,
+                    pinned_order: pinned.then_some(next_order),
+                },
+            );
         }
         if changed {
             self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -2212,17 +2401,132 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.projects.write() {
             guard.insert(id, view.clone());
         }
+        self.dispatch_wire_or_queue(
+            host_id,
+            WireMessage::UpsertHostProject {
+                request_id: Uuid::new_v4(),
+                project: HostProjectEntry {
+                    project_id: view.project_id.clone(),
+                    name: view.name.clone(),
+                    directories: view.directories.clone(),
+                    sort_order: 0,
+                    hidden: false,
+                    updated_at_ms: view.updated_at_ms,
+                },
+            },
+        );
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         Ok(view)
     }
 
     pub fn remove_project(&self, project_id: &str) -> Result<(), ClientCoreError> {
+        let removed_host_id = self
+            .projects
+            .read()
+            .ok()
+            .and_then(|g| g.get(project_id).map(|p| p.host_id.clone()));
         self.store.delete_client_project(project_id)?;
         if let Ok(mut guard) = self.projects.write() {
             guard.remove(project_id);
         }
+        if let Ok(mut order) = self.project_order.write() {
+            let before = order.len();
+            order.retain(|k| k != project_id);
+            if order.len() != before
+                && let Ok(json) = serde_json::to_string(&*order)
+            {
+                let _ = self
+                    .store
+                    .set_client_kv("project_order", &json, unix_ms_now() as i64);
+            }
+        }
+        if let Some(hid) = removed_host_id {
+            self.dispatch_wire_or_queue(
+                &hid,
+                WireMessage::DeleteHostProject {
+                    request_id: Uuid::new_v4(),
+                    project_id: project_id.to_string(),
+                },
+            );
+        }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         Ok(())
+    }
+
+    pub fn project_order(&self) -> Vec<String> {
+        self.project_order
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Persists manual sidebar project order locally and synchronizes each host's slice
+    /// to its Orbit Daemon (`SetHostProjectOrder`) so every connected device converges.
+    pub fn reorder_projects(
+        &self,
+        ordered_keys: Vec<String>,
+    ) -> Result<Vec<String>, ClientCoreError> {
+        let mut deduped: Vec<String> = Vec::with_capacity(ordered_keys.len());
+        let mut seen: HashSet<String> = HashSet::new();
+        for raw in ordered_keys {
+            let clean = raw.trim().to_string();
+            if !clean.is_empty() && seen.insert(clean.clone()) {
+                deduped.push(clean);
+            }
+        }
+        if let Ok(json) = serde_json::to_string(&deduped) {
+            self.store
+                .set_client_kv("project_order", &json, unix_ms_now() as i64)?;
+        }
+        if let Ok(mut guard) = self.project_order.write() {
+            *guard = deduped.clone();
+        }
+
+        // Partition keys by host and push to each host daemon.
+        let project_hosts: HashMap<String, String> = self
+            .projects
+            .read()
+            .ok()
+            .map(|g| {
+                g.iter()
+                    .map(|(pid, p)| (pid.clone(), p.host_id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let known_hosts: Vec<String> = self
+            .hosts
+            .read()
+            .ok()
+            .map(|g| g.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut per_host: HashMap<String, Vec<String>> = HashMap::new();
+        for key in &deduped {
+            let owner = project_hosts.get(key).cloned().or_else(|| {
+                key.split_once("::").and_then(|(prefix, _)| {
+                    known_hosts
+                        .iter()
+                        .find(|hid| hid.as_str() == prefix)
+                        .cloned()
+                })
+            });
+            if let Some(hid) = owner {
+                per_host.entry(hid).or_default().push(key.clone());
+            }
+        }
+        for (hid, host_keys) in per_host {
+            self.dispatch_wire_or_queue(
+                &hid,
+                WireMessage::SetHostProjectOrder {
+                    request_id: Uuid::new_v4(),
+                    project_order: host_keys,
+                    project_sort_mode: Some("manual".to_string()),
+                },
+            );
+        }
+
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        Ok(deduped)
     }
 
     pub fn list_directory(self: &Arc<Self>, host_id: &str, path: Option<String>) {
@@ -2508,6 +2812,11 @@ impl OrbitAppCore {
                 // Fast SQLite state (`< 2ms`) FIRST so sidebar sessions appear immediately,
                 // followed by orchestration state, filesystem project discovery & background quota probes!
                 let _ = handle
+                    .send_wire(WireMessage::GetHostSyncState {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListWorkspaces {
                         request_id: Uuid::new_v4(),
                         include_archived: true,
@@ -2777,6 +3086,9 @@ impl OrbitAppCore {
         let mut rewound_to_persist: Option<(AgentSummary, Vec<TimelineEvent>, bool, bool)> = None;
         let mut stale_replica_agents: Vec<(String, bool)> = Vec::new();
         let mut initial_seen_seeds: Vec<(String, u64)> = Vec::new();
+        type ServerPrefSync = (String, u64, Option<(bool, i64)>);
+        let mut server_pref_syncs: Vec<ServerPrefSync> = Vec::new();
+        let mut host_sync_to_apply: Option<(HostSyncState, bool)> = None;
         let mut migrated_opt_pref: Option<(String, String)> = None;
         let mut rewound_seen_reset: Option<(String, u64)> = None;
 
@@ -2873,6 +3185,7 @@ impl OrbitAppCore {
                         .map(|(k, v)| (k.clone(), (v.timeline_epoch, v.latest_seq)))
                         .collect();
                     let is_initial_hydration = !state.initial_agents_hydrated;
+                    let sync_pin_authoritative = state.host_sync_supported;
                     state.initial_agents_hydrated = true;
                     state.agents.retain(|k, _| k.starts_with("opt_"));
                     for a in agents {
@@ -2897,7 +3210,21 @@ impl OrbitAppCore {
                             push_notify_timeline(ag_id.clone());
                         }
                         if is_initial_hydration && a.latest_seq > 0 {
-                            initial_seen_seeds.push((ag_id.clone(), a.latest_seq));
+                            let seed_seq = if a.read_seq == 0 && a.attention == AttentionState::None
+                            {
+                                a.latest_seq
+                            } else {
+                                a.read_seq
+                            };
+                            initial_seen_seeds.push((ag_id.clone(), seed_seq));
+                        }
+                        let pin_sync = if sync_pin_authoritative || a.is_pinned {
+                            Some((a.is_pinned, a.pinned_order))
+                        } else {
+                            None
+                        };
+                        if a.read_seq > 0 || pin_sync.is_some() {
+                            server_pref_syncs.push((ag_id.clone(), a.read_seq, pin_sync));
                         }
                         state.agents.insert(ag_id, a);
                     }
@@ -2933,6 +3260,13 @@ impl OrbitAppCore {
                         state.mark_stage_meta_dirty(parent_id);
                         push_notify_timeline(parent_id.clone());
                     }
+                    if agent.read_seq > 0 || agent.is_pinned {
+                        server_pref_syncs.push((
+                            ag_id.clone(),
+                            agent.read_seq,
+                            agent.is_pinned.then_some((true, agent.pinned_order)),
+                        ));
+                    }
                     state.last_created_agent_id = Some(ag_id.clone());
                     state.agents.insert(ag_id.clone(), agent);
                     auto_subscribe_agent = Some(ag_id.clone());
@@ -2943,6 +3277,7 @@ impl OrbitAppCore {
                 WireMessage::AgentUpdated { agent } => {
                     let ag_id = agent.agent_id.clone();
                     let prev_epoch = state.agents.get(&ag_id).map(|a| a.timeline_epoch);
+                    let prev_pinned = state.agents.get(&ag_id).map(|a| a.is_pinned);
                     let prev_parent_id = state
                         .agents
                         .get(&ag_id)
@@ -2972,6 +3307,17 @@ impl OrbitAppCore {
                     {
                         state.mark_stage_meta_dirty(&prev_pid);
                         push_notify_timeline(prev_pid);
+                    }
+                    let pin_sync = if state.host_sync_supported
+                        || agent.is_pinned
+                        || prev_pinned.is_some_and(|p| p != agent.is_pinned)
+                    {
+                        Some((agent.is_pinned, agent.pinned_order))
+                    } else {
+                        None
+                    };
+                    if agent.read_seq > 0 || pin_sync.is_some() {
+                        server_pref_syncs.push((ag_id.clone(), agent.read_seq, pin_sync));
                     }
                     state.agents.insert(ag_id.clone(), agent);
                     notify_fleet = true;
@@ -3270,8 +3616,91 @@ impl OrbitAppCore {
                 }
                 WireMessage::GitStatusResponse { status, .. } => {
                     let cwd = status.cwd.clone();
+                    let norm_cwd = crate::sidebar::normalize_project_path(&cwd);
+                    state.git_repos_by_cwd.insert(
+                        norm_cwd.clone(),
+                        GitReposInspectionView {
+                            path: norm_cwd,
+                            is_git_repo: status.is_git_repo,
+                            git_branch: status.branch.clone(),
+                            nested_git_repos: status.nested_git_repos.clone(),
+                        },
+                    );
                     state.git_statuses.insert(cwd.clone(), status);
                     notify_git_cwd = Some(cwd);
+                }
+                WireMessage::GitReposResponse {
+                    request_id,
+                    cwd,
+                    is_git_repo,
+                    git_branch,
+                    repos,
+                } => {
+                    let norm_path = crate::sidebar::normalize_project_path(&cwd);
+                    let view = GitReposInspectionView {
+                        path: norm_path.clone(),
+                        is_git_repo,
+                        git_branch,
+                        nested_git_repos: repos,
+                    };
+                    state.git_repos_by_cwd.insert(norm_path, view.clone());
+                    if let Some(tx) = state.pending_git_repo_inspections.remove(&request_id) {
+                        let _ = tx.send(Ok(view));
+                    }
+                    notify_fleet = true;
+                    notify_host = true;
+                }
+                WireMessage::HostSyncStateSnapshot {
+                    state: sync_state, ..
+                } => {
+                    state.host_sync_supported = true;
+                    state.host_sync_state = sync_state.clone();
+                    host_sync_to_apply = Some((sync_state, false));
+                    notify_fleet = true;
+                    notify_host = true;
+                }
+                WireMessage::HostSyncStateUpdated { state: sync_state } => {
+                    state.host_sync_supported = true;
+                    state.host_sync_state = sync_state.clone();
+                    host_sync_to_apply = Some((sync_state, true));
+                    notify_fleet = true;
+                    notify_host = true;
+                }
+                WireMessage::WorkspaceBoardSnapshot { board, .. }
+                | WireMessage::WorkspaceBoardUpdated { board } => {
+                    let ws_id = board.workspace_id.clone();
+                    let rev = board.revision;
+                    if let Some(ws) = state
+                        .workspaces
+                        .iter_mut()
+                        .find(|w| w.workspace_id == ws_id)
+                    {
+                        ws.board_revision = rev;
+                    }
+                    state.workspace_boards.insert(ws_id, board);
+                    notify_fleet = true;
+                    notify_host = true;
+                }
+                WireMessage::WorkspaceEventsSnapshot {
+                    workspace_id,
+                    events,
+                    ..
+                } => {
+                    state.workspace_events.insert(workspace_id, events);
+                    notify_fleet = true;
+                    notify_host = true;
+                }
+                WireMessage::WorkspaceEventRecorded { event } => {
+                    let ws_id = event.workspace_id.clone();
+                    let list = state.workspace_events.entry(ws_id).or_default();
+                    if !list.iter().any(|existing| existing.seq == event.seq) {
+                        list.insert(0, event);
+                        if list.len() > 200 {
+                            list.truncate(200);
+                        }
+                    }
+                    notify_fleet = true;
+                    notify_host = true;
                 }
                 WireMessage::GitDiffResponse {
                     cwd,
@@ -3397,6 +3826,10 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_git_repo_inspections.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_side_questions.remove(&req_id)
                     {
                         let _ = tx.send(SideQuestionStreamEvent::Done {
@@ -3454,16 +3887,16 @@ impl OrbitAppCore {
             && let Ok(mut prefs) = self.thread_prefs.write()
         {
             let now_ms = unix_ms_now() as i64;
-            for (ag_id, latest_seq) in initial_seen_seeds {
+            for (ag_id, seed_seq) in initial_seen_seeds {
                 let key = (host_id.to_string(), ag_id.clone());
                 prefs.entry(key).or_insert_with(|| {
                     let _ = self
                         .store
-                        .set_client_thread_seen_seq(host_id, &ag_id, latest_seq, false, now_ms);
+                        .set_client_thread_seen_seq(host_id, &ag_id, seed_seq, false, now_ms);
                     ClientThreadPref {
                         host_id: host_id.to_string(),
                         agent_id: ag_id,
-                        seen_seq: latest_seq,
+                        seen_seq: seed_seq,
                         is_pinned: false,
                         pinned_order: 0,
                         updated_at_ms: now_ms,
@@ -3471,18 +3904,75 @@ impl OrbitAppCore {
                 });
             }
         }
+        if !server_pref_syncs.is_empty()
+            && let Ok(mut prefs) = self.thread_prefs.write()
+        {
+            let now_ms = unix_ms_now() as i64;
+            for (ag_id, server_read_seq, pin_sync) in server_pref_syncs {
+                let key = (host_id.to_string(), ag_id.clone());
+                let entry = prefs.entry(key).or_insert_with(|| ClientThreadPref {
+                    host_id: host_id.to_string(),
+                    agent_id: ag_id.clone(),
+                    seen_seq: server_read_seq,
+                    is_pinned: pin_sync.map(|(p, _)| p).unwrap_or(false),
+                    pinned_order: pin_sync.map(|(_, o)| o).unwrap_or(0),
+                    updated_at_ms: now_ms,
+                });
+                let mut dirty = false;
+                if server_read_seq > entry.seen_seq {
+                    entry.seen_seq = server_read_seq;
+                    dirty = true;
+                }
+                if let Some((srv_pinned, srv_order)) = pin_sync
+                    && (entry.is_pinned != srv_pinned
+                        || (srv_pinned && srv_order > 0 && entry.pinned_order != srv_order))
+                {
+                    entry.is_pinned = srv_pinned;
+                    entry.pinned_order = if srv_pinned {
+                        if srv_order > 0 {
+                            srv_order
+                        } else {
+                            self.pin_order_seq.fetch_add(1, Ordering::SeqCst) as i64
+                        }
+                    } else {
+                        0
+                    };
+                    dirty = true;
+                }
+                if dirty {
+                    entry.updated_at_ms = entry.updated_at_ms.max(now_ms);
+                    let _ = self.store.upsert_client_thread_pref(entry);
+                }
+            }
+        }
+        if let Some((sync_state, is_live_update)) = host_sync_to_apply {
+            self.reconcile_host_sync_state(host_id, sync_state, is_live_update);
+        }
         if let Some((opt_id, real_id)) = migrated_opt_pref {
             let _ = self
                 .store
                 .migrate_client_thread_pref(host_id, &opt_id, &real_id);
+            let mut migrated_pinned = false;
             if let Ok(mut prefs) = self.thread_prefs.write()
                 && let Some(mut old_pref) = prefs.remove(&(host_id.to_string(), opt_id))
             {
+                migrated_pinned = old_pref.is_pinned;
                 let real_key = (host_id.to_string(), real_id.clone());
                 if let std::collections::hash_map::Entry::Vacant(e) = prefs.entry(real_key) {
-                    old_pref.agent_id = real_id;
+                    old_pref.agent_id = real_id.clone();
                     e.insert(old_pref);
                 }
+            }
+            if migrated_pinned {
+                self.dispatch_wire_or_queue(
+                    host_id,
+                    WireMessage::SetAgentPinned {
+                        request_id: Uuid::new_v4(),
+                        agent_id: real_id,
+                        pinned: true,
+                        pinned_order: None,
+                    },
+                );
             }
         }
         if let Some((rewound_ag_id, rewound_latest_seq)) = rewound_seen_reset {
@@ -3619,6 +4109,125 @@ impl OrbitAppCore {
         }
     }
 
+    fn reconcile_host_sync_state(
+        &self,
+        host_id: &str,
+        sync_state: HostSyncState,
+        is_live_update: bool,
+    ) {
+        let now_ms = unix_ms_now() as i64;
+        // 1. Reconcile saved projects for this host.
+        let mut to_seed_to_daemon: Vec<HostProjectEntry> = Vec::new();
+        if let Ok(mut projs) = self.projects.write() {
+            if !is_live_update && sync_state.projects.is_empty() && sync_state.updated_at_ms == 0 {
+                // First connect to a freshly upgraded daemon: seed existing client-local projects upward
+                // so upgrading users never lose their saved Desktop sidebar projects.
+                for p in projs.values().filter(|p| p.host_id == host_id) {
+                    to_seed_to_daemon.push(HostProjectEntry {
+                        project_id: p.project_id.clone(),
+                        name: p.name.clone(),
+                        directories: p.directories.clone(),
+                        sort_order: 0,
+                        hidden: false,
+                        updated_at_ms: p.updated_at_ms,
+                    });
+                }
+            } else {
+                let incoming_ids: HashSet<&str> = sync_state
+                    .projects
+                    .iter()
+                    .map(|p| p.project_id.as_str())
+                    .collect();
+                let stale_ids: Vec<String> = projs
+                    .iter()
+                    .filter(|(_, p)| {
+                        p.host_id == host_id && !incoming_ids.contains(p.project_id.as_str())
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for stale_id in stale_ids {
+                    projs.remove(&stale_id);
+                    let _ = self.store.delete_client_project(&stale_id);
+                }
+                for entry in &sync_state.projects {
+                    let stored = StoredClientProject {
+                        project_id: entry.project_id.clone(),
+                        host_id: host_id.to_string(),
+                        name: entry.name.clone(),
+                        directories: entry.directories.clone(),
+                        updated_at_ms: entry.updated_at_ms.max(now_ms.min(1)),
+                    };
+                    let _ = self.store.upsert_client_project(&stored);
+                    projs.insert(
+                        entry.project_id.clone(),
+                        ClientProjectView {
+                            project_id: stored.project_id,
+                            host_id: stored.host_id,
+                            name: stored.name,
+                            directories: stored.directories,
+                            updated_at_ms: stored.updated_at_ms,
+                        },
+                    );
+                }
+            }
+        }
+        for seed in to_seed_to_daemon {
+            self.dispatch_wire_or_queue(
+                host_id,
+                WireMessage::UpsertHostProject {
+                    request_id: Uuid::new_v4(),
+                    project: seed,
+                },
+            );
+        }
+
+        // 2. Reconcile manual project order for this host.
+        if is_live_update || !sync_state.project_order.is_empty() {
+            let host_project_ids: HashSet<String> = self
+                .projects
+                .read()
+                .ok()
+                .map(|g| {
+                    g.values()
+                        .filter(|p| p.host_id == host_id)
+                        .map(|p| p.project_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let host_prefix = format!("{host_id}::");
+            let belongs_to_host = |key: &str| -> bool {
+                host_project_ids.contains(key) || key.starts_with(&host_prefix)
+            };
+            if let Ok(mut order) = self.project_order.write() {
+                let first_pos = order.iter().position(|k| belongs_to_host(k));
+                let mut others: Vec<String> = order
+                    .iter()
+                    .filter(|k| !belongs_to_host(k))
+                    .cloned()
+                    .collect();
+                let insert_at = first_pos.unwrap_or(others.len()).min(others.len());
+                let mut merged = Vec::with_capacity(others.len() + sync_state.project_order.len());
+                merged.extend(others.drain(..insert_at));
+                for k in sync_state.project_order {
+                    if !merged.contains(&k) {
+                        merged.push(k);
+                    }
+                }
+                for k in others {
+                    if !merged.contains(&k) {
+                        merged.push(k);
+                    }
+                }
+                if *order != merged {
+                    *order = merged;
+                    if let Ok(json) = serde_json::to_string(&*order) {
+                        let _ = self.store.set_client_kv("project_order", &json, now_ms);
+                    }
+                }
+            }
+        }
+    }
+
     fn dispatch_wire(&self, host_id: &str, msg: WireMessage) {
         let session = self
             .hosts
@@ -3628,6 +4237,33 @@ impl OrbitAppCore {
         if let Some(handle) = session {
             self.runtime.spawn(async move {
                 let _ = handle.send_wire(msg).await;
+            });
+        }
+    }
+
+    /// Sends immediately if connected, or queues into `pending_outbox` without requiring `&Arc<Self>`,
+    /// so `&self` sync mutations (read state, pins, projects, drag order) converge reliably across reconnects.
+    fn dispatch_wire_or_queue(&self, host_id: &str, msg: WireMessage) {
+        let mut live_handle = None;
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if let Some(ref handle) = h.session {
+                live_handle = Some(handle.clone());
+            } else {
+                h.pending_outbox.push(msg.clone());
+            }
+        }
+        if let Some(handle) = live_handle {
+            let hosts = Arc::clone(&self.hosts);
+            let owned_host = host_id.to_string();
+            self.runtime.spawn(async move {
+                if handle.send_wire(msg.clone()).await.is_err()
+                    && let Ok(mut guard) = hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_outbox.push(msg);
+                }
             });
         }
     }
@@ -3667,6 +4303,12 @@ impl OrbitAppCore {
     }
 
     pub fn refresh_host(&self, host_id: &str) {
+        self.dispatch_wire(
+            host_id,
+            WireMessage::GetHostSyncState {
+                request_id: Uuid::new_v4(),
+            },
+        );
         self.dispatch_wire(
             host_id,
             WireMessage::DiscoverProjects {
@@ -3791,6 +4433,9 @@ impl OrbitAppCore {
             initial_display_prompt: None,
             initial_badges: Vec::new(),
             worktree_branch,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
         });
     }
 
@@ -3819,6 +4464,9 @@ impl OrbitAppCore {
             initial_display_prompt: None,
             initial_badges: Vec::new(),
             worktree_branch,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
         })
     }
 
@@ -3833,29 +4481,21 @@ impl OrbitAppCore {
     ) -> String {
         let clean_branch = req.worktree_branch.map(str::trim).filter(|b| !b.is_empty());
         let use_auto_worktree = clean_branch == Some("auto");
-        if let Some(branch) = clean_branch.filter(|b| *b != "auto") {
-            self.dispatch_wire_queued(
-                req.host_id,
-                WireMessage::CreateWorkspace {
-                    request_id: Uuid::new_v4(),
-                    source_cwd: req.cwd.to_string(),
-                    title: Some(branch.to_string()),
-                    worktree_branch: Some(branch.to_string()),
-                    base_ref: None,
-                    isolation: WorkspaceIsolation::Worktree,
-                    worktree_mode: WorktreeCreateMode::BranchOff,
-                    pr_number: None,
-                    parent_workspace_id: None,
-                    background: false,
-                    idempotency_key: None,
-                },
-            );
-        }
+        let explicit_ws = req
+            .workspace_id
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(ToOwned::to_owned);
+        let use_worktree = use_auto_worktree || clean_branch.is_some();
 
         let req_id = Uuid::new_v4();
         let opt_id = format!("opt_{req_id}");
         let now = Utc::now();
         let clean_model = req.model.filter(|m| !m.trim().is_empty());
+        let clean_handle = req
+            .handle
+            .map(|h| h.trim().trim_start_matches('@').to_string())
+            .filter(|h| !h.is_empty());
         let visible_seed = req
             .initial_display_prompt
             .as_deref()
@@ -3879,7 +4519,9 @@ impl OrbitAppCore {
         {
             let opt_agent = AgentSummary {
                 agent_id: opt_id.clone(),
-                workspace_id: format!("ws_{opt_id}"),
+                workspace_id: explicit_ws
+                    .clone()
+                    .unwrap_or_else(|| format!("ws_{opt_id}")),
                 cwd: req.cwd.to_string(),
                 title,
                 provider: req.provider,
@@ -3897,6 +4539,11 @@ impl OrbitAppCore {
                 last_activity_at: Some(now),
                 labels: HashMap::new(),
                 latest_seq: 0,
+                read_seq: 0,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: clean_handle.clone(),
+                cluster_suggestion: None,
                 timeline_epoch: 0,
                 created_at: now,
                 updated_at: now,
@@ -3951,8 +4598,8 @@ impl OrbitAppCore {
                 initial_prompt: req.initial_prompt.to_string(),
                 initial_display_prompt: req.initial_display_prompt,
                 initial_badges: req.initial_badges,
-                worktree: use_auto_worktree,
-                workspace_id: None,
+                worktree: use_worktree,
+                workspace_id: explicit_ws,
                 parent_agent_id: None,
                 parent_host_id: None,
                 profile_id,
@@ -3963,6 +4610,8 @@ impl OrbitAppCore {
                 base_ref: None,
                 worktree_mode: WorktreeCreateMode::BranchOff,
                 branch: clean_branch.filter(|b| *b != "auto").map(ToOwned::to_owned),
+                handle: clean_handle,
+                auto_cluster: req.auto_cluster,
             },
         );
 
@@ -4373,30 +5022,7 @@ impl OrbitAppCore {
     }
 
     pub fn mark_agent_read(self: &Arc<Self>, host_id: &str, agent_id: &str) {
-        let mut changed = false;
-        if let Ok(mut guard) = self.hosts.write()
-            && let Some(h) = guard.get_mut(host_id)
-            && let Some(ag) = h.agents.get_mut(agent_id)
-            && ag.attention != AttentionState::None
-        {
-            ag.attention = AttentionState::None;
-            changed = true;
-        }
-        if !agent_id.starts_with("opt_") {
-            self.dispatch_wire_queued(
-                host_id,
-                WireMessage::MarkAgentRead {
-                    request_id: Uuid::new_v4(),
-                    agent_id: agent_id.to_string(),
-                },
-            );
-        }
-        if changed {
-            self.emit(|revision| CoreNotification::HostChanged {
-                revision,
-                host_id: host_id.to_string(),
-            });
-        }
+        self.mark_agent_seen(host_id, agent_id, 0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4410,6 +5036,35 @@ impl OrbitAppCore {
         mode: Option<SessionMode>,
         labels: Option<HashMap<String, String>>,
     ) {
+        self.update_agent_with_handle(host_id, agent_id, title, model, effort, mode, labels, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent_with_handle(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        title: Option<String>,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+        mode: Option<SessionMode>,
+        labels: Option<HashMap<String, String>>,
+        handle: Option<String>,
+    ) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            if let Some(ref t) = title {
+                ag.title = t.clone();
+            }
+            if let Some(ref h_val) = handle {
+                let clean = h_val.trim().trim_start_matches('@');
+                if !clean.is_empty() {
+                    ag.handle = Some(clean.to_string());
+                }
+            }
+        }
         self.dispatch_wire_queued(
             host_id,
             WireMessage::UpdateAgent {
@@ -4420,8 +5075,319 @@ impl OrbitAppCore {
                 effort,
                 mode,
                 labels,
+                handle,
             },
         );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    // --- Git Repository Discovery & Mission Workspace Orchestration ---
+
+    pub fn request_git_repos_inspection(
+        self: &Arc<Self>,
+        host_id: &str,
+        path: &str,
+        extra_dirs: Vec<String>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::InspectGitRepos {
+                request_id: Uuid::new_v4(),
+                cwd: path.to_string(),
+                extra_dirs,
+            },
+        );
+    }
+
+    pub fn git_repos_inspection(
+        &self,
+        host_id: &str,
+        path: &str,
+    ) -> Option<GitReposInspectionView> {
+        let norm = crate::sidebar::normalize_project_path(path);
+        self.hosts.read().ok().and_then(|g| {
+            let h = g.get(host_id)?;
+            h.git_repos_by_cwd
+                .get(&norm)
+                .or_else(|| {
+                    h.git_repos_by_cwd
+                        .iter()
+                        .find(|(k, _)| cwd_paths_equivalent(k, &norm))
+                        .map(|(_, v)| v)
+                })
+                .cloned()
+        })
+    }
+
+    pub async fn inspect_git_repos_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        path: &str,
+        extra_dirs: Vec<String>,
+    ) -> Result<GitReposInspectionView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            if let Some(cached) = self.git_repos_inspection(host_id, path) {
+                return Ok(cached);
+            }
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_path = path.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_git_repo_inspections.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::InspectGitRepos {
+                    request_id: req_id,
+                    cwd: owned_path,
+                    extra_dirs,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_git_repo_inspections.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send InspectGitRepos: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(6), ack_rx).await {
+                Ok(Ok(Ok(view))) => Ok(view),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while inspecting git repos".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_git_repo_inspections.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to inspect git repositories".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "git inspection task cancelled".to_string())?
+    }
+
+    pub fn inspect_git_repos_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        path: &str,
+        extra_dirs: Vec<String>,
+    ) -> Result<GitReposInspectionView, String> {
+        self.runtime
+            .block_on(self.inspect_git_repos_on_host(host_id, path, extra_dirs))
+    }
+
+    pub fn fetch_workspace_board(self: &Arc<Self>, host_id: &str, workspace_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::GetWorkspaceBoard {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+            },
+        );
+    }
+
+    pub fn workspace_board(
+        &self,
+        host_id: &str,
+        workspace_id: &str,
+    ) -> Option<WorkspaceBoardSnapshot> {
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|g| g.get(host_id)?.workspace_boards.get(workspace_id).cloned())
+    }
+
+    pub fn update_workspace_board(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: &str,
+        content: String,
+        section: Option<String>,
+        updated_by: Option<String>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UpdateWorkspaceBoard {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+                content,
+                section,
+                updated_by,
+            },
+        );
+    }
+
+    pub fn fetch_workspace_events(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: &str,
+        limit: Option<u32>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ListWorkspaceEvents {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+                limit,
+            },
+        );
+    }
+
+    pub fn workspace_events(&self, host_id: &str, workspace_id: &str) -> Vec<WorkspaceEventRecord> {
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|g| g.get(host_id)?.workspace_events.get(workspace_id).cloned())
+            .unwrap_or_default()
+    }
+
+    pub fn update_workspace_goal(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: &str,
+        goal: String,
+    ) {
+        let trimmed = goal.trim();
+        let next_goal = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ws) = h
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id == workspace_id)
+        {
+            ws.mission_goal = next_goal.clone();
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UpdateWorkspaceGoal {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+                title: None,
+                mission_goal: Some(goal),
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn move_agent_to_workspace(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        target_workspace_id: Option<String>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::MoveAgentToWorkspace {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+                target_workspace_id,
+                new_workspace_title: None,
+            },
+        );
+    }
+
+    pub fn merge_workspaces(
+        self: &Arc<Self>,
+        host_id: &str,
+        source_workspace_id: &str,
+        target_workspace_id: &str,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::MergeWorkspaces {
+                request_id: Uuid::new_v4(),
+                source_workspace_id: source_workspace_id.to_string(),
+                target_workspace_id: target_workspace_id.to_string(),
+            },
+        );
+    }
+
+    pub fn dismiss_cluster_suggestion(self: &Arc<Self>, host_id: &str, agent_id: &str) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.cluster_suggestion = None;
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::DismissClusterSuggestion {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn spawn_workspace_peer(self: &Arc<Self>, req: SpawnWorkspacePeerRequest) -> String {
+        self.create_agent_with_profile(
+            CreateAgentRequest {
+                host_id: &req.host_id,
+                cwd: &req.cwd,
+                extra_dirs: req.extra_dirs,
+                provider: req.provider,
+                model: req.model,
+                effort: req.effort,
+                mode: req.mode,
+                initial_prompt: &req.initial_prompt,
+                initial_display_prompt: None,
+                initial_badges: Vec::new(),
+                worktree_branch: req.worktree_branch.as_deref(),
+                workspace_id: Some(&req.workspace_id),
+                handle: req.handle,
+                auto_cluster: Some(false),
+            },
+            req.profile_id,
+        )
     }
 
     // --- Workspace Orchestration & Scripts ---
@@ -5176,6 +6142,11 @@ impl OrbitAppCore {
                     return;
                 }
                 let _ = handle
+                    .send_wire(WireMessage::GetHostSyncState {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListWorkspaces {
                         request_id: Uuid::new_v4(),
                         include_archived: true,
@@ -5882,6 +6853,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_rewinds.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_git_repo_inspections.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {
@@ -6772,11 +7746,14 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         AgentStatus::Error { .. } => ("Error".to_string(), false, false),
         AgentStatus::Closed => ("Closed".to_string(), false, false),
     };
-    let seen_seq = pref.map(|p| p.seen_seq).unwrap_or(0);
-    let is_pinned = pref.is_some_and(|p| p.is_pinned);
+    let local_seen_seq = pref.map(|p| p.seen_seq).unwrap_or(0);
+    let effective_seen_seq = a.read_seq.max(local_seen_seq);
+    let is_pinned = a.is_pinned || pref.is_some_and(|p| p.is_pinned);
     let is_unread = !a.agent_id.starts_with("opt_")
         && !is_running
-        && (a.latest_seq > seen_seq || a.attention != AttentionState::None);
+        && (a.attention != AttentionState::None
+            || (a.latest_seq > 0 && a.latest_seq > effective_seen_seq));
+    let worktree_branch = a.labels.get("orbit.worktree_branch").cloned();
     AgentCardView {
         agent_id: a.agent_id.clone(),
         workspace_id: a.workspace_id.clone(),
@@ -6802,8 +7779,12 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         latest_seq: a.latest_seq,
         updated_at_rfc3339: a.updated_at.to_rfc3339(),
         is_pinned,
-        seen_seq,
+        seen_seq: effective_seen_seq,
+        read_seq: a.read_seq,
         is_unread,
+        handle: a.handle.clone(),
+        cluster_suggestion: a.cluster_suggestion.clone(),
+        worktree_branch,
     }
 }
 
@@ -7252,6 +8233,9 @@ mod tests {
             initial_display_prompt: None,
             initial_badges: Vec::new(),
             worktree_branch: None,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
         });
 
         let stage = core.agent_stage("host_mobile", &opt_id);
@@ -7518,6 +8502,11 @@ mod tests {
                     parent_agent_id: None,
                     parent_host_id: None,
                     latest_seq: 5,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -7625,6 +8614,11 @@ mod tests {
                     parent_agent_id: None,
                     parent_host_id: None,
                     latest_seq: 3,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -7742,6 +8736,11 @@ mod tests {
                     parent_agent_id: None,
                     parent_host_id: None,
                     latest_seq: 5,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -7910,6 +8909,11 @@ mod tests {
                     parent_agent_id: None,
                     parent_host_id: None,
                     latest_seq: 3,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 2,
                     created_at: now,
                     updated_at: now,
@@ -7967,7 +8971,9 @@ mod tests {
             mem.workspaces.push(WorkspaceSummary {
                 workspace_id: "ws1".into(),
                 cwd: "/work/orbit".into(),
+                project_root: None,
                 title: "orbit".into(),
+                mission_goal: None,
                 is_worktree: false,
                 git_branch: Some("main".into()),
                 updated_at: now,
@@ -7977,6 +8983,9 @@ mod tests {
                 archived_at: None,
                 background: false,
                 setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
             });
             guard.insert("h1".into(), mem);
         }
@@ -7999,6 +9008,11 @@ mod tests {
                     parent_agent_id: None,
                     parent_host_id: None,
                     latest_seq: 10,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -8037,6 +9051,11 @@ mod tests {
                     parent_agent_id: None,
                     parent_host_id: None,
                     latest_seq: 0,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -8068,6 +9087,11 @@ mod tests {
                     parent_agent_id: None,
                     parent_host_id: None,
                     latest_seq: 3,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -8244,6 +9268,11 @@ mod tests {
                 parent_agent_id: None,
                 parent_host_id: None,
                 latest_seq: 2,
+                read_seq: 0,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
                 timeline_epoch: 1,
                 created_at: now,
                 updated_at: now,
@@ -8409,6 +9438,11 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     latest_seq: 1,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: None,
@@ -8453,6 +9487,11 @@ mod tests {
                     created_at: now,
                     updated_at: now,
                     latest_seq: 1,
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: Some("ag_parent".into()),

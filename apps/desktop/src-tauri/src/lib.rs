@@ -35,8 +35,8 @@ use orbit_client_core::composer::{
     SlashCommandView,
 };
 use orbit_client_core::contract::{
-    BridgeInfoView, FleetSidebarRequest, MentionRankRequest, ModelSelectionRequest,
-    RenderDiagramRequest, RenderDiagramView,
+    BridgeInfoView, FleetSidebarRequest, GitReposInspectionView, MentionRankRequest,
+    ModelSelectionRequest, RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -50,7 +50,8 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentProfile, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
-    ScheduleTarget, SessionMode, WorkspaceIsolation, WorktreeCreateMode,
+    ScheduleTarget, SessionMode, WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation,
+    WorktreeCreateMode,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -420,6 +421,44 @@ fn remove_project(state: State<'_, DesktopAppState>, project_id: String) -> Resu
 }
 
 #[tauri::command]
+fn reorder_projects(
+    state: State<'_, DesktopAppState>,
+    ordered_keys: Vec<String>,
+) -> Result<Vec<String>, String> {
+    state
+        .core
+        .reorder_projects(ordered_keys)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_project_order(state: State<'_, DesktopAppState>) -> Vec<String> {
+    state.core.project_order()
+}
+
+#[tauri::command]
+async fn inspect_git_repos(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    path: String,
+    extra_dirs: Option<Vec<String>>,
+) -> Result<GitReposInspectionView, String> {
+    state
+        .core
+        .inspect_git_repos_on_host(&host_id, &path, extra_dirs.unwrap_or_default())
+        .await
+}
+
+#[tauri::command]
+fn get_git_repos(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    path: String,
+) -> Option<GitReposInspectionView> {
+    state.core.git_repos_inspection(&host_id, &path)
+}
+
+#[tauri::command]
 fn list_directory(state: State<'_, DesktopAppState>, host_id: String, path: Option<String>) {
     state.core.list_directory(&host_id, path);
 }
@@ -469,6 +508,9 @@ fn create_agent(
     initial_badges: Option<Vec<PromptBadge>>,
     worktree_branch: Option<String>,
     profile_id: Option<String>,
+    workspace_id: Option<String>,
+    handle: Option<String>,
+    auto_cluster: Option<bool>,
 ) -> String {
     state.core.create_agent_with_profile(
         CreateAgentRequest {
@@ -483,6 +525,9 @@ fn create_agent(
             initial_display_prompt,
             initial_badges: initial_badges.unwrap_or_default(),
             worktree_branch: worktree_branch.as_deref(),
+            workspace_id: workspace_id.as_deref(),
+            handle,
+            auto_cluster,
         },
         profile_id,
     )
@@ -601,10 +646,113 @@ fn update_agent(
     effort: Option<ReasoningEffort>,
     mode: Option<SessionMode>,
     labels: Option<HashMap<String, String>>,
+    handle: Option<String>,
+) {
+    state.core.update_agent_with_handle(
+        &host_id, &agent_id, title, model, effort, mode, labels, handle,
+    );
+}
+
+#[tauri::command]
+fn fetch_workspace_board(state: State<'_, DesktopAppState>, host_id: String, workspace_id: String) {
+    state.core.fetch_workspace_board(&host_id, &workspace_id);
+}
+
+#[tauri::command]
+fn get_workspace_board(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+) -> Option<WorkspaceBoardSnapshot> {
+    state.core.workspace_board(&host_id, &workspace_id)
+}
+
+#[tauri::command]
+fn update_workspace_board(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+    content: String,
+    section: Option<String>,
+    updated_by: Option<String>,
 ) {
     state
         .core
-        .update_agent(&host_id, &agent_id, title, model, effort, mode, labels);
+        .update_workspace_board(&host_id, &workspace_id, content, section, updated_by);
+}
+
+#[tauri::command]
+fn fetch_workspace_events(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+    limit: Option<u32>,
+) {
+    state
+        .core
+        .fetch_workspace_events(&host_id, &workspace_id, limit);
+}
+
+#[tauri::command]
+fn get_workspace_events(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+) -> Vec<WorkspaceEventRecord> {
+    state.core.workspace_events(&host_id, &workspace_id)
+}
+
+#[tauri::command]
+fn update_workspace_goal(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+    goal: String,
+) {
+    state
+        .core
+        .update_workspace_goal(&host_id, &workspace_id, goal);
+}
+
+#[tauri::command]
+fn move_agent_to_workspace(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    target_workspace_id: Option<String>,
+) {
+    state
+        .core
+        .move_agent_to_workspace(&host_id, &agent_id, target_workspace_id);
+}
+
+#[tauri::command]
+fn merge_workspaces(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    source_workspace_id: String,
+    target_workspace_id: String,
+) {
+    state
+        .core
+        .merge_workspaces(&host_id, &source_workspace_id, &target_workspace_id);
+}
+
+#[tauri::command]
+fn dismiss_cluster_suggestion(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) {
+    state.core.dismiss_cluster_suggestion(&host_id, &agent_id);
+}
+
+#[tauri::command]
+fn spawn_workspace_peer(
+    state: State<'_, DesktopAppState>,
+    req: SpawnWorkspacePeerRequest,
+) -> String {
+    state.core.spawn_workspace_peer(req)
 }
 
 #[tauri::command]
@@ -707,9 +855,9 @@ fn create_schedule(
     target: ScheduleTarget,
     max_runs: Option<u32>,
 ) {
-    state
-        .core
-        .create_schedule(&host_id, name, cron_expr, timezone, prompt, target, max_runs);
+    state.core.create_schedule(
+        &host_id, name, cron_expr, timezone, prompt, target, max_runs,
+    );
 }
 
 #[tauri::command]
@@ -783,9 +931,7 @@ fn add_connected_host(
     label: Option<String>,
     pairing_uri: String,
 ) {
-    state
-        .core
-        .add_connected_host(&host_id, label, &pairing_uri);
+    state.core.add_connected_host(&host_id, label, &pairing_uri);
 }
 
 #[tauri::command]
@@ -807,9 +953,7 @@ fn remove_connected_host(
     host_id: String,
     registration_id: String,
 ) {
-    state
-        .core
-        .remove_connected_host(&host_id, &registration_id);
+    state.core.remove_connected_host(&host_id, &registration_id);
 }
 
 #[tauri::command]
@@ -1422,6 +1566,10 @@ pub fn run() {
             upgrade_remote_daemon,
             upsert_project,
             remove_project,
+            reorder_projects,
+            get_project_order,
+            inspect_git_repos,
+            get_git_repos,
             list_directory,
             connect_host,
             connect_all_hosts,
@@ -1442,6 +1590,16 @@ pub fn run() {
             detach_agent,
             mark_agent_read,
             update_agent,
+            fetch_workspace_board,
+            get_workspace_board,
+            update_workspace_board,
+            fetch_workspace_events,
+            get_workspace_events,
+            update_workspace_goal,
+            move_agent_to_workspace,
+            merge_workspaces,
+            dismiss_cluster_suggestion,
+            spawn_workspace_peer,
             create_workspace_v2,
             rename_workspace,
             archive_workspace,

@@ -71,6 +71,7 @@ fn effort_to_slug(effort: ReasoningEffort) -> &'static str {
 fn parse_sidebar_sort(raw: Option<&str>) -> SidebarProjectSort {
     match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
         "alphabetical" | "name" => SidebarProjectSort::Alphabetical,
+        "manual" | "custom" => SidebarProjectSort::Manual,
         _ => SidebarProjectSort::Recent,
     }
 }
@@ -649,6 +650,9 @@ impl OhosCoreFacade {
             initial_display_prompt,
             initial_badges,
             worktree_branch,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
         });
         Ok(opt_id)
     }
@@ -897,6 +901,43 @@ impl OhosCoreFacade {
 
     pub fn on_network_changed(&self) {
         self.inner.on_network_changed();
+    }
+
+    pub fn reorder_projects_json(&self, ordered_keys_json: &str) -> Result<String, String> {
+        let keys = parse_string_vec_json(Some(ordered_keys_json))?;
+        let saved = self
+            .inner
+            .reorder_projects(keys)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&saved).map_err(|e| e.to_string())
+    }
+
+    pub fn project_order_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.inner.project_order()).map_err(|e| e.to_string())
+    }
+
+    pub fn move_agent_to_workspace(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        target_workspace_id: Option<String>,
+    ) {
+        self.inner
+            .move_agent_to_workspace(host_id, agent_id, target_workspace_id);
+    }
+
+    pub fn merge_workspaces(
+        &self,
+        host_id: &str,
+        source_workspace_id: &str,
+        target_workspace_id: &str,
+    ) {
+        self.inner
+            .merge_workspaces(host_id, source_workspace_id, target_workspace_id);
+    }
+
+    pub fn dismiss_cluster_suggestion(&self, host_id: &str, agent_id: &str) {
+        self.inner.dismiss_cluster_suggestion(host_id, agent_id);
     }
 }
 

@@ -1070,6 +1070,8 @@ async fn main() -> anyhow::Result<()> {
                         base_ref,
                         worktree_mode: WorktreeCreateMode::BranchOff,
                         branch,
+                        handle: None,
+                        auto_cluster: None,
                     },
                     Duration::from_secs(45),
                     |w| {

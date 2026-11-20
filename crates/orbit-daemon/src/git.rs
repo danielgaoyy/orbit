@@ -100,6 +100,7 @@ pub async fn inspect_git_status(cwd: &Path) -> GitStatusSnapshot {
         ahead,
         behind,
         files,
+        nested_git_repos: Vec::new(),
     }
 }
 
@@ -280,6 +281,7 @@ fn collect_shallow_files_sync(
 }
 
 fn empty_non_git(cwd: String) -> GitStatusSnapshot {
+    let nested_git_repos = crate::discovery::discover_nested_git_repos(Path::new(&cwd), &[], 3, 24);
     GitStatusSnapshot {
         cwd,
         is_git_repo: false,
@@ -288,6 +290,7 @@ fn empty_non_git(cwd: String) -> GitStatusSnapshot {
         ahead: 0,
         behind: 0,
         files: Vec::new(),
+        nested_git_repos,
     }
 }
 
@@ -566,7 +569,7 @@ fn is_valid_git_oid(s: &str) -> bool {
 }
 
 /// Resolve Git repo root and optional relative subdir scope when `cwd` is nested inside a monorepo.
-async fn resolve_git_scope(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
+pub(crate) async fn resolve_git_scope(cwd: &Path) -> Option<(PathBuf, Option<String>)> {
     let out = tokio::time::timeout(
         Duration::from_secs(2),
         Command::new("git")

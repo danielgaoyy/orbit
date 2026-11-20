@@ -1983,6 +1983,7 @@ impl From<AgentStageDeltaView> for FfiAgentStageDelta {
 pub enum FfiSidebarProjectSort {
     Recent,
     Alphabetical,
+    Manual,
 }
 
 impl From<FfiSidebarProjectSort> for SidebarProjectSort {
@@ -1990,6 +1991,7 @@ impl From<FfiSidebarProjectSort> for SidebarProjectSort {
         match v {
             FfiSidebarProjectSort::Recent => Self::Recent,
             FfiSidebarProjectSort::Alphabetical => Self::Alphabetical,
+            FfiSidebarProjectSort::Manual => Self::Manual,
         }
     }
 }
@@ -2621,6 +2623,8 @@ impl From<FfiMentionRankRequest> for MentionRankRequest {
             cwd: v.cwd,
             query: v.query,
             limit: v.limit as usize,
+            workspace_id: None,
+            active_agent_id: None,
         }
     }
 }
@@ -2698,6 +2702,9 @@ impl From<FfiCreateSessionRequest> for CreateSessionRequest {
             initial_display_prompt: v.initial_display_prompt,
             initial_badges: v.initial_badges.into_iter().map(Into::into).collect(),
             worktree_branch: v.worktree_branch,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
         }
     }
 }
@@ -3454,6 +3461,9 @@ impl OrbitMobileCore {
             initial_display_prompt,
             initial_badges: initial_badges.into_iter().map(Into::into).collect(),
             worktree_branch: worktree_branch.as_deref(),
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
         })
     }
 
@@ -3693,6 +3703,45 @@ impl OrbitMobileCore {
 
     pub fn render_diagram(&self, req: FfiRenderDiagramRequest) -> FfiRenderDiagramView {
         self.inner.render_diagram(req.into()).into()
+    }
+
+    pub fn reorder_projects(
+        &self,
+        ordered_keys: Vec<String>,
+    ) -> Result<Vec<String>, FfiOrbitError> {
+        self.inner
+            .reorder_projects(ordered_keys)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn project_order(&self) -> Vec<String> {
+        self.inner.project_order()
+    }
+
+    pub fn move_agent_to_workspace(
+        &self,
+        host_id: String,
+        agent_id: String,
+        target_workspace_id: Option<String>,
+    ) {
+        self.inner
+            .move_agent_to_workspace(&host_id, &agent_id, target_workspace_id);
+    }
+
+    pub fn merge_workspaces(
+        &self,
+        host_id: String,
+        source_workspace_id: String,
+        target_workspace_id: String,
+    ) {
+        self.inner
+            .merge_workspaces(&host_id, &source_workspace_id, &target_workspace_id);
+    }
+
+    pub fn dismiss_cluster_suggestion(&self, host_id: String, agent_id: String) {
+        self.inner.dismiss_cluster_suggestion(&host_id, &agent_id);
     }
 }
 

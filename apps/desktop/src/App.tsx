@@ -15,6 +15,7 @@ import { WorkspaceSidePanel } from "@/components/side-panel/workspace-side-panel
 import { FleetSidebar } from "@/components/sidebar/fleet-sidebar";
 import { RemoteFolderPickerDialog } from "@/components/sidebar/remote-folder-picker-dialog";
 import { StreamStage } from "@/components/stage/stream-stage";
+import { WorkspacePeerStrip } from "@/components/stage/workspace-peer-strip";
 import { SimpleTooltip, TooltipProvider } from "@/components/ui/overlays";
 import { modSymbol, useGlobalErgonomicKeybindings } from "@/lib/keybindings";
 import { orbitIpc, isMacDesktop } from "@/lib/orbit-ipc";
@@ -353,6 +354,7 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
         >
           <TopBar />
           <ConnectionStatusBanner />
+          <WorkspacePeerStrip />
           <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
           </main>

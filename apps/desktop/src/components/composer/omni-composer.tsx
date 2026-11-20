@@ -130,6 +130,13 @@ export const OmniComposer = memo(function OmniComposer({
         ?.mode ?? null
     );
   });
+  const activeWorkspaceId = useOrbitSelector((s) => {
+    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return null;
+    return (
+      s.hostDetails[s.selectedHostId]?.agents.find((a) => a.agent_id === s.selectedAgentId)
+        ?.workspace_id ?? null
+    );
+  });
 
   const scopeKey = useOrbitSelector(composerScopeKey);
   const draftText = useComposerDraft(scopeKey);
@@ -296,7 +303,14 @@ export const OmniComposer = memo(function OmniComposer({
     const cwd = selectedCwd || "~";
     const query = mentionTrigger.query;
     void orbitIpc
-      .rankMentionCandidates({ host_id: hostId, cwd, query, limit: 12 })
+      .rankMentionCandidates({
+        host_id: hostId,
+        cwd,
+        query,
+        limit: 12,
+        workspace_id: activeWorkspaceId,
+        active_agent_id: isDraft ? null : selectedAgentId,
+      })
       .then((items) => {
         if (mentionReqSeqRef.current === reqId) {
           setRankedMentions(items);
@@ -307,7 +321,16 @@ export const OmniComposer = memo(function OmniComposer({
           setRankedMentions(EMPTY_MENTIONS);
         }
       });
-  }, [mentionTrigger, selectedHostId, selectedCwd, workspaceFiles, gitFiles]);
+  }, [
+    mentionTrigger,
+    selectedHostId,
+    selectedCwd,
+    workspaceFiles,
+    gitFiles,
+    activeWorkspaceId,
+    isDraft,
+    selectedAgentId,
+  ]);
 
   const hasSubstantiveInput =
     draftText.trim().length > 0 ||
@@ -445,6 +468,9 @@ export const OmniComposer = memo(function OmniComposer({
         staged,
         label: candidate.title,
       });
+      insertInlineToken(token);
+    } else if (candidate.kind === "workspace_peer") {
+      const token = candidate.token_label || candidate.title;
       insertInlineToken(token);
     } else if (candidate.kind === "terminal_output") {
       const snap = orbitActions.captureActiveTerminalTail();

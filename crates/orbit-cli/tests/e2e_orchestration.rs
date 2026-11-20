@@ -437,6 +437,8 @@ async fn create_agent_rpc(
                 base_ref: None,
                 worktree_mode: WorktreeCreateMode::BranchOff,
                 branch: None,
+                handle: None,
+                auto_cluster: Some(false),
             },
             Duration::from_secs(20),
             |w| matches!(w, WireMessage::AgentCreated { request_id, .. } if *request_id == req_id),
@@ -1094,6 +1096,9 @@ async fn scenario_07_worktree_lifecycle_includes_setup_service_proxy_and_teardow
             pr_number: None,
             parent_workspace_id: None,
             background: false,
+            mission_goal: None,
+            project_root: None,
+            allow_reuse_existing: false,
         })
         .await
         .expect("create worktree");

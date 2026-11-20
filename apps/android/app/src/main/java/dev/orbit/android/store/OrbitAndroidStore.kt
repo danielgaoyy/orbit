@@ -178,11 +178,13 @@ data class ComposerDraftState(
 enum class OrbitSidebarProjectSort(val label: String) {
     RECENT("Recent"),
     NAME("Name"),
+    MANUAL("Manual"),
     ;
 
     fun toFfi(): FfiSidebarProjectSort = when (this) {
         RECENT -> FfiSidebarProjectSort.RECENT
         NAME -> FfiSidebarProjectSort.ALPHABETICAL
+        MANUAL -> FfiSidebarProjectSort.MANUAL
     }
 }
 

@@ -16,6 +16,8 @@ pub enum AttentionState {
     Finished,
     Error,
     Permission,
+    /// Explicitly marked unread by the user (synced across all connected devices without regressing `read_seq`).
+    ManualUnread,
 }
 
 /// How an incoming prompt should be delivered when the target agent already has an active turn.
@@ -202,6 +204,9 @@ pub struct OrchestrationConfig {
     /// IDs of bundled orchestration skills synced to local agent skill directories.
     #[serde(default)]
     pub installed_skills: Vec<String>,
+    /// Automatically cluster closely related new conversations into existing Mission Workspaces (default: `true`).
+    #[serde(default = "default_true")]
+    pub auto_cluster_enabled: bool,
 }
 
 impl Default for OrchestrationConfig {
@@ -213,6 +218,7 @@ impl Default for OrchestrationConfig {
             resume_on_startup: false,
             resume_prompt: default_resume_prompt(),
             installed_skills: Vec::new(),
+            auto_cluster_enabled: true,
         }
     }
 }
@@ -413,4 +419,97 @@ pub struct WorkspaceSetupProgress {
     pub output_tail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Discovered nested Git repository inside a non-git parent or multi-directory project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NestedGitRepo {
+    pub path: String,
+    pub relative_path: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+}
+
+/// Daemon-authoritative saved project entry synced across all clients of a host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostProjectEntry {
+    pub project_id: String,
+    pub name: String,
+    pub directories: Vec<String>,
+    #[serde(default)]
+    pub sort_order: i64,
+    #[serde(default)]
+    pub hidden: bool,
+    pub updated_at_ms: i64,
+}
+
+/// Daemon-authoritative host-level UI preference snapshot synced across all connected devices.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSyncState {
+    #[serde(default)]
+    pub projects: Vec<HostProjectEntry>,
+    /// Ordered list of stable project keys (`project_id` or normalized `primary_cwd`) for Manual sidebar sort.
+    #[serde(default)]
+    pub project_order: Vec<String>,
+    /// Optional preferred sidebar sort mode (`"recent"`, `"alphabetical"`, `"manual"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_sort_mode: Option<String>,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+/// Auto-clustering recommendation or reversible auto-grouping metadata attached to a conversation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkspaceClusterSuggestion {
+    pub target_workspace_id: String,
+    pub target_workspace_title: String,
+    pub confidence: f32,
+    pub reason: String,
+    #[serde(default)]
+    pub auto_applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_workspace_id: Option<String>,
+}
+
+/// Shared Markdown Blackboard state for a Mission Workspace (`BOARD.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBoardSnapshot {
+    pub workspace_id: String,
+    pub content: String,
+    pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_path: Option<String>,
+}
+
+/// Category of an intra-workspace collaboration or conflict-radar event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceEventKind {
+    PeerJoined,
+    PeerFinished,
+    BoardUpdated,
+    PeerMessage,
+    FileEdited,
+    ConflictWarning,
+    WorkspaceMerged,
+}
+
+/// Persisted chronological activity record inside a Mission Workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceEventRecord {
+    pub seq: u64,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_handle: Option<String>,
+    pub kind: WorkspaceEventKind,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    pub created_at: DateTime<Utc>,
 }

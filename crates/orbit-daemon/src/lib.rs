@@ -19,6 +19,8 @@ pub mod messaging;
 pub mod scheduler;
 pub mod skills;
 pub mod tools;
+pub mod workspace_board;
+pub mod workspace_cluster;
 pub mod workspace_runtime;
 
 use std::collections::{HashMap, HashSet};
@@ -941,6 +943,15 @@ async fn run_client_session_loop(
                             None
                         }
                     }
+                    DaemonBroadcast::HostSyncStateUpdated(state) => {
+                        Some(WireMessage::HostSyncStateUpdated { state })
+                    }
+                    DaemonBroadcast::WorkspaceBoardUpdated(board) => {
+                        Some(WireMessage::WorkspaceBoardUpdated { board })
+                    }
+                    DaemonBroadcast::WorkspaceEventRecorded(event) => {
+                        Some(WireMessage::WorkspaceEventRecorded { event })
+                    }
                 };
                 if let Some(msg) = maybe_msg
                     && out_tx
@@ -1146,6 +1157,9 @@ async fn handle_wire_rpc(
                     pr_number,
                     parent_workspace_id,
                     background,
+                    project_root: None,
+                    mission_goal: None,
+                    allow_reuse_existing: true,
                 })
                 .await
             {
@@ -1164,7 +1178,12 @@ async fn handle_wire_rpc(
                     if let Some(ref k) = reserved_key {
                         let _ = runtime.store.delete_pending_receipt("ws_create", k);
                     }
-                    Some(rpc_err(request_id, "workspace_error", e))
+                    let err_code = if e.to_string().contains("not_a_git_repo") {
+                        "not_a_git_repo"
+                    } else {
+                        "workspace_error"
+                    };
+                    Some(rpc_err(request_id, err_code, e))
                 }
             }
         }
@@ -1247,6 +1266,37 @@ async fn handle_wire_rpc(
                 let _ = tx
                     .send(SessionFrame::Wire {
                         msg: WireMessage::GitStatusResponse { request_id, status },
+                        zstd,
+                    })
+                    .await;
+            });
+            None
+        }
+        WireMessage::InspectGitRepos {
+            request_id,
+            cwd,
+            extra_dirs,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let resolved = expand_host_path(&cwd);
+                let extra_paths: Vec<PathBuf> =
+                    extra_dirs.iter().map(|d| expand_host_path(d)).collect();
+                let (is_git_repo, git_branch, repos) = tokio::task::spawn_blocking(move || {
+                    crate::discovery::inspect_project_git_repos(&resolved, &extra_paths)
+                })
+                .await
+                .unwrap_or((false, None, Vec::new()));
+                let _ = tx
+                    .send(SessionFrame::Wire {
+                        msg: WireMessage::GitReposResponse {
+                            request_id,
+                            cwd,
+                            is_git_repo,
+                            git_branch,
+                            repos,
+                        },
                         zstd,
                     })
                     .await;
@@ -1364,6 +1414,8 @@ async fn handle_wire_rpc(
             base_ref,
             worktree_mode,
             branch,
+            handle,
+            auto_cluster,
         } => {
             let mut reserved_key: Option<String> = None;
             if let Some(ref idem) = idempotency_key
@@ -1439,6 +1491,8 @@ async fn handle_wire_rpc(
                     worktree_mode,
                     branch,
                     pr_number: None,
+                    handle,
+                    auto_cluster,
                 })
                 .await
             {
@@ -1471,7 +1525,12 @@ async fn handle_wire_rpc(
                     if let Some(ref k) = reserved_key {
                         let _ = runtime.store.delete_pending_receipt("agent_create", k);
                     }
-                    Some(rpc_err(request_id, "create_agent_failed", e))
+                    let err_code = if e.to_string().contains("not_a_git_repo") {
+                        "not_a_git_repo"
+                    } else {
+                        "create_agent_failed"
+                    };
+                    Some(rpc_err(request_id, err_code, e))
                 }
             }
         }
@@ -1524,6 +1583,14 @@ async fn handle_wire_rpc(
                     Err(e) => Some(rpc_err(request_id, "send_prompt_failed", e)),
                 }
             } else {
+                // Support `@all <message>` human broadcast to all sibling peers in the same Mission Workspace
+                let broadcast_body = prompt
+                    .trim_start()
+                    .strip_prefix("@all ")
+                    .or_else(|| prompt.trim_start().strip_prefix("@ALL "))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned);
                 match runtime
                     .orchestrator
                     .send_prompt_with_options(
@@ -1536,7 +1603,43 @@ async fn handle_wire_rpc(
                     )
                     .await
                 {
-                    Ok(()) => Some(WireMessage::Ack { request_id }),
+                    Ok(()) => {
+                        if let Some(body) = broadcast_body
+                            && let Ok(Some(cur_ag)) = runtime.store.get_agent(&agent_id)
+                            && let Ok(peers) = runtime.store.list_agents_filtered(
+                                Some(&cur_ag.workspace_id),
+                                false,
+                                false,
+                                None,
+                            )
+                        {
+                            for peer in peers {
+                                if peer.agent_id == agent_id {
+                                    continue;
+                                }
+                                let _ = runtime
+                                    .delivery
+                                    .enqueue(QueuedAgentMessage {
+                                        recipient_id: peer.agent_id,
+                                        message_id: format!("bc_{}", uuid::Uuid::new_v4().simple()),
+                                        source: AgentPromptSource {
+                                            kind: AgentMessageKind::DirectMessage,
+                                            source_agent_id: Some(agent_id.clone()),
+                                            source_host_id: Some(runtime.host_info.host_id.clone()),
+                                            source_title: Some("Workspace @all".into()),
+                                            event: Some("workspace_broadcast".into()),
+                                            permission_context: None,
+                                        },
+                                        body: body.clone(),
+                                        active_turn_behavior,
+                                        session_mode: None,
+                                        unarchive: true,
+                                    })
+                                    .await;
+                            }
+                        }
+                        Some(WireMessage::Ack { request_id })
+                    }
                     Err(e) => Some(rpc_err(request_id, "send_prompt_failed", e)),
                 }
             }
@@ -1630,9 +1733,34 @@ async fn handle_wire_rpc(
         WireMessage::MarkAgentRead {
             request_id,
             agent_id,
-        } => match runtime.orchestrator.mark_agent_read(&agent_id).await {
+            seen_seq,
+        } => match runtime
+            .orchestrator
+            .mark_agent_read(&agent_id, seen_seq)
+            .await
+        {
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "mark_read_failed", e)),
+        },
+        WireMessage::MarkAgentUnread {
+            request_id,
+            agent_id,
+        } => match runtime.orchestrator.mark_agent_unread(&agent_id).await {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "mark_unread_failed", e)),
+        },
+        WireMessage::SetAgentPinned {
+            request_id,
+            agent_id,
+            pinned,
+            pinned_order,
+        } => match runtime
+            .orchestrator
+            .set_agent_pinned(&agent_id, pinned, pinned_order)
+            .await
+        {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "set_pinned_failed", e)),
         },
         WireMessage::UpdateAgent {
             request_id,
@@ -1642,13 +1770,127 @@ async fn handle_wire_rpc(
             effort,
             mode,
             labels,
+            handle,
         } => match runtime
             .orchestrator
-            .update_agent(&agent_id, title, model, effort, mode, labels)
+            .update_agent(&agent_id, title, model, effort, mode, labels, handle)
             .await
         {
             Ok(_) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "update_agent_failed", e)),
+        },
+        WireMessage::GetHostSyncState { request_id } => {
+            match runtime.orchestrator.get_host_sync_state() {
+                Ok(state) => Some(WireMessage::HostSyncStateSnapshot { request_id, state }),
+                Err(e) => Some(rpc_err(request_id, "host_sync_error", e)),
+            }
+        }
+        WireMessage::UpsertHostProject {
+            request_id,
+            project,
+        } => match runtime.orchestrator.upsert_host_project(project) {
+            Ok(state) => Some(WireMessage::HostSyncStateSnapshot { request_id, state }),
+            Err(e) => Some(rpc_err(request_id, "upsert_host_project_failed", e)),
+        },
+        WireMessage::DeleteHostProject {
+            request_id,
+            project_id,
+        } => match runtime.orchestrator.delete_host_project(&project_id) {
+            Ok(state) => Some(WireMessage::HostSyncStateSnapshot { request_id, state }),
+            Err(e) => Some(rpc_err(request_id, "delete_host_project_failed", e)),
+        },
+        WireMessage::SetHostProjectOrder {
+            request_id,
+            project_order,
+            project_sort_mode,
+        } => match runtime
+            .orchestrator
+            .set_host_project_order(project_order, project_sort_mode)
+        {
+            Ok(state) => Some(WireMessage::HostSyncStateSnapshot { request_id, state }),
+            Err(e) => Some(rpc_err(request_id, "set_project_order_failed", e)),
+        },
+        WireMessage::GetWorkspaceBoard {
+            request_id,
+            workspace_id,
+        } => match runtime.orchestrator.get_workspace_board(&workspace_id) {
+            Ok(board) => Some(WireMessage::WorkspaceBoardSnapshot { request_id, board }),
+            Err(e) => Some(rpc_err(request_id, "get_board_failed", e)),
+        },
+        WireMessage::UpdateWorkspaceBoard {
+            request_id,
+            workspace_id,
+            content,
+            section,
+            updated_by,
+        } => match runtime.orchestrator.update_workspace_board(
+            &workspace_id,
+            &content,
+            section.as_deref(),
+            updated_by.as_deref().or(Some("user")),
+            None,
+        ) {
+            Ok(board) => Some(WireMessage::WorkspaceBoardSnapshot { request_id, board }),
+            Err(e) => Some(rpc_err(request_id, "update_board_failed", e)),
+        },
+        WireMessage::ListWorkspaceEvents {
+            request_id,
+            workspace_id,
+            limit,
+        } => match runtime
+            .orchestrator
+            .list_workspace_events(&workspace_id, limit.unwrap_or(50) as usize)
+        {
+            Ok(events) => Some(WireMessage::WorkspaceEventsSnapshot {
+                request_id,
+                workspace_id,
+                events,
+            }),
+            Err(e) => Some(rpc_err(request_id, "list_ws_events_failed", e)),
+        },
+        WireMessage::UpdateWorkspaceGoal {
+            request_id,
+            workspace_id,
+            title,
+            mission_goal,
+        } => match runtime
+            .orchestrator
+            .update_workspace_goal(&workspace_id, title, mission_goal)
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "update_ws_goal_failed", e)),
+        },
+        WireMessage::MoveAgentToWorkspace {
+            request_id,
+            agent_id,
+            target_workspace_id,
+            new_workspace_title,
+        } => match runtime
+            .orchestrator
+            .move_agent_to_workspace(&agent_id, target_workspace_id, new_workspace_title)
+            .await
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "move_agent_failed", e)),
+        },
+        WireMessage::MergeWorkspaces {
+            request_id,
+            source_workspace_id,
+            target_workspace_id,
+        } => match runtime
+            .orchestrator
+            .merge_workspaces(&source_workspace_id, &target_workspace_id)
+            .await
+        {
+            Ok(_) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "merge_workspaces_failed", e)),
+        },
+        WireMessage::DismissClusterSuggestion {
+            request_id,
+            agent_id,
+        } => match runtime.orchestrator.dismiss_cluster_suggestion(&agent_id) {
+            Ok(()) => Some(WireMessage::Ack { request_id }),
+            Err(e) => Some(rpc_err(request_id, "dismiss_cluster_failed", e)),
         },
         WireMessage::ListPendingPermissions {
             request_id,

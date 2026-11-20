@@ -1282,3 +1282,347 @@ async fn test_04_auto_clustering_high_medium_unrelated_and_reversible_undo() {
     drop_core(core).await;
     drop(rt);
 }
+
+// ============================================================================
+// TEST 5: First-Class Workspace CRUD, Unclassified (`待归类`) Inbox, AI Auto-Triage,
+//         Disband-to-Inbox, and Semantic Editable/Locked Tab Handles
+// ============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_05_workspace_management_unclassified_inbox_ai_triage_and_tab_rename() {
+    ensure_mock_claude_installed();
+    let home = new_temp_dir("ux_home");
+    let repo = new_temp_dir("ux_repo");
+    init_git_repo(&repo, "main");
+    let repo_str = repo.to_string_lossy().to_string();
+
+    let (addr, rt) = spawn_embedded_daemon(home.to_path_buf(), None)
+        .await
+        .expect("daemon");
+    let uri = rt
+        .build_pairing_offer(vec![format!("ws://{addr}/ws")], None)
+        .to_qr_uri()
+        .expect("pair uri");
+
+    let (client_a, host_id) = open_and_connect_core(home.join("ux_a.db"), uri.clone()).await;
+    let (client_b, _) = open_and_connect_core(home.join("ux_b.db"), uri).await;
+
+    // 1. Manually create an EMPTY curated Mission Workspace -> visible on BOTH clients with peer_count == 0
+    client_a.create_mission_workspace(
+        &host_id,
+        &repo_str,
+        "支付网关重构".into(),
+        Some("统一 Stripe 与 Alipay 回调幂等逻辑".into()),
+        orbit_protocol::WorkspaceIsolation::Local,
+        None,
+        None,
+    );
+
+    let empty_ws_synced = wait_until(Duration::from_secs(12), || {
+        let a = Arc::clone(&client_a);
+        let b = Arc::clone(&client_b);
+        let hid = host_id.clone();
+        async move {
+            let check = |core: &OrbitAppCore| {
+                let sb = core.fleet_sidebar(
+                    SidebarProjectSort::Recent,
+                    SidebarThreadFilter::All,
+                    "",
+                    Some(hid.as_str()),
+                    None,
+                    None,
+                );
+                sb.projects.iter().any(|p| {
+                    p.workspaces
+                        .iter()
+                        .any(|w| w.title == "支付网关重构" && w.is_curated && w.peer_count == 0)
+                })
+            };
+            check(&a) && check(&b)
+        }
+    })
+    .await;
+    assert!(
+        empty_ws_synced,
+        "Manually created empty curated Workspace must sync and appear in both Client A & Client B sidebars"
+    );
+
+    let manual_ws_id = rt
+        .store
+        .list_workspaces_filtered(false, false)
+        .expect("ws list")
+        .into_iter()
+        .find(|w| w.title == "支付网关重构")
+        .expect("manual ws")
+        .workspace_id;
+
+    // 2. Rename Workspace -> syncs across devices
+    client_a.rename_workspace(&host_id, &manual_ws_id, "支付中心 v2");
+    let renamed_ok = wait_until(Duration::from_secs(10), || {
+        let b = Arc::clone(&client_b);
+        let hid = host_id.clone();
+        let wid = manual_ws_id.clone();
+        async move {
+            b.host_detail(&hid)
+                .and_then(|d| d.workspaces.into_iter().find(|w| w.workspace_id == wid))
+                .is_some_and(|w| w.title == "支付中心 v2" && w.is_curated && w.title_locked)
+        }
+    })
+    .await;
+    assert!(renamed_ok, "Renamed workspace must sync to Client B");
+
+    // 3. Create 2 unclassified conversations sharing a distinct topic ("剪贴板图片上传") with auto_cluster=false
+    for prompt in [
+        "请帮我排查剪贴板图片上传失败导致 clipboard_upload.rs 超时的问题",
+        "继续补齐 clipboard_upload.rs 剪贴板图片上传的单元测试与重试逻辑",
+    ] {
+        client_a.create_agent_with_profile(
+            CreateAgentRequest {
+                host_id: &host_id,
+                cwd: &repo_str,
+                extra_dirs: Vec::new(),
+                provider: ProviderKind::ClaudeCode,
+                model: None,
+                effort: None,
+                mode: SessionMode::AcceptEdits,
+                initial_prompt: prompt,
+                initial_display_prompt: None,
+                initial_badges: Vec::new(),
+                worktree_branch: None,
+                workspace_id: None,
+                handle: None,
+                auto_cluster: Some(false),
+            },
+            None,
+        );
+    }
+
+    // Both must settle in `unclassified_conversations` (`待归类`), NOT inside curated `workspaces`,
+    // and their initial handles must be semantic (NOT generic `agy`/`claude`/`codex`/`lead`/`peer`)!
+    let unclassified_ready = wait_until(Duration::from_secs(15), || {
+        let a = Arc::clone(&client_a);
+        let hid = host_id.clone();
+        async move {
+            let sb = a.fleet_sidebar(
+                SidebarProjectSort::Recent,
+                SidebarThreadFilter::All,
+                "",
+                Some(hid.as_str()),
+                None,
+                None,
+            );
+            sb.projects.iter().any(|p| {
+                p.unclassified_conversations.len() == 2
+                    && p.unclassified_conversations
+                        .iter()
+                        .all(|c| !c.agent.is_running)
+            })
+        }
+    })
+    .await;
+    assert!(
+        unclassified_ready,
+        "New standalone conversations must appear in `unclassified_conversations` (`待归类`)"
+    );
+
+    let unclassified_agents = rt
+        .store
+        .list_agents_filtered(None, false, false, None)
+        .expect("agents");
+    assert_eq!(unclassified_agents.len(), 2);
+    for ag in &unclassified_agents {
+        let h = ag.handle.as_deref().unwrap_or("");
+        assert!(
+            !orbit_daemon::workspace_cluster::is_generic_harness_handle(h),
+            "New session handle must be semantic, not generic harness name: got `{h}`"
+        );
+        // Verify unclassified container has is_curated == false and did NOT inject <orbit-workspace>
+        let ws = rt
+            .store
+            .get_workspace(&ag.workspace_id)
+            .expect("get ws")
+            .expect("ws");
+        assert!(
+            !ws.is_curated,
+            "Unclassified session container must have is_curated=false"
+        );
+        let reply = rt
+            .store
+            .last_assistant_message_text(&ag.agent_id)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        assert!(
+            !reply.contains("<orbit-workspace"),
+            "Unclassified conversations must NEVER inject <orbit-workspace> XML"
+        );
+    }
+
+    // 4. Trigger AI Auto-Triage (`organize_project_workspaces`) on the project
+    client_a.organize_project_workspaces(&host_id, &repo_str, Vec::new(), true);
+    let organized_ok = wait_until(Duration::from_secs(15), || {
+        let b = Arc::clone(&client_b);
+        let hid = host_id.clone();
+        let root = repo_str.clone();
+        async move {
+            let Some(detail) = b.host_detail(&hid) else {
+                return false;
+            };
+            let phase_done = detail
+                .workspace_organize_status
+                .get(&root)
+                .is_some_and(|ev| ev.phase == orbit_protocol::WorkspaceOrganizePhase::Completed);
+            let sb = b.fleet_sidebar(
+                SidebarProjectSort::Recent,
+                SidebarThreadFilter::All,
+                "",
+                Some(hid.as_str()),
+                None,
+                None,
+            );
+            let grouped = sb.projects.iter().any(|p| {
+                p.unclassified_conversations.is_empty()
+                    && p.workspaces
+                        .iter()
+                        .any(|w| w.is_curated && w.peer_count == 2)
+            });
+            phase_done && grouped
+        }
+    })
+    .await;
+    assert!(
+        organized_ok,
+        "AI Auto-Triage must group both related unclassified conversations into one curated Workspace and clear `待归类`"
+    );
+
+    let ag1_id = unclassified_agents[0].agent_id.clone();
+    let ag2_id = unclassified_agents[1].agent_id.clone();
+    let ag1_after_org = rt.store.get_agent(&ag1_id).expect("get").expect("ag1");
+    let grouped_ws_id = ag1_after_org.workspace_id.clone();
+    assert!(
+        ag1_after_org
+            .task_summary
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "AI Organizer must populate 1-line `task_summary`"
+    );
+
+    // 5. Manually switch ag1 into the manually created Workspace (`支付中心 v2`)
+    client_a.move_agent_to_workspace_v2(&host_id, &ag1_id, Some(manual_ws_id.clone()), None, false);
+    let moved_ok = wait_until(Duration::from_secs(10), || {
+        let b = Arc::clone(&client_b);
+        let hid = host_id.clone();
+        let aid = ag1_id.clone();
+        let dst = manual_ws_id.clone();
+        async move {
+            b.host_detail(&hid)
+                .and_then(|d| d.agents.into_iter().find(|a| a.agent_id == aid))
+                .is_some_and(|a| a.workspace_id == dst)
+        }
+    })
+    .await;
+    assert!(moved_ok, "Manual workspace switch must sync to Client B");
+
+    // 6. Move ag1 back to `待归类` (`make_unclassified = true`)
+    client_a.move_agent_to_workspace_v2(&host_id, &ag1_id, None, None, true);
+    let back_to_inbox = wait_until(Duration::from_secs(10), || {
+        let b = Arc::clone(&client_b);
+        let hid = host_id.clone();
+        let aid = ag1_id.clone();
+        async move {
+            let sb = b.fleet_sidebar(
+                SidebarProjectSort::Recent,
+                SidebarThreadFilter::All,
+                "",
+                Some(hid.as_str()),
+                None,
+                None,
+            );
+            sb.projects.iter().any(|p| {
+                p.unclassified_conversations
+                    .iter()
+                    .any(|c| c.agent.agent_id == aid)
+            })
+        }
+    })
+    .await;
+    assert!(
+        back_to_inbox,
+        "Moving agent with make_unclassified=true must return it cleanly to `待归类`"
+    );
+
+    // 7. Disband `grouped_ws_id` (`keep_agents_unclassified = true`) -> ag2 returns to `待归类` without archiving!
+    client_a.archive_workspace_v2(&host_id, &grouped_ws_id, true);
+    let disbanded_ok = wait_until(Duration::from_secs(10), || {
+        let b = Arc::clone(&client_b);
+        let hid = host_id.clone();
+        let aid2 = ag2_id.clone();
+        let disbanded = grouped_ws_id.clone();
+        async move {
+            let sb = b.fleet_sidebar(
+                SidebarProjectSort::Recent,
+                SidebarThreadFilter::All,
+                "",
+                Some(hid.as_str()),
+                None,
+                None,
+            );
+            sb.projects.iter().any(|p| {
+                !p.workspaces.iter().any(|w| w.workspace_id == disbanded)
+                    && p.unclassified_conversations
+                        .iter()
+                        .any(|c| c.agent.agent_id == aid2)
+            })
+        }
+    })
+    .await;
+    assert!(
+        disbanded_ok,
+        "Disbanding a Workspace must archive the Workspace while keeping its sessions alive in `待归类`"
+    );
+
+    // 8. Manual Tab Handle Rename + Lock (`orbit.handle_locked=1`) must survive subsequent `summarize_agent`!
+    client_a.update_agent_identity(
+        &host_id,
+        &ag1_id,
+        Some("剪贴板修复".into()),
+        None,
+        None,
+        true,
+        false,
+    );
+    let locked_ok = wait_until(Duration::from_secs(10), || {
+        let store = rt.store.clone();
+        let aid = ag1_id.clone();
+        async move {
+            store.get_agent(&aid).ok().flatten().is_some_and(|a| {
+                a.handle.as_deref() == Some("剪贴板修复")
+                    && a.labels.get("orbit.handle_locked").map(String::as_str) == Some("1")
+            })
+        }
+    })
+    .await;
+    assert!(
+        locked_ok,
+        "Manual CJK tab handle rename must persist with lock label"
+    );
+
+    client_a.summarize_agent(&host_id, &ag1_id);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let after_resum = rt.store.get_agent(&ag1_id).expect("get").expect("ag1");
+    assert_eq!(
+        after_resum.handle.as_deref(),
+        Some("剪贴板修复"),
+        "User-locked tab handle must NEVER be overwritten by AI summarize"
+    );
+    assert!(
+        after_resum
+            .task_summary
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "AI summarize must maintain live task_summary"
+    );
+
+    drop_core(client_a).await;
+    drop_core(client_b).await;
+    drop(rt);
+}

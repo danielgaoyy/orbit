@@ -249,6 +249,7 @@ export interface OrbitUiState {
   draftUseWorktree: boolean;
   draftWorktreeBranch: string;
   draftWorktreeRepoPath: string | null;
+  draftWorkspaceId: string | null;
   gitReposCache: Record<string, GitReposInspectionView>;
 
   // Composer drafts, slash workflow directives, context mentions, pasted attachments, diff quotes, and queued prompts
@@ -534,6 +535,7 @@ let state: OrbitUiState = {
   draftUseWorktree: initialPrefs.draftUseWorktree ?? true,
   draftWorktreeBranch: "",
   draftWorktreeRepoPath: null,
+  draftWorkspaceId: null,
   gitReposCache: {},
 
   composerDrafts: {},
@@ -1874,6 +1876,7 @@ export const orbitActions = {
     cwd?: string,
     prefillPrompt?: string,
     prefillSlash?: SlashDirective | null,
+    workspaceId?: string | null,
   ): void {
     pendingDraftCreate = null;
     const targetHostId = hostId ?? state.selectedHostId ?? state.fleet.hosts[0]?.host_id ?? null;
@@ -1901,6 +1904,7 @@ export const orbitActions = {
       isDraftNewSession: true,
       selectedWorkspaceCwd: defaultCwd || "~",
       draftWorktreeRepoPath: null,
+      draftWorkspaceId: workspaceId ?? null,
       draftProvider: nextProvider,
       commandPaletteOpen: false,
       ...(prefillPrompt !== undefined
@@ -1956,6 +1960,7 @@ export const orbitActions = {
       selectedWorkspaceCwd: cwd,
       selectedDiffPath: null,
       draftWorktreeRepoPath: null,
+      draftWorkspaceId: null,
     }));
     if (state.selectedHostId && cwd && cwd !== "~") {
       void orbitActions.refreshGit(state.selectedHostId, cwd, null, state.diffStaged);
@@ -1973,6 +1978,7 @@ export const orbitActions = {
       selectedWorkspaceCwd: cwd,
       selectedDiffPath: null,
       draftWorktreeRepoPath: null,
+      draftWorkspaceId: null,
       draftProvider:
         avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
     }));
@@ -1992,6 +1998,7 @@ export const orbitActions = {
     useWorktree?: boolean;
     worktreeBranch?: string;
     worktreeRepoPath?: string | null;
+    workspaceId?: string | null;
   }): void {
     setState(
       (s) => {
@@ -2020,6 +2027,8 @@ export const orbitActions = {
               : patch.useWorktree === false
                 ? null
                 : s.draftWorktreeRepoPath,
+          draftWorkspaceId:
+            patch.workspaceId !== undefined ? patch.workspaceId : s.draftWorkspaceId,
         };
       },
       true,
@@ -2739,6 +2748,7 @@ export const orbitActions = {
           initialBadges: badges,
           worktreeBranch,
           profileId: state.draftProfileId,
+          workspaceId: state.draftWorkspaceId,
         });
       } catch (err) {
         pendingDraftCreate = null;
@@ -2755,6 +2765,7 @@ export const orbitActions = {
         ...s,
         draftProvider: effectiveProvider,
         draftWorktreeBranch: "",
+        draftWorkspaceId: null,
       }));
       return;
     }
@@ -5108,19 +5119,98 @@ export const orbitActions = {
     const trimmed = title.trim();
     if (!trimmed) return;
     await orbitIpc.renameWorkspace(hostId, workspaceId, trimmed);
-    notifyToast(`Workspace renamed to "${trimmed}"`);
+    orbitActions.refreshSidebarView();
+    notifyToast(`Workspace 已重命名为 "${trimmed}"`);
+  },
+
+  async createMissionWorkspace(params: {
+    hostId: string;
+    sourceCwd: string;
+    title: string;
+    missionGoal?: string | null;
+    isolation?: "local" | "worktree";
+    worktreeBranch?: string | null;
+  }): Promise<void> {
+    const trimmed = params.title.trim();
+    if (!trimmed) return;
+    await orbitIpc.createMissionWorkspace({
+      hostId: params.hostId,
+      sourceCwd: params.sourceCwd,
+      title: trimmed,
+      missionGoal: params.missionGoal ?? null,
+      isolation: params.isolation ?? "local",
+      worktreeBranch: params.worktreeBranch ?? null,
+    });
+    orbitActions.refreshSidebarView();
+    notifyToast(`已创建 Workspace「${trimmed}」`);
+  },
+
+  async archiveWorkspace(
+    hostId: string,
+    workspaceId: string,
+    keepAgentsUnclassified = false,
+  ): Promise<void> {
+    await orbitIpc.archiveWorkspace(hostId, workspaceId, keepAgentsUnclassified);
+    orbitActions.refreshSidebarView();
+    notifyToast(
+      keepAgentsUnclassified
+        ? "已解散 Workspace，会话已移回「待归类」"
+        : "已归档 Workspace",
+    );
   },
 
   async moveAgentToWorkspace(
     hostId: string,
     agentId: string,
     targetWorkspaceId?: string | null,
+    opts?: { newWorkspaceTitle?: string | null; makeUnclassified?: boolean },
   ): Promise<void> {
-    await orbitIpc.moveAgentToWorkspace(hostId, agentId, targetWorkspaceId ?? null);
+    await orbitIpc.moveAgentToWorkspace(hostId, agentId, targetWorkspaceId ?? null, opts);
     orbitActions.refreshSidebarView();
     notifyToast(
-      targetWorkspaceId ? "Moved conversation into workspace" : "Split into its own workspace",
+      opts?.makeUnclassified
+        ? "已移回「待归类」"
+        : targetWorkspaceId
+          ? "已切换会话到目标 Workspace"
+          : opts?.newWorkspaceTitle
+            ? `已新建并移入「${opts.newWorkspaceTitle}」`
+            : "已移入独立 Workspace",
     );
+  },
+
+  async organizeProjectWorkspaces(
+    hostId: string,
+    projectRoot: string,
+    agentIds: string[] = [],
+    autoApply = true,
+  ): Promise<void> {
+    await orbitIpc.organizeProjectWorkspaces(hostId, projectRoot, agentIds, autoApply);
+    notifyToast(
+      agentIds.length === 1 ? "AI 正在理解会话并归类…" : "AI 正在自动归类待归类会话…",
+    );
+  },
+
+  async summarizeAgent(hostId: string, agentId: string): Promise<void> {
+    await orbitIpc.summarizeAgent(hostId, agentId);
+    notifyToast("AI 正在生成会话标签与摘要…");
+  },
+
+  async updateAgentIdentity(params: {
+    hostId: string;
+    agentId: string;
+    handle?: string | null;
+    title?: string | null;
+    taskSummary?: string | null;
+    lockHandle?: boolean;
+    lockTitle?: boolean;
+  }): Promise<void> {
+    await orbitIpc.updateAgentIdentity(params);
+    orbitActions.refreshSidebarView();
+    if (params.handle) {
+      notifyToast(`已更新会话标签为「${params.handle.trim().replace(/^@+/, "")}」`);
+    } else if (params.taskSummary !== undefined) {
+      notifyToast("已更新会话摘要");
+    }
   },
 
   async mergeWorkspaces(

@@ -130,6 +130,10 @@ pub fn build_workspace_roster_context(
     recent_events: &[WorkspaceEventRecord],
     board: Option<&WorkspaceBoardSnapshot>,
 ) -> Option<(String, String)> {
+    if !workspace.is_curated {
+        return None;
+    }
+
     let active_peers: Vec<&AgentSummary> = peers
         .iter()
         .filter(|a| a.archived_at.is_none() && !a.background)
@@ -184,11 +188,18 @@ pub fn build_workspace_roster_context(
         }
         let handle = peer.handle.as_deref().unwrap_or("peer");
         let status_slug = status_short_slug(&peer.status);
-        let last_summary = store
-            .last_assistant_message_text(&peer.agent_id)
-            .ok()
-            .flatten()
-            .map(|s| single_line_excerpt(&s, 140))
+        let last_summary = peer
+            .task_summary
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| single_line_excerpt(s, 140))
+            .or_else(|| {
+                store
+                    .last_assistant_message_text(&peer.agent_id)
+                    .ok()
+                    .flatten()
+                    .map(|s| single_line_excerpt(&s, 140))
+            })
             .unwrap_or_else(|| single_line_excerpt(&peer.title, 100));
         xml.push_str(&format!(
             "    <peer handle=\"@{}\" agent-id=\"{}\" provider=\"{}\" status=\"{}\" cwd=\"{}\">{}</peer>\n",

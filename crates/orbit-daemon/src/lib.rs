@@ -21,6 +21,7 @@ pub mod skills;
 pub mod tools;
 pub mod workspace_board;
 pub mod workspace_cluster;
+pub mod workspace_organizer;
 pub mod workspace_runtime;
 
 use std::collections::{HashMap, HashSet};
@@ -954,6 +955,9 @@ async fn run_client_session_loop(
                     DaemonBroadcast::WorkspaceEventRecorded(event) => {
                         Some(WireMessage::WorkspaceEventRecorded { event })
                     }
+                    DaemonBroadcast::WorkspaceOrganizeProgress(event) => {
+                        Some(WireMessage::WorkspaceOrganizeProgress { event })
+                    }
                 };
                 if let Some(msg) = maybe_msg
                     && out_tx
@@ -1099,6 +1103,9 @@ async fn handle_wire_rpc(
             parent_workspace_id,
             background,
             idempotency_key,
+            is_curated,
+            mission_goal,
+            project_root,
         } => {
             let mut reserved_key: Option<String> = None;
             if let Some(ref idem) = idempotency_key
@@ -1113,6 +1120,7 @@ async fn handle_wire_rpc(
                     "worktree_mode": worktree_mode,
                     "pr_number": pr_number,
                     "background": background,
+                    "is_curated": is_curated,
                 }));
                 match runtime
                     .store
@@ -1147,6 +1155,7 @@ async fn handle_wire_rpc(
                 }
             }
 
+            let effective_curated = is_curated.unwrap_or(false);
             match runtime
                 .orchestrator
                 .create_workspace_v2(CreateWorkspaceSpec {
@@ -1159,9 +1168,10 @@ async fn handle_wire_rpc(
                     pr_number,
                     parent_workspace_id,
                     background,
-                    project_root: None,
-                    mission_goal: None,
-                    allow_reuse_existing: true,
+                    project_root,
+                    mission_goal,
+                    allow_reuse_existing: !effective_curated,
+                    is_curated: effective_curated,
                 })
                 .await
             {
@@ -1204,7 +1214,12 @@ async fn handle_wire_rpc(
         WireMessage::ArchiveWorkspace {
             request_id,
             workspace_id,
-        } => match runtime.orchestrator.archive_workspace(&workspace_id).await {
+            keep_agents_unclassified,
+        } => match runtime
+            .orchestrator
+            .archive_workspace_with_options(&workspace_id, keep_agents_unclassified)
+            .await
+        {
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "archive_workspace_failed", e)),
         },
@@ -1850,9 +1865,19 @@ async fn handle_wire_rpc(
             mode,
             labels,
             handle,
+            task_summary,
         } => match runtime
             .orchestrator
-            .update_agent(&agent_id, title, model, effort, mode, labels, handle)
+            .update_agent(
+                &agent_id,
+                title,
+                model,
+                effort,
+                mode,
+                labels,
+                handle,
+                task_summary,
+            )
             .await
         {
             Ok(_) => Some(WireMessage::Ack { request_id }),
@@ -1944,9 +1969,15 @@ async fn handle_wire_rpc(
             agent_id,
             target_workspace_id,
             new_workspace_title,
+            make_unclassified,
         } => match runtime
             .orchestrator
-            .move_agent_to_workspace(&agent_id, target_workspace_id, new_workspace_title)
+            .move_agent_to_workspace_v2(
+                &agent_id,
+                target_workspace_id,
+                new_workspace_title,
+                make_unclassified,
+            )
             .await
         {
             Ok(_) => Some(WireMessage::Ack { request_id }),
@@ -1971,6 +2002,48 @@ async fn handle_wire_rpc(
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "dismiss_cluster_failed", e)),
         },
+        WireMessage::OrganizeProjectWorkspaces {
+            request_id,
+            project_root,
+            agent_ids,
+            auto_apply,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match orch
+                    .organize_project_workspaces(
+                        Some(request_id),
+                        &project_root,
+                        agent_ids,
+                        auto_apply,
+                    )
+                    .await
+                {
+                    Ok(_) => WireMessage::Ack { request_id },
+                    Err(e) => rpc_err(request_id, "organize_workspaces_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::SummarizeAgent {
+            request_id,
+            agent_id,
+        } => {
+            let orch = Arc::clone(&runtime.orchestrator);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match orch.summarize_agent(&agent_id).await {
+                    Ok(_) => WireMessage::Ack { request_id },
+                    Err(e) => rpc_err(request_id, "summarize_agent_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::ListPendingPermissions {
             request_id,
             agent_id,

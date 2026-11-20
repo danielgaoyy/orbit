@@ -11,6 +11,10 @@ use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: u32 = 4;
 
+fn wire_default_true() -> bool {
+    true
+}
+
 /// First-class supported coding agent CLIs in Orbit Phase 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -226,6 +230,9 @@ pub struct WorkspaceSummary {
     /// Whether this workspace has absorbed auto-clustered sessions.
     #[serde(default)]
     pub auto_clustered: bool,
+    /// `true` for explicit/curated Mission Workspaces; `false` for unclassified inbox containers (`待归类`).
+    #[serde(default)]
+    pub is_curated: bool,
 }
 
 /// Auto-discovered local project / Git repository choice for zero-typing UI selection.
@@ -344,6 +351,9 @@ pub struct AgentSummary {
     /// Optional auto-clustering recommendation or reversible auto-group banner metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cluster_suggestion: Option<WorkspaceClusterSuggestion>,
+    /// Concise 1-line AI-generated (or user-edited) summary of what this conversation is currently doing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_summary: Option<String>,
 }
 
 /// Active detached PTY terminal summary.
@@ -604,6 +614,15 @@ pub enum WireMessage {
         background: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
+        /// Explicit curated flag (`Some(true)` for user-created Mission Workspaces).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        is_curated: Option<bool>,
+        /// Optional one-line mission goal for a curated Mission Workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mission_goal: Option<String>,
+        /// Optional logical project root (defaults to `source_cwd`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
     },
     WorkspaceCreated {
         request_id: Uuid,
@@ -623,6 +642,9 @@ pub enum WireMessage {
     ArchiveWorkspace {
         request_id: Uuid,
         workspace_id: String,
+        /// When `true`, disbands the workspace and moves its active conversations back to `待归类` instead of archiving them.
+        #[serde(default)]
+        keep_agents_unclassified: bool,
     },
     UnarchiveWorkspace {
         request_id: Uuid,
@@ -914,6 +936,8 @@ pub enum WireMessage {
         labels: Option<HashMap<String, String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_summary: Option<String>,
     },
     ListPendingPermissions {
         request_id: Uuid,
@@ -1357,11 +1381,14 @@ pub enum WireMessage {
     MoveAgentToWorkspace {
         request_id: Uuid,
         agent_id: String,
-        /// Target workspace ID; `None` splits the agent into a fresh standalone Mission Workspace.
+        /// Target workspace ID; `None` splits the agent into a fresh curated Mission Workspace (or `待归类` when `make_unclassified == true`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_workspace_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         new_workspace_title: Option<String>,
+        /// When `true`, removes the agent from its curated Mission Workspace and places it in `待归类`.
+        #[serde(default)]
+        make_unclassified: bool,
     },
     MergeWorkspaces {
         request_id: Uuid,
@@ -1371,6 +1398,24 @@ pub enum WireMessage {
     DismissClusterSuggestion {
         request_id: Uuid,
         agent_id: String,
+    },
+    /// Trigger AI-assisted classification & semantic summarization for unclassified sessions in a project.
+    OrganizeProjectWorkspaces {
+        request_id: Uuid,
+        project_root: String,
+        #[serde(default)]
+        agent_ids: Vec<String>,
+        #[serde(default = "wire_default_true")]
+        auto_apply: bool,
+    },
+    /// Trigger AI-assisted semantic tab handle & 1-line live summary update for a single conversation.
+    SummarizeAgent {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    /// Broadcast progress/completion update for AI workspace organization.
+    WorkspaceOrganizeProgress {
+        event: WorkspaceOrganizeEvent,
     },
 
     RpcError {
@@ -1800,6 +1845,7 @@ mod tests {
                 pinned_order: 0,
                 handle: Some("lead".into()),
                 cluster_suggestion: None,
+                task_summary: None,
             },
             to_before_seq: 42,
             events: Vec::new(),

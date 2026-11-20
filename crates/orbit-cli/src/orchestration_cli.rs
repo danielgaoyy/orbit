@@ -770,6 +770,9 @@ pub async fn cmd_workspace(
                     parent_workspace_id: None,
                     background: false,
                     idempotency_key: None,
+                    is_curated: Some(true),
+                    mission_goal: None,
+                    project_root: None,
                 },
                 60,
             )
@@ -817,6 +820,7 @@ pub async fn cmd_workspace(
                 WireMessage::ArchiveWorkspace {
                     request_id: req_id,
                     workspace_id: workspace_id.clone(),
+                    keep_agents_unclassified: false,
                 },
                 60,
             )

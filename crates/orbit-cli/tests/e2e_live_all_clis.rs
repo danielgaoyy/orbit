@@ -655,6 +655,224 @@ async fn live_all_three_clis_mission_workspace_sync_and_nested_worktree() {
         "Device B sidebar must display all 3 CLIs (Claude + Codex + Antigravity) united inside one multi-agent Mission Workspace"
     );
 
+    // Step 6: Live Real-LLM Semantic Summarization, Tab Lock, Manual Workspace CRUD & AI Auto-Triage!
+    // 6A. Create an empty curated Workspace manually + rename it, and verify sync to Device B
+    device_a.create_mission_workspace(
+        &host_id,
+        &parent_str,
+        "缓存优化临时名".into(),
+        Some("评估 TTL 缓存与限流协同".into()),
+        orbit_protocol::WorkspaceIsolation::Local,
+        None,
+        None,
+    );
+    let empty_ws_id = {
+        let ok = wait_until(Duration::from_secs(10), || {
+            let b = Arc::clone(&device_b);
+            let hid = host_id.clone();
+            async move {
+                let sb = b.fleet_sidebar(
+                    SidebarProjectSort::Manual,
+                    SidebarThreadFilter::All,
+                    "",
+                    Some(hid.as_str()),
+                    None,
+                    None,
+                );
+                sb.projects.iter().any(|p| {
+                    p.workspaces
+                        .iter()
+                        .any(|w| w.title == "缓存优化临时名" && w.is_curated && w.peer_count == 0)
+                })
+            }
+        })
+        .await;
+        assert!(ok, "Empty manually created Workspace must sync to Device B");
+        rt.store
+            .list_workspaces_filtered(false, false)
+            .expect("ws")
+            .into_iter()
+            .find(|w| w.title == "缓存优化临时名")
+            .expect("empty ws")
+            .workspace_id
+    };
+    device_a.rename_workspace(&host_id, &empty_ws_id, "缓存与限流专题");
+
+    // 6B. Launch 2 fresh unclassified sessions (no manual handle, no workspace_id, auto_cluster=false)
+    //     on a shared topic using Claude + Antigravity, then trigger REAL LLM `organize_project_workspaces`!
+    let initial_ids = [
+        architect.agent_id.clone(),
+        impl_peer.agent_id.clone(),
+        reviewer.agent_id.clone(),
+    ];
+    device_a.create_agent_with_profile(
+        CreateAgentRequest {
+            host_id: &host_id,
+            cwd: &nested_repo.to_string_lossy(),
+            extra_dirs: vec![parent_str.clone()],
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            mode: SessionMode::FullAccess,
+            initial_prompt: "请用 2 句话说明如何在 TokenBucket 限流器前增加一层内存 TTL 缓存以减少热点 key 竞争（纯问答，不要读写或修改任何文件）。",
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch: None,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: Some(false),
+        },
+        None,
+    );
+    device_a.create_agent_with_profile(
+        CreateAgentRequest {
+            host_id: &host_id,
+            cwd: &nested_repo.to_string_lossy(),
+            extra_dirs: vec![parent_str.clone()],
+            provider: ProviderKind::Antigravity,
+            model: None,
+            effort: None,
+            mode: SessionMode::FullAccess,
+            initial_prompt: "请用 2 句话列出为 TokenBucket 前置内存 TTL 缓存编写单元测试时最关键的 3 个边界用例（纯问答，不要读写或修改任何文件）。",
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch: None,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: Some(false),
+        },
+        None,
+    );
+
+    let two_unclassified_settled = wait_until(Duration::from_secs(180), || {
+        let store = rt.store.clone();
+        let known = initial_ids.clone();
+        async move {
+            let Ok(all) = store.list_agents_filtered(None, false, false, None) else {
+                return false;
+            };
+            let newcomers: Vec<_> = all
+                .into_iter()
+                .filter(|a| !known.iter().any(|id| id == &a.agent_id))
+                .collect();
+            newcomers.len() == 2
+                && newcomers
+                    .iter()
+                    .all(|a| matches!(a.status, orbit_protocol::AgentStatus::Idle))
+        }
+    })
+    .await;
+    if !two_unclassified_settled {
+        let snap = rt
+            .store
+            .list_agents_filtered(None, false, false, None)
+            .unwrap_or_default();
+        for a in &snap {
+            println!(
+                "[LIVE E2E DIAG] agent={} provider={:?} status={:?} ws={} handle={:?}",
+                a.agent_id, a.provider, a.status, a.workspace_id, a.handle
+            );
+        }
+    }
+    assert!(
+        two_unclassified_settled,
+        "Both live unclassified conversations (Claude + AGY) must finish Turn 1"
+    );
+
+    let newcomers: Vec<_> = rt
+        .store
+        .list_agents_filtered(None, false, false, None)
+        .expect("agents")
+        .into_iter()
+        .filter(|a| !initial_ids.iter().any(|id| id == &a.agent_id))
+        .collect();
+    let nc_ids: Vec<String> = newcomers.iter().map(|a| a.agent_id.clone()).collect();
+
+    // Trigger REAL LLM `organize_project_workspaces` across the two live sessions!
+    device_a.organize_project_workspaces(&host_id, &parent_str, nc_ids.clone(), true);
+    let ai_triage_done = wait_until(Duration::from_secs(120), || {
+        let b = Arc::clone(&device_b);
+        let hid = host_id.clone();
+        let root = parent_str.clone();
+        async move {
+            b.host_detail(&hid)
+                .and_then(|d| d.workspace_organize_status.get(&root).cloned())
+                .is_some_and(|ev| {
+                    ev.request_id.is_some()
+                        && ev.phase == orbit_protocol::WorkspaceOrganizePhase::Completed
+                })
+        }
+    })
+    .await;
+    assert!(
+        ai_triage_done,
+        "Real LLM organize_project_workspaces must complete cleanly"
+    );
+
+    for aid in &nc_ids {
+        let ag = rt.store.get_agent(aid).expect("get").expect("agent");
+        let h = ag.handle.as_deref().unwrap_or("");
+        let summary = ag.task_summary.as_deref().unwrap_or("");
+        println!(
+            "[LIVE E2E] AI Organized Agent {}: handle=`{}` | summary=`{}` | ws={}",
+            ag.agent_id, h, summary, ag.workspace_id
+        );
+        assert!(
+            !h.is_empty() && !orbit_daemon::workspace_cluster::is_generic_harness_handle(h),
+            "Real LLM must assign a non-generic semantic handle (got `{h}`)"
+        );
+        assert!(
+            !summary.trim().is_empty() && !summary.contains("不要读写或修改任何文件"),
+            "Real LLM must generate a genuine semantic `task_summary` instead of raw prompt fallback (got `{summary}`)"
+        );
+        let ws = rt
+            .store
+            .get_workspace(&ag.workspace_id)
+            .expect("get ws")
+            .expect("ws");
+        assert!(
+            ws.is_curated,
+            "Real LLM AI Auto-Triage must move substantive conversations into a curated Mission Workspace"
+        );
+    }
+
+    // 6C. User-locked tab rename survives real LLM `summarize_agent`
+    let first_nc = &nc_ids[0];
+    device_a.update_agent_identity(
+        &host_id,
+        first_nc,
+        Some("热点缓存设计".into()),
+        None,
+        None,
+        true,
+        false,
+    );
+    let _ = wait_until(Duration::from_secs(10), || {
+        let store = rt.store.clone();
+        let aid = first_nc.clone();
+        async move {
+            store
+                .get_agent(&aid)
+                .ok()
+                .flatten()
+                .is_some_and(|a| a.handle.as_deref() == Some("热点缓存设计"))
+        }
+    })
+    .await;
+    let resum = rt
+        .orchestrator
+        .summarize_agent(first_nc)
+        .await
+        .expect("live summarize_agent");
+    assert_eq!(
+        resum.handle.as_deref(),
+        Some("热点缓存设计"),
+        "User-locked tab handle must survive real LLM summarize_agent"
+    );
+    println!(
+        "[LIVE E2E] Step 6 PASS: Live LLM AI Triage + Semantic Handle + Locked Tab Rename verified!"
+    );
+
     println!(
         "\n======================================================================\n\
          [LIVE E2E] ALL 3 CLIs (Claude + Codex + Antigravity) PASSED FULL MISSION!\n\

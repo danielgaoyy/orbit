@@ -23,7 +23,7 @@ use orbit_protocol::{
     ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
     TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
     WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
+    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -208,6 +208,8 @@ pub struct AgentCardView {
     pub cluster_suggestion: Option<WorkspaceClusterSuggestion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_summary: Option<String>,
 }
 
 pub struct CreateAgentRequest<'a> {
@@ -266,6 +268,8 @@ pub struct HostDetailView {
     pub workspace_boards: HashMap<String, WorkspaceBoardSnapshot>,
     #[serde(default)]
     pub workspace_events: HashMap<String, Vec<WorkspaceEventRecord>>,
+    #[serde(default)]
+    pub workspace_organize_status: HashMap<String, WorkspaceOrganizeEvent>,
     #[serde(default)]
     pub host_sync_state: HostSyncState,
 }
@@ -548,6 +552,7 @@ struct HostMemoryState {
     workspace_files: HashMap<String, Vec<String>>,
     workspace_boards: HashMap<String, WorkspaceBoardSnapshot>,
     workspace_events: HashMap<String, Vec<WorkspaceEventRecord>>,
+    workspace_organize_status: HashMap<String, WorkspaceOrganizeEvent>,
     profiles: Vec<AgentProfile>,
     schedules: Vec<ScheduleSpec>,
     schedule_runs: HashMap<String, Vec<ScheduleRunRecord>>,
@@ -621,6 +626,7 @@ impl HostMemoryState {
             workspace_files: HashMap::new(),
             workspace_boards: HashMap::new(),
             workspace_events: HashMap::new(),
+            workspace_organize_status: HashMap::new(),
             profiles: Vec::new(),
             schedules: Vec::new(),
             schedule_runs: HashMap::new(),
@@ -1075,6 +1081,7 @@ impl OrbitAppCore {
             git_repos_by_cwd: state.git_repos_by_cwd.clone(),
             workspace_boards: state.workspace_boards.clone(),
             workspace_events: state.workspace_events.clone(),
+            workspace_organize_status: state.workspace_organize_status.clone(),
             host_sync_state: state.host_sync_state.clone(),
         })
     }
@@ -3725,6 +3732,17 @@ impl OrbitAppCore {
                     notify_fleet = true;
                     notify_host = true;
                 }
+                WireMessage::WorkspaceOrganizeProgress { event } => {
+                    let norm_root = crate::sidebar::normalize_project_path(&event.project_root);
+                    state
+                        .workspace_organize_status
+                        .insert(norm_root, event.clone());
+                    state
+                        .workspace_organize_status
+                        .insert(event.project_root.clone(), event);
+                    notify_fleet = true;
+                    notify_host = true;
+                }
                 WireMessage::GitDiffResponse {
                     cwd,
                     path,
@@ -4587,6 +4605,7 @@ impl OrbitAppCore {
                 pinned_order: 0,
                 handle: clean_handle.clone(),
                 cluster_suggestion: None,
+                task_summary: None,
                 timeline_epoch: 0,
                 created_at: now,
                 updated_at: now,
@@ -5270,6 +5289,69 @@ impl OrbitAppCore {
                 mode,
                 labels,
                 handle,
+                task_summary: None,
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent_identity(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        handle: Option<String>,
+        title: Option<String>,
+        task_summary: Option<String>,
+        lock_handle: bool,
+        lock_title: bool,
+    ) {
+        let mut labels: HashMap<String, String> = HashMap::new();
+        if lock_handle {
+            labels.insert("orbit.handle_locked".into(), "1".into());
+        }
+        if lock_title {
+            labels.insert("orbit.title_locked".into(), "1".into());
+        }
+        let clean_handle = handle.map(|h| h.trim().trim_start_matches('@').to_string());
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            if let Some(ref t) = title
+                && !t.trim().is_empty()
+            {
+                ag.title = t.trim().to_string();
+            }
+            if let Some(ref hv) = clean_handle
+                && !hv.is_empty()
+            {
+                ag.handle = Some(hv.clone());
+            }
+            if let Some(ref ts) = task_summary {
+                let tr = ts.trim();
+                ag.task_summary = (!tr.is_empty()).then(|| tr.to_string());
+            }
+            for (k, v) in &labels {
+                ag.labels.insert(k.clone(), v.clone());
+            }
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UpdateAgent {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+                title,
+                model: None,
+                effort: None,
+                mode: None,
+                labels: (!labels.is_empty()).then_some(labels),
+                handle: clean_handle,
+                task_summary,
             },
         );
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -5514,13 +5596,76 @@ impl OrbitAppCore {
         agent_id: &str,
         target_workspace_id: Option<String>,
     ) {
+        self.move_agent_to_workspace_v2(host_id, agent_id, target_workspace_id, None, false);
+    }
+
+    pub fn move_agent_to_workspace_v2(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        target_workspace_id: Option<String>,
+        new_workspace_title: Option<String>,
+        make_unclassified: bool,
+    ) {
         self.dispatch_wire_queued(
             host_id,
             WireMessage::MoveAgentToWorkspace {
                 request_id: Uuid::new_v4(),
                 agent_id: agent_id.to_string(),
                 target_workspace_id,
-                new_workspace_title: None,
+                new_workspace_title,
+                make_unclassified,
+            },
+        );
+    }
+
+    pub fn organize_project_workspaces(
+        self: &Arc<Self>,
+        host_id: &str,
+        project_root: &str,
+        agent_ids: Vec<String>,
+        auto_apply: bool,
+    ) {
+        let req_id = Uuid::new_v4();
+        let running = WorkspaceOrganizeEvent {
+            request_id: Some(req_id),
+            project_root: project_root.to_string(),
+            phase: orbit_protocol::WorkspaceOrganizePhase::Running,
+            message: "正在触发 AI 上下文理解与 Workspace 归类…".into(),
+            created_workspaces: 0,
+            grouped_agents: 0,
+            summarized_agents: 0,
+        };
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            let norm = crate::sidebar::normalize_project_path(project_root);
+            h.workspace_organize_status.insert(norm, running.clone());
+            h.workspace_organize_status
+                .insert(project_root.to_string(), running);
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::OrganizeProjectWorkspaces {
+                request_id: req_id,
+                project_root: project_root.to_string(),
+                agent_ids,
+                auto_apply,
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn summarize_agent(self: &Arc<Self>, host_id: &str, agent_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::SummarizeAgent {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
             },
         );
     }
@@ -5612,11 +5757,64 @@ impl OrbitAppCore {
                 parent_workspace_id: None,
                 background: false,
                 idempotency_key: None,
+                is_curated: Some(true),
+                mission_goal: None,
+                project_root: None,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_mission_workspace(
+        self: &Arc<Self>,
+        host_id: &str,
+        source_cwd: &str,
+        title: String,
+        mission_goal: Option<String>,
+        isolation: WorkspaceIsolation,
+        worktree_branch: Option<String>,
+        base_ref: Option<String>,
+    ) {
+        let clean_title = title.trim();
+        let final_title = (!clean_title.is_empty()).then(|| clean_title.to_string());
+        let clean_goal = mission_goal
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::CreateWorkspace {
+                request_id: Uuid::new_v4(),
+                source_cwd: source_cwd.to_string(),
+                title: final_title,
+                worktree_branch,
+                base_ref,
+                isolation,
+                worktree_mode: WorktreeCreateMode::BranchOff,
+                pr_number: None,
+                parent_workspace_id: None,
+                background: false,
+                idempotency_key: None,
+                is_curated: Some(true),
+                mission_goal: clean_goal,
+                project_root: Some(source_cwd.to_string()),
             },
         );
     }
 
     pub fn rename_workspace(self: &Arc<Self>, host_id: &str, workspace_id: &str, title: &str) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ws) = h
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id == workspace_id)
+        {
+            ws.title = title.to_string();
+            ws.title_locked = true;
+            ws.is_curated = true;
+        }
         self.dispatch_wire_queued(
             host_id,
             WireMessage::RenameWorkspace {
@@ -5625,14 +5823,29 @@ impl OrbitAppCore {
                 title: title.to_string(),
             },
         );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
     }
 
     pub fn archive_workspace(self: &Arc<Self>, host_id: &str, workspace_id: &str) {
+        self.archive_workspace_v2(host_id, workspace_id, false);
+    }
+
+    pub fn archive_workspace_v2(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: &str,
+        keep_agents_unclassified: bool,
+    ) {
         self.dispatch_wire_queued(
             host_id,
             WireMessage::ArchiveWorkspace {
                 request_id: Uuid::new_v4(),
                 workspace_id: workspace_id.to_string(),
+                keep_agents_unclassified,
             },
         );
     }
@@ -8203,6 +8416,7 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         handle: a.handle.clone(),
         cluster_suggestion: a.cluster_suggestion.clone(),
         worktree_branch,
+        task_summary: a.task_summary.clone(),
     }
 }
 
@@ -8925,6 +9139,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -9038,6 +9253,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -9181,6 +9397,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -9355,6 +9572,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 2,
                     created_at: now,
                     updated_at: now,
@@ -9428,6 +9646,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             });
             guard.insert("h1".into(), mem);
         }
@@ -9455,6 +9674,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -9499,6 +9719,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -9536,6 +9757,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -9718,6 +9940,7 @@ mod tests {
                 pinned_order: 0,
                 handle: None,
                 cluster_suggestion: None,
+                task_summary: None,
                 timeline_epoch: 1,
                 created_at: now,
                 updated_at: now,
@@ -9889,6 +10112,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: None,
@@ -9939,6 +10163,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: Some("ag_parent".into()),
@@ -10032,6 +10257,7 @@ mod tests {
             pinned_order: 0,
             handle: None,
             cluster_suggestion: None,
+            task_summary: None,
         };
 
         let pref = ClientThreadPref {

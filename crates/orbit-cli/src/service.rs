@@ -465,6 +465,12 @@ fn install_systemd_user_service(
 
     let unit_file = systemd_dir.join(format!("{}.service", role.unit_name()));
     let log_file = role.log_file(home_dir);
+    // Keep detached `orbit shim` agent sessions alive across `orbit-daemon` restarts/upgrades.
+    let kill_mode_line = if role == ServiceRole::Daemon {
+        "KillMode=process\n"
+    } else {
+        ""
+    };
     let content = format!(
         "[Unit]\n\
          Description={desc}\n\
@@ -472,6 +478,7 @@ fn install_systemd_user_service(
          \n\
          [Service]\n\
          Type=simple\n\
+         {kill_mode_line}\
          ExecStart=\"{exe}\" --home \"{home}\" {sub}\n\
          Restart=always\n\
          RestartSec=2\n\

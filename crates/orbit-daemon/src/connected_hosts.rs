@@ -565,7 +565,18 @@ async fn connect_to_peer_daemon(
     // 1. Direct WebSocket endpoints
     for ep in &row.direct_endpoints {
         match connect_direct_peer(ep, self_host_id).await {
-            Ok(conn) => return Ok(conn),
+            Ok((info, tx, rx)) => {
+                if let Some(ref pinned) = row.host_id
+                    && pinned != &info.host_id
+                {
+                    last_err = anyhow::anyhow!(
+                        "direct endpoint `{ep}` belongs to `{}` instead of pinned `{pinned}`",
+                        info.host_id
+                    );
+                    continue;
+                }
+                return Ok((info, tx, rx));
+            }
             Err(e) => last_err = e,
         }
     }
@@ -589,7 +600,7 @@ async fn connect_direct_peer(
     mpsc::Sender<WireMessage>,
     mpsc::Receiver<WireMessage>,
 )> {
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(ws_url)).await??;
+    let (ws, _) = tokio::time::timeout(Duration::from_secs(2), connect_async(ws_url)).await??;
     let (mut sink, mut stream) = ws.split();
 
     let hello = WireMessage::Hello {
@@ -666,7 +677,7 @@ async fn connect_relay_peer(
     mpsc::Receiver<WireMessage>,
 )> {
     let connector = RelayConnector::connect(relay_base).await?;
-    let path = format!("/v1/client/connect?pubkey={daemon_pubkey_b64}");
+    let path = format!("/v1/client/{daemon_pubkey_b64}");
     let ws = connector.open_ws(&path).await?;
     let (mut sink, mut stream) = ws.split();
 

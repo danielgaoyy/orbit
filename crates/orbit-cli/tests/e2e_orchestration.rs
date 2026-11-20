@@ -1721,3 +1721,99 @@ async fn scenario_10_cli_orchestration_commands_mcp_stdio_bridge_and_policy_gati
     let _ = runtime.orchestrator.kill_agent(&agent_id).await;
     // TempTestDir RAII Drop kills all shims and removes temp dirs.
 }
+
+// ============================================================================
+// Scenario 11: Relay-Routed Fleet Mesh (Allowlisted Relay + Direct Mismatch Fallback)
+// ============================================================================
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scenario_11_relay_routed_fleet_mesh_and_direct_mismatch_fallback() {
+    let home_a = new_temp_dir("oe_s11_a");
+    let home_b = new_temp_dir("oe_s11_b");
+    let home_decoy = new_temp_dir("oe_s11_c");
+
+    // 1. Bootstrap Daemon B to obtain its X25519 static public key for strict Relay allowlisting
+    let pre_b = orbit_daemon::DaemonRuntime::bootstrap(&home_b)
+        .await
+        .expect("bootstrap B");
+    let pubkey_b = pre_b.keypair.public_key_b64.clone();
+    drop(pre_b);
+
+    // 2. Start a real allowlisted Orbit Relay
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay probe");
+    let relay_addr = probe.local_addr().expect("relay addr");
+    drop(probe);
+
+    let mut allow = std::collections::HashSet::new();
+    allow.insert(pubkey_b);
+    let relay_cfg = orbit_relay::RelayConfig {
+        listen_addr: relay_addr,
+        allowed_pubkeys: std::sync::Arc::new(allow),
+    };
+    let relay_handle = tokio::spawn(async move {
+        let _ = orbit_relay::run_relay(relay_cfg).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let relay_url = format!("ws://{relay_addr}");
+
+    // 3. Start Daemon B attached outbound to the Relay, a Decoy Daemon C, and Daemon A
+    let (_addr_b, rt_b) = spawn_embedded_daemon(home_b.to_path_buf(), Some(relay_url.clone()))
+        .await
+        .expect("daemon B");
+    let (addr_decoy, _rt_decoy) = spawn_embedded_daemon(home_decoy.to_path_buf(), None)
+        .await
+        .expect("daemon decoy");
+    let (_addr_a, rt_a) = spawn_embedded_daemon(home_a.to_path_buf(), None)
+        .await
+        .expect("daemon A");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 4. Register Daemon B onto Daemon A with Decoy C's direct endpoint + real Relay URL.
+    //    Daemon A must reject the mismatched direct host_id on Decoy C and fall back over
+    //    `/v1/client/{pubkey}` Noise NK E2EE Relay to reach Daemon B cleanly.
+    let offer_b = rt_b.build_pairing_offer(vec![format!("ws://{addr_decoy}/ws")], Some(relay_url));
+    let uri_b = offer_b.to_qr_uri().expect("pair uri b");
+    rt_a.connected_hosts
+        .add_from_pairing_uri(Some("Relay-Worker-B".into()), &uri_b)
+        .await
+        .expect("add relay peer B");
+
+    let mesh_online = wait_until(Duration::from_secs(10), || async {
+        rt_a.connected_hosts.list_summaries().await.iter().any(|h| {
+            h.host_id.as_deref() == Some(rt_b.host_info.host_id.as_str())
+                && h.status == ConnectedHostStatus::Online
+        })
+    })
+    .await;
+    assert!(
+        mesh_online,
+        "Daemon A must skip mismatched direct endpoint and connect to Daemon B via allowlisted E2EE Relay"
+    );
+
+    // 5. Execute a correlated WireMessage RPC over the Noise NK Relay mesh link
+    let req_id = Uuid::new_v4();
+    let reply = rt_a
+        .connected_hosts
+        .send_rpc(
+            &rt_b.host_info.host_id,
+            req_id,
+            WireMessage::ListAgents {
+                request_id: req_id,
+                workspace_id: None,
+                include_archived: false,
+                include_background: false,
+                parent_agent_id: None,
+            },
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("ListAgents over relay mesh");
+    assert!(
+        matches!(reply, WireMessage::AgentsSnapshot { request_id, .. } if request_id == req_id),
+        "Expected correlated AgentsSnapshot over relay mesh, got: {reply:?}"
+    );
+
+    relay_handle.abort();
+}

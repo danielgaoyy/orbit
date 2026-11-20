@@ -3618,6 +3618,21 @@ impl OrbitAppCore {
                     {
                         endpoints.insert(0, custom.clone());
                     }
+                    // Strip loopback-only endpoints when syncing across different machines if another route exists,
+                    // preventing remote daemons from dialing a local process on `127.0.0.1`.
+                    let non_loopback: Vec<String> = endpoints
+                        .iter()
+                        .filter(|ep| {
+                            let lower = ep.to_ascii_lowercase();
+                            !lower.contains("://127.0.0.1")
+                                && !lower.contains("://localhost")
+                                && !lower.contains("://[::1]")
+                        })
+                        .cloned()
+                        .collect();
+                    if !non_loopback.is_empty() || h.profile.relay_url.is_some() {
+                        endpoints = non_loopback;
+                    }
                     let offer = PairingOffer {
                         host_id: h.profile.host_id.clone(),
                         hostname: h.profile.hostname.clone(),

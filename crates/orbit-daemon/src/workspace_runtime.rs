@@ -134,7 +134,14 @@ pub fn copy_worktree_includes(source_cwd: &Path, worktree_cwd: &Path) -> Vec<Str
     }
 
     let mut copied = Vec::new();
-    walk_and_copy_matching(&canon_src, &canon_src, worktree_cwd, &patterns, 0, &mut copied);
+    walk_and_copy_matching(
+        &canon_src,
+        &canon_src,
+        worktree_cwd,
+        &patterns,
+        0,
+        &mut copied,
+    );
     copied
 }
 
@@ -346,11 +353,7 @@ pub async fn create_worktree_with_mode(
                 .ok_or_else(|| anyhow::anyhow!("`pr_number` is required for checkout_pr mode"))?;
             let local_branch = format!("orbit/pr-{pr}");
             let fetch = Command::new("git")
-                .args([
-                    "fetch",
-                    "origin",
-                    &format!("pull/{pr}/head:{local_branch}"),
-                ])
+                .args(["fetch", "origin", &format!("pull/{pr}/head:{local_branch}")])
                 .current_dir(source_cwd)
                 .output()
                 .await?;
@@ -732,7 +735,10 @@ impl WorkspaceScriptRegistry {
         removed
     }
 
-    pub async fn unregister_all_for_workspace(&self, workspace_id: &str) -> Vec<RunningScriptState> {
+    pub async fn unregister_all_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Vec<RunningScriptState> {
         let keys: Vec<(String, String)> = self
             .running
             .read()
@@ -821,10 +827,8 @@ mod tests {
 
     #[test]
     fn copies_worktreeinclude_and_blocks_symlink_escape() {
-        let root = std::env::temp_dir().join(format!(
-            "orbit_wt_inc_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("orbit_wt_inc_{}", uuid::Uuid::new_v4().simple()));
         let src = root.join("src");
         let dst = root.join("dst");
         let outside = root.join("secret.txt");
@@ -853,10 +857,8 @@ mod tests {
 
     #[test]
     fn loads_orbit_json_and_falls_back_to_paseo_json() {
-        let dir = std::env::temp_dir().join(format!(
-            "orbit_manifest_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("orbit_manifest_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("paseo.json"),

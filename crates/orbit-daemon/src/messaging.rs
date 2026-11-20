@@ -126,7 +126,10 @@ pub fn format_orbit_envelope(
         }
     }
     attrs.push_str(&format!(" message-id=\"{}\"", escape_xml(message_id)));
-    format!("<orbit-system {attrs}>\n{}\n</orbit-system>", escape_xml(body))
+    format!(
+        "<orbit-system {attrs}>\n{}\n</orbit-system>",
+        escape_xml(body)
+    )
 }
 
 /// Escape human text if it attempts to mimic an `<orbit-system>` tag so system envelopes cannot be spoofed.
@@ -297,10 +300,7 @@ impl AgentMessageDelivery {
             if let Some(abort) = bucket.timer_abort.take() {
                 abort.abort();
             }
-            *guard
-                .in_flight
-                .entry(recipient_id.to_string())
-                .or_insert(0) += 1;
+            *guard.in_flight.entry(recipient_id.to_string()).or_insert(0) += 1;
             bucket.items
         };
 

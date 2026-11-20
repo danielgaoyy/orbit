@@ -644,10 +644,17 @@ pub async fn cmd_inspect(
     } else {
         println!("Agent ID   : {}", agent.agent_id);
         println!("Title      : {}", agent.title);
-        println!("Provider   : {} (model: {:?})", agent.provider.display_name(), agent.model);
+        println!(
+            "Provider   : {} (model: {:?})",
+            agent.provider.display_name(),
+            agent.model
+        );
         println!("Status     : {}", format_status(&agent.status));
         println!("Workspace  : {} ({})", agent.workspace_id, agent.cwd);
-        println!("Parent     : {:?} (host: {:?})", agent.parent_agent_id, agent.parent_host_id);
+        println!(
+            "Parent     : {:?} (host: {:?})",
+            agent.parent_agent_id, agent.parent_host_id
+        );
         println!("Profile    : {:?}", agent.profile_id);
         println!("Archived   : {:?}", agent.archived_at);
         println!("Attention  : {:?}", agent.attention);
@@ -683,7 +690,11 @@ pub async fn cmd_simple_agent_op(
 ) -> anyhow::Result<()> {
     let client = connect_cli_server(server, via_relay).await?;
     let _ = send_rpc(&client, req_id, msg, 20).await?;
-    print_out(json_mode, &json!({ "ok": true, "action": label }), &format!("[✓] {label}"));
+    print_out(
+        json_mode,
+        &json!({ "ok": true, "action": label }),
+        &format!("[✓] {label}"),
+    );
     Ok(())
 }
 
@@ -929,8 +940,13 @@ pub async fn cmd_terminal(
     match action {
         TerminalAction::Ls => {
             let req_id = Uuid::new_v4();
-            let resp = send_rpc(&client, req_id, WireMessage::ListTerminals { request_id: req_id }, 15)
-                .await?;
+            let resp = send_rpc(
+                &client,
+                req_id,
+                WireMessage::ListTerminals { request_id: req_id },
+                15,
+            )
+            .await?;
             if let WireMessage::TerminalsSnapshot { terminals, .. } = resp {
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&terminals)?);
@@ -972,7 +988,10 @@ pub async fn cmd_terminal(
                 print_out(
                     json_mode,
                     &serde_json::to_value(&terminal)?,
-                    &format!("[✓] Created terminal `{}` in {}", terminal.terminal_id, terminal.cwd),
+                    &format!(
+                        "[✓] Created terminal `{}` in {}",
+                        terminal.terminal_id, terminal.cwd
+                    ),
                 );
             }
         }
@@ -1429,8 +1448,13 @@ pub async fn cmd_profile(
     match action {
         ProfileAction::Ls => {
             let req_id = Uuid::new_v4();
-            let resp = send_rpc(&client, req_id, WireMessage::ListProfiles { request_id: req_id }, 15)
-                .await?;
+            let resp = send_rpc(
+                &client,
+                req_id,
+                WireMessage::ListProfiles { request_id: req_id },
+                15,
+            )
+            .await?;
             if let WireMessage::ProfilesSnapshot { profiles, .. } = resp {
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&profiles)?);
@@ -1464,7 +1488,9 @@ pub async fn cmd_profile(
         } => {
             let now = chrono::Utc::now();
             let profile = AgentProfile {
-                profile_id: id.unwrap_or_else(|| format!("prof_{}", &Uuid::new_v4().simple().to_string()[..8])),
+                profile_id: id.unwrap_or_else(|| {
+                    format!("prof_{}", &Uuid::new_v4().simple().to_string()[..8])
+                }),
                 name,
                 provider: ProviderKind::from(provider),
                 model,
@@ -1494,7 +1520,10 @@ pub async fn cmd_profile(
                 print_out(
                     json_mode,
                     &serde_json::to_value(&profile)?,
-                    &format!("[✓] Saved profile `{}` ({})", profile.profile_id, profile.name),
+                    &format!(
+                        "[✓] Saved profile `{}` ({})",
+                        profile.profile_id, profile.name
+                    ),
                 );
             }
         }
@@ -1573,7 +1602,10 @@ pub async fn cmd_host(
                 print_out(
                     json_mode,
                     &serde_json::to_value(&host)?,
-                    &format!("[✓] Registered connected host `{}` ({})", host.registration_id, host.label),
+                    &format!(
+                        "[✓] Registered connected host `{}` ({})",
+                        host.registration_id, host.label
+                    ),
                 );
             }
         }
@@ -1793,7 +1825,10 @@ pub async fn cmd_config(
                 print_out(
                     json_mode,
                     &serde_json::to_value(&config)?,
-                    &format!("[✓] Updated orchestration config:\n{}", serde_json::to_string_pretty(&config)?),
+                    &format!(
+                        "[✓] Updated orchestration config:\n{}",
+                        serde_json::to_string_pretty(&config)?
+                    ),
                 );
             }
         }

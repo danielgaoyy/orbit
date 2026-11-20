@@ -538,7 +538,8 @@ impl HostMemoryState {
             .agents
             .values()
             .filter(|a| {
-                a.archived_at.is_none() && matches!(a.status, AgentStatus::AwaitingPermission { .. })
+                a.archived_at.is_none()
+                    && matches!(a.status, AgentStatus::AwaitingPermission { .. })
             })
             .count() as u32;
         let active_workspace_count = self

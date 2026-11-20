@@ -295,13 +295,14 @@ impl AgentOrchestrator {
         for ag in agents {
             let primary = self.shim_socket_path("a", &ag.agent_id);
             let legacy = self.legacy_shim_socket_path("agent", &ag.agent_id);
-            let surviving_sock = if primary.exists() && connect_existing_shim(&primary).await.is_some() {
-                Some(primary)
-            } else if legacy.exists() && connect_existing_shim(&legacy).await.is_some() {
-                Some(legacy)
-            } else {
-                None
-            };
+            let surviving_sock =
+                if primary.exists() && connect_existing_shim(&primary).await.is_some() {
+                    Some(primary)
+                } else if legacy.exists() && connect_existing_shim(&legacy).await.is_some() {
+                    Some(legacy)
+                } else {
+                    None
+                };
             let was_running = matches!(
                 ag.status,
                 AgentStatus::Running { .. } | AgentStatus::AutonomousWakeup { .. }
@@ -516,7 +517,10 @@ impl AgentOrchestrator {
             .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
 
         // 1. Stop any running scripts/services in this workspace
-        let stopped_scripts = self.scripts.unregister_all_for_workspace(workspace_id).await;
+        let stopped_scripts = self
+            .scripts
+            .unregister_all_for_workspace(workspace_id)
+            .await;
         for st in stopped_scripts {
             if let Some(ref tid) = st.info.terminal_id {
                 let _ = self.kill_terminal(tid).await;
@@ -562,7 +566,10 @@ impl AgentOrchestrator {
         Ok(())
     }
 
-    pub async fn unarchive_workspace(&self, workspace_id: &str) -> anyhow::Result<WorkspaceSummary> {
+    pub async fn unarchive_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<WorkspaceSummary> {
         self.store.unarchive_workspace(workspace_id)?;
         let ws = self
             .store
@@ -604,12 +611,16 @@ impl AgentOrchestrator {
             .get_workspace(workspace_id)?
             .ok_or_else(|| anyhow::anyhow!("workspace `{workspace_id}` not found"))?;
         let ws_path = PathBuf::from(&ws.cwd);
-        let manifest =
-            load_workspace_manifest_with_fallback(&ws_path, ws.source_cwd.as_deref().map(Path::new));
+        let manifest = load_workspace_manifest_with_fallback(
+            &ws_path,
+            ws.source_cwd.as_deref().map(Path::new),
+        );
         let entry = manifest
             .scripts
             .get(script_name)
-            .ok_or_else(|| anyhow::anyhow!("script `{script_name}` not found in orbit.json/paseo.json"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("script `{script_name}` not found in orbit.json/paseo.json")
+            })?
             .clone();
 
         // Stop previous instance if already running
@@ -672,7 +683,9 @@ impl AgentOrchestrator {
             )
             .await
         {
-            if sib.kind == WorkspaceScriptKind::Service && sib.status == WorkspaceScriptStatus::Running {
+            if sib.kind == WorkspaceScriptKind::Service
+                && sib.status == WorkspaceScriptStatus::Running
+            {
                 let norm: String = sib
                     .name
                     .chars()
@@ -766,7 +779,10 @@ impl AgentOrchestrator {
             None => None,
         };
 
-        let provider = profile.as_ref().map(|p| p.provider).unwrap_or(spec.provider);
+        let provider = profile
+            .as_ref()
+            .map(|p| p.provider)
+            .unwrap_or(spec.provider);
         let model = spec
             .model
             .or_else(|| profile.as_ref().and_then(|p| p.model.clone()));
@@ -877,7 +893,10 @@ impl AgentOrchestrator {
             archived_at: None,
             background: effective_background || ws.background,
             auto_archive: spec.auto_archive,
-            profile_id: profile.as_ref().map(|p| p.profile_id.clone()).or(spec.profile_id),
+            profile_id: profile
+                .as_ref()
+                .map(|p| p.profile_id.clone())
+                .or(spec.profile_id),
             labels: HashMap::new(),
             attention: AttentionState::None,
             last_activity_at: Some(now),
@@ -1805,12 +1824,12 @@ impl AgentOrchestrator {
     ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
         let primary_sock = self.shim_socket_path("a", &summary.agent_id);
         let legacy_sock = self.legacy_shim_socket_path("agent", &summary.agent_id);
-        let shim_socket = if reattach_existing_shim && !primary_sock.exists() && legacy_sock.exists()
-        {
-            legacy_sock
-        } else {
-            primary_sock
-        };
+        let shim_socket =
+            if reattach_existing_shim && !primary_sock.exists() && legacy_sock.exists() {
+                legacy_sock
+            } else {
+                primary_sock
+            };
 
         let mut extra_dirs: Vec<PathBuf> = self
             .store
@@ -1833,7 +1852,10 @@ impl AgentOrchestrator {
             .and_then(|pid| self.store.get_profile(pid).ok().flatten());
         let orch_cfg = self.orch_config.read().await.clone();
         let mcp_enabled = orch_cfg.mcp_inject_enabled
-            && profile.as_ref().map(|p| p.mcp_policy.enabled).unwrap_or(true);
+            && profile
+                .as_ref()
+                .map(|p| p.mcp_policy.enabled)
+                .unwrap_or(true);
         let daemon_port = *self.listen_port.read().await;
 
         let mcp_spec = if mcp_enabled && daemon_port > 0 {

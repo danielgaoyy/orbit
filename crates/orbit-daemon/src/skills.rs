@@ -189,7 +189,13 @@ mod tests {
 
         // Uninstall all managed skills
         let cleared = sync_orchestration_skills(&tmp, &[]).expect("sync uninstall");
-        assert!(!cleared.iter().find(|s| s.id == "orbit").expect("orbit").installed);
+        assert!(
+            !cleared
+                .iter()
+                .find(|s| s.id == "orbit")
+                .expect("orbit")
+                .installed
+        );
         // Custom unmanaged directory still preserved
         assert!(unmanaged_dir.join("SKILL.md").exists());
 

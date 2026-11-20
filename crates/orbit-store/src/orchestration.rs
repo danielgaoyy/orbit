@@ -198,7 +198,10 @@ pub(crate) fn migrate_orchestration_schema(conn: &rusqlite::Connection) -> Resul
 impl OrbitStore {
     // --- Extended Workspace Operations ---
 
-    pub fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceSummary>, StoreError> {
+    pub fn get_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Option<WorkspaceSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT workspace_id, title, cwd, git_branch, is_worktree, updated_at,
@@ -366,7 +369,10 @@ impl OrbitStore {
         Ok(rows)
     }
 
-    pub fn list_child_agents(&self, parent_agent_id: &str) -> Result<Vec<AgentSummary>, StoreError> {
+    pub fn list_child_agents(
+        &self,
+        parent_agent_id: &str,
+    ) -> Result<Vec<AgentSummary>, StoreError> {
         self.list_agents_filtered(None, false, true, Some(parent_agent_id))
     }
 
@@ -517,7 +523,10 @@ impl OrbitStore {
     }
 
     /// Return the most recent assistant message text for finish-notification summaries without loading a provider.
-    pub fn last_assistant_message_text(&self, agent_id: &str) -> Result<Option<String>, StoreError> {
+    pub fn last_assistant_message_text(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<String>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
             "SELECT payload_json FROM timeline_events

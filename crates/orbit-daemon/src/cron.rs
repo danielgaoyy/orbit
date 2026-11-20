@@ -47,7 +47,8 @@ pub fn normalize_cron_expr(raw: &str) -> anyhow::Result<String> {
             }
             format!("{m} {h} * * *")
         }
-        _ if lower.ends_with('m') && lower[..lower.len() - 1].chars().all(|c| c.is_ascii_digit()) =>
+        _ if lower.ends_with('m')
+            && lower[..lower.len() - 1].chars().all(|c| c.is_ascii_digit()) =>
         {
             let mins: u32 = lower[..lower.len() - 1].parse()?;
             if mins == 0 || mins > 59 {
@@ -59,7 +60,8 @@ pub fn normalize_cron_expr(raw: &str) -> anyhow::Result<String> {
                 format!("*/{mins} * * * *")
             }
         }
-        _ if lower.ends_with('h') && lower[..lower.len() - 1].chars().all(|c| c.is_ascii_digit()) =>
+        _ if lower.ends_with('h')
+            && lower[..lower.len() - 1].chars().all(|c| c.is_ascii_digit()) =>
         {
             let hrs: u32 = lower[..lower.len() - 1].parse()?;
             if hrs == 0 || hrs > 23 {
@@ -138,10 +140,8 @@ impl CronSchedule {
     /// Compute the next UTC timestamp strictly after `after` (rounded up to the next minute boundary).
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         // Start at the next whole minute
-        let mut cand = after
-            .with_second(0)
-            .and_then(|d| d.with_nanosecond(0))?
-            + Duration::minutes(1);
+        let mut cand =
+            after.with_second(0).and_then(|d| d.with_nanosecond(0))? + Duration::minutes(1);
 
         // Search up to 4 years forward (handles Feb 29 schedules)
         let limit = cand + Duration::days(366 * 4);
@@ -168,9 +168,7 @@ impl CronSchedule {
                 dom_ok || dow_ok
             };
             if !day_match {
-                cand = (cand + Duration::days(1))
-                    .with_hour(0)?
-                    .with_minute(0)?;
+                cand = (cand + Duration::days(1)).with_hour(0)?.with_minute(0)?;
                 continue;
             }
             if !self.hours[cand.hour() as usize] {

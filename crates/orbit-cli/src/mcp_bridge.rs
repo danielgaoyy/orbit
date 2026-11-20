@@ -133,16 +133,17 @@ pub async fn run_mcp_stdio_bridge(
                 }
                 if !status.is_success() {
                     if let Some(id_val) = req_id {
-                        let out_val = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_else(|_| {
-                            serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id_val,
-                                "error": {
-                                    "code": -32000,
-                                    "message": format!("Orbit MCP HTTP {status}: {body}")
-                                }
-                            })
-                        });
+                        let out_val = serde_json::from_str::<serde_json::Value>(&body)
+                            .unwrap_or_else(|_| {
+                                serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id_val,
+                                    "error": {
+                                        "code": -32000,
+                                        "message": format!("Orbit MCP HTTP {status}: {body}")
+                                    }
+                                })
+                            });
                         let out = format!("{}\n", serde_json::to_string(&out_val)?);
                         stdout.write_all(out.as_bytes()).await?;
                         stdout.flush().await?;

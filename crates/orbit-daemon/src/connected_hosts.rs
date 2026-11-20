@@ -110,11 +110,10 @@ impl ConnectedHostsManager {
             anyhow::bail!("cannot register this daemon as its own connected host");
         }
         // Check if already registered for the same pubkey/host_id -> update endpoints idempotently
-        let existing = self
-            .store
-            .list_connected_hosts()?
-            .into_iter()
-            .find(|h| h.daemon_pubkey_b64 == offer.daemon_pubkey_b64 || h.host_id.as_deref() == Some(&offer.host_id));
+        let existing = self.store.list_connected_hosts()?.into_iter().find(|h| {
+            h.daemon_pubkey_b64 == offer.daemon_pubkey_b64
+                || h.host_id.as_deref() == Some(&offer.host_id)
+        });
 
         let now = Utc::now();
         let record = if let Some(mut ex) = existing {
@@ -175,7 +174,10 @@ impl ConnectedHostsManager {
         Ok(summary)
     }
 
-    pub async fn remove_registration(&self, registration_id: &str) -> anyhow::Result<Option<String>> {
+    pub async fn remove_registration(
+        &self,
+        registration_id: &str,
+    ) -> anyhow::Result<Option<String>> {
         let existing = self.store.get_connected_host(registration_id)?;
         let old_host_id = existing.as_ref().and_then(|r| r.host_id.clone());
         if let Some(link) = self.links.write().await.remove(registration_id)
@@ -326,8 +328,14 @@ impl ConnectedHostsManager {
     ) {
         let mut backoff_secs = 1u64;
         loop {
-            self.set_link_state(&row.registration_id, ConnectedHostStatus::Connecting, None, None, None)
-                .await;
+            self.set_link_state(
+                &row.registration_id,
+                ConnectedHostStatus::Connecting,
+                None,
+                None,
+                None,
+            )
+            .await;
 
             match connect_to_peer_daemon(&row, &self.self_host_id).await {
                 Ok((host_info, tx, mut rx)) => {

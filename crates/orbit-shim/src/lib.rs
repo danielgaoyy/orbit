@@ -753,10 +753,8 @@ mod tests {
 
     #[tokio::test]
     async fn parent_watchdog_terminates_shim_when_watched_pid_is_gone() {
-        let sock_path = std::env::temp_dir().join(format!(
-            "orbit_watchdog_shim_{}.sock",
-            std::process::id()
-        ));
+        let sock_path =
+            std::env::temp_dir().join(format!("orbit_watchdog_shim_{}.sock", std::process::id()));
         let mut env = HashMap::new();
         // Guaranteed non-existent PID
         env.insert("ORBIT_SHIM_WATCHDOG_PID".into(), "4194300".into());

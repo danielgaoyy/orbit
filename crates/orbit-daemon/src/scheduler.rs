@@ -196,7 +196,10 @@ impl ScheduleEngine {
     }
 
     /// Trigger one immediate execution of a schedule without altering its cron cadence.
-    pub async fn run_once(self: &Arc<Self>, schedule_id: &str) -> anyhow::Result<ScheduleRunRecord> {
+    pub async fn run_once(
+        self: &Arc<Self>,
+        schedule_id: &str,
+    ) -> anyhow::Result<ScheduleRunRecord> {
         let sched = self
             .store
             .get_schedule(schedule_id)?
@@ -401,7 +404,8 @@ impl ScheduleEngine {
                                 .send(DaemonBroadcast::ScheduleUpdated(sched));
                         }
                         run.status = ScheduleRunStatus::Skipped;
-                        run.summary = Some("Target agent archived or deleted; heartbeat retired".into());
+                        run.summary =
+                            Some("Target agent archived or deleted; heartbeat retired".into());
                         run.finished_at = Some(Utc::now());
                         let _ = self.store.finish_schedule_run(
                             &run_id,
@@ -419,7 +423,11 @@ impl ScheduleEngine {
                 let spec = CreateAgentSpec {
                     cwd: cfg.cwd.clone(),
                     extra_dirs: Vec::new(),
-                    title: Some(format!("{} · {}", sched.name, started_at.format("%m-%d %H:%M"))),
+                    title: Some(format!(
+                        "{} · {}",
+                        sched.name,
+                        started_at.format("%m-%d %H:%M")
+                    )),
                     provider: cfg.provider,
                     model: cfg.model.clone(),
                     effort: cfg.effort,
@@ -461,7 +469,8 @@ impl ScheduleEngine {
                             let mut rx = orch_bg.broadcast_tx.subscribe();
                             let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
                             loop {
-                                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                                let remaining =
+                                    deadline.saturating_duration_since(tokio::time::Instant::now());
                                 if remaining.is_zero() {
                                     let _ = store_bg.finish_schedule_run(
                                         &rid,
@@ -473,7 +482,12 @@ impl ScheduleEngine {
                                     );
                                     return;
                                 }
-                                match tokio::time::timeout(remaining.min(Duration::from_secs(15)), rx.recv()).await {
+                                match tokio::time::timeout(
+                                    remaining.min(Duration::from_secs(15)),
+                                    rx.recv(),
+                                )
+                                .await
+                                {
                                     Ok(Ok(DaemonBroadcast::AgentUpdated(updated)))
                                         if updated.agent_id == ag_id =>
                                     {
@@ -483,7 +497,9 @@ impl ScheduleEngine {
                                                     .last_assistant_message_text(&ag_id)
                                                     .ok()
                                                     .flatten()
-                                                    .map(|s| s.chars().take(400).collect::<String>());
+                                                    .map(|s| {
+                                                        s.chars().take(400).collect::<String>()
+                                                    });
                                                 let _ = store_bg.finish_schedule_run(
                                                     &rid,
                                                     ScheduleRunStatus::Succeeded,
@@ -505,12 +521,16 @@ impl ScheduleEngine {
                                                 );
                                                 return;
                                             }
-                                            AgentStatus::Closed if updated.archived_at.is_some() => {
+                                            AgentStatus::Closed
+                                                if updated.archived_at.is_some() =>
+                                            {
                                                 let summary = store_bg
                                                     .last_assistant_message_text(&ag_id)
                                                     .ok()
                                                     .flatten()
-                                                    .map(|s| s.chars().take(400).collect::<String>());
+                                                    .map(|s| {
+                                                        s.chars().take(400).collect::<String>()
+                                                    });
                                                 let _ = store_bg.finish_schedule_run(
                                                     &rid,
                                                     ScheduleRunStatus::Succeeded,

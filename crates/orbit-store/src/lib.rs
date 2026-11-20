@@ -17,7 +17,8 @@ use orbit_protocol::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const AGENT_SELECT_COLS: &str = "agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
+pub(crate) const AGENT_SELECT_COLS: &str =
+    "agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
     status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
     parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
     attention_state, last_activity_at, timeline_epoch";
@@ -1619,7 +1620,9 @@ mod tests {
         child.agent_id = "ag_child".into();
         child.title = "Child Worker".into();
         child.parent_agent_id = Some("ag_parent".into());
-        child.labels.insert("orbit.open_tab.desktop".into(), "true".into());
+        child
+            .labels
+            .insert("orbit.open_tab.desktop".into(), "true".into());
         store.upsert_agent(&child, Some("ref_c")).expect("child");
 
         // Detach strips parent & open_tab labels

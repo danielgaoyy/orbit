@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -52,7 +52,10 @@ pub async fn mcp_agents_handler(
     let provided_token = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+        .and_then(|s| {
+            s.strip_prefix("Bearer ")
+                .or_else(|| s.strip_prefix("bearer "))
+        })
         .map(str::trim);
     if provided_token != Some(runtime.mcp_token.as_str()) {
         return (

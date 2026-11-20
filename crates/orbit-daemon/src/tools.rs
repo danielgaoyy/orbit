@@ -58,7 +58,10 @@ impl ToolExecResult {
 }
 
 /// Resolve the effective `McpToolPolicy` for an optional calling agent.
-pub fn resolve_caller_policy(runtime: &DaemonRuntime, caller_agent_id: Option<&str>) -> McpToolPolicy {
+pub fn resolve_caller_policy(
+    runtime: &DaemonRuntime,
+    caller_agent_id: Option<&str>,
+) -> McpToolPolicy {
     let Some(cid) = caller_agent_id else {
         return McpToolPolicy::default();
     };
@@ -96,7 +99,9 @@ pub async fn execute_tool(
 ) -> ToolExecResult {
     let policy = resolve_caller_policy(runtime, caller_agent_id);
     if !policy.enabled || policy.disabled_tools.iter().any(|d| d == name) {
-        return ToolExecResult::err(format!("tool `{name}` is disabled by this agent's profile policy"));
+        return ToolExecResult::err(format!(
+            "tool `{name}` is disabled by this agent's profile policy"
+        ));
     }
 
     match execute_tool_inner(runtime, caller_agent_id, name, &args).await {
@@ -112,7 +117,8 @@ async fn execute_tool_inner(
     args: &Value,
 ) -> anyhow::Result<Value> {
     let caller = caller_agent_id.and_then(|id| rt.store.get_agent(id).ok().flatten());
-    let target_host = resolve_target_host_id(rt, args.get("host_id").and_then(|v| v.as_str())).await?;
+    let target_host =
+        resolve_target_host_id(rt, args.get("host_id").and_then(|v| v.as_str())).await?;
 
     match name {
         // ==================== AGENTS ====================
@@ -136,7 +142,9 @@ async fn execute_tool_inner(
             } else if let Some(ref c) = caller {
                 (c.provider, None)
             } else {
-                anyhow::bail!("missing required string argument `provider` (or supply `profile_id`)");
+                anyhow::bail!(
+                    "missing required string argument `provider` (or supply `profile_id`)"
+                );
             };
             let model = opt_str(args, "model")
                 .or(inline_model)
@@ -170,7 +178,10 @@ async fn execute_tool_inner(
             // Check local idempotency receipt when supplied
             if let Some(ref idem) = idempotency_key {
                 let hash = sha256_json(args);
-                match rt.store.check_or_reserve_receipt("create_agent", idem, &hash)? {
+                match rt
+                    .store
+                    .check_or_reserve_receipt("create_agent", idem, &hash)?
+                {
                     ReceiptOutcome::Committed(cached_json) => {
                         return Ok(serde_json::from_str(&cached_json)?);
                     }
@@ -178,7 +189,9 @@ async fn execute_tool_inner(
                         anyhow::bail!("idempotency_key `{idem}` reused with different arguments");
                     }
                     ReceiptOutcome::PendingInFlight => {
-                        anyhow::bail!("create_agent with idempotency_key `{idem}` is already in flight");
+                        anyhow::bail!(
+                            "create_agent with idempotency_key `{idem}` is already in flight"
+                        );
                     }
                     ReceiptOutcome::Reserved => {}
                 }
@@ -187,7 +200,9 @@ async fn execute_tool_inner(
             let created_agent = if let Some(ref remote_host_id) = target_host {
                 let cwd = opt_str(args, "cwd").unwrap_or_default();
                 if workspace_id.is_none() && cwd.is_empty() {
-                    anyhow::bail!("remote `create_agent` requires `workspace_id` or `cwd` on host `{remote_host_id}`");
+                    anyhow::bail!(
+                        "remote `create_agent` requires `workspace_id` or `cwd` on host `{remote_host_id}`"
+                    );
                 }
                 let req_id = Uuid::new_v4();
                 let resp = rt
@@ -207,7 +222,10 @@ async fn execute_tool_inner(
                             initial_prompt,
                             initial_display_prompt: None,
                             initial_badges: Vec::new(),
-                            worktree: args.get("worktree").and_then(|v| v.as_bool()).unwrap_or(false),
+                            worktree: args
+                                .get("worktree")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
                             workspace_id,
                             parent_agent_id: caller_agent_id.map(ToOwned::to_owned),
                             parent_host_id: caller_agent_id.map(|_| rt.host_info.host_id.clone()),
@@ -217,7 +235,9 @@ async fn execute_tool_inner(
                             notify_on_finish: Some(false),
                             idempotency_key: idempotency_key.clone(),
                             base_ref: opt_str(args, "base_ref"),
-                            worktree_mode: parse_worktree_mode(opt_str(args, "worktree_mode").as_deref()),
+                            worktree_mode: parse_worktree_mode(
+                                opt_str(args, "worktree_mode").as_deref(),
+                            ),
                             branch: opt_str(args, "branch"),
                         },
                         Duration::from_secs(30),
@@ -256,7 +276,10 @@ async fn execute_tool_inner(
                         initial_prompt,
                         initial_display_prompt: None,
                         initial_badges: Vec::new(),
-                        worktree: args.get("worktree").and_then(|v| v.as_bool()).unwrap_or(false),
+                        worktree: args
+                            .get("worktree")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                         workspace_id,
                         parent_agent_id: caller_agent_id.map(ToOwned::to_owned),
                         parent_host_id: None,
@@ -264,9 +287,14 @@ async fn execute_tool_inner(
                         background,
                         auto_archive,
                         base_ref: opt_str(args, "base_ref"),
-                        worktree_mode: parse_worktree_mode(opt_str(args, "worktree_mode").as_deref()),
+                        worktree_mode: parse_worktree_mode(
+                            opt_str(args, "worktree_mode").as_deref(),
+                        ),
                         branch: opt_str(args, "branch"),
-                        pr_number: args.get("pr_number").and_then(|v| v.as_u64()).map(|n| n as u32),
+                        pr_number: args
+                            .get("pr_number")
+                            .and_then(|v| v.as_u64())
+                            .map(|n| n as u32),
                     })
                     .await;
                 match res {
@@ -304,7 +332,9 @@ async fn execute_tool_inner(
                 "notify_on_finish": notify_on_finish,
             });
             if let Some(ref idem) = idempotency_key {
-                let _ = rt.store.commit_receipt("create_agent", idem, &result.to_string());
+                let _ = rt
+                    .store
+                    .commit_receipt("create_agent", idem, &result.to_string());
             }
             Ok(result)
         }
@@ -479,7 +509,10 @@ async fn execute_tool_inner(
             };
 
             let start = events.len().saturating_sub(limit);
-            let summary: Vec<Value> = events[start..].iter().map(summarize_timeline_event).collect();
+            let summary: Vec<Value> = events[start..]
+                .iter()
+                .map(summarize_timeline_event)
+                .collect();
             Ok(json!({
                 "agent_id": agent_id,
                 "host_id": target_host.unwrap_or_else(|| rt.host_info.host_id.clone()),
@@ -801,7 +834,10 @@ async fn execute_tool_inner(
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
             let title = str_arg(args, "title")?;
-            let ws = rt.orchestrator.rename_workspace(&workspace_id, &title).await?;
+            let ws = rt
+                .orchestrator
+                .rename_workspace(&workspace_id, &title)
+                .await?;
             Ok(json!({ "workspace": ws }))
         }
 
@@ -831,7 +867,10 @@ async fn execute_tool_inner(
             let workspace_id = opt_str(args, "workspace_id")
                 .or_else(|| caller.as_ref().map(|c| c.workspace_id.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`workspace_id` is required"))?;
-            let scripts = rt.orchestrator.list_workspace_scripts(&workspace_id).await?;
+            let scripts = rt
+                .orchestrator
+                .list_workspace_scripts(&workspace_id)
+                .await?;
             Ok(json!({ "workspace_id": workspace_id, "scripts": scripts }))
         }
 
@@ -875,7 +914,14 @@ async fn execute_tool_inner(
             let initial_command = opt_str(args, "initial_command");
             let term = rt
                 .orchestrator
-                .create_terminal_with_command(cwd, title, cols, rows, initial_command, HashMap::new())
+                .create_terminal_with_command(
+                    cwd,
+                    title,
+                    cols,
+                    rows,
+                    initial_command,
+                    HashMap::new(),
+                )
                 .await?;
             Ok(json!({ "terminal": term }))
         }
@@ -929,7 +975,10 @@ async fn execute_tool_inner(
             let cwd = opt_str(args, "cwd")
                 .or_else(|| caller.as_ref().map(|c| c.cwd.clone()))
                 .ok_or_else(|| anyhow::anyhow!("`cwd` is required"))?;
-            let max_runs = args.get("max_runs").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let max_runs = args
+                .get("max_runs")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
             let expires_at = opt_str(args, "expires_at")
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
@@ -941,10 +990,16 @@ async fn execute_tool_inner(
                 effort,
                 mode,
                 profile_id: opt_str(args, "profile_id"),
-                worktree: args.get("worktree").and_then(|v| v.as_bool()).unwrap_or(false),
+                worktree: args
+                    .get("worktree")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 base_ref: opt_str(args, "base_ref"),
                 archive_on_finish: true,
-                background: args.get("background").and_then(|v| v.as_bool()).unwrap_or(false),
+                background: args
+                    .get("background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             });
             let sched = rt.scheduler.create_schedule(
                 name,
@@ -980,13 +1035,17 @@ async fn execute_tool_inner(
 
         "pause_schedule" => {
             let sid = str_arg(args, "schedule_id")?;
-            let s = rt.scheduler.set_schedule_status(&sid, ScheduleStatus::Paused)?;
+            let s = rt
+                .scheduler
+                .set_schedule_status(&sid, ScheduleStatus::Paused)?;
             Ok(json!({ "schedule": s }))
         }
 
         "resume_schedule" => {
             let sid = str_arg(args, "schedule_id")?;
-            let s = rt.scheduler.set_schedule_status(&sid, ScheduleStatus::Active)?;
+            let s = rt
+                .scheduler
+                .set_schedule_status(&sid, ScheduleStatus::Active)?;
             Ok(json!({ "schedule": s }))
         }
 
@@ -1000,7 +1059,9 @@ async fn execute_tool_inner(
                 opt_str(args, "name"),
                 opt_str(args, "cron").as_deref(),
                 opt_str(args, "prompt"),
-                args.get("max_runs").and_then(|v| v.as_u64()).map(|n| n as u32),
+                args.get("max_runs")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32),
                 expires_at,
                 None,
             )?;
@@ -1029,11 +1090,18 @@ async fn execute_tool_inner(
         "create_heartbeat" => {
             let target_agent = opt_str(args, "agent_id")
                 .or_else(|| caller_agent_id.map(ToOwned::to_owned))
-                .ok_or_else(|| anyhow::anyhow!("`create_heartbeat` requires an active caller agent or `agent_id`"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`create_heartbeat` requires an active caller agent or `agent_id`"
+                    )
+                })?;
             let cron = str_arg(args, "cron")?;
             let prompt = str_arg(args, "prompt")?;
             let name = opt_str(args, "name").unwrap_or_else(|| "Agent Heartbeat".to_string());
-            let max_runs = args.get("max_runs").and_then(|v| v.as_u64()).map(|n| n as u32);
+            let max_runs = args
+                .get("max_runs")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
             let expires_at = opt_str(args, "expires_at")
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
@@ -1219,13 +1287,18 @@ async fn resolve_target_host_id(
     let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    if raw == rt.host_info.host_id || raw.eq_ignore_ascii_case("self") || raw.eq_ignore_ascii_case("local") {
+    if raw == rt.host_info.host_id
+        || raw.eq_ignore_ascii_case("self")
+        || raw.eq_ignore_ascii_case("local")
+    {
         return Ok(None);
     }
     if let Some(resolved) = rt.connected_hosts.resolve_host_id(raw).await {
         return Ok(Some(resolved));
     }
-    anyhow::bail!("connected host `{raw}` not found or disabled (call `list_hosts` to inspect available hosts)")
+    anyhow::bail!(
+        "connected host `{raw}` not found or disabled (call `list_hosts` to inspect available hosts)"
+    )
 }
 
 fn str_arg(args: &Value, key: &str) -> anyhow::Result<String> {
@@ -1242,7 +1315,10 @@ fn opt_str(args: &Value, key: &str) -> Option<String> {
 
 fn parse_provider_and_model(raw: &str) -> anyhow::Result<(ProviderKind, Option<String>)> {
     let (prov_part, model_part) = match raw.split_once('/') {
-        Some((p, m)) => (p.trim(), Some(m.trim().to_string()).filter(|s| !s.is_empty())),
+        Some((p, m)) => (
+            p.trim(),
+            Some(m.trim().to_string()).filter(|s| !s.is_empty()),
+        ),
         None => (raw.trim(), None),
     };
     let provider = match prov_part.to_ascii_lowercase().as_str() {
@@ -1306,7 +1382,9 @@ fn summarize_timeline_event(ev: &orbit_protocol::TimelineEvent) -> Value {
             "timestamp": ev.timestamp,
             "text": truncate_chars(text, 800),
         }),
-        TimelinePayload::AssistantMessage { text, streaming, .. } => json!({
+        TimelinePayload::AssistantMessage {
+            text, streaming, ..
+        } => json!({
             "seq": ev.seq,
             "type": "assistant_message",
             "timestamp": ev.timestamp,
@@ -1315,8 +1393,13 @@ fn summarize_timeline_event(ev: &orbit_protocol::TimelineEvent) -> Value {
         }),
         TimelinePayload::ToolCall { status, detail, .. } => {
             let label = match detail {
-                ToolCallDetail::Shell { command, exit_code, .. } => {
-                    format!("shell: {} (exit={exit_code:?})", truncate_chars(command, 160))
+                ToolCallDetail::Shell {
+                    command, exit_code, ..
+                } => {
+                    format!(
+                        "shell: {} (exit={exit_code:?})",
+                        truncate_chars(command, 160)
+                    )
                 }
                 ToolCallDetail::FileEdit { path, .. } => format!("edit: {path}"),
                 ToolCallDetail::FileRead { path, .. } => format!("read: {path}"),

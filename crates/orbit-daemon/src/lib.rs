@@ -1373,7 +1373,9 @@ async fn handle_wire_rpc(
                     .check_or_reserve_receipt("agent_create", idem, &hash)
                 {
                     Ok(ReceiptOutcome::Committed(json)) => {
-                        if let Ok(agent) = serde_json::from_str::<orbit_protocol::AgentSummary>(&json) {
+                        if let Ok(agent) =
+                            serde_json::from_str::<orbit_protocol::AgentSummary>(&json)
+                        {
                             subscribed_agents.insert(agent.agent_id.clone());
                             return Some(WireMessage::AgentCreated { request_id, agent });
                         }
@@ -1844,7 +1846,8 @@ async fn handle_wire_rpc(
             mut profile,
         } => {
             if profile.profile_id.trim().is_empty() {
-                profile.profile_id = format!("prof_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+                profile.profile_id =
+                    format!("prof_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
             }
             profile.updated_at = chrono::Utc::now();
             match runtime.store.upsert_profile(&profile) {

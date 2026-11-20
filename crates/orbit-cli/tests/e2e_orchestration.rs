@@ -358,9 +358,7 @@ impl Drop for TempTestDir {
 
 fn new_temp_dir(prefix: &str) -> TempTestDir {
     let short_uid = &Uuid::new_v4().simple().to_string()[..8];
-    let short_pfx = prefix
-        .strip_prefix("orbit_e2e_")
-        .unwrap_or(prefix);
+    let short_pfx = prefix.strip_prefix("orbit_e2e_").unwrap_or(prefix);
     let dir = std::env::temp_dir().join(format!("oe_{short_pfx}_{short_uid}"));
     std::fs::create_dir_all(&dir).expect("mkdir temp");
     TempTestDir(dir)
@@ -528,7 +526,10 @@ async fn scenario_01_single_host_delegation_worktree_and_auto_finish_wakeup() {
         has_finish_msg && parent_idle
     })
     .await;
-    assert!(got_finish, "Parent must automatically wake up with child finish report");
+    assert!(
+        got_finish,
+        "Parent must automatically wake up with child finish report"
+    );
 
     // Verify child ran inside an isolated git worktree and wrote wt_proof.txt there (NOT in source repo!)
     assert!(
@@ -699,7 +700,10 @@ async fn scenario_03_quiet_window_coalescing_single_parent_wakeup() {
             .filter(|e| {
                 matches!(
                     &e.payload,
-                    TimelinePayload::AssistantMessage { streaming: false, .. }
+                    TimelinePayload::AssistantMessage {
+                        streaming: false,
+                        ..
+                    }
                 )
             })
             .collect();
@@ -1007,7 +1011,13 @@ async fn scenario_06_idle_runtime_cleanup_veto_and_transparent_resume() {
         .expect("delete hb");
     let collected = runtime.idle_cleanup.sweep_once(future_now).await;
     assert_eq!(collected, vec![agent.agent_id.clone()]);
-    assert!(!runtime.orchestrator.list_live_agent_ids().await.contains(&agent.agent_id));
+    assert!(
+        !runtime
+            .orchestrator
+            .list_live_agent_ids()
+            .await
+            .contains(&agent.agent_id)
+    );
 
     // Next prompt transparently resumes the collected agent with `--resume <session_id>`!
     runtime
@@ -1028,7 +1038,10 @@ async fn scenario_06_idle_runtime_cleanup_veto_and_transparent_resume() {
         })
     })
     .await;
-    assert!(resumed_ok, "Collected idle agent must transparently resume with --resume");
+    assert!(
+        resumed_ok,
+        "Collected idle agent must transparently resume with --resume"
+    );
 
     // TempTestDir RAII Drop kills all shims and removes temp dirs.
 }
@@ -1086,7 +1099,10 @@ async fn scenario_07_worktree_lifecycle_includes_setup_service_proxy_and_teardow
         .expect("create worktree");
 
     let wt_path = PathBuf::from(&ws.cwd);
-    assert!(wt_path.join(".env.local").is_file(), ".worktreeinclude must copy .env.local");
+    assert!(
+        wt_path.join(".env.local").is_file(),
+        ".worktreeinclude must copy .env.local"
+    );
 
     // Wait for async setup hook to finish
     let setup_done = wait_until(Duration::from_secs(10), || async {
@@ -1141,8 +1157,14 @@ async fn scenario_07_worktree_lifecycle_includes_setup_service_proxy_and_teardow
         .archive_workspace(&ws.workspace_id)
         .await
         .expect("archive worktree");
-    assert!(teardown_marker.is_file(), "worktree.teardown hook must execute on archive");
-    assert!(!wt_path.exists(), "worktree directory must be removed after final archive");
+    assert!(
+        teardown_marker.is_file(),
+        "worktree.teardown hook must execute on archive"
+    );
+    assert!(
+        !wt_path.exists(),
+        "worktree directory must be removed after final archive"
+    );
 
     // TempTestDir RAII Drop kills all shims and removes temp dirs.
 }
@@ -1211,7 +1233,10 @@ async fn scenario_08_cron_schedules_auto_archive_and_heartbeat_busy_skip() {
                 .any(|r| r.run_id == run.run_id && r.status == ScheduleRunStatus::Succeeded)
     })
     .await;
-    assert!(auto_archived, "Cron run agent must record Succeeded and auto-archive on finish");
+    assert!(
+        auto_archived,
+        "Cron run agent must record Succeeded and auto-archive on finish"
+    );
 
     // 2. Heartbeat busy-skip while target is running, then idle delivery
     let busy_agent = create_agent_rpc(
@@ -1280,7 +1305,9 @@ async fn scenario_08_cron_schedules_auto_archive_and_heartbeat_busy_skip() {
     assert_eq!(delivered.status, ScheduleRunStatus::Succeeded);
 
     let got_hb_msg = wait_until(Duration::from_secs(10), || async {
-        let Ok((events, _)) = runtime.store.fetch_timeline_since(&busy_agent.agent_id, 0, 200)
+        let Ok((events, _)) = runtime
+            .store
+            .fetch_timeline_since(&busy_agent.agent_id, 0, 200)
         else {
             return false;
         };
@@ -1330,17 +1357,16 @@ async fn scenario_09_cross_host_fleet_mesh_delegation_and_idempotency() {
 
     // Wait for Daemon A <-> Daemon B persistent link to become Connected
     let mesh_connected = wait_until(Duration::from_secs(10), || async {
-        rt_a.connected_hosts
-            .list_summaries()
-            .await
-            .iter()
-            .any(|h| {
-                h.host_id.as_deref() == Some(rt_b.host_info.host_id.as_str())
-                    && h.status == ConnectedHostStatus::Online
-            })
+        rt_a.connected_hosts.list_summaries().await.iter().any(|h| {
+            h.host_id.as_deref() == Some(rt_b.host_info.host_id.as_str())
+                && h.status == ConnectedHostStatus::Online
+        })
     })
     .await;
-    assert!(mesh_connected, "Daemon A must connect to Daemon B via pairing URI");
+    assert!(
+        mesh_connected,
+        "Daemon A must connect to Daemon B via pairing URI"
+    );
 
     // Spawn Parent on Daemon A that delegates a Child to Daemon B via MCP `create_agent(host_id=B)`
     let client_a = connect_direct(&format!("ws://{addr_a}/ws"), None)
@@ -1435,7 +1461,10 @@ async fn scenario_09_cross_host_fleet_mesh_delegation_and_idempotency() {
         .expect("idem 2 replay");
     match ws2 {
         WireMessage::WorkspaceCreated { workspace, .. } => {
-            assert_eq!(workspace.workspace_id, ws1_id, "Idempotency replay must return exact same workspace");
+            assert_eq!(
+                workspace.workspace_id, ws1_id,
+                "Idempotency replay must return exact same workspace"
+            );
         }
         other => panic!("unexpected: {other:?}"),
     }
@@ -1596,7 +1625,10 @@ async fn scenario_10_cli_orchestration_commands_mcp_stdio_bridge_and_policy_gati
             json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "list_profiles", "arguments": {}}}),
         ] {
             let line = format!("{req}\n");
-            stdin.write_all(line.as_bytes()).await.expect("write mcp req");
+            stdin
+                .write_all(line.as_bytes())
+                .await
+                .expect("write mcp req");
         }
         stdin.shutdown().await.expect("close stdin");
     }
@@ -1614,8 +1646,15 @@ async fn scenario_10_cli_orchestration_commands_mcp_stdio_bridge_and_policy_gati
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str::<Value>(l).expect("valid json-rpc response"))
         .collect();
-    assert_eq!(lines.len(), 4, "Expected 4 JSON-RPC responses from orbit mcp bridge");
-    assert_eq!(lines[0]["result"]["serverInfo"]["name"], "orbit-orchestrator");
+    assert_eq!(
+        lines.len(),
+        4,
+        "Expected 4 JSON-RPC responses from orbit mcp bridge"
+    );
+    assert_eq!(
+        lines[0]["result"]["serverInfo"]["name"],
+        "orbit-orchestrator"
+    );
 
     let listed_tools = lines[1]["result"]["tools"].as_array().expect("tools array");
     assert!(

@@ -178,106 +178,114 @@ async fn run_agy_actor(
     let mut next_rpc_id: i64 = if is_reattached { 1000 } else { 1 };
     let mut pending_rpcs: HashMap<String, oneshot::Sender<Result<Value, Value>>> = HashMap::new();
 
-    let (session_id, available_model_ids, canonical_base_ids, mut active_effort, mut current_base_model) =
-        if is_reattached && let Some(ref sid) = cfg.resume_session_id {
-            (
-                sid.clone(),
-                HashSet::new(),
-                HashSet::new(),
-                cfg.effort,
-                cfg.model.clone(),
-            )
-        } else {
-            // 1. Send `initialize`
-            let init_rx = match send_acp_req(
-                &shim,
-                &mut next_rpc_id,
-                &mut pending_rpcs,
-                "initialize",
-                json!({
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "elicitation": { "form": {} }
-                    },
-                    "clientInfo": {
-                        "name": "orbit",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }),
-            )
-            .await
-            {
-                Ok(rx) => rx,
-                Err(_) => {
-                    let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
-                    return;
+    let (
+        session_id,
+        available_model_ids,
+        canonical_base_ids,
+        mut active_effort,
+        mut current_base_model,
+    ) = if is_reattached && let Some(ref sid) = cfg.resume_session_id {
+        (
+            sid.clone(),
+            HashSet::new(),
+            HashSet::new(),
+            cfg.effort,
+            cfg.model.clone(),
+        )
+    } else {
+        // 1. Send `initialize`
+        let init_rx = match send_acp_req(
+            &shim,
+            &mut next_rpc_id,
+            &mut pending_rpcs,
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {
+                    "elicitation": { "form": {} }
+                },
+                "clientInfo": {
+                    "name": "orbit",
+                    "version": env!("CARGO_PKG_VERSION")
                 }
-            };
-
-            if wait_rpc_during_boot(&mut shim, &mut pending_rpcs, init_rx)
-                .await
-                .is_err()
-            {
-                warn!(agent_id = %cfg.agent_id, "Antigravity ACP initialize failed");
-                let _ = evt_tx
-                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                        message: "Antigravity ACP initialize failed".into(),
-                        recoverable: false,
-                    }))
-                    .await;
+            }),
+        )
+        .await
+        {
+            Ok(rx) => rx,
+            Err(_) => {
+                let _ = evt_tx.send(DriverEvent::Exited { code: None }).await;
                 return;
             }
+        };
 
-            // 2. `session/load` or `session/new` with Orbit MCP servers (HTTP first, stdio fallback)
-            let is_resume = cfg.resume_session_id.is_some();
-            let open_session_with = |mcp_val: Value| {
-                let mut params = if let Some(ref sid) = cfg.resume_session_id {
-                    json!({
-                        "sessionId": sid,
-                        "cwd": cfg.cwd.to_string_lossy(),
-                        "mcpServers": mcp_val
-                    })
-                } else {
-                    json!({
-                        "cwd": cfg.cwd.to_string_lossy(),
-                        "mcpServers": mcp_val
-                    })
+        if wait_rpc_during_boot(&mut shim, &mut pending_rpcs, init_rx)
+            .await
+            .is_err()
+        {
+            warn!(agent_id = %cfg.agent_id, "Antigravity ACP initialize failed");
+            let _ = evt_tx
+                .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                    message: "Antigravity ACP initialize failed".into(),
+                    recoverable: false,
+                }))
+                .await;
+            return;
+        }
+
+        // 2. `session/load` or `session/new` with Orbit MCP servers (HTTP first, stdio fallback)
+        let is_resume = cfg.resume_session_id.is_some();
+        let open_session_with = |mcp_val: Value| {
+            let mut params = if let Some(ref sid) = cfg.resume_session_id {
+                json!({
+                    "sessionId": sid,
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "mcpServers": mcp_val
+                })
+            } else {
+                json!({
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "mcpServers": mcp_val
+                })
+            };
+            if let Some(meta) = build_agy_session_meta(&cfg) {
+                params["_meta"] = meta;
+            }
+            let method = if is_resume {
+                "session/load"
+            } else {
+                "session/new"
+            };
+            (method, params)
+        };
+
+        let (method, params) = open_session_with(build_agy_mcp_servers_http(&cfg));
+        let Ok(sess_rx) =
+            send_acp_req(&shim, &mut next_rpc_id, &mut pending_rpcs, method, params).await
+        else {
+            return;
+        };
+
+        let sess_val = match wait_rpc_during_boot(&mut shim, &mut pending_rpcs, sess_rx).await {
+            Ok(v) => v,
+            Err(first_err) if cfg.mcp_spec.is_some() => {
+                // Fallback to stdio `orbit mcp` if ACP binary rejects HTTP MCP descriptor
+                let (fb_method, fb_params) = open_session_with(build_agy_mcp_servers_stdio(&cfg));
+                let Ok(fb_rx) = send_acp_req(
+                    &shim,
+                    &mut next_rpc_id,
+                    &mut pending_rpcs,
+                    fb_method,
+                    fb_params,
+                )
+                .await
+                else {
+                    return;
                 };
-                if let Some(meta) = build_agy_session_meta(&cfg) {
-                    params["_meta"] = meta;
-                }
-                let method = if is_resume { "session/load" } else { "session/new" };
-                (method, params)
-            };
-
-            let (method, params) = open_session_with(build_agy_mcp_servers_http(&cfg));
-            let Ok(sess_rx) =
-                send_acp_req(&shim, &mut next_rpc_id, &mut pending_rpcs, method, params).await
-            else {
-                return;
-            };
-
-            let sess_val = match wait_rpc_during_boot(&mut shim, &mut pending_rpcs, sess_rx).await {
-                Ok(v) => v,
-                Err(first_err) if cfg.mcp_spec.is_some() => {
-                    // Fallback to stdio `orbit mcp` if ACP binary rejects HTTP MCP descriptor
-                    let (fb_method, fb_params) =
-                        open_session_with(build_agy_mcp_servers_stdio(&cfg));
-                    let Ok(fb_rx) = send_acp_req(
-                        &shim,
-                        &mut next_rpc_id,
-                        &mut pending_rpcs,
-                        fb_method,
-                        fb_params,
-                    )
-                    .await
-                    else {
-                        return;
-                    };
-                    match wait_rpc_during_boot(&mut shim, &mut pending_rpcs, fb_rx).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = evt_tx
+                match wait_rpc_during_boot(&mut shim, &mut pending_rpcs, fb_rx).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = evt_tx
                                 .send(DriverEvent::StatusChanged(AgentStatus::Error {
                                     message: format!(
                                         "Antigravity session open failed: {first_err} (stdio fallback: {e})"
@@ -285,134 +293,134 @@ async fn run_agy_actor(
                                     recoverable: false,
                                 }))
                                 .await;
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = evt_tx
-                        .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                            message: format!("Antigravity session open failed: {e}"),
-                            recoverable: false,
-                        }))
-                        .await;
-                    return;
-                }
-            };
-
-            // Drain replay notifications on `session/load` until 50ms of quiet
-            if is_resume {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-                while tokio::time::Instant::now() < deadline {
-                    if tokio::time::timeout(Duration::from_millis(50), shim.rx.recv())
-                        .await
-                        .is_err()
-                    {
-                        break;
+                        return;
                     }
                 }
             }
-
-            let session_id = sess_val
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .or(cfg.resume_session_id.as_deref())
-                .unwrap_or("unknown")
-                .to_string();
-
-            let available_model_ids: HashSet<String> = sess_val
-                .pointer("/models/availableModels")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|item| item.get("modelId").and_then(|s| s.as_str()))
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let canonical_base_ids: HashSet<String> = sess_val
-                .get("configOptions")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| {
-                    arr.iter()
-                        .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("model"))
-                })
-                .and_then(|opt| opt.get("options"))
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|item| item.get("value").and_then(|s| s.as_str()))
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let raw_initial_model = sess_val
-                .pointer("/models/currentModelId")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned)
-                .or_else(|| cfg.model.clone());
-
-            let active_effort = cfg.effort;
-            let mut current_base_model = raw_initial_model
-                .as_deref()
-                .map(|m| normalize_agy_base_model_id(m, &canonical_base_ids))
-                .or_else(|| cfg.model.clone());
-
-            // Optional `session/set_model` when explicit model or effort was requested
-            if (cfg.model.is_some() || cfg.effort.is_some())
-                && let Some(ref base_m) = cfg.model.as_ref().or(current_base_model.as_ref()).cloned()
-            {
-                let wire_model_id = resolve_agy_wire_model_id(
-                    base_m,
-                    active_effort,
-                    &available_model_ids,
-                    &canonical_base_ids,
-                );
-                if let Ok(rx) = send_acp_req(
-                    &shim,
-                    &mut next_rpc_id,
-                    &mut pending_rpcs,
-                    "session/set_model",
-                    json!({
-                        "sessionId": session_id,
-                        "modelId": wire_model_id
-                    }),
-                )
-                .await
-                    && let Ok(v) = wait_rpc_during_boot(&mut shim, &mut pending_rpcs, rx).await
-                    && let Some(m) = v.pointer("/models/currentModelId").and_then(|x| x.as_str())
-                {
-                    current_base_model = Some(normalize_agy_base_model_id(m, &canonical_base_ids));
-                }
+            Err(e) => {
+                let _ = evt_tx
+                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                        message: format!("Antigravity session open failed: {e}"),
+                        recoverable: false,
+                    }))
+                    .await;
+                return;
             }
-
-            // Optional `session/set_mode` for `accept-edits` (ignore -32601)
-            if matches!(cfg.mode, SessionMode::AcceptEdits)
-                && let Ok(rx) = send_acp_req(
-                    &shim,
-                    &mut next_rpc_id,
-                    &mut pending_rpcs,
-                    "session/set_mode",
-                    json!({
-                        "sessionId": session_id,
-                        "modeId": "accept-edits"
-                    }),
-                )
-                .await
-            {
-                let _ = wait_rpc_during_boot(&mut shim, &mut pending_rpcs, rx).await;
-            }
-
-            (
-                session_id,
-                available_model_ids,
-                canonical_base_ids,
-                active_effort,
-                current_base_model,
-            )
         };
+
+        // Drain replay notifications on `session/load` until 50ms of quiet
+        if is_resume {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                if tokio::time::timeout(Duration::from_millis(50), shim.rx.recv())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+
+        let session_id = sess_val
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .or(cfg.resume_session_id.as_deref())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let available_model_ids: HashSet<String> = sess_val
+            .pointer("/models/availableModels")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("modelId").and_then(|s| s.as_str()))
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let canonical_base_ids: HashSet<String> = sess_val
+            .get("configOptions")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("model"))
+            })
+            .and_then(|opt| opt.get("options"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("value").and_then(|s| s.as_str()))
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let raw_initial_model = sess_val
+            .pointer("/models/currentModelId")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .or_else(|| cfg.model.clone());
+
+        let active_effort = cfg.effort;
+        let mut current_base_model = raw_initial_model
+            .as_deref()
+            .map(|m| normalize_agy_base_model_id(m, &canonical_base_ids))
+            .or_else(|| cfg.model.clone());
+
+        // Optional `session/set_model` when explicit model or effort was requested
+        if (cfg.model.is_some() || cfg.effort.is_some())
+            && let Some(ref base_m) = cfg.model.as_ref().or(current_base_model.as_ref()).cloned()
+        {
+            let wire_model_id = resolve_agy_wire_model_id(
+                base_m,
+                active_effort,
+                &available_model_ids,
+                &canonical_base_ids,
+            );
+            if let Ok(rx) = send_acp_req(
+                &shim,
+                &mut next_rpc_id,
+                &mut pending_rpcs,
+                "session/set_model",
+                json!({
+                    "sessionId": session_id,
+                    "modelId": wire_model_id
+                }),
+            )
+            .await
+                && let Ok(v) = wait_rpc_during_boot(&mut shim, &mut pending_rpcs, rx).await
+                && let Some(m) = v.pointer("/models/currentModelId").and_then(|x| x.as_str())
+            {
+                current_base_model = Some(normalize_agy_base_model_id(m, &canonical_base_ids));
+            }
+        }
+
+        // Optional `session/set_mode` for `accept-edits` (ignore -32601)
+        if matches!(cfg.mode, SessionMode::AcceptEdits)
+            && let Ok(rx) = send_acp_req(
+                &shim,
+                &mut next_rpc_id,
+                &mut pending_rpcs,
+                "session/set_mode",
+                json!({
+                    "sessionId": session_id,
+                    "modeId": "accept-edits"
+                }),
+            )
+            .await
+        {
+            let _ = wait_rpc_during_boot(&mut shim, &mut pending_rpcs, rx).await;
+        }
+
+        (
+            session_id,
+            available_model_ids,
+            canonical_base_ids,
+            active_effort,
+            current_base_model,
+        )
+    };
 
     let _ = evt_tx
         .send(DriverEvent::SessionInitialized {
@@ -1868,20 +1876,20 @@ async fn handle_acp_permission_request(
     );
 
     let _ = evt_tx
-        .send(DriverEvent::StatusChanged(
-            AgentStatus::AwaitingPermission {
-                turn_id: active_turn_id.clone().unwrap_or_default(),
-                request_id: req_id.clone(),
-            },
-        ))
-        .await;
-    let _ = evt_tx
         .send(DriverEvent::PermissionRequest {
-            request_id: req_id,
+            request_id: req_id.clone(),
             title,
             detail,
             allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
         })
+        .await;
+    let _ = evt_tx
+        .send(DriverEvent::StatusChanged(
+            AgentStatus::AwaitingPermission {
+                turn_id: active_turn_id.clone().unwrap_or_default(),
+                request_id: req_id,
+            },
+        ))
         .await;
 }
 
@@ -3123,7 +3131,9 @@ impl AgyTranscriptMonitor {
         &mut self,
         bg_tracker: &BackgroundTaskTracker,
     ) -> Vec<UndeliveredCancelEvent> {
-        let dir = self.brain_dir.join(".system_generated/messages/undelivered");
+        let dir = self
+            .brain_dir
+            .join(".system_generated/messages/undelivered");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
@@ -3154,12 +3164,11 @@ impl AgyTranscriptMonitor {
                 .find(|(_, canceled, _)| *canceled)
                 .map(|(tid, _, lp)| (tid, lp))
                 .or_else(|| {
-                    bg_tracker.tasks.keys().find(|tid| raw.contains(tid.as_str())).map(|tid| {
-                        (
-                            tid.clone(),
-                            extract_log_path_from_text(&raw),
-                        )
-                    })
+                    bg_tracker
+                        .tasks
+                        .keys()
+                        .find(|tid| raw.contains(tid.as_str()))
+                        .map(|tid| (tid.clone(), extract_log_path_from_text(&raw)))
                 });
             if let Some((task_id, log_path)) = matched_task_id {
                 out.push(UndeliveredCancelEvent {
@@ -3199,7 +3208,11 @@ impl AgyTranscriptMonitor {
         }
     }
 
-    fn read_new_lines(&mut self, silent: bool, bg_deltas: &mut Vec<BgTaskDelta>) -> Vec<WakeupStep> {
+    fn read_new_lines(
+        &mut self,
+        silent: bool,
+        bg_deltas: &mut Vec<BgTaskDelta>,
+    ) -> Vec<WakeupStep> {
         let Some(path) = self.active_path().map(Path::to_path_buf) else {
             return Vec::new();
         };
@@ -4568,7 +4581,8 @@ mod tests {
     }
 
     #[test]
-    fn transcript_monitor_handles_checkpoint_compaction_in_progress_thinking_and_undelivered_cancel() {
+    fn transcript_monitor_handles_checkpoint_compaction_in_progress_thinking_and_undelivered_cancel()
+     {
         let dir = std::env::temp_dir().join(format!("orbit_chk_test_{}", uuid::Uuid::new_v4()));
         let logs_dir = dir.join(".system_generated/logs");
         let undeliv_dir = dir.join(".system_generated/messages/undelivered");

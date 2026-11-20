@@ -124,104 +124,103 @@ async fn run_codex_actor(
     let mut next_id: u64 = if is_reattached { 1000 } else { 2 };
     let mut mode = cfg.mode.clone();
 
-    let (thread_id, mut resolved_model) = if is_reattached
-        && let Some(ref tid) = cfg.resume_session_id
-    {
-        (tid.clone(), cfg.model.clone())
-    } else {
-        // Start or resume thread (injecting Orbit MCP server into `config.mcp_servers`)
-        let (approval_policy, start_sandbox) = codex_thread_mode_strings(&mode);
-        let thread_req_id = next_id;
-        next_id += 1;
-
-        let mut inner_config = serde_json::Map::new();
-        if let Some(ref mcp) = cfg.mcp_spec {
-            inner_config.insert(
-                "mcp_servers".into(),
-                json!({
-                    mcp.server_name.clone(): {
-                        "url": mcp.http_url,
-                        "http_headers": {
-                            "Authorization": format!("Bearer {}", mcp.bearer_token)
-                        },
-                        "tool_timeout_sec": 120
-                    }
-                }),
-            );
-        }
-        if let Some(ref sys_append) = cfg.system_prompt_append
-            && !sys_append.trim().is_empty()
-        {
-            inner_config.insert(
-                "developer_instructions".into(),
-                Value::String(sys_append.clone()),
-            );
-        }
-
-        let start_msg = if let Some(ref tid) = cfg.resume_session_id {
-            let mut params = json!({
-                "threadId": tid,
-                "excludeTurns": true
-            });
-            if !inner_config.is_empty() {
-                params["config"] = Value::Object(inner_config);
-            }
-            json!({
-                "id": thread_req_id,
-                "method": "thread/resume",
-                "params": params
-            })
+    let (thread_id, mut resolved_model) =
+        if is_reattached && let Some(ref tid) = cfg.resume_session_id {
+            (tid.clone(), cfg.model.clone())
         } else {
-            let mut params = json!({
-                "cwd": cfg.cwd.to_string_lossy(),
-                "approvalPolicy": approval_policy,
-                "sandbox": start_sandbox,
-                "approvalsReviewer": "user",
-                "ephemeral": false
-            });
-            if let Some(ref m) = cfg.model {
-                params["model"] = Value::String(m.clone());
-            }
-            if !inner_config.is_empty() {
-                params["config"] = Value::Object(inner_config);
-            }
-            json!({
-                "id": thread_req_id,
-                "method": "thread/start",
-                "params": params
-            })
-        };
+            // Start or resume thread (injecting Orbit MCP server into `config.mcp_servers`)
+            let (approval_policy, start_sandbox) = codex_thread_mode_strings(&mode);
+            let thread_req_id = next_id;
+            next_id += 1;
 
-        if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
-            return;
-        }
+            let mut inner_config = serde_json::Map::new();
+            if let Some(ref mcp) = cfg.mcp_spec {
+                inner_config.insert(
+                    "mcp_servers".into(),
+                    json!({
+                        mcp.server_name.clone(): {
+                            "url": mcp.http_url,
+                            "http_headers": {
+                                "Authorization": format!("Bearer {}", mcp.bearer_token)
+                            },
+                            "tool_timeout_sec": 120
+                        }
+                    }),
+                );
+            }
+            if let Some(ref sys_append) = cfg.system_prompt_append
+                && !sys_append.trim().is_empty()
+            {
+                inner_config.insert(
+                    "developer_instructions".into(),
+                    Value::String(sys_append.clone()),
+                );
+            }
 
-        let thread_res = match wait_codex_id_response(&mut shim, thread_req_id).await {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = evt_tx
-                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                        message: format!("Codex thread start failed: {e}"),
-                        recoverable: false,
-                    }))
-                    .await;
+            let start_msg = if let Some(ref tid) = cfg.resume_session_id {
+                let mut params = json!({
+                    "threadId": tid,
+                    "excludeTurns": true
+                });
+                if !inner_config.is_empty() {
+                    params["config"] = Value::Object(inner_config);
+                }
+                json!({
+                    "id": thread_req_id,
+                    "method": "thread/resume",
+                    "params": params
+                })
+            } else {
+                let mut params = json!({
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "approvalPolicy": approval_policy,
+                    "sandbox": start_sandbox,
+                    "approvalsReviewer": "user",
+                    "ephemeral": false
+                });
+                if let Some(ref m) = cfg.model {
+                    params["model"] = Value::String(m.clone());
+                }
+                if !inner_config.is_empty() {
+                    params["config"] = Value::Object(inner_config);
+                }
+                json!({
+                    "id": thread_req_id,
+                    "method": "thread/start",
+                    "params": params
+                })
+            };
+
+            if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
                 return;
             }
-        };
 
-        let tid = thread_res
-            .pointer("/thread/id")
-            .and_then(|v| v.as_str())
-            .or(cfg.resume_session_id.as_deref())
-            .unwrap_or("unknown")
-            .to_string();
-        let model = thread_res
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-            .or_else(|| cfg.model.clone());
-        (tid, model)
-    };
+            let thread_res = match wait_codex_id_response(&mut shim, thread_req_id).await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = evt_tx
+                        .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                            message: format!("Codex thread start failed: {e}"),
+                            recoverable: false,
+                        }))
+                        .await;
+                    return;
+                }
+            };
+
+            let tid = thread_res
+                .pointer("/thread/id")
+                .and_then(|v| v.as_str())
+                .or(cfg.resume_session_id.as_deref())
+                .unwrap_or("unknown")
+                .to_string();
+            let model = thread_res
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned)
+                .or_else(|| cfg.model.clone());
+            (tid, model)
+        };
     let mut current_effort = cfg.effort;
 
     let _ = evt_tx
@@ -609,9 +608,7 @@ async fn dispatch_codex_turn(
         "method": "turn/start",
         "params": params
     });
-    shim.write_stdin_line(req.to_string())
-        .await
-        .map_err(|_| ())
+    shim.write_stdin_line(req.to_string()).await.map_err(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -830,11 +827,14 @@ async fn handle_codex_notification(
                         .and_then(|v| v.as_str())
                         .map(|s| truncate_str(s, 72))
                         .unwrap_or_else(|| "Codex Subagent".to_string());
-                    let st = map_codex_item_status(item.get("status").and_then(|v| v.as_str()), is_done);
+                    let st =
+                        map_codex_item_status(item.get("status").and_then(|v| v.as_str()), is_done);
                     let pstatus = match st {
                         ToolCallStatus::Running => ProviderSubagentStatus::Running,
                         ToolCallStatus::Completed => ProviderSubagentStatus::Completed,
-                        ToolCallStatus::Failed | ToolCallStatus::Denied => ProviderSubagentStatus::Failed,
+                        ToolCallStatus::Failed | ToolCallStatus::Denied => {
+                            ProviderSubagentStatus::Failed
+                        }
                     };
                     let now = Utc::now();
                     let _ = evt_tx
@@ -946,16 +946,8 @@ async fn handle_codex_server_request(
                 .map(ToOwned::to_owned);
             pending_approvals.insert(req_id.clone(), PendingCodexApproval { rpc_id });
             let _ = evt_tx
-                .send(DriverEvent::StatusChanged(
-                    AgentStatus::AwaitingPermission {
-                        turn_id: client_turn_id.clone().unwrap_or_default(),
-                        request_id: req_id.clone(),
-                    },
-                ))
-                .await;
-            let _ = evt_tx
                 .send(DriverEvent::PermissionRequest {
-                    request_id: req_id,
+                    request_id: req_id.clone(),
                     title: format!("Run command: {cmd}"),
                     detail: ToolCallDetail::Shell {
                         command: cmd,
@@ -965,6 +957,14 @@ async fn handle_codex_server_request(
                     },
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                 })
+                .await;
+            let _ = evt_tx
+                .send(DriverEvent::StatusChanged(
+                    AgentStatus::AwaitingPermission {
+                        turn_id: client_turn_id.clone().unwrap_or_default(),
+                        request_id: req_id,
+                    },
+                ))
                 .await;
         }
         "item/fileChange/requestApproval" => {
@@ -986,20 +986,20 @@ async fn handle_codex_server_request(
             });
             pending_approvals.insert(req_id.clone(), PendingCodexApproval { rpc_id });
             let _ = evt_tx
-                .send(DriverEvent::StatusChanged(
-                    AgentStatus::AwaitingPermission {
-                        turn_id: client_turn_id.clone().unwrap_or_default(),
-                        request_id: req_id.clone(),
-                    },
-                ))
-                .await;
-            let _ = evt_tx
                 .send(DriverEvent::PermissionRequest {
-                    request_id: req_id,
+                    request_id: req_id.clone(),
                     title: "Approve file modifications".into(),
                     detail,
                     allowed_decisions: vec!["allow".into(), "deny".into()],
                 })
+                .await;
+            let _ = evt_tx
+                .send(DriverEvent::StatusChanged(
+                    AgentStatus::AwaitingPermission {
+                        turn_id: client_turn_id.clone().unwrap_or_default(),
+                        request_id: req_id,
+                    },
+                ))
                 .await;
         }
         "item/tool/requestUserInput" | "tool/requestUserInput" => {

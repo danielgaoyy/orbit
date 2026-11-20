@@ -116,7 +116,9 @@ impl FinishSubscriptionManager {
 
     /// Cancel any active watches owned by a caller that was archived or deleted.
     pub async fn cancel_for_caller(&self, caller_agent_id: &str) {
-        let _ = self.store.delete_finish_subscriptions_for_caller(caller_agent_id);
+        let _ = self
+            .store
+            .delete_finish_subscriptions_for_caller(caller_agent_id);
         let mut guard = self.active_watches.lock().await;
         guard.retain(|k, abort| {
             if k.caller_agent_id == caller_agent_id {
@@ -157,7 +159,11 @@ impl FinishSubscriptionManager {
         timeline_has_completed_latest_turn(&events)
     }
 
-    async fn caller_should_receive(&self, sub: &StoredFinishSubscription, child: Option<&AgentSummary>) -> bool {
+    async fn caller_should_receive(
+        &self,
+        sub: &StoredFinishSubscription,
+        child: Option<&AgentSummary>,
+    ) -> bool {
         let Ok(Some(caller)) = self.store.get_agent(&sub.caller_agent_id) else {
             return false;
         };
@@ -333,7 +339,11 @@ impl FinishSubscriptionManager {
                 let _ = self.store.delete_finish_subscription(&sub.id);
                 return;
             }
-            if !self.connected_hosts.is_host_registered(target_host_id).await {
+            if !self
+                .connected_hosts
+                .is_host_registered(target_host_id)
+                .await
+            {
                 self.deliver_unavailable_and_delete(
                     &sub,
                     "host removed",
@@ -364,14 +374,22 @@ impl FinishSubscriptionManager {
             match probe_res {
                 Ok(WireMessage::AgentsSnapshot { agents, .. }) => {
                     consecutive_failures = 0;
-                    if let Some(child) = agents.into_iter().find(|a| a.agent_id == sub.child_agent_id) {
+                    if let Some(child) = agents
+                        .into_iter()
+                        .find(|a| a.agent_id == sub.child_agent_id)
+                    {
                         if !self.caller_should_receive(&sub, Some(&child)).await {
                             let _ = self.store.delete_finish_subscription(&sub.id);
                             return;
                         }
                         if child.archived_at.is_some() {
-                            self.deliver_remote_terminal(&sub, &child, target_host_id, "was closed")
-                                .await;
+                            self.deliver_remote_terminal(
+                                &sub,
+                                &child,
+                                target_host_id,
+                                "was closed",
+                            )
+                            .await;
                             return;
                         }
                         match &child.status {
@@ -490,9 +508,7 @@ impl FinishSubscriptionManager {
                     }
                     // Loop around to process cleanly
                 }
-                Ok(Ok(RemoteHostEvent::HostRemoved { host_id }))
-                    if host_id == *target_host_id =>
-                {
+                Ok(Ok(RemoteHostEvent::HostRemoved { host_id })) if host_id == *target_host_id => {
                     self.deliver_unavailable_and_delete(
                         &sub,
                         "host removed",
@@ -515,11 +531,23 @@ impl FinishSubscriptionManager {
         if sub.delivered_perm_ids.iter().any(|id| id == request_id) {
             return;
         }
-        let Some(perm) = self
-            .orchestrator
-            .get_pending_permission(&child.agent_id, request_id)
-            .await
-        else {
+        // Wait briefly in case `StatusChanged(AwaitingPermission)` arrived just ahead of
+        // `PermissionRequest` ingestion on another task.
+        let mut perm = None;
+        for attempt in 0..8 {
+            if let Some(found) = self
+                .orchestrator
+                .get_pending_permission(&child.agent_id, request_id)
+                .await
+            {
+                perm = Some(found);
+                break;
+            }
+            if attempt < 7 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        let Some(perm) = perm else {
             return;
         };
         let perm_ref = PermissionCheckpointRef {
@@ -689,12 +717,12 @@ impl FinishSubscriptionManager {
             )
             .await
         {
-            Ok(WireMessage::TimelineCatchup { events, .. }) => events.into_iter().rev().find_map(
-                |ev| match ev.payload {
+            Ok(WireMessage::TimelineCatchup { events, .. }) => {
+                events.into_iter().rev().find_map(|ev| match ev.payload {
                     orbit_protocol::TimelinePayload::AssistantMessage { text, .. } => Some(text),
                     _ => None,
-                },
-            ),
+                })
+            }
             _ => None,
         };
         let event_tag = match reason {
@@ -815,7 +843,9 @@ fn format_permission_notification_body(
             .to_string(),
     );
     let payload = serde_json::to_string_pretty(perm).unwrap_or_default();
-    sections.push(format!("<permission-request>\n{payload}\n</permission-request>"));
+    sections.push(format!(
+        "<permission-request>\n{payload}\n</permission-request>"
+    ));
     sections.join("\n\n")
 }
 

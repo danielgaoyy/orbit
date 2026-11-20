@@ -1032,20 +1032,20 @@ async fn handle_claude_control_request(
     );
 
     let _ = evt_tx
-        .send(DriverEvent::StatusChanged(
-            AgentStatus::AwaitingPermission {
-                turn_id: active_turn_id.clone().unwrap_or_default(),
-                request_id: req_id.clone(),
-            },
-        ))
-        .await;
-    let _ = evt_tx
         .send(DriverEvent::PermissionRequest {
-            request_id: req_id,
+            request_id: req_id.clone(),
             title,
             detail,
             allowed_decisions: vec!["allow".into(), "allow_always".into(), "deny".into()],
         })
+        .await;
+    let _ = evt_tx
+        .send(DriverEvent::StatusChanged(
+            AgentStatus::AwaitingPermission {
+                turn_id: active_turn_id.clone().unwrap_or_default(),
+                request_id: req_id,
+            },
+        ))
         .await;
 }
 

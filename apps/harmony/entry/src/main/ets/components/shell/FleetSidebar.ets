@@ -1,7 +1,8 @@
 import { SymbolGlyphModifier } from '@kit.ArkUI';
 import {
-  AgentCardDto,
   HostCardDto,
+  SidebarConversationDto,
+  SidebarProjectGroupDto,
   basenameOfPath,
   cwdPathsEquivalent,
   formatCompactRelativeTime,
@@ -21,22 +22,19 @@ import {
 } from '../common/OrbitCommonControls';
 import {
   MAX_VISIBLE_THREADS_PER_PROJECT,
-  SidebarProjectGroup,
-  buildSidebarNeedsAttention,
-  buildSidebarPinnedAgents,
-  buildSidebarUnifiedProjects
+  filterSidebarConversationsForHost,
+  filterSidebarProjectsForHost
 } from './FleetProjectGrouping';
 
 @ComponentV2
 export struct FleetSidebar {
-  @Local searchQuery: string = '';
   @Local expandedMoreProjectIds: string[] = [];
 
   private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
   @Computed
   get normalizedQuery(): string {
-    return this.searchQuery.trim().toLowerCase();
+    return this.store.sidebarSearchQuery.trim().toLowerCase();
   }
 
   @Computed
@@ -45,35 +43,32 @@ export struct FleetSidebar {
   }
 
   @Computed
-  get needsAttentionList(): AgentCardDto[] {
-    return buildSidebarNeedsAttention(this.store.currentHostDetail, this.normalizedQuery);
-  }
-
-  @Computed
-  get pinnedList(): AgentCardDto[] {
-    const _seenRev = this.store.seenSeqRevision;
-    if (_seenRev < 0) {
+  get needsAttentionList(): SidebarConversationDto[] {
+    if (this.normalizedQuery.length > 0) {
       return [];
     }
-    return buildSidebarPinnedAgents(
-      this.store,
-      this.store.currentHostDetail,
-      this.store.selectedHostId,
-      this.normalizedQuery
+    return filterSidebarConversationsForHost(
+      this.store.sidebarView?.needs_attention,
+      this.store.selectedHostId
     );
   }
 
   @Computed
-  get unifiedProjects(): SidebarProjectGroup[] {
-    const _seenRev = this.store.seenSeqRevision;
-    if (_seenRev < 0) {
+  get pinnedList(): SidebarConversationDto[] {
+    if (this.normalizedQuery.length > 0) {
       return [];
     }
-    return buildSidebarUnifiedProjects(
-      this.store,
-      this.store.currentHostDetail,
-      this.store.selectedHostId,
-      this.normalizedQuery
+    return filterSidebarConversationsForHost(
+      this.store.sidebarView?.pinned_conversations,
+      this.store.selectedHostId
+    );
+  }
+
+  @Computed
+  get unifiedProjects(): SidebarProjectGroupDto[] {
+    return filterSidebarProjectsForHost(
+      this.store.sidebarView,
+      this.store.selectedHostId
     );
   }
 
@@ -102,19 +97,11 @@ export struct FleetSidebar {
     return host.last_ping_ms !== null ? `${conn} · ${host.last_ping_ms}ms` : conn;
   }
 
-  private isAgentUnreadReactive(hostId: string, agent: AgentCardDto): boolean {
-    const rev = this.store.seenSeqRevision;
-    if (rev < 0 || hostId.length === 0) {
-      return false;
+  private visibleThreadsForGroup(group: SidebarProjectGroupDto): SidebarConversationDto[] {
+    if (this.normalizedQuery.length > 0 || this.isProjectMoreExpanded(group.id)) {
+      return group.conversations;
     }
-    return this.store.isThreadUnread(hostId, agent);
-  }
-
-  private visibleThreadsForGroup(group: SidebarProjectGroup): AgentCardDto[] {
-    if (this.normalizedQuery.length > 0 || this.isProjectMoreExpanded(group.projectId)) {
-      return group.threads;
-    }
-    return group.threads.slice(0, MAX_VISIBLE_THREADS_PER_PROJECT);
+    return group.conversations.slice(0, MAX_VISIBLE_THREADS_PER_PROJECT);
   }
 
   @Builder
@@ -223,7 +210,7 @@ export struct FleetSidebar {
   }
 
   @Builder
-  private renderProjectContextMenu(group: SidebarProjectGroup) {
+  private renderProjectContextMenu(group: SidebarProjectGroupDto) {
     Menu() {
       MenuItemGroup() {
         MenuItem({
@@ -232,7 +219,7 @@ export struct FleetSidebar {
           content: 'New Session Here'
         })
           .onClick(() => {
-            this.store.startNewSessionDraft(group.primaryDir);
+            this.store.startNewSessionDraft(group.primary_cwd);
           })
 
         MenuItem({
@@ -241,7 +228,7 @@ export struct FleetSidebar {
           content: 'Select Workspace'
         })
           .onClick(() => {
-            this.store.startNewSessionDraft(group.primaryDir);
+            this.store.startNewSessionDraft(group.primary_cwd);
           })
 
         MenuItem({
@@ -250,7 +237,7 @@ export struct FleetSidebar {
           content: 'Diff Review'
         })
           .onClick(() => {
-            this.store.inspectGitDiffForCwd(group.primaryDir);
+            this.store.inspectGitDiffForCwd(group.primary_cwd);
           })
 
         MenuItem({
@@ -259,20 +246,21 @@ export struct FleetSidebar {
           content: 'Terminal'
         })
           .onClick(() => {
-            this.store.openPtyTerminalInCwd(group.primaryDir);
+            this.store.openPtyTerminalInCwd(group.primary_cwd);
           })
 
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier(
-            group.pinnedProjectId.length > 0 ? $r('sys.symbol.pin_slash') : $r('sys.symbol.pin')
+            (group.pinned_project_id ?? '').length > 0 ? $r('sys.symbol.pin_slash') : $r('sys.symbol.pin')
           ).fontColor([this.store.palette.iconPrimary]),
-          content: group.pinnedProjectId.length > 0 ? 'Unpin Project' : 'Pin Project'
+          content: (group.pinned_project_id ?? '').length > 0 ? 'Unpin Project' : 'Pin Project'
         })
           .onClick(() => {
-            if (group.pinnedProjectId.length > 0) {
-              this.store.removePinnedProject(group.pinnedProjectId);
+            const pinnedProjId = group.pinned_project_id ?? '';
+            if (pinnedProjId.length > 0) {
+              this.store.removePinnedProject(pinnedProjId);
             } else {
-              this.store.pinDirectoryAsProject(group.primaryDir);
+              this.store.pinDirectoryAsProject(group.primary_cwd);
             }
           })
 
@@ -282,28 +270,33 @@ export struct FleetSidebar {
           content: 'Copy Path'
         })
           .onClick(() => {
-            this.store.copyToClipboard(group.primaryDir, 'Copied path');
+            this.store.copyToClipboard(group.primary_cwd, 'Copied path');
           })
       }
     }
   }
 
   @Builder
-  private renderSessionContextMenu(agent: AgentCardDto) {
+  private renderSessionContextMenu(conv: SidebarConversationDto) {
     Menu() {
       MenuItemGroup() {
         MenuItem({
           symbolStartIcon: new SymbolGlyphModifier(
-            this.store.isThreadPinned(this.store.selectedHostId, agent.agent_id)
-              ? $r('sys.symbol.pin_slash')
-              : $r('sys.symbol.pin')
+            conv.is_pinned ? $r('sys.symbol.pin_slash') : $r('sys.symbol.pin')
           ).fontColor([this.store.palette.iconPrimary]),
-          content: this.store.isThreadPinned(this.store.selectedHostId, agent.agent_id)
-            ? 'Unpin Conversation'
-            : 'Pin Conversation'
+          content: conv.is_pinned ? 'Unpin Conversation' : 'Pin Conversation'
         })
           .onClick(() => {
-            this.store.togglePinThread(this.store.selectedHostId, agent.agent_id);
+            this.store.togglePinThread(conv.host_id, conv.agent.agent_id);
+          })
+
+        MenuItem({
+          symbolStartIcon: new SymbolGlyphModifier($r('sys.symbol.dot_circle'))
+            .fontColor([this.store.palette.iconPrimary]),
+          content: 'Mark Unread'
+        })
+          .onClick(() => {
+            this.store.markAgentUnread(conv.host_id, conv.agent.agent_id);
           })
 
         MenuItem({
@@ -312,7 +305,7 @@ export struct FleetSidebar {
           content: 'New Session in Workspace'
         })
           .onClick(() => {
-            this.store.startNewSessionDraft(agent.cwd);
+            this.store.startNewSessionDraft(conv.agent.cwd);
           })
 
         MenuItem({
@@ -321,7 +314,7 @@ export struct FleetSidebar {
           content: 'Diff Review'
         })
           .onClick(() => {
-            this.store.inspectGitDiffForCwd(agent.cwd);
+            this.store.inspectGitDiffForCwd(conv.agent.cwd);
           })
 
         MenuItem({
@@ -330,7 +323,7 @@ export struct FleetSidebar {
           content: 'Terminal'
         })
           .onClick(() => {
-            this.store.openPtyTerminalInCwd(agent.cwd);
+            this.store.openPtyTerminalInCwd(conv.agent.cwd);
           })
 
         MenuItem({
@@ -339,7 +332,7 @@ export struct FleetSidebar {
           content: 'Copy Workspace Path'
         })
           .onClick(() => {
-            this.store.copyToClipboard(agent.cwd, 'Copied path');
+            this.store.copyToClipboard(conv.agent.cwd, 'Copied path');
           })
       }
 
@@ -351,7 +344,7 @@ export struct FleetSidebar {
         })
           .contentFontColor(this.store.palette.statusDanger)
           .onClick(() => {
-            this.store.archiveSession(agent.agent_id);
+            this.store.archiveSession(conv.agent.agent_id);
           })
       }
     }
@@ -382,23 +375,23 @@ export struct FleetSidebar {
 
   @Builder
   private renderConversationRow(
-    agent: AgentCardDto,
+    conv: SidebarConversationDto,
     showWorkspaceHint: boolean,
     indentLeft: number
   ) {
     ListItem() {
       Row({ space: OrbitTokens.SPACE_SM }) {
         Row() {
-          if (agent.is_awaiting_permission) {
+          if (conv.agent.is_awaiting_permission) {
             SymbolGlyph($r('sys.symbol.exclamationmark_triangle_fill'))
               .fontSize(14)
               .fontColor([this.store.palette.statusWarning])
-          } else if (agent.is_running) {
+          } else if (conv.agent.is_running) {
             LoadingProgress()
               .width(16)
               .height(16)
               .color(this.store.palette.iconSecondary)
-          } else if (this.isAgentUnreadReactive(this.store.selectedHostId, agent)) {
+          } else if (conv.is_unread) {
             Row()
               .width(7)
               .height(7)
@@ -411,11 +404,11 @@ export struct FleetSidebar {
         .alignItems(VerticalAlign.Center)
 
         Column({ space: 2 }) {
-          Text(agent.title.trim().length > 0 ? agent.title : agent.provider_label)
+          Text(conv.agent.title.trim().length > 0 ? conv.agent.title : conv.agent.provider_label)
             .attributeModifier(
               orbitTextSubhead(
                 this.store.palette.fgPrimary,
-                !this.store.isNewSessionDraft && this.store.selectedAgentId === agent.agent_id
+                !this.store.isNewSessionDraft && this.store.selectedAgentId === conv.agent.agent_id
                   ? FontWeight.Medium
                   : FontWeight.Normal
               )
@@ -424,7 +417,7 @@ export struct FleetSidebar {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
 
           if (showWorkspaceHint) {
-            Text(basenameOfPath(agent.cwd))
+            Text(basenameOfPath(conv.agent.cwd))
               .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -433,8 +426,8 @@ export struct FleetSidebar {
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
 
-        if (formatCompactRelativeTime(agent.updated_at_rfc3339).length > 0) {
-          Text(formatCompactRelativeTime(agent.updated_at_rfc3339))
+        if (formatCompactRelativeTime(conv.agent.updated_at_rfc3339).length > 0) {
+          Text(formatCompactRelativeTime(conv.agent.updated_at_rfc3339))
             .attributeModifier(orbitTextMeta(this.store.palette.fgMuted))
             .maxLines(1)
         }
@@ -448,7 +441,7 @@ export struct FleetSidebar {
         bottom: 6
       })
       .backgroundColor(
-        !this.store.isNewSessionDraft && this.store.selectedAgentId === agent.agent_id
+        !this.store.isNewSessionDraft && this.store.selectedAgentId === conv.agent.agent_id
           ? this.store.palette.subtleSurface
           : Color.Transparent
       )
@@ -456,11 +449,11 @@ export struct FleetSidebar {
       .alignItems(VerticalAlign.Center)
       .onClick(() => {
         dismissHarmonyKeyboard(this.getUIContext());
-        this.store.selectAgent(agent.agent_id);
+        this.store.selectAgent(conv.agent.agent_id);
       })
       .bindContextMenu(
         () => {
-          this.renderSessionContextMenu(agent);
+          this.renderSessionContextMenu(conv);
         },
         ResponseType.LongPress
       )
@@ -469,18 +462,18 @@ export struct FleetSidebar {
     .swipeAction({
       end: {
         builder: () => {
-          this.renderSwipeArchiveButton(agent.agent_id);
+          this.renderSwipeArchiveButton(conv.agent.agent_id);
         }
       }
     })
   }
 
   @Builder
-  private renderProjectHeaderRow(group: SidebarProjectGroup) {
+  private renderProjectHeaderRow(group: SidebarProjectGroupDto) {
     ListItem() {
       Row({ space: 6 }) {
         SymbolGlyph(
-          this.normalizedQuery.length === 0 && this.store.isProjectCollapsed(group.projectId)
+          this.normalizedQuery.length === 0 && this.store.isProjectCollapsed(group.id)
             ? $r('sys.symbol.chevron_right')
             : $r('sys.symbol.chevron_down')
         )
@@ -490,7 +483,7 @@ export struct FleetSidebar {
         SymbolGlyph($r('sys.symbol.folder'))
           .fontSize(16)
           .fontColor([
-            this.store.isNewSessionDraft && cwdPathsEquivalent(group.primaryDir, this.store.activeCwd)
+            this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
               ? this.store.palette.accentPrimary
               : this.store.palette.iconSecondary
           ])
@@ -499,7 +492,7 @@ export struct FleetSidebar {
           .attributeModifier(
             orbitTextSubhead(
               this.store.palette.fgPrimary,
-              this.store.isNewSessionDraft && cwdPathsEquivalent(group.primaryDir, this.store.activeCwd)
+              this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
                 ? FontWeight.Bold
                 : FontWeight.Medium
             )
@@ -521,14 +514,14 @@ export struct FleetSidebar {
         .accessibilityText(`New session in ${group.name}`)
         .onClick(() => {
           dismissHarmonyKeyboard(this.getUIContext());
-          this.store.startNewSessionDraft(group.primaryDir);
+          this.store.startNewSessionDraft(group.primary_cwd);
         })
       }
       .width('100%')
       .constraintSize({ minHeight: OrbitTokens.HIT_MIN })
       .padding({ left: 8, right: 4 })
       .backgroundColor(
-        this.store.isNewSessionDraft && cwdPathsEquivalent(group.primaryDir, this.store.activeCwd)
+        this.store.isNewSessionDraft && cwdPathsEquivalent(group.primary_cwd, this.store.activeCwd)
           ? this.store.palette.subtleSurface
           : Color.Transparent
       )
@@ -536,7 +529,7 @@ export struct FleetSidebar {
       .alignItems(VerticalAlign.Center)
       .onClick(() => {
         dismissHarmonyKeyboard(this.getUIContext());
-        this.store.toggleProjectCollapsed(group.projectId);
+        this.store.toggleProjectCollapsed(group.id);
       })
       .bindContextMenu(
         () => {
@@ -591,7 +584,7 @@ export struct FleetSidebar {
     Column() {
       // 1. Native HarmonyOS 7 Search + Compose Action Row
       Row({ space: OrbitTokens.SPACE_SM }) {
-        Search({ value: this.searchQuery, placeholder: 'Search' })
+        Search({ value: this.store.sidebarSearchQuery, placeholder: 'Search' })
           .layoutWeight(1)
           .height(OrbitTokens.HIT_COMPACT)
           .backgroundColor(this.store.palette.subtleSurface)
@@ -601,7 +594,7 @@ export struct FleetSidebar {
           .placeholderFont({ size: OrbitTokens.FONT_SUBHEAD_RES })
           .maxFontScale(OrbitTokens.MAX_FONT_SCALE_CHROME)
           .onChange((val: string) => {
-            this.searchQuery = val;
+            this.store.setSidebarSearchQuery(val);
           })
 
         Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -687,10 +680,10 @@ export struct FleetSidebar {
 
             ForEach(
               this.needsAttentionList,
-              (agent: AgentCardDto) => {
-                this.renderConversationRow(agent, true, 12)
+              (conv: SidebarConversationDto) => {
+                this.renderConversationRow(conv, true, 12)
               },
-              (agent: AgentCardDto) => `attn_${agent.agent_id}`
+              (conv: SidebarConversationDto) => `attn_${conv.host_id}_${conv.agent.agent_id}`
             )
           }
 
@@ -703,10 +696,10 @@ export struct FleetSidebar {
 
             ForEach(
               this.pinnedList,
-              (agent: AgentCardDto) => {
-                this.renderConversationRow(agent, true, 12)
+              (conv: SidebarConversationDto) => {
+                this.renderConversationRow(conv, true, 12)
               },
-              (agent: AgentCardDto) => `pin_${agent.agent_id}`
+              (conv: SidebarConversationDto) => `pin_${conv.host_id}_${conv.agent.agent_id}`
             )
           }
 
@@ -781,7 +774,7 @@ export struct FleetSidebar {
                     .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
                     .padding({ left: 0, right: OrbitTokens.SPACE_SM })
                     .onClick(() => {
-                      this.searchQuery = '';
+                      this.store.setSidebarSearchQuery('');
                     })
                 } else if (this.store.sidebarThreadFilter !== 'all') {
                   Button('Show all conversations', { type: ButtonType.Normal, stateEffect: true })
@@ -800,31 +793,31 @@ export struct FleetSidebar {
           } else {
             ForEach(
               this.unifiedProjects,
-              (group: SidebarProjectGroup) => {
+              (group: SidebarProjectGroupDto) => {
                 ListItemGroup() {
                   this.renderProjectHeaderRow(group)
 
                   if (
                     this.normalizedQuery.length > 0 ||
-                    !this.store.isProjectCollapsed(group.projectId)
+                    !this.store.isProjectCollapsed(group.id)
                   ) {
                     ForEach(
                       this.visibleThreadsForGroup(group),
-                      (agent: AgentCardDto) => {
-                        this.renderConversationRow(agent, false, 20)
+                      (conv: SidebarConversationDto) => {
+                        this.renderConversationRow(conv, false, 20)
                       },
-                      (agent: AgentCardDto) => `t_${group.projectId}_${agent.agent_id}`
+                      (conv: SidebarConversationDto) => `t_${group.id}_${conv.host_id}_${conv.agent.agent_id}`
                     )
 
                     if (
                       this.normalizedQuery.length === 0 &&
-                      group.threads.length > MAX_VISIBLE_THREADS_PER_PROJECT
+                      group.conversations.length > MAX_VISIBLE_THREADS_PER_PROJECT
                     ) {
                       ListItem() {
                         Button(
-                          this.isProjectMoreExpanded(group.projectId)
+                          this.isProjectMoreExpanded(group.id)
                             ? 'Show less'
-                            : `Show ${group.threads.length - MAX_VISIBLE_THREADS_PER_PROJECT} more…`,
+                            : `Show ${group.conversations.length - MAX_VISIBLE_THREADS_PER_PROJECT} more…`,
                           { type: ButtonType.Normal, stateEffect: true }
                         )
                           .attributeModifier(orbitButtonSubhead(this.store.palette.fgMuted, Color.Transparent))
@@ -832,7 +825,7 @@ export struct FleetSidebar {
                           .constraintSize({ minHeight: OrbitTokens.HIT_COMPACT })
                           .padding({ left: 46, right: OrbitTokens.SPACE_MD })
                           .onClick(() => {
-                            this.toggleProjectMoreExpanded(group.projectId);
+                            this.toggleProjectMoreExpanded(group.id);
                           })
                       }
                       .padding({ left: OrbitTokens.SPACE_SM, right: OrbitTokens.SPACE_SM })
@@ -840,7 +833,7 @@ export struct FleetSidebar {
                   }
                 }
               },
-              (group: SidebarProjectGroup) => `proj_${group.projectId}`
+              (group: SidebarProjectGroupDto) => `proj_${group.id}`
             )
           }
         }

@@ -117,7 +117,7 @@ export function AppearanceSection() {
                   type="button"
                   onClick={() => orbitActions.setTheme(opt.id)}
                   className={cn(
-                    "flex cursor-pointer flex-col items-center gap-2 rounded-[11px] border p-2.5 transition-all",
+                    "flex cursor-pointer flex-col items-center gap-2 rounded-[11px] border p-2.5 transition-colors",
                     active
                       ? "border-foreground/35 bg-accent/60 text-foreground"
                       : "border-border hover:border-foreground/18 text-muted-foreground hover:text-foreground",

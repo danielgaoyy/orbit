@@ -332,6 +332,8 @@ pub struct ProviderQuotaSnapshot {
 pub struct PromptBadge {
     pub kind: String,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 /// Monotonically sequenced timeline event stored in SQLite WAL and streamed to clients.

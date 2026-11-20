@@ -15,31 +15,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { GitFileEntry } from "@/lib/orbit-ipc";
+import type { MentionCandidateView } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
-
-export type MentionCandidate =
-  | {
-      key: string;
-      kind: "git_diff";
-      staged: boolean;
-      label: string;
-      subtitle: string;
-    }
-  | {
-      key: string;
-      kind: "terminal_output";
-      label: string;
-      subtitle: string;
-    }
-  | {
-      key: string;
-      kind: "file";
-      path: string;
-      basename: string;
-      dirPath: string;
-      gitStatus: string | null;
-    };
 
 const LOCKFILE_NAMES = new Set([
   "cargo.lock",
@@ -159,121 +136,11 @@ export function resolveSemanticFileIcon(basename: string): LucideIcon {
   }
 }
 
-function fuzzyMatchScore(target: string, basename: string, queryLower: string): number {
-  if (!queryLower) return 10;
-  const baseLower = basename.toLowerCase();
-  const fullLower = target.toLowerCase();
-
-  if (baseLower === queryLower) return 120;
-  if (baseLower.startsWith(queryLower)) return 100;
-  if (baseLower.includes(queryLower)) return 82;
-  if (fullLower.includes(queryLower)) return 64;
-
-  // Subsequence match (e.g. "omc" -> "omni-composer.tsx")
-  let qi = 0;
-  for (let i = 0; i < fullLower.length && qi < queryLower.length; i += 1) {
-    if (fullLower[i] === queryLower[qi]) {
-      qi += 1;
-    }
-  }
-  return qi === queryLower.length ? 40 : 0;
-}
-
-export function buildMentionCandidates(
-  query: string,
-  workspaceFiles: readonly string[],
-  gitFiles: readonly GitFileEntry[],
-): MentionCandidate[] {
-  const q = query.trim().toLowerCase();
-  const results: MentionCandidate[] = [];
-
-  // 1. Live Context Sources
-  const specialSources: Exclude<MentionCandidate, { kind: "file" }>[] = [
-    {
-      key: "special:working_diff",
-      kind: "git_diff",
-      staged: false,
-      label: "Working Tree Diff",
-      subtitle: "Uncommitted changes in workspace",
-    },
-    {
-      key: "special:staged_diff",
-      kind: "git_diff",
-      staged: true,
-      label: "Staged Diff",
-      subtitle: "Git index staged changes",
-    },
-    {
-      key: "special:terminal",
-      kind: "terminal_output",
-      label: "Terminal Output",
-      subtitle: "Recent lines from active PTY terminal",
-    },
-  ];
-
-  for (const sp of specialSources) {
-    if (
-      !q ||
-      sp.label.toLowerCase().includes(q) ||
-      sp.subtitle.toLowerCase().includes(q) ||
-      (sp.kind === "git_diff" && "diff".includes(q)) ||
-      (sp.kind === "terminal_output" && "pty".includes(q))
-    ) {
-      results.push(sp);
-    }
-  }
-
-  // 2. Workspace & Modified Files
-  const gitStatusByPath = new Map<string, string>();
-  for (const gf of gitFiles) {
-    gitStatusByPath.set(gf.path, gf.untracked ? "U" : gf.status || "M");
-  }
-
-  const allPaths = new Set<string>();
-  for (const gf of gitFiles) {
-    allPaths.add(gf.path);
-  }
-  for (const f of workspaceFiles) {
-    allPaths.add(f);
-  }
-
-  const scoredFiles: { score: number; item: Extract<MentionCandidate, { kind: "file" }> }[] = [];
-  for (const path of allPaths) {
-    const slashIdx = path.lastIndexOf("/");
-    const basename = slashIdx >= 0 ? path.slice(slashIdx + 1) : path;
-    const dirPath = slashIdx >= 0 ? path.slice(0, slashIdx) : "";
-    const baseScore = fuzzyMatchScore(path, basename, q);
-    if (baseScore <= 0) continue;
-
-    const gitStatus = gitStatusByPath.get(path) ?? null;
-    const finalScore = baseScore + (gitStatus ? 18 : 0) - Math.min(12, path.length * 0.08);
-    scoredFiles.push({
-      score: finalScore,
-      item: {
-        key: `file:${path}`,
-        kind: "file",
-        path,
-        basename,
-        dirPath,
-        gitStatus,
-      },
-    });
-  }
-
-  scoredFiles.sort((a, b) => b.score - a.score);
-  const maxFiles = Math.max(4, 11 - results.length);
-  for (let i = 0; i < Math.min(maxFiles, scoredFiles.length); i += 1) {
-    results.push(scoredFiles[i].item);
-  }
-
-  return results;
-}
-
 interface MentionMenuProps {
-  items: MentionCandidate[];
+  items: MentionCandidateView[];
   activeIndex: number;
   onHoverIndex: (index: number) => void;
-  onSelect: (item: MentionCandidate) => void;
+  onSelect: (item: MentionCandidateView) => void;
 }
 
 export function MentionMenu({
@@ -304,7 +171,11 @@ export function MentionMenu({
           );
 
           if (item.kind === "file") {
-            const FileIcon = resolveSemanticFileIcon(item.basename);
+            const path = item.file_path || item.title;
+            const slashIdx = path.lastIndexOf("/");
+            const basename = slashIdx >= 0 ? path.slice(slashIdx + 1) : path;
+            const dirPath = slashIdx >= 0 ? path.slice(0, slashIdx) : "";
+            const FileIcon = resolveSemanticFileIcon(basename);
             return (
               <button
                 key={item.key}
@@ -325,26 +196,27 @@ export function MentionMenu({
                 <div className="flex min-w-0 items-center gap-2.5">
                   <FileIcon className={iconClass} />
                   <span className="shrink-0 font-mono text-[13px] font-medium">
-                    {item.basename}
+                    {basename}
                   </span>
-                  {item.dirPath && (
+                  {dirPath && (
                     <span className="text-muted-foreground truncate font-mono text-[11.5px]">
-                      {item.dirPath}
+                      {dirPath}
                     </span>
                   )}
                 </div>
-                {item.gitStatus && (
+                {item.git_status && (
                   <span className="bg-muted text-muted-foreground shrink-0 rounded-[4px] px-1.5 py-0.5 font-mono text-[10.5px] font-medium dark:bg-white/[0.09]">
-                    {item.gitStatus}
+                    {item.git_status}
                   </span>
                 )}
               </button>
             );
           }
 
+          const isStagedDiff = item.key.includes("staged");
           const SourceIcon =
             item.kind === "git_diff"
-              ? item.staged
+              ? isStagedDiff
                 ? GitCompareArrows
                 : FileDiff
               : SquareTerminal;
@@ -368,7 +240,7 @@ export function MentionMenu({
             >
               <div className="flex min-w-0 items-center gap-2.5">
                 <SourceIcon className={iconClass} />
-                <span className="shrink-0 text-[13px] font-medium">{item.label}</span>
+                <span className="shrink-0 text-[13px] font-medium">{item.title}</span>
                 <span className="text-muted-foreground truncate text-[12px]">
                   {item.subtitle}
                 </span>

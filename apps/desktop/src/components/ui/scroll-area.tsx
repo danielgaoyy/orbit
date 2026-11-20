@@ -1,9 +1,7 @@
 import * as React from "react";
-import { ScrollArea as BaseScrollArea } from "@base-ui/react/scroll-area";
 import { cn } from "@/lib/utils";
 
-export interface ScrollAreaProps
-  extends React.ComponentPropsWithoutRef<typeof BaseScrollArea.Root> {
+export interface ScrollAreaProps extends React.HTMLAttributes<HTMLDivElement> {
   orientation?: "vertical" | "horizontal" | "both";
   viewportRef?: React.Ref<HTMLDivElement>;
   viewportClassName?: string;
@@ -11,6 +9,11 @@ export interface ScrollAreaProps
   onViewportScroll?: React.UIEventHandler<HTMLDivElement>;
 }
 
+/**
+ * Native Composited ScrollArea:
+ * Runs 100% on the OS / WebKit compositor thread (native macOS overlay NSScroller, standard CSS thin scrollbars elsewhere)
+ * with zero JS scrollbar tracking, zero `getComputedStyle` layout reads, and zero inherited CSS variable invalidation storms.
+ */
 function ScrollArea({
   className,
   children,
@@ -21,67 +24,51 @@ function ScrollArea({
   onViewportScroll,
   ...props
 }: ScrollAreaProps) {
-  const showVertical = orientation === "vertical" || orientation === "both";
-  const showHorizontal = orientation === "horizontal" || orientation === "both";
-
   return (
-    <BaseScrollArea.Root
+    <div
       data-slot="scroll-area"
       className={cn("relative overflow-hidden", className)}
       {...props}
     >
-      <BaseScrollArea.Viewport
+      <div
         ref={viewportRef}
         data-slot="scroll-area-viewport"
+        data-orientation={orientation}
         onScroll={onViewportScroll}
         className={cn(
-          "size-full rounded-[inherit] outline-none",
+          "orbit-native-scroll size-full rounded-[inherit] outline-none",
           orientation === "vertical" && "overflow-x-hidden overflow-y-auto",
-          orientation === "horizontal" && "overflow-x-auto overflow-y-hidden",
-          orientation === "both" && "overflow-auto",
+          orientation === "horizontal" &&
+            "overflow-x-auto overflow-y-hidden overscroll-x-contain",
+          orientation === "both" && "overflow-auto overscroll-contain",
           viewportClassName,
         )}
       >
-        <BaseScrollArea.Content
+        <div
           data-slot="scroll-area-content"
+          style={
+            orientation === "vertical"
+              ? { minWidth: 0, maxWidth: "100%" }
+              : { minWidth: "fit-content" }
+          }
           className={cn(
             orientation === "vertical" ? "w-full min-w-0" : "min-w-full",
             contentClassName,
           )}
         >
           {children}
-        </BaseScrollArea.Content>
-      </BaseScrollArea.Viewport>
-      {showVertical && <ScrollBar orientation="vertical" />}
-      {showHorizontal && <ScrollBar orientation="horizontal" />}
-      {showVertical && showHorizontal && <BaseScrollArea.Corner />}
-    </BaseScrollArea.Root>
+        </div>
+      </div>
+    </div>
   );
 }
 
-function ScrollBar({
-  className,
-  orientation = "vertical",
-  ...props
-}: React.ComponentPropsWithoutRef<typeof BaseScrollArea.Scrollbar>) {
-  return (
-    <BaseScrollArea.Scrollbar
-      data-slot="scroll-area-scrollbar"
-      orientation={orientation}
-      className={cn(
-        "pointer-events-none z-30 flex touch-none select-none opacity-0 transition-opacity duration-150 delay-300 data-[hovering]:pointer-events-auto data-[hovering]:opacity-100 data-[hovering]:delay-0 data-[scrolling]:pointer-events-auto data-[scrolling]:opacity-100 data-[scrolling]:delay-0 data-[scrolling]:duration-75",
-        orientation === "vertical" && "h-full w-2.5 border-l border-l-transparent p-[2px]",
-        orientation === "horizontal" && "h-2.5 flex-col border-t border-t-transparent p-[2px]",
-        className,
-      )}
-      {...props}
-    >
-      <BaseScrollArea.Thumb
-        data-slot="scroll-area-thumb"
-        className="bg-foreground/15 hover:bg-foreground/28 active:bg-foreground/38 relative flex-1 rounded-full transition-colors duration-150"
-      />
-    </BaseScrollArea.Scrollbar>
-  );
+/** Compatibility stub retained for callers importing `ScrollBar`; native composited scrollbars require no extra DOM element. */
+function ScrollBar(_props: {
+  className?: string;
+  orientation?: "vertical" | "horizontal";
+}) {
+  return null;
 }
 
 export { ScrollArea, ScrollBar };

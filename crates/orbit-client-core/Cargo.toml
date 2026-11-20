@@ -26,3 +26,5 @@ pulldown-cmark.workspace = true
 syntect.workspace = true
 similar.workspace = true
 vt100.workspace = true
+mermaid-rs-renderer.workspace = true
+layout-rs.workspace = true

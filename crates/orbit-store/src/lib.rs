@@ -40,13 +40,24 @@ pub struct StoredHostProfile {
     pub meta: StoredHostMeta,
 }
 
-/// Persisted Paseo-style multi-directory Project (`1 primary cwd + 0..N extra_dirs`).
+/// Persisted multi-directory Project (`1 primary cwd + 0..N extra_dirs`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredClientProject {
     pub project_id: String,
     pub host_id: String,
     pub name: String,
     pub directories: Vec<String>,
+    pub updated_at_ms: i64,
+}
+
+/// Persisted per-thread client UI state (`seen_seq`, pinned status & ordering).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientThreadPref {
+    pub host_id: String,
+    pub agent_id: String,
+    pub seen_seq: u64,
+    pub is_pinned: bool,
+    pub pinned_order: i64,
     pub updated_at_ms: i64,
 }
 
@@ -194,6 +205,16 @@ impl OrbitStore {
             CREATE TABLE IF NOT EXISTS client_replica_cursors (
                 agent_id       TEXT PRIMARY KEY,
                 contiguous_seq INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS client_thread_prefs (
+                host_id       TEXT NOT NULL,
+                agent_id      TEXT NOT NULL,
+                seen_seq      INTEGER NOT NULL DEFAULT 0,
+                is_pinned     INTEGER NOT NULL DEFAULT 0,
+                pinned_order  INTEGER NOT NULL DEFAULT 0,
+                updated_at_ms INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (host_id, agent_id)
             );
             ",
         )?;
@@ -1221,6 +1242,10 @@ impl OrbitStore {
             "DELETE FROM client_replica_agents WHERE host_id = ?1",
             params![host_id],
         )?;
+        conn.execute(
+            "DELETE FROM client_thread_prefs WHERE host_id = ?1",
+            params![host_id],
+        )?;
         Ok(())
     }
 
@@ -1232,6 +1257,10 @@ impl OrbitStore {
         )?;
         conn.execute(
             "DELETE FROM client_replica_agents WHERE host_id = ?1",
+            params![host_id],
+        )?;
+        conn.execute(
+            "DELETE FROM client_thread_prefs WHERE host_id = ?1",
             params![host_id],
         )?;
         Ok(())
@@ -1284,6 +1313,216 @@ impl OrbitStore {
         conn.execute(
             "DELETE FROM client_projects WHERE project_id = ?1",
             params![project_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_client_thread_prefs(&self) -> Result<Vec<ClientThreadPref>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT host_id, agent_id, seen_seq, is_pinned, pinned_order, updated_at_ms
+             FROM client_thread_prefs
+             ORDER BY pinned_order DESC, updated_at_ms DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ClientThreadPref {
+                host_id: row.get(0)?,
+                agent_id: row.get(1)?,
+                seen_seq: row.get::<_, i64>(2)?.max(0) as u64,
+                is_pinned: row.get::<_, i64>(3)? != 0,
+                pinned_order: row.get(4)?,
+                updated_at_ms: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn upsert_client_thread_pref(&self, pref: &ClientThreadPref) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO client_thread_prefs (
+                host_id, agent_id, seen_seq, is_pinned, pinned_order, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(host_id, agent_id) DO UPDATE SET
+                seen_seq = excluded.seen_seq,
+                is_pinned = excluded.is_pinned,
+                pinned_order = excluded.pinned_order,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                pref.host_id,
+                pref.agent_id,
+                pref.seen_seq as i64,
+                i32::from(pref.is_pinned),
+                pref.pinned_order,
+                pref.updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_client_thread_seen_seq(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        seen_seq: u64,
+        force_reset: bool,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let sql = if force_reset {
+            "INSERT INTO client_thread_prefs (
+                host_id, agent_id, seen_seq, is_pinned, pinned_order, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 0, 0, ?4)
+             ON CONFLICT(host_id, agent_id) DO UPDATE SET
+                seen_seq = excluded.seen_seq,
+                updated_at_ms = excluded.updated_at_ms"
+        } else {
+            "INSERT INTO client_thread_prefs (
+                host_id, agent_id, seen_seq, is_pinned, pinned_order, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 0, 0, ?4)
+             ON CONFLICT(host_id, agent_id) DO UPDATE SET
+                seen_seq = MAX(client_thread_prefs.seen_seq, excluded.seen_seq),
+                updated_at_ms = MAX(client_thread_prefs.updated_at_ms, excluded.updated_at_ms)"
+        };
+        conn.execute(sql, params![host_id, agent_id, seen_seq as i64, now_ms])?;
+        Ok(())
+    }
+
+    pub fn set_client_thread_pinned(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        is_pinned: bool,
+        pinned_order: i64,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO client_thread_prefs (
+                host_id, agent_id, seen_seq, is_pinned, pinned_order, updated_at_ms
+             ) VALUES (?1, ?2, 0, ?3, ?4, ?5)
+             ON CONFLICT(host_id, agent_id) DO UPDATE SET
+                is_pinned = excluded.is_pinned,
+                pinned_order = excluded.pinned_order,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                host_id,
+                agent_id,
+                i32::from(is_pinned),
+                pinned_order,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn migrate_client_thread_pref(
+        &self,
+        host_id: &str,
+        old_agent_id: &str,
+        new_agent_id: &str,
+    ) -> Result<(), StoreError> {
+        if old_agent_id == new_agent_id {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+
+        let read_pref = |tx: &rusqlite::Transaction<'_>,
+                         aid: &str|
+         -> Result<Option<ClientThreadPref>, StoreError> {
+            tx.query_row(
+                "SELECT host_id, agent_id, seen_seq, is_pinned, pinned_order, updated_at_ms
+                 FROM client_thread_prefs
+                 WHERE host_id = ?1 AND agent_id = ?2",
+                params![host_id, aid],
+                |row| {
+                    Ok(ClientThreadPref {
+                        host_id: row.get(0)?,
+                        agent_id: row.get(1)?,
+                        seen_seq: row.get::<_, i64>(2)?.max(0) as u64,
+                        is_pinned: row.get::<_, i64>(3)? != 0,
+                        pinned_order: row.get(4)?,
+                        updated_at_ms: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+        };
+
+        let Some(old_pref) = read_pref(&tx, old_agent_id)? else {
+            return Ok(());
+        };
+        let new_pref = read_pref(&tx, new_agent_id)?;
+        let merged = match new_pref {
+            Some(existing) => ClientThreadPref {
+                host_id: host_id.to_string(),
+                agent_id: new_agent_id.to_string(),
+                seen_seq: existing.seen_seq.max(old_pref.seen_seq),
+                is_pinned: existing.is_pinned || old_pref.is_pinned,
+                pinned_order: match (existing.is_pinned, old_pref.is_pinned) {
+                    (true, true) => existing.pinned_order.max(old_pref.pinned_order),
+                    (true, false) => existing.pinned_order,
+                    (false, true) => old_pref.pinned_order,
+                    (false, false) => 0,
+                },
+                updated_at_ms: existing.updated_at_ms.max(old_pref.updated_at_ms),
+            },
+            None => ClientThreadPref {
+                host_id: host_id.to_string(),
+                agent_id: new_agent_id.to_string(),
+                seen_seq: old_pref.seen_seq,
+                is_pinned: old_pref.is_pinned,
+                pinned_order: old_pref.pinned_order,
+                updated_at_ms: old_pref.updated_at_ms,
+            },
+        };
+
+        tx.execute(
+            "INSERT INTO client_thread_prefs (
+                host_id, agent_id, seen_seq, is_pinned, pinned_order, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(host_id, agent_id) DO UPDATE SET
+                seen_seq = excluded.seen_seq,
+                is_pinned = excluded.is_pinned,
+                pinned_order = excluded.pinned_order,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                merged.host_id,
+                merged.agent_id,
+                merged.seen_seq as i64,
+                i32::from(merged.is_pinned),
+                merged.pinned_order,
+                merged.updated_at_ms,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM client_thread_prefs WHERE host_id = ?1 AND agent_id = ?2",
+            params![host_id, old_agent_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_client_thread_pref(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM client_thread_prefs WHERE host_id = ?1 AND agent_id = ?2",
+            params![host_id, agent_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_client_thread_prefs_for_host(&self, host_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "DELETE FROM client_thread_prefs WHERE host_id = ?1",
+            params![host_id],
         )?;
         Ok(())
     }
@@ -1805,5 +2044,89 @@ mod tests {
         );
         store.replace_replica_timeline("ag_pg", &[]).expect("wipe");
         assert_eq!(store.get_replica_contiguous_seq("ag_pg").expect("get"), 0);
+    }
+
+    #[test]
+    fn client_thread_prefs_crud_monotonic_reset_and_migration() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let pref = ClientThreadPref {
+            host_id: "h1".into(),
+            agent_id: "opt_1".into(),
+            seen_seq: 3,
+            is_pinned: true,
+            pinned_order: 100,
+            updated_at_ms: 1000,
+        };
+        store.upsert_client_thread_pref(&pref).expect("upsert");
+
+        // Monotonic seen_seq ignores smaller values unless force_reset = true
+        store
+            .set_client_thread_seen_seq("h1", "opt_1", 1, false, 1100)
+            .expect("ignore lower seen");
+        store
+            .set_client_thread_seen_seq("h1", "opt_1", 7, false, 1200)
+            .expect("advance seen");
+
+        let prefs = store.list_client_thread_prefs().expect("list");
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].seen_seq, 7);
+        assert!(prefs[0].is_pinned);
+
+        // Migrate opt_1 -> ag_1 merges pinned + max(seen_seq) and deletes opt_1
+        store
+            .set_client_thread_seen_seq("h1", "ag_1", 10, false, 1300)
+            .expect("seed target");
+        store
+            .migrate_client_thread_pref("h1", "opt_1", "ag_1")
+            .expect("migrate");
+        let after = store.list_client_thread_prefs().expect("list after");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].agent_id, "ag_1");
+        assert_eq!(after[0].seen_seq, 10);
+        assert!(after[0].is_pinned);
+        assert_eq!(after[0].pinned_order, 100);
+
+        // force_reset allows rewind to reduce seen_seq
+        store
+            .set_client_thread_seen_seq("h1", "ag_1", 2, true, 1400)
+            .expect("reset");
+        let after_reset = store.list_client_thread_prefs().expect("list reset");
+        assert_eq!(after_reset[0].seen_seq, 2);
+
+        store
+            .set_client_thread_pinned("h1", "ag_1", false, 0, 1500)
+            .expect("unpin");
+        let after_unpin = store.list_client_thread_prefs().expect("list unpin");
+        assert!(!after_unpin[0].is_pinned);
+
+        store
+            .delete_client_thread_pref("h1", "ag_1")
+            .expect("delete");
+        assert!(
+            store
+                .list_client_thread_prefs()
+                .expect("list empty")
+                .is_empty()
+        );
+
+        store
+            .upsert_client_thread_pref(&ClientThreadPref {
+                host_id: "h2".into(),
+                agent_id: "ag_2".into(),
+                seen_seq: 5,
+                is_pinned: false,
+                pinned_order: 0,
+                updated_at_ms: 1600,
+            })
+            .expect("insert h2");
+        store
+            .delete_client_thread_prefs_for_host("h2")
+            .expect("delete host");
+        assert!(
+            store
+                .list_client_thread_prefs()
+                .expect("list after host wipe")
+                .is_empty()
+        );
     }
 }

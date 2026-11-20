@@ -55,111 +55,54 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
         }
     }
 
-    func workflowInstruction() -> String {
+    public var ffiValue: FfiSlashDirective {
         switch self {
-        case .plan:
-            return """
-            <WORKFLOW_INSTRUCTION>
-            Create a clear, step-by-step architectural and implementation plan first. Identify affected files, key trade-offs, and verification steps before making code edits.
-            </WORKFLOW_INSTRUCTION>
-            """
-        case .review:
-            return """
-            <WORKFLOW_INSTRUCTION>
-            Review the current repository changes thoroughly for correctness, edge cases, security, error handling, and idiomatic style. Cite exact file paths and line numbers.
-            </WORKFLOW_INSTRUCTION>
-            """
-        case .compact:
-            return "/compact"
+        case .plan: return .plan
+        case .review: return .review
+        case .compact: return .compact
+        }
+    }
+
+    public init?(ffiValue: FfiSlashDirective?) {
+        guard let ffiValue else { return nil }
+        switch ffiValue {
+        case .plan: self = .plan
+        case .review: self = .review
+        case .compact: self = .compact
         }
     }
 }
 
-public enum OrbitSlashCommand: String, CaseIterable, Identifiable, Equatable {
-    case plan
-    case review
-    case diff
-    case compact
-    case ask
-    case edits
-    case full
-    case terminal
-    case new
-    case settings
-
-    public var id: String { rawValue }
-
-    public var command: String { "/\(rawValue)" }
-
-    public var label: String {
-        switch self {
-        case .plan: return "Draft Implementation Plan"
-        case .review: return "Code Review Working Tree"
-        case .diff: return "Toggle Diff Inspector"
-        case .compact: return "Compact Context"
-        case .ask: return "Always Ask Permissions"
-        case .edits: return "Accept Edits Permissions"
-        case .full: return "Full Access Permissions"
-        case .terminal: return "Toggle PTY Terminal"
-        case .new: return "New Agent Session"
-        case .settings: return "Settings"
+public extension OrbitSlashDirective {
+    static func iconName(forSlashCommandId id: String) -> String {
+        switch id {
+        case "plan": return "checklist"
+        case "review": return "doc.text.magnifyingglass"
+        case "diff": return "arrow.left.arrow.right"
+        case "compact": return "rectangle.compress.vertical"
+        case "ask": return "shield"
+        case "edits": return "checkmark.shield"
+        case "full": return "shield.slash"
+        case "terminal": return "terminal"
+        case "new": return "square.and.pencil"
+        case "settings": return "gearshape"
+        default: return "command"
         }
     }
+}
 
-    public var description: String {
-        switch self {
-        case .plan: return "Prompt the agent to design a step-by-step plan before editing"
-        case .review: return "Attach uncommitted git diff and prepare an engineering review"
-        case .diff: return "Open or close the Git & Turn Diff panel"
-        case .compact: return "Ask active agent to summarize and compact conversation history"
-        case .ask: return "Require approval before file edits and shell commands"
-        case .edits: return "Auto-approve file edits, ask before shell commands"
-        case .full: return "Edit files and run commands without approval prompts"
-        case .terminal: return "Show or hide the persistent multi-slot terminal"
-        case .new: return "Start a fresh isolated session in the stage"
-        case .settings: return "Configure hosts, engines, worktrees, and appearance"
-        }
-    }
+extension FfiLaunchpadProject: Identifiable {}
 
-    public var icon: String {
-        switch self {
-        case .plan: return "checklist"
-        case .review: return "doc.text.magnifyingglass"
-        case .diff: return "arrow.left.arrow.right"
-        case .compact: return "rectangle.compress.vertical"
-        case .ask: return "shield"
-        case .edits: return "checkmark.shield"
-        case .full: return "shield.slash"
-        case .terminal: return "terminal"
-        case .new: return "square.and.pencil"
-        case .settings: return "gearshape"
-        }
-    }
+extension FfiSidebarConversation: Identifiable {
+    public var id: String { "\(hostId)::\(agent.agentId)" }
+}
 
-    public var keywords: [String] {
-        switch self {
-        case .plan: return ["plan", "design", "architect", "checklist"]
-        case .review: return ["review", "audit", "critique", "git"]
-        case .diff: return ["diff", "inspector", "changes"]
-        case .compact: return ["compact", "summarize", "context", "memory"]
-        case .ask: return ["ask", "supervised", "default", "safe", "permission"]
-        case .edits: return ["edits", "auto", "edit", "accept", "permission"]
-        case .full: return ["full", "autonomous", "bypass", "unrestricted", "permission"]
-        case .terminal: return ["terminal", "pty", "shell", "console"]
-        case .new: return ["new", "thread", "session", "clear"]
-        case .settings: return ["settings", "preferences", "config"]
-        }
-    }
+extension FfiSidebarProjectGroup: Identifiable {}
 
-    public static func filter(query: String) -> [OrbitSlashCommand] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return allCases }
-        return allCases.filter { cmd in
-            cmd.rawValue.contains(q)
-                || cmd.label.lowercased().contains(q)
-                || cmd.keywords.contains(where: { $0.contains(q) })
-        }
-    }
+extension FfiSlashCommand: Identifiable {}
+
+extension FfiMentionCandidate: Identifiable {
+    public var id: String { key }
 }
 
 public struct InlineMentionRegistration: Equatable, Hashable {
@@ -169,20 +112,6 @@ public struct InlineMentionRegistration: Equatable, Hashable {
     public init(token: String, item: ComposerContextItem) {
         self.token = token
         self.item = item
-    }
-}
-
-public struct OrbitLaunchpadProject: Identifiable, Hashable {
-    public let id: String
-    public let name: String
-    public let path: String
-    public let branch: String?
-
-    public init(id: String, name: String, path: String, branch: String?) {
-        self.id = id
-        self.name = name
-        self.path = path
-        self.branch = branch
     }
 }
 
@@ -214,6 +143,13 @@ public enum OrbitSidebarProjectSort: String, CaseIterable, Identifiable, Equatab
         case .alphabetical: return "Alphabetical"
         }
     }
+
+    public var ffiValue: FfiSidebarProjectSort {
+        switch self {
+        case .recent: return .recent
+        case .alphabetical: return .alphabetical
+        }
+    }
 }
 
 public enum OrbitSidebarThreadFilter: String, CaseIterable, Identifiable, Equatable {
@@ -226,6 +162,13 @@ public enum OrbitSidebarThreadFilter: String, CaseIterable, Identifiable, Equata
         switch self {
         case .all: return "All conversations"
         case .activeUnread: return "Active & unread"
+        }
+    }
+
+    public var ffiValue: FfiSidebarThreadFilter {
+        switch self {
+        case .all: return .all
+        case .activeUnread: return .activeUnread
         }
     }
 }
@@ -408,6 +351,8 @@ public final class OrbitIosStore: ObservableObject {
     // Active Session & Stage (`selectedAgentId == nil` means New Session draft)
     @Published public var selectedAgentId: String?
     @Published public private(set) var agentStage: FfiAgentStage?
+    @Published public private(set) var sidebarView: FfiFleetSidebar?
+    @Published public private(set) var slashCommands: [FfiSlashCommand] = []
 
     // Workspace, Files, Git, Terminal
     @Published public var activeCwd: String = "~"
@@ -441,13 +386,23 @@ public final class OrbitIosStore: ObservableObject {
     @Published public private(set) var containerWidth: CGFloat = 0
     @Published public var isDrawerOpen: Bool = false
     @Published public var isPadSidebarCollapsed: Bool = false
-    @Published public var drawerSearchQuery: String = ""
+    @Published public var drawerSearchQuery: String = "" {
+        didSet {
+            refreshSidebar()
+        }
+    }
     @Published public var drawerFilter: OrbitDrawerFilter = .all
-    @Published public var sidebarProjectSort: OrbitSidebarProjectSort = .recent
-    @Published public var sidebarThreadFilter: OrbitSidebarThreadFilter = .all
+    @Published public var sidebarProjectSort: OrbitSidebarProjectSort = .recent {
+        didSet {
+            refreshSidebar()
+        }
+    }
+    @Published public var sidebarThreadFilter: OrbitSidebarThreadFilter = .all {
+        didSet {
+            refreshSidebar()
+        }
+    }
     @Published public var collapsedProjectIds: Set<String> = []
-    @Published public var pinnedThreadKeys: [String] = []
-    @Published public private(set) var seenSeqByAgentKey: [String: UInt64] = [:]
     @Published public var diffFileFilterQuery: String = ""
     @Published public var isPadDiffInspectorVisible: Bool = false
     @Published public var activeSheet: OrbitSheetDestination?
@@ -476,12 +431,13 @@ public final class OrbitIosStore: ObservableObject {
     private var explicitDiffSheetRequested: Bool = false
     private var pendingLaunchPtyCommand: String?
     private var ptyLaunchCmdDispatched: Bool = false
+    private var cachedFallbackCatalogs: [FfiProviderModelCatalog] = []
 
-    private static let pinnedThreadKeysDefaultsKey = "orbit.ios.pinnedThreadKeys"
+    private static let legacyPinnedThreadKeysDefaultsKey = "orbit.ios.pinnedThreadKeys"
+    private static let migratedThreadPrefsDefaultsKey = "orbit.ios.migratedThreadPrefsV1"
     private static let draftUseWorktreeDefaultsKey = "orbit.ios.draftUseWorktree"
 
     public init() {
-        self.pinnedThreadKeys = UserDefaults.standard.stringArray(forKey: Self.pinnedThreadKeysDefaultsKey) ?? []
         self.draftUseWorktree = UserDefaults.standard.bool(forKey: Self.draftUseWorktreeDefaultsKey)
         let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         let dbPath = docDir?.appendingPathComponent("orbit_ios_v3.sqlite").path ?? ":memory:"
@@ -497,6 +453,35 @@ public final class OrbitIosStore: ObservableObject {
             }
             self.core = instance
 
+            if !UserDefaults.standard.bool(forKey: Self.migratedThreadPrefsDefaultsKey) {
+                let legacyPinned = UserDefaults.standard.stringArray(forKey: Self.legacyPinnedThreadKeysDefaultsKey) ?? []
+                if !legacyPinned.isEmpty {
+                    let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    let seeds: [FfiThreadPrefSeed] = legacyPinned.enumerated().compactMap { idx, compositeKey in
+                        guard let sepRange = compositeKey.range(of: "::") else { return nil }
+                        let hostId = String(compositeKey[..<sepRange.lowerBound])
+                        let agentId = String(compositeKey[sepRange.upperBound...])
+                        guard !hostId.isEmpty, !agentId.isEmpty else { return nil }
+                        return FfiThreadPrefSeed(
+                            hostId: hostId,
+                            agentId: agentId,
+                            seenSeq: 0,
+                            isPinned: true,
+                            pinnedOrder: Int64(idx),
+                            updatedAtMs: nowMs
+                        )
+                    }
+                    if !seeds.isEmpty {
+                        instance.seedThreadPrefs(seeds: seeds)
+                    }
+                }
+                UserDefaults.standard.set(true, forKey: Self.migratedThreadPrefsDefaultsKey)
+                UserDefaults.standard.removeObject(forKey: Self.legacyPinnedThreadKeysDefaultsKey)
+            }
+
+            self.cachedFallbackCatalogs = instance.fallbackProviderCatalogs()
+            self.slashCommands = instance.slashCommands(platform: .ios, query: nil)
+
             let bridge = WeakMobileListenerBridge(owner: self)
             self.listenerBridge = bridge
             instance.subscribeThrottled(listener: bridge, intervalMs: 24)
@@ -505,6 +490,7 @@ public final class OrbitIosStore: ObservableObject {
             self.refreshPasteboardAvailability()
 
             reloadFleet()
+            refreshSidebar()
             instance.connectAllHosts()
             startNetworkMonitor()
         } catch {
@@ -608,99 +594,22 @@ public final class OrbitIosStore: ObservableObject {
         return projects.filter { $0.hostId == hid }
     }
 
-    public var launchpadProjects: [OrbitLaunchpadProject] {
+    public var launchpadProjects: [FfiLaunchpadProject] {
         guard let hid = selectedHostId else { return [] }
-        let detail = currentHostDetail
-        var results: [OrbitLaunchpadProject] = []
+        return (sidebarView?.launchpadProjects ?? []).filter { $0.hostId == hid }
+    }
 
-        func isBareHomePath(_ raw: String) -> Bool {
-            var clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if clean.isEmpty || clean == "~" || clean == "/" { return true }
-            while clean.count > 1 && clean.hasSuffix("/") { clean.removeLast() }
-            let parts = clean.split(separator: "/")
-            return parts.count == 2 && (parts[0] == "Users" || parts[0] == "home")
-        }
-
-        func resolvedBranch(for dir: String) -> String? {
-            if let branch = activeGitBranch, OrbitFormatters.arePathsEquivalent(dir, activeCwd) {
-                return branch
-            }
-            if let dp = detail?.discoveredProjects.first(where: { OrbitFormatters.arePathsEquivalent($0.path, dir) }),
-               let b = dp.gitBranch, !b.isEmpty {
-                return b
-            }
-            if let ws = detail?.workspaces.first(where: { OrbitFormatters.arePathsEquivalent($0.cwd, dir) }),
-               let b = ws.gitBranch, !b.isEmpty {
-                return b
-            }
-            return nil
-        }
-
-        func appendIfUnique(id: String, name: String, path: String, branch: String?) {
-            let clean = path.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !clean.isEmpty else { return }
-            if results.contains(where: { OrbitFormatters.arePathsEquivalent($0.path, clean) }) {
-                return
-            }
-            let resolvedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            results.append(OrbitLaunchpadProject(
-                id: id,
-                name: resolvedName.isEmpty ? OrbitFormatters.shortPath(clean) : resolvedName,
-                path: clean,
-                branch: branch ?? resolvedBranch(for: clean)
-            ))
-        }
-
-        for proj in hostPinnedProjects {
-            if let primary = proj.directories.first {
-                appendIfUnique(
-                    id: proj.projectId,
-                    name: proj.name,
-                    path: primary,
-                    branch: nil
-                )
-            }
-        }
-
-        for ws in detail?.workspaces ?? [] where !ws.isWorktree {
-            guard !isBareHomePath(ws.cwd) else { continue }
-            appendIfUnique(
-                id: "\(hid)::ws::\(ws.workspaceId)",
-                name: ws.title.isEmpty ? OrbitFormatters.shortPath(ws.cwd) : ws.title,
-                path: ws.cwd,
-                branch: ws.gitBranch
-            )
-        }
-
-        for dp in detail?.discoveredProjects ?? [] {
-            guard !isBareHomePath(dp.path), !dp.path.contains("/worktrees/") else { continue }
-            appendIfUnique(
-                id: "\(hid)::dp::\(dp.path)",
-                name: dp.name,
-                path: dp.path,
-                branch: dp.gitBranch
-            )
-        }
-
-        if !activeCwd.isEmpty, !isBareHomePath(activeCwd) {
-            appendIfUnique(
-                id: "\(hid)::active::\(activeCwd)",
-                name: OrbitFormatters.shortPath(activeCwd),
-                path: activeCwd,
-                branch: activeGitBranch
-            )
-        }
-
-        if results.isEmpty, let firstDp = detail?.discoveredProjects.first {
-            appendIfUnique(
-                id: "\(hid)::dp::\(firstDp.path)",
-                name: firstDp.name,
-                path: firstDp.path,
-                branch: firstDp.gitBranch
-            )
-        }
-
-        return results
+    public func refreshSidebar() {
+        guard let core else { return }
+        let req = FfiFleetSidebarRequest(
+            sort: sidebarProjectSort.ffiValue,
+            filter: sidebarThreadFilter.ffiValue,
+            query: drawerSearchQuery,
+            activeHostId: selectedHostId,
+            activeAgentId: isDraftNewSession ? nil : selectedAgentId,
+            activeCwd: activeCwd
+        )
+        sidebarView = core.fleetSidebarRequest(req: req)
     }
 
     public var otherHostsPendingApprovals: UInt32 {
@@ -714,17 +623,14 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func isThreadPinned(hostId: String, agentId: String) -> Bool {
-        pinnedThreadKeys.contains(threadKey(hostId: hostId, agentId: agentId))
+        (sidebarView?.pinnedConversations ?? []).contains {
+            $0.hostId == hostId && $0.agent.agentId == agentId
+        }
     }
 
     public func togglePinThread(hostId: String, agentId: String) {
-        let key = threadKey(hostId: hostId, agentId: agentId)
-        if let idx = pinnedThreadKeys.firstIndex(of: key) {
-            pinnedThreadKeys.remove(at: idx)
-        } else {
-            pinnedThreadKeys.insert(key, at: 0)
-        }
-        UserDefaults.standard.set(pinnedThreadKeys, forKey: Self.pinnedThreadKeysDefaultsKey)
+        _ = core?.togglePinAgent(hostId: hostId, agentId: agentId)
+        refreshSidebar()
         hapticLight()
     }
 
@@ -738,11 +644,14 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func markAgentSeen(hostId: String, agentId: String, seq: UInt64) {
-        let key = threadKey(hostId: hostId, agentId: agentId)
-        let current = seenSeqByAgentKey[key] ?? 0
-        if seq >= current || seenSeqByAgentKey[key] == nil {
-            seenSeqByAgentKey[key] = max(current, seq)
-        }
+        core?.markAgentSeen(hostId: hostId, agentId: agentId, seq: seq)
+        refreshSidebar()
+    }
+
+    public func markAgentUnread(hostId: String, agentId: String) {
+        core?.markAgentUnread(hostId: hostId, agentId: agentId)
+        refreshSidebar()
+        hapticLight()
     }
 
     public func isThreadUnread(hostId: String, agent: FfiAgentCard) -> Bool {
@@ -750,11 +659,17 @@ public final class OrbitIosStore: ObservableObject {
         if isSelected || agent.isRunning {
             return false
         }
-        let key = threadKey(hostId: hostId, agentId: agent.agentId)
-        guard let seen = seenSeqByAgentKey[key] else {
-            return false
+        if let conv = sidebarView?.pinnedConversations.first(where: {
+            $0.hostId == hostId && $0.agent.agentId == agent.agentId
+        }) {
+            return conv.isUnread
         }
-        return agent.latestSeq > seen
+        for group in sidebarView?.projects ?? [] where group.hostId == hostId {
+            if let conv = group.conversations.first(where: { $0.agent.agentId == agent.agentId }) {
+                return conv.isUnread
+            }
+        }
+        return false
     }
 
     public func catalog(for provider: FfiProviderKind) -> FfiProviderModelCatalog {
@@ -762,7 +677,26 @@ public final class OrbitIosStore: ObservableObject {
            !found.models.isEmpty {
             return found
         }
+        if let cached = cachedFallbackCatalogs.first(where: { $0.provider == provider }),
+           !cached.models.isEmpty {
+            return cached
+        }
         return fallbackProviderCatalog(provider: provider)
+    }
+
+    public func resolvedModelSelection(
+        provider: FfiProviderKind,
+        desiredModel: String?,
+        desiredEffort: FfiReasoningEffort?
+    ) -> FfiResolvedModelSelection? {
+        core?.resolveModelSelection(
+            req: FfiModelSelectionRequest(
+                hostId: selectedHostId,
+                provider: provider,
+                desiredModel: desiredModel,
+                desiredEffort: desiredEffort
+            )
+        )
     }
 
     public var activeModelSpec: FfiProviderModelSpec? {
@@ -777,11 +711,25 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public var composerModelDisplayName: String {
+        if let resolved = resolvedModelSelection(
+            provider: selectedProvider,
+            desiredModel: selectedModel,
+            desiredEffort: selectedEffort
+        ) {
+            return resolved.selectedModelLabel
+        }
         let cat = catalog(for: selectedProvider)
         return formatCatalogModelLabel(catalog: cat, rawModelId: selectedModel)
     }
 
     public var composerEffortDisplayLabel: String? {
+        if let resolved = resolvedModelSelection(
+            provider: selectedProvider,
+            desiredModel: selectedModel,
+            desiredEffort: selectedEffort
+        ) {
+            return resolved.selectedEffortLabel
+        }
         let cat = catalog(for: selectedProvider)
         guard let spec = activeModelSpec else {
             guard let effort = selectedEffort else { return nil }
@@ -1148,6 +1096,7 @@ public final class OrbitIosStore: ObservableObject {
                 agentStage = nil
             }
         }
+        refreshSidebar()
     }
 
     public func selectHost(_ hostId: String) {
@@ -1169,14 +1118,14 @@ public final class OrbitIosStore: ObservableObject {
         core?.refreshProviderModels(hostId: hostId, forceRefresh: false)
         core?.refreshQuotas(hostId: hostId)
         reloadHostDetail(hostId)
+        refreshSidebar()
     }
 
     public func reloadHostDetail(_ hostId: String) {
         guard let detail = core?.hostDetail(hostId: hostId) else { return }
         currentHostDetail = detail
 
-        // Migrate queued prompts, running state, pinned keys, and seen cursors across optimistic -> permanent agent IDs
-        var pinnedChanged = false
+        // Migrate queued prompts and running state across optimistic -> permanent agent IDs
         for (oldAid, newAid) in detail.replacedOptimisticAgents {
             let oldKey = "\(hostId)::\(oldAid)"
             let newKey = "\(hostId)::\(newAid)"
@@ -1188,27 +1137,12 @@ public final class OrbitIosStore: ObservableObject {
             if let wasRun = lastKnownRunningByAgentKey.removeValue(forKey: oldKey) {
                 lastKnownRunningByAgentKey[newKey] = wasRun
             }
-            if let seen = seenSeqByAgentKey.removeValue(forKey: oldKey) {
-                seenSeqByAgentKey[newKey] = max(seenSeqByAgentKey[newKey] ?? 0, seen)
-            }
-            if let pinIdx = pinnedThreadKeys.firstIndex(of: oldKey) {
-                pinnedThreadKeys[pinIdx] = newKey
-                pinnedChanged = true
-            }
-        }
-        if pinnedChanged {
-            UserDefaults.standard.set(pinnedThreadKeys, forKey: Self.pinnedThreadKeysDefaultsKey)
         }
 
-        // Seed initial seen sequences for pre-existing threads and advance currently active thread's seen cursor
-        for ag in detail.agents {
-            let key = threadKey(hostId: hostId, agentId: ag.agentId)
-            let isSelected = selectedHostId == hostId && selectedAgentId == ag.agentId && !isDraftNewSession
-            if isSelected {
-                seenSeqByAgentKey[key] = max(seenSeqByAgentKey[key] ?? 0, ag.latestSeq)
-            } else if seenSeqByAgentKey[key] == nil {
-                seenSeqByAgentKey[key] = ag.latestSeq
-            }
+        // Advance active thread's seen cursor if currently viewing it
+        if selectedHostId == hostId, let currentAid = selectedAgentId, !isDraftNewSession,
+           let ag = detail.agents.first(where: { $0.agentId == currentAid }) {
+            core?.markAgentSeen(hostId: hostId, agentId: currentAid, seq: ag.latestSeq)
         }
 
         // Seamlessly migrate optimistic agent ID when daemon assigns permanent ID
@@ -1273,9 +1207,16 @@ public final class OrbitIosStore: ObservableObject {
             let busy = agent.isRunning || agent.isAwaitingPermission
             evaluateAgentQueueDrain(hostId: hostId, agentId: agent.agentId, isBusy: busy)
         }
+
+        refreshSidebar()
     }
 
     private func syncDefaultModelAndEffort(for provider: FfiProviderKind) {
+        if let resolved = resolvedModelSelection(provider: provider, desiredModel: nil, desiredEffort: nil) {
+            selectedModel = resolved.selectedModelId
+            selectedEffort = resolved.selectedEffort
+            return
+        }
         let cat = catalog(for: provider)
         let defaultSpec = cat.configuredDefaultModel.flatMap { id in
             cat.models.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame })
@@ -1305,13 +1246,64 @@ public final class OrbitIosStore: ObservableObject {
             updateActiveWorkspaceCwd(card.cwd)
             markAgentSeen(hostId: hid, agentId: agentId, seq: max(card.latestSeq, agentStage?.latestSeq ?? 0))
         }
+        refreshSidebar()
         hapticLight()
     }
 
     public func reloadAgentStage(hostId: String, agentId: String) {
-        let stage = core?.agentStage(hostId: hostId, agentId: agentId)
+        let sameStage = agentStage?.hostId == hostId && (agentStage?.agent?.agentId ?? selectedAgentId) == agentId
+        let sinceRev: UInt64 = sameStage ? (agentStage?.revision ?? 0) : 0
+        guard let delta = core?.agentStageDelta(hostId: hostId, agentId: agentId, sinceRevision: sinceRev) else {
+            return
+        }
+
+        let stage: FfiAgentStage
+        if !delta.reset,
+           sameStage,
+           let current = agentStage,
+           Int(delta.replaceFromTurnIndex) <= current.turns.count {
+            var mergedTurns = Array(current.turns.prefix(Int(delta.replaceFromTurnIndex)))
+            mergedTurns.append(contentsOf: delta.changedTurns)
+            stage = FfiAgentStage(
+                revision: delta.revision,
+                hostId: delta.hostId,
+                agent: delta.agent ?? current.agent,
+                turns: mergedTurns,
+                pendingPermissions: delta.pendingPermissions,
+                pendingQuestions: delta.pendingQuestions,
+                sessionTurnDiffs: delta.sessionTurnDiffs,
+                insights: delta.insights,
+                latestSeq: delta.latestSeq
+            )
+        } else if !delta.reset && sinceRev > 0,
+                  let full = core?.agentStageDelta(hostId: hostId, agentId: agentId, sinceRevision: 0) {
+            stage = FfiAgentStage(
+                revision: full.revision,
+                hostId: full.hostId,
+                agent: full.agent,
+                turns: full.changedTurns,
+                pendingPermissions: full.pendingPermissions,
+                pendingQuestions: full.pendingQuestions,
+                sessionTurnDiffs: full.sessionTurnDiffs,
+                insights: full.insights,
+                latestSeq: full.latestSeq
+            )
+        } else {
+            stage = FfiAgentStage(
+                revision: delta.revision,
+                hostId: delta.hostId,
+                agent: delta.agent,
+                turns: delta.changedTurns,
+                pendingPermissions: delta.pendingPermissions,
+                pendingQuestions: delta.pendingQuestions,
+                sessionTurnDiffs: delta.sessionTurnDiffs,
+                insights: delta.insights,
+                latestSeq: delta.latestSeq
+            )
+        }
+
         agentStage = stage
-        if let card = stage?.agent {
+        if let card = stage.agent {
             selectedProvider = card.provider
             if let m = card.model { selectedModel = m }
             if let e = card.effort { selectedEffort = e }
@@ -1320,17 +1312,16 @@ public final class OrbitIosStore: ObservableObject {
                 updateActiveWorkspaceCwd(card.cwd)
             }
             if hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
-                markAgentSeen(hostId: hostId, agentId: agentId, seq: max(card.latestSeq, stage?.latestSeq ?? 0))
+                markAgentSeen(hostId: hostId, agentId: agentId, seq: max(card.latestSeq, stage.latestSeq))
             }
-        } else if let stageSeq = stage?.latestSeq,
-                  hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
-            markAgentSeen(hostId: hostId, agentId: agentId, seq: stageSeq)
+        } else if hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
+            markAgentSeen(hostId: hostId, agentId: agentId, seq: stage.latestSeq)
         }
 
         if hostId == selectedHostId && agentId == selectedAgentId {
-            let awaitingDecision = !(stage?.pendingPermissions.isEmpty ?? true)
-                || !(stage?.pendingQuestions.isEmpty ?? true)
-                || (stage?.agent?.isAwaitingPermission ?? false)
+            let awaitingDecision = !stage.pendingPermissions.isEmpty
+                || !stage.pendingQuestions.isEmpty
+                || (stage.agent?.isAwaitingPermission ?? false)
             let isBusy = isActiveAgentRunning || awaitingDecision
             evaluateAgentQueueDrain(hostId: hostId, agentId: agentId, isBusy: isBusy)
         }
@@ -1370,6 +1361,7 @@ public final class OrbitIosStore: ObservableObject {
         if let cwd = cwd, !cwd.isEmpty {
             updateActiveWorkspaceCwd(cwd)
         }
+        refreshSidebar()
         hapticLight()
     }
 
@@ -1434,6 +1426,7 @@ public final class OrbitIosStore: ObservableObject {
             gitReview = core?.gitReview(hostId: hid, cwd: cwd, path: nil)
             core?.fetchWorkspaceFiles(hostId: hid, cwd: cwd)
             workspaceFilesList = core?.workspaceFiles(hostId: hid, cwd: cwd) ?? []
+            refreshSidebar()
         }
     }
 
@@ -1616,22 +1609,30 @@ public final class OrbitIosStore: ObservableObject {
         modelId: String?,
         effort: FfiReasoningEffort?
     ) {
-        let cat = catalog(for: provider)
-        let spec = modelId.flatMap { id in
-            cat.models.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame })
-        }
-            ?? cat.models.first(where: { $0.isDefault })
-            ?? cat.models.first
-        let resolvedEffort = resolveSupportedEffortForModel(
-            spec: spec,
-            desired: effort,
-            catalogDefault: cat.configuredDefaultEffort
-        )
-
         let providerChanged = selectedProvider != provider
         selectedProvider = provider
-        selectedModel = spec?.id ?? modelId
-        selectedEffort = resolvedEffort
+        if let resolved = resolvedModelSelection(
+            provider: provider,
+            desiredModel: modelId,
+            desiredEffort: effort
+        ) {
+            selectedModel = resolved.selectedModelId
+            selectedEffort = resolved.selectedEffort
+        } else {
+            let cat = catalog(for: provider)
+            let spec = modelId.flatMap { id in
+                cat.models.first(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame })
+            }
+                ?? cat.models.first(where: { $0.isDefault })
+                ?? cat.models.first
+            selectedModel = spec?.id ?? modelId
+            selectedEffort = resolveSupportedEffortForModel(
+                spec: spec,
+                desired: effort,
+                catalogDefault: cat.configuredDefaultEffort
+            )
+        }
+
         if isDraftNewSession {
             hasUserCustomizedDraftModel = true
             draftSelectionsByProvider[provider] = (selectedModel, selectedEffort)
@@ -1644,14 +1645,14 @@ public final class OrbitIosStore: ObservableObject {
                     agentId: aid,
                     provider: provider,
                     model: selectedModel,
-                    effort: resolvedEffort
+                    effort: selectedEffort
                 )
             } else {
                 core?.setAgentConfig(
                     hostId: hid,
                     agentId: aid,
                     model: selectedModel,
-                    effort: resolvedEffort
+                    effort: selectedEffort
                 )
             }
             reloadAgentStage(hostId: hid, agentId: aid)
@@ -1933,6 +1934,24 @@ public final class OrbitIosStore: ObservableObject {
         hapticLight()
     }
 
+    public func filterSlashCommands(query: String) -> [FfiSlashCommand] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return slashCommands }
+        return core?.slashCommands(platform: .ios, query: trimmed) ?? slashCommands
+    }
+
+    public func rankMentionCandidates(query: String, limit: UInt32 = 11) -> [FfiMentionCandidate] {
+        guard let core, let hid = selectedHostId else { return [] }
+        return core.rankMentionCandidates(
+            req: FfiMentionRankRequest(
+                hostId: hid,
+                cwd: activeCwd,
+                query: query,
+                limit: limit
+            )
+        )
+    }
+
     public func submitComposer() {
         guard !hasUploadingAttachments else {
             showToast("Waiting for attachment upload…")
@@ -1943,30 +1962,38 @@ public final class OrbitIosStore: ObservableObject {
             return
         }
 
+        let draftText = composerText
+        let draftDirective = slashDirective
+        let draftQuotes = quotedDiffSnippets
+        let draftContexts = mergedContextsResolvingInlineMentions(
+            for: draftText,
+            baseContexts: attachedContexts
+        )
+
+        if let preview = composePromptDraft(
+            hostId: hid,
+            rawInput: draftText,
+            explicitDirective: draftDirective,
+            contexts: draftContexts,
+            quotes: draftQuotes
+        ) {
+            guard !preview.isEmpty else { return }
+            if preview.isBtw {
+                showToast("Side question (/btw) is available on Desktop & HarmonyOS")
+                return
+            }
+            if preview.isCompact && selectedAgentId == nil {
+                showToast("Start a session first to compact context")
+                return
+            }
+        } else {
+            return
+        }
+
         if isActiveAgentRunning, selectedAgentId != nil {
             enqueueComposerPrompt()
             return
         }
-
-        let draftText = composerText
-        let draftDirective = slashDirective
-        let draftQuotes = quotedDiffSnippets
-        let parsed = parseInlineDirective(rawInput: draftText, explicitDirective: draftDirective)
-        let draftContexts = mergedContextsResolvingInlineMentions(
-            for: parsed.cleanText,
-            baseContexts: attachedContexts
-        )
-
-        if parsed.directive == .compact && selectedAgentId == nil {
-            showToast("Start a session first to compact context")
-            return
-        }
-        let hasContent = !parsed.cleanText.isEmpty
-            || !draftContexts.isEmpty
-            || !draftQuotes.isEmpty
-            || parsed.directive == .review
-            || parsed.directive == .compact
-        guard hasContent else { return }
 
         // Reset draft immediately for snappy 60/120fps responsiveness
         composerText = ""
@@ -1995,21 +2022,27 @@ public final class OrbitIosStore: ObservableObject {
             submitComposer()
             return
         }
-        let parsed = parseInlineDirective(rawInput: composerText, explicitDirective: slashDirective)
         let mergedContexts = mergedContextsResolvingInlineMentions(
-            for: parsed.cleanText,
+            for: composerText,
             baseContexts: attachedContexts
         )
-        let hasContent = !parsed.cleanText.isEmpty
-            || !mergedContexts.isEmpty
-            || !quotedDiffSnippets.isEmpty
-            || parsed.directive == .review
-            || parsed.directive == .compact
-        guard hasContent else { return }
+        guard let preview = composePromptDraft(
+            hostId: hid,
+            rawInput: composerText,
+            explicitDirective: slashDirective,
+            contexts: mergedContexts,
+            quotes: quotedDiffSnippets
+        ), !preview.isEmpty else {
+            return
+        }
+        if preview.isBtw {
+            showToast("Side question (/btw) cannot be queued")
+            return
+        }
 
         let item = QueuedPromptItem(
-            text: parsed.cleanText,
-            slashDirective: parsed.directive,
+            text: composerText.trimmingCharacters(in: .whitespacesAndNewlines),
+            slashDirective: OrbitSlashDirective(ffiValue: preview.effectiveDirective),
             attachedContexts: mergedContexts,
             quotedDiffSnippets: quotedDiffSnippets
         )
@@ -2096,28 +2129,75 @@ public final class OrbitIosStore: ObservableObject {
         }
     }
 
-    private func parseInlineDirective(
-        rawInput: String,
-        explicitDirective: OrbitSlashDirective?
-    ) -> (cleanText: String, directive: OrbitSlashDirective?) {
-        var rawText = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        var effectiveDirective = explicitDirective
+    private func buildFfiComposerInputs(
+        contexts: [ComposerContextItem],
+        quotes: [QuotedDiffSnippet]
+    ) -> (contexts: [FfiComposerContextInput], quotes: [FfiComposerQuoteInput], pastes: [FfiComposerPasteInput]) {
+        var ffiContexts: [FfiComposerContextInput] = []
+        var ffiPastes: [FfiComposerPasteInput] = []
 
-        if effectiveDirective == nil {
-            for candidate in OrbitSlashDirective.allCases {
-                let prefix = "/\(candidate.rawValue)"
-                if rawText == prefix {
-                    effectiveDirective = candidate
-                    rawText = ""
-                    break
-                } else if rawText.hasPrefix(prefix + " ") {
-                    effectiveDirective = candidate
-                    rawText = String(rawText.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    break
+        for ctx in contexts {
+            switch ctx {
+            case let .file(path):
+                ffiContexts.append(.workspaceFile(path: path))
+            case let .gitDiff(staged, label):
+                let diffText: String? = (staged == gitStagedMode) ? gitReview?.rawDiff : nil
+                ffiContexts.append(.gitDiff(staged: staged, label: label, diffText: diffText))
+            case let .terminalOutput(label, content):
+                ffiContexts.append(.terminalOutput(label: label, content: content))
+            case let .assistantQuote(_, label, excerpt):
+                ffiContexts.append(.assistantQuote(label: label, content: excerpt))
+            case let .stagedImage(_, filename, remotePath, _, _, _):
+                if let path = remotePath, !path.isEmpty {
+                    ffiContexts.append(.image(path: path, filename: filename))
                 }
+            case let .stagedFile(_, filename, remotePath, _, _):
+                if let path = remotePath, !path.isEmpty {
+                    ffiContexts.append(.stagedFile(path: path, filename: filename))
+                }
+            case let .inlineFile(_, filename, content, _, _):
+                ffiPastes.append(
+                    FfiComposerPasteInput(
+                        label: filename,
+                        filename: filename,
+                        content: content
+                    )
+                )
             }
         }
-        return (rawText, effectiveDirective)
+
+        let ffiQuotes = quotes.map { q in
+            FfiComposerQuoteInput(
+                path: q.path,
+                lineNumber: q.lineNumber,
+                code: q.content
+            )
+        }
+
+        return (ffiContexts, ffiQuotes, ffiPastes)
+    }
+
+    private func composePromptDraft(
+        hostId hid: String,
+        rawInput: String,
+        explicitDirective: OrbitSlashDirective?,
+        contexts: [ComposerContextItem],
+        quotes: [QuotedDiffSnippet]
+    ) -> FfiComposedPrompt? {
+        guard let core else { return nil }
+        let inputs = buildFfiComposerInputs(contexts: contexts, quotes: quotes)
+        return core.composePrompt(
+            req: FfiComposePromptRequest(
+                provider: selectedProvider,
+                rawText: rawInput,
+                explicitDirective: explicitDirective?.ffiValue,
+                hostId: hid,
+                cwd: activeCwd,
+                contexts: inputs.contexts,
+                quotes: inputs.quotes,
+                pastes: inputs.pastes
+            )
+        )
     }
 
     private func dispatchPromptInputs(
@@ -2128,29 +2208,44 @@ public final class OrbitIosStore: ObservableObject {
         contexts: [ComposerContextItem],
         quotes: [QuotedDiffSnippet]
     ) {
-        let parsed = parseInlineDirective(rawInput: rawInput, explicitDirective: explicitDirective)
-        let rawText = parsed.cleanText
-        let effectiveDirective = parsed.directive
+        let needsGitDiff = explicitDirective == .review
+            || rawInput.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("/review")
+            || contexts.contains {
+                if case .gitDiff = $0 { return true }
+                return false
+            }
+        if needsGitDiff && (gitReview == nil || !OrbitFormatters.arePathsEquivalent(gitReview?.cwd ?? "", activeCwd)) {
+            core?.fetchGitStatus(hostId: hid, cwd: activeCwd)
+            core?.fetchGitDiff(hostId: hid, cwd: activeCwd, path: nil, staged: gitStagedMode)
+            gitReview = core?.gitReview(hostId: hid, cwd: activeCwd, path: nil)
+        }
 
-        // Handle `/compact` on an active session
-        if effectiveDirective == .compact {
+        guard let composed = composePromptDraft(
+            hostId: hid,
+            rawInput: rawInput,
+            explicitDirective: explicitDirective,
+            contexts: contexts,
+            quotes: quotes
+        ), !composed.isEmpty else {
+            return
+        }
+
+        if composed.isBtw {
+            showToast("Side question (/btw) is available on Desktop & HarmonyOS")
+            return
+        }
+
+        if composed.isCompact {
             guard let aid = agentId else {
                 showToast("Start a session first to compact context")
                 return
             }
-            let badges = [FfiPromptBadge(kind: "slash", label: "/compact")]
-            let wire: String
-            if selectedProvider == .claudeCode || selectedProvider == .antigravity {
-                wire = rawText.isEmpty ? "/compact" : "/compact \(rawText)"
-            } else {
-                wire = rawText.isEmpty ? "Summarize and compact the conversation context." : "Summarize and compact context focusing on: \(rawText)"
-            }
             core?.sendPromptWithMeta(
                 hostId: hid,
                 agentId: aid,
-                prompt: wire,
-                displayPrompt: rawText.isEmpty ? "/compact" : rawText,
-                badges: badges
+                prompt: composed.wirePrompt,
+                displayPrompt: composed.displayPrompt,
+                badges: composed.badges
             )
             if aid == selectedAgentId {
                 reloadAgentStage(hostId: hid, agentId: aid)
@@ -2158,136 +2253,14 @@ public final class OrbitIosStore: ObservableObject {
             return
         }
 
-        let hasContent = !rawText.isEmpty || !contexts.isEmpty || !quotes.isEmpty || effectiveDirective == .review
-        guard hasContent else { return }
-
-        // 1. Build clean user-facing badges
-        var badges: [FfiPromptBadge] = []
-        if let dir = effectiveDirective {
-            badges.append(FfiPromptBadge(kind: "slash", label: dir.badgeLabel))
-        }
-        for ctx in contexts {
-            switch ctx {
-            case let .file(path):
-                let short = OrbitFormatters.shortPath(path)
-                if !rawText.contains("@\(short)") {
-                    badges.append(FfiPromptBadge(kind: "file", label: short))
-                }
-            case let .gitDiff(staged, label):
-                let alias = staged ? "@staged-diff" : "@working-diff"
-                if !rawText.contains(alias) && effectiveDirective != .review {
-                    badges.append(FfiPromptBadge(kind: "git_diff", label: label))
-                }
-            case let .terminalOutput(label, _):
-                if !rawText.contains("@terminal") {
-                    badges.append(FfiPromptBadge(kind: "terminal", label: label))
-                }
-            case let .assistantQuote(_, label, _):
-                badges.append(FfiPromptBadge(kind: "quote", label: label))
-            case let .stagedImage(_, filename, _, _, _, _):
-                badges.append(FfiPromptBadge(kind: "image", label: filename))
-            case let .stagedFile(_, filename, _, _, _):
-                badges.append(FfiPromptBadge(kind: "file", label: filename))
-            case let .inlineFile(_, filename, _, _, _):
-                badges.append(FfiPromptBadge(kind: "file", label: filename))
-            }
-        }
-        for quote in quotes {
-            badges.append(FfiPromptBadge(kind: "quote", label: quote.chipLabel))
-        }
-
-        // 2. Build structured wire prompt
-        var wireSections: [String] = []
-        if let dir = effectiveDirective {
-            wireSections.append(dir.workflowInstruction())
-        }
-
-        let stagedImagePaths = contexts.compactMap { item -> String? in
-            if case let .stagedImage(_, _, remotePath, _, _, _) = item { return remotePath }
-            return nil
-        }
-        if !stagedImagePaths.isEmpty {
-            wireSections.append(
-                stagedImagePaths.map { "Attached image file: `\($0)`" }.joined(separator: "\n")
-            )
-        }
-
-        let stagedFilePaths = contexts.compactMap { item -> String? in
-            if case let .stagedFile(_, _, remotePath, _, _) = item { return remotePath }
-            return nil
-        }
-        if !stagedFilePaths.isEmpty {
-            wireSections.append(
-                stagedFilePaths.map { "Attached file: `\($0)`" }.joined(separator: "\n")
-            )
-        }
-
-        let filePaths = contexts.compactMap { item -> String? in
-            if case let .file(path) = item { return path }
-            return nil
-        }
-        if !filePaths.isEmpty {
-            let formatted = filePaths.map { "`\($0)`" }.joined(separator: ", ")
-            wireSections.append("Referenced workspace files: \(formatted)")
-        }
-
-        var includeDiff = contexts.contains(where: {
-            if case .gitDiff = $0 { return true }
-            return false
-        })
-        if effectiveDirective == .review {
-            includeDiff = true
-        }
-        if includeDiff {
-            let review = gitReview ?? core?.gitReview(hostId: hid, cwd: activeCwd, path: nil)
-            if let rawDiff = review?.rawDiff, !rawDiff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                let capped = String(rawDiff.prefix(24_000))
-                wireSections.append("<GIT_DIFF>\n\(capped)\n</GIT_DIFF>")
-            } else {
-                wireSections.append("Inspect the current git working tree changes with `git status` and `git diff`.")
-            }
-        }
-
-        for ctx in contexts {
-            if case let .inlineFile(_, filename, content, lineCount, _) = ctx {
-                wireSections.append("File `\(filename)` (\(lineCount) lines):\n```text\n\(content)\n```")
-            } else if case let .terminalOutput(_, content) = ctx, !content.isEmpty {
-                wireSections.append("<TERMINAL_OUTPUT>\n\(content)\n</TERMINAL_OUTPUT>")
-            } else if case let .assistantQuote(_, _, excerpt) = ctx, !excerpt.isEmpty {
-                wireSections.append("<QUOTED_EXCERPT>\n\(excerpt)\n</QUOTED_EXCERPT>")
-            }
-        }
-
-        if !quotes.isEmpty {
-            let quoteLines = quotes.map { q -> String in
-                let loc = q.lineNumber.map { "\(q.path):\($0)" } ?? q.path
-                return "File `\(loc)`:\n```\n\(q.content)\n```"
-            }.joined(separator: "\n\n")
-            wireSections.append("<QUOTED_DIFF_LINES>\n\(quoteLines)\n</QUOTED_DIFF_LINES>")
-        }
-
-        let cleanDisplayPrompt: String
-        if !rawText.isEmpty {
-            cleanDisplayPrompt = rawText
-            wireSections.append(rawText)
-        } else if effectiveDirective == .review {
-            cleanDisplayPrompt = "Review uncommitted changes"
-            wireSections.append("Please review all uncommitted changes in this workspace.")
-        } else {
-            cleanDisplayPrompt = "Analyze attached context"
-            wireSections.append("Please inspect the attached context above.")
-        }
-
-        let finalWirePrompt = wireSections.joined(separator: "\n\n")
-
         if let aid = agentId {
             lastKnownRunningByAgentKey["\(hid)::\(aid)"] = true
             core?.sendPromptWithMeta(
                 hostId: hid,
                 agentId: aid,
-                prompt: finalWirePrompt,
-                displayPrompt: cleanDisplayPrompt,
-                badges: badges
+                prompt: composed.wirePrompt,
+                displayPrompt: composed.displayPrompt,
+                badges: composed.badges
             )
             if aid == selectedAgentId {
                 reloadAgentStage(hostId: hid, agentId: aid)
@@ -2301,9 +2274,9 @@ public final class OrbitIosStore: ObservableObject {
                 model: selectedModel,
                 effort: selectedEffort,
                 mode: selectedMode,
-                initialPrompt: finalWirePrompt,
-                initialDisplayPrompt: cleanDisplayPrompt,
-                initialBadges: badges,
+                initialPrompt: composed.wirePrompt,
+                initialDisplayPrompt: composed.displayPrompt,
+                initialBadges: composed.badges,
                 worktreeBranch: draftUseWorktree ? "auto" : nil
             )
             if let newId = createdId, !newId.isEmpty {
@@ -2715,5 +2688,45 @@ public final class OrbitIosStore: ObservableObject {
 
     public func hapticWarning() {
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
+    }
+
+    // MARK: - Native Diagram Rendering & Bounded Cache
+
+    private var diagramRenderCache: [String: FfiRenderDiagramView] = [:]
+    private var diagramRenderCacheOrder: [String] = []
+    private let diagramRenderCacheLimit = 96
+
+    public func renderDiagram(
+        kind: FfiDiagramKind,
+        source: String,
+        isDark: Bool
+    ) async -> FfiRenderDiagramView? {
+        let key = "\(kind)::\(isDark ? "dark" : "light")::\(source)"
+        if let hit = diagramRenderCache[key] {
+            if let pos = diagramRenderCacheOrder.firstIndex(of: key) {
+                diagramRenderCacheOrder.remove(at: pos)
+                diagramRenderCacheOrder.append(key)
+            }
+            return hit
+        }
+        guard let coreRef = core else { return nil }
+        let theme: FfiDiagramTheme = isDark ? .dark : .light
+        let result = await Task.detached(priority: .userInitiated) {
+            coreRef.renderDiagram(
+                req: FfiRenderDiagramRequest(kind: kind, source: source, theme: theme)
+            )
+        }.value
+        if diagramRenderCache[key] == nil,
+           diagramRenderCacheOrder.count >= diagramRenderCacheLimit,
+           let oldest = diagramRenderCacheOrder.first {
+            diagramRenderCacheOrder.removeFirst()
+            diagramRenderCache.removeValue(forKey: oldest)
+        }
+        if let pos = diagramRenderCacheOrder.firstIndex(of: key) {
+            diagramRenderCacheOrder.remove(at: pos)
+        }
+        diagramRenderCacheOrder.append(key)
+        diagramRenderCache[key] = result
+        return result
     }
 }

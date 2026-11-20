@@ -7,8 +7,16 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  type CSSProperties,
+  type ReactElement,
 } from "react";
-import { Tooltip as BaseTooltip } from "@base-ui/react/tooltip";
+import { createPortal } from "react-dom";
+import {
+  useVirtualizer,
+  type Range,
+  type ReactVirtualizer,
+  type Virtualizer,
+} from "@tanstack/react-virtual";
 import {
   AlertTriangle,
   ArrowDown,
@@ -41,25 +49,36 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  type DiffFileView,
   type DiffLineView,
+  type InlineSpanView,
   type PromptBadge,
+  type RichBlockView,
+  type SessionInsightsView,
+  type StageTurnView,
   type TimelineItemView,
+  type TurnFileDiffSummaryView,
+  type WorkSummaryResultView,
 } from "@/lib/orbit-ipc";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import {
-  type StageTurn,
-  type TurnFileDiffSummary,
-  type WorkSummaryResult,
   classifySearchTool,
   describeToolStep,
   extractThinkingHeadline,
   formatDurationCompact,
   formatThoughtSummaryLabel,
-  processTimelineForStage,
   stripWorkspacePrefix,
 } from "@/lib/timeline-coalesce";
 import { OmniComposer } from "@/components/composer/omni-composer";
-import { MarkdownBlocksView } from "@/components/markdown-blocks";
+import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
+import { openOrbitLink } from "@/lib/file-links";
+import {
+  getCachedPromptImage,
+  loadPromptImage,
+  lookupRecentSentTurnImage,
+  type PromptImageEntry,
+} from "@/lib/prompt-image-cache";
+import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { StickyApprovalDock } from "@/components/stage/stage-approval-dock";
 import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
@@ -114,10 +133,14 @@ const FULL_TIMESTAMP_FMT =
     : null;
 const fullTimestampTooltipCache = new Map<number, string>();
 
-// Shared singleton 15s relative-time clock so N rendered turns share 1 timer (0 timers when idle/empty)
+// Shared singleton relative-time clocks (15s for recent < 1h, 60s for older >= 1h)
+const RECENT_CLOCK_THRESHOLD_MS = 3_600_000;
 let sharedRelativeNowMs = Date.now();
+let sharedSlowRelativeNowMs = Date.now();
 let sharedRelativeTimerId: number | null = null;
+let sharedSlowRelativeTimerId: number | null = null;
 const relativeClockListeners = new Set<() => void>();
+const slowRelativeClockListeners = new Set<() => void>();
 
 function subscribeRelativeClock(listener: () => void): () => void {
   relativeClockListeners.add(listener);
@@ -139,11 +162,32 @@ function subscribeRelativeClock(listener: () => void): () => void {
   };
 }
 
-function useSharedRelativeNow(): number {
+function subscribeSlowRelativeClock(listener: () => void): () => void {
+  slowRelativeClockListeners.add(listener);
+  if (sharedSlowRelativeTimerId === null && typeof window !== "undefined") {
+    sharedSlowRelativeNowMs = Date.now();
+    sharedSlowRelativeTimerId = window.setInterval(() => {
+      sharedSlowRelativeNowMs = Date.now();
+      for (const fn of slowRelativeClockListeners) {
+        fn();
+      }
+    }, 60_000);
+  }
+  return () => {
+    slowRelativeClockListeners.delete(listener);
+    if (slowRelativeClockListeners.size === 0 && sharedSlowRelativeTimerId !== null) {
+      window.clearInterval(sharedSlowRelativeTimerId);
+      sharedSlowRelativeTimerId = null;
+    }
+  };
+}
+
+function useSharedRelativeNow(timestampMs: number): number {
+  const isRecent = Date.now() - timestampMs < RECENT_CLOCK_THRESHOLD_MS;
   return useSyncExternalStore(
-    subscribeRelativeClock,
-    () => sharedRelativeNowMs,
-    () => sharedRelativeNowMs,
+    isRecent ? subscribeRelativeClock : subscribeSlowRelativeClock,
+    () => (isRecent ? sharedRelativeNowMs : sharedSlowRelativeNowMs),
+    () => (isRecent ? sharedRelativeNowMs : sharedSlowRelativeNowMs),
   );
 }
 
@@ -296,10 +340,29 @@ function resolveToolStepIcon(
   }
 }
 
+function stableStepItemKey(item: TimelineItemView, idx: number): string {
+  switch (item.item_type) {
+    case "assistant_thinking":
+      return item.item_id ? `think-${item.item_id}` : `think-seq-${item.seq}-${idx}`;
+    case "assistant_message":
+      return item.item_id ? `msg-${item.item_id}` : `msg-seq-${item.seq}-${idx}`;
+    case "tool_call":
+      return item.call_id ? `tool-${item.call_id}` : `tool-seq-${item.seq}-${idx}`;
+    case "permission_request":
+      return item.request_id ? `perm-${item.request_id}` : `perm-seq-${item.seq}-${idx}`;
+    case "question_request":
+      return item.request_id ? `q-${item.request_id}` : `q-seq-${item.seq}-${idx}`;
+    case "user_prompt":
+      return item.message_id ? `prompt-${item.message_id}` : `prompt-seq-${item.seq}-${idx}`;
+    case "notice":
+      return `notice-${item.seq}-${idx}`;
+  }
+}
+
 /**
  * Borderless step row for reasoning, intermediate notes, permissions, and tool calls:
  * - Zero box/border clutter at rest; tight vertical grouping.
- * - Semantic muted icon swaps cleanly in-place to `ChevronRight` on hover/expand.
+ * - Pure-CSS `group-hover` swap between semantic icon and `ChevronRight` (0 React hover re-renders during scroll).
  * - Active thinking/tool step sweeps a calm linear-gradient text shimmer.
  */
 const StepItemRow = memo(function StepItemRow({
@@ -322,14 +385,13 @@ const StepItemRow = memo(function StepItemRow({
     item.item_type === "tool_call" &&
     (item.status === "failed" || item.status === "denied");
   const [expanded, setExpanded] = useState(defaultOpen);
-  const [hovered, setHovered] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const toolRowRef = useRef<HTMLDivElement | null>(null);
 
   if (item.item_type === "assistant_thinking") {
     const trimmedThinking = item.text.trim();
     const headline = extractThinkingHeadline(trimmedThinking, isActivelyThinking);
     const canExpand = trimmedThinking.length > 0;
-    const showChevron = canExpand && (hovered || expanded);
     const thoughtLabel = isActivelyThinking
       ? "Thinking"
       : formatThoughtSummaryLabel(thoughtDurationMs, 1);
@@ -340,22 +402,22 @@ const StepItemRow = memo(function StepItemRow({
           ref={triggerRef}
           type="button"
           disabled={!canExpand}
-          onMouseEnter={() => setHovered(true)}
-          onMouseLeave={() => setHovered(false)}
           onClick={() => {
             if (!canExpand) return;
             holdViewport(triggerRef.current, () => setExpanded((v) => !v));
           }}
           className="group/step hover:bg-accent/55 -ml-1.5 flex w-full max-w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13px] transition-colors disabled:cursor-default"
         >
-          <span className="text-muted-foreground group-hover/step:text-foreground/80 flex size-4 shrink-0 items-center justify-center">
-            {showChevron ? (
-              <ChevronRight
-                className={cn(
-                  "size-3.5 stroke-[1.9] transition-transform duration-150",
-                  expanded && "rotate-90",
-                )}
-              />
+          <span className="text-muted-foreground group-hover/step:text-foreground/80 relative flex size-4 shrink-0 items-center justify-center">
+            {canExpand ? (
+              expanded ? (
+                <ChevronRight className="size-3.5 rotate-90 stroke-[1.9] transition-transform duration-150" />
+              ) : (
+                <>
+                  <Sparkles className="size-3.5 stroke-[1.75] transition-opacity duration-100 group-hover/step:opacity-0" />
+                  <ChevronRight className="absolute size-3.5 stroke-[1.9] opacity-0 transition-opacity duration-100 group-hover/step:opacity-100" />
+                </>
+              )
             ) : (
               <Sparkles className="size-3.5 stroke-[1.75]" />
             )}
@@ -419,27 +481,22 @@ const StepItemRow = memo(function StepItemRow({
       );
     }
 
-    const showChevron = hovered || expanded;
     return (
       <div>
         <button
           ref={triggerRef}
           type="button"
-          onMouseEnter={() => setHovered(true)}
-          onMouseLeave={() => setHovered(false)}
           onClick={() => holdViewport(triggerRef.current, () => setExpanded((v) => !v))}
           className="group/note hover:bg-accent/55 -ml-1.5 flex w-full max-w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-left text-[13px] transition-colors"
         >
-          <span className="text-muted-foreground group-hover/note:text-foreground/80 flex size-4 shrink-0 items-center justify-center">
-            {showChevron ? (
-              <ChevronRight
-                className={cn(
-                  "size-3.5 stroke-[1.9] transition-transform duration-150",
-                  expanded && "rotate-90",
-                )}
-              />
+          <span className="text-muted-foreground group-hover/note:text-foreground/80 relative flex size-4 shrink-0 items-center justify-center">
+            {expanded ? (
+              <ChevronRight className="size-3.5 rotate-90 stroke-[1.9] transition-transform duration-150" />
             ) : (
-              <MessageSquareText className="size-3.5 stroke-[1.75]" />
+              <>
+                <MessageSquareText className="size-3.5 stroke-[1.75] transition-opacity duration-100 group-hover/note:opacity-0" />
+                <ChevronRight className="absolute size-3.5 stroke-[1.9] opacity-0 transition-opacity duration-100 group-hover/note:opacity-100" />
+              </>
             )}
           </span>
           <span className="text-foreground/72 group-hover/note:text-foreground truncate">
@@ -509,32 +566,47 @@ const StepItemRow = memo(function StepItemRow({
   const hasExpandableDetail =
     desc.hasExpandableDetail &&
     (item.detail.kind !== "file_edit" || diffLines.length > 0);
-  const showChevron = hasExpandableDetail && (hovered || expanded);
   const openFilePath = desc.openPath;
   const canOpenFileInDiff =
     Boolean(openFilePath) && (desc.kind === "file_edit" || desc.kind === "file_create");
   const canOpenFileDirect = Boolean(openFilePath) && desc.kind === "file_read";
   const isSubagentStep = item.detail.kind === "subagent";
+  const readStartLine = item.detail.kind === "file_read" ? item.detail.start_line : null;
+  const readEndLine = item.detail.kind === "file_read" ? item.detail.end_line : null;
+  const canOpenTargetDirectly = Boolean(
+    openFilePath && ((canOpenFileInDiff && !hasExpandableDetail) || canOpenFileDirect),
+  );
+  const handleOpenTargetFile = () => {
+    if (!openFilePath) return;
+    if (canOpenFileInDiff) {
+      orbitActions.openInspectorForFile(openFilePath, "session_turns");
+      return;
+    }
+    if (canOpenFileDirect) {
+      orbitActions.openFileInSidePanel(openFilePath, {
+        cwd,
+        focusLine: readStartLine,
+        focusEndLine: readEndLine,
+      });
+    }
+  };
 
   return (
     <div>
       <div
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
         className={cn(
           "group/tool -ml-1.5 flex items-center justify-between gap-2 rounded-md px-1.5 py-1 text-[13px] transition-colors",
           (hasExpandableDetail || canOpenFileInDiff || canOpenFileDirect || isSubagentStep) &&
             "hover:bg-accent/55",
         )}
       >
-        <button
-          ref={triggerRef}
-          type="button"
-          disabled={!hasExpandableDetail}
-          onClick={() => {
-            if (!hasExpandableDetail) return;
-            holdViewport(triggerRef.current, () => setExpanded((v) => !v));
-          }}
+        <div
+          ref={toolRowRef}
+          onClick={
+            hasExpandableDetail
+              ? () => holdViewport(toolRowRef.current, () => setExpanded((v) => !v))
+              : undefined
+          }
           className={cn(
             "flex min-w-0 flex-1 items-center gap-2 text-left",
             hasExpandableDetail ? "cursor-pointer" : "cursor-default",
@@ -542,19 +614,25 @@ const StepItemRow = memo(function StepItemRow({
         >
           <span
             className={cn(
-              "flex size-4 shrink-0 items-center justify-center",
+              "relative flex size-4 shrink-0 items-center justify-center",
               isError
                 ? "text-rose-500"
                 : "text-muted-foreground group-hover/tool:text-foreground/80",
             )}
           >
-            {showChevron ? (
-              <ChevronRight
-                className={cn(
-                  "size-3.5 stroke-[1.9] transition-transform duration-150",
-                  expanded && "rotate-90",
-                )}
-              />
+            {hasExpandableDetail ? (
+              expanded ? (
+                <ChevronRight className="size-3.5 rotate-90 stroke-[1.9] transition-transform duration-150" />
+              ) : (
+                <>
+                  {isError ? (
+                    <AlertTriangle className="size-3.5 stroke-[1.85] transition-opacity duration-100 group-hover/tool:opacity-0" />
+                  ) : (
+                    <IconComp className="size-3.5 stroke-[1.75] transition-opacity duration-100 group-hover/tool:opacity-0" />
+                  )}
+                  <ChevronRight className="absolute size-3.5 stroke-[1.9] opacity-0 transition-opacity duration-100 group-hover/tool:opacity-100" />
+                </>
+              )
             ) : isError ? (
               <AlertTriangle className="size-3.5 stroke-[1.85]" />
             ) : (
@@ -575,43 +653,60 @@ const StepItemRow = memo(function StepItemRow({
             {desc.verb}
           </span>
 
-          {desc.target && (
-            <span
-              onClick={
-                canOpenFileInDiff && !hasExpandableDetail && openFilePath
-                  ? (e) => {
-                      e.stopPropagation();
-                      orbitActions.openInspectorForFile(openFilePath, "session_turns");
-                    }
-                  : canOpenFileDirect && openFilePath
-                    ? (e) => {
-                        e.stopPropagation();
-                        orbitActions.openFileInSidePanel(openFilePath, {
-                          focusLine:
-                            item.detail.kind === "file_read" ? item.detail.start_line : null,
-                        });
-                      }
-                    : undefined
-              }
-              className={cn(
-                "truncate font-mono text-[12px]",
-                desc.isRunning
-                  ? "agent-text-shimmer"
-                  : "text-muted-foreground group-hover/tool:text-foreground/70",
-                ((canOpenFileInDiff && !hasExpandableDetail) || canOpenFileDirect) &&
-                  "cursor-pointer hover:underline",
-              )}
-            >
-              {desc.target}
-            </span>
-          )}
+          {desc.target &&
+            (canOpenTargetDirectly ? (
+              <button
+                type="button"
+                title={
+                  canOpenFileInDiff
+                    ? `Open ${desc.target} diff`
+                    : `Open ${desc.target} in Side Panel`
+                }
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleOpenTargetFile();
+                }}
+                className={cn(
+                  "min-w-0 cursor-pointer truncate text-left font-mono text-[12px] hover:underline",
+                  desc.isRunning
+                    ? "agent-text-shimmer"
+                    : "text-muted-foreground group-hover/tool:text-foreground/70 hover:text-foreground",
+                )}
+              >
+                {desc.target}
+              </button>
+            ) : (
+              <span
+                className={cn(
+                  "truncate font-mono text-[12px]",
+                  desc.isRunning
+                    ? "agent-text-shimmer"
+                    : "text-muted-foreground group-hover/tool:text-foreground/70",
+                )}
+              >
+                {desc.target}
+              </span>
+            ))}
 
-          {desc.secondaryMeta && (
-            <span className="text-muted-foreground/70 shrink-0 font-mono text-[11.5px]">
-              {desc.secondaryMeta}
-            </span>
-          )}
-        </button>
+          {desc.secondaryMeta &&
+            (canOpenFileDirect && openFilePath ? (
+              <button
+                type="button"
+                title={`Jump to ${desc.target ?? openFilePath} (${desc.secondaryMeta})`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleOpenTargetFile();
+                }}
+                className="text-muted-foreground/75 hover:text-foreground shrink-0 cursor-pointer font-mono text-[11.5px] hover:underline"
+              >
+                {desc.secondaryMeta}
+              </button>
+            ) : (
+              <span className="text-muted-foreground/70 shrink-0 font-mono text-[11.5px]">
+                {desc.secondaryMeta}
+              </span>
+            ))}
+        </div>
 
         <div className="tabular-nums flex shrink-0 items-center gap-2 font-mono text-[11.5px]">
           {(desc.additions > 0 || desc.deletions > 0) && (
@@ -655,7 +750,9 @@ const StepItemRow = memo(function StepItemRow({
               onClick={(e) => {
                 e.stopPropagation();
                 orbitActions.openFileInSidePanel(openFilePath, {
-                  focusLine: item.detail.kind === "file_read" ? item.detail.start_line : null,
+                  cwd,
+                  focusLine: readStartLine,
+                  focusEndLine: readEndLine,
                 });
               }}
               className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
@@ -791,7 +888,7 @@ const StepTimelineRail = memo(function StepTimelineRail({
 
         return (
           <StepItemRow
-            key={`${sub.item_type}-${sub.seq}-${i}`}
+            key={stableStepItemKey(sub, i)}
             item={sub}
             cwd={cwd}
             holdViewport={holdViewport}
@@ -839,7 +936,7 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   liveLabel: string;
   liveDetail: string | null;
   settledLabel: string;
-  summaryCounts: WorkSummaryResult["counts"];
+  summaryCounts: WorkSummaryResultView["counts"];
   labelIncludesFailure: boolean;
   defaultCollapsed: boolean;
   autoOpenForError: boolean;
@@ -875,7 +972,7 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   const defaultOpen = !defaultCollapsed || autoOpenForError;
   const isExpanded = userExpanded !== null ? userExpanded : defaultOpen;
   const showFailureBadge =
-    !isWorkActive && summaryCounts.unrecoveredFailureCount > 0 && !labelIncludesFailure;
+    !isWorkActive && summaryCounts.unrecovered_failure_count > 0 && !labelIncludesFailure;
   const showDiffNumbers =
     isWorkActive && (summaryCounts.additions > 0 || summaryCounts.deletions > 0);
   const showSettledDuration =
@@ -944,7 +1041,7 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
             </span>
             {showFailureBadge && (
               <span className="shrink-0 text-[12.5px] text-rose-600 dark:text-rose-400">
-                · {summaryCounts.unrecoveredFailureCount} failed
+                · {summaryCounts.unrecovered_failure_count} failed
               </span>
             )}
             {showSettledDuration && (
@@ -972,7 +1069,7 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
             indented
             isLiveActive={isWorkActive}
             autoExpandErrors={
-              !isWorkActive && (summaryCounts.failedCount > 0 || summaryCounts.deniedCount > 0)
+              !isWorkActive && (summaryCounts.failed_count > 0 || summaryCounts.denied_count > 0)
             }
             agentId={agentId}
             thinkingSignature={thinkingSignature}
@@ -1054,14 +1151,14 @@ function extractUserPromptPresentation(
   working = working.replace(/^Attached image file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
     sanitized = true;
     const name = rawPath.split("/").pop() || rawPath;
-    inferredBadges.push({ kind: "image", label: name });
+    inferredBadges.push({ kind: "image", label: name, path: rawPath });
     return "";
   });
 
   working = working.replace(/^Attached file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
     sanitized = true;
     const name = rawPath.split("/").pop() || rawPath;
-    inferredBadges.push({ kind: "file", label: name });
+    inferredBadges.push({ kind: "file", label: name, path: rawPath });
     return "";
   });
 
@@ -1069,8 +1166,9 @@ function extractUserPromptPresentation(
     sanitized = true;
     const matches = Array.from(listStr.matchAll(/`@?([^`]+)`/g));
     for (const m of matches) {
-      const name = m[1].split("/").pop() || m[1];
-      inferredBadges.push({ kind: "file", label: name });
+      const rawPath = m[1];
+      const name = rawPath.split("/").pop() || rawPath;
+      inferredBadges.push({ kind: "file", label: name, path: rawPath });
     }
     return "";
   });
@@ -1107,7 +1205,7 @@ function extractUserPromptPresentation(
     (_, loc: string) => {
       sanitized = true;
       const shortLoc = loc.split("/").pop() || loc;
-      inferredBadges.push({ kind: "quote", label: shortLoc });
+      inferredBadges.push({ kind: "quote", label: shortLoc, path: loc });
       return "";
     },
   );
@@ -1133,9 +1231,199 @@ function extractUserPromptPresentation(
   return res;
 }
 
+interface PromptImagePreviewTarget {
+  url: string;
+  label: string;
+  path: string | null;
+  hostId: string;
+  cwd: string;
+}
+
+const PromptImageThumbnail = memo(function PromptImageThumbnail({
+  badge,
+  cleanText,
+  imageIndex,
+  hostId,
+  agentId,
+  cwd,
+  onPreviewImage,
+}: {
+  badge: PromptBadge;
+  cleanText: string;
+  imageIndex: number;
+  hostId: string;
+  agentId: string;
+  cwd: string;
+  onPreviewImage: (img: PromptImagePreviewTarget) => void;
+}) {
+  const recent = useMemo(
+    () =>
+      !badge.path
+        ? lookupRecentSentTurnImage(hostId, agentId || null, cleanText, imageIndex, badge.label)
+        : null,
+    [badge.path, badge.label, cleanText, imageIndex, hostId, agentId],
+  );
+  const effectivePath = badge.path?.trim() || recent?.path?.trim() || null;
+
+  const resolveInitialState = (): {
+    status: "loading" | "ready" | "fallback";
+    url: string | null;
+    resolvedPath: string | null;
+  } => {
+    if (effectivePath && hostId) {
+      const cached = getCachedPromptImage(hostId, effectivePath);
+      if (cached?.status === "ready") {
+        return { status: "ready", url: cached.url, resolvedPath: cached.resolvedPath };
+      }
+      if (cached?.status === "error") {
+        return recent?.previewUrl
+          ? { status: "ready", url: recent.previewUrl, resolvedPath: effectivePath }
+          : { status: "fallback", url: null, resolvedPath: effectivePath };
+      }
+      return recent?.previewUrl
+        ? { status: "ready", url: recent.previewUrl, resolvedPath: effectivePath }
+        : { status: "loading", url: null, resolvedPath: effectivePath };
+    }
+    if (recent?.previewUrl) {
+      return { status: "ready", url: recent.previewUrl, resolvedPath: effectivePath };
+    }
+    return { status: "fallback", url: null, resolvedPath: null };
+  };
+
+  const [thumbState, setThumbState] = useState(resolveInitialState);
+
+  useEffect(() => {
+    const initial = resolveInitialState();
+    setThumbState(initial);
+    if (initial.status !== "loading" || !effectivePath || !hostId) {
+      return;
+    }
+    let cancelled = false;
+    void loadPromptImage(hostId, cwd || "~", effectivePath).then((entry: PromptImageEntry) => {
+      if (cancelled) return;
+      if (entry.status === "ready") {
+        setThumbState({ status: "ready", url: entry.url, resolvedPath: entry.resolvedPath });
+      } else {
+        setThumbState({ status: "fallback", url: null, resolvedPath: effectivePath });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId, agentId, cwd, badge.path, badge.label, effectivePath]);
+
+  if (thumbState.status === "loading") {
+    return (
+      <div
+        title={badge.label}
+        className="border-border bg-muted/55 size-[92px] shrink-0 animate-pulse rounded-[16px] border"
+      />
+    );
+  }
+
+  if (thumbState.status === "ready" && thumbState.url) {
+    const imgUrl = thumbState.url;
+    const imgPath = thumbState.resolvedPath ?? effectivePath;
+    return (
+      <button
+        type="button"
+        title={`Preview ${badge.label}`}
+        onClick={() =>
+          onPreviewImage({
+            url: imgUrl,
+            label: badge.label,
+            path: imgPath,
+            hostId,
+            cwd,
+          })
+        }
+        className="group/img border-border bg-muted/40 relative size-[92px] shrink-0 cursor-pointer overflow-hidden rounded-[16px] border shadow-[0_1px_4px_rgba(0,0,0,0.06)] transition-[border-color,box-shadow] duration-150 hover:border-foreground/25 dark:shadow-[0_2px_8px_rgba(0,0,0,0.28)]"
+      >
+        <img
+          src={imgUrl}
+          alt={badge.label}
+          decoding="async"
+          draggable={false}
+          className="size-full object-cover transition-transform duration-200 ease-[var(--ease-out-expo)] group-hover/img:scale-[1.03]"
+        />
+      </button>
+    );
+  }
+
+  return (
+    <span
+      title={badge.label}
+      className="text-foreground/85 inline-flex items-center gap-1.5 rounded-xl border border-black/[0.075] bg-black/[0.03] px-2.5 py-1 text-[12px] dark:border-white/[0.10] dark:bg-white/[0.055]"
+    >
+      <FileImage className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
+      <span className="max-w-[180px] truncate font-medium">{badge.label}</span>
+    </span>
+  );
+});
+
+const PromptImageLightbox = memo(function PromptImageLightbox({
+  target,
+  onClose,
+}: {
+  target: PromptImagePreviewTarget | null;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog open={target !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="w-fit max-w-[92vw] gap-3 p-4 sm:p-5">
+        <DialogHeader className="gap-1 pr-8">
+          <DialogTitle className="truncate font-mono text-[13.5px] font-medium">
+            {target?.label ?? ""}
+          </DialogTitle>
+          {target?.path && (
+            <DialogDescription className="truncate font-mono text-[11.5px]">
+              {target.path}
+            </DialogDescription>
+          )}
+        </DialogHeader>
+
+        {target && (
+          <div className="flex flex-col items-end gap-3">
+            <div className="border-border bg-muted/30 flex max-h-[76vh] max-w-[86vw] items-center justify-center overflow-hidden rounded-xl border p-1.5">
+              <img
+                src={target.url}
+                alt={target.label}
+                className="max-h-[72vh] max-w-[84vw] rounded-lg object-contain"
+              />
+            </div>
+
+            {target.path && target.hostId && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  const p = target.path;
+                  const h = target.hostId;
+                  const c = target.cwd;
+                  onClose();
+                  if (p) {
+                    orbitActions.openFileInSidePanel(p, { hostId: h, cwd: c });
+                  }
+                }}
+                className="gap-1.5 text-[12px]"
+              >
+                <FileSymlink className="size-3.5" />
+                Open in Side Panel
+              </Button>
+            )}
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+});
+
 /**
  * Orbit Native User Prompt Bubble:
  * - Crisp cool-neutral Orbit surface aligned flush right.
+ * - Renders image attachments as right-aligned rounded thumbnails cleanly above the text bubble.
  * - Renders semantic context & slash workflow tokens (`/plan`, `/review`, `@file`, `Diff`)
  *   without exposing hidden wire scaffolding.
  * - Long messages preview smoothly with a bottom fade gradient; click anywhere on the bubble to
@@ -1144,14 +1432,22 @@ function extractUserPromptPresentation(
  */
 const UserPromptBubble = memo(function UserPromptBubble({
   item,
+  hostId,
+  agentId,
+  cwd,
   holdViewport,
   animateEntrance = false,
   onRequestRewind,
+  onPreviewImage,
 }: {
   item: Extract<TimelineItemView, { item_type: "user_prompt" }>;
+  hostId: string;
+  agentId: string;
+  cwd?: string;
   holdViewport: ViewportAnchorHoldFn;
   animateEntrance?: boolean;
   onRequestRewind?: (seq: number, promptText: string) => void;
+  onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
@@ -1174,9 +1470,19 @@ const UserPromptBubble = memo(function UserPromptBubble({
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(measure);
+    let rafId = 0;
+    const ro = new ResizeObserver(() => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        measure();
+      });
+    });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (rafId) window.cancelAnimationFrame(rafId);
+    };
   }, [cleanText, badges.length]);
 
   useEffect(() => {
@@ -1223,14 +1529,20 @@ const UserPromptBubble = memo(function UserPromptBubble({
     holdViewport(bubbleRef.current, () => setExpanded(true), "top");
   };
 
+  const imageBadges = useMemo(
+    () => badges.filter((b) => b.kind === "image"),
+    [badges],
+  );
   const slashBadge = useMemo(
     () => badges.find((b) => b.kind === "slash") ?? null,
     [badges],
   );
   const attachmentBadges = useMemo(
-    () => badges.filter((b) => b.kind !== "slash"),
+    () => badges.filter((b) => b.kind !== "slash" && b.kind !== "image"),
     [badges],
   );
+  const hasBubbleContent =
+    attachmentBadges.length > 0 || Boolean(slashBadge) || cleanText.length > 0;
   const SlashIcon = slashBadge ? resolvePromptBadgeIcon(slashBadge) : null;
   const slashLabel = slashBadge ? slashBadge.label.replace(/^\//, "") : "";
   const promptTimestampMs =
@@ -1248,74 +1560,119 @@ const UserPromptBubble = memo(function UserPromptBubble({
         animateEntrance && "orbit-bubble-enter",
       )}
     >
-      <div
-        ref={bubbleRef}
-        onClick={handleBubbleClick}
-        className={cn(
-          "prompt-bubble-surface text-foreground relative min-w-0 max-w-[80%] overflow-hidden rounded-[20px] px-4 py-2.5",
-          overflowing && !expanded && "cursor-pointer",
-        )}
-      >
+      {imageBadges.length > 0 && (
         <div
-          ref={bodyRef}
-          style={
-            !expanded && overflowing
-              ? { maxHeight: `${USER_PROMPT_PREVIEW_MAX_PX}px`, overflow: "hidden" }
-              : undefined
-          }
-          className="relative space-y-1.5"
-        >
-          {attachmentBadges.length > 0 && (
-            <div className="flex flex-wrap items-center gap-1.5 select-none">
-              {attachmentBadges.map((badge, idx) => {
-                const BadgeIcon = resolvePromptBadgeIcon(badge);
-                const isMono = badge.kind === "file" || badge.kind === "quote";
-                return (
-                  <span
-                    key={`${badge.kind}-${badge.label}-${idx}`}
-                    className="text-foreground/85 inline-flex items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] dark:border-white/[0.10] dark:bg-white/[0.055]"
-                  >
-                    <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
-                    <span className={cn("leading-normal font-medium", isMono && "font-mono")}>
-                      {badge.label}
-                    </span>
-                  </span>
-                );
-              })}
-            </div>
+          className={cn(
+            "flex max-w-[80%] flex-wrap justify-end gap-2 select-none",
+            hasBubbleContent && "mb-1.5",
           )}
+        >
+          {imageBadges.map((badge, idx) => (
+            <PromptImageThumbnail
+              key={`uimg-${badge.path ?? badge.label}-${idx}`}
+              badge={badge}
+              cleanText={cleanText}
+              imageIndex={idx}
+              hostId={hostId}
+              agentId={agentId}
+              cwd={cwd || "~"}
+              onPreviewImage={onPreviewImage}
+            />
+          ))}
+        </div>
+      )}
 
-          {slashBadge && SlashIcon ? (
-            <p className="selectable-text text-foreground text-[14.5px] leading-[1.64] whitespace-pre-wrap">
-              <span className="mr-1.5 inline-flex items-center gap-1.5 align-baseline select-none">
-                <SlashIcon className="text-muted-foreground relative top-[2px] size-[14px] shrink-0 stroke-[1.75]" />
-                <span className="text-foreground font-medium">{slashLabel}</span>
-              </span>
-              {cleanText}
-            </p>
-          ) : (
-            cleanText.length > 0 &&
-            (sanitizedLegacy ? (
+      {hasBubbleContent && (
+        <div
+          ref={bubbleRef}
+          onClick={handleBubbleClick}
+          className={cn(
+            "prompt-bubble-surface text-foreground relative min-w-0 max-w-[80%] overflow-hidden rounded-[20px] px-4 py-2.5",
+            overflowing && !expanded && "cursor-pointer",
+          )}
+        >
+          <div
+            ref={bodyRef}
+            style={
+              !expanded && overflowing
+                ? { maxHeight: `${USER_PROMPT_PREVIEW_MAX_PX}px`, overflow: "hidden" }
+                : undefined
+            }
+            className="relative space-y-1.5"
+          >
+            {attachmentBadges.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5 select-none">
+                {attachmentBadges.map((badge, idx) => {
+                  const BadgeIcon = resolvePromptBadgeIcon(badge);
+                  const isMono = badge.kind === "file" || badge.kind === "quote";
+                  const fileTarget = badge.path?.trim() || badge.label;
+                  const isClickableFileBadge = isMono && fileTarget.trim().length > 0;
+                  if (isClickableFileBadge) {
+                    return (
+                      <button
+                        key={`${badge.kind}-${badge.label}-${idx}`}
+                        type="button"
+                        title={`Open ${badge.label} in Side Panel`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openOrbitLink(fileTarget, { hostId, cwd });
+                        }}
+                        className="text-foreground/85 hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] transition-colors hover:border-black/[0.14] hover:bg-black/[0.055] dark:border-white/[0.10] dark:bg-white/[0.055] dark:hover:border-white/[0.18] dark:hover:bg-white/[0.095]"
+                      >
+                        <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
+                        <span className="font-mono leading-normal font-medium hover:underline">
+                          {badge.label}
+                        </span>
+                      </button>
+                    );
+                  }
+                  return (
+                    <span
+                      key={`${badge.kind}-${badge.label}-${idx}`}
+                      className="text-foreground/85 inline-flex items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] dark:border-white/[0.10] dark:bg-white/[0.055]"
+                    >
+                      <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
+                      <span className={cn("leading-normal font-medium", isMono && "font-mono")}>
+                        {badge.label}
+                      </span>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
+            {slashBadge && SlashIcon ? (
               <p className="selectable-text text-foreground text-[14.5px] leading-[1.64] whitespace-pre-wrap">
+                <span className="mr-1.5 inline-flex items-center gap-1.5 align-baseline select-none">
+                  <SlashIcon className="text-muted-foreground relative top-[2px] size-[14px] shrink-0 stroke-[1.75]" />
+                  <span className="text-foreground font-medium">{slashLabel}</span>
+                </span>
                 {cleanText}
               </p>
             ) : (
-              <MarkdownBlocksView blocks={item.blocks} bubble />
-            ))
+              cleanText.length > 0 &&
+              (sanitizedLegacy ? (
+                <p className="selectable-text text-foreground text-[14.5px] leading-[1.64] whitespace-pre-wrap">
+                  {cleanText}
+                </p>
+              ) : (
+                <MarkdownBlocksView blocks={item.blocks} bubble />
+              ))
+            )}
+          </div>
+
+          {!expanded && overflowing && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-14 rounded-b-[19px]"
+              style={{
+                background:
+                  "linear-gradient(to top, var(--surface-elevated) 14%, color-mix(in oklab, var(--surface-elevated) 82%, transparent) 52%, transparent 100%)",
+              }}
+            />
           )}
         </div>
-
-        {!expanded && overflowing && (
-          <div
-            aria-hidden="true"
-            className="pointer-events-none absolute inset-x-0 bottom-0 h-14 rounded-b-[19px]"
-            style={{
-              background:
-                "linear-gradient(to top, var(--surface-elevated) 14%, color-mix(in oklab, var(--surface-elevated) 82%, transparent) 52%, transparent 100%)",
-            }}
-          />
-        )}
-      </div>
+      )}
 
       <div className="mt-1 -mb-1.5 flex h-[22px] shrink-0 items-center justify-end gap-1 pr-1 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100">
         {promptTimestampMs !== null && (
@@ -1342,7 +1699,7 @@ const TurnChangesBar = memo(function TurnChangesBar({
   diffs,
   cwd,
 }: {
-  diffs: TurnFileDiffSummary[];
+  diffs: TurnFileDiffSummaryView[];
   cwd: string;
 }) {
   if (diffs.length === 0) return null;
@@ -1378,6 +1735,92 @@ const TurnChangesBar = memo(function TurnChangesBar({
   );
 });
 
+/**
+ * Zero-rest-overhead hover pill tooltip:
+ * Avoids mounting hundreds of persistent tooltip context/portal providers per conversation turn.
+ * Reads trigger geometry only after hover/focus delay elapses and mounts a single lightweight portal.
+ */
+function HoverPillTooltip({
+  label,
+  delay = 220,
+  tabularNums = false,
+  renderTrigger,
+}: {
+  label: string;
+  delay?: number;
+  tabularNums?: boolean;
+  renderTrigger: (handlers: {
+    onMouseEnter: (e: React.MouseEvent<HTMLElement>) => void;
+    onMouseLeave: () => void;
+    onFocus: (e: React.FocusEvent<HTMLElement>) => void;
+    onBlur: () => void;
+  }) => ReactElement;
+}) {
+  const [anchorPos, setAnchorPos] = useState<{ x: number; y: number } | null>(null);
+  const timerRef = useRef<number | null>(null);
+
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearTimer, [clearTimer]);
+
+  const scheduleShow = useCallback(
+    (el: HTMLElement | null) => {
+      clearTimer();
+      if (!el || !label) return;
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        if (!el.isConnected) return;
+        const rect = el.getBoundingClientRect();
+        setAnchorPos({ x: rect.left + rect.width / 2, y: rect.top - 6 });
+      }, delay);
+    },
+    [clearTimer, delay, label],
+  );
+
+  const hide = useCallback(() => {
+    clearTimer();
+    setAnchorPos(null);
+  }, [clearTimer]);
+
+  return (
+    <>
+      {renderTrigger({
+        onMouseEnter: (e) => scheduleShow(e.currentTarget),
+        onMouseLeave: hide,
+        onFocus: (e) => scheduleShow(e.currentTarget),
+        onBlur: hide,
+      })}
+      {anchorPos &&
+        label &&
+        createPortal(
+          <div
+            role="tooltip"
+            style={{
+              left: `${anchorPos.x}px`,
+              top: `${anchorPos.y}px`,
+            }}
+            className="pointer-events-none fixed z-50 -translate-x-1/2 -translate-y-full"
+          >
+            <div
+              className={cn(
+                "bg-elevated text-foreground rounded-full border border-black/[0.08] px-2.5 py-0.5 text-[11.5px] leading-normal font-normal shadow-[0_4px_14px_rgba(0,0,0,0.08)] select-none dark:border-white/[0.11] dark:shadow-[0_4px_16px_rgba(0,0,0,0.36)]",
+                tabularNums && "tabular-nums px-3 py-1 text-[12px]",
+              )}
+            >
+              {label}
+            </div>
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
+
 /** Shared pill-styled Copy icon button (`13px` icon in `22×22px` hit target, balanced with `14.5px` prose). */
 function CopyActionButton({
   copied,
@@ -1391,42 +1834,35 @@ function CopyActionButton({
   className?: string;
 }) {
   return (
-    <BaseTooltip.Root>
-      <BaseTooltip.Trigger
-        delay={240}
-        render={
-          <button
-            type="button"
-            aria-label={copied ? "Copied" : label}
-            onClick={onClick}
+    <HoverPillTooltip
+      label={copied ? "Copied" : label}
+      delay={240}
+      renderTrigger={(handlers) => (
+        <button
+          type="button"
+          aria-label={copied ? "Copied" : label}
+          onClick={onClick}
+          {...handlers}
+          className={cn(
+            "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
+            className,
+          )}
+        >
+          <Copy
             className={cn(
-              "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
-              className,
+              "size-[13px] stroke-[1.8] transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)]",
+              copied ? "scale-50 -rotate-12 opacity-0" : "scale-100 rotate-0 opacity-100",
             )}
           />
-        }
-      >
-        <Copy
-          className={cn(
-            "size-[13px] stroke-[1.8] transition-all duration-150 ease-[var(--ease-out-expo)]",
-            copied ? "scale-50 -rotate-12 opacity-0" : "scale-100 rotate-0 opacity-100",
-          )}
-        />
-        <Check
-          className={cn(
-            "absolute size-[13px] stroke-[2] text-emerald-600 transition-all duration-150 ease-[var(--ease-out-expo)] dark:text-emerald-400",
-            copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0",
-          )}
-        />
-      </BaseTooltip.Trigger>
-      <BaseTooltip.Portal>
-        <BaseTooltip.Positioner side="top" sideOffset={6} className="pointer-events-none z-50">
-          <BaseTooltip.Popup className="bg-elevated text-foreground orbit-tooltip-content rounded-full border border-black/[0.08] px-2.5 py-0.5 text-[11.5px] leading-normal font-normal shadow-[0_4px_14px_rgba(0,0,0,0.08)] select-none dark:border-white/[0.11] dark:shadow-[0_4px_16px_rgba(0,0,0,0.36)]">
-            {copied ? "Copied" : label}
-          </BaseTooltip.Popup>
-        </BaseTooltip.Positioner>
-      </BaseTooltip.Portal>
-    </BaseTooltip.Root>
+          <Check
+            className={cn(
+              "absolute size-[13px] stroke-[2] text-emerald-600 transition-[transform,opacity] duration-150 ease-[var(--ease-out-expo)] dark:text-emerald-400",
+              copied ? "scale-100 rotate-0 opacity-100" : "scale-50 rotate-12 opacity-0",
+            )}
+          />
+        </button>
+      )}
+    />
   );
 }
 
@@ -1441,31 +1877,24 @@ function UndoActionButton({
   className?: string;
 }) {
   return (
-    <BaseTooltip.Root>
-      <BaseTooltip.Trigger
-        delay={240}
-        render={
-          <button
-            type="button"
-            aria-label={label}
-            onClick={onClick}
-            className={cn(
-              "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
-              className,
-            )}
-          />
-        }
-      >
-        <Undo2 className="size-[13px] stroke-[1.8]" />
-      </BaseTooltip.Trigger>
-      <BaseTooltip.Portal>
-        <BaseTooltip.Positioner side="top" sideOffset={6} className="pointer-events-none z-50">
-          <BaseTooltip.Popup className="bg-elevated text-foreground orbit-tooltip-content rounded-full border border-black/[0.08] px-2.5 py-0.5 text-[11.5px] leading-normal font-normal shadow-[0_4px_14px_rgba(0,0,0,0.08)] select-none dark:border-white/[0.11] dark:shadow-[0_4px_16px_rgba(0,0,0,0.36)]">
-            {label}
-          </BaseTooltip.Popup>
-        </BaseTooltip.Positioner>
-      </BaseTooltip.Portal>
-    </BaseTooltip.Root>
+    <HoverPillTooltip
+      label={label}
+      delay={240}
+      renderTrigger={(handlers) => (
+        <button
+          type="button"
+          aria-label={label}
+          onClick={onClick}
+          {...handlers}
+          className={cn(
+            "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
+            className,
+          )}
+        >
+          <Undo2 className="size-[13px] stroke-[1.8]" />
+        </button>
+      )}
+    />
   );
 }
 
@@ -1583,7 +2012,7 @@ function RewindTurnDialog({
             <div className="relative min-w-0">
               <div
                 className={cn(
-                  "max-h-[216px] space-y-1.5 overflow-y-auto pr-1 transition-opacity duration-150",
+                  "max-h-[216px] space-y-1.5 overflow-y-auto pr-3.5 transition-opacity duration-150",
                   !restoreFiles && "opacity-45",
                 )}
               >
@@ -1621,7 +2050,7 @@ function RewindTurnDialog({
               </div>
               {files.length > 7 && (
                 <div
-                  className="pointer-events-none absolute inset-x-0 bottom-0 h-7"
+                  className="pointer-events-none absolute right-3.5 bottom-0 left-0 h-7"
                   style={{
                     background:
                       "linear-gradient(to top, var(--surface-elevated) 0%, transparent 100%)",
@@ -1672,30 +2101,24 @@ const RelativeTimestampPill = memo(function RelativeTimestampPill({
 }: {
   timestampMs: number;
 }) {
-  const nowMs = useSharedRelativeNow();
+  const nowMs = useSharedRelativeNow(timestampMs);
   const relativeText = formatRelativeTimeLabel(timestampMs, nowMs);
   const fullText = formatFullTimestampTooltip(timestampMs);
 
   return (
-    <BaseTooltip.Root>
-      <BaseTooltip.Trigger
-        delay={140}
-        render={
-          <span className="text-muted-foreground hover:text-foreground/85 tabular-nums inline-flex cursor-default items-center rounded px-1 py-0.5 text-[12px] leading-none transition-colors select-none" />
-        }
-      >
-        {relativeText}
-      </BaseTooltip.Trigger>
-      {fullText && (
-        <BaseTooltip.Portal>
-          <BaseTooltip.Positioner side="top" sideOffset={6} className="pointer-events-none z-50">
-            <BaseTooltip.Popup className="bg-elevated text-foreground orbit-tooltip-content tabular-nums rounded-full border border-black/[0.08] px-3 py-1 text-[12px] leading-normal font-normal shadow-[0_4px_14px_rgba(0,0,0,0.08)] select-none dark:border-white/[0.11] dark:shadow-[0_4px_16px_rgba(0,0,0,0.36)]">
-              {fullText}
-            </BaseTooltip.Popup>
-          </BaseTooltip.Positioner>
-        </BaseTooltip.Portal>
+    <HoverPillTooltip
+      label={fullText}
+      delay={140}
+      tabularNums
+      renderTrigger={(handlers) => (
+        <span
+          {...handlers}
+          className="text-muted-foreground hover:text-foreground/85 tabular-nums inline-flex cursor-default items-center rounded px-1 py-0.5 text-[12px] leading-none transition-colors select-none"
+        >
+          {relativeText}
+        </span>
       )}
-    </BaseTooltip.Root>
+    />
   );
 });
 
@@ -1818,6 +2241,14 @@ const WakeupDivider = memo(function WakeupDivider({ label }: { label?: string })
 });
 
 const EMPTY_TIMELINE_ITEMS: TimelineItemView[] = [];
+const EMPTY_TURNS: StageTurnView[] = [];
+const EMPTY_DIFF_FILES: DiffFileView[] = [];
+const EMPTY_INSIGHTS: SessionInsightsView = {
+  touched_files: [],
+  background_tasks: [],
+  subagents: [],
+  detected_local_urls: [],
+};
 
 function computeTotalThinkingDurationMs(
   items: TimelineItemView[],
@@ -1838,12 +2269,12 @@ function computeTotalThinkingDurationMs(
 }
 
 function buildTurnThinkingSignature(
-  turn: StageTurn,
+  turn: StageTurnView,
   agentId: string,
   thinkingTimings: Record<string, TurnTimingRecord>,
 ): string {
   let sig = "";
-  for (const seg of turn.liveSegments) {
+  for (const seg of turn.live_segments) {
     if (seg.kind !== "step_group") continue;
     for (const it of seg.items) {
       if (it.item_type !== "assistant_thinking") continue;
@@ -1857,22 +2288,22 @@ function buildTurnThinkingSignature(
   return sig;
 }
 
-const EMPTY_WORK_COUNTS: WorkSummaryResult["counts"] = {
-  editedFileCount: 0,
-  createdFileCount: 0,
-  commandCount: 0,
-  readFileCount: 0,
-  searchCount: 0,
-  subagentCount: 0,
-  mcpServerCount: 0,
-  otherToolCount: 0,
-  thoughtCount: 0,
-  narrationCount: 0,
-  actionSteps: 0,
-  totalSteps: 0,
-  failedCount: 0,
-  deniedCount: 0,
-  unrecoveredFailureCount: 0,
+const EMPTY_WORK_COUNTS: WorkSummaryResultView["counts"] = {
+  edited_file_count: 0,
+  created_file_count: 0,
+  command_count: 0,
+  read_file_count: 0,
+  search_count: 0,
+  subagent_count: 0,
+  mcp_server_count: 0,
+  other_tool_count: 0,
+  thought_count: 0,
+  narration_count: 0,
+  action_steps: 0,
+  total_steps: 0,
+  failed_count: 0,
+  denied_count: 0,
+  unrecovered_failure_count: 0,
   additions: 0,
   deletions: 0,
 };
@@ -1892,82 +2323,84 @@ const TurnStageSection = memo(function TurnStageSection({
   isNetworkOffline,
   animatePromptEntrance = false,
   autoFoldCompleted,
+  hostId,
   cwd,
   agentId,
   timing,
-  thinkingSignature,
+  thinkingSignature: _thinkingSignature,
   getThinkingDurationMs,
   holdViewport,
-  registerTurnEl,
   onRequestRewind,
+  onPreviewImage,
 }: {
-  turn: StageTurn;
+  turn: StageTurnView;
   isTurnActive: boolean;
   isNetworkOffline: boolean;
   animatePromptEntrance?: boolean;
   autoFoldCompleted: boolean;
+  hostId: string;
   cwd: string;
   agentId: string;
   timing?: TurnTimingRecord;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
-  registerTurnEl: (seq: number, el: HTMLDivElement | null) => void;
   onRequestRewind: (seq: number, promptText: string) => void;
+  onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
-  const setRef = useCallback(
-    (el: HTMLDivElement | null) => {
-      registerTurnEl(turn.anchorSeq, el);
-    },
-    [registerTurnEl, turn.anchorSeq],
-  );
-
   if (
-    turn.isCompactionCommand &&
-    turn.foldedSteps.length === 0 &&
-    turn.terminalReply === null &&
+    turn.is_compaction_command &&
+    turn.folded_steps.length === 0 &&
+    turn.terminal_reply === null &&
     turn.notices.length === 0
   ) {
-    return (
-      <div ref={setRef}>
-        <CompactionDivider label={turn.compactions[0]?.label || "Context compacted"} />
-      </div>
-    );
+    return <CompactionDivider label={turn.compactions[0]?.label || "Context compacted"} />;
   }
 
-  const segments = turn.liveSegments;
+  const segments = turn.live_segments;
   const lastSeg = segments[segments.length - 1] ?? null;
   const hasBody = segments.length > 0 || isTurnActive;
-  const liveStartedAtMs = timing?.startedAtMs ?? turn.startedAtMs ?? null;
+  const liveStartedAtMs = timing?.startedAtMs ?? turn.started_at_ms ?? null;
+  const promptItem =
+    turn.user_prompt?.item_type === "user_prompt" ? turn.user_prompt : null;
+  const lastReplyText =
+    !isTurnActive && turn.last_assistant_reply?.item_type === "assistant_message"
+      ? turn.last_assistant_reply.text
+      : null;
 
   // Show a lightweight trailing live indicator when the turn is active, but the last rendered
   // segment is already settled (e.g., after an interim reply, notice, or wakeup divider).
   const needsTrailingActivity =
     isTurnActive &&
     (lastSeg === null ||
-      (lastSeg.kind === "assistant_message" && !lastSeg.item.streaming) ||
+      (lastSeg.kind === "assistant_message" &&
+        lastSeg.item.item_type === "assistant_message" &&
+        !lastSeg.item.streaming) ||
       lastSeg.kind === "notice" ||
       lastSeg.kind === "wakeup" ||
       lastSeg.kind === "compaction");
 
   return (
     <div
-      ref={setRef}
       style={!isTurnActive ? { contain: "layout style" } : undefined}
-      className="space-y-4"
+      className="min-w-0 space-y-4"
     >
-      {turn.userPrompt && (
+      {promptItem && (
         <UserPromptBubble
-          item={turn.userPrompt}
+          item={promptItem}
+          hostId={hostId}
+          agentId={agentId}
+          cwd={cwd}
           holdViewport={holdViewport}
           animateEntrance={animatePromptEntrance}
           onRequestRewind={onRequestRewind}
+          onPreviewImage={onPreviewImage}
         />
       )}
 
       {hasBody && (
-        <div className="px-[10px]">
-          <div className="space-y-3">
+        <div className="min-w-0 px-[10px]">
+          <div className="min-w-0 space-y-3">
             {segments.map((seg, idx) => {
               const isLastSeg = idx === segments.length - 1;
 
@@ -1981,6 +2414,7 @@ const TurnStageSection = memo(function TurnStageSection({
 
               if (seg.kind === "notice") {
                 const n = seg.item;
+                if (n.item_type !== "notice") return null;
                 const isError = n.level === "error";
                 const isWarning = n.level === "warning";
                 return (
@@ -2013,55 +2447,58 @@ const TurnStageSection = memo(function TurnStageSection({
               }
 
               if (seg.kind === "assistant_message") {
+                if (seg.item.item_type !== "assistant_message") return null;
                 return (
-                  <MarkdownBlocksView
-                    key={seg.key}
-                    blocks={seg.item.blocks}
-                    streaming={seg.item.streaming}
-                  />
+                  <MarkdownLinkProvider key={seg.key} cwd={cwd}>
+                    <MarkdownBlocksView
+                      blocks={seg.item.blocks}
+                      streaming={seg.item.streaming}
+                    />
+                  </MarkdownLinkProvider>
                 );
               }
 
               // `step_group`
               const isGroupActive =
-                isTurnActive && (seg.hasRunningStep || (isLastSeg && !seg.hasFollowingContent));
+                isTurnActive && (seg.has_running_step || (isLastSeg && !seg.has_following_content));
               const groupThoughtMs =
                 computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
-                seg.thoughtDurationMs;
+                seg.thought_duration_ms ??
+                null;
               const groupSettledLabel =
-                seg.summary.counts.actionSteps === 0 && seg.summary.counts.thoughtCount > 0
-                  ? formatThoughtSummaryLabel(groupThoughtMs, seg.summary.counts.thoughtCount)
+                seg.summary.counts.action_steps === 0 && seg.summary.counts.thought_count > 0
+                  ? formatThoughtSummaryLabel(groupThoughtMs, seg.summary.counts.thought_count)
                   : seg.summary.label;
               const groupSettledDurationMs =
-                seg.workDurationMs ??
+                seg.work_duration_ms ??
                 (segments.length === 1
-                  ? (timing?.workDurationMs ?? turn.workDurationMs ?? timing?.durationMs ?? null)
+                  ? (timing?.workDurationMs ?? turn.work_duration_ms ?? timing?.durationMs ?? null)
                   : null);
-              const groupLiveStartMs = seg.startedAtMs ?? liveStartedAtMs;
+              const groupLiveStartMs = seg.started_at_ms ?? liveStartedAtMs;
 
               return (
                 <TurnActivityDisclosure
                   key={seg.key}
                   items={seg.items}
                   isWorkActive={isGroupActive}
-                  liveLabel={seg.summary.liveLabel}
-                  liveDetail={seg.summary.liveDetail}
+                  liveLabel={seg.summary.live_label}
+                  liveDetail={seg.summary.live_detail ?? null}
                   settledLabel={groupSettledLabel}
                   summaryCounts={seg.summary.counts}
-                  labelIncludesFailure={seg.summary.labelIncludesFailure}
+                  labelIncludesFailure={seg.summary.label_includes_failure}
                   defaultCollapsed={autoFoldCompleted}
                   autoOpenForError={
                     !isGroupActive &&
-                    !seg.hasFollowingContent &&
-                    seg.summary.counts.unrecoveredFailureCount > 0
+                    !seg.has_following_content &&
+                    seg.summary.counts.unrecovered_failure_count > 0
                   }
                   liveStartedAtMs={groupLiveStartMs}
-                  latestActivityMs={seg.latestActivityMs ?? groupLiveStartMs}
+                  latestActivityMs={seg.latest_activity_ms ?? groupLiveStartMs}
                   isNetworkOffline={isNetworkOffline}
                   settledDurationMs={groupSettledDurationMs}
                   cwd={cwd}
                   agentId={agentId}
-                  thinkingSignature={thinkingSignature}
+                  thinkingSignature={_thinkingSignature}
                   getThinkingDurationMs={getThinkingDurationMs}
                   holdViewport={holdViewport}
                 />
@@ -2080,24 +2517,24 @@ const TurnStageSection = memo(function TurnStageSection({
                 defaultCollapsed={autoFoldCompleted}
                 autoOpenForError={false}
                 liveStartedAtMs={liveStartedAtMs}
-                latestActivityMs={turn.completedAtMs ?? liveStartedAtMs}
+                latestActivityMs={turn.completed_at_ms ?? liveStartedAtMs}
                 isNetworkOffline={isNetworkOffline}
                 settledDurationMs={null}
                 cwd={cwd}
                 agentId={agentId}
-                thinkingSignature={thinkingSignature}
+                thinkingSignature={_thinkingSignature}
                 getThinkingDurationMs={getThinkingDurationMs}
                 holdViewport={holdViewport}
               />
             )}
 
-            {!isTurnActive && <TurnChangesBar diffs={turn.turnDiffs} cwd={cwd} />}
+            {!isTurnActive && <TurnChangesBar diffs={turn.turn_diffs} cwd={cwd} />}
 
             <TurnFooter
               isTurnActive={isTurnActive}
               timing={timing}
-              completedAtMs={turn.completedAtMs}
-              replyText={!isTurnActive ? (turn.lastAssistantReply?.text ?? null) : null}
+              completedAtMs={turn.completed_at_ms}
+              replyText={lastReplyText}
             />
           </div>
         </div>
@@ -2123,7 +2560,7 @@ const TurnStageSection = memo(function TurnStageSection({
 function NewSessionLaunchpad() {
   return (
     <div className="orbit-stage-enter flex h-full w-full flex-col justify-center px-6 py-12 pb-[10vh]">
-      <div className="mx-auto w-full max-w-[768px] space-y-6">
+      <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,768px)] space-y-6">
         <h1 className="text-foreground/90 px-1 text-center text-[26px] font-normal tracking-[-0.018em]">
           What would you like to build?
         </h1>
@@ -2134,6 +2571,715 @@ function NewSessionLaunchpad() {
   );
 }
 
+interface StageScrollUiSnapshot {
+  isOccludingText: boolean;
+  showJumpLatest: boolean;
+  activePromptSeq: number | null;
+}
+
+interface StageScrollUiStore {
+  getSnapshot: () => StageScrollUiSnapshot;
+  subscribe: (listener: () => void) => () => void;
+  update: (patch: Partial<StageScrollUiSnapshot>) => void;
+}
+
+function createStageScrollUiStore(): StageScrollUiStore {
+  let snap: StageScrollUiSnapshot = {
+    isOccludingText: false,
+    showJumpLatest: false,
+    activePromptSeq: null,
+  };
+  const listeners = new Set<() => void>();
+  return {
+    getSnapshot: () => snap,
+    subscribe: (listener) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+    update: (patch) => {
+      const nextOcclusion = patch.isOccludingText ?? snap.isOccludingText;
+      const nextJump = patch.showJumpLatest ?? snap.showJumpLatest;
+      const nextActive =
+        patch.activePromptSeq !== undefined ? patch.activePromptSeq : snap.activePromptSeq;
+      if (
+        nextOcclusion === snap.isOccludingText &&
+        nextJump === snap.showJumpLatest &&
+        nextActive === snap.activePromptSeq
+      ) {
+        return;
+      }
+      snap = {
+        isOccludingText: nextOcclusion,
+        showJumpLatest: nextJump,
+        activePromptSeq: nextActive,
+      };
+      for (const listener of listeners) {
+        listener();
+      }
+    },
+  };
+}
+
+interface OutlinePromptWithIndex {
+  seq: number;
+  turnIndex: number;
+  preview: string;
+}
+
+const StageOutlineRailBridge = memo(function StageOutlineRailBridge({
+  scrollUiStore,
+  prompts,
+  onJumpToSeq,
+  visible,
+  offsetPx,
+  offsetTransition,
+  isAnimating,
+}: {
+  scrollUiStore: StageScrollUiStore;
+  prompts: OutlinePromptWithIndex[];
+  onJumpToSeq: (seq: number) => void;
+  visible: boolean;
+  offsetPx: number;
+  offsetTransition: string;
+  isAnimating: boolean;
+}) {
+  const activePromptSeq = useSyncExternalStore(
+    scrollUiStore.subscribe,
+    () => scrollUiStore.getSnapshot().activePromptSeq,
+    () => scrollUiStore.getSnapshot().activePromptSeq,
+  );
+  return (
+    <ChatOutlineRail
+      prompts={prompts}
+      activeSeq={activePromptSeq ?? prompts[prompts.length - 1]?.seq ?? null}
+      onJumpToSeq={onJumpToSeq}
+      visible={visible}
+      offsetPx={offsetPx}
+      offsetTransition={offsetTransition}
+      isAnimating={isAnimating}
+    />
+  );
+});
+
+const StageJumpLatestBanner = memo(function StageJumpLatestBanner({
+  scrollUiStore,
+  stagePushStyle,
+  dockedOverviewLayout,
+  onJumpLatest,
+}: {
+  scrollUiStore: StageScrollUiStore;
+  stagePushStyle: CSSProperties;
+  dockedOverviewLayout: boolean;
+  onJumpLatest: () => void;
+}) {
+  const snap = useSyncExternalStore(
+    scrollUiStore.subscribe,
+    scrollUiStore.getSnapshot,
+    scrollUiStore.getSnapshot,
+  );
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-full h-7">
+      <div
+        className={cn(
+          "absolute inset-y-0 left-0 transition-opacity duration-150",
+          dockedOverviewLayout ? "right-[324px]" : "right-5",
+          snap.isOccludingText ? "opacity-100" : "opacity-0",
+        )}
+        style={{
+          background:
+            "linear-gradient(to top, var(--surface-canvas) 0%, color-mix(in oklab, var(--surface-canvas) 66%, transparent) 48%, transparent 100%)",
+        }}
+      />
+      <div
+        style={stagePushStyle}
+        className={cn(
+          "pointer-events-none absolute inset-y-0 left-0",
+          dockedOverviewLayout ? "right-[324px]" : "right-0",
+        )}
+      >
+        <button
+          type="button"
+          aria-label="Scroll to latest"
+          aria-hidden={!snap.showJumpLatest}
+          tabIndex={snap.showJumpLatest ? 0 : -1}
+          onClick={onJumpLatest}
+          className={cn(
+            "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute bottom-2 left-1/2 inline-flex size-9.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-[transform,opacity,color,border-color] duration-200 ease-[var(--ease-out-expo)] dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
+            snap.showJumpLatest
+              ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
+              : "pointer-events-none translate-y-1 scale-95 opacity-0",
+          )}
+        >
+          <ArrowDown className="size-[18px] stroke-[1.9]" />
+        </button>
+      </div>
+    </div>
+  );
+});
+
+const StageDockedComposer = memo(function StageDockedComposer({
+  scrollUiStore,
+}: {
+  scrollUiStore: StageScrollUiStore;
+}) {
+  const isOccludingText = useSyncExternalStore(
+    scrollUiStore.subscribe,
+    () => scrollUiStore.getSnapshot().isOccludingText,
+    () => scrollUiStore.getSnapshot().isOccludingText,
+  );
+  return <OmniComposer variant="docked" occluding={isOccludingText} />;
+});
+
+const SESSION_TURN_HEIGHT_CACHE_LIMIT = 1000;
+const sessionTurnHeightCache = new Map<string, number>();
+
+function getCachedTurnHeight(key: string): number | undefined {
+  return sessionTurnHeightCache.get(key);
+}
+
+function setCachedTurnHeight(key: string, height: number): void {
+  if (height <= 0 || !Number.isFinite(height)) return;
+  if (sessionTurnHeightCache.has(key)) {
+    sessionTurnHeightCache.delete(key);
+  } else if (sessionTurnHeightCache.size >= SESSION_TURN_HEIGHT_CACHE_LIMIT) {
+    const oldest = sessionTurnHeightCache.keys().next().value;
+    if (oldest !== undefined) sessionTurnHeightCache.delete(oldest);
+  }
+  sessionTurnHeightCache.set(key, height);
+}
+
+const TURN_LIST_GAP_PX = 32;
+const IDLE_LOOKAHEAD_UP_PX = 2400;
+const IDLE_LOOKAHEAD_DOWN_PX = 1400;
+const SCROLL_LEADING_PX = 3600;
+const SCROLL_FAST_LEADING_PX = 5200;
+const SCROLL_TRAILING_PX = 1200;
+const FAST_FLICK_PX_PER_SEC = 2200;
+const MAX_OVERSCAN_ITEMS_PER_SIDE = 24;
+const WARM_RESTING_CAP = 36;
+const WARM_SCROLLING_CAP = 52;
+const IDLE_PREWARM_BATCH = 2;
+
+function spanCharLen(spans: InlineSpanView[]): number {
+  let len = 0;
+  for (const s of spans) {
+    len += s.text.length;
+  }
+  return len;
+}
+
+function estimateRichBlockHeight(block: RichBlockView): number {
+  switch (block.kind) {
+    case "code_block":
+      return Math.min(1400, Math.max(84, block.lines.length * 21 + 52));
+    case "table":
+      return Math.min(1200, Math.max(96, (block.rows.length + 1) * 38 + 24));
+    case "heading":
+      return 42;
+    case "list_item":
+      return Math.max(28, Math.ceil(spanCharLen(block.spans) / 68) * 24 + 8);
+    case "paragraph":
+      return Math.max(34, Math.ceil(spanCharLen(block.spans) / 72) * 25 + 14);
+    case "block_quote":
+      return Math.max(44, Math.ceil(spanCharLen(block.spans) / 66) * 24 + 16);
+    case "horizontal_rule":
+      return 28;
+  }
+}
+
+function estimateTurnSizeFallback(turn: StageTurnView | undefined): number {
+  if (!turn) return 180;
+  let est = 24;
+  if (turn.user_prompt?.item_type === "user_prompt") {
+    const promptLen = turn.user_prompt.text?.length ?? 0;
+    const badges = turn.user_prompt.badges ?? [];
+    const imageCount = badges.filter((b) => b.kind === "image").length;
+    const otherBadgeCount = badges.length - imageCount;
+    est =
+      56 +
+      Math.min(124, Math.ceil(promptLen / 56) * 24) +
+      (otherBadgeCount > 0 ? 28 : 0) +
+      (imageCount > 0 ? Math.min(204, Math.ceil(imageCount / 5) * 102) : 0);
+  }
+  for (const seg of turn.live_segments) {
+    if (seg.kind === "assistant_message" && seg.item.item_type === "assistant_message") {
+      if (seg.item.blocks.length === 0) {
+        est += 48;
+      } else {
+        let blockSum = 16;
+        for (const block of seg.item.blocks) {
+          blockSum += estimateRichBlockHeight(block);
+        }
+        est += blockSum;
+      }
+    } else if (seg.kind === "step_group") {
+      est += 34;
+    } else {
+      est += 44;
+    }
+  }
+  if (turn.turn_diffs.length > 0) est += 38;
+  return Math.max(72, Math.min(5600, est));
+}
+
+interface ScrollVelocityState {
+  offset: number;
+  ts: number;
+  dir: "up" | "down" | null;
+  fast: boolean;
+  wasScrolling: boolean;
+}
+
+const VirtualizedTurnList = memo(function VirtualizedTurnList({
+  selectedHostId,
+  selectedAgentId,
+  stageTurns,
+  isLatestTurnActive,
+  baselineMaxSeq,
+  isNetworkOffline,
+  autoFoldCompleted,
+  effectiveCwd,
+  stageMaxContentWidthPx,
+  scrollRef,
+  stickToBottomRef,
+  holdActiveRef,
+  virtualizerRef,
+  turnTimingsRef,
+  thinkingTimingsRef,
+  getThinkingDurationMs,
+  holdViewport,
+  onRequestRewind,
+  onPreviewImage,
+}: {
+  selectedHostId: string;
+  selectedAgentId: string;
+  stageTurns: StageTurnView[];
+  isLatestTurnActive: boolean;
+  baselineMaxSeq: number;
+  isNetworkOffline: boolean;
+  autoFoldCompleted: boolean;
+  effectiveCwd: string;
+  stageMaxContentWidthPx: number | null;
+  scrollRef: React.RefObject<HTMLDivElement | null>;
+  stickToBottomRef: React.RefObject<boolean>;
+  holdActiveRef: React.RefObject<boolean>;
+  virtualizerRef: React.MutableRefObject<ReactVirtualizer<HTMLDivElement, HTMLDivElement> | null>;
+  turnTimingsRef: React.RefObject<Record<string, TurnTimingRecord>>;
+  thinkingTimingsRef: React.RefObject<Record<string, TurnTimingRecord>>;
+  getThinkingDurationMs: ThinkingDurationLookupFn;
+  holdViewport: ViewportAnchorHoldFn;
+  onRequestRewind: (seq: number, promptText: string) => void;
+  onPreviewImage: (img: PromptImagePreviewTarget) => void;
+}) {
+  const widthBucket = stageMaxContentWidthPx ? Math.round(stageMaxContentWidthPx / 32) : 24;
+  const selectionTurnsRef = useRef<number[]>([]);
+  const warmKeysRef = useRef<Set<string>>(new Set());
+  const [warmRevision, setWarmRevision] = useState(0);
+  const scrollVelocityRef = useRef<ScrollVelocityState>({
+    offset: 0,
+    ts: 0,
+    dir: null,
+    fast: false,
+    wasScrolling: false,
+  });
+  const localVirtualizerRef = useRef<ReactVirtualizer<HTMLDivElement, HTMLDivElement> | null>(null);
+
+  const turnsRef = useRef(stageTurns);
+  turnsRef.current = stageTurns;
+  const activeRef = useRef(isLatestTurnActive);
+  activeRef.current = isLatestTurnActive;
+
+  useEffect(() => {
+    const onSelectionChange = () => {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+        selectionTurnsRef.current = [];
+        return;
+      }
+      const getTurnIndex = (node: Node | null): number | null => {
+        const el =
+          node instanceof Element ? node : (node?.parentElement ?? null);
+        const host = el?.closest<HTMLElement>("[data-orbit-turn-index]");
+        if (!host) return null;
+        const parsed = Number.parseInt(host.dataset.orbitTurnIndex ?? "", 10);
+        return Number.isNaN(parsed) ? null : parsed;
+      };
+      const aIdx = getTurnIndex(sel.anchorNode);
+      const fIdx = getTurnIndex(sel.focusNode);
+      const pins: number[] = [];
+      if (aIdx !== null && fIdx !== null) {
+        const lo = Math.min(aIdx, fIdx);
+        const hi = Math.max(aIdx, fIdx);
+        if (hi - lo <= 8) {
+          for (let k = lo; k <= hi; k += 1) pins.push(k);
+        } else {
+          pins.push(aIdx, fIdx);
+        }
+      } else {
+        if (aIdx !== null) pins.push(aIdx);
+        if (fIdx !== null && fIdx !== aIdx) pins.push(fIdx);
+      }
+      selectionTurnsRef.current = pins;
+    };
+    document.addEventListener("selectionchange", onSelectionChange);
+    return () => document.removeEventListener("selectionchange", onSelectionChange);
+  }, []);
+
+  const readScrollVelocity = useCallback(
+    (v: Virtualizer<HTMLDivElement, HTMLDivElement> | null): ScrollVelocityState => {
+      const prev = scrollVelocityRef.current;
+      if (!v) return prev;
+      const offset = v.scrollOffset ?? 0;
+      const isScrolling = Boolean(v.isScrolling);
+      if (offset === prev.offset && isScrolling === prev.wasScrolling) {
+        return prev;
+      }
+
+      const now = performance.now();
+      const dt = now - prev.ts;
+      const delta = offset - prev.offset;
+      let dir = prev.dir;
+      let fast = prev.fast;
+
+      if (!isScrolling) {
+        dir = null;
+        fast = false;
+      } else if (Math.abs(delta) > 0.5) {
+        dir = delta < 0 ? "up" : "down";
+        if (dt >= 2 && dt <= 250) {
+          const speed = (Math.abs(delta) * 1000) / dt;
+          fast = speed >= FAST_FLICK_PX_PER_SEC;
+        } else if (dt > 250) {
+          fast = false;
+        }
+      }
+
+      const next: ScrollVelocityState = {
+        offset,
+        ts: now,
+        dir,
+        fast,
+        wasScrolling: isScrolling,
+      };
+      scrollVelocityRef.current = next;
+      return next;
+    },
+    [],
+  );
+
+  const rangeExtractor = useCallback(
+    (range: Range): number[] => {
+      const turns = turnsRef.current;
+      const total = turns.length;
+      if (total === 0) {
+        warmKeysRef.current.clear();
+        return [];
+      }
+
+      const v = localVirtualizerRef.current;
+      const measurements = v?.measurementsCache;
+      const isScrolling = Boolean(v?.isScrolling);
+      const vel = readScrollVelocity(v);
+
+      let upBudgetPx = IDLE_LOOKAHEAD_UP_PX;
+      let downBudgetPx = IDLE_LOOKAHEAD_DOWN_PX;
+      if (vel.dir === "up") {
+        upBudgetPx = vel.fast ? SCROLL_FAST_LEADING_PX : SCROLL_LEADING_PX;
+        downBudgetPx = SCROLL_TRAILING_PX;
+      } else if (vel.dir === "down") {
+        upBudgetPx = SCROLL_TRAILING_PX;
+        downBudgetPx = vel.fast ? SCROLL_FAST_LEADING_PX : SCROLL_LEADING_PX;
+      }
+
+      const clampedStart = Math.max(0, Math.min(range.startIndex, total - 1));
+      const clampedEnd = Math.max(clampedStart, Math.min(range.endIndex, total - 1));
+
+      let windowStart = clampedStart;
+      let accUp = 0;
+      while (
+        windowStart > 0 &&
+        accUp < upBudgetPx &&
+        clampedStart - windowStart < MAX_OVERSCAN_ITEMS_PER_SIDE
+      ) {
+        const prevIdx = windowStart - 1;
+        const size = measurements?.[prevIdx]?.size ?? estimateTurnSizeFallback(turns[prevIdx]);
+        accUp += size + TURN_LIST_GAP_PX;
+        windowStart = prevIdx;
+      }
+
+      let windowEnd = clampedEnd;
+      let accDown = 0;
+      while (
+        windowEnd < total - 1 &&
+        accDown < downBudgetPx &&
+        windowEnd - clampedEnd < MAX_OVERSCAN_ITEMS_PER_SIDE
+      ) {
+        const nextIdx = windowEnd + 1;
+        const size = measurements?.[nextIdx]?.size ?? estimateTurnSizeFallback(turns[nextIdx]);
+        accDown += size + TURN_LIST_GAP_PX;
+        windowEnd = nextIdx;
+      }
+
+      const activeSet = new Set<number>();
+      for (let i = windowStart; i <= windowEnd; i += 1) {
+        activeSet.add(i);
+      }
+      if (activeRef.current) {
+        activeSet.add(total - 1);
+      }
+      for (const idx of selectionTurnsRef.current) {
+        if (idx >= 0 && idx < total) {
+          activeSet.add(idx);
+        }
+      }
+
+      const prevWarmKeys = warmKeysRef.current;
+      const nextWarmKeys = new Set<string>();
+      const merged = new Set<number>(activeSet);
+      for (const idx of activeSet) {
+        nextWarmKeys.add(turns[idx].key);
+      }
+      if (prevWarmKeys.size > 0) {
+        for (let i = 0; i < total; i += 1) {
+          const key = turns[i].key;
+          if (prevWarmKeys.has(key)) {
+            merged.add(i);
+            nextWarmKeys.add(key);
+          }
+        }
+      }
+
+      const cap = isScrolling ? WARM_SCROLLING_CAP : WARM_RESTING_CAP;
+      if (merged.size > cap) {
+        const center = (clampedStart + clampedEnd) * 0.5;
+        const evictable: number[] = [];
+        for (const idx of merged) {
+          if (!activeSet.has(idx)) {
+            evictable.push(idx);
+          }
+        }
+        evictable.sort((a, b) => Math.abs(b - center) - Math.abs(a - center));
+        for (const idx of evictable) {
+          if (merged.size <= cap) break;
+          merged.delete(idx);
+          nextWarmKeys.delete(turns[idx].key);
+        }
+      }
+
+      warmKeysRef.current = nextWarmKeys;
+      return Array.from(merged).sort((a, b) => a - b);
+    },
+    [readScrollVelocity, warmRevision],
+  );
+
+  const getItemKey = useCallback(
+    (index: number) => turnsRef.current[index]?.key ?? index,
+    [],
+  );
+
+  const estimateSize = useCallback(
+    (index: number) => {
+      const turn = turnsRef.current[index];
+      if (!turn) return 180;
+      const cached = getCachedTurnHeight(`${selectedAgentId}::${turn.key}::${widthBucket}`);
+      return cached ?? estimateTurnSizeFallback(turn);
+    },
+    [selectedAgentId, widthBucket],
+  );
+
+  const handleVirtualizerChange = useCallback(
+    (instance: Virtualizer<HTMLDivElement, HTMLDivElement>) => {
+      const wasScrolling = scrollVelocityRef.current.wasScrolling;
+      readScrollVelocity(instance);
+      if (wasScrolling && !instance.isScrolling && warmKeysRef.current.size > WARM_RESTING_CAP) {
+        setWarmRevision((n) => n + 1);
+      }
+    },
+    [readScrollVelocity],
+  );
+
+  const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
+    count: stageTurns.length,
+    getScrollElement: () => scrollRef.current,
+    getItemKey,
+    estimateSize,
+    rangeExtractor,
+    onChange: handleVirtualizerChange,
+    gap: TURN_LIST_GAP_PX,
+    overscan: 0,
+    useScrollendEvent: true,
+    directDomUpdates: true,
+  });
+
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
+    if (holdActiveRef.current) {
+      return false;
+    }
+    const scrollOffset = instance.scrollOffset ?? 0;
+    if (stickToBottomRef.current) {
+      return item.end <= scrollOffset;
+    }
+    const key = String(item.key);
+    const alreadyMeasured = instance.itemSizeCache.has(key);
+    return alreadyMeasured ? item.end <= scrollOffset : item.start < scrollOffset;
+  };
+
+  localVirtualizerRef.current = virtualizer;
+  virtualizerRef.current = virtualizer;
+  useEffect(() => {
+    return () => {
+      if (localVirtualizerRef.current === virtualizer) {
+        localVirtualizerRef.current = null;
+      }
+      if (virtualizerRef.current === virtualizer) {
+        virtualizerRef.current = null;
+      }
+    };
+  }, [virtualizer, virtualizerRef]);
+
+  // Gently pre-warm offscreen preceding turns during idle time (never while streaming or scrolling)
+  useEffect(() => {
+    if (isLatestTurnActive || stageTurns.length <= 2) return;
+
+    let cancelled = false;
+    let initialTimer: number | null = null;
+    let fallbackTimer: number | null = null;
+    let idleHandle: number | null = null;
+
+    const scheduleStep = () => {
+      if (cancelled) return;
+      if (typeof window.requestIdleCallback === "function") {
+        idleHandle = window.requestIdleCallback(runStep, { timeout: 180 });
+      } else {
+        fallbackTimer = window.setTimeout(runStep, 48);
+      }
+    };
+
+    const runStep = () => {
+      idleHandle = null;
+      fallbackTimer = null;
+      if (cancelled) return;
+
+      if (localVirtualizerRef.current?.isScrolling) {
+        scheduleStep();
+        return;
+      }
+
+      const turns = turnsRef.current;
+      const warm = warmKeysRef.current;
+      if (turns.length === 0 || warm.size >= WARM_RESTING_CAP) {
+        return;
+      }
+
+      let lowestMounted = turns.length;
+      for (let i = 0; i < turns.length; i += 1) {
+        if (warm.has(turns[i].key)) {
+          lowestMounted = i;
+          break;
+        }
+      }
+
+      let added = 0;
+      for (
+        let idx = lowestMounted - 1;
+        idx >= 0 && added < IDLE_PREWARM_BATCH && warm.size < WARM_RESTING_CAP;
+        idx -= 1
+      ) {
+        const key = turns[idx].key;
+        if (!warm.has(key)) {
+          warm.add(key);
+          added += 1;
+        }
+      }
+
+      if (added > 0) {
+        setWarmRevision((n) => n + 1);
+        if (warm.size < WARM_RESTING_CAP) {
+          scheduleStep();
+        }
+      }
+    };
+
+    initialTimer = window.setTimeout(scheduleStep, 220);
+
+    return () => {
+      cancelled = true;
+      if (initialTimer !== null) window.clearTimeout(initialTimer);
+      if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
+      if (idleHandle !== null && typeof window.cancelIdleCallback === "function") {
+        window.cancelIdleCallback(idleHandle);
+      }
+    };
+  }, [selectedAgentId, stageTurns.length, isLatestTurnActive]);
+
+  const measureTurnNode = useCallback(
+    (el: HTMLDivElement | null) => {
+      virtualizer.measureElement(el);
+      if (el) {
+        const idxAttr = el.getAttribute("data-index");
+        const idx = idxAttr ? Number.parseInt(idxAttr, 10) : -1;
+        const turn = idx >= 0 ? turnsRef.current[idx] : undefined;
+        const cachedSize = turn ? virtualizer.itemSizeCache.get(turn.key) : undefined;
+        if (turn && cachedSize && cachedSize > 0) {
+          setCachedTurnHeight(`${selectedAgentId}::${turn.key}::${widthBucket}`, cachedSize);
+        }
+      }
+    },
+    [virtualizer, selectedAgentId, widthBucket],
+  );
+
+  const virtualItems = virtualizer.getVirtualItems();
+
+  return (
+    <div ref={virtualizer.containerRef} className="relative w-full min-w-0">
+      {virtualItems.map((vItem) => {
+        const turn = stageTurns[vItem.index];
+        if (!turn) return null;
+        const isLast = vItem.index === stageTurns.length - 1;
+        const turnActive = isLast && isLatestTurnActive;
+        const isFreshLivePrompt =
+          turn.user_prompt?.item_type === "user_prompt" &&
+          turn.user_prompt.seq > baselineMaxSeq;
+        const timing = turnTimingsRef.current[`${selectedAgentId}::${turn.key}`];
+        const thinkingSignature = buildTurnThinkingSignature(
+          turn,
+          selectedAgentId,
+          thinkingTimingsRef.current,
+        );
+
+        return (
+          <div
+            key={vItem.key}
+            data-index={vItem.index}
+            data-orbit-turn-index={vItem.index}
+            ref={measureTurnNode}
+            className="absolute top-0 left-0 w-full min-w-0"
+          >
+            <TurnStageSection
+              turn={turn}
+              isTurnActive={turnActive}
+              isNetworkOffline={isNetworkOffline}
+              animatePromptEntrance={isFreshLivePrompt}
+              autoFoldCompleted={autoFoldCompleted}
+              hostId={selectedHostId}
+              cwd={effectiveCwd}
+              agentId={selectedAgentId}
+              timing={timing}
+              thinkingSignature={thinkingSignature}
+              getThinkingDurationMs={getThinkingDurationMs}
+              holdViewport={holdViewport}
+              onRequestRewind={onRequestRewind}
+              onPreviewImage={onPreviewImage}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
 export function StreamStage() {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
@@ -2141,14 +3287,25 @@ export function StreamStage() {
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const sessionScrollNonce = useOrbitSelector((s) => s.sessionScrollNonce);
   const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
-  const overviewDesktopOpenPref = useOrbitSelector((s) => s.overviewDesktopOpenPref);
   const isNetworkOffline = useOrbitSelector((s) => s.isBrowserOffline);
+  const {
+    canDockOverview,
+    isStageWide,
+    dockedOverviewLayout,
+    stageShiftPx,
+    stageTransition,
+    stageMaxContentWidthPx,
+    outlineOffsetPx,
+    outlineTransition,
+    isAnimating,
+    onStageTransitionEnd,
+  } = useWorkspaceMotion();
   const hostDetail = useOrbitSelector((s) =>
     s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
   );
-  const cachedTimeline = useOrbitSelector((s) =>
+  const stageView = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
-      ? (s.timelines[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
+      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
       : null,
   );
   const wasSessionRewound = useOrbitSelector((s) =>
@@ -2161,14 +3318,22 @@ export function StreamStage() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const composerShelfRef = useRef<HTMLDivElement | null>(null);
+  const virtualizerRef = useRef<ReactVirtualizer<HTMLDivElement, HTMLDivElement> | null>(null);
   const prevComposerHeightRef = useRef<number>(0);
   const lastObservedScrollTopRef = useRef<number>(0);
   const stickToBottomRef = useRef<boolean>(true);
+  const holdActiveRef = useRef<boolean>(false);
   const programmaticScrollRef = useRef<boolean>(false);
   const programmaticScrollTimerRef = useRef<number | null>(null);
   const scrollRafRef = useRef<number | null>(null);
+  const bottomSyncRafRef = useRef<number | null>(null);
   const lastOutlineSyncAtRef = useRef<number>(0);
-  const turnElementMapRef = useRef<Map<number, HTMLDivElement>>(new Map());
+  const scrollUiStoreRef = useRef<StageScrollUiStore | null>(null);
+  if (scrollUiStoreRef.current === null) {
+    scrollUiStoreRef.current = createStageScrollUiStore();
+  }
+  const scrollUiStore = scrollUiStoreRef.current;
+
   const turnTimingsRef = useRef<Record<string, TurnTimingRecord>>({});
   const thinkingTimingsRef = useRef<Record<string, TurnTimingRecord>>({});
   const mountedBaselineRef = useRef<{ agentId: string | null; maxSeq: number }>({
@@ -2176,15 +3341,14 @@ export function StreamStage() {
     maxSeq: 0,
   });
 
-  const [isOccludingText, setIsOccludingText] = useState(false);
-  const [showJumpLatest, setShowJumpLatest] = useState(false);
-  const [stageWidth, setStageWidth] = useState(0);
-  const [canDockOverview, setCanDockOverview] = useState(false);
-  const canDockOverviewRef = useRef(false);
-  const [activePromptSeq, setActivePromptSeq] = useState<number | null>(null);
+  const isStageWideRef = useRef(isStageWide);
+  isStageWideRef.current = isStageWide;
   const [, setTimingTick] = useState(0);
   const [rewindTarget, setRewindTarget] = useState<RewindRequestTarget | null>(null);
   const [rewindSubmitting, setRewindSubmitting] = useState(false);
+  const [imagePreviewTarget, setImagePreviewTarget] =
+    useState<PromptImagePreviewTarget | null>(null);
+  const handleCloseImagePreview = useCallback(() => setImagePreviewTarget(null), []);
 
   const getThinkingDurationMs = useCallback<ThinkingDurationLookupFn>((thinkKey) => {
     return thinkingTimingsRef.current[thinkKey]?.durationMs ?? null;
@@ -2193,24 +3357,35 @@ export function StreamStage() {
   const currentAgent = useMemo(
     () =>
       hostDetail?.agents.find((a) => a.agent_id === selectedAgentId) ??
-      cachedTimeline?.agent ??
+      stageView?.agent ??
       null,
-    [hostDetail, selectedAgentId, cachedTimeline?.agent],
+    [hostDetail, selectedAgentId, stageView?.agent],
   );
   const isAgentRunning = Boolean(currentAgent?.is_running);
 
-  const stage = useMemo(
+  const stageTurns = stageView?.turns ?? EMPTY_TURNS;
+  const pendingPermissions = useMemo(
     () =>
-      processTimelineForStage(
-        cachedTimeline?.items ?? EMPTY_TIMELINE_ITEMS,
-        coalesceExploration,
+      (stageView?.pending_permissions ?? EMPTY_TIMELINE_ITEMS).filter(
+        (it): it is Extract<TimelineItemView, { item_type: "permission_request" }> =>
+          it.item_type === "permission_request",
       ),
-    [cachedTimeline?.items, coalesceExploration],
+    [stageView?.pending_permissions],
   );
+  const pendingQuestions = useMemo(
+    () =>
+      (stageView?.pending_questions ?? EMPTY_TIMELINE_ITEMS).filter(
+        (it): it is Extract<TimelineItemView, { item_type: "question_request" }> =>
+          it.item_type === "question_request",
+      ),
+    [stageView?.pending_questions],
+  );
+  const sessionTurnDiffs = stageView?.session_turn_diffs ?? EMPTY_DIFF_FILES;
+  const stageInsights = stageView?.insights ?? EMPTY_INSIGHTS;
 
-  const latestTurn = stage.turns[stage.turns.length - 1] ?? null;
+  const latestTurn = stageTurns[stageTurns.length - 1] ?? null;
   const isLatestTurnActive = Boolean(
-    latestTurn && (isAgentRunning || latestTurn.hasActiveItem),
+    latestTurn && (isAgentRunning || latestTurn.has_active_item),
   );
 
   // Record live turn & per-thinking-block start/completion durations for the active session
@@ -2222,8 +3397,8 @@ export function StreamStage() {
     const timingKey = `${selectedAgentId}::${latestTurn.key}`;
     const existing = turnTimingsRef.current[timingKey];
     const seededStartMs =
-      latestTurn.startedAtMs !== null && latestTurn.startedAtMs <= now
-        ? latestTurn.startedAtMs
+      latestTurn.started_at_ms !== null && latestTurn.started_at_ms <= now
+        ? latestTurn.started_at_ms
         : now;
 
     if (isLatestTurnActive) {
@@ -2235,13 +3410,13 @@ export function StreamStage() {
           workDurationMs: null,
         };
         changed = true;
-      } else if (latestTurn.terminalReply !== null && existing.workDurationMs === null) {
+      } else if (latestTurn.terminal_reply !== null && existing.workDurationMs === null) {
         turnTimingsRef.current[timingKey] = {
           ...existing,
           workDurationMs: Math.max(0, now - existing.startedAtMs),
         };
         changed = true;
-      } else if (latestTurn.terminalReply === null && existing.workDurationMs !== null) {
+      } else if (latestTurn.terminal_reply === null && existing.workDurationMs !== null) {
         turnTimingsRef.current[timingKey] = {
           ...existing,
           workDurationMs: null,
@@ -2259,116 +3434,91 @@ export function StreamStage() {
       changed = true;
     }
 
-    const rawItems = cachedTimeline?.items ?? EMPTY_TIMELINE_ITEMS;
-    const lastRawItem = rawItems[rawItems.length - 1] ?? null;
+    const lastSeg = latestTurn.live_segments[latestTurn.live_segments.length - 1] ?? null;
+    const lastSegItem =
+      lastSeg?.kind === "step_group" ? (lastSeg.items[lastSeg.items.length - 1] ?? null) : null;
 
-    for (let idx = rawItems.length - 1; idx >= 0; idx -= 1) {
-      const item = rawItems[idx];
-      if (item.seq < latestTurn.anchorSeq) break;
-      if (item.item_type !== "assistant_thinking") continue;
+    for (const seg of latestTurn.live_segments) {
+      if (seg.kind !== "step_group") continue;
+      for (const item of seg.items) {
+        if (item.item_type !== "assistant_thinking") continue;
 
-      const thinkKey = `${selectedAgentId}::think::${item.item_id || item.seq}`;
-      const isCurrentlyThinking =
-        isLatestTurnActive && lastRawItem?.seq === item.seq;
-      const prevThink = thinkingTimingsRef.current[thinkKey];
+        const thinkKey = `${selectedAgentId}::think::${item.item_id || item.seq}`;
+        const isCurrentlyThinking =
+          isLatestTurnActive &&
+          lastSegItem?.item_type === "assistant_thinking" &&
+          lastSegItem.seq === item.seq;
+        const prevThink = thinkingTimingsRef.current[thinkKey];
 
-      if (isCurrentlyThinking) {
-        if (!prevThink) {
+        if (isCurrentlyThinking) {
+          if (!prevThink) {
+            thinkingTimingsRef.current[thinkKey] = {
+              startedAtMs: now,
+              completedAtMs: null,
+              durationMs: null,
+              workDurationMs: null,
+            };
+            changed = true;
+          }
+        } else if (prevThink && prevThink.completedAtMs === null) {
           thinkingTimingsRef.current[thinkKey] = {
-            startedAtMs: now,
-            completedAtMs: null,
-            durationMs: null,
+            ...prevThink,
+            completedAtMs: now,
+            durationMs: Math.max(0, now - prevThink.startedAtMs),
             workDurationMs: null,
           };
           changed = true;
         }
-      } else if (prevThink && prevThink.completedAtMs === null) {
-        thinkingTimingsRef.current[thinkKey] = {
-          ...prevThink,
-          completedAtMs: now,
-          durationMs: Math.max(0, now - prevThink.startedAtMs),
-          workDurationMs: null,
-        };
-        changed = true;
       }
     }
 
     if (changed) {
       setTimingTick((n) => n + 1);
     }
-  }, [selectedAgentId, latestTurn, isLatestTurnActive, cachedTimeline?.items]);
+  }, [selectedAgentId, latestTurn, isLatestTurnActive]);
 
-  // Hysteresis-guarded ResizeObserver for Stage Overview docking (`>= 1040px` dock, `< 1000px` collapse)
-  // and unified stage width tracking for the peripheral outline rail.
-  // Synchronous `useLayoutEffect` prevents first-paint layout shift when entering an active session.
-  useLayoutEffect(() => {
-    const stageEl = stageContainerRef.current;
-    if (!stageEl || typeof ResizeObserver === "undefined") {
-      orbitActions.setStageCanDockOverview(false);
-      return;
-    }
-
-    const syncStageWidth = (w: number) => {
-      setStageWidth((prev) => (Math.abs(prev - w) < 0.5 ? prev : w));
-      const nextCanDock = canDockOverviewRef.current ? w >= 1000 : w >= 1040;
-      if (nextCanDock !== canDockOverviewRef.current) {
-        canDockOverviewRef.current = nextCanDock;
-        setCanDockOverview(nextCanDock);
-        orbitActions.setStageCanDockOverview(nextCanDock);
-      }
-    };
-
-    const initialW = stageEl.getBoundingClientRect().width;
-    const initialDock = initialW >= 1040;
-    setStageWidth(initialW);
-    canDockOverviewRef.current = initialDock;
-    setCanDockOverview(initialDock);
-    orbitActions.setStageCanDockOverview(initialDock);
-
-    const roStage = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width ?? 0;
-      syncStageWidth(w);
-    });
-    roStage.observe(stageEl);
-
-    return () => {
-      roStage.disconnect();
-    };
-  }, [isDraft, selectedAgentId]);
-
-  const isOverviewDockedVisible = canDockOverview && overviewDesktopOpenPref;
-  const isStageWide = stageWidth - (isOverviewDockedVisible ? 324 : 0) >= 820;
-
-  const outlinePrompts = useMemo(
-    () =>
-      stage.turns
-        .filter((t) => t.userPrompt && !t.isCompactionCommand)
-        .map((t) => {
-          const pres = extractUserPromptPresentation(t.userPrompt!);
-          const summary =
-            pres.cleanText || pres.badges.map((b) => b.label).join(" ") || "Prompt";
-          return {
-            seq: t.anchorSeq,
-            preview: summary.replace(/\s+/g, " ").trim().slice(0, 110),
-          };
-        }),
-    [stage.turns],
+  const stagePushStyle = useMemo<CSSProperties>(
+    () => ({
+      transform: stageShiftPx !== 0 ? `translate3d(${stageShiftPx}px, 0, 0)` : undefined,
+      transition: stageTransition,
+      willChange: isAnimating ? "transform" : undefined,
+    }),
+    [stageShiftPx, stageTransition, isAnimating],
   );
+
+  const outlinePrompts = useMemo<OutlinePromptWithIndex[]>(() => {
+    const out: OutlinePromptWithIndex[] = [];
+    for (let turnIndex = 0; turnIndex < stageTurns.length; turnIndex += 1) {
+      const t = stageTurns[turnIndex];
+      if (t.user_prompt?.item_type === "user_prompt" && !t.is_compaction_command) {
+        const promptItem = t.user_prompt as Extract<TimelineItemView, { item_type: "user_prompt" }>;
+        const pres = extractUserPromptPresentation(promptItem);
+        const summary =
+          pres.cleanText || pres.badges.map((b) => b.label).join(" ") || "Prompt";
+        out.push({
+          seq: t.anchor_seq,
+          turnIndex,
+          preview: summary.replace(/\s+/g, " ").trim().slice(0, 110),
+        });
+      }
+    }
+    return out;
+  }, [stageTurns]);
 
   // Refs for `syncScrollMetrics` so its callback identity (and `holdViewport`) stays 100% stable forever
   const outlinePromptsRef = useRef(outlinePrompts);
   outlinePromptsRef.current = outlinePrompts;
-  const stageTurnsRef = useRef(stage.turns);
-  stageTurnsRef.current = stage.turns;
-  const turnsCountRef = useRef(stage.turns.length);
-  turnsCountRef.current = stage.turns.length;
+  const stageTurnsRef = useRef(stageTurns);
+  stageTurnsRef.current = stageTurns;
+  const turnsCountRef = useRef(stageTurns.length);
+  turnsCountRef.current = stageTurns.length;
 
   const effectiveCwdRef = useRef("");
   effectiveCwdRef.current = selectedCwd || currentAgent?.cwd || "";
 
   const handleRequestRewind = useCallback((seq: number, promptText: string) => {
     const activeCwd = effectiveCwdRef.current;
-    const affected = stageTurnsRef.current.filter((t) => t.anchorSeq >= seq);
+    const affected = stageTurnsRef.current.filter((t) => t.anchor_seq >= seq);
     const byPath = new Map<string, RewindFileEntry>();
 
     const recordFile = (rawPath: string, additions: number, deletions: number) => {
@@ -2391,10 +3541,10 @@ export function StreamStage() {
     };
 
     for (const turn of affected) {
-      for (const diff of turn.turnDiffs) {
+      for (const diff of turn.turn_diffs) {
         if (diff.path) recordFile(diff.path, diff.additions, diff.deletions);
       }
-      for (const seg of turn.liveSegments) {
+      for (const seg of turn.live_segments) {
         if (seg.kind !== "step_group") continue;
         for (const step of seg.items) {
           if (
@@ -2438,8 +3588,6 @@ export function StreamStage() {
     },
     [rewindTarget, selectedHostId, selectedAgentId, rewindSubmitting],
   );
-  const isStageWideRef = useRef(isStageWide);
-  isStageWideRef.current = isStageWide;
 
   useEffect(() => {
     return () => {
@@ -2448,6 +3596,9 @@ export function StreamStage() {
       }
       if (scrollRafRef.current !== null) {
         window.cancelAnimationFrame(scrollRafRef.current);
+      }
+      if (bottomSyncRafRef.current !== null) {
+        window.cancelAnimationFrame(bottomSyncRafRef.current);
       }
     };
   }, []);
@@ -2462,6 +3613,9 @@ export function StreamStage() {
     const distanceFromBottom = Math.max(0, el.scrollHeight - currentTop - el.clientHeight);
     const hasTurns = turnsCountRef.current > 0;
 
+    let nextOccluding = false;
+    let nextJump = false;
+
     if (programmaticScrollRef.current) {
       if (distanceFromBottom < 8) {
         programmaticScrollRef.current = false;
@@ -2471,8 +3625,6 @@ export function StreamStage() {
         }
       }
       stickToBottomRef.current = true;
-      setIsOccludingText((prev) => (prev ? false : prev));
-      setShowJumpLatest((prev) => (prev ? false : prev));
     } else {
       const nearBottom = distanceFromBottom < 36;
       const scrolledUp = currentTop < prevTop - 1.5;
@@ -2482,30 +3634,44 @@ export function StreamStage() {
         stickToBottomRef.current = false;
       }
       const pinned = stickToBottomRef.current;
-      const nextOccluding = !pinned && distanceFromBottom > 4 && hasTurns;
-      const nextJump = !pinned && !nearBottom && hasTurns;
-      setIsOccludingText((prev) => (prev === nextOccluding ? prev : nextOccluding));
-      setShowJumpLatest((prev) => (prev === nextJump ? prev : nextJump));
+      nextOccluding = !pinned && distanceFromBottom > 4 && hasTurns;
+      nextJump = !pinned && !nearBottom && hasTurns;
     }
 
-    // Update active turn in peripheral outline rail strictly when visible (throttled to avoid layout thrash during fast momentum scrolling)
+    // O(log N) binary search over virtualizer offset cache — zero DOM layout reads during scroll
+    let nextActiveSeq = scrollUiStore.getSnapshot().activePromptSeq;
     const prompts = outlinePromptsRef.current;
     if (isStageWideRef.current && prompts.length >= 2) {
       const now = performance.now();
-      if (now - lastOutlineSyncAtRef.current >= 90) {
+      if (now - lastOutlineSyncAtRef.current >= 80) {
         lastOutlineSyncAtRef.current = now;
-        const viewportAnchorY = el.getBoundingClientRect().top + 120;
-        let currentSeq = prompts[0].seq;
-        for (const p of prompts) {
-          const node = turnElementMapRef.current.get(p.seq);
-          if (node && node.getBoundingClientRect().top <= viewportAnchorY) {
-            currentSeq = p.seq;
+        const measurements = virtualizerRef.current?.measurementsCache;
+        const anchorOffset = Math.max(0, currentTop + 96);
+        if (measurements && measurements.length > 0) {
+          let lo = 0;
+          let hi = prompts.length - 1;
+          let best = prompts[0].seq;
+          while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            const m = measurements[prompts[mid].turnIndex];
+            if (!m || m.start <= anchorOffset) {
+              best = prompts[mid].seq;
+              lo = mid + 1;
+            } else {
+              hi = mid - 1;
+            }
           }
+          nextActiveSeq = best;
         }
-        setActivePromptSeq((prev) => (prev === currentSeq ? prev : currentSeq));
       }
     }
-  }, []);
+
+    scrollUiStore.update({
+      isOccludingText: nextOccluding,
+      showJumpLatest: nextJump,
+      activePromptSeq: nextActiveSeq,
+    });
+  }, [scrollUiStore]);
 
   const snapScrollerToBottom = useCallback(() => {
     const el = scrollRef.current;
@@ -2513,6 +3679,17 @@ export function StreamStage() {
     el.scrollTop = el.scrollHeight;
     lastObservedScrollTopRef.current = el.scrollTop;
   }, []);
+
+  const scheduleBottomSync = useCallback(() => {
+    if (bottomSyncRafRef.current !== null) return;
+    bottomSyncRafRef.current = window.requestAnimationFrame(() => {
+      bottomSyncRafRef.current = null;
+      if (stickToBottomRef.current && !programmaticScrollRef.current) {
+        snapScrollerToBottom();
+      }
+      syncScrollMetrics();
+    });
+  }, [snapScrollerToBottom, syncScrollMetrics]);
 
   const handleScroll = useCallback(() => {
     if (scrollRafRef.current !== null) return;
@@ -2542,22 +3719,32 @@ export function StreamStage() {
     return () => el.removeEventListener("wheel", onPassiveWheel);
   }, [isDraft, selectedHostId, selectedAgentId]);
 
-  // Keep conversation bottom anchored cleanly when inner content grows (async timeline load, markdown/code layout, images)
+  // Keep conversation bottom anchored cleanly when virtualized content or viewport height changes
   useEffect(() => {
     const contentEl = contentRef.current;
     const scrollerEl = scrollRef.current;
     if (!contentEl || !scrollerEl || typeof ResizeObserver === "undefined") return;
 
+    let lastScrollHeight = scrollerEl.scrollHeight;
+    let lastClientHeight = scrollerEl.clientHeight;
+
     const ro = new ResizeObserver(() => {
-      if (stickToBottomRef.current && !programmaticScrollRef.current) {
-        snapScrollerToBottom();
+      const sh = scrollerEl.scrollHeight;
+      const ch = scrollerEl.clientHeight;
+      const heightChanged = sh !== lastScrollHeight || ch !== lastClientHeight;
+      lastScrollHeight = sh;
+      lastClientHeight = ch;
+
+      if (heightChanged) {
+        scheduleBottomSync();
+      } else {
+        handleScroll();
       }
-      syncScrollMetrics();
     });
     ro.observe(contentEl);
     ro.observe(scrollerEl);
     return () => ro.disconnect();
-  }, [isDraft, selectedHostId, selectedAgentId, snapScrollerToBottom, syncScrollMetrics]);
+  }, [isDraft, selectedHostId, selectedAgentId, scheduleBottomSync, handleScroll]);
 
   // Keep conversation bottom anchored cleanly above the Composer when the Composer grows (multiline / attachments)
   useEffect(() => {
@@ -2594,8 +3781,7 @@ export function StreamStage() {
     if (!el) return;
     programmaticScrollRef.current = true;
     stickToBottomRef.current = true;
-    setIsOccludingText(false);
-    setShowJumpLatest(false);
+    scrollUiStore.update({ isOccludingText: false, showJumpLatest: false });
 
     if (programmaticScrollTimerRef.current !== null) {
       window.clearTimeout(programmaticScrollTimerRef.current);
@@ -2607,7 +3793,7 @@ export function StreamStage() {
     }, 800);
 
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-  }, [syncScrollMetrics]);
+  }, [scrollUiStore, syncScrollMetrics]);
 
   /**
    * Disclosure Scroll-Anchor Hold:
@@ -2625,12 +3811,16 @@ export function StreamStage() {
       const beforeAnchor = edge === "bottom" ? beforeRect.bottom : beforeRect.top;
       const wasPinnedBottom = stickToBottomRef.current;
       stickToBottomRef.current = false;
+      holdActiveRef.current = true;
 
       apply();
 
       requestAnimationFrame(() => {
         const curScroller = scrollRef.current;
-        if (!curScroller || !triggerEl.isConnected) return;
+        if (!curScroller || !triggerEl.isConnected) {
+          holdActiveRef.current = false;
+          return;
+        }
         const afterRect = triggerEl.getBoundingClientRect();
         const afterAnchor = edge === "bottom" ? afterRect.bottom : afterRect.top;
         const delta = afterAnchor - beforeAnchor;
@@ -2659,32 +3849,25 @@ export function StreamStage() {
           stickToBottomRef.current = dist < 48;
         }
         syncScrollMetrics();
+        requestAnimationFrame(() => {
+          holdActiveRef.current = false;
+        });
       });
     },
     [syncScrollMetrics],
   );
 
-  const registerTurnEl = useCallback((seq: number, el: HTMLDivElement | null) => {
-    if (el) {
-      turnElementMapRef.current.set(seq, el);
-    } else {
-      turnElementMapRef.current.delete(seq);
-    }
-  }, []);
-
-  const jumpToPromptSeq = useCallback((seq: number) => {
-    const scroller = scrollRef.current;
-    const target = turnElementMapRef.current.get(seq);
-    if (!scroller || !target) return;
-    stickToBottomRef.current = false;
-    setActivePromptSeq(seq);
-    const offsetTop =
-      target.getBoundingClientRect().top -
-      scroller.getBoundingClientRect().top +
-      scroller.scrollTop -
-      16;
-    scroller.scrollTo({ top: Math.max(0, offsetTop), behavior: "smooth" });
-  }, []);
+  const jumpToPromptSeq = useCallback(
+    (seq: number) => {
+      const entry = outlinePromptsRef.current.find((p) => p.seq === seq);
+      const v = virtualizerRef.current;
+      if (!entry || !v) return;
+      stickToBottomRef.current = false;
+      scrollUiStore.update({ activePromptSeq: seq });
+      v.scrollToIndex(entry.turnIndex, { align: "start", behavior: "smooth" });
+    },
+    [scrollUiStore],
+  );
 
   const activeSessionScope =
     !isDraft && selectedHostId && selectedAgentId
@@ -2699,28 +3882,35 @@ export function StreamStage() {
       programmaticScrollTimerRef.current = null;
     }
     programmaticScrollRef.current = false;
+    holdActiveRef.current = false;
     stickToBottomRef.current = true;
     lastObservedScrollTopRef.current = 0;
-    setIsOccludingText(false);
-    setShowJumpLatest(false);
-    setActivePromptSeq(null);
+    scrollUiStore.update({
+      isOccludingText: false,
+      showJumpLatest: false,
+      activePromptSeq: null,
+    });
     setRewindTarget(null);
+    if (turnsCountRef.current > 0) {
+      virtualizerRef.current?.scrollToIndex(turnsCountRef.current - 1, { align: "end" });
+    }
     snapScrollerToBottom();
-  }, [activeSessionScope, sessionScrollNonce, snapScrollerToBottom]);
+    scheduleBottomSync();
+  }, [activeSessionScope, sessionScrollNonce, scrollUiStore, snapScrollerToBottom, scheduleBottomSync]);
 
-  // Synchronously pin to bottom before paint as timeline items arrive or turns append
+  // Synchronously keep pinned to bottom before paint as timeline items arrive or turns append
   useLayoutEffect(() => {
     if (!activeSessionScope) return;
     if (stickToBottomRef.current && !programmaticScrollRef.current) {
       snapScrollerToBottom();
     }
-    syncScrollMetrics();
+    scheduleBottomSync();
   }, [
     activeSessionScope,
-    cachedTimeline?.latestSeq,
-    stage.turns.length,
+    stageView?.latest_seq,
+    stageTurns.length,
     snapScrollerToBottom,
-    syncScrollMetrics,
+    scheduleBottomSync,
   ]);
 
   if (!selectedHostId) {
@@ -2734,27 +3924,37 @@ export function StreamStage() {
   if (isDraft || !selectedAgentId) {
     mountedBaselineRef.current = { agentId: null, maxSeq: 0 };
     return (
-      <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:h-full">
-        <NewSessionLaunchpad />
+      <ScrollArea
+        className="min-h-0 flex-1"
+        viewportClassName="[&>div]:h-full"
+        style={
+          stageMaxContentWidthPx
+            ? ({ "--orbit-stage-max-w": `${stageMaxContentWidthPx}px` } as CSSProperties)
+            : undefined
+        }
+      >
+        <div className="h-full w-full" style={stagePushStyle}>
+          <NewSessionLaunchpad />
+        </div>
       </ScrollArea>
     );
   }
 
   if (mountedBaselineRef.current.agentId !== selectedAgentId) {
-    const isFreshFirstTurn = stage.turns.length === 1 && isLatestTurnActive;
+    const isFreshFirstTurn = stageTurns.length === 1 && isLatestTurnActive;
     mountedBaselineRef.current = {
       agentId: selectedAgentId,
       maxSeq: isFreshFirstTurn
         ? 0
-        : (cachedTimeline?.latestSeq ?? Number.MAX_SAFE_INTEGER),
+        : (stageView?.latest_seq ?? Number.MAX_SAFE_INTEGER),
     };
   } else if (
-    cachedTimeline &&
-    cachedTimeline.latestSeq < mountedBaselineRef.current.maxSeq
+    stageView &&
+    stageView.latest_seq < mountedBaselineRef.current.maxSeq
   ) {
     mountedBaselineRef.current = {
       agentId: selectedAgentId,
-      maxSeq: cachedTimeline.latestSeq,
+      maxSeq: stageView.latest_seq,
     };
   }
   const baselineMaxSeq = mountedBaselineRef.current.maxSeq;
@@ -2764,13 +3964,22 @@ export function StreamStage() {
   return (
     <div
       ref={stageContainerRef}
+      style={
+        stageMaxContentWidthPx
+          ? ({ "--orbit-stage-max-w": `${stageMaxContentWidthPx}px` } as CSSProperties)
+          : undefined
+      }
       className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
     >
-      {/* Peripheral Megathread Outline Rail (spacious conversation column >= 820px only) */}
-      {isStageWide && outlinePrompts.length >= 2 && (
-        <ChatOutlineRail
+      {/* Peripheral Megathread Outline Rail (real left gutter >= 900px / < 868px) */}
+      {outlinePrompts.length >= 2 && (
+        <StageOutlineRailBridge
+          visible={isStageWide}
+          offsetPx={outlineOffsetPx}
+          offsetTransition={outlineTransition}
+          isAnimating={isAnimating}
+          scrollUiStore={scrollUiStore}
           prompts={outlinePrompts}
-          activeSeq={activePromptSeq ?? outlinePrompts[outlinePrompts.length - 1]?.seq ?? null}
           onJumpToSeq={jumpToPromptSeq}
         />
       )}
@@ -2781,21 +3990,21 @@ export function StreamStage() {
         viewportRef={scrollRef}
         onViewportScroll={handleScroll}
         viewportClassName={cn(
-          "pt-6 pb-11 pl-6 transition-[padding-right]",
-          isOverviewDockedVisible
-            ? "pr-[348px] duration-[240ms] ease-[var(--ease-panel)]"
-            : "pr-6 duration-[200ms] ease-[var(--ease-panel-out)]",
+          "pt-6 pb-11 pl-6",
+          dockedOverviewLayout ? "pr-[348px]" : "pr-6",
         )}
       >
         <div
           key={selectedAgentId}
           ref={contentRef}
-          className="orbit-stage-enter mx-auto w-full max-w-[768px] space-y-8"
+          onTransitionEnd={onStageTransitionEnd}
+          style={stagePushStyle}
+          className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,768px)]"
         >
-          {stage.turns.length === 0 &&
+          {stageTurns.length === 0 &&
             wasSessionRewound &&
-            cachedTimeline !== null &&
-            (cachedTimeline.agent?.latest_seq ?? 0) === 0 &&
+            stageView !== null &&
+            (stageView.agent?.latest_seq ?? 0) === 0 &&
             !isAgentRunning && (
               <div className="text-muted-foreground flex flex-col items-center justify-center py-20 text-center">
                 <RotateCcw className="mb-2.5 size-5 opacity-45" />
@@ -2805,107 +4014,67 @@ export function StreamStage() {
               </div>
             )}
 
-          {stage.turns.map((turn, idx) => {
-            const isLast = idx === stage.turns.length - 1;
-            const turnActive = isLast && isLatestTurnActive;
-            const isFreshLivePrompt =
-              turn.userPrompt !== null && turn.userPrompt.seq > baselineMaxSeq;
-            const timing = turnTimingsRef.current[`${selectedAgentId}::${turn.key}`];
-            const thinkingSignature = buildTurnThinkingSignature(
-              turn,
-              selectedAgentId,
-              thinkingTimingsRef.current,
-            );
-            return (
-              <TurnStageSection
-                key={turn.key}
-                turn={turn}
-                isTurnActive={turnActive}
-                isNetworkOffline={isNetworkOffline}
-                animatePromptEntrance={isFreshLivePrompt}
-                autoFoldCompleted={coalesceExploration}
-                cwd={effectiveCwd}
-                agentId={selectedAgentId}
-                timing={timing}
-                thinkingSignature={thinkingSignature}
-                getThinkingDurationMs={getThinkingDurationMs}
-                holdViewport={holdViewport}
-                registerTurnEl={registerTurnEl}
-                onRequestRewind={handleRequestRewind}
-              />
-            );
-          })}
+          {stageTurns.length > 0 && (
+            <VirtualizedTurnList
+              key={activeSessionScope ?? selectedAgentId}
+              selectedHostId={selectedHostId}
+              selectedAgentId={selectedAgentId}
+              stageTurns={stageTurns}
+              isLatestTurnActive={isLatestTurnActive}
+              baselineMaxSeq={baselineMaxSeq}
+              isNetworkOffline={isNetworkOffline}
+              autoFoldCompleted={coalesceExploration}
+              effectiveCwd={effectiveCwd}
+              stageMaxContentWidthPx={stageMaxContentWidthPx}
+              scrollRef={scrollRef}
+              stickToBottomRef={stickToBottomRef}
+              holdActiveRef={holdActiveRef}
+              virtualizerRef={virtualizerRef}
+              turnTimingsRef={turnTimingsRef}
+              thinkingTimingsRef={thinkingTimingsRef}
+              getThinkingDurationMs={getThinkingDurationMs}
+              holdViewport={holdViewport}
+              onRequestRewind={handleRequestRewind}
+              onPreviewImage={setImagePreviewTarget}
+            />
+          )}
         </div>
       </ScrollArea>
 
       {/* 2. Docked Composer Shelf — normal flex sibling below scrollRef (scrollbar never enters here) */}
       <div ref={composerShelfRef} className="bg-canvas relative z-20 shrink-0">
         {/* Upward Occlusion Fade & `38×38` [↓] Button */}
-        <div className="pointer-events-none absolute inset-x-0 bottom-full h-7">
-          <div
-            className={cn(
-              "h-full w-full transition-opacity duration-150",
-              isOccludingText ? "opacity-100" : "opacity-0",
-            )}
-            style={{
-              background:
-                "linear-gradient(to top, var(--surface-canvas) 0%, color-mix(in oklab, var(--surface-canvas) 66%, transparent) 48%, transparent 100%)",
-            }}
-          />
-          <div
-            className={cn(
-              "pointer-events-none absolute inset-y-0 left-0 transition-[right]",
-              isOverviewDockedVisible
-                ? "right-[324px] duration-[240ms] ease-[var(--ease-panel)]"
-                : "right-0 duration-[200ms] ease-[var(--ease-panel-out)]",
-            )}
-          >
-            <button
-              type="button"
-              aria-label="Scroll to latest"
-              aria-hidden={!showJumpLatest}
-              tabIndex={showJumpLatest ? 0 : -1}
-              onClick={scrollToLatest}
-              className={cn(
-                "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute bottom-2 left-1/2 inline-flex size-9.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-all duration-200 ease-[var(--ease-out-expo)] dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
-                showJumpLatest
-                  ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
-                  : "pointer-events-none translate-y-1 scale-95 opacity-0",
-              )}
-            >
-              <ArrowDown className="size-[18px] stroke-[1.9]" />
-            </button>
-          </div>
-        </div>
+        <StageJumpLatestBanner
+          scrollUiStore={scrollUiStore}
+          stagePushStyle={stagePushStyle}
+          dockedOverviewLayout={dockedOverviewLayout}
+          onJumpLatest={scrollToLatest}
+        />
 
-        <div
-          className={cn(
-            "transition-[padding-right]",
-            isOverviewDockedVisible
-              ? "pr-[324px] duration-[240ms] ease-[var(--ease-panel)]"
-              : "pr-0 duration-[200ms] ease-[var(--ease-panel-out)]",
-          )}
-        >
-          <StickyApprovalDock
-            hostId={selectedHostId}
-            agentId={selectedAgentId}
-            cwd={effectiveCwd}
-            permissions={stage.pendingPermissions}
-            questions={stage.pendingQuestions}
-          />
-          <OmniComposer variant="docked" occluding={isOccludingText} />
+        <div className={dockedOverviewLayout ? "pr-[324px]" : "pr-0"}>
+          <div style={stagePushStyle}>
+            <StickyApprovalDock
+              hostId={selectedHostId}
+              agentId={selectedAgentId}
+              cwd={effectiveCwd}
+              permissions={pendingPermissions}
+              questions={pendingQuestions}
+            />
+            <StageDockedComposer scrollUiStore={scrollUiStore} />
+          </div>
         </div>
       </div>
 
-      {/* 3. Top-Right Floating Overview Card Overlay (to the left of the far-right scrollbar) */}
+      {/* 3. Top-Right Viewport-Anchored Overview Card Overlay (to the left of the far-right scrollbar) */}
       <StageOverviewPanel
         canDock={canDockOverview}
         hostId={selectedHostId}
         agentId={selectedAgentId}
         cwd={effectiveCwd}
-        items={cachedTimeline?.items ?? EMPTY_TIMELINE_ITEMS}
-        sessionTurnDiffs={stage.sessionTurnDiffs}
+        insights={stageInsights}
+        sessionTurnDiffs={sessionTurnDiffs}
         currentAgent={currentAgent}
+        stageContainerRef={stageContainerRef}
       />
 
       <RewindTurnDialog
@@ -2916,6 +4085,11 @@ export function StreamStage() {
           if (!open) setRewindTarget(null);
         }}
         onConfirm={(restoreFiles) => void handleConfirmRewind(restoreFiles)}
+      />
+
+      <PromptImageLightbox
+        target={imagePreviewTarget}
+        onClose={handleCloseImagePreview}
       />
     </div>
   );

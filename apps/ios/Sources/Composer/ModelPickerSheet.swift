@@ -129,6 +129,13 @@ struct ModelPickerPopoverView: View {
         let isActiveOnProvider = (effectiveBrowsedProvider == store.selectedProvider)
             && (resolvedSelectedModelIdOnBrowsed?.caseInsensitiveCompare(row.id) == .orderedSame)
         let desired = isActiveOnProvider ? store.selectedEffort : row.defaultEffort
+        if let resolved = store.resolvedModelSelection(
+            provider: effectiveBrowsedProvider,
+            desiredModel: row.id,
+            desiredEffort: desired
+        )?.selectedEffort {
+            return resolved
+        }
         let spec = catalog.models.first(where: { $0.id.caseInsensitiveCompare(row.id) == .orderedSame })
         if let supported = resolveSupportedEffortForModel(
             spec: spec,

@@ -303,7 +303,16 @@ struct RichMarkdownView: View {
                 .padding(.vertical, OrbitSpacing.xs)
 
         case let .codeBlock(language, rawCode, lines):
-            CodeBlockView(language: language, rawCode: rawCode, lines: lines)
+            if let diagramKind = detectDiagramKind(language: language, source: rawCode) {
+                DiagramBlockView(
+                    kind: diagramKind,
+                    language: language,
+                    rawCode: rawCode,
+                    lines: lines
+                )
+            } else {
+                CodeBlockView(language: language, rawCode: rawCode, lines: lines)
+            }
 
         case let .table(tableModel):
             MarkdownTableView(

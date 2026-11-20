@@ -30,6 +30,19 @@ function countSpansLength(spans: InlineSpanView[]): number {
   return len;
 }
 
+function countTableBlockChars(block: Extract<RichBlockView, { kind: "table" }>): number {
+  let total = 0;
+  for (const h of block.headers) {
+    total += countSpansLength(h.spans);
+  }
+  for (const r of block.rows) {
+    for (const c of r.cells) {
+      total += countSpansLength(c.spans);
+    }
+  }
+  return total;
+}
+
 export function countRichBlocksChars(blocks: RichBlockView[]): number {
   let total = 0;
   for (const b of blocks) {
@@ -44,14 +57,7 @@ export function countRichBlocksChars(blocks: RichBlockView[]): number {
         total += b.raw_code.length;
         break;
       case "table":
-        for (const h of b.headers) {
-          total += countSpansLength(h.spans);
-        }
-        for (const r of b.rows) {
-          for (const c of r.cells) {
-            total += countSpansLength(c.spans);
-          }
-        }
+        total += countTableBlockChars(b);
         break;
       case "horizontal_rule":
         total += 1;
@@ -128,6 +134,12 @@ export function sliceRichBlocks(blocks: RichBlockView[], budget: number): RichBl
         break;
       }
       case "table": {
+        const tableLen = countTableBlockChars(block);
+        if (tableLen <= rem) {
+          out.push(block);
+          rem -= tableLen;
+          break;
+        }
         const nextHeaders = block.headers.map((h) => {
           if (rem <= 0) return { spans: [] };
           const len = countSpansLength(h.spans);
@@ -175,18 +187,27 @@ export function sliceRichBlocks(blocks: RichBlockView[], budget: number): RichBl
 /**
  * Paces lumpy network/daemon streaming deltas over a smooth 150ms 60Hz horizon
  * while rendering historical or already-completed messages 100% immediately on first paint.
+ * Optional `resetKey` resets revealed progress when advancing to a newly streamed tail block.
  */
-export function usePacedRichBlocks(blocks: RichBlockView[], streaming = false): RichBlockView[] {
+export function usePacedRichBlocks(
+  blocks: RichBlockView[],
+  streaming = false,
+  resetKey?: string | number,
+): RichBlockView[] {
   const targetChars = useMemo(() => countRichBlocksChars(blocks), [blocks]);
   const [revealedChars, setRevealedChars] = useState<number>(() => targetChars);
   const targetRef = useRef<number>(targetChars);
   const revealedRef = useRef<number>(revealedChars);
+  const prevResetKeyRef = useRef<string | number | undefined>(resetKey);
   const rafIdRef = useRef<number>(0);
   const prevFrameMsRef = useRef<number | null>(null);
 
   targetRef.current = targetChars;
 
   useEffect(() => {
+    const keyChanged = prevResetKeyRef.current !== resetKey;
+    prevResetKeyRef.current = resetKey;
+
     if (!streaming) {
       if (rafIdRef.current !== 0) {
         window.cancelAnimationFrame(rafIdRef.current);
@@ -198,7 +219,10 @@ export function usePacedRichBlocks(blocks: RichBlockView[], streaming = false): 
       return;
     }
 
-    if (targetChars < revealedRef.current) {
+    if (keyChanged && resetKey !== undefined) {
+      revealedRef.current = 0;
+      setRevealedChars(0);
+    } else if (targetChars < revealedRef.current) {
       revealedRef.current = targetChars;
       setRevealedChars(targetChars);
     }
@@ -236,7 +260,7 @@ export function usePacedRichBlocks(blocks: RichBlockView[], streaming = false): 
     };
 
     rafIdRef.current = window.requestAnimationFrame(stepFrame);
-  }, [streaming, targetChars]);
+  }, [streaming, targetChars, resetKey]);
 
   useEffect(() => {
     return () => {

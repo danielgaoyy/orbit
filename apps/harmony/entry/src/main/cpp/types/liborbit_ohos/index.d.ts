@@ -4,13 +4,48 @@ export class OrbitHarmonyCore {
   subscribeEvents(callback: (err: Error | null, payloadJson: string) => void): void;
   discoverLocalDaemonUri(): string | null;
   fleetOverviewJson(): string;
+  bridgeInfoJson(): string;
+  fleetSidebarByRequestJson(reqJson: string): string;
+  agentStageDeltaByRequestJson(reqJson: string): string;
+  createSessionJson(reqJson: string): string;
+  sendPromptJson(reqJson: string): void;
+  updateHostConfigRequestJson(reqJson: string): string;
+  resolveModelSelectionJson(reqJson: string): string;
+  slashCommandsJson(platform?: string | null, query?: string | null): string;
+  composePromptJson(reqJson: string): string;
+  rankMentionCandidatesJson(reqJson: string): string;
   hostDetailJson(hostId: string): string;
   agentStageJson(hostId: string, agentId: string): string;
+  agentStageDeltaJson(hostId: string, agentId: string, sinceRevision: number): string;
+  fleetSidebarJson(
+    sort?: string | null,
+    filter?: string | null,
+    query?: string | null,
+    activeHostId?: string | null,
+    activeAgentId?: string | null,
+    activeCwd?: string | null
+  ): string;
+  markAgentSeen(hostId: string, agentId: string, seq: number): void;
+  markAgentUnread(hostId: string, agentId: string): void;
+  setAgentPinned(hostId: string, agentId: string, pinned: boolean): void;
+  togglePinAgent(hostId: string, agentId: string): boolean;
+  seedThreadPrefsJson(prefsJson: string): void;
+  fallbackProviderCatalogJson(provider: string): string;
+  fallbackProviderCatalogsJson(): string;
+  formatCatalogModelLabel(catalogJson: string, rawModelId?: string | null): string;
+  formatEffortLabel(effort: string): string;
+  defaultEffortDescription(effort: string): string;
+  resolveSupportedEffortForModel(
+    specJson?: string | null,
+    desired?: string | null,
+    catalogDefault?: string | null
+  ): string | null;
   agentTimelineJson(hostId: string, agentId: string): string;
   agentTimelineDeltaJson(hostId: string, agentId: string, sinceSeq: number): string;
   describeToolItemJson(itemJson: string, cwd?: string | null): string | null;
   gitReviewJson(hostId: string, cwd: string, path?: string | null): string;
   terminalScreenJson(hostId: string): string;
+  terminalScreenSlotJson(hostId: string, slot: number): string;
   pairHostJson(pairingUri: string): string;
   removeHost(hostId: string): void;
   updateHostRelay(hostId: string, relayUrl?: string | null): void;
@@ -109,7 +144,23 @@ export class OrbitHarmonyCore {
   attachTerminal(hostId: string, terminalId: string, slot: number): void;
   killTerminal(hostId: string, terminalId: string): void;
   sendTerminalKeys(hostId: string, keys: string): void;
+  sendTerminalKeysSlot(hostId: string, slot: number, keys: string): void;
   resizeTerminal(hostId: string, cols: number, rows: number): void;
+  resizeTerminalSlot(hostId: string, slot: number, cols: number, rows: number): void;
+  rewindAgentJson(
+    hostId: string,
+    agentId: string,
+    toBeforeSeq: number,
+    restoreFiles: boolean
+  ): Promise<string>;
+  readWorkspaceFileJson(hostId: string, cwd: string, path: string): Promise<string>;
+  buildSideQuestionContext(hostId: string, agentId: string, maxChars?: number | null): string;
+  askSideQuestion(
+    reqJson: string,
+    callback: (err: Error | null, payloadJson: string) => void
+  ): string;
+  detectDiagramKind(language: string, source: string): string | null;
+  renderDiagramJson(reqJson: string): Promise<string>;
   onAppForeground(): void;
   onAppBackground(): void;
   onNetworkChanged(): void;

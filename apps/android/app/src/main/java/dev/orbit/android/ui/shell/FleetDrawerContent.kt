@@ -87,91 +87,13 @@ import dev.orbit.android.ui.theme.OrbitMenuSectionHeader
 import dev.orbit.android.ui.theme.OrbitSpacing
 import dev.orbit.android.ui.theme.OrbitTheme
 import uniffi.orbit_ffi_uniffi.FfiAgentCard
-import uniffi.orbit_ffi_uniffi.FfiClientProject
 import uniffi.orbit_ffi_uniffi.FfiConnectionState
-import uniffi.orbit_ffi_uniffi.FfiDiscoveredProject
 import uniffi.orbit_ffi_uniffi.FfiHostCard
 import uniffi.orbit_ffi_uniffi.FfiProviderKind
-import uniffi.orbit_ffi_uniffi.FfiWorkspaceSummary
+import uniffi.orbit_ffi_uniffi.FfiSidebarConversation
+import uniffi.orbit_ffi_uniffi.FfiSidebarProjectGroup
 
 private const val MAX_VISIBLE_THREADS_PER_PROJECT = 5
-private const val FALLBACK_UNPINNED_DISCOVERED_LIMIT = 4
-
-private data class SidebarProjectGroup(
-    val projectId: String,
-    val pinnedProjectId: String?,
-    val name: String,
-    val primaryDir: String,
-    val branch: String?,
-    val isHomeWorkspace: Boolean,
-    val lastActivityMs: Long,
-    val threads: List<FfiAgentCard>,
-)
-
-private val HOME_USER_REGEX = Regex("^/(Users|home)/[^/]+$")
-
-private fun canonicalPathKey(path: String): String {
-    val trimmed = path.trim()
-    if (trimmed.isEmpty() || trimmed == "~") return "~"
-    if (trimmed == "/") return "/"
-    return trimmed.trimEnd('/')
-}
-
-private fun isHomePath(path: String): Boolean {
-    val norm = canonicalPathKey(path)
-    return norm == "~" || norm == "/root" || HOME_USER_REGEX.matches(norm)
-}
-
-private fun resolveWorktreeBasePath(
-    rawPath: String,
-    knownRepoBases: List<String>,
-): String {
-    val clean = canonicalPathKey(rawPath)
-    if (clean == "~" || clean == "/") return clean
-
-    val exactParent = knownRepoBases.firstOrNull { base ->
-        clean == base || clean.startsWith("$base/")
-    }
-    if (exactParent != null) return exactParent
-
-    val worktreeIdx = clean.indexOf("/worktrees/")
-    if (worktreeIdx >= 0) {
-        val after = clean.substring(worktreeIdx + "/worktrees/".length)
-        val seg = after.substringBefore('/')
-        if (seg.isNotEmpty()) {
-            val matchedRepo = knownRepoBases.firstOrNull { base ->
-                val repoName = OrbitFormatters.shortPath(base)
-                seg == repoName || seg.startsWith("$repoName-")
-            }
-            if (matchedRepo != null) return matchedRepo
-        }
-    }
-    return clean
-}
-
-private fun resolveLiveWorkspaceBranch(
-    cwd: String,
-    activeCwd: String,
-    liveGitBranch: String?,
-    discoveredProjects: List<FfiDiscoveredProject>,
-    workspaces: List<FfiWorkspaceSummary>,
-): String? {
-    if (!liveGitBranch.isNullOrBlank() && OrbitFormatters.pathsEquivalent(cwd, activeCwd)) {
-        return liveGitBranch
-    }
-    workspaces.firstOrNull { OrbitFormatters.pathsEquivalent(it.cwd, cwd) }
-        ?.gitBranch
-        ?.takeIf { it.isNotBlank() }
-        ?.let { return it }
-    discoveredProjects.firstOrNull { OrbitFormatters.pathsEquivalent(it.path, cwd) }
-        ?.gitBranch
-        ?.takeIf { it.isNotBlank() }
-        ?.let { return it }
-    return null
-}
-
-private fun agentTimestampMs(agent: FfiAgentCard): Long =
-    OrbitFormatters.parseRfc3339EpochMs(agent.updatedAtRfc3339) ?: 0L
 
 private fun hostStatusColor(
     state: FfiConnectionState,
@@ -183,214 +105,6 @@ private fun hostStatusColor(
     FfiConnectionState.DISCONNECTED -> colors.dangerRemoved
 }
 
-private fun buildUnifiedProjects(
-    ui: OrbitUiState,
-    hostProjects: List<FfiClientProject>,
-    discoveredProjects: List<FfiDiscoveredProject>,
-    workspaces: List<FfiWorkspaceSummary>,
-    agents: List<FfiAgentCard>,
-    normalizedQuery: String,
-): List<SidebarProjectGroup> {
-    val hostId = ui.selectedHostId ?: return emptyList()
-    val liveBranch = ui.gitReview?.branch
-
-    // Build list of known non-worktree repository base paths so worktrees nest cleanly under parent repos.
-    val nonWorktreeBases = linkedSetOf<String>()
-    hostProjects.forEach { proj ->
-        proj.directories.forEach { dir ->
-            val key = canonicalPathKey(dir)
-            if (!isHomePath(key) && !key.contains("/worktrees/")) {
-                nonWorktreeBases.add(key)
-            }
-        }
-    }
-    discoveredProjects.forEach { disc ->
-        val key = canonicalPathKey(disc.path)
-        if (!isHomePath(key) && !key.contains("/worktrees/")) {
-            nonWorktreeBases.add(key)
-        }
-    }
-    val orderedKnownBases = nonWorktreeBases.sortedByDescending { it.length }
-
-    // Map canonical directory path -> target pinned project group ID (if pinned)
-    val dirToPinnedProjectId = linkedMapOf<String, String>()
-    hostProjects.forEach { proj ->
-        proj.directories.forEach { dir ->
-            dirToPinnedProjectId[canonicalPathKey(dir)] = proj.projectId
-        }
-    }
-
-    // Group agents into either a pinned project or resolved base workspace path
-    val threadsByPinnedId = linkedMapOf<String, MutableList<FfiAgentCard>>()
-    val threadsByBasePath = linkedMapOf<String, MutableList<FfiAgentCard>>()
-
-    agents.forEach { agent ->
-        val resolvedBase = resolveWorktreeBasePath(agent.cwd, orderedKnownBases)
-        val pinnedMatch = dirToPinnedProjectId[canonicalPathKey(agent.cwd)]
-            ?: dirToPinnedProjectId[resolvedBase]
-        if (pinnedMatch != null) {
-            threadsByPinnedId.getOrPut(pinnedMatch) { mutableListOf() }.add(agent)
-        } else {
-            threadsByBasePath.getOrPut(resolvedBase) { mutableListOf() }.add(agent)
-        }
-    }
-
-    val rawGroups = mutableListOf<SidebarProjectGroup>()
-    val coveredBases = hashSetOf<String>()
-
-    // 1. User-pinned projects always preserved (including empty ones unless filtered out below)
-    hostProjects.forEach { proj ->
-        proj.directories.forEach { coveredBases.add(canonicalPathKey(it)) }
-        val primary = proj.directories.firstOrNull() ?: "~"
-        val groupAgents = threadsByPinnedId[proj.projectId].orEmpty()
-        val discMatch = discoveredProjects.firstOrNull { d ->
-            proj.directories.any { OrbitFormatters.pathsEquivalent(it, d.path) }
-        }
-        val maxAgentTs = groupAgents.maxOfOrNull(::agentTimestampMs) ?: 0L
-        val discTs = (discMatch?.lastModifiedUnix ?: 0L) * 1000L
-        rawGroups += SidebarProjectGroup(
-            projectId = proj.projectId,
-            pinnedProjectId = proj.projectId,
-            name = proj.name,
-            primaryDir = primary,
-            branch = resolveLiveWorkspaceBranch(
-                cwd = primary,
-                activeCwd = ui.activeCwd,
-                liveGitBranch = liveBranch,
-                discoveredProjects = discoveredProjects,
-                workspaces = workspaces,
-            ),
-            isHomeWorkspace = isHomePath(primary),
-            lastActivityMs = maxOf(maxAgentTs, discTs, proj.updatedAtMs),
-            threads = groupAgents,
-        )
-    }
-
-    // 2. Active workspaces & directories that already own conversations
-    val unpinnedDiscoveredByPath = discoveredProjects.associateBy {
-        resolveWorktreeBasePath(it.path, orderedKnownBases)
-    }
-    val candidateUnpinnedBases = linkedSetOf<String>()
-    threadsByBasePath.keys.forEach { base ->
-        if (!coveredBases.contains(base)) candidateUnpinnedBases.add(base)
-    }
-    workspaces.forEach { ws ->
-        val base = resolveWorktreeBasePath(ws.cwd, orderedKnownBases)
-        if (!coveredBases.contains(base) && !isHomePath(base)) {
-            candidateUnpinnedBases.add(base)
-        }
-    }
-    if (ui.activeCwd.isNotBlank() && !isHomePath(ui.activeCwd)) {
-        val activeBase = resolveWorktreeBasePath(ui.activeCwd, orderedKnownBases)
-        if (!coveredBases.contains(activeBase)) {
-            candidateUnpinnedBases.add(activeBase)
-        }
-    }
-
-    // 3. Fallback up to top 4 recently modified non-home discovered repos when sidebar is sparse
-    discoveredProjects
-        .asSequence()
-        .map { it to resolveWorktreeBasePath(it.path, orderedKnownBases) }
-        .filter { (_, base) -> !isHomePath(base) && !coveredBases.contains(base) }
-        .sortedByDescending { (disc, _) -> disc.lastModifiedUnix }
-        .take(FALLBACK_UNPINNED_DISCOVERED_LIMIT)
-        .forEach { (_, base) -> candidateUnpinnedBases.add(base) }
-
-    candidateUnpinnedBases.forEach { base ->
-        val groupThreads = threadsByBasePath[base].orEmpty()
-        val isHome = isHomePath(base)
-        // Skip empty Home directory entry unless active and nothing else exists
-        if (isHome && groupThreads.isEmpty()) return@forEach
-
-        val disc = unpinnedDiscoveredByPath[base]
-        val ws = workspaces.firstOrNull { OrbitFormatters.pathsEquivalent(it.cwd, base) }
-        val maxAgentTs = groupThreads.maxOfOrNull(::agentTimestampMs) ?: 0L
-        val discTs = (disc?.lastModifiedUnix ?: 0L) * 1000L
-        val displayName = when {
-            isHome -> "Workspace (~)"
-            disc?.name?.isNotBlank() == true -> disc.name
-            ws?.title?.isNotBlank() == true -> ws.title
-            else -> OrbitFormatters.shortPath(base)
-        }
-
-        rawGroups += SidebarProjectGroup(
-            projectId = "dir::$base",
-            pinnedProjectId = null,
-            name = displayName,
-            primaryDir = base,
-            branch = resolveLiveWorkspaceBranch(
-                cwd = base,
-                activeCwd = ui.activeCwd,
-                liveGitBranch = liveBranch,
-                discoveredProjects = discoveredProjects,
-                workspaces = workspaces,
-            ),
-            isHomeWorkspace = isHome,
-            lastActivityMs = maxOf(maxAgentTs, discTs),
-            threads = groupThreads,
-        )
-    }
-
-    // Apply conversation filter + search query + recent sort
-    val filteredGroups = rawGroups.mapNotNull { group ->
-        val filterPassThreads = when (ui.sidebarThreadFilter) {
-            OrbitSidebarThreadFilter.ALL -> group.threads
-            OrbitSidebarThreadFilter.ACTIVE_AND_UNREAD -> group.threads.filter { ag ->
-                ag.isAwaitingPermission || ag.isRunning || ui.isThreadUnread(hostId, ag)
-            }
-        }
-
-        val sortedThreads = filterPassThreads.sortedWith(
-            compareByDescending<FfiAgentCard> { agentTimestampMs(it) }
-                .thenByDescending { it.updatedAtRfc3339 }
-        )
-
-        val visibleThreads = if (normalizedQuery.isEmpty()) {
-            sortedThreads
-        } else {
-            val projectMatches = group.name.lowercase().contains(normalizedQuery) ||
-                group.primaryDir.lowercase().contains(normalizedQuery) ||
-                (group.branch?.lowercase()?.contains(normalizedQuery) == true)
-            val threadMatches = sortedThreads.filter { ag ->
-                ag.title.lowercase().contains(normalizedQuery) ||
-                    ag.cwd.lowercase().contains(normalizedQuery) ||
-                    ag.providerLabel.lowercase().contains(normalizedQuery) ||
-                    OrbitFormatters.providerLabel(ag.provider).lowercase().contains(normalizedQuery)
-            }
-            when {
-                threadMatches.isNotEmpty() -> threadMatches
-                projectMatches -> sortedThreads
-                else -> return@mapNotNull null
-            }
-        }
-
-        if (ui.sidebarThreadFilter == OrbitSidebarThreadFilter.ACTIVE_AND_UNREAD && visibleThreads.isEmpty()) {
-            return@mapNotNull null
-        }
-
-        val recomputedTs = maxOf(
-            group.lastActivityMs,
-            visibleThreads.maxOfOrNull(::agentTimestampMs) ?: 0L,
-        )
-        group.copy(lastActivityMs = recomputedTs, threads = visibleThreads)
-    }
-
-    // Sort projects (non-home repos & non-empty before home/empty)
-    return when (ui.sidebarProjectSort) {
-        OrbitSidebarProjectSort.RECENT -> filteredGroups.sortedWith(
-            compareBy<SidebarProjectGroup> { it.isHomeWorkspace }
-                .thenBy { it.threads.isEmpty() }
-                .thenByDescending { it.lastActivityMs }
-                .thenBy { it.name.lowercase() }
-        )
-
-        OrbitSidebarProjectSort.NAME -> filteredGroups.sortedWith(
-            compareBy<SidebarProjectGroup> { it.isHomeWorkspace }
-                .thenBy { it.name.lowercase() }
-        )
-    }
-}
-
 @Composable
 fun FleetDrawerContent(
     ui: OrbitUiState,
@@ -399,6 +113,7 @@ fun FleetDrawerContent(
     onSetThreadFilter: (OrbitSidebarThreadFilter) -> Unit,
     onToggleProjectCollapsed: (String) -> Unit,
     onTogglePinThread: (String, String) -> Unit,
+    onMarkAgentUnread: (String, String) -> Unit = { _, _ -> },
     onSelectHost: (String) -> Unit,
     onConnectLocalDaemon: () -> Unit,
     onSelectProjectDir: (String) -> Unit,
@@ -430,69 +145,32 @@ fun FleetDrawerContent(
     val hostId = ui.selectedHostId
     val searchQuery = ui.drawerSearchQuery
     val normalizedQuery = remember(searchQuery) { searchQuery.trim().lowercase() }
-    val agents = ui.hostDetail?.agents.orEmpty()
-    val hostProjects = remember(ui.projects, hostId) {
-        ui.projects.filter { it.hostId == hostId }
-    }
-    val allDiscovered = ui.hostDetail?.discoveredProjects.orEmpty()
-    val allWorkspaces = ui.hostDetail?.workspaces.orEmpty()
 
     var expandedMoreProjectIds by remember(hostId) { mutableStateOf(emptySet<String>()) }
     var filterMenuExpanded by remember { mutableStateOf(false) }
     var hostMenuExpanded by remember { mutableStateOf(false) }
 
-    val projectGroups = remember(
-        ui.selectedHostId,
-        hostProjects,
-        allDiscovered,
-        allWorkspaces,
-        agents,
-        ui.activeCwd,
-        ui.gitReview?.branch,
-        ui.sidebarProjectSort,
-        ui.sidebarThreadFilter,
-        ui.seenSeqByThreadKey,
-        normalizedQuery,
-    ) {
-        buildUnifiedProjects(
-            ui = ui,
-            hostProjects = hostProjects,
-            discoveredProjects = allDiscovered,
-            workspaces = allWorkspaces,
-            agents = agents,
-            normalizedQuery = normalizedQuery,
-        )
-    }
-
-    val needsAttentionAgents = remember(agents, normalizedQuery) {
-        if (normalizedQuery.isNotEmpty()) {
+    val projectGroups = remember(ui.sidebarView, hostId) {
+        if (hostId == null) {
             emptyList()
         } else {
-            agents
-                .filter { it.isAwaitingPermission }
-                .sortedWith(
-                    compareByDescending<FfiAgentCard> { agentTimestampMs(it) }
-                        .thenByDescending { it.updatedAtRfc3339 }
-                )
+            ui.sidebarView?.projects.orEmpty().filter { it.hostId == hostId }
         }
     }
 
-    val pinnedAgents = remember(hostId, agents, ui.pinnedThreadKeys, ui.sidebarThreadFilter, ui.seenSeqByThreadKey, normalizedQuery) {
+    val needsAttentionItems = remember(ui.sidebarView, hostId, normalizedQuery) {
         if (hostId == null || normalizedQuery.isNotEmpty()) {
             emptyList()
         } else {
-            agents
-                .filter { ag ->
-                    ui.isThreadPinned(hostId, ag.agentId) &&
-                        (ui.sidebarThreadFilter == OrbitSidebarThreadFilter.ALL ||
-                            ag.isAwaitingPermission ||
-                            ag.isRunning ||
-                            ui.isThreadUnread(hostId, ag))
-                }
-                .sortedWith(
-                    compareByDescending<FfiAgentCard> { agentTimestampMs(it) }
-                        .thenByDescending { it.updatedAtRfc3339 }
-                )
+            ui.sidebarView?.needsAttention.orEmpty().filter { it.hostId == hostId }
+        }
+    }
+
+    val pinnedItems = remember(ui.sidebarView, hostId, normalizedQuery) {
+        if (hostId == null || normalizedQuery.isNotEmpty()) {
+            emptyList()
+        } else {
+            ui.sidebarView?.pinnedConversations.orEmpty().filter { it.hostId == hostId }
         }
     }
 
@@ -665,23 +343,30 @@ fun FleetDrawerContent(
                 ),
             ) {
                 // Conditional Needs Attention
-                if (needsAttentionAgents.isNotEmpty() && hostId != null) {
+                if (needsAttentionItems.isNotEmpty() && hostId != null) {
                     item(key = "sec_needs_attention") {
                         DrawerSectionHeaderRow(
                             title = "Needs Attention",
                             accent = colors.warning,
                         )
                     }
-                    items(needsAttentionAgents, key = { "attn_${it.agentId}" }) { agent ->
+                    items(needsAttentionItems, key = { "attn_${it.agent.agentId}" }) { conv ->
+                        val agent = conv.agent
+                        val isSelected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId
                         ConversationTreeRow(
                             agent = agent,
-                            selected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId,
-                            isUnread = ui.isThreadUnread(hostId, agent),
-                            isPinned = ui.isThreadPinned(hostId, agent.agentId),
+                            selected = isSelected,
+                            isUnread = conv.isUnread && !isSelected && !agent.isRunning,
+                            isPinned = conv.isPinned,
                             showWorkspaceHint = true,
                             indentStart = 12.dp,
                             onSelect = { onSelectAgent(agent.agentId) },
                             onTogglePin = { onTogglePinThread(hostId, agent.agentId) },
+                            onMarkUnread = if (!conv.isUnread && !isSelected) {
+                                { onMarkAgentUnread(hostId, agent.agentId) }
+                            } else {
+                                null
+                            },
                             onNewSessionInWorkspace = { onNewSessionInWorkspace(agent.cwd, agent.provider) },
                             onInspectGitDiff = { onInspectGitDiffAtCwd(agent.cwd) },
                             onOpenTerminalHere = { onOpenTerminalAtCwd(agent.cwd) },
@@ -692,21 +377,28 @@ fun FleetDrawerContent(
                 }
 
                 // Conditional Pinned Conversations
-                if (pinnedAgents.isNotEmpty() && hostId != null) {
+                if (pinnedItems.isNotEmpty() && hostId != null) {
                     item(key = "sec_pinned") {
                         Spacer(modifier = Modifier.height(OrbitSpacing.sm))
                         DrawerSectionHeaderRow(title = "Pinned")
                     }
-                    items(pinnedAgents, key = { "pin_${it.agentId}" }) { agent ->
+                    items(pinnedItems, key = { "pin_${it.agent.agentId}" }) { conv ->
+                        val agent = conv.agent
+                        val isSelected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId
                         ConversationTreeRow(
                             agent = agent,
-                            selected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId,
-                            isUnread = ui.isThreadUnread(hostId, agent),
+                            selected = isSelected,
+                            isUnread = conv.isUnread && !isSelected && !agent.isRunning,
                             isPinned = true,
                             showWorkspaceHint = true,
                             indentStart = 12.dp,
                             onSelect = { onSelectAgent(agent.agentId) },
                             onTogglePin = { onTogglePinThread(hostId, agent.agentId) },
+                            onMarkUnread = if (!conv.isUnread && !isSelected) {
+                                { onMarkAgentUnread(hostId, agent.agentId) }
+                            } else {
+                                null
+                            },
                             onNewSessionInWorkspace = { onNewSessionInWorkspace(agent.cwd, agent.provider) },
                             onInspectGitDiff = { onInspectGitDiffAtCwd(agent.cwd) },
                             onOpenTerminalHere = { onOpenTerminalAtCwd(agent.cwd) },
@@ -718,7 +410,7 @@ fun FleetDrawerContent(
 
                 // Projects Header Row: "Projects" + [ Filter/Sort ] + [ Open Folder ]
                 item(key = "sec_projects_header") {
-                    if (needsAttentionAgents.isNotEmpty() || pinnedAgents.isNotEmpty()) {
+                    if (needsAttentionItems.isNotEmpty() || pinnedItems.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(OrbitSpacing.sm))
                     }
                     Row(
@@ -852,51 +544,58 @@ fun FleetDrawerContent(
                 } else if (hostId != null) {
                     projectGroups.forEach { group ->
                         val isCollapsed = normalizedQuery.isEmpty() &&
-                            ui.collapsedProjectIds.contains(group.projectId)
-                        val isActiveProject = OrbitFormatters.pathsEquivalent(group.primaryDir, ui.activeCwd)
+                            ui.collapsedProjectIds.contains(group.id)
+                        val isActiveProject = OrbitFormatters.pathsEquivalent(group.primaryCwd, ui.activeCwd)
 
-                        item(key = "proj_${group.projectId}") {
+                        item(key = "proj_${group.id}") {
                             ProjectTreeHeaderRow(
                                 group = group,
                                 isCollapsed = isCollapsed,
                                 isActiveWorkspace = isActiveProject && ui.isNewSessionMode,
-                                onToggleCollapse = { onToggleProjectCollapsed(group.projectId) },
-                                onNewSessionHere = { onNewSessionInWorkspace(group.primaryDir, null) },
-                                onSelectWorkspace = { onSelectProjectDir(group.primaryDir) },
+                                onToggleCollapse = { onToggleProjectCollapsed(group.id) },
+                                onNewSessionHere = { onNewSessionInWorkspace(group.primaryCwd, null) },
+                                onSelectWorkspace = { onSelectProjectDir(group.primaryCwd) },
                                 onTogglePin = {
                                     val pinnedId = group.pinnedProjectId
                                     if (pinnedId != null) {
                                         onUnpinProject(pinnedId)
                                     } else {
-                                        onPinProject(group.name, group.primaryDir)
+                                        onPinProject(group.name, group.primaryCwd)
                                     }
                                 },
-                                onInspectGitDiff = { onInspectGitDiffAtCwd(group.primaryDir) },
-                                onOpenTerminalHere = { onOpenTerminalAtCwd(group.primaryDir) },
-                                onCopyPath = { copyPathToClipboard(group.primaryDir) },
+                                onInspectGitDiff = { onInspectGitDiffAtCwd(group.primaryCwd) },
+                                onOpenTerminalHere = { onOpenTerminalAtCwd(group.primaryCwd) },
+                                onCopyPath = { copyPathToClipboard(group.primaryCwd) },
                             )
                         }
 
                         if (!isCollapsed) {
                             val isMoreExpanded = normalizedQuery.isNotEmpty() ||
-                                expandedMoreProjectIds.contains(group.projectId)
+                                expandedMoreProjectIds.contains(group.id)
                             val visibleThreads = if (isMoreExpanded) {
-                                group.threads
+                                group.conversations
                             } else {
-                                group.threads.take(MAX_VISIBLE_THREADS_PER_PROJECT)
+                                group.conversations.take(MAX_VISIBLE_THREADS_PER_PROJECT)
                             }
-                            val hiddenCount = (group.threads.size - MAX_VISIBLE_THREADS_PER_PROJECT).coerceAtLeast(0)
+                            val hiddenCount = (group.conversations.size - MAX_VISIBLE_THREADS_PER_PROJECT).coerceAtLeast(0)
 
-                            items(visibleThreads, key = { "thread_${group.projectId}_${it.agentId}" }) { agent ->
+                            items(visibleThreads, key = { "thread_${group.id}_${it.agent.agentId}" }) { conv ->
+                                val agent = conv.agent
+                                val isSelected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId
                                 ConversationTreeRow(
                                     agent = agent,
-                                    selected = !ui.isNewSessionMode && agent.agentId == ui.selectedAgentId,
-                                    isUnread = ui.isThreadUnread(hostId, agent),
-                                    isPinned = ui.isThreadPinned(hostId, agent.agentId),
+                                    selected = isSelected,
+                                    isUnread = conv.isUnread && !isSelected && !agent.isRunning,
+                                    isPinned = conv.isPinned,
                                     showWorkspaceHint = false,
                                     indentStart = 20.dp,
                                     onSelect = { onSelectAgent(agent.agentId) },
                                     onTogglePin = { onTogglePinThread(hostId, agent.agentId) },
+                                    onMarkUnread = if (!conv.isUnread && !isSelected) {
+                                        { onMarkAgentUnread(hostId, agent.agentId) }
+                                    } else {
+                                        null
+                                    },
                                     onNewSessionInWorkspace = { onNewSessionInWorkspace(agent.cwd, agent.provider) },
                                     onInspectGitDiff = { onInspectGitDiffAtCwd(agent.cwd) },
                                     onOpenTerminalHere = { onOpenTerminalAtCwd(agent.cwd) },
@@ -906,7 +605,7 @@ fun FleetDrawerContent(
                             }
 
                             if (hiddenCount > 0) {
-                                item(key = "more_${group.projectId}") {
+                                item(key = "more_${group.id}") {
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -915,9 +614,9 @@ fun FleetDrawerContent(
                                             .clip(RoundedCornerShape(10.dp))
                                             .clickable {
                                                 expandedMoreProjectIds = if (isMoreExpanded) {
-                                                    expandedMoreProjectIds - group.projectId
+                                                    expandedMoreProjectIds - group.id
                                                 } else {
-                                                    expandedMoreProjectIds + group.projectId
+                                                    expandedMoreProjectIds + group.id
                                                 }
                                             }
                                             .padding(start = 42.dp, end = OrbitSpacing.md),
@@ -1139,7 +838,7 @@ private fun DrawerSectionHeaderRow(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ProjectTreeHeaderRow(
-    group: SidebarProjectGroup,
+    group: FfiSidebarProjectGroup,
     isCollapsed: Boolean,
     isActiveWorkspace: Boolean,
     onToggleCollapse: () -> Unit,
@@ -1332,6 +1031,7 @@ private fun ConversationTreeRow(
     indentStart: androidx.compose.ui.unit.Dp,
     onSelect: () -> Unit,
     onTogglePin: () -> Unit,
+    onMarkUnread: (() -> Unit)? = null,
     onNewSessionInWorkspace: () -> Unit,
     onInspectGitDiff: () -> Unit,
     onOpenTerminalHere: () -> Unit,
@@ -1460,6 +1160,29 @@ private fun ConversationTreeRow(
                     onTogglePin()
                 },
             )
+            if (onMarkUnread != null) {
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = "Mark Unread",
+                            style = typography.subheadMedium,
+                            color = colors.fgPrimary,
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Outlined.MarkChatUnread,
+                            contentDescription = null,
+                            tint = colors.fgSecondary,
+                            modifier = Modifier.size(OrbitSpacing.iconSm),
+                        )
+                    },
+                    onClick = {
+                        menuExpanded = false
+                        onMarkUnread()
+                    },
+                )
+            }
             DropdownMenuItem(
                 text = { Text("New Session in Workspace", style = typography.subheadMedium, color = colors.fgPrimary) },
                 leadingIcon = {

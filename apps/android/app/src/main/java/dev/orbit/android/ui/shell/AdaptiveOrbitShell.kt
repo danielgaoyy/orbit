@@ -49,6 +49,7 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -75,6 +76,7 @@ import dev.orbit.android.ui.sheets.GitDiffInspectorPane
 import dev.orbit.android.ui.sheets.PairQrSheet
 import dev.orbit.android.ui.sheets.PtyTerminalSheet
 import dev.orbit.android.ui.sheets.SettingsSheet
+import dev.orbit.android.ui.stage.LocalDiagramRenderer
 import dev.orbit.android.ui.stage.StreamStageScreen
 import dev.orbit.android.ui.theme.OrbitComposeIcon
 import dev.orbit.android.ui.theme.OrbitCopyIcon
@@ -127,6 +129,11 @@ fun AdaptiveOrbitShell(
         }
     }
 
+    CompositionLocalProvider(
+        LocalDiagramRenderer provides { kind, source, isDark ->
+            store.renderDiagram(kind, source, isDark)
+        }
+    ) {
     BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
@@ -237,6 +244,7 @@ fun AdaptiveOrbitShell(
                 onSetThreadFilter = { store.setSidebarThreadFilter(it) },
                 onToggleProjectCollapsed = { store.toggleProjectCollapsed(it) },
                 onTogglePinThread = { hId, aId -> store.togglePinThread(hId, aId) },
+                onMarkAgentUnread = { hId, aId -> store.markAgentUnread(hId, aId) },
                 onSelectHost = { hostId ->
                     store.selectHost(hostId)
                     if (!hasPermanentDrawer) scope.launch { drawerState.close() }
@@ -526,6 +534,7 @@ fun AdaptiveOrbitShell(
                     includeStagedDiff = ui.composer.includeStagedDiff,
                     includeTerminal = ui.composer.includeTerminal,
                     activeSlashCommand = ui.composer.activeSlashCommand,
+                    slashCommands = ui.slashCommands,
                     onRequestRefreshFiles = { store.refreshWorkspaceFiles() },
                     onAddFileMention = { store.addFileMention(it) },
                     onToggleGitDiff = { store.toggleGitDiffContext() },
@@ -602,6 +611,7 @@ fun AdaptiveOrbitShell(
                 )
             }
         }
+    }
     }
 }
 

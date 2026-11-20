@@ -269,6 +269,7 @@ fn empty_non_git(cwd: String) -> GitStatusSnapshot {
 
 const DEFAULT_MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 const HARD_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+const IMAGE_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceFilePayload {
@@ -293,6 +294,34 @@ fn image_mime_for_path(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Resolve a path that points directly into `$ORBIT_HOME/attachments` even when `cwd` is `"~"` or missing.
+async fn resolve_attachment_file_if_allowed(
+    trimmed: &str,
+    allow_attachments: bool,
+) -> Option<PathBuf> {
+    if !allow_attachments {
+        return None;
+    }
+    let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest))?
+    } else {
+        let p = Path::new(trimmed);
+        if !p.is_absolute() {
+            return None;
+        }
+        p.to_path_buf()
+    };
+
+    let orbit_home = std::env::var_os("ORBIT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".orbit")))?;
+    let canon_att = tokio::fs::canonicalize(orbit_home.join("attachments"))
+        .await
+        .ok()?;
+    let canonical = tokio::fs::canonicalize(&candidate).await.ok()?;
+    canonical.starts_with(&canon_att).then_some(canonical)
+}
+
 /// Resolve a canonical file path strictly contained inside `cwd` (or `$ORBIT_HOME/attachments`
 /// when `allow_attachments` is true), blocking path-traversal and symlink escapes.
 async fn resolve_contained_file_path(
@@ -303,6 +332,10 @@ async fn resolve_contained_file_path(
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         return Err("File path cannot be empty".to_string());
+    }
+
+    if let Some(att_path) = resolve_attachment_file_if_allowed(trimmed, allow_attachments).await {
+        return Ok(att_path);
     }
 
     let canonical_cwd = tokio::fs::canonicalize(cwd)
@@ -370,9 +403,16 @@ pub async fn read_workspace_file(
     }
 
     let size_bytes = meta.len();
-    let cap = max_bytes
-        .unwrap_or(DEFAULT_MAX_READ_BYTES)
-        .clamp(4096, HARD_MAX_READ_BYTES);
+    let is_image = image_mime_for_path(&canonical).is_some();
+    let cap = if is_image {
+        max_bytes
+            .unwrap_or(IMAGE_MAX_READ_BYTES)
+            .clamp(4096, IMAGE_MAX_READ_BYTES)
+    } else {
+        max_bytes
+            .unwrap_or(DEFAULT_MAX_READ_BYTES)
+            .clamp(4096, HARD_MAX_READ_BYTES)
+    };
     let resolved_path = canonical.to_string_lossy().to_string();
 
     if let Some(mime) = image_mime_for_path(&canonical) {

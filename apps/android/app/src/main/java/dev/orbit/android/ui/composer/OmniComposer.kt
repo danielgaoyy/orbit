@@ -98,8 +98,6 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import dev.orbit.android.store.ComposerDraftState
 import dev.orbit.android.store.OrbitFormatters
-import dev.orbit.android.store.OrbitSlashCommand
-import dev.orbit.android.store.OrbitSlashCommandId
 import dev.orbit.android.store.QueuedPromptItem
 import dev.orbit.android.store.StagedAttachmentItem
 import dev.orbit.android.ui.theme.OrbitCompactDropdownMenu
@@ -113,7 +111,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.orbit_ffi_uniffi.FfiHostDetail
+import uniffi.orbit_ffi_uniffi.FfiMentionCandidate
 import uniffi.orbit_ffi_uniffi.FfiSessionMode
+import uniffi.orbit_ffi_uniffi.FfiSlashCommand
 import java.io.File
 
 private sealed class AutocompleteTrigger {
@@ -148,17 +148,18 @@ private fun detectAutocompleteTrigger(
     }
 }
 
-private fun slashCommandIcon(id: OrbitSlashCommandId): ImageVector = when (id) {
-    OrbitSlashCommandId.PLAN -> Icons.Outlined.Checklist
-    OrbitSlashCommandId.REVIEW -> Icons.Outlined.FindInPage
-    OrbitSlashCommandId.DIFF -> Icons.Outlined.Difference
-    OrbitSlashCommandId.COMPACT -> Icons.Outlined.ContentCut
-    OrbitSlashCommandId.SUPERVISED -> Icons.Outlined.Shield
-    OrbitSlashCommandId.AUTO -> Icons.Outlined.VerifiedUser
-    OrbitSlashCommandId.FULL -> Icons.Outlined.GppMaybe
-    OrbitSlashCommandId.TERMINAL -> Icons.Outlined.Terminal
-    OrbitSlashCommandId.NEW_SESSION -> Icons.Outlined.EditNote
-    OrbitSlashCommandId.SETTINGS -> Icons.Outlined.Settings
+private fun slashCommandIcon(id: String): ImageVector = when (id) {
+    "plan" -> Icons.Outlined.Checklist
+    "review" -> Icons.Outlined.FindInPage
+    "diff" -> Icons.Outlined.Difference
+    "compact" -> Icons.Outlined.ContentCut
+    "ask" -> Icons.Outlined.Shield
+    "edits" -> Icons.Outlined.VerifiedUser
+    "full" -> Icons.Outlined.GppMaybe
+    "terminal" -> Icons.Outlined.Terminal
+    "new" -> Icons.Outlined.EditNote
+    "settings" -> Icons.Outlined.Settings
+    else -> Icons.Outlined.Terminal
 }
 
 private data class ReadUriResult(
@@ -230,7 +231,10 @@ fun OmniComposer(
     onAttachFileBytes: (filename: String, mimeType: String?, bytes: ByteArray) -> Unit = { _, _, _ -> },
     onRemoveStagedAttachment: (String) -> Unit = {},
     onRegisterInlineMention: (token: String, kind: String, path: String?, staged: Boolean, label: String) -> Unit = { _, _, _, _, _ -> },
-    onExecuteSlashCommand: (OrbitSlashCommand) -> Unit = {},
+    slashCommands: List<FfiSlashCommand> = emptyList(),
+    onFilterSlashCommands: (String) -> List<FfiSlashCommand> = { emptyList() },
+    onRankMentions: (String) -> List<FfiMentionCandidate> = { emptyList() },
+    onExecuteSlashCommand: (FfiSlashCommand) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val colors = OrbitTheme.colors
@@ -302,31 +306,19 @@ fun OmniComposer(
         )
     }
 
-    val filteredSlashCommands = remember(trigger) {
+    val filteredSlashCommands = remember(trigger, slashCommands) {
         if (trigger is AutocompleteTrigger.Slash) {
-            OrbitSlashCommand.filter(trigger.query)
+            onFilterSlashCommands(trigger.query)
         } else {
             emptyList()
         }
     }
 
-    val mentionQuery = (trigger as? AutocompleteTrigger.Mention)?.query?.trim().orEmpty()
-    val filteredMentionFiles = remember(trigger, workspaceFiles, activeCwd) {
-        if (trigger !is AutocompleteTrigger.Mention) {
-            emptyList()
+    val rankedMentionCandidates = remember(trigger, workspaceFiles, activeCwd) {
+        if (trigger is AutocompleteTrigger.Mention) {
+            onRankMentions(trigger.query)
         } else {
-            val q = mentionQuery.lowercase()
-            val mapped = workspaceFiles.map { raw ->
-                raw to OrbitFormatters.stripWorkspacePrefix(raw, activeCwd)
-            }
-            val matches = if (q.isEmpty()) {
-                mapped
-            } else {
-                mapped.filter { (raw, rel) ->
-                    raw.lowercase().contains(q) || rel.lowercase().contains(q)
-                }
-            }
-            matches.take(40)
+            emptyList()
         }
     }
 
@@ -458,7 +450,7 @@ fun OmniComposer(
                         is AutocompleteTrigger.Slash -> {
                             items(
                                 items = filteredSlashCommands,
-                                key = { "slash:${it.id.name}" },
+                                key = { "slash:${it.id}" },
                             ) { cmd ->
                                 Row(
                                     modifier = Modifier
@@ -499,102 +491,69 @@ fun OmniComposer(
                         }
 
                         is AutocompleteTrigger.Mention -> {
-                            val qLower = mentionQuery.lowercase()
-                            val showWorkingDiff = qLower.isEmpty() || "working-diff".contains(qLower) || "diff".contains(qLower)
-                            val showStagedDiff = qLower.isEmpty() || "staged-diff".contains(qLower) || "diff".contains(qLower)
-                            val showTerminal = qLower.isEmpty() || "terminal".contains(qLower)
-
-                            if (showWorkingDiff) {
-                                item(key = "mention:working-diff") {
-                                    MentionAutocompleteRow(
-                                        icon = Icons.Outlined.Difference,
-                                        title = "@working-diff",
-                                        subtitle = "Working Tree Diff",
-                                        onClick = {
-                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            val replaced = draft.text.replaceRange(trigger.range, "@working-diff ")
-                                            onTextChange(replaced)
-                                            onRegisterInlineMention(
-                                                "@working-diff",
+                            items(
+                                items = rankedMentionCandidates,
+                                key = { it.key },
+                            ) { candidate ->
+                                val icon = when (candidate.kind) {
+                                    "git_diff", "staged" -> Icons.Outlined.Difference
+                                    "terminal" -> Icons.Outlined.Terminal
+                                    else -> orbitSemanticFileIcon(candidate.title)
+                                }
+                                val displayTitle = if (candidate.kind == "file") {
+                                    candidate.title
+                                } else {
+                                    candidate.tokenLabel
+                                }
+                                val displaySubtitle = if (candidate.kind == "file") {
+                                    if (candidate.gitStatus.isNotEmpty()) {
+                                        if (candidate.subtitle.isNotEmpty()) "${candidate.subtitle} · ${candidate.gitStatus}" else candidate.gitStatus
+                                    } else {
+                                        candidate.subtitle
+                                    }
+                                } else {
+                                    candidate.subtitle
+                                }
+                                MentionAutocompleteRow(
+                                    icon = icon,
+                                    title = displayTitle,
+                                    subtitle = displaySubtitle,
+                                    onClick = {
+                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        val token = candidate.tokenLabel.ifEmpty { "@${candidate.title}" }
+                                        val replaced = draft.text.replaceRange(trigger.range, "$token ")
+                                        onTextChange(replaced)
+                                        when (candidate.kind) {
+                                            "git_diff" -> onRegisterInlineMention(
+                                                token,
                                                 "git_diff",
                                                 null,
                                                 false,
-                                                "Working Tree Diff",
+                                                candidate.title.ifEmpty { "Working Tree Diff" },
                                             )
-                                        },
-                                    )
-                                }
-                            }
-                            if (showStagedDiff) {
-                                item(key = "mention:staged-diff") {
-                                    MentionAutocompleteRow(
-                                        icon = Icons.Outlined.Difference,
-                                        title = "@staged-diff",
-                                        subtitle = "Staged Diff",
-                                        onClick = {
-                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            val replaced = draft.text.replaceRange(trigger.range, "@staged-diff ")
-                                            onTextChange(replaced)
-                                            onRegisterInlineMention(
-                                                "@staged-diff",
+                                            "staged" -> onRegisterInlineMention(
+                                                token,
                                                 "git_diff",
                                                 null,
                                                 true,
-                                                "Staged Diff",
+                                                candidate.title.ifEmpty { "Staged Diff" },
                                             )
-                                        },
-                                    )
-                                }
-                            }
-                            if (showTerminal) {
-                                item(key = "mention:terminal") {
-                                    MentionAutocompleteRow(
-                                        icon = Icons.Outlined.Terminal,
-                                        title = "@terminal",
-                                        subtitle = "Active Terminal Output",
-                                        onClick = {
-                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                            val replaced = draft.text.replaceRange(trigger.range, "@terminal ")
-                                            onTextChange(replaced)
-                                            onRegisterInlineMention(
-                                                "@terminal",
+                                            "terminal" -> onRegisterInlineMention(
+                                                token,
                                                 "terminal",
                                                 null,
                                                 false,
-                                                "Terminal",
+                                                candidate.title.ifEmpty { "Terminal" },
                                             )
-                                        },
-                                    )
-                                }
-                            }
-                            if ((showWorkingDiff || showStagedDiff || showTerminal) && filteredMentionFiles.isNotEmpty()) {
-                                item(key = "mention:divider") {
-                                    HorizontalDivider(
-                                        thickness = OrbitSpacing.hairline,
-                                        color = colors.hairline,
-                                        modifier = Modifier.padding(vertical = 2.dp),
-                                    )
-                                }
-                            }
-                            items(
-                                items = filteredMentionFiles,
-                                key = { (raw, _) -> "file:$raw" },
-                            ) { (rawPath, relPath) ->
-                                val base = OrbitFormatters.shortPath(rawPath)
-                                val token = "@$base"
-                                MentionAutocompleteRow(
-                                    icon = orbitSemanticFileIcon(base),
-                                    title = base,
-                                    subtitle = relPath,
-                                    onClick = {
-                                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                        val replaced = draft.text.replaceRange(trigger.range, "$token ")
-                                        onTextChange(replaced)
-                                        onRegisterInlineMention(token, "file", rawPath, false, base)
+                                            else -> {
+                                                val rawPath = candidate.filePath.ifEmpty { candidate.key }
+                                                onRegisterInlineMention(token, "file", rawPath, false, candidate.title)
+                                            }
+                                        }
                                     },
                                 )
                             }
-                            if (filteredMentionFiles.isEmpty() && !showWorkingDiff && !showStagedDiff && !showTerminal) {
+                            if (rankedMentionCandidates.isEmpty()) {
                                 item(key = "mention:empty") {
                                     Text(
                                         text = "No matching workspace files",

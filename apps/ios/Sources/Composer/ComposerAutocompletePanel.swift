@@ -1,31 +1,9 @@
 import SwiftUI
 
-struct ComposerMentionCandidate: Identifiable, Equatable {
-    enum Kind: Equatable {
-        case gitDiff(staged: Bool, label: String, subtitle: String)
-        case terminalOutput(label: String, subtitle: String)
-        case file(path: String, basename: String, dirPath: String, gitStatus: String?)
-    }
-
-    let id: String
-    let kind: Kind
-
-    var icon: String {
-        switch kind {
-        case let .gitDiff(staged, _, _):
-            return staged ? "arrow.left.arrow.right" : "doc.badge.plus"
-        case .terminalOutput:
-            return "terminal"
-        case let .file(_, basename, _, _):
-            return OrbitFormatters.semanticFileIcon(for: basename)
-        }
-    }
-}
-
 /// Native iOS `List`-backed `/` command panel aligned with Desktop `SlashCommandMenu`.
 struct ComposerSlashCommandPanel: View {
-    let commands: [OrbitSlashCommand]
-    let onSelect: (OrbitSlashCommand) -> Void
+    let commands: [FfiSlashCommand]
+    let onSelect: (FfiSlashCommand) -> Void
 
     @Environment(\.orbitPalette) private var palette
 
@@ -39,7 +17,7 @@ struct ComposerSlashCommandPanel: View {
                 onSelect(cmd)
             } label: {
                 HStack(spacing: 10) {
-                    Image(systemName: cmd.icon)
+                    Image(systemName: OrbitSlashDirective.iconName(forSlashCommandId: cmd.id))
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(palette.fgSecondary)
                         .frame(width: 22, alignment: .center)
@@ -80,8 +58,8 @@ struct ComposerSlashCommandPanel: View {
 
 /// Native iOS `List`-backed `@` mention panel aligned with Desktop `MentionMenu`.
 struct ComposerMentionPanel: View {
-    let candidates: [ComposerMentionCandidate]
-    let onSelect: (ComposerMentionCandidate) -> Void
+    let candidates: [FfiMentionCandidate]
+    let onSelect: (FfiMentionCandidate) -> Void
 
     @Environment(\.orbitPalette) private var palette
 
@@ -116,24 +94,36 @@ struct ComposerMentionPanel: View {
         )
     }
 
-    @ViewBuilder
-    private func rowContent(for item: ComposerMentionCandidate) -> some View {
+    private func iconName(for item: FfiMentionCandidate) -> String {
         switch item.kind {
-        case let .file(_, basename, dirPath, gitStatus):
+        case "staged":
+            return "arrow.left.arrow.right"
+        case "git_diff":
+            return "doc.badge.plus"
+        case "terminal":
+            return "terminal"
+        default:
+            return OrbitFormatters.semanticFileIcon(for: item.title)
+        }
+    }
+
+    @ViewBuilder
+    private func rowContent(for item: FfiMentionCandidate) -> some View {
+        if item.kind == "file" {
             HStack(spacing: 10) {
-                Image(systemName: item.icon)
+                Image(systemName: iconName(for: item))
                     .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(palette.fgSecondary)
                     .frame(width: 22, alignment: .center)
 
-                Text(basename)
+                Text(item.title)
                     .font(.system(size: 13.5, weight: .medium, design: .monospaced))
                     .foregroundStyle(palette.fgPrimary)
                     .lineLimit(1)
                     .layoutPriority(1)
 
-                if !dirPath.isEmpty {
-                    Text(dirPath)
+                if !item.subtitle.isEmpty {
+                    Text(item.subtitle)
                         .font(.system(size: 12, weight: .regular, design: .monospaced))
                         .foregroundStyle(palette.fgMuted)
                         .lineLimit(1)
@@ -142,8 +132,8 @@ struct ComposerMentionPanel: View {
 
                 Spacer(minLength: 4)
 
-                if let status = gitStatus {
-                    Text(status)
+                if !item.gitStatus.isEmpty {
+                    Text(item.gitStatus)
                         .font(.system(size: 10.5, weight: .medium, design: .monospaced))
                         .foregroundStyle(palette.fgSecondary)
                         .padding(.horizontal, 6)
@@ -152,19 +142,19 @@ struct ComposerMentionPanel: View {
                         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                 }
             }
-        case let .gitDiff(_, label, subtitle), let .terminalOutput(label, subtitle):
+        } else {
             HStack(spacing: 10) {
-                Image(systemName: item.icon)
+                Image(systemName: iconName(for: item))
                     .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(palette.fgSecondary)
                     .frame(width: 22, alignment: .center)
 
-                Text(label)
+                Text(item.title)
                     .font(.system(size: 13.5, weight: .medium))
                     .foregroundStyle(palette.fgPrimary)
                     .fixedSize(horizontal: true, vertical: false)
 
-                Text(subtitle)
+                Text(item.subtitle)
                     .font(.system(size: 12.5, weight: .regular))
                     .foregroundStyle(palette.fgMuted)
                     .lineLimit(1)

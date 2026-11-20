@@ -6,6 +6,7 @@
 use orbit_protocol::{
     ProviderKind, ProviderModelCatalog, ProviderModelSpec, ReasoningEffort, ThinkingOptionSpec,
 };
+use serde::{Deserialize, Serialize};
 
 const CODEX_FULL_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
@@ -548,6 +549,100 @@ pub fn resolve_supported_effort_for_model(
     spec.thinking_options.first().map(|o| o.effort)
 }
 
+const RETIRED_MODEL_SLUGS: &[&str] = &[
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.4-mini",
+    "gemini-3.1-pro",
+    "gemini-3-flash",
+    "gemini-2.5-pro",
+    "claude-sonnet-4-5",
+    "opusplan",
+    "opus",
+    "sonnet",
+    "haiku",
+];
+
+pub fn is_retired_model_slug(slug: &str) -> bool {
+    let trimmed = slug.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    RETIRED_MODEL_SLUGS
+        .iter()
+        .any(|retired| retired.eq_ignore_ascii_case(trimmed))
+}
+
+pub fn sanitize_model_slug(raw: Option<&str>) -> Option<String> {
+    let clean = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if is_retired_model_slug(clean) {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedModelSelectionView {
+    pub provider: ProviderKind,
+    pub catalog: ProviderModelCatalog,
+    pub selected_model_id: Option<String>,
+    pub selected_model_label: String,
+    pub selected_effort: Option<ReasoningEffort>,
+    pub selected_effort_label: Option<String>,
+    pub thinking_options: Vec<ThinkingOptionSpec>,
+}
+
+pub fn resolve_model_selection(
+    effective_catalogs: &[ProviderModelCatalog],
+    provider: ProviderKind,
+    desired_model: Option<&str>,
+    desired_effort: Option<ReasoningEffort>,
+) -> ResolvedModelSelectionView {
+    let catalog = effective_catalogs
+        .iter()
+        .find(|c| c.provider == provider)
+        .cloned()
+        .unwrap_or_else(|| fallback_provider_catalog(provider));
+
+    let clean_desired = sanitize_model_slug(desired_model);
+    let active_spec = resolve_active_model_spec(&catalog, clean_desired.as_deref());
+    let selected_model_id = active_spec
+        .map(|s| s.id.clone())
+        .or_else(|| clean_desired.clone())
+        .or_else(|| catalog.configured_default_model.clone());
+
+    let agy_suffix_effort = if desired_effort.is_none() && provider == ProviderKind::Antigravity {
+        clean_desired
+            .as_deref()
+            .and_then(|raw| strip_agy_effort_suffix(raw).1)
+    } else {
+        None
+    };
+
+    let selected_effort = resolve_supported_effort_for_model(
+        active_spec,
+        desired_effort.or(agy_suffix_effort),
+        catalog.configured_default_effort,
+    );
+    let selected_model_label = format_catalog_model_label(&catalog, selected_model_id.as_deref());
+    let selected_effort_label = selected_effort.map(|e| format_effort_label(e).to_string());
+    let thinking_options = active_spec
+        .map(|s| s.thinking_options.clone())
+        .unwrap_or_default();
+
+    ResolvedModelSelectionView {
+        provider,
+        catalog,
+        selected_model_id,
+        selected_model_label,
+        selected_effort,
+        selected_effort_label,
+        thinking_options,
+    }
+}
+
 fn capitalize_first(word: &str) -> String {
     let mut chars = word.chars();
     let Some(first) = chars.next() else {
@@ -885,5 +980,51 @@ mod tests {
             resolve_supported_effort_for_model(None, None, None),
             Some(ReasoningEffort::Medium)
         );
+    }
+
+    #[test]
+    fn sanitize_and_resolve_model_selection_across_providers() {
+        assert!(is_retired_model_slug("gemini-2.5-pro"));
+        assert!(is_retired_model_slug("gpt-5.4"));
+        assert!(is_retired_model_slug("claude-sonnet-4-5"));
+        assert_eq!(sanitize_model_slug(Some("  sonnet  ")), None);
+        assert_eq!(
+            sanitize_model_slug(Some("claude-sonnet-5-5")),
+            Some("claude-sonnet-5-5".into())
+        );
+
+        let catalogs = effective_provider_catalogs(&[]);
+        // Retired slug resets cleanly to catalog default
+        let claude_res =
+            resolve_model_selection(&catalogs, ProviderKind::ClaudeCode, Some("sonnet"), None);
+        assert_eq!(
+            claude_res.selected_model_id.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert!(!claude_res.thinking_options.is_empty());
+
+        // Antigravity suffix effort extraction
+        let agy_res = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Antigravity,
+            Some("gemini-4-carbon-high"),
+            None,
+        );
+        assert_eq!(
+            agy_res.selected_model_id.as_deref(),
+            Some("gemini-4-carbon")
+        );
+        assert_eq!(agy_res.selected_effort, Some(ReasoningEffort::High));
+        assert_eq!(agy_res.selected_effort_label.as_deref(), Some("High"));
+
+        // Orchestrator exposes empty thinking options and None effort
+        let orch_res = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Antigravity,
+            Some("gemini-pro-orchestrator"),
+            Some(ReasoningEffort::High),
+        );
+        assert_eq!(orch_res.selected_effort, None);
+        assert!(orch_res.thinking_options.is_empty());
     }
 }

@@ -20,15 +20,15 @@ import { modSymbol } from "@/lib/keybindings";
 import {
   type AgentCardView,
   type HostCardView,
+  type SidebarConversationView,
+  type SidebarProjectGroupView,
   isMacDesktop,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import {
-  type ProjectConversationEntry,
-  type UnifiedProjectEntry,
   basenameOfProjectPath,
-  buildUnifiedProjects,
   matchesProjectDirectory,
+  projectPathScopeKey,
 } from "@/lib/projects";
 import { SidebarConversationRow } from "@/components/sidebar/sidebar-conversation-row";
 import {
@@ -70,16 +70,15 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
   const fleet = useOrbitSelector((s) => s.fleet);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const sidebarView = useOrbitSelector((s) => s.sidebarView);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedWorkspaceCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
   const collapsedProjectIds = useOrbitSelector((s) => s.collapsedProjectIds);
-  const pinnedThreadKeys = useOrbitSelector((s) => s.pinnedThreadKeys);
   const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
-  const seenAgentSeqs = useOrbitSelector((s) => s.seenAgentSeqs);
   const sidebarProjectSort = useOrbitSelector((s) => s.sidebarProjectSort);
   const sidebarThreadFilter = useOrbitSelector((s) => s.sidebarThreadFilter);
   const hiddenProjectKeys = useOrbitSelector((s) => s.hiddenProjectKeys);
@@ -90,7 +89,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const [convMenu, setConvMenu] = useState<ActiveConversationMenuState | null>(null);
   const [projMenu, setProjMenu] = useState<ActiveProjectMenuState | null>(null);
   const [deleteProjectTarget, setDeleteProjectTarget] =
-    useState<UnifiedProjectEntry | null>(null);
+    useState<SidebarProjectGroupView | null>(null);
 
   const nowMs = useSidebarRelativeClock(sidebarOpen);
   const isMac = isMacDesktop();
@@ -127,32 +126,24 @@ export const FleetSidebar = memo(function FleetSidebar() {
     setRenamingThreadKey(null);
   }, []);
 
-  const rawProjects = useMemo(
-    () =>
-      buildUnifiedProjects(
-        fleet.hosts,
-        fleet.projects ?? [],
-        hostDetails,
-        hiddenProjectKeys,
-      ),
-    [fleet.hosts, fleet.projects, hostDetails, hiddenProjectKeys],
+  const hostById = useMemo(
+    () => new Map(fleet.hosts.map((h) => [h.host_id, h])),
+    [fleet.hosts],
   );
 
-  const pinnedSet = useMemo(() => new Set(pinnedThreadKeys), [pinnedThreadKeys]);
+  const rawProjects = sidebarView?.projects ?? [];
 
-  const isThreadUnread = useCallback(
-    (hostId: string, ag: AgentCardView): boolean => {
-      const tKey = threadScopeKey(hostId, ag.agent_id);
+  const isConvUnread = useCallback(
+    (conv: SidebarConversationView): boolean => {
       const isSelected =
         workspacePanel === "conversation" &&
         !isDraftNewSession &&
-        selectedHostId === hostId &&
-        selectedAgentId === ag.agent_id;
-      if (isSelected || ag.is_running) return false;
-      const seen = seenAgentSeqs[tKey];
-      return seen !== undefined && ag.latest_seq > seen;
+        selectedHostId === conv.host_id &&
+        selectedAgentId === conv.agent.agent_id;
+      if (isSelected || conv.agent.is_running) return false;
+      return conv.is_unread;
     },
-    [workspacePanel, isDraftNewSession, selectedHostId, selectedAgentId, seenAgentSeqs],
+    [workspacePanel, isDraftNewSession, selectedHostId, selectedAgentId],
   );
 
   // 1. Conditional Needs Attention items (borderless, 0px when clear)
@@ -163,115 +154,104 @@ export const FleetSidebar = memo(function FleetSidebar() {
       projectName: string;
       effectiveTitle: string;
     }[] = [];
-    for (const proj of rawProjects) {
-      for (const { agent } of proj.conversations) {
-        const tKey = threadScopeKey(proj.host.host_id, agent.agent_id);
-        if (agent.is_awaiting_permission && !archivedThreads[tKey]) {
-          items.push({
-            host: proj.host,
-            agent,
-            projectName: proj.name,
-            effectiveTitle: threadCustomTitles[tKey] || agent.title,
-          });
-        }
-      }
+    for (const conv of sidebarView?.needs_attention ?? []) {
+      const tKey = threadScopeKey(conv.host_id, conv.agent.agent_id);
+      if (archivedThreads[tKey]) continue;
+      const host = hostById.get(conv.host_id);
+      if (!host) continue;
+      const matchedProj = rawProjects.find(
+        (p) =>
+          p.host_id === conv.host_id &&
+          matchesProjectDirectory(p.directories, conv.agent.cwd),
+      );
+      items.push({
+        host,
+        agent: conv.agent,
+        projectName: matchedProj?.name || basenameOfProjectPath(conv.agent.cwd),
+        effectiveTitle: threadCustomTitles[tKey] || conv.agent.title,
+      });
     }
     return items;
-  }, [rawProjects, archivedThreads, threadCustomTitles]);
+  }, [sidebarView?.needs_attention, archivedThreads, hostById, rawProjects, threadCustomTitles]);
 
   // 2. Conditional Pinned conversations (0px when empty)
   const pinnedEntries = useMemo(() => {
-    if (pinnedThreadKeys.length === 0) return [];
-    const lookup = new Map<
-      string,
-      { host: HostCardView; projectName: string; conv: ProjectConversationEntry }
-    >();
-    for (const proj of rawProjects) {
-      for (const conv of proj.conversations) {
-        const tKey = threadScopeKey(proj.host.host_id, conv.agent.agent_id);
-        if (!archivedThreads[tKey]) {
-          lookup.set(tKey, { host: proj.host, projectName: proj.name, conv });
-        }
-      }
-    }
     const ordered: {
       key: string;
       host: HostCardView;
       projectName: string;
-      conv: ProjectConversationEntry;
+      conv: SidebarConversationView;
     }[] = [];
-    for (const key of pinnedThreadKeys) {
-      const found = lookup.get(key);
-      if (found) {
-        ordered.push({ key, ...found });
-      }
+    for (const conv of sidebarView?.pinned_conversations ?? []) {
+      const tKey = threadScopeKey(conv.host_id, conv.agent.agent_id);
+      if (archivedThreads[tKey]) continue;
+      const host = hostById.get(conv.host_id);
+      if (!host) continue;
+      const matchedProj = rawProjects.find(
+        (p) =>
+          p.host_id === conv.host_id &&
+          matchesProjectDirectory(p.directories, conv.agent.cwd),
+      );
+      ordered.push({
+        key: tKey,
+        host,
+        projectName: matchedProj?.name || basenameOfProjectPath(conv.agent.cwd),
+        conv,
+      });
     }
     return ordered;
-  }, [pinnedThreadKeys, rawProjects, archivedThreads]);
+  }, [sidebarView?.pinned_conversations, archivedThreads, hostById, rawProjects]);
 
-  // 3. Filtered & sorted Projects tree
+  // 3. Projects tree (sorted & filtered by Rust, plus Desktop-local archived/hidden overlays)
   const displayProjects = useMemo(() => {
     const list: {
-      project: UnifiedProjectEntry;
-      visibleConversations: ProjectConversationEntry[];
+      project: SidebarProjectGroupView;
+      host: HostCardView;
+      visibleConversations: SidebarConversationView[];
     }[] = [];
 
     for (const proj of rawProjects) {
-      const nonArchived = proj.conversations.filter((c) => {
-        const tKey = threadScopeKey(proj.host.host_id, c.agent.agent_id);
-        if (archivedThreads[tKey] || pinnedSet.has(tKey)) return false;
-        if (sidebarThreadFilter === "active_unread") {
-          const unread = isThreadUnread(proj.host.host_id, c.agent);
-          return c.agent.is_running || c.agent.is_awaiting_permission || unread;
-        }
-        return true;
-      });
+      const host = hostById.get(proj.host_id);
+      if (!host) continue;
 
       const isActiveTarget =
-        selectedHostId === proj.host.host_id &&
+        selectedHostId === proj.host_id &&
         matchesProjectDirectory(proj.directories, selectedWorkspaceCwd);
 
-      const hadConversationsOriginally = proj.conversations.length > 0;
-      const allConversationsArchived =
-        hadConversationsOriginally &&
-        proj.conversations.every(
-          (c) => Boolean(archivedThreads[threadScopeKey(proj.host.host_id, c.agent.agent_id)]),
-        );
-      if (!proj.pinnedProject && allConversationsArchived && !isActiveTarget) {
-        continue;
-      }
-
       if (
-        sidebarThreadFilter === "active_unread" &&
-        nonArchived.length === 0 &&
-        !proj.pinnedProject &&
+        proj.conversations.length === 0 &&
+        !proj.pinned_project_id &&
+        hiddenProjectKeys[projectPathScopeKey(proj.host_id, proj.primary_cwd)] &&
         !isActiveTarget
       ) {
         continue;
       }
 
+      const visibleConversations = proj.conversations.filter(
+        (c) => !archivedThreads[threadScopeKey(proj.host_id, c.agent.agent_id)],
+      );
+
+      const allArchived =
+        proj.conversations.length > 0 && visibleConversations.length === 0;
+      if (!proj.pinned_project_id && allArchived && !isActiveTarget) {
+        continue;
+      }
+
       list.push({
         project: proj,
-        visibleConversations: nonArchived,
+        host,
+        visibleConversations,
       });
-    }
-
-    if (sidebarProjectSort === "alphabetical") {
-      list.sort((a, b) =>
-        a.project.name.localeCompare(b.project.name, undefined, { sensitivity: "base" }),
-      );
     }
 
     return list;
   }, [
     rawProjects,
+    hostById,
+    hiddenProjectKeys,
     archivedThreads,
-    pinnedSet,
-    sidebarThreadFilter,
-    sidebarProjectSort,
     selectedHostId,
     selectedWorkspaceCwd,
-    isThreadUnread,
   ]);
 
   // 4. Restorable Archived Conversations for Footer Drawer
@@ -293,7 +273,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       if (!ag) continue;
       const matchedProj = rawProjects.find(
         (p) =>
-          p.host.host_id === meta.hostId && matchesProjectDirectory(p.directories, ag.cwd),
+          p.host_id === meta.hostId && matchesProjectDirectory(p.directories, ag.cwd),
       );
       entries.push({
         key: meta.key,
@@ -413,7 +393,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 !isDraftNewSession &&
                 selectedHostId === host.host_id &&
                 selectedAgentId === conv.agent.agent_id;
-              const unread = isThreadUnread(host.host_id, conv.agent);
+              const unread = isConvUnread(conv);
               const effectiveTitle = threadCustomTitles[key] || conv.agent.title;
 
               return (
@@ -424,7 +404,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   agent={conv.agent}
                   projectName={projectName}
                   effectiveTitle={effectiveTitle}
-                  isWorktree={conv.isWorktree}
+                  isWorktree={conv.is_worktree}
                   isPinned={true}
                   isUnread={unread}
                   selected={selected}
@@ -539,7 +519,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
             </div>
           ) : (
             <div className="space-y-1">
-              {displayProjects.map(({ project: proj, visibleConversations }) => {
+              {displayProjects.map(({ project: proj, host, visibleConversations }) => {
                 const collapsed = Boolean(collapsedProjectIds[proj.id]);
                 const projMenuOpen = projMenu?.project.id === proj.id;
 
@@ -554,15 +534,13 @@ export const FleetSidebar = memo(function FleetSidebar() {
                   collapsed &&
                   !hasCollapsedApproval &&
                   !hasCollapsedRunning &&
-                  visibleConversations.some((c) =>
-                    isThreadUnread(proj.host.host_id, c.agent),
-                  );
+                  visibleConversations.some((c) => isConvUnread(c));
 
                 const selectedIdx = visibleConversations.findIndex(
                   (c) =>
                     workspacePanel === "conversation" &&
                     !isDraftNewSession &&
-                    selectedHostId === proj.host.host_id &&
+                    selectedHostId === proj.host_id &&
                     selectedAgentId === c.agent.agent_id,
                 );
                 const isExpandedAll =
@@ -585,6 +563,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                         e.preventDefault();
                         setProjMenu({
                           project: proj,
+                          host,
                           anchor: {
                             left: e.clientX,
                             top: e.clientY,
@@ -597,7 +576,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                     >
                       <button
                         type="button"
-                        title={proj.primaryCwd}
+                        title={proj.primary_cwd}
                         onClick={() => orbitActions.toggleProjectCollapsed(proj.id)}
                         className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5 text-left"
                       >
@@ -618,8 +597,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
                         {!singleHostMode && (
                           <span className="text-muted-foreground/75 ml-0.5 inline-flex shrink-0 items-center gap-1 text-[11.5px]">
-                            <HostStateDot state={proj.host.connection_state} />
-                            <span className="max-w-18 truncate">{proj.host.display_name}</span>
+                            <HostStateDot state={host.connection_state} />
+                            <span className="max-w-18 truncate">{host.display_name}</span>
                           </span>
                         )}
                       </button>
@@ -650,13 +629,13 @@ export const FleetSidebar = memo(function FleetSidebar() {
                           )}
                         >
                           {!singleHostMode &&
-                            proj.host.connection_state === "disconnected" && (
+                            host.connection_state === "disconnected" && (
                               <button
                                 type="button"
-                                title={`Reconnect ${proj.host.display_name}`}
+                                title={`Reconnect ${host.display_name}`}
                                 onClick={() => {
-                                  void orbitIpc.connectHost(proj.host.host_id);
-                                  void orbitIpc.refreshHost(proj.host.host_id);
+                                  void orbitIpc.connectHost(host.host_id);
+                                  void orbitIpc.refreshHost(host.host_id);
                                 }}
                                 className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
                               >
@@ -671,6 +650,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                               const r = e.currentTarget.getBoundingClientRect();
                               setProjMenu({
                                 project: proj,
+                                host,
                                 anchor: {
                                   left: r.left,
                                   top: r.top,
@@ -689,8 +669,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             title={`New conversation in ${proj.name}`}
                             onClick={() =>
                               orbitActions.startNewThreadDraft(
-                                proj.host.host_id,
-                                proj.primaryCwd,
+                                proj.host_id,
+                                proj.primary_cwd,
                               )
                             }
                             className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
@@ -709,25 +689,26 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       >
                         <div className="orbit-collapse-inner">
                           <div className="space-y-0.5 pt-0.5">
-                            {slicedConversations.map(({ agent: ag, isWorktree }) => {
-                              const tKey = threadScopeKey(proj.host.host_id, ag.agent_id);
+                            {slicedConversations.map((conv) => {
+                              const ag = conv.agent;
+                              const tKey = threadScopeKey(proj.host_id, ag.agent_id);
                               const selected =
                                 workspacePanel === "conversation" &&
                                 !isDraftNewSession &&
-                                selectedHostId === proj.host.host_id &&
+                                selectedHostId === proj.host_id &&
                                 selectedAgentId === ag.agent_id;
-                              const unread = isThreadUnread(proj.host.host_id, ag);
+                              const unread = isConvUnread(conv);
                               const effectiveTitle = threadCustomTitles[tKey] || ag.title;
 
                               return (
                                 <SidebarConversationRow
                                   key={ag.agent_id}
                                   threadKey={tKey}
-                                  host={proj.host}
+                                  host={host}
                                   agent={ag}
                                   projectName={proj.name}
                                   effectiveTitle={effectiveTitle}
-                                  isWorktree={isWorktree}
+                                  isWorktree={conv.is_worktree}
                                   isPinned={false}
                                   isUnread={unread}
                                   selected={selected}

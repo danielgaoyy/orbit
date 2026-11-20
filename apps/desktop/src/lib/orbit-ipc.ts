@@ -139,6 +139,9 @@ export interface AgentCardView {
   parent_agent_id: string | null;
   latest_seq: number;
   updated_at_rfc3339: string;
+  is_pinned: boolean;
+  seen_seq: number;
+  is_unread: boolean;
 }
 
 export interface QuotaWindow {
@@ -332,6 +335,7 @@ export interface QuestionItem {
 export interface PromptBadge {
   kind: "slash" | "file" | "git_diff" | "terminal" | "image" | "quote" | "paste" | string;
   label: string;
+  path?: string | null;
 }
 
 export type TimelineItemView =
@@ -463,6 +467,41 @@ export interface WorkspaceFileView {
   markdown_blocks: RichBlockView[];
 }
 
+export type DiagramKind = "mermaid" | "svg" | "graphviz";
+export type DiagramTheme = "light" | "dark";
+
+export interface RenderDiagramRequest {
+  kind: DiagramKind;
+  source: string;
+  theme: DiagramTheme;
+}
+
+export interface RenderDiagramView {
+  kind: DiagramKind;
+  theme: DiagramTheme;
+  svg: string | null;
+  width: number;
+  height: number;
+  error: string | null;
+  diagram_type_label: string | null;
+}
+
+export function detectDiagramKind(language: string, source: string): DiagramKind | null {
+  const lang = language.trim().toLowerCase();
+  if (lang === "mermaid" || lang === "mmd") return "mermaid";
+  if (lang === "svg") return "svg";
+  if (lang === "dot" || lang === "graphviz") return "graphviz";
+  if (lang === "xml" || lang === "html") {
+    const cleaned = source
+      .replace(/^\uFEFF/, "")
+      .replace(/^(?:\s*(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->|<!DOCTYPE[^>]*>))*\s*/i, "");
+    if (/^<svg(?:\s|>)/i.test(cleaned)) {
+      return "svg";
+    }
+  }
+  return null;
+}
+
 export type SideQuestionStreamEvent =
   | {
       kind: "delta";
@@ -488,6 +527,359 @@ export interface StagedAttachmentInfo {
   path: string;
   filename: string;
   size_bytes: number;
+}
+
+export type ToolStepKind =
+  | "file_read"
+  | "file_create"
+  | "file_edit"
+  | "search"
+  | "shell"
+  | "subagent"
+  | "generic";
+
+export interface ToolStepDescriptorView {
+  kind: ToolStepKind;
+  verb: string;
+  target: string;
+  secondary_meta: string | null;
+  open_path: string | null;
+  additions: number;
+  deletions: number;
+  exit_code: number | null;
+  is_running: boolean;
+  is_failed: boolean;
+  is_denied: boolean;
+  has_expandable_detail: boolean;
+}
+
+export interface TurnFileDiffSummaryView {
+  path: string;
+  additions: number;
+  deletions: number;
+}
+
+export interface TurnWorkCountsView {
+  edited_file_count: number;
+  created_file_count: number;
+  command_count: number;
+  read_file_count: number;
+  search_count: number;
+  subagent_count: number;
+  mcp_server_count: number;
+  other_tool_count: number;
+  thought_count: number;
+  narration_count: number;
+  action_steps: number;
+  total_steps: number;
+  failed_count: number;
+  denied_count: number;
+  unrecovered_failure_count: number;
+  additions: number;
+  deletions: number;
+}
+
+export interface WorkSummaryResultView {
+  counts: TurnWorkCountsView;
+  label: string;
+  live_label: string;
+  live_detail?: string | null;
+  label_includes_failure: boolean;
+}
+
+export interface TurnCompactionItemView {
+  seq: number;
+  label: string;
+}
+
+export type TurnLiveSegmentView =
+  | {
+      kind: "step_group";
+      key: string;
+      first_seq: number;
+      items: TimelineItemView[];
+      summary: WorkSummaryResultView;
+      thought_duration_ms?: number | null;
+      work_duration_ms?: number | null;
+      started_at_ms?: number | null;
+      latest_activity_ms?: number | null;
+      has_following_content: boolean;
+      has_running_step: boolean;
+    }
+  | {
+      kind: "assistant_message";
+      key: string;
+      item: TimelineItemView;
+    }
+  | {
+      kind: "notice";
+      key: string;
+      item: TimelineItemView;
+    }
+  | {
+      kind: "compaction";
+      key: string;
+      label: string;
+    }
+  | {
+      kind: "wakeup";
+      key: string;
+      label: string;
+    };
+
+export interface StageTurnView {
+  key: string;
+  turn_index: number;
+  anchor_seq: number;
+  user_prompt: TimelineItemView | null;
+  is_compaction_command: boolean;
+  folded_steps: TimelineItemView[];
+  work_counts: TurnWorkCountsView;
+  work_summary_label: string;
+  work_summary_live_label: string;
+  work_summary_live_detail?: string | null;
+  work_summary_includes_failure: boolean;
+  thought_duration_ms: number | null;
+  work_duration_ms?: number | null;
+  turn_duration_ms: number | null;
+  terminal_reply: TimelineItemView | null;
+  last_assistant_reply?: TimelineItemView | null;
+  notices: TimelineItemView[];
+  compactions: TurnCompactionItemView[];
+  live_segments: TurnLiveSegmentView[];
+  turn_diffs: TurnFileDiffSummaryView[];
+  has_error: boolean;
+  has_unrecovered_error: boolean;
+  has_active_item: boolean;
+  started_at_ms: number | null;
+  completed_at_ms: number | null;
+}
+
+export type SessionTouchedFileAction = "created" | "edited" | "read";
+
+export interface SessionTouchedFileView {
+  path: string;
+  display_path: string;
+  action: SessionTouchedFileAction;
+  additions: number;
+  deletions: number;
+  last_seq: number;
+}
+
+export type SessionBackgroundTaskKind = "shell" | "wakeup" | "queued";
+export type SessionBackgroundTaskStatus = "running" | "queued";
+
+export interface SessionBackgroundTaskView {
+  id: string;
+  kind: SessionBackgroundTaskKind;
+  title: string;
+  subtitle: string;
+  status: SessionBackgroundTaskStatus;
+  started_at_ms: number | null;
+  command: string | null;
+  output_preview: string | null;
+}
+
+export interface SessionSubagentEntryView {
+  id: string;
+  role: string;
+  prompt_preview: string;
+  status: "running" | "completed" | "failed" | "denied";
+  child_agent_id: string | null;
+  last_seq: number;
+}
+
+export interface SessionInsightsView {
+  touched_files: SessionTouchedFileView[];
+  background_tasks: SessionBackgroundTaskView[];
+  subagents: SessionSubagentEntryView[];
+  detected_local_urls: string[];
+}
+
+export interface AgentStageView {
+  revision: number;
+  host_id: string;
+  agent: AgentCardView | null;
+  turns: StageTurnView[];
+  pending_permissions: TimelineItemView[];
+  pending_questions: TimelineItemView[];
+  session_turn_diffs: DiffFileView[];
+  insights: SessionInsightsView;
+  latest_seq: number;
+  aux_revision?: number;
+}
+
+export interface AgentStageDeltaView {
+  revision: number;
+  host_id: string;
+  agent: AgentCardView | null;
+  replace_from_turn_index: number;
+  changed_turns: StageTurnView[];
+  total_turn_count: number;
+  pending_permissions: TimelineItemView[];
+  pending_questions: TimelineItemView[];
+  session_turn_diffs: DiffFileView[];
+  insights: SessionInsightsView;
+  latest_seq: number;
+  reset: boolean;
+  aux_revision?: number;
+  aux_unchanged?: boolean;
+}
+
+export type SidebarProjectSort = "recent" | "alphabetical";
+export type SidebarThreadFilter = "all" | "active_unread";
+
+export interface SidebarConversationView {
+  host_id: string;
+  agent: AgentCardView;
+  is_worktree: boolean;
+  is_pinned: boolean;
+  is_unread: boolean;
+  seen_seq: number;
+}
+
+export interface SidebarProjectGroupView {
+  id: string;
+  host_id: string;
+  name: string;
+  primary_cwd: string;
+  directories: string[];
+  git_branch: string | null;
+  pinned_project_id: string | null;
+  is_home_workspace: boolean;
+  sort_weight_ms: number;
+  conversations: SidebarConversationView[];
+}
+
+export interface LaunchpadProjectView {
+  id: string;
+  host_id: string;
+  name: string;
+  path: string;
+  branch: string | null;
+}
+
+export interface FleetSidebarView {
+  revision: number;
+  projects: SidebarProjectGroupView[];
+  launchpad_projects: LaunchpadProjectView[];
+  needs_attention: SidebarConversationView[];
+  pinned_conversations: SidebarConversationView[];
+}
+
+export interface ClientThreadPrefSeed {
+  host_id: string;
+  agent_id: string;
+  seen_seq: number;
+  is_pinned: boolean;
+  pinned_order: number;
+  updated_at_ms: number;
+}
+
+export interface BridgeInfoView {
+  protocol_version: number;
+  core_version: string;
+  capabilities: string[];
+}
+
+export interface FleetSidebarRequest {
+  sort: SidebarProjectSort;
+  filter: SidebarThreadFilter;
+  query: string;
+  active_host_id: string | null;
+  active_agent_id: string | null;
+  active_cwd: string | null;
+}
+
+export interface ModelSelectionRequest {
+  host_id: string | null;
+  provider: ProviderKind;
+  desired_model: string | null;
+  desired_effort: ReasoningEffort | null;
+}
+
+export interface ResolvedModelSelectionView {
+  provider: ProviderKind;
+  catalog: ProviderModelCatalog;
+  selected_model_id: string | null;
+  selected_model_label: string;
+  selected_effort: ReasoningEffort | null;
+  selected_effort_label: string | null;
+  thinking_options: ThinkingOptionSpec[];
+}
+
+export type ClientPlatform = "desktop" | "ios" | "android" | "harmony";
+export type SlashDirective = "plan" | "review" | "compact";
+
+export interface SlashCommandView {
+  id: string;
+  command: string;
+  label: string;
+  description: string;
+  shortcut_key: string | null;
+  icon_key: string;
+  keywords: string[];
+  desktop_only: boolean;
+}
+
+export type ComposerContextInput =
+  | { kind: "image"; path: string; filename: string }
+  | { kind: "staged_file"; path: string; filename: string }
+  | { kind: "workspace_file"; path: string }
+  | { kind: "git_diff"; staged: boolean; label: string; diff_text?: string | null }
+  | { kind: "terminal_output"; label: string; content: string }
+  | { kind: "assistant_quote"; label: string; content: string };
+
+export interface ComposerQuoteInput {
+  path: string;
+  line_number: number | null;
+  code: string;
+}
+
+export interface ComposerPasteInput {
+  label: string;
+  filename: string | null;
+  content: string;
+}
+
+export interface ComposePromptRequest {
+  provider: ProviderKind;
+  raw_text: string;
+  explicit_directive: SlashDirective | null;
+  host_id: string | null;
+  cwd: string | null;
+  contexts: ComposerContextInput[];
+  quotes: ComposerQuoteInput[];
+  pastes: ComposerPasteInput[];
+}
+
+export interface ComposedPromptView {
+  wire_prompt: string;
+  display_prompt: string;
+  badges: PromptBadge[];
+  effective_directive: SlashDirective | null;
+  is_compact: boolean;
+  is_btw: boolean;
+  btw_question: string | null;
+  is_empty: boolean;
+}
+
+export interface MentionCandidateView {
+  key: string;
+  kind: string;
+  token_label: string;
+  title: string;
+  subtitle: string;
+  file_path: string;
+  git_status: string;
+  score: number;
+}
+
+export interface MentionRankRequest {
+  host_id: string;
+  cwd: string;
+  query: string;
+  limit: number;
 }
 
 export type CoreNotification =
@@ -548,9 +940,192 @@ export const orbitIpc = {
     return invoke("get_fleet_overview");
   },
 
+  async getBridgeInfo(): Promise<BridgeInfoView> {
+    if (!isTauriRuntime()) {
+      return { protocol_version: 2, core_version: "0.3.7", capabilities: [] };
+    }
+    return invoke("get_bridge_info");
+  },
+
+  async getFleetSidebar(req: FleetSidebarRequest): Promise<FleetSidebarView> {
+    if (!isTauriRuntime()) {
+      return {
+        revision: 0,
+        projects: [],
+        launchpad_projects: [],
+        needs_attention: [],
+        pinned_conversations: [],
+      };
+    }
+    return invoke("get_fleet_sidebar", { req });
+  },
+
   async getHostDetail(hostId: string): Promise<HostDetailView | null> {
     if (!isTauriRuntime()) return null;
     return invoke("get_host_detail", { hostId });
+  },
+
+  async getAgentStage(hostId: string, agentId: string): Promise<AgentStageView> {
+    if (!isTauriRuntime()) {
+      return {
+        revision: 0,
+        host_id: hostId,
+        agent: null,
+        turns: [],
+        pending_permissions: [],
+        pending_questions: [],
+        session_turn_diffs: [],
+        insights: {
+          touched_files: [],
+          background_tasks: [],
+          subagents: [],
+          detected_local_urls: [],
+        },
+        latest_seq: 0,
+      };
+    }
+    return invoke("get_agent_stage", { hostId, agentId });
+  },
+
+  async getAgentStageDelta(
+    hostId: string,
+    agentId: string,
+    sinceRevision: number,
+    sinceAuxRevision?: number | null,
+  ): Promise<AgentStageDeltaView> {
+    if (!isTauriRuntime()) {
+      return {
+        revision: 0,
+        host_id: hostId,
+        agent: null,
+        replace_from_turn_index: 0,
+        changed_turns: [],
+        total_turn_count: 0,
+        pending_permissions: [],
+        pending_questions: [],
+        session_turn_diffs: [],
+        insights: {
+          touched_files: [],
+          background_tasks: [],
+          subagents: [],
+          detected_local_urls: [],
+        },
+        latest_seq: 0,
+        reset: sinceRevision > 0,
+        aux_revision: 0,
+        aux_unchanged: false,
+      };
+    }
+    return invoke("get_agent_stage_delta", {
+      hostId,
+      agentId,
+      sinceRevision,
+      sinceAuxRevision: sinceAuxRevision ?? null,
+    });
+  },
+
+  async getFallbackProviderCatalogs(): Promise<ProviderModelCatalog[]> {
+    if (!isTauriRuntime()) return [];
+    return invoke("get_fallback_provider_catalogs");
+  },
+
+  async resolveModelSelection(req: ModelSelectionRequest): Promise<ResolvedModelSelectionView | null> {
+    if (!isTauriRuntime()) return null;
+    return invoke("resolve_model_selection", { req });
+  },
+
+  async getSlashCommands(
+    platform: ClientPlatform = "desktop",
+    query?: string | null,
+  ): Promise<SlashCommandView[]> {
+    if (!isTauriRuntime()) return [];
+    return invoke("get_slash_commands", { platform, query: query ?? null });
+  },
+
+  async composePrompt(req: ComposePromptRequest): Promise<ComposedPromptView> {
+    if (!isTauriRuntime()) {
+      const text = req.raw_text.trim();
+      return {
+        wire_prompt: text,
+        display_prompt: text,
+        badges: [],
+        effective_directive: req.explicit_directive,
+        is_compact: false,
+        is_btw: false,
+        btw_question: null,
+        is_empty: text.length === 0,
+      };
+    }
+    return invoke("compose_prompt", { req });
+  },
+
+  async rankMentionCandidates(req: MentionRankRequest): Promise<MentionCandidateView[]> {
+    if (!isTauriRuntime()) return [];
+    return invoke("rank_mention_candidates", { req });
+  },
+
+  async buildSideQuestionContext(
+    hostId: string,
+    agentId: string,
+    maxChars = 3000,
+  ): Promise<string> {
+    if (!isTauriRuntime()) return "";
+    return invoke("build_side_question_context", { hostId, agentId, maxChars });
+  },
+
+  async renderDiagram(req: RenderDiagramRequest): Promise<RenderDiagramView> {
+    if (!isTauriRuntime()) {
+      return {
+        kind: req.kind,
+        theme: req.theme,
+        svg: null,
+        width: 0,
+        height: 0,
+        error: "Diagram rendering requires desktop native core",
+        diagram_type_label: null,
+      };
+    }
+    return invoke<RenderDiagramView>("render_diagram", { req });
+  },
+
+  async markAgentSeen(hostId: string, agentId: string, seq: number): Promise<void> {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("mark_agent_seen", { hostId, agentId, seq });
+  },
+
+  async markAgentUnread(hostId: string, agentId: string): Promise<void> {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("mark_agent_unread", { hostId, agentId });
+  },
+
+  async setAgentPinned(hostId: string, agentId: string, pinned: boolean): Promise<void> {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("set_agent_pinned", { hostId, agentId, pinned });
+  },
+
+  async togglePinAgent(hostId: string, agentId: string): Promise<boolean> {
+    if (!isTauriRuntime()) return false;
+    return invoke<boolean>("toggle_pin_agent", { hostId, agentId });
+  },
+
+  async seedThreadPrefs(seeds: ClientThreadPrefSeed[]): Promise<void> {
+    if (!isTauriRuntime() || seeds.length === 0) return;
+    await invoke<void>("seed_thread_prefs", { seeds });
+  },
+
+  async onAppForeground(): Promise<void> {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("on_app_foreground");
+  },
+
+  async onAppBackground(): Promise<void> {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("on_app_background");
+  },
+
+  async onNetworkChanged(): Promise<void> {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("on_network_changed");
   },
 
   async getAgentTimeline(hostId: string, agentId: string): Promise<AgentTimelineView> {
@@ -1028,14 +1603,20 @@ export const orbitIpc = {
     await invoke<void>("open_external_browser_url", { url });
   },
 
-  stageAttachment: async (
+  stageHostAttachmentBytes: async (
+    hostId: string,
     filename: string,
-    bytes: number[],
+    bytes: Uint8Array,
   ): Promise<StagedAttachmentInfo> => {
     if (!isTauriRuntime()) {
-      return { path: `/tmp/${filename}`, filename, size_bytes: bytes.length };
+      return { path: `/tmp/${filename}`, filename, size_bytes: bytes.byteLength };
     }
-    return invoke<StagedAttachmentInfo>("stage_attachment", { filename, bytes });
+    return invoke<StagedAttachmentInfo>("stage_host_attachment_bytes", bytes, {
+      headers: {
+        "x-orbit-host-id": hostId,
+        "x-orbit-filename": encodeURIComponent(filename),
+      },
+    });
   },
 
   stageHostAttachment: async (

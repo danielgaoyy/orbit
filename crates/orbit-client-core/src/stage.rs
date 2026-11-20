@@ -1,12 +1,10 @@
 //! Semantic conversation turn coalescing, tool step descriptors, thinking headline extraction,
-//! and work-summary bucketing shared across iOS (SwiftUI), Android (Compose), HarmonyOS (ArkUI V2),
-//! and Desktop.
-//!
-//! Direct pure-Rust port of `apps/desktop/src/lib/timeline-coalesce.ts`.
+//! session insights derivation, and work-summary bucketing shared across Desktop, iOS (SwiftUI),
+//! Android (Compose), and HarmonyOS (ArkUI V2).
 
 use std::collections::HashMap;
 
-use orbit_protocol::{ToolCallDetail, ToolCallStatus};
+use orbit_protocol::{GitStatusSnapshot, ToolCallDetail, ToolCallStatus};
 use serde::{Deserialize, Serialize};
 
 use crate::app_core::{AgentCardView, TimelineItemView};
@@ -45,10 +43,19 @@ pub struct WorkSummaryResultView {
     pub counts: TurnWorkCountsView,
     /// Settled collapsed summary label (e.g. `Edited 2 files, ran a command`, `Read omni-composer.tsx`, `Thought for 6s`).
     pub label: String,
-    /// Active streaming summary label while steps are still in flight (e.g. `Reading omni-composer.tsx…`).
+    /// Active streaming summary label while steps are still in flight (e.g. `Reading omni-composer.tsx…`, `Thinking`).
     pub live_label: String,
+    /// Optional muted secondary context for live status (e.g. active thinking headline).
+    #[serde(default)]
+    pub live_detail: Option<String>,
     /// Whether the primary `label` already embeds failure wording (e.g. `Command failed`).
     pub label_includes_failure: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnCompactionItemView {
+    pub seq: u64,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +94,14 @@ pub enum TurnLiveSegmentView {
         first_seq: u64,
         items: Vec<TimelineItemView>,
         summary: WorkSummaryResultView,
+        #[serde(default)]
+        thought_duration_ms: Option<i64>,
+        #[serde(default)]
+        work_duration_ms: Option<i64>,
+        #[serde(default)]
+        started_at_ms: Option<i64>,
+        #[serde(default)]
+        latest_activity_ms: Option<i64>,
         /// True when subsequent prose or another segment has already started after this step batch.
         has_following_content: bool,
         /// True if any tool call inside this group is currently `running`.
@@ -101,6 +116,10 @@ pub enum TurnLiveSegmentView {
         item: TimelineItemView,
     },
     Compaction {
+        key: String,
+        label: String,
+    },
+    Wakeup {
         key: String,
         label: String,
     },
@@ -121,16 +140,28 @@ pub struct StageTurnView {
     pub work_summary_label: String,
     /// Streaming summary label while steps in `folded_steps` are in flight.
     pub work_summary_live_label: String,
+    /// Optional muted secondary detail for live status (e.g. active thinking headline).
+    #[serde(default)]
+    pub work_summary_live_detail: Option<String>,
     /// Whether `work_summary_label` already states failure (`Command failed`).
     pub work_summary_includes_failure: bool,
     /// Duration of thinking blocks in milliseconds when >= 1000ms.
     pub thought_duration_ms: Option<i64>,
+    /// Computed work duration in ms across `folded_steps` up to `terminal_reply` when >= 1000ms.
+    #[serde(default)]
+    pub work_duration_ms: Option<i64>,
     /// End-to-end turn duration in milliseconds when timestamps are available.
     pub turn_duration_ms: Option<i64>,
     /// Final synthesis reply of the turn, kept visible when pre-reply work folds.
     pub terminal_reply: Option<TimelineItemView>,
+    /// Most recent non-empty assistant message anywhere in the turn (used for Copy action).
+    #[serde(default)]
+    pub last_assistant_reply: Option<TimelineItemView>,
     /// Notices (warnings/errors) surfaced unconditionally so system alerts are never buried.
     pub notices: Vec<TimelineItemView>,
+    /// Context compaction notices preserved in chronological turn context.
+    #[serde(default)]
+    pub compactions: Vec<TurnCompactionItemView>,
     /// Chronological segments used while the turn has not yet reached a terminal reply (or when unfolded).
     pub live_segments: Vec<TurnLiveSegmentView>,
     /// Deduplicated per-file diff stats touched during this turn.
@@ -147,6 +178,69 @@ pub struct StageTurnView {
     pub completed_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTouchedFileAction {
+    Created,
+    Edited,
+    Read,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionTouchedFileView {
+    pub path: String,
+    pub display_path: String,
+    pub action: SessionTouchedFileAction,
+    pub additions: u32,
+    pub deletions: u32,
+    pub last_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBackgroundTaskKind {
+    Shell,
+    Wakeup,
+    Queued,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBackgroundTaskStatus {
+    Running,
+    Queued,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBackgroundTaskView {
+    pub id: String,
+    pub kind: SessionBackgroundTaskKind,
+    pub title: String,
+    pub subtitle: String,
+    pub status: SessionBackgroundTaskStatus,
+    pub started_at_ms: Option<i64>,
+    pub command: Option<String>,
+    pub output_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSubagentEntryView {
+    pub id: String,
+    pub role: String,
+    pub prompt_preview: String,
+    pub status: ToolCallStatus,
+    pub child_agent_id: Option<String>,
+    pub last_seq: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInsightsView {
+    pub touched_files: Vec<SessionTouchedFileView>,
+    pub background_tasks: Vec<SessionBackgroundTaskView>,
+    pub subagents: Vec<SessionSubagentEntryView>,
+    pub detected_local_urls: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStageView {
     pub revision: u64,
@@ -156,7 +250,31 @@ pub struct AgentStageView {
     pub pending_permissions: Vec<TimelineItemView>,
     pub pending_questions: Vec<TimelineItemView>,
     pub session_turn_diffs: Vec<DiffFileView>,
+    #[serde(default)]
+    pub insights: SessionInsightsView,
     pub latest_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentStageDeltaView {
+    pub revision: u64,
+    pub host_id: String,
+    pub agent: Option<AgentCardView>,
+    pub replace_from_turn_index: u32,
+    pub changed_turns: Vec<StageTurnView>,
+    pub total_turn_count: u32,
+    pub pending_permissions: Vec<TimelineItemView>,
+    pub pending_questions: Vec<TimelineItemView>,
+    pub session_turn_diffs: Vec<DiffFileView>,
+    #[serde(default)]
+    pub insights: SessionInsightsView,
+    pub latest_seq: u64,
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default)]
+    pub aux_revision: u64,
+    #[serde(default)]
+    pub aux_unchanged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +300,61 @@ pub fn timeline_item_seq(item: &TimelineItemView) -> u64 {
         | TimelineItemView::PermissionRequest { seq, .. }
         | TimelineItemView::QuestionRequest { seq, .. }
         | TimelineItemView::Notice { seq, .. } => *seq,
+    }
+}
+
+/// Returns a rendering key that stays invariant as a coalesced streaming item's `seq` advances.
+pub fn stable_timeline_item_key(item: &TimelineItemView) -> String {
+    match item {
+        TimelineItemView::UserPrompt {
+            message_id, seq, ..
+        } => {
+            if !message_id.is_empty() {
+                format!("prompt-{message_id}")
+            } else {
+                format!("prompt-seq-{seq}")
+            }
+        }
+        TimelineItemView::AssistantThinking { item_id, seq, .. } => {
+            if !item_id.is_empty() {
+                format!("think-{item_id}")
+            } else {
+                format!("think-seq-{seq}")
+            }
+        }
+        TimelineItemView::AssistantMessage { item_id, seq, .. } => {
+            if !item_id.is_empty() {
+                format!("msg-{item_id}")
+            } else {
+                format!("msg-seq-{seq}")
+            }
+        }
+        TimelineItemView::ToolCall { call_id, seq, .. } => {
+            if !call_id.is_empty() {
+                format!("tool-{call_id}")
+            } else {
+                format!("tool-seq-{seq}")
+            }
+        }
+        TimelineItemView::PermissionRequest {
+            request_id, seq, ..
+        } => {
+            if !request_id.is_empty() {
+                format!("perm-{request_id}")
+            } else {
+                format!("perm-seq-{seq}")
+            }
+        }
+        TimelineItemView::QuestionRequest {
+            request_id, seq, ..
+        } => {
+            if !request_id.is_empty() {
+                format!("q-{request_id}")
+            } else {
+                format!("q-seq-{seq}")
+            }
+        }
+        TimelineItemView::Notice { seq, .. } => format!("notice-{seq}"),
     }
 }
 
@@ -895,7 +1068,7 @@ pub fn summarize_work_items(
             )
         })
         .or_else(|| items.last());
-    let live_label = build_live_step_label(active_tail);
+    let (live_label, live_detail) = build_live_step_status(active_tail);
 
     let mut label_includes_failure = false;
     let label = if tool_calls.is_empty() {
@@ -1139,8 +1312,156 @@ pub fn summarize_work_items(
         },
         label,
         live_label,
+        live_detail,
         label_includes_failure,
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SlicedStageTurns {
+    pub turns: Vec<StageTurnView>,
+    pub turn_item_starts: Vec<usize>,
+}
+
+/// Builds semantic turns starting at `start_item_idx` (and `start_turn_index`),
+/// allowing `OrbitAppCore` to recompute only the active tail when streaming deltas arrive.
+pub fn process_timeline_turns_slice(
+    items: &[TimelineItemView],
+    start_item_idx: usize,
+    start_turn_index: u32,
+    cwd: Option<&str>,
+) -> SlicedStageTurns {
+    let mut turns: Vec<StageTurnView> = Vec::new();
+    let mut turn_item_starts: Vec<usize> = Vec::new();
+
+    let mut current_prompt: Option<TimelineItemView> = None;
+    let mut current_body: Vec<TimelineItemView> = Vec::new();
+    let mut current_turn_start: Option<usize> = None;
+    let mut has_open_turn = false;
+
+    let flush_turn = |turns: &mut Vec<StageTurnView>,
+                      turn_item_starts: &mut Vec<usize>,
+                      current_prompt: &mut Option<TimelineItemView>,
+                      current_body: &mut Vec<TimelineItemView>,
+                      current_turn_start: &mut Option<usize>,
+                      has_open_turn: &mut bool| {
+        if !*has_open_turn {
+            return;
+        }
+        let idx = start_turn_index + turns.len() as u32;
+        let prompt = current_prompt.take();
+        let body = std::mem::take(current_body);
+        let item_start = current_turn_start.take().unwrap_or(start_item_idx);
+        *has_open_turn = false;
+        turns.push(finalize_turn(idx, prompt, body, cwd));
+        turn_item_starts.push(item_start);
+    };
+
+    for (abs_idx, raw_item) in items.iter().enumerate().skip(start_item_idx) {
+        let item = enrich_item_descriptor(raw_item, cwd);
+        if let TimelineItemView::PermissionRequest {
+            ref resolved_decision,
+            ..
+        } = item
+            && resolved_decision.is_none()
+        {
+            continue;
+        }
+        if let TimelineItemView::QuestionRequest {
+            ref resolved_answers,
+            ..
+        } = item
+            && resolved_answers.is_none()
+        {
+            continue;
+        }
+
+        if matches!(item, TimelineItemView::UserPrompt { .. }) {
+            flush_turn(
+                &mut turns,
+                &mut turn_item_starts,
+                &mut current_prompt,
+                &mut current_body,
+                &mut current_turn_start,
+                &mut has_open_turn,
+            );
+            current_prompt = Some(item);
+            current_body.clear();
+            current_turn_start = Some(abs_idx);
+            has_open_turn = true;
+            continue;
+        }
+
+        if !has_open_turn {
+            has_open_turn = true;
+            current_prompt = None;
+            current_turn_start = Some(abs_idx);
+        }
+        current_body.push(item);
+    }
+
+    flush_turn(
+        &mut turns,
+        &mut turn_item_starts,
+        &mut current_prompt,
+        &mut current_body,
+        &mut current_turn_start,
+        &mut has_open_turn,
+    );
+
+    SlicedStageTurns {
+        turns,
+        turn_item_starts,
+    }
+}
+
+/// Collects unresolved HITL gates, session-wide tool diffs, and derived session insights in a single pass.
+pub fn collect_stage_auxiliary_state(
+    items: &[TimelineItemView],
+    cwd: Option<&str>,
+    current_agent: Option<&AgentCardView>,
+    host_agents: &[AgentCardView],
+) -> (
+    Vec<TimelineItemView>,
+    Vec<TimelineItemView>,
+    Vec<DiffFileView>,
+    SessionInsightsView,
+) {
+    let mut pending_permissions: Vec<TimelineItemView> = Vec::new();
+    let mut pending_questions: Vec<TimelineItemView> = Vec::new();
+    let mut session_turn_diffs: Vec<DiffFileView> = Vec::new();
+
+    for raw_item in items {
+        let item = enrich_item_descriptor(raw_item, cwd);
+        match item {
+            TimelineItemView::ToolCall { ref diff_files, .. } => {
+                for df in diff_files {
+                    session_turn_diffs.push(df.clone());
+                }
+            }
+            TimelineItemView::PermissionRequest {
+                ref resolved_decision,
+                ..
+            } if resolved_decision.is_none() => {
+                pending_permissions.push(item);
+            }
+            TimelineItemView::QuestionRequest {
+                ref resolved_answers,
+                ..
+            } if resolved_answers.is_none() => {
+                pending_questions.push(item);
+            }
+            _ => {}
+        }
+    }
+
+    let insights = derive_session_insights(items, cwd, current_agent, host_agents);
+    (
+        pending_permissions,
+        pending_questions,
+        session_turn_diffs,
+        insights,
+    )
 }
 
 pub fn process_timeline_for_stage(
@@ -1152,86 +1473,11 @@ pub fn process_timeline_for_stage(
     Vec<TimelineItemView>,
     Vec<DiffFileView>,
 ) {
-    let mut turns: Vec<StageTurnView> = Vec::new();
-    let mut pending_permissions: Vec<TimelineItemView> = Vec::new();
-    let mut pending_questions: Vec<TimelineItemView> = Vec::new();
-    let mut session_turn_diffs: Vec<DiffFileView> = Vec::new();
-
-    let mut current_prompt: Option<TimelineItemView> = None;
-    let mut current_body: Vec<TimelineItemView> = Vec::new();
-    let mut has_open_turn = false;
-
-    let flush_turn = |turns: &mut Vec<StageTurnView>,
-                      current_prompt: &mut Option<TimelineItemView>,
-                      current_body: &mut Vec<TimelineItemView>,
-                      has_open_turn: &mut bool| {
-        if !*has_open_turn {
-            return;
-        }
-        let idx = turns.len() as u32;
-        let prompt = current_prompt.take();
-        let body = std::mem::take(current_body);
-        *has_open_turn = false;
-        turns.push(finalize_turn(idx, prompt, body, cwd));
-    };
-
-    for raw_item in items {
-        let item = enrich_item_descriptor(raw_item, cwd);
-        if let TimelineItemView::ToolCall { ref diff_files, .. } = item {
-            for df in diff_files {
-                session_turn_diffs.push(df.clone());
-            }
-        }
-
-        if let TimelineItemView::PermissionRequest {
-            ref resolved_decision,
-            ..
-        } = item
-            && resolved_decision.is_none()
-        {
-            pending_permissions.push(item);
-            continue;
-        }
-
-        if let TimelineItemView::QuestionRequest {
-            ref resolved_answers,
-            ..
-        } = item
-            && resolved_answers.is_none()
-        {
-            pending_questions.push(item);
-            continue;
-        }
-
-        if matches!(item, TimelineItemView::UserPrompt { .. }) {
-            flush_turn(
-                &mut turns,
-                &mut current_prompt,
-                &mut current_body,
-                &mut has_open_turn,
-            );
-            current_prompt = Some(item);
-            current_body.clear();
-            has_open_turn = true;
-            continue;
-        }
-
-        if !has_open_turn {
-            has_open_turn = true;
-            current_prompt = None;
-        }
-        current_body.push(item);
-    }
-
-    flush_turn(
-        &mut turns,
-        &mut current_prompt,
-        &mut current_body,
-        &mut has_open_turn,
-    );
-
+    let sliced = process_timeline_turns_slice(items, 0, 0, cwd);
+    let (pending_permissions, pending_questions, session_turn_diffs, _) =
+        collect_stage_auxiliary_state(items, cwd, None, &[]);
     (
-        turns,
+        sliced.turns,
         pending_permissions,
         pending_questions,
         session_turn_diffs,
@@ -1275,7 +1521,10 @@ fn finalize_turn(
 
     let key = match &user_prompt {
         Some(TimelineItemView::UserPrompt { message_id, .. }) => format!("turn-{message_id}"),
-        _ => format!("turn-init-{anchor_seq}"),
+        _ => body_items
+            .first()
+            .map(|it| format!("turn-init-{}", stable_timeline_item_key(it)))
+            .unwrap_or_else(|| format!("turn-init-idx-{turn_index}")),
     };
 
     let is_compaction_command = match &user_prompt {
@@ -1291,6 +1540,7 @@ fn finalize_turn(
     };
 
     let mut notices: Vec<TimelineItemView> = Vec::new();
+    let mut compactions: Vec<TurnCompactionItemView> = Vec::new();
     let mut non_notice_body: Vec<TimelineItemView> = Vec::new();
     let mut has_error = false;
     let mut has_active_item = false;
@@ -1365,12 +1615,18 @@ fn finalize_turn(
         }
 
         if let TimelineItemView::Notice {
+            seq,
             ref level,
             ref message,
             ..
         } = *it
         {
-            if level == "error" || !contains_ascii_case_insensitive(message, "compact") {
+            if level != "error" && contains_ascii_case_insensitive(message, "compact") {
+                compactions.push(TurnCompactionItemView {
+                    seq,
+                    label: message.clone(),
+                });
+            } else {
                 notices.push(it.clone());
             }
             continue;
@@ -1420,7 +1676,7 @@ fn finalize_turn(
             Vec::new()
         };
 
-    let thought_duration_ms = compute_thought_duration_ms(&non_notice_body, None);
+    let thought_duration_ms = compute_thought_duration_ms(&folded_steps, terminal_reply.as_ref());
     let summary = summarize_work_items(&folded_steps, thought_duration_ms);
     let full_turn_tool_summary = summarize_work_items(&non_notice_body, thought_duration_ms);
 
@@ -1428,6 +1684,24 @@ fn finalize_turn(
         .as_ref()
         .and_then(timeline_item_timestamp_ms)
         .or_else(|| body_items.iter().find_map(timeline_item_timestamp_ms));
+
+    let work_start_ms = folded_steps
+        .iter()
+        .find_map(timeline_item_timestamp_ms)
+        .or_else(|| user_prompt.as_ref().and_then(timeline_item_timestamp_ms));
+    let work_end_ms = terminal_reply
+        .as_ref()
+        .and_then(timeline_item_timestamp_ms)
+        .or_else(|| {
+            folded_steps
+                .iter()
+                .rev()
+                .find_map(timeline_item_timestamp_ms)
+        });
+    let work_duration_ms = match (work_start_ms, work_end_ms) {
+        (Some(start), Some(end)) if end - start >= 1000 => Some(end - start),
+        _ => None,
+    };
 
     let completed_at_ms = terminal_reply
         .as_ref()
@@ -1439,6 +1713,12 @@ fn finalize_turn(
         (Some(start), Some(end)) if end > start => Some(end - start),
         _ => None,
     };
+
+    let last_assistant_reply = non_notice_body
+        .iter()
+        .rev()
+        .find(|it| matches!(it, TimelineItemView::AssistantMessage { text, .. } if !text.trim().is_empty()))
+        .cloned();
 
     let turn_diffs: Vec<TurnFileDiffSummaryView> = diff_paths_order
         .into_iter()
@@ -1455,12 +1735,16 @@ fn finalize_turn(
         work_counts: summary.counts,
         work_summary_label: summary.label,
         work_summary_live_label: summary.live_label,
+        work_summary_live_detail: summary.live_detail,
         work_summary_includes_failure: summary.label_includes_failure,
         thought_duration_ms,
+        work_duration_ms,
         turn_duration_ms,
         terminal_reply,
+        last_assistant_reply,
         notices,
-        live_segments: build_live_segments(&body_items),
+        compactions,
+        live_segments: build_live_segments(&body_items, started_at_ms),
         turn_diffs,
         has_error,
         has_unrecovered_error: full_turn_tool_summary.counts.unrecovered_failure_count > 0,
@@ -1470,7 +1754,10 @@ fn finalize_turn(
     }
 }
 
-fn build_live_segments(body_items: &[TimelineItemView]) -> Vec<TurnLiveSegmentView> {
+fn build_live_segments(
+    body_items: &[TimelineItemView],
+    fallback_start_ms: Option<i64>,
+) -> Vec<TurnLiveSegmentView> {
     let mut raw_segments: Vec<TurnLiveSegmentView> = Vec::new();
     let mut step_buf: Vec<TimelineItemView> = Vec::new();
 
@@ -1492,13 +1779,35 @@ fn build_live_segments(body_items: &[TimelineItemView]) -> Vec<TurnLiveSegmentVi
             )
         });
         let thought_ms = compute_thought_duration_ms(step_buf, following_item);
+        let started_at_ms = step_buf
+            .iter()
+            .find_map(timeline_item_timestamp_ms)
+            .or_else(|| {
+                raw_segments
+                    .is_empty()
+                    .then_some(fallback_start_ms)
+                    .flatten()
+            });
+        let latest_activity_ms = step_buf.iter().rev().find_map(timeline_item_timestamp_ms);
+        let end_ms = following_item
+            .and_then(timeline_item_timestamp_ms)
+            .or(latest_activity_ms);
+        let work_duration_ms = match (started_at_ms, end_ms) {
+            (Some(s), Some(e)) if e - s >= 1000 => Some(e - s),
+            _ => None,
+        };
         let items = std::mem::take(step_buf);
+        let group_key = format!("steps-{}", stable_timeline_item_key(&items[0]));
         let summary = summarize_work_items(&items, thought_ms);
         raw_segments.push(TurnLiveSegmentView::StepGroup {
-            key: format!("steps-{first_seq}"),
+            key: group_key,
             first_seq,
             items,
             summary,
+            thought_duration_ms: thought_ms,
+            work_duration_ms,
+            started_at_ms,
+            latest_activity_ms,
             has_following_content,
             has_running_step,
         });
@@ -1511,10 +1820,24 @@ fn build_live_segments(body_items: &[TimelineItemView]) -> Vec<TurnLiveSegmentVi
         }
 
         match it {
-            TimelineItemView::AssistantMessage { seq, item_id, .. } => {
+            TimelineItemView::AssistantMessage {
+                seq,
+                item_id,
+                text,
+                streaming,
+                ..
+            } => {
+                if text.trim().is_empty() && !*streaming {
+                    continue;
+                }
                 flush_steps(&mut raw_segments, &mut step_buf, true, Some(it));
+                let msg_key = if !item_id.is_empty() {
+                    format!("msg-{item_id}")
+                } else {
+                    format!("msg-seq-{seq}")
+                };
                 raw_segments.push(TurnLiveSegmentView::AssistantMessage {
-                    key: format!("msg-{item_id}-{seq}"),
+                    key: msg_key,
                     item: it.clone(),
                 });
             }
@@ -1524,19 +1847,24 @@ fn build_live_segments(body_items: &[TimelineItemView]) -> Vec<TurnLiveSegmentVi
                 message,
                 ..
             } => {
-                if level != "error" && contains_ascii_case_insensitive(message, "compact") {
+                if level == "wakeup" {
+                    flush_steps(&mut raw_segments, &mut step_buf, true, Some(it));
+                    raw_segments.push(TurnLiveSegmentView::Wakeup {
+                        key: format!("wakeup-{seq}"),
+                        label: if message.is_empty() {
+                            "Resumed from background task".to_string()
+                        } else {
+                            message.clone()
+                        },
+                    });
+                } else if level != "error" && contains_ascii_case_insensitive(message, "compact") {
                     flush_steps(&mut raw_segments, &mut step_buf, true, Some(it));
                     raw_segments.push(TurnLiveSegmentView::Compaction {
                         key: format!("compact-{seq}"),
                         label: message.clone(),
                     });
                 } else {
-                    flush_steps(
-                        &mut raw_segments,
-                        &mut step_buf,
-                        level == "wakeup",
-                        Some(it),
-                    );
+                    flush_steps(&mut raw_segments, &mut step_buf, false, Some(it));
                     raw_segments.push(TurnLiveSegmentView::Notice {
                         key: format!("notice-{seq}"),
                         item: it.clone(),
@@ -1663,17 +1991,17 @@ fn summarize_single_tool_call(
     }
 }
 
-fn build_live_step_label(item: Option<&TimelineItemView>) -> String {
+fn build_live_step_status(item: Option<&TimelineItemView>) -> (String, Option<String>) {
     let Some(item) = item else {
-        return "Working…".to_string();
+        return ("Working…".to_string(), None);
     };
     match item {
         TimelineItemView::AssistantThinking { text, .. } => {
             let headline = extract_thinking_headline(text, true);
             if headline.is_empty() {
-                "Thinking…".to_string()
+                ("Thinking…".to_string(), None)
             } else {
-                headline
+                ("Thinking".to_string(), Some(headline))
             }
         }
         TimelineItemView::ToolCall {
@@ -1683,44 +2011,518 @@ fn build_live_step_label(item: Option<&TimelineItemView>) -> String {
         } => match detail {
             ToolCallDetail::FileRead { path, .. } => {
                 let name = basename_of_path(path);
-                if !name.is_empty() {
+                let label = if !name.is_empty() {
                     format!("Reading {name}…")
                 } else {
                     "Reading a file…".to_string()
-                }
+                };
+                (label, None)
             }
             ToolCallDetail::FileEdit { path, .. } => {
                 let is_create = is_file_create_detail(summary_title, detail);
                 let name = basename_of_path(path);
                 let verb = if is_create { "Creating" } else { "Editing" };
-                if !name.is_empty() {
+                let label = if !name.is_empty() {
                     format!("{verb} {name}…")
                 } else {
                     format!("{verb} a file…")
-                }
+                };
+                (label, None)
             }
             ToolCallDetail::Search { query, .. } => {
                 match classify_search_tool(query, summary_title) {
-                    SearchSubkind::Web => "Searching the web…".to_string(),
-                    SearchSubkind::Glob => "Looking for files…".to_string(),
-                    SearchSubkind::Grep => "Searching files…".to_string(),
+                    SearchSubkind::Web => ("Searching the web…".to_string(), None),
+                    SearchSubkind::Glob => ("Looking for files…".to_string(), None),
+                    SearchSubkind::Grep => {
+                        let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let char_len = q.chars().count();
+                        let label = if (1..=28).contains(&char_len) {
+                            format!("Searching \"{q}\"…")
+                        } else {
+                            "Searching files…".to_string()
+                        };
+                        (label, None)
+                    }
                 }
             }
-            ToolCallDetail::Shell { .. } => "Running a command…".to_string(),
-            ToolCallDetail::Subagent { .. } => "Running subagent…".to_string(),
+            ToolCallDetail::Shell { command, .. } => {
+                let first_line = command
+                    .lines()
+                    .map(|ln| ln.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .find(|ln| !ln.is_empty())
+                    .unwrap_or_default();
+                let label = if first_line.is_empty() {
+                    "Running a command…".to_string()
+                } else {
+                    let short_cmd = truncate_chars_head(&first_line, 36).trim_end().to_string();
+                    if short_cmd.ends_with('…') {
+                        format!("Running {short_cmd}")
+                    } else {
+                        format!("Running {short_cmd}…")
+                    }
+                };
+                (label, None)
+            }
+            ToolCallDetail::Subagent { role, .. } => {
+                let clean_role = role.split_whitespace().collect::<Vec<_>>().join(" ");
+                let char_len = clean_role.chars().count();
+                let label = if (1..=28).contains(&char_len) {
+                    format!("Running {clean_role}…")
+                } else {
+                    "Running subagent…".to_string()
+                };
+                (label, None)
+            }
             ToolCallDetail::Generic { tool_name, .. } => {
                 let parsed = parse_generic_tool_name(tool_name);
-                if let Some(server) = parsed.server_name {
+                let label = if let Some(server) = parsed.server_name {
                     format!("Using {server}…")
                 } else if !parsed.display_label.is_empty() {
                     format!("Using {}…", parsed.display_label)
                 } else {
                     "Using a tool…".to_string()
-                }
+                };
+                (label, None)
             }
         },
-        _ => "Working…".to_string(),
+        _ => ("Working…".to_string(), None),
     }
+}
+
+fn truncate_chars_head(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let collected: String = chars.by_ref().take(max_chars).collect();
+    collected
+}
+
+fn truncate_chars_tail(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    s.chars().skip(total - max_chars).collect()
+}
+
+fn normalize_detected_url(raw: &str) -> String {
+    let replaced = raw.replace("0.0.0.0", "localhost");
+    replaced
+        .trim_end_matches(&['.', ',', ';', ':', '!', '?'][..])
+        .to_string()
+}
+
+fn collect_local_urls(text: &str, out: &mut Vec<String>) {
+    if text.is_empty() || out.len() >= 8 {
+        return;
+    }
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let mut offset = 0;
+
+    while offset < lower.len() && out.len() < 8 {
+        let rel_http = lower[offset..].find("http://");
+        let rel_https = lower[offset..].find("https://");
+        let (rel, scheme_len) = match (rel_http, rel_https) {
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    (a, 7)
+                } else {
+                    (b, 8)
+                }
+            }
+            (Some(a), None) => (a, 7),
+            (None, Some(b)) => (b, 8),
+            (None, None) => break,
+        };
+        let start = offset + rel;
+        let word_boundary = if start == 0 {
+            true
+        } else {
+            text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        };
+        let after_scheme = start + scheme_len;
+        if word_boundary && lower.is_char_boundary(after_scheme) {
+            let rest_lower = &lower[after_scheme..];
+            let host_len = if rest_lower.starts_with("localhost:") {
+                Some("localhost".len())
+            } else if rest_lower.starts_with("127.0.0.1:") {
+                Some("127.0.0.1".len())
+            } else if rest_lower.starts_with("0.0.0.0:") {
+                Some("0.0.0.0".len())
+            } else if rest_lower.starts_with("[::1]:") {
+                Some("[::1]".len())
+            } else {
+                None
+            };
+
+            if let Some(hl) = host_len {
+                let port_start = after_scheme + hl + 1;
+                let mut port_end = port_start;
+                while port_end < bytes.len()
+                    && bytes[port_end].is_ascii_digit()
+                    && (port_end - port_start) < 5
+                {
+                    port_end += 1;
+                }
+                let port_digits = port_end - port_start;
+                let port_terminated_by_digit =
+                    port_end < bytes.len() && bytes[port_end].is_ascii_digit();
+                if (2..=5).contains(&port_digits) && !port_terminated_by_digit {
+                    let mut url_end = port_end;
+                    if url_end < bytes.len() && bytes[url_end] == b'/' {
+                        url_end += 1;
+                        while url_end < text.len() {
+                            let Some(ch) = text[url_end..].chars().next() else {
+                                break;
+                            };
+                            if ch.is_whitespace()
+                                || matches!(ch, '"' | '\'' | '`' | '<' | '>' | ')' | ']')
+                            {
+                                break;
+                            }
+                            url_end += ch.len_utf8();
+                        }
+                    }
+                    let cleaned = normalize_detected_url(&text[start..url_end]);
+                    if !cleaned.is_empty() {
+                        push_unique(out, &cleaned);
+                    }
+                    offset = url_end;
+                    continue;
+                }
+            }
+        }
+        offset = after_scheme;
+    }
+}
+
+/// Derive compact, deduplicated session inventory (touched files, active background tasks,
+/// subagents, and detected localhost preview URLs) from the active timeline & host state.
+pub fn derive_session_insights(
+    items: &[TimelineItemView],
+    cwd: Option<&str>,
+    current_agent: Option<&AgentCardView>,
+    host_agents: &[AgentCardView],
+) -> SessionInsightsView {
+    let mut file_map: HashMap<String, SessionTouchedFileView> = HashMap::new();
+    let mut running_shells: Vec<SessionBackgroundTaskView> = Vec::new();
+    let mut subagent_map: HashMap<String, SessionSubagentEntryView> = HashMap::new();
+    let mut detected_local_urls: Vec<String> = Vec::new();
+
+    let last_user_prompt_index = items
+        .iter()
+        .rposition(|it| matches!(it, TimelineItemView::UserPrompt { .. }));
+    let agent_running = current_agent.is_some_and(|a| a.is_running);
+
+    for (idx, item) in items.iter().enumerate() {
+        match item {
+            TimelineItemView::AssistantMessage { text, .. } => {
+                collect_local_urls(text, &mut detected_local_urls);
+            }
+            TimelineItemView::ToolCall {
+                seq,
+                call_id,
+                status,
+                summary_title,
+                detail,
+                diff_files,
+                timestamp_ms,
+                ..
+            } => match detail {
+                ToolCallDetail::FileRead { path, .. } => {
+                    let raw_path = path.trim();
+                    if raw_path.is_empty() {
+                        continue;
+                    }
+                    let display_path = strip_workspace_prefix(raw_path, cwd);
+                    file_map
+                        .entry(display_path.clone())
+                        .and_modify(|prev| prev.last_seq = prev.last_seq.max(*seq))
+                        .or_insert_with(|| SessionTouchedFileView {
+                            path: raw_path.to_string(),
+                            display_path,
+                            action: SessionTouchedFileAction::Read,
+                            additions: 0,
+                            deletions: 0,
+                            last_seq: *seq,
+                        });
+                }
+                ToolCallDetail::FileEdit { path, .. } => {
+                    let raw_path = path.trim();
+                    if raw_path.is_empty() {
+                        continue;
+                    }
+                    let display_path = strip_workspace_prefix(raw_path, cwd);
+                    let is_create = is_file_create_detail(summary_title, detail);
+                    let add: u32 = diff_files.iter().map(|f| f.additions).sum();
+                    let del: u32 = diff_files.iter().map(|f| f.deletions).sum();
+                    file_map
+                        .entry(display_path.clone())
+                        .and_modify(|prev| {
+                            prev.action =
+                                if prev.action == SessionTouchedFileAction::Created || is_create {
+                                    SessionTouchedFileAction::Created
+                                } else {
+                                    SessionTouchedFileAction::Edited
+                                };
+                            prev.additions += add;
+                            prev.deletions += del;
+                            prev.last_seq = prev.last_seq.max(*seq);
+                        })
+                        .or_insert_with(|| SessionTouchedFileView {
+                            path: raw_path.to_string(),
+                            display_path,
+                            action: if is_create {
+                                SessionTouchedFileAction::Created
+                            } else {
+                                SessionTouchedFileAction::Edited
+                            },
+                            additions: add,
+                            deletions: del,
+                            last_seq: *seq,
+                        });
+                }
+                ToolCallDetail::Shell {
+                    command,
+                    cwd: shell_cwd,
+                    output_preview,
+                    ..
+                } => {
+                    if let Some(out) = output_preview {
+                        collect_local_urls(out, &mut detected_local_urls);
+                    }
+                    let after_last_prompt =
+                        last_user_prompt_index.is_none_or(|prompt_idx| idx > prompt_idx);
+                    if agent_running && after_last_prompt && *status == ToolCallStatus::Running {
+                        let first_line = command
+                            .lines()
+                            .map(str::trim)
+                            .find(|l| !l.is_empty())
+                            .unwrap_or("Running command")
+                            .to_string();
+                        let subtitle = shell_cwd
+                            .as_deref()
+                            .map(|c| strip_workspace_prefix(c, cwd))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "Shell command".to_string());
+                        running_shells.push(SessionBackgroundTaskView {
+                            id: format!("shell:{call_id}"),
+                            kind: SessionBackgroundTaskKind::Shell,
+                            title: first_line,
+                            subtitle,
+                            status: SessionBackgroundTaskStatus::Running,
+                            started_at_ms: *timestamp_ms,
+                            command: Some(command.clone()),
+                            output_preview: output_preview.clone(),
+                        });
+                    }
+                }
+                ToolCallDetail::Subagent {
+                    child_agent_id,
+                    role,
+                    prompt_preview,
+                } => {
+                    let key = child_agent_id
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(call_id.as_str())
+                        .to_string();
+                    subagent_map.insert(
+                        key,
+                        SessionSubagentEntryView {
+                            id: call_id.clone(),
+                            role: if role.is_empty() {
+                                "Subagent".to_string()
+                            } else {
+                                role.clone()
+                            },
+                            prompt_preview: prompt_preview.clone(),
+                            status: *status,
+                            child_agent_id: child_agent_id.clone(),
+                            last_seq: *seq,
+                        },
+                    );
+                }
+                ToolCallDetail::Search { .. } | ToolCallDetail::Generic { .. } => {}
+            },
+            _ => {}
+        }
+    }
+
+    if let Some(cur) = current_agent {
+        for ag in host_agents {
+            if ag.parent_agent_id.as_deref() == Some(cur.agent_id.as_str()) {
+                let status = if ag.is_running {
+                    ToolCallStatus::Running
+                } else if contains_ascii_case_insensitive(&ag.status_label, "error") {
+                    ToolCallStatus::Failed
+                } else {
+                    ToolCallStatus::Completed
+                };
+                if let Some(existing) = subagent_map.get_mut(&ag.agent_id) {
+                    existing.status = status;
+                    existing.child_agent_id = Some(ag.agent_id.clone());
+                } else {
+                    subagent_map.insert(
+                        ag.agent_id.clone(),
+                        SessionSubagentEntryView {
+                            id: ag.agent_id.clone(),
+                            role: if ag.title.is_empty() {
+                                "Subagent".to_string()
+                            } else {
+                                ag.title.clone()
+                            },
+                            prompt_preview: ag.status_label.clone(),
+                            status,
+                            child_agent_id: Some(ag.agent_id.clone()),
+                            last_seq: ag.latest_seq,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let mut background_tasks = running_shells;
+    if let Some(cur) = current_agent
+        && cur.is_running
+    {
+        let trimmed = cur.status_label.trim_start();
+        if starts_with_ignore_ascii_case(trimmed, "waking")
+            && trimmed["waking".len()..].trim_start().starts_with('(')
+        {
+            background_tasks.insert(
+                0,
+                SessionBackgroundTaskView {
+                    id: format!("wakeup:{}", cur.agent_id),
+                    kind: SessionBackgroundTaskKind::Wakeup,
+                    title: cur.status_label.clone(),
+                    subtitle: "Autonomous background wakeup".to_string(),
+                    status: SessionBackgroundTaskStatus::Running,
+                    started_at_ms: None,
+                    command: None,
+                    output_preview: None,
+                },
+            );
+        }
+    }
+
+    let mut touched_files: Vec<SessionTouchedFileView> = file_map.into_values().collect();
+    touched_files.sort_by(|a, b| {
+        let a_edit = u8::from(a.action != SessionTouchedFileAction::Read);
+        let b_edit = u8::from(b.action != SessionTouchedFileAction::Read);
+        b_edit
+            .cmp(&a_edit)
+            .then_with(|| b.last_seq.cmp(&a.last_seq))
+    });
+
+    let mut subagents: Vec<SessionSubagentEntryView> = subagent_map.into_values().collect();
+    subagents.sort_by(|a, b| {
+        let a_run = u8::from(a.status == ToolCallStatus::Running);
+        let b_run = u8::from(b.status == ToolCallStatus::Running);
+        b_run.cmp(&a_run).then_with(|| b.last_seq.cmp(&a.last_seq))
+    });
+
+    SessionInsightsView {
+        touched_files,
+        background_tasks,
+        subagents,
+        detected_local_urls,
+    }
+}
+
+/// Build a concise, bounded read-only context summary of the active session for `/btw` side questions.
+pub fn build_side_question_context_summary(
+    cwd: &str,
+    branch_name: Option<&str>,
+    items: &[TimelineItemView],
+    git_status: Option<&GitStatusSnapshot>,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+    let display_cwd = if cwd.trim().is_empty() { "~" } else { cwd };
+    let branch_suffix = branch_name
+        .filter(|b| !b.trim().is_empty())
+        .map(|b| format!(" (branch: {b})"))
+        .unwrap_or_default();
+    sections.push(format!("Workspace: {display_cwd}{branch_suffix}"));
+
+    if let Some(status) = git_status
+        && !status.files.is_empty()
+    {
+        let total = status.files.len();
+        let list: String = status
+            .files
+            .iter()
+            .take(20)
+            .map(|f| format!("{} {}", f.status, f.path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sections.push(format!("Modified files ({total}): {list}"));
+    }
+
+    let relevant: Vec<&TimelineItemView> = items
+        .iter()
+        .filter(|it| match it {
+            TimelineItemView::UserPrompt { .. } | TimelineItemView::AssistantMessage { .. } => true,
+            TimelineItemView::ToolCall { detail, .. } => matches!(
+                detail,
+                ToolCallDetail::FileEdit { .. } | ToolCallDetail::Shell { .. }
+            ),
+            _ => false,
+        })
+        .collect();
+
+    let start_idx = relevant.len().saturating_sub(18);
+    let mut recent_exchanges: Vec<String> = Vec::new();
+    for it in &relevant[start_idx..] {
+        match it {
+            TimelineItemView::UserPrompt { text, .. } => {
+                let snippet = truncate_chars_head(text.trim(), 700);
+                recent_exchanges.push(format!("User: {snippet}"));
+            }
+            TimelineItemView::AssistantMessage { text, .. } => {
+                let snippet = truncate_chars_head(text.trim(), 1200);
+                recent_exchanges.push(format!("Assistant: {snippet}"));
+            }
+            TimelineItemView::ToolCall { status, detail, .. } => {
+                let status_str = match status {
+                    ToolCallStatus::Running => "running",
+                    ToolCallStatus::Completed => "completed",
+                    ToolCallStatus::Failed => "failed",
+                    ToolCallStatus::Denied => "denied",
+                };
+                match detail {
+                    ToolCallDetail::FileEdit { path, .. } => {
+                        let rel = strip_workspace_prefix(path, Some(cwd));
+                        recent_exchanges.push(format!("Tool [edit {rel}] ({status_str})"));
+                    }
+                    ToolCallDetail::Shell {
+                        command, exit_code, ..
+                    } => {
+                        let cmd = truncate_chars_head(command, 140);
+                        let exit_suffix =
+                            exit_code.map(|c| format!(" exit={c}")).unwrap_or_default();
+                        recent_exchanges
+                            .push(format!("Tool [shell: {cmd}] ({status_str}{exit_suffix})"));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !recent_exchanges.is_empty() {
+        recent_exchanges.shrink_to_fit();
+        sections.push(format!(
+            "Recent conversation trace:\n{}",
+            recent_exchanges.join("\n\n")
+        ));
+    }
+
+    truncate_chars_tail(&sections.join("\n\n"), 10_500)
 }
 
 fn lowercase_clause_lead(clause: &str) -> String {
@@ -2202,5 +3004,199 @@ mod tests {
         assert_eq!(t2.turn_diffs.len(), 1);
         assert_eq!(t2.turn_diffs[0].path, "src/lib.rs");
         assert_eq!(t2.turn_diffs[0].additions, 5);
+    }
+
+    #[test]
+    fn wakeup_live_detail_work_duration_compactions_and_insights_match_desktop() {
+        use orbit_protocol::{AgentStatus, ProviderKind, SessionMode};
+
+        let items = vec![
+            TimelineItemView::UserPrompt {
+                seq: 1,
+                message_id: "m1".into(),
+                text: "Start task".into(),
+                badges: Vec::new(),
+                blocks: Vec::new(),
+                timestamp_ms: Some(1_000),
+            },
+            TimelineItemView::AssistantThinking {
+                seq: 2,
+                item_id: "th1".into(),
+                text: "## Inspecting codebase\nChecking modules".into(),
+                timestamp_ms: Some(2_000),
+            },
+            TimelineItemView::AssistantMessage {
+                seq: 3,
+                item_id: "a1".into(),
+                text: "Interim reply at http://0.0.0.0:5173/app!".into(),
+                streaming: false,
+                blocks: Vec::new(),
+                timestamp_ms: Some(5_000),
+            },
+            TimelineItemView::Notice {
+                seq: 4,
+                level: "wakeup".into(),
+                message: "Resumed from background timer".into(),
+                timestamp_ms: Some(6_000),
+            },
+            TimelineItemView::Notice {
+                seq: 5,
+                level: "info".into(),
+                message: "Compacted conversation history".into(),
+                timestamp_ms: Some(7_000),
+            },
+            make_tool(
+                6,
+                ToolCallStatus::Running,
+                "Running cargo test --workspace",
+                ToolCallDetail::Shell {
+                    command: "cargo test --workspace".into(),
+                    cwd: Some("/repo/crates".into()),
+                    exit_code: None,
+                    output_preview: Some("listening on http://127.0.0.1:8080/".into()),
+                },
+                Vec::new(),
+                8_000,
+            ),
+            make_tool(
+                7,
+                ToolCallStatus::Completed,
+                "Subagent review",
+                ToolCallDetail::Subagent {
+                    child_agent_id: Some("child_1".into()),
+                    role: "Reviewer".into(),
+                    prompt_preview: "Audit stage".into(),
+                },
+                Vec::new(),
+                9_000,
+            ),
+        ];
+
+        let (turns, _, _, _) = process_timeline_for_stage(&items, Some("/repo"));
+        assert_eq!(turns.len(), 1);
+        let t = &turns[0];
+        assert!(t.terminal_reply.is_none());
+        assert!(t.last_assistant_reply.is_some());
+        assert_eq!(t.compactions.len(), 1);
+        assert!(matches!(
+            t.live_segments.iter().find(|s| matches!(s, TurnLiveSegmentView::Wakeup { .. })),
+            Some(TurnLiveSegmentView::Wakeup { label, .. }) if label == "Resumed from background timer"
+        ));
+
+        // Thinking only group should emit live_label="Thinking" + live_detail="Checking modules"
+        let thinking_only = vec![items[1].clone()];
+        let think_sum = summarize_work_items(&thinking_only, None);
+        assert_eq!(think_sum.live_label, "Thinking");
+        assert_eq!(think_sum.live_detail.as_deref(), Some("Checking modules"));
+
+        let cur_agent = AgentCardView {
+            agent_id: "parent_1".into(),
+            workspace_id: "ws_1".into(),
+            cwd: "/repo".into(),
+            title: "Main".into(),
+            provider: ProviderKind::ClaudeCode,
+            provider_label: "Claude Code".into(),
+            model: None,
+            effort: None,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::AutonomousWakeup {
+                source: "cron".into(),
+                turn_id: "wk_cron".into(),
+            },
+            status_label: "Waking (cron)".into(),
+            is_running: true,
+            is_awaiting_permission: false,
+            parent_agent_id: None,
+            latest_seq: 7,
+            updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
+            is_pinned: false,
+            seen_seq: 0,
+            is_unread: false,
+        };
+        let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[]);
+        assert_eq!(
+            insights.detected_local_urls,
+            vec![
+                "http://localhost:5173/app".to_string(),
+                "http://127.0.0.1:8080/".to_string()
+            ]
+        );
+        assert_eq!(insights.background_tasks.len(), 2);
+        assert_eq!(
+            insights.background_tasks[0].kind,
+            SessionBackgroundTaskKind::Wakeup
+        );
+        assert_eq!(
+            insights.background_tasks[1].kind,
+            SessionBackgroundTaskKind::Shell
+        );
+        assert_eq!(insights.subagents.len(), 1);
+
+        let ctx = build_side_question_context_summary("/repo", Some("main"), &items, None);
+        assert!(ctx.contains("Workspace: /repo (branch: main)"));
+        assert!(ctx.contains("Tool [shell: cargo test --workspace] (running)"));
+    }
+
+    #[test]
+    fn streaming_seq_updates_preserve_stable_turn_and_segment_keys() {
+        let initial = vec![
+            TimelineItemView::AssistantThinking {
+                seq: 1,
+                item_id: "think_1".into(),
+                text: "Scanning modules".into(),
+                timestamp_ms: Some(1_000),
+            },
+            TimelineItemView::AssistantMessage {
+                seq: 2,
+                item_id: "msg_1".into(),
+                text: "| A | B |\n| - | - |\n| 1 | 2".into(),
+                streaming: true,
+                blocks: Vec::new(),
+                timestamp_ms: Some(1_500),
+            },
+        ];
+        let updated = vec![
+            TimelineItemView::AssistantThinking {
+                seq: 10,
+                item_id: "think_1".into(),
+                text: "Scanning modules deeply".into(),
+                timestamp_ms: Some(1_000),
+            },
+            TimelineItemView::AssistantMessage {
+                seq: 11,
+                item_id: "msg_1".into(),
+                text: "| A | B |\n| - | - |\n| 1 | 2 |\n\nMore trailing text...".into(),
+                streaming: true,
+                blocks: Vec::new(),
+                timestamp_ms: Some(1_500),
+            },
+        ];
+
+        let (turns_a, _, _, _) = process_timeline_for_stage(&initial, Some("/repo"));
+        let (turns_b, _, _, _) = process_timeline_for_stage(&updated, Some("/repo"));
+        assert_eq!(turns_a.len(), 1);
+        assert_eq!(turns_b.len(), 1);
+        assert_eq!(turns_a[0].key, turns_b[0].key);
+        assert_eq!(turns_a[0].live_segments.len(), 2);
+        assert_eq!(turns_b[0].live_segments.len(), 2);
+
+        fn key_of(seg: &TurnLiveSegmentView) -> &str {
+            match seg {
+                TurnLiveSegmentView::StepGroup { key, .. } => key.as_str(),
+                TurnLiveSegmentView::AssistantMessage { key, .. } => key.as_str(),
+                TurnLiveSegmentView::Notice { key, .. } => key.as_str(),
+                TurnLiveSegmentView::Compaction { key, .. } => key.as_str(),
+                TurnLiveSegmentView::Wakeup { key, .. } => key.as_str(),
+            }
+        }
+        assert_eq!(
+            key_of(&turns_a[0].live_segments[0]),
+            key_of(&turns_b[0].live_segments[0])
+        );
+        assert_eq!(
+            key_of(&turns_a[0].live_segments[1]),
+            key_of(&turns_b[0].live_segments[1])
+        );
+        assert_eq!(key_of(&turns_b[0].live_segments[1]), "msg-msg_1");
     }
 }

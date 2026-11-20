@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 import { isMacDesktop, orbitIpc } from "@/lib/orbit-ipc";
 import {
-  findFirstPendingPermission,
   getFocusedDecisionTarget,
   isAlwaysDecision,
   isDenyDecision,
@@ -109,6 +108,14 @@ export function useGlobalErgonomicKeybindings(): void {
         return;
       }
 
+      // 5b-2. Open Side Panel New Tab / Launchpad (`⌘T` / `Ctrl+T`)
+      if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "t") {
+        e.preventDefault();
+        if (e.repeat) return;
+        orbitActions.openSidePanelNewTab();
+        return;
+      }
+
       // 5c. Toggle Main Stage Overview Panel (`⌘⌥O` / `Ctrl+Alt+O`)
       if (mod && e.altKey && !e.shiftKey && (keyLower === "o" || e.code === "KeyO")) {
         e.preventDefault();
@@ -169,18 +176,17 @@ export function useGlobalErgonomicKeybindings(): void {
       if (mod && !e.altKey && !e.repeat && snap.selectedHostId && snap.selectedAgentId && !snap.isDraftNewSession) {
         const focused = getFocusedDecisionTarget();
         if (focused?.kind !== "question") {
-          const tl = snap.timelines[`${snap.selectedHostId}::${snap.selectedAgentId}`];
-          if (tl) {
+          const stage = snap.stages[`${snap.selectedHostId}::${snap.selectedAgentId}`];
+          if (stage) {
+            const pendingPerms = stage.pending_permissions.filter(
+              (it): it is Extract<(typeof stage.pending_permissions)[number], { item_type: "permission_request" }> =>
+                it.item_type === "permission_request" && !it.resolved_decision,
+            );
             const focusedPerm =
               focused?.kind === "permission"
-                ? tl.items.find(
-                    (it): it is Extract<(typeof tl.items)[number], { item_type: "permission_request" }> =>
-                      it.item_type === "permission_request" &&
-                      !it.resolved_decision &&
-                      it.request_id === focused.requestId,
-                  ) ?? null
+                ? pendingPerms.find((it) => it.request_id === focused.requestId) ?? null
                 : null;
-            const targetPerm = focusedPerm ?? findFirstPendingPermission(tl.items);
+            const targetPerm = focusedPerm ?? pendingPerms[0] ?? null;
             if (targetPerm) {
               const decisions =
                 targetPerm.allowed_decisions.length > 0

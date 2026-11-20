@@ -1566,60 +1566,83 @@ pub fn read_local_workspace_file(
     use std::io::Read;
     use std::path::Component;
 
+    const LOCAL_IMAGE_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         return Err("File path cannot be empty".into());
     }
 
-    let resolved_cwd = if cwd.trim().is_empty() || cwd.trim() == "~" {
-        resolve_user_home().unwrap_or_else(|| PathBuf::from("."))
-    } else if let Some(rest) = cwd.trim().strip_prefix("~/") {
-        resolve_user_home()
-            .map(|h| h.join(rest))
-            .unwrap_or_else(|| PathBuf::from(cwd.trim()))
-    } else {
-        PathBuf::from(cwd.trim())
-    };
-    let canonical_cwd = fs::canonicalize(&resolved_cwd)
-        .map_err(|e| format!("Workspace directory unavailable: {e}"))?;
+    let orbit_home_dir = std::env::var_os("ORBIT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| resolve_user_home().map(|h| h.join(".orbit")));
 
-    let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
-        resolve_user_home()
-            .map(|h| h.join(rest))
-            .ok_or_else(|| "Cannot resolve home directory".to_string())?
-    } else {
-        let p = Path::new(trimmed);
-        if p.is_absolute() {
-            p.to_path_buf()
+    let attachment_direct = (|| -> Option<PathBuf> {
+        let cand = if let Some(rest) = trimmed.strip_prefix("~/") {
+            resolve_user_home()?.join(rest)
         } else {
-            if p.components()
-                .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-            {
-                return Err(format!("Path `{trimmed}` escapes the workspace directory"));
+            let p = Path::new(trimmed);
+            if !p.is_absolute() {
+                return None;
             }
-            canonical_cwd.join(p)
-        }
-    };
+            p.to_path_buf()
+        };
+        let home = orbit_home_dir.as_ref()?;
+        let canon_att = fs::canonicalize(home.join("attachments")).ok()?;
+        let canon_cand = fs::canonicalize(&cand).ok()?;
+        canon_cand.starts_with(&canon_att).then_some(canon_cand)
+    })();
 
-    let canonical =
-        fs::canonicalize(&candidate).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
-    let mut allowed = canonical.starts_with(&canonical_cwd);
-    if !allowed {
-        let orbit_home = std::env::var_os("ORBIT_HOME")
-            .map(PathBuf::from)
-            .or_else(|| resolve_user_home().map(|h| h.join(".orbit")));
-        if let Some(home) = orbit_home
+    let canonical = if let Some(att_path) = attachment_direct {
+        att_path
+    } else {
+        let resolved_cwd = if cwd.trim().is_empty() || cwd.trim() == "~" {
+            resolve_user_home().unwrap_or_else(|| PathBuf::from("."))
+        } else if let Some(rest) = cwd.trim().strip_prefix("~/") {
+            resolve_user_home()
+                .map(|h| h.join(rest))
+                .unwrap_or_else(|| PathBuf::from(cwd.trim()))
+        } else {
+            PathBuf::from(cwd.trim())
+        };
+        let canonical_cwd = fs::canonicalize(&resolved_cwd)
+            .map_err(|e| format!("Workspace directory unavailable: {e}"))?;
+
+        let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
+            resolve_user_home()
+                .map(|h| h.join(rest))
+                .ok_or_else(|| "Cannot resolve home directory".to_string())?
+        } else {
+            let p = Path::new(trimmed);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                if p.components()
+                    .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+                {
+                    return Err(format!("Path `{trimmed}` escapes the workspace directory"));
+                }
+                canonical_cwd.join(p)
+            }
+        };
+
+        let canon =
+            fs::canonicalize(&candidate).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+        let mut allowed = canon.starts_with(&canonical_cwd);
+        if !allowed
+            && let Some(home) = orbit_home_dir.as_ref()
             && let Ok(canon_att) = fs::canonicalize(home.join("attachments"))
-            && canonical.starts_with(&canon_att)
+            && canon.starts_with(&canon_att)
         {
             allowed = true;
         }
-    }
-    if !allowed {
-        return Err(format!(
-            "Access denied: `{trimmed}` is outside the workspace directory"
-        ));
-    }
+        if !allowed {
+            return Err(format!(
+                "Access denied: `{trimmed}` is outside the workspace directory"
+            ));
+        }
+        canon
+    };
 
     let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
     if !meta.is_file() {
@@ -1627,9 +1650,16 @@ pub fn read_local_workspace_file(
     }
 
     let size_bytes = meta.len();
-    let cap = max_bytes
-        .unwrap_or(2 * 1024 * 1024)
-        .clamp(4096, 4 * 1024 * 1024);
+    let is_image = local_image_mime_for_path(&canonical).is_some();
+    let cap = if is_image {
+        max_bytes
+            .unwrap_or(LOCAL_IMAGE_MAX_READ_BYTES)
+            .clamp(4096, LOCAL_IMAGE_MAX_READ_BYTES)
+    } else {
+        max_bytes
+            .unwrap_or(2 * 1024 * 1024)
+            .clamp(4096, 4 * 1024 * 1024)
+    };
     let resolved_path = canonical.to_string_lossy().to_string();
 
     if let Some(mime) = local_image_mime_for_path(&canonical) {

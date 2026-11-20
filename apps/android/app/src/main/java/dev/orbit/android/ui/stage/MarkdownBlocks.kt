@@ -69,6 +69,7 @@ import uniffi.orbit_ffi_uniffi.FfiInlineSpan
 import uniffi.orbit_ffi_uniffi.FfiRichBlock
 import uniffi.orbit_ffi_uniffi.FfiTableAlignment
 import uniffi.orbit_ffi_uniffi.FfiTableCell
+import uniffi.orbit_ffi_uniffi.detectDiagramKind
 
 private sealed class MarkdownRenderSegment {
     data class ProseRun(val blocks: List<FfiRichBlock>) : MarkdownRenderSegment()
@@ -236,7 +237,12 @@ fun MarkdownBlocks(
                     }
 
                     is MarkdownRenderSegment.CodeBlock -> {
-                        CodeBlockSurface(block = seg.block)
+                        val diagramKind = detectDiagramKind(seg.block.language, seg.block.rawCode)
+                        if (diagramKind != null && LocalDiagramRenderer.current != null) {
+                            DiagramBlockSurface(kind = diagramKind, block = seg.block)
+                        } else {
+                            CodeBlockSurface(block = seg.block)
+                        }
                     }
 
                     is MarkdownRenderSegment.Table -> {
@@ -402,7 +408,10 @@ private fun AnnotatedString.Builder.appendStyledSpans(
 }
 
 @Composable
-private fun CodeBlockSurface(block: FfiRichBlock.CodeBlock) {
+internal fun CodeBlockSurface(
+    block: FfiRichBlock.CodeBlock,
+    modifier: Modifier = Modifier,
+) {
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
     val context = LocalContext.current
@@ -420,7 +429,7 @@ private fun CodeBlockSurface(block: FfiRichBlock.CodeBlock) {
     val defaultCodeFg = if (colors.isDark) Color(0xFFE6E8EE) else colors.fgPrimary
 
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clip(shape)
             .background(colors.code, shape)

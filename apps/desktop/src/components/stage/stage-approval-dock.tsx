@@ -801,7 +801,7 @@ export const StickyApprovalDock = memo(
 
     return (
       <div className="w-full px-[24px] pb-2.5">
-        <div className="mx-auto w-full max-w-[768px]">
+        <div className="mx-auto w-full max-w-[var(--orbit-stage-max-w,768px)]">
           {activeEntry.kind === "permission" ? (
             <PermissionApprovalCard
               key={activeEntry.item.request_id}

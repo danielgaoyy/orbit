@@ -12,7 +12,6 @@ import {
   Tablet,
 } from "lucide-react";
 import { orbitIpc } from "@/lib/orbit-ipc";
-import { deriveSessionInsights } from "@/lib/session-insights";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -91,32 +90,16 @@ export const BrowserTab = memo(function BrowserTab({
   overlayState?: BrowserTabOverlayState;
 }) {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
-  const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
-  const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
-  const activeTimeline = useOrbitSelector((s) =>
+  const activeStage = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
-      ? (s.timelines[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
+      ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
       : null,
   );
   const hostDetail = useOrbitSelector((s) =>
     s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
   );
 
-  const detectedUrls = useMemo(() => {
-    const items = activeTimeline?.items ?? [];
-    if (items.length === 0) return [];
-    const currentAgent =
-      hostDetail?.agents.find((a) => a.agent_id === selectedAgentId) ??
-      activeTimeline?.agent ??
-      null;
-    return deriveSessionInsights({
-      items,
-      cwd: selectedCwd,
-      currentAgent,
-      hostDetail,
-      queuedPrompts: [],
-    }).detectedLocalUrls;
-  }, [activeTimeline, hostDetail, selectedAgentId, selectedCwd]);
+  const detectedUrls = activeStage?.insights.detected_local_urls ?? [];
 
   const initialUrl = sanitizeHttpUrl(tab.url ?? "");
   const [navState, setNavState] = useState<{ entries: string[]; idx: number }>(() =>

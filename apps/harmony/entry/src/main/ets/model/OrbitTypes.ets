@@ -37,9 +37,10 @@ export interface DiscoveredProjectDto {
 
 export interface LaunchpadProjectDto {
   id: string;
+  host_id?: string;
   name: string;
   path: string;
-  branch: string;
+  branch: string | null;
 }
 
 export interface HostCardDto {
@@ -103,6 +104,9 @@ export interface AgentCardDto {
   parent_agent_id: string | null;
   latest_seq: number;
   updated_at_rfc3339: string;
+  is_pinned?: boolean;
+  seen_seq?: number;
+  is_unread?: boolean;
 }
 
 export interface ThinkingOptionSpecDto {
@@ -194,6 +198,7 @@ export interface HostDetailDto {
 export interface PromptBadgeDto {
   kind: string;
   label: string;
+  path?: string | null;
 }
 
 export interface InlineSpanDto {
@@ -352,7 +357,13 @@ export interface WorkSummaryResultDto {
   counts: TurnWorkCountsDto;
   label: string;
   live_label: string;
+  live_detail?: string | null;
   label_includes_failure: boolean;
+}
+
+export interface TurnCompactionItemDto {
+  seq: number;
+  label: string;
 }
 
 export interface TurnLiveSegmentDto {
@@ -361,6 +372,10 @@ export interface TurnLiveSegmentDto {
   first_seq?: number;
   items?: TimelineItemDto[];
   summary?: WorkSummaryResultDto;
+  thought_duration_ms?: number | null;
+  work_duration_ms?: number | null;
+  started_at_ms?: number | null;
+  latest_activity_ms?: number | null;
   has_following_content?: boolean;
   has_running_step?: boolean;
   item?: TimelineItemDto;
@@ -377,11 +392,14 @@ export interface StageTurnDto {
   work_counts: TurnWorkCountsDto;
   work_summary_label: string;
   work_summary_live_label: string;
+  work_summary_live_detail?: string | null;
   work_summary_includes_failure: boolean;
   thought_duration_ms: number | null;
+  work_duration_ms?: number | null;
   turn_duration_ms: number | null;
   terminal_reply: TimelineItemDto | null;
   notices: TimelineItemDto[];
+  compactions?: TurnCompactionItemDto[];
   live_segments: TurnLiveSegmentDto[];
   turn_diffs: TurnFileDiffSummaryDto[];
   has_error: boolean;
@@ -400,6 +418,213 @@ export interface AgentStageDto {
   pending_questions: TimelineItemDto[];
   session_turn_diffs: DiffFileDto[];
   latest_seq: number;
+}
+
+export interface AgentStageDeltaDto {
+  revision: number;
+  host_id: string;
+  agent: AgentCardDto | null;
+  replace_from_turn_index: number;
+  changed_turns: StageTurnDto[];
+  total_turn_count: number;
+  pending_permissions: TimelineItemDto[];
+  pending_questions: TimelineItemDto[];
+  session_turn_diffs: DiffFileDto[];
+  latest_seq: number;
+  reset: boolean;
+}
+
+export interface FleetSidebarRequestDto {
+  sort: string;
+  filter: string;
+  query: string;
+  active_host_id: string | null;
+  active_agent_id: string | null;
+  active_cwd: string | null;
+}
+
+export interface SidebarConversationDto {
+  host_id: string;
+  agent: AgentCardDto;
+  is_worktree: boolean;
+  is_pinned: boolean;
+  is_unread: boolean;
+  seen_seq: number;
+}
+
+export interface SidebarProjectGroupDto {
+  id: string;
+  host_id: string;
+  name: string;
+  primary_cwd: string;
+  directories: string[];
+  git_branch: string | null;
+  pinned_project_id: string | null;
+  is_home_workspace: boolean;
+  sort_weight_ms: number;
+  conversations: SidebarConversationDto[];
+}
+
+export interface FleetSidebarDto {
+  revision: number;
+  projects: SidebarProjectGroupDto[];
+  launchpad_projects: LaunchpadProjectDto[];
+  needs_attention: SidebarConversationDto[];
+  pinned_conversations: SidebarConversationDto[];
+}
+
+export interface ThreadPrefSeedDto {
+  host_id: string;
+  agent_id: string;
+  seen_seq: number;
+  is_pinned: boolean;
+  pinned_order: number;
+  updated_at_ms: number;
+}
+
+export interface ModelSelectionRequestDto {
+  host_id: string | null;
+  provider: string;
+  desired_model: string | null;
+  desired_effort: string | null;
+}
+
+export interface ResolvedModelSelectionDto {
+  provider: string;
+  catalog: ProviderModelCatalogDto;
+  selected_model_id: string | null;
+  selected_model_label: string;
+  selected_effort: string | null;
+  selected_effort_label: string | null;
+  thinking_options: ThinkingOptionSpecDto[];
+}
+
+export interface SlashCommandDto {
+  id: string;
+  command: string;
+  label: string;
+  description: string;
+  shortcut_key: string | null;
+  icon_key: string;
+  keywords: string[];
+  desktop_only: boolean;
+}
+
+export interface MentionRankRequestDto {
+  host_id: string;
+  cwd: string;
+  query: string;
+  limit: number;
+}
+
+export interface MentionCandidateDto {
+  key: string;
+  kind: string; // 'git_diff' | 'staged' | 'terminal' | 'file'
+  token_label: string;
+  title: string;
+  subtitle: string;
+  file_path: string;
+  git_status: string;
+  score: number;
+}
+
+export interface ComposerContextInputDto {
+  kind: string; // 'image' | 'staged_file' | 'workspace_file' | 'git_diff' | 'terminal_output' | 'assistant_quote'
+  path?: string;
+  filename?: string;
+  staged?: boolean;
+  label?: string;
+  diff_text?: string | null;
+  content?: string;
+}
+
+export interface ComposerQuoteInputDto {
+  path: string;
+  line_number: number | null;
+  code: string;
+}
+
+export interface ComposerPasteInputDto {
+  label: string;
+  filename: string | null;
+  content: string;
+}
+
+export interface ComposePromptRequestDto {
+  provider: string;
+  raw_text: string;
+  explicit_directive: string | null;
+  host_id: string | null;
+  cwd: string | null;
+  contexts: ComposerContextInputDto[];
+  quotes: ComposerQuoteInputDto[];
+  pastes: ComposerPasteInputDto[];
+}
+
+export interface ComposedPromptDto {
+  wire_prompt: string;
+  display_prompt: string;
+  badges: PromptBadgeDto[];
+  effective_directive: string | null;
+  is_compact: boolean;
+  is_btw: boolean;
+  btw_question: string | null;
+  is_empty: boolean;
+}
+
+export interface RewindAgentResultDto {
+  agent: AgentCardDto;
+  restored_files: number;
+  restored_prompt: string | null;
+  notice: string | null;
+}
+
+export interface WorkspaceFileViewDto {
+  host_id: string;
+  cwd: string;
+  path: string;
+  resolved_path: string;
+  language: string;
+  content_kind: string;
+  mime_type: string | null;
+  content: string;
+  size_bytes: number;
+  truncated: boolean;
+  highlighted_lines: HighlightedLineDto[];
+  markdown_blocks: RichBlockDto[];
+}
+
+export interface AskSideQuestionRequestDto {
+  host_id: string;
+  agent_id: string | null;
+  cwd: string;
+  provider: string;
+  model: string | null;
+  question: string;
+  context_summary: string | null;
+}
+
+export interface SideQuestionEventDto {
+  request_id?: string;
+  text_delta?: string;
+  full_text?: string;
+  error?: string | null;
+}
+
+export interface RenderDiagramRequestDto {
+  kind: string; // 'mermaid' | 'svg' | 'graphviz'
+  source: string;
+  theme: string; // 'light' | 'dark'
+}
+
+export interface RenderDiagramViewDto {
+  kind: string;
+  theme: string;
+  svg: string | null;
+  width: number;
+  height: number;
+  error: string | null;
+  diagram_type_label: string | null;
 }
 
 export interface GitFileEntryDto {
@@ -474,15 +699,6 @@ export interface InlineMentionRegistration {
   label: string;
 }
 
-export interface OrbitSlashCommand {
-  id: string;
-  command: string;
-  label: string;
-  description: string;
-  symbol: Resource;
-  keywords: string[];
-}
-
 export interface QuotedDiffSnippet {
   id: string;
   path: string;
@@ -510,16 +726,6 @@ export interface QueuedPromptItem {
   stagedAttachments: ComposerAttachmentItem[];
   inlineMentions: InlineMentionRegistration[];
   createdAtMs: number;
-}
-
-export interface ComposerMentionCandidate {
-  key: string;
-  kind: string; // 'diff' | 'staged' | 'terminal' | 'file'
-  tokenLabel: string;
-  title: string;
-  subtitle: string;
-  filePath: string;
-  gitStatus: string;
 }
 
 export interface DevKeyItem {
@@ -898,108 +1104,38 @@ export function isAutoCollapsedDiffPath(rawPath: string): boolean {
   return false;
 }
 
-export function getOrbitSlashCommands(): OrbitSlashCommand[] {
-  return [
-    {
-      id: 'plan',
-      command: '/plan',
-      label: 'Draft Implementation Plan',
-      description: 'Prompt the agent to design a step-by-step plan before editing',
-      symbol: $r('sys.symbol.list_checkmark'),
-      keywords: ['plan', 'design', 'architect', 'checklist'],
-    },
-    {
-      id: 'review',
-      command: '/review',
-      label: 'Code Review Working Tree',
-      description: 'Attach uncommitted git diff and prepare an engineering review',
-      symbol: $r('sys.symbol.doc_text_badge_magnifyingglass'),
-      keywords: ['review', 'audit', 'critique', 'git'],
-    },
-    {
-      id: 'diff',
-      command: '/diff',
-      label: 'Toggle Diff Inspector',
-      description: 'Open or close the side-by-side Git & Turn Diff panel',
-      symbol: $r('sys.symbol.arrow_left_arrow_right'),
-      keywords: ['diff', 'inspector', 'changes'],
-    },
-    {
-      id: 'compact',
-      command: '/compact',
-      label: 'Compact Context',
-      description: 'Ask active agent to summarize and compact conversation history',
-      symbol: $r('sys.symbol.cut'),
-      keywords: ['compact', 'summarize', 'context', 'memory'],
-    },
-    {
-      id: 'supervised',
-      command: '/ask',
-      label: 'Always Ask Permissions',
-      description: 'Require approval before file edits and shell commands',
-      symbol: $r('sys.symbol.security_shield'),
-      keywords: ['ask', 'supervised', 'default', 'safe', 'permission'],
-    },
-    {
-      id: 'auto',
-      command: '/edits',
-      label: 'Accept Edits Permissions',
-      description: 'Auto-approve file edits, ask before shell commands',
-      symbol: $r('sys.symbol.checkmark_shield'),
-      keywords: ['edits', 'auto', 'edit', 'accept', 'permission'],
-    },
-    {
-      id: 'full',
-      command: '/full',
-      label: 'Full Access Permissions',
-      description: 'Edit files and run commands without approval prompts',
-      symbol: $r('sys.symbol.key_shield_slash'),
-      keywords: ['full', 'autonomous', 'bypass', 'unrestricted', 'permission'],
-    },
-    {
-      id: 'terminal',
-      command: '/terminal',
-      label: 'Toggle PTY Terminal',
-      description: 'Show or hide the persistent multi-slot terminal dock',
-      symbol: $r('sys.symbol.code'),
-      keywords: ['terminal', 'pty', 'shell', 'console'],
-    },
-    {
-      id: 'new',
-      command: '/new',
-      label: 'New Agent Session',
-      description: 'Start a fresh isolated session in the stage',
-      symbol: $r('sys.symbol.square_and_pencil'),
-      keywords: ['new', 'thread', 'session', 'clear'],
-    },
-    {
-      id: 'settings',
-      command: '/settings',
-      label: 'Settings',
-      description: 'Configure hosts, engines, worktrees, and keybindings',
-      symbol: $r('sys.symbol.gearshape'),
-      keywords: ['settings', 'preferences', 'config'],
-    },
-  ];
-}
-
-export function filterOrbitSlashCommands(query: string): OrbitSlashCommand[] {
-  const all = getOrbitSlashCommands();
-  const q = query.trim().toLowerCase();
-  if (q.length === 0) {
-    return all;
+export function slashCommandSymbol(id: string): Resource {
+  if (id === 'plan') {
+    return $r('sys.symbol.list_checkmark');
   }
-  return all.filter((c) => {
-    if (c.command.substring(1).toLowerCase().includes(q) || c.label.toLowerCase().includes(q)) {
-      return true;
-    }
-    for (let i = 0; i < c.keywords.length; i++) {
-      if (c.keywords[i].includes(q)) {
-        return true;
-      }
-    }
-    return false;
-  });
+  if (id === 'review') {
+    return $r('sys.symbol.doc_text_badge_magnifyingglass');
+  }
+  if (id === 'diff') {
+    return $r('sys.symbol.arrow_left_arrow_right');
+  }
+  if (id === 'compact') {
+    return $r('sys.symbol.cut');
+  }
+  if (id === 'ask' || id === 'supervised') {
+    return $r('sys.symbol.security_shield');
+  }
+  if (id === 'edits' || id === 'auto') {
+    return $r('sys.symbol.checkmark_shield');
+  }
+  if (id === 'full') {
+    return $r('sys.symbol.key_shield_slash');
+  }
+  if (id === 'terminal') {
+    return $r('sys.symbol.code');
+  }
+  if (id === 'new') {
+    return $r('sys.symbol.square_and_pencil');
+  }
+  if (id === 'settings') {
+    return $r('sys.symbol.gearshape');
+  }
+  return $r('sys.symbol.bubble_left');
 }
 
 export function formatRelativeTimeLabel(unixSecs: number): string {

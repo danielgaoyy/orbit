@@ -65,7 +65,7 @@ const SingleFileDiffCard = memo(function SingleFileDiffCard({
   file: DiffFileView;
   layout: DiffLayoutMode;
   onQuoteLine?: (path: string, lineNumber: number | null, code: string) => void;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (path: string, focusLine?: number | null) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
 
@@ -111,7 +111,7 @@ const SingleFileDiffCard = memo(function SingleFileDiffCard({
               type="button"
               title="Open full file"
               onClick={() => onOpenFile(file.path)}
-              className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md opacity-70 transition-all hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.08]"
+              className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md opacity-70 transition-[color,background-color,opacity] hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.08]"
             >
               <FileCode2 className="h-[13.5px] w-[13.5px] stroke-[1.75]" />
             </button>
@@ -203,9 +203,20 @@ const SingleFileDiffCard = memo(function SingleFileDiffCard({
                           : "bg-black/[0.015] dark:bg-white/[0.01]",
                     )}
                   >
-                    <span className="tabular-nums w-8 shrink-0 pr-1.5 text-right text-[11.5px] text-zinc-400 select-none dark:text-zinc-600">
-                      {left?.old_line ?? ""}
-                    </span>
+                    {onOpenFile && left?.old_line != null ? (
+                      <button
+                        type="button"
+                        title={`Open ${file.path} around line ${left.old_line}`}
+                        onClick={() => onOpenFile(file.path, left.old_line)}
+                        className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-1.5 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
+                      >
+                        {left.old_line}
+                      </button>
+                    ) : (
+                      <span className="tabular-nums w-8 shrink-0 pr-1.5 text-right text-[11.5px] text-zinc-400 select-none dark:text-zinc-600">
+                        {left?.old_line ?? ""}
+                      </span>
+                    )}
                     <span className="w-3 shrink-0 opacity-60 select-none">
                       {left?.kind === "removed" ? "-" : " "}
                     </span>
@@ -223,9 +234,20 @@ const SingleFileDiffCard = memo(function SingleFileDiffCard({
                           : "bg-black/[0.015] dark:bg-white/[0.01]",
                     )}
                   >
-                    <span className="tabular-nums w-8 shrink-0 pr-1.5 text-right text-[11.5px] text-zinc-400 select-none dark:text-zinc-600">
-                      {right?.new_line ?? ""}
-                    </span>
+                    {onOpenFile && right?.new_line != null ? (
+                      <button
+                        type="button"
+                        title={`Open ${file.path} at line ${right.new_line}`}
+                        onClick={() => onOpenFile(file.path, right.new_line)}
+                        className="tabular-nums hover:text-foreground w-8 shrink-0 cursor-pointer pr-1.5 text-right text-[11.5px] text-zinc-400 select-none hover:underline dark:text-zinc-600"
+                      >
+                        {right.new_line}
+                      </button>
+                    ) : (
+                      <span className="tabular-nums w-8 shrink-0 pr-1.5 text-right text-[11.5px] text-zinc-400 select-none dark:text-zinc-600">
+                        {right?.new_line ?? ""}
+                      </span>
+                    )}
                     {onQuoteLine && right ? (
                       <button
                         type="button"
@@ -266,7 +288,7 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
   files: DiffFileView[];
   layout?: DiffLayoutMode;
   onQuoteLine?: (path: string, lineNumber: number | null, code: string) => void;
-  onOpenFile?: (path: string) => void;
+  onOpenFile?: (path: string, focusLine?: number | null) => void;
 }) {
   if (files.length === 0) {
     return (

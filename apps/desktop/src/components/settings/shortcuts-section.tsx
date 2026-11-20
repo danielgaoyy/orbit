@@ -30,6 +30,7 @@ export function ShortcutsSection() {
 
       { group: "Panels", action: "Toggle Sidebar", keys: `${mod}B` },
       { group: "Panels", action: "Toggle Right Side Panel", keys: `${mod}\\` },
+      { group: "Panels", action: "New Side Panel Tab", keys: `${mod}T` },
       { group: "Panels", action: "Toggle Stage Overview", keys: `${mod}⌥O` },
       { group: "Panels", action: "Quick Open File", keys: `${mod}P` },
       { group: "Panels", action: "Toggle Diff Review", keys: `${mod}D` },

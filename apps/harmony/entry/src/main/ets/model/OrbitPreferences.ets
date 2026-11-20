@@ -6,6 +6,7 @@ import { orbitLogWarn } from './OrbitLogger';
 const PREFS_NAME: string = 'orbit_harmony_prefs';
 const KEY_THEME_MODE: string = 'theme_mode';
 const KEY_PINNED_THREADS: string = 'pinned_threads_json';
+const KEY_MIGRATED_THREAD_PREFS_V1: string = 'migrated_thread_prefs_v1';
 const KEY_DRAFT_PREFS: string = 'draft_prefs_v1';
 
 export interface OrbitDraftPrefs {
@@ -58,6 +59,33 @@ export class OrbitPreferencesStore {
       });
     } catch (err) {
       orbitLogWarn('OrbitPrefs', 'Failed to save theme mode', err as Object);
+    }
+  }
+
+  public hasMigratedThreadPrefsV1(): boolean {
+    if (this.prefs === null) {
+      return false;
+    }
+    try {
+      return this.prefs.getSync(KEY_MIGRATED_THREAD_PREFS_V1, false) === true;
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to read thread prefs migration flag', err as Object);
+      return false;
+    }
+  }
+
+  public markMigratedThreadPrefsV1(): void {
+    if (this.prefs === null) {
+      return;
+    }
+    try {
+      this.prefs.putSync(KEY_MIGRATED_THREAD_PREFS_V1, true);
+      this.prefs.putSync(KEY_PINNED_THREADS, '');
+      this.prefs.flush().catch((err: Object) => {
+        orbitLogWarn('OrbitPrefs', 'Failed to flush thread prefs migration flag', err);
+      });
+    } catch (err) {
+      orbitLogWarn('OrbitPrefs', 'Failed to mark thread prefs migrated', err as Object);
     }
   }
 

@@ -459,11 +459,18 @@ export type RichBlockView =
 
 export type DiffLineKind = "meta" | "hunk_header" | "context" | "added" | "removed";
 
+export interface InlineDiffSpan {
+  start: number;
+  end: number;
+}
+
 export interface DiffLineView {
   kind: DiffLineKind;
   old_line: number | null;
   new_line: number | null;
   content: string;
+  tokens?: HighlightedTokenView[];
+  inline_changes?: InlineDiffSpan[];
 }
 
 export interface DiffFileView {
@@ -1991,9 +1998,9 @@ export const orbitIpc = {
     });
   },
 
-  getWorkspaceFiles: async (hostId: string, cwd: string): Promise<string[]> => {
+  getWorkspaceFiles: async (hostId: string, cwd: string, force = false): Promise<string[]> => {
     if (!isTauriRuntime()) return [];
-    return invoke<string[]>("get_workspace_files", { hostId, cwd });
+    return invoke<string[]>("get_workspace_files", { hostId, cwd, force });
   },
 
   readWorkspaceFile: async (
@@ -2139,7 +2146,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.5.4";
+    if (!isTauriRuntime()) return "0.5.5";
     return invoke<string>("get_app_version");
   },
 

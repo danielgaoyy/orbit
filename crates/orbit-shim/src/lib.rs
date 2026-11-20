@@ -386,7 +386,7 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
                         .lock()
                         .map(|g| g.iter().cloned().collect())
                         .unwrap_or_default();
-                    handle_daemon_attach(stream, initial_frames, out_tx.subscribe(), in_tx.clone());
+                    handle_daemon_attach(stream, initial_frames, out_tx.subscribe(), in_tx.clone(), None);
                 }
             }
             _ = kill_rx.recv() => {
@@ -439,6 +439,7 @@ async fn run_pty_shim(
         .slave
         .spawn_command(cmd)
         .map_err(|e| ShimError::Pty(e.to_string()))?;
+    let mut child_killer = child.clone_killer();
     drop(pair.slave);
 
     let mut reader = pair
@@ -531,10 +532,17 @@ async fn run_pty_shim(
                     } else {
                         vec![ShimFrame::PtySnapshot { data_b64: B64.encode(&snap_bytes) }]
                     };
-                    handle_daemon_attach(stream, initial, out_tx.subscribe(), in_tx.clone());
+                    handle_daemon_attach(
+                        stream,
+                        initial,
+                        out_tx.subscribe(),
+                        in_tx.clone(),
+                        Some(scrollback.clone()),
+                    );
                 }
             }
             _ = kill_rx.recv() => {
+                let _ = child_killer.kill();
                 let _ = out_tx.send(ShimFrame::Exited { code: None });
                 break;
             }
@@ -573,6 +581,7 @@ fn handle_daemon_attach(
     initial_frames: Vec<ShimFrame>,
     mut out_rx: broadcast::Receiver<ShimFrame>,
     in_tx: mpsc::Sender<ShimFrame>,
+    pty_scrollback: Option<Arc<Mutex<VecDeque<u8>>>>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     tokio::spawn(async move {
@@ -595,12 +604,39 @@ fn handle_daemon_attach(
                 }
             }
         }
-        while let Ok(frame) = out_rx.recv().await {
-            if let Ok(mut encoded) = serde_json::to_string(&frame) {
-                encoded.push('\n');
-                if write_half.write_all(encoded.as_bytes()).await.is_err() {
-                    break;
+        loop {
+            match out_rx.recv().await {
+                Ok(frame) => {
+                    if let Ok(mut encoded) = serde_json::to_string(&frame) {
+                        encoded.push('\n');
+                        if write_half.write_all(encoded.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
                 }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    if let Some(ref sb_arc) = pty_scrollback {
+                        let snap_bytes: Vec<u8> = sb_arc
+                            .lock()
+                            .map(|sb| sb.iter().copied().collect())
+                            .unwrap_or_default();
+                        if !snap_bytes.is_empty() {
+                            let snap = ShimFrame::PtySnapshot {
+                                data_b64: B64.encode(&snap_bytes),
+                            };
+                            if let Ok(mut encoded) = serde_json::to_string(&snap) {
+                                encoded.push('\n');
+                                if write_half.write_all(encoded.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        let _ = skipped;
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });

@@ -46,6 +46,11 @@ private struct OrbitSvgWebCanvas: UIViewRepresentable {
         syncHtmlIfNeeded(web: uiView, coordinator: context.coordinator)
     }
 
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        uiView.stopLoading()
+        uiView.loadHTMLString("", baseURL: nil)
+    }
+
     private func syncHtmlIfNeeded(web: WKWebView, coordinator: Coordinator) {
         guard coordinator.lastSvg != svg || coordinator.lastIsDark != isDark || coordinator.lastAllowZoom != allowZoomScroll else {
             return

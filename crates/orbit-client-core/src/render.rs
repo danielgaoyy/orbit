@@ -919,12 +919,40 @@ pub enum DiffLineKind {
     Removed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlineDiffSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffLineView {
     pub kind: DiffLineKind,
     pub old_line: Option<u32>,
     pub new_line: Option<u32>,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<HighlightedTokenView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inline_changes: Vec<InlineDiffSpan>,
+}
+
+impl DiffLineView {
+    fn plain(
+        kind: DiffLineKind,
+        old_line: Option<u32>,
+        new_line: Option<u32>,
+        content: String,
+    ) -> Self {
+        Self {
+            kind,
+            old_line,
+            new_line,
+            content,
+            tokens: Vec::new(),
+            inline_changes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -967,12 +995,12 @@ fn flush_omitted_diff_notice(files: &mut [DiffFileView], omitted_lines: &mut usi
     if *omitted_lines > 0
         && let Some(last) = files.last_mut()
     {
-        last.lines.push(DiffLineView {
-            kind: DiffLineKind::Meta,
-            old_line: None,
-            new_line: None,
-            content: format!("… {} more diff lines omitted", *omitted_lines),
-        });
+        last.lines.push(DiffLineView::plain(
+            DiffLineKind::Meta,
+            None,
+            None,
+            format!("… {} more diff lines omitted", *omitted_lines),
+        ));
     }
     *omitted_lines = 0;
 }
@@ -1038,12 +1066,7 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             push_capped_diff_line(
                 cur_file,
                 &mut omitted_lines,
-                DiffLineView {
-                    kind: DiffLineKind::Meta,
-                    old_line: None,
-                    new_line: None,
-                    content: raw_line.to_string(),
-                },
+                DiffLineView::plain(DiffLineKind::Meta, None, None, raw_line.to_string()),
             );
             continue;
         }
@@ -1055,12 +1078,7 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             push_capped_diff_line(
                 cur_file,
                 &mut omitted_lines,
-                DiffLineView {
-                    kind: DiffLineKind::HunkHeader,
-                    old_line: None,
-                    new_line: None,
-                    content: raw_line.to_string(),
-                },
+                DiffLineView::plain(DiffLineKind::HunkHeader, None, None, raw_line.to_string()),
             );
             continue;
         }
@@ -1072,12 +1090,7 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             push_capped_diff_line(
                 cur_file,
                 &mut omitted_lines,
-                DiffLineView {
-                    kind: DiffLineKind::Added,
-                    old_line: None,
-                    new_line: Some(ln),
-                    content: added.to_string(),
-                },
+                DiffLineView::plain(DiffLineKind::Added, None, Some(ln), added.to_string()),
             );
         } else if let Some(removed) = raw_line.strip_prefix('-') {
             cur_file.deletions += 1;
@@ -1086,12 +1099,7 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             push_capped_diff_line(
                 cur_file,
                 &mut omitted_lines,
-                DiffLineView {
-                    kind: DiffLineKind::Removed,
-                    old_line: Some(ln),
-                    new_line: None,
-                    content: removed.to_string(),
-                },
+                DiffLineView::plain(DiffLineKind::Removed, Some(ln), None, removed.to_string()),
             );
         } else {
             let content = raw_line.strip_prefix(' ').unwrap_or(raw_line).to_string();
@@ -1106,18 +1114,23 @@ pub fn parse_unified_diff(unified_diff: &str) -> Vec<DiffFileView> {
             push_capped_diff_line(
                 cur_file,
                 &mut omitted_lines,
-                DiffLineView {
-                    kind: DiffLineKind::Context,
-                    old_line: o,
-                    new_line: n,
-                    content,
-                },
+                DiffLineView::plain(DiffLineKind::Context, o, n, content),
             );
         }
     }
 
     flush_omitted_diff_notice(&mut files, &mut omitted_lines);
     files.sort_by_key(|f| is_generated_or_lockfile_path(&f.path));
+    // Budget eager syntax highlighting across huge multi-file diffs so IPC payloads stay small
+    // and parsing stays < 15ms; single-file diffs always highlight in full.
+    let mut remaining_highlight_budget: usize = if files.len() <= 1 {
+        MAX_RENDERED_DIFF_LINES_PER_FILE
+    } else {
+        2400
+    };
+    for file in &mut files {
+        enrich_diff_file_highlights_and_intraline(file, &mut remaining_highlight_budget);
+    }
     files
 }
 
@@ -1141,24 +1154,24 @@ pub fn diff_two_texts(path: &str, old_text: &str, new_text: &str) -> DiffFileVie
             ChangeTag::Equal => push_capped_diff_line(
                 &mut file,
                 &mut omitted_lines,
-                DiffLineView {
-                    kind: DiffLineKind::Context,
-                    old_line: change.old_index().map(|i| (i + 1) as u32),
-                    new_line: change.new_index().map(|i| (i + 1) as u32),
+                DiffLineView::plain(
+                    DiffLineKind::Context,
+                    change.old_index().map(|i| (i + 1) as u32),
+                    change.new_index().map(|i| (i + 1) as u32),
                     content,
-                },
+                ),
             ),
             ChangeTag::Delete => {
                 file.deletions += 1;
                 push_capped_diff_line(
                     &mut file,
                     &mut omitted_lines,
-                    DiffLineView {
-                        kind: DiffLineKind::Removed,
-                        old_line: change.old_index().map(|i| (i + 1) as u32),
-                        new_line: None,
+                    DiffLineView::plain(
+                        DiffLineKind::Removed,
+                        change.old_index().map(|i| (i + 1) as u32),
+                        None,
                         content,
-                    },
+                    ),
                 );
             }
             ChangeTag::Insert => {
@@ -1166,27 +1179,155 @@ pub fn diff_two_texts(path: &str, old_text: &str, new_text: &str) -> DiffFileVie
                 push_capped_diff_line(
                     &mut file,
                     &mut omitted_lines,
-                    DiffLineView {
-                        kind: DiffLineKind::Added,
-                        old_line: None,
-                        new_line: change.new_index().map(|i| (i + 1) as u32),
+                    DiffLineView::plain(
+                        DiffLineKind::Added,
+                        None,
+                        change.new_index().map(|i| (i + 1) as u32),
                         content,
-                    },
+                    ),
                 );
             }
         }
     }
 
     if omitted_lines > 0 {
-        file.lines.push(DiffLineView {
-            kind: DiffLineKind::Meta,
-            old_line: None,
-            new_line: None,
-            content: format!("… {omitted_lines} more diff lines omitted"),
-        });
+        file.lines.push(DiffLineView::plain(
+            DiffLineKind::Meta,
+            None,
+            None,
+            format!("… {omitted_lines} more diff lines omitted"),
+        ));
     }
 
+    let mut budget = MAX_RENDERED_DIFF_LINES_PER_FILE;
+    enrich_diff_file_highlights_and_intraline(&mut file, &mut budget);
     file
+}
+
+fn enrich_diff_file_highlights_and_intraline(
+    file: &mut DiffFileView,
+    remaining_highlight_budget: &mut usize,
+) {
+    if file.lines.is_empty() || is_generated_or_lockfile_path(&file.path) {
+        return;
+    }
+
+    // 1. Syntax-highlight code lines via cached syntect pipeline within multi-file budget
+    let lang = detect_language_for_path(&file.path);
+    if !lang.is_empty() && lang != "text" && *remaining_highlight_budget > 0 {
+        let mut code_indices: Vec<usize> = Vec::with_capacity(file.lines.len());
+        let mut joined = String::new();
+        for (idx, line) in file.lines.iter().enumerate() {
+            if code_indices.len() >= *remaining_highlight_budget {
+                break;
+            }
+            if matches!(
+                line.kind,
+                DiffLineKind::Added | DiffLineKind::Removed | DiffLineKind::Context
+            ) && line.content.len() <= 600
+            {
+                code_indices.push(idx);
+                joined.push_str(&line.content);
+                joined.push('\n');
+            }
+        }
+        if !code_indices.is_empty() {
+            let cap = code_indices.len().min(MAX_RENDERED_DIFF_LINES_PER_FILE);
+            let highlighted = highlight_code_lines_capped(lang, &joined, cap);
+            for (line_pos, &line_idx) in code_indices.iter().enumerate() {
+                if let Some(hl) = highlighted.get(line_pos) {
+                    file.lines[line_idx].tokens = hl.tokens.clone();
+                }
+            }
+            *remaining_highlight_budget =
+                remaining_highlight_budget.saturating_sub(code_indices.len());
+        }
+    }
+
+    // 2. Word-level intra-line diff for paired Removed/Added batches
+    let mut i = 0usize;
+    let total = file.lines.len();
+    while i < total {
+        if file.lines[i].kind != DiffLineKind::Removed {
+            i += 1;
+            continue;
+        }
+        let rem_start = i;
+        while i < total && file.lines[i].kind == DiffLineKind::Removed {
+            i += 1;
+        }
+        let rem_end = i;
+        let add_start = i;
+        while i < total && file.lines[i].kind == DiffLineKind::Added {
+            i += 1;
+        }
+        let add_end = i;
+
+        let pair_count = (rem_end - rem_start).min(add_end - add_start).min(32);
+        for k in 0..pair_count {
+            let old_s = file.lines[rem_start + k].content.as_str();
+            let new_s = file.lines[add_start + k].content.as_str();
+            if old_s.len() > 2048 || new_s.len() > 2048 || old_s == new_s {
+                continue;
+            }
+            let (old_spans, new_spans) = compute_intraline_word_spans(old_s, new_s);
+            file.lines[rem_start + k].inline_changes = old_spans;
+            file.lines[add_start + k].inline_changes = new_spans;
+        }
+    }
+}
+
+fn compute_intraline_word_spans(
+    old_line: &str,
+    new_line: &str,
+) -> (Vec<InlineDiffSpan>, Vec<InlineDiffSpan>) {
+    let diff = TextDiff::from_words(old_line, new_line);
+    let mut old_spans: Vec<InlineDiffSpan> = Vec::new();
+    let mut new_spans: Vec<InlineDiffSpan> = Vec::new();
+    let mut old_pos = 0usize;
+    let mut new_pos = 0usize;
+
+    for change in diff.iter_all_changes() {
+        let len_utf16 = change.value().encode_utf16().count();
+        match change.tag() {
+            ChangeTag::Equal => {
+                old_pos += len_utf16;
+                new_pos += len_utf16;
+            }
+            ChangeTag::Delete => {
+                if len_utf16 > 0 {
+                    if let Some(last) = old_spans.last_mut()
+                        && last.end == old_pos
+                    {
+                        last.end = old_pos + len_utf16;
+                    } else {
+                        old_spans.push(InlineDiffSpan {
+                            start: old_pos,
+                            end: old_pos + len_utf16,
+                        });
+                    }
+                    old_pos += len_utf16;
+                }
+            }
+            ChangeTag::Insert => {
+                if len_utf16 > 0 {
+                    if let Some(last) = new_spans.last_mut()
+                        && last.end == new_pos
+                    {
+                        last.end = new_pos + len_utf16;
+                    } else {
+                        new_spans.push(InlineDiffSpan {
+                            start: new_pos,
+                            end: new_pos + len_utf16,
+                        });
+                    }
+                    new_pos += len_utf16;
+                }
+            }
+        }
+    }
+
+    (old_spans, new_spans)
 }
 
 fn parse_hunk_header_numbers(header: &str) -> (u32, u32) {

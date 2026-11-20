@@ -87,7 +87,7 @@ struct LiveTerminal {
     summary: TerminalSummary,
     shim_tx: mpsc::Sender<PtyAction>,
     out_tx: broadcast::Sender<PtyBroadcast>,
-    last_snapshot: Arc<RwLock<Vec<u8>>>,
+    last_snapshot: Arc<RwLock<std::collections::VecDeque<u8>>>,
 }
 
 enum PtyAction {
@@ -2276,7 +2276,9 @@ impl AgentOrchestrator {
     async fn bind_terminal_shim(self: &Arc<Self>, summary: TerminalSummary, mut shim: ShimClient) {
         let (shim_tx, mut shim_rx) = mpsc::channel::<PtyAction>(256);
         let (out_tx, _) = broadcast::channel::<PtyBroadcast>(512);
-        let last_snapshot = Arc::new(RwLock::new(Vec::new()));
+        let last_snapshot = Arc::new(RwLock::new(std::collections::VecDeque::with_capacity(
+            64 * 1024,
+        )));
 
         let live = Arc::new(LiveTerminal {
             summary: summary.clone(),
@@ -2314,7 +2316,12 @@ impl AgentOrchestrator {
                         match frame {
                             ShimFrame::PtySnapshot { data_b64 } => {
                                 if let Ok(bytes) = B64.decode(data_b64) {
-                                    *last_snapshot.write().await = bytes.clone();
+                                    {
+                                        let mut sb = last_snapshot.write().await;
+                                        sb.clear();
+                                        let start = bytes.len().saturating_sub(64 * 1024);
+                                        sb.extend(bytes[start..].iter().copied());
+                                    }
                                     let _ = out_tx.send(PtyBroadcast::Snapshot(bytes));
                                 }
                             }
@@ -2322,10 +2329,19 @@ impl AgentOrchestrator {
                                 if let Ok(bytes) = B64.decode(data_b64) {
                                     {
                                         let mut sb = last_snapshot.write().await;
-                                        sb.extend_from_slice(&bytes);
-                                        if sb.len() > 64 * 1024 {
-                                            let excess = sb.len() - 64 * 1024;
-                                            sb.drain(..excess);
+                                        if bytes.len() >= 64 * 1024 {
+                                            sb.clear();
+                                            let start = bytes.len() - 64 * 1024;
+                                            sb.extend(bytes[start..].iter().copied());
+                                        } else {
+                                            let total = sb.len() + bytes.len();
+                                            if total > 64 * 1024 {
+                                                let excess = total - 64 * 1024;
+                                                for _ in 0..excess {
+                                                    sb.pop_front();
+                                                }
+                                            }
+                                            sb.extend(bytes.iter().copied());
                                         }
                                     }
                                     let _ = out_tx.send(PtyBroadcast::Output(bytes));
@@ -2348,8 +2364,14 @@ impl AgentOrchestrator {
         terminal_id: &str,
     ) -> Option<(TerminalSummary, Vec<u8>, broadcast::Receiver<PtyBroadcast>)> {
         let live = self.live_terminals.read().await.get(terminal_id).cloned()?;
-        let snap = live.last_snapshot.read().await.clone();
+        let snap: Vec<u8> = live.last_snapshot.read().await.iter().copied().collect();
         Some((live.summary.clone(), snap, live.out_tx.subscribe()))
+    }
+
+    pub async fn terminal_snapshot(&self, terminal_id: &str) -> Option<Vec<u8>> {
+        let live = self.live_terminals.read().await.get(terminal_id).cloned()?;
+        let snap: Vec<u8> = live.last_snapshot.read().await.iter().copied().collect();
+        Some(snap)
     }
 
     pub async fn write_terminal_input(&self, terminal_id: &str, data: Vec<u8>) {
@@ -2371,7 +2393,7 @@ impl AgentOrchestrator {
             .get(terminal_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("terminal `{terminal_id}` not found"))?;
-        let raw = live.last_snapshot.read().await.clone();
+        let raw: Vec<u8> = live.last_snapshot.read().await.iter().copied().collect();
         let rows = live.summary.rows.max(24);
         let cols = live.summary.cols.max(80);
         let nz_rows = std::num::NonZeroU16::new(rows.max(1)).unwrap_or(std::num::NonZeroU16::MIN);

@@ -862,7 +862,19 @@ async fn run_client_session_loop(
                 }
             }
 
-            Ok(bcast) = bcast_rx.recv() => {
+            bcast_res = bcast_rx.recv() => {
+                let bcast = match bcast_res {
+                    Ok(b) => b,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            skipped,
+                            "Daemon broadcast lagged for client session; closing to force cursor resync"
+                        );
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 let maybe_msg = match bcast {
                     DaemonBroadcast::AgentUpdated(agent) => {
                         Some(WireMessage::AgentUpdated { agent })
@@ -2285,6 +2297,8 @@ async fn bind_terminal_stream_to_client(
     }
 
     let tx_clone = out_tx.clone();
+    let orchestrator = Arc::clone(&runtime.orchestrator);
+    let tid_owned = terminal_id.to_string();
     let join_handle = tokio::spawn(async move {
         if !snap.is_empty()
             && tx_clone
@@ -2297,9 +2311,9 @@ async fn bind_terminal_stream_to_client(
         {
             return;
         }
-        while let Ok(ev) = rx.recv().await {
-            match ev {
-                PtyBroadcast::Snapshot(data) => {
+        loop {
+            match rx.recv().await {
+                Ok(PtyBroadcast::Snapshot(data)) => {
                     if tx_clone
                         .send(SessionFrame::Terminal(TerminalBinaryFrame::Snapshot {
                             slot,
@@ -2311,7 +2325,7 @@ async fn bind_terminal_stream_to_client(
                         break;
                     }
                 }
-                PtyBroadcast::Output(data) => {
+                Ok(PtyBroadcast::Output(data)) => {
                     if tx_clone
                         .send(SessionFrame::Terminal(TerminalBinaryFrame::Output {
                             slot,
@@ -2323,7 +2337,27 @@ async fn bind_terminal_stream_to_client(
                         break;
                     }
                 }
-                PtyBroadcast::Closed => break,
+                Ok(PtyBroadcast::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        terminal_id = %tid_owned,
+                        skipped,
+                        "PTY client broadcast lagged; resyncing with latest snapshot"
+                    );
+                    if let Some(fresh) = orchestrator.terminal_snapshot(&tid_owned).await
+                        && !fresh.is_empty()
+                        && tx_clone
+                            .send(SessionFrame::Terminal(TerminalBinaryFrame::Snapshot {
+                                slot,
+                                data: fresh,
+                            }))
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });

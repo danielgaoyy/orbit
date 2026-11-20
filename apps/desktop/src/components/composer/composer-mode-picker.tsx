@@ -25,9 +25,11 @@ import { cn } from "@/lib/utils";
 export const ComposerModePicker = memo(function ComposerModePicker({
   mode,
   onSelectMode,
+  iconOnly = false,
 }: {
   mode: SessionMode;
   onSelectMode: (m: SessionMode) => void;
+  iconOnly?: boolean;
 }) {
   const activeMode = normalizePermissionMode(mode);
 
@@ -36,11 +38,15 @@ export const ComposerModePicker = memo(function ComposerModePicker({
       <DropdownMenuTrigger asChild>
         <button
           type="button"
-          title="Access permissions (⇧Tab)"
-          className="text-foreground/78 hover:text-foreground inline-flex h-8.5 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13.5px] font-normal transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+          title={`${modeLabel(activeMode)} (⇧Tab)`}
+          aria-label={`Access permissions: ${modeLabel(activeMode)}`}
+          className={cn(
+            "text-foreground/78 hover:text-foreground inline-flex h-8.5 shrink-0 cursor-pointer items-center rounded-full text-[13.5px] font-normal transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
+            iconOnly ? "justify-center gap-0.5 px-2" : "gap-1.5 px-2.5",
+          )}
         >
           <ModeIcon mode={activeMode} className="opacity-75" />
-          <span className="hidden sm:inline">{modeLabel(activeMode)}</span>
+          {!iconOnly && <span className="hidden whitespace-nowrap sm:inline">{modeLabel(activeMode)}</span>}
           <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
         </button>
       </DropdownMenuTrigger>

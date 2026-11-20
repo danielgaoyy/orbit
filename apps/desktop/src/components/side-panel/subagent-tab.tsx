@@ -1,7 +1,10 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { ArrowUpRight, Check, Layers, Loader2, AlertTriangle } from "lucide-react";
-import { MarkdownBlocksView } from "@/components/markdown-blocks";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  ConversationUserBubble,
+  ConversationViewport,
+} from "@/components/conversation/conversation-viewport";
+import { TurnStageSection } from "@/components/stage/stream-stage";
 import { type ProviderSubagentEvent, orbitIpc } from "@/lib/orbit-ipc";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -20,9 +23,20 @@ function formatProviderSubagentPayload(payload: unknown): string {
   return JSON.stringify(payload).slice(0, 400);
 }
 
+const NOOP_HOLD_VIEWPORT = (_el?: HTMLElement | null) => {};
+const NOOP_THINKING_DURATION = () => null;
+const NOOP_REWIND = () => {};
+const NOOP_PREVIEW_IMAGE = () => {};
+
 export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTab }) {
   const hostId = useOrbitSelector((s) => tab.hostId ?? s.selectedHostId);
+  const cwd = useOrbitSelector((s) => tab.cwd ?? s.selectedWorkspaceCwd);
   const parentAgentId = useOrbitSelector((s) => tab.parentAgentId ?? s.selectedAgentId);
+  const isNetworkOffline = useOrbitSelector((s) =>
+    hostId
+      ? s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state === "disconnected"
+      : false,
+  );
   const childAgent = useOrbitSelector((s) =>
     hostId && tab.childAgentId
       ? (s.hostDetails[hostId]?.agents.find((a) => a.agent_id === tab.childAgentId) ?? null)
@@ -59,21 +73,32 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           ? "completed"
           : "failed"
       : (parentSubagent?.status ?? "completed");
-
   const [providerEvents, setProviderEvents] = useState<ProviderSubagentEvent[]>([]);
+  const lastFingerprintRef = useRef<string>("");
+
+  // Ensure daemon hydrates/subscribes the provider subagent timeline on open or reconnect
+  useEffect(() => {
+    if (!hostId || !parentAgentId || !tab.providerSubagentId) return;
+    void orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, tab.providerSubagentId);
+  }, [hostId, parentAgentId, tab.providerSubagentId]);
 
   useEffect(() => {
     if (!hostId || !parentAgentId || !tab.providerSubagentId) {
       setProviderEvents([]);
+      lastFingerprintRef.current = "";
       return;
     }
     const subId = tab.providerSubagentId;
     let cancelled = false;
-    void orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, subId);
     const poll = async () => {
       try {
         const evs = await orbitIpc.getProviderSubagentTimeline(hostId, parentAgentId, subId);
-        if (!cancelled) setProviderEvents(evs);
+        if (cancelled) return;
+        const fp = `${evs.length}:${evs[evs.length - 1]?.seq ?? 0}`;
+        if (fp !== lastFingerprintRef.current) {
+          lastFingerprintRef.current = fp;
+          setProviderEvents(evs);
+        }
       } catch {
         // ignore transient polling error
       }
@@ -91,9 +116,17 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     };
   }, [hostId, parentAgentId, tab.providerSubagentId, status, providerSubagent?.updated_at]);
 
+  const handleOpenThread = useCallback(() => {
+    if (hostId && tab.childAgentId) {
+      orbitActions.selectAgent(hostId, tab.childAgentId);
+    }
+  }, [hostId, tab.childAgentId]);
+
   const resolvedTitle =
     providerSubagent?.title || tab.subagentRole || childAgent?.title || "Subagent";
   const resolvedPrompt = tab.subagentPrompt || providerSubagent?.subtitle || "";
+  const contentVersion = `${childStage?.revision ?? 0}:${providerEvents.length}:${providerEvents[providerEvents.length - 1]?.seq ?? 0}`;
+  const hasChildTurns = Boolean(childStage && childStage.turns.length > 0);
 
   return (
     <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -127,7 +160,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         {hostId && tab.childAgentId && childAgent && (
           <button
             type="button"
-            onClick={() => orbitActions.selectAgent(hostId, tab.childAgentId!)}
+            onClick={handleOpenThread}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] transition-colors"
           >
             <span>Open thread</span>
@@ -136,50 +169,49 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         )}
       </div>
 
-      {/* Subagent Prompt & Child Activity */}
-      <ScrollArea className="bg-canvas min-h-0 flex-1" viewportClassName="space-y-4 p-4">
-        {resolvedPrompt && (
-          <div className="space-y-1.5">
-            <div className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
-              Delegated Task
-            </div>
-            <div className="border-border bg-elevated/60 selectable-text text-foreground/88 rounded-xl border p-3 text-[12.5px] leading-relaxed whitespace-pre-wrap">
-              {resolvedPrompt}
-            </div>
-          </div>
-        )}
+      {/* Full Main Conversation View (read-only, without Composer) */}
+      <ConversationViewport
+        hostId={hostId}
+        cwd={cwd}
+        resetKey={tab.id}
+        contentVersion={contentVersion}
+        viewportClassName="space-y-6 px-5 py-5"
+      >
+        {!hasChildTurns && resolvedPrompt && <ConversationUserBubble text={resolvedPrompt} />}
 
-        {childStage && childStage.turns.length > 0 ? (
-          <div className="space-y-4">
-            <div className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
-              Activity ({childStage.turns.length} {childStage.turns.length === 1 ? "turn" : "turns"})
-            </div>
-            {childStage.turns.map((turn) => (
-              <div key={turn.key} className="border-border space-y-2 border-l-2 pl-3">
-                {turn.work_summary_label && (
-                  <div className="text-muted-foreground text-[12px]">
-                    {turn.work_summary_label}
-                  </div>
-                )}
-                {turn.terminal_reply?.item_type === "assistant_message" && (
-                  <div className="text-[12.5px]">
-                    <MarkdownBlocksView
-                      blocks={turn.terminal_reply.blocks}
-                      streaming={turn.terminal_reply.streaming}
-                      compact
-                    />
-                  </div>
-                )}
-              </div>
-            ))}
+        {hasChildTurns && childStage ? (
+          <div className="space-y-8">
+            {childStage.turns.map((turn, idx) => {
+              const isLastTurn = idx === childStage.turns.length - 1;
+              const isTurnActive =
+                isLastTurn && (Boolean(childAgent?.is_running) || turn.has_active_item);
+              return (
+                <TurnStageSection
+                  key={turn.key}
+                  turn={turn}
+                  isTurnActive={isTurnActive}
+                  agentStatusLabel={isLastTurn ? (childAgent?.status_label ?? null) : null}
+                  isNetworkOffline={isNetworkOffline}
+                  autoFoldCompleted
+                  hostId={hostId ?? ""}
+                  cwd={cwd}
+                  agentId={tab.childAgentId ?? ""}
+                  thinkingSignature=""
+                  getThinkingDurationMs={NOOP_THINKING_DURATION}
+                  holdViewport={NOOP_HOLD_VIEWPORT}
+                  onRequestRewind={NOOP_REWIND}
+                  onPreviewImage={NOOP_PREVIEW_IMAGE}
+                />
+              );
+            })}
           </div>
         ) : tab.providerSubagentId && providerEvents.length > 0 ? (
-          <div className="space-y-2">
+          <div className="space-y-2.5">
             <div className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
               Provider Activity ({providerEvents.length}{" "}
               {providerEvents.length === 1 ? "event" : "events"})
             </div>
-            <div className="border-border bg-elevated/50 divide-border/50 selectable-text divide-y rounded-xl border font-mono text-[11.5px]">
+            <div className="border-border bg-elevated/50 divide-border/50 selectable-text divide-y rounded-xl border font-mono text-[12px]">
               {providerEvents.map((ev) => (
                 <div key={ev.seq} className="px-3 py-2 break-words whitespace-pre-wrap">
                   <span className="text-muted-foreground mr-2">#{ev.seq}</span>
@@ -191,13 +223,13 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
             </div>
           </div>
         ) : (
-          <div className="border-border text-muted-foreground rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
+          <div className="border-border text-muted-foreground rounded-xl border border-dashed px-4 py-6 text-center text-[12.5px]">
             {status === "running"
               ? "Subagent is running in an isolated context. Final results will return to the main thread."
               : "Subagent execution completed. Summary and outputs are folded into the parent conversation."}
           </div>
         )}
-      </ScrollArea>
+      </ConversationViewport>
     </div>
   );
 });

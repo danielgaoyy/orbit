@@ -129,10 +129,10 @@ fun AdaptiveOrbitShell(
         }
     }
 
+    val diagramRenderer = remember(store) { store::renderDiagram }
+
     CompositionLocalProvider(
-        LocalDiagramRenderer provides { kind, source, isDark ->
-            store.renderDiagram(kind, source, isDark)
-        }
+        LocalDiagramRenderer provides diagramRenderer
     ) {
     BoxWithConstraints(
         modifier = modifier

@@ -20,8 +20,8 @@ export function useGlobalErgonomicKeybindings(): void {
       const mod = isMacDesktop() ? e.metaKey : e.ctrlKey;
       const keyLower = e.key.toLowerCase();
 
-      // 1. Command Palette (`⌘K` / `Ctrl+K`) — always works everywhere
-      if (mod && !e.shiftKey && !e.altKey && keyLower === "k") {
+      // 1. Command Palette (`⌘K` / `Ctrl+K`) — yield to terminal clear/kill-line when terminal is focused
+      if (mod && !e.shiftKey && !e.altKey && keyLower === "k" && !snap.terminalFocused) {
         e.preventDefault();
         if (e.repeat) return;
         orbitActions.setCommandPaletteOpen(!snap.commandPaletteOpen);

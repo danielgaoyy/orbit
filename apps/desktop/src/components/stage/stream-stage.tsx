@@ -2334,7 +2334,7 @@ const EMPTY_WORK_COUNTS: WorkSummaryResultView["counts"] = {
  *   post-turn autonomous wakeups.
  * - Notices (API warnings, stream interruptions, errors) and wakeup boundaries render in place.
  */
-const TurnStageSection = memo(function TurnStageSection({
+export const TurnStageSection = memo(function TurnStageSection({
   turn,
   isTurnActive,
   agentStatusLabel = null,

@@ -629,6 +629,9 @@ const hostSyncGates = new Map<string, SimpleSyncGate>();
 const fleetSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const sidebarSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const lastReportedSeenSeq = new Map<string, number>();
+const submittingComposerScopes = new Set<string>();
+const cancelledSideQuestionIds = new Set<string>();
+let gitChangedDebounceTimer: number | null = null;
 
 function markThreadSeenInCore(hostId: string, agentId: string, seq: number): void {
   const key = threadScopeKey(hostId, agentId);
@@ -1068,8 +1071,17 @@ export const orbitActions = {
         }
       } else if (ev.kind === "git_changed") {
         if (ev.host_id === state.selectedHostId && ev.cwd === state.selectedWorkspaceCwd) {
-          void orbitActions.loadGitReviewSnapshot(ev.host_id, ev.cwd, state.selectedDiffPath);
-          void orbitActions.ensureWorkspaceFiles(ev.host_id, ev.cwd, true);
+          const hostId = ev.host_id;
+          const cwd = ev.cwd;
+          if (gitChangedDebounceTimer !== null) {
+            window.clearTimeout(gitChangedDebounceTimer);
+          }
+          gitChangedDebounceTimer = window.setTimeout(() => {
+            gitChangedDebounceTimer = null;
+            void orbitActions.loadGitReviewSnapshot(hostId, cwd, state.selectedDiffPath);
+            void orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+            orbitActions.markOpenFilesStaleForWorkspace(hostId, cwd);
+          }, 150);
         }
       } else if (ev.kind === "terminal_changed") {
         const chKey = `${ev.host_id}::${ev.slot}`;
@@ -1839,8 +1851,8 @@ export const orbitActions = {
     if (!hostId || !cwd || cwd === "~") return;
     const cacheKey = `${hostId}::${cwd}`;
     if (!force && (state.workspaceFilesCache[cacheKey]?.length ?? 0) > 0) return;
-    const files = await orbitIpc.getWorkspaceFiles(hostId, cwd);
-    if (files.length > 0) {
+    const files = await orbitIpc.getWorkspaceFiles(hostId, cwd, force);
+    if (files.length > 0 || force) {
       setState((s) => ({
         ...s,
         workspaceFilesCache: {
@@ -1875,6 +1887,10 @@ export const orbitActions = {
 
   removeContextMention(id: string): void {
     const key = composerScopeKey(state);
+    const removed = (state.contextItems[key] ?? []).find((c) => c.id === id);
+    if (removed && removed.kind === "image" && removed.previewUrl?.startsWith("blob:")) {
+      URL.revokeObjectURL(removed.previewUrl);
+    }
     setState((s) => ({
       ...s,
       contextItems: {
@@ -2060,6 +2076,20 @@ export const orbitActions = {
     if (!hostId) return;
 
     const key = composerScopeKey(state);
+    if (submittingComposerScopes.has(key)) return;
+    submittingComposerScopes.add(key);
+    try {
+      await orbitActions._submitComposerUnlocked(hostId, key, steerImmediately);
+    } finally {
+      submittingComposerScopes.delete(key);
+    }
+  },
+
+  async _submitComposerUnlocked(
+    hostId: string,
+    key: string,
+    steerImmediately: boolean,
+  ): Promise<void> {
     const rawDraft = (state.composerDrafts[key] ?? "").trim();
     const storedDirective = state.slashDirectives[key] ?? null;
 
@@ -2258,7 +2288,9 @@ export const orbitActions = {
     for (const ctx of mergedContexts) {
       if (ctx.kind === "image") {
         if (ctx.path && ctx.previewUrl) {
-          seedPromptImagePreview(hostId, ctx.path, ctx.previewUrl);
+          seedPromptImagePreview(hostId, ctx.path, ctx.previewUrl, true);
+        } else if (ctx.previewUrl?.startsWith("blob:")) {
+          URL.revokeObjectURL(ctx.previewUrl);
         }
         sentImages.push({
           label: ctx.filename,
@@ -2854,10 +2886,45 @@ export const orbitActions = {
         delete nextArchived[tKey];
         const nextTitles = { ...s.threadCustomTitles };
         delete nextTitles[tKey];
+        const nextStages = { ...s.stages };
+        delete nextStages[tKey];
+        const nextDrafts = { ...s.composerDrafts };
+        delete nextDrafts[tKey];
+        const nextDirectives = { ...s.slashDirectives };
+        delete nextDirectives[tKey];
+        const nextInline = { ...s.inlineMentions };
+        delete nextInline[tKey];
+        const nextContexts = { ...s.contextItems };
+        for (const ctx of nextContexts[tKey] ?? []) {
+          if (ctx.kind === "image" && ctx.previewUrl?.startsWith("blob:")) {
+            URL.revokeObjectURL(ctx.previewUrl);
+          }
+        }
+        delete nextContexts[tKey];
+        const nextPastes = { ...s.pastedAttachments };
+        delete nextPastes[tKey];
+        const nextQuotes = { ...s.diffQuotes };
+        delete nextQuotes[tKey];
+        const nextQueued = { ...s.queuedPrompts };
+        delete nextQueued[tKey];
+        const nextSideQ = { ...s.sideQuestionsByScope };
+        delete nextSideQ[tKey];
+        const nextRewound = { ...s.rewoundSessions };
+        delete nextRewound[tKey];
         return {
           ...s,
           archivedThreads: nextArchived,
           threadCustomTitles: nextTitles,
+          stages: nextStages,
+          composerDrafts: nextDrafts,
+          slashDirectives: nextDirectives,
+          inlineMentions: nextInline,
+          contextItems: nextContexts,
+          pastedAttachments: nextPastes,
+          diffQuotes: nextQuotes,
+          queuedPrompts: nextQueued,
+          sideQuestionsByScope: nextSideQ,
+          rewoundSessions: nextRewound,
           ...(wasSelected ? { selectedAgentId: null, isDraftNewSession: true } : {}),
         };
       },
@@ -2865,6 +2932,7 @@ export const orbitActions = {
     );
 
     lastReportedSeenSeq.delete(tKey);
+    stagePullGates.delete(tKey);
     await orbitIpc.deleteAgent(hostId, agentId);
     orbitActions.refreshSidebarView();
     notifyToast("Conversation deleted");
@@ -2944,8 +3012,8 @@ export const orbitActions = {
     });
   },
 
-  setSidebarWidth(w: number): void {
-    setState((s) => ({ ...s, sidebarWidth: Math.min(400, Math.max(230, w)) }), true);
+  setSidebarWidth(w: number, persist = true): void {
+    setState((s) => ({ ...s, sidebarWidth: Math.min(400, Math.max(230, w)) }), persist);
   },
 
   toggleHostCollapsed(hostId: string): void {
@@ -3229,8 +3297,45 @@ export const orbitActions = {
     }
   },
 
-  setSidePanelWidth(w: number): void {
-    setState((s) => ({ ...s, sidePanelWidth: Math.min(780, Math.max(360, w)) }), true);
+  setSidePanelWidth(w: number, persist = true): void {
+    setState((s) => ({ ...s, sidePanelWidth: Math.min(780, Math.max(360, w)) }), persist);
+  },
+
+  markOpenFilesStaleForWorkspace(hostId: string, cwd: string): void {
+    const prefix = `${hostId}::${cwd}::`;
+    const matchingKeys = Object.keys(state.fileViewCache).filter((k) => k.startsWith(prefix));
+    if (matchingKeys.length === 0) return;
+
+    const activeTab = state.sidePanelTabs.find((t) => t.id === state.activeSidePanelTabId);
+    const activeFileKey =
+      state.sidePanelOpen &&
+      activeTab?.kind === "file" &&
+      activeTab.hostId &&
+      activeTab.cwd &&
+      activeTab.filePath
+        ? `${activeTab.hostId}::${activeTab.cwd}::${activeTab.filePath}`
+        : null;
+
+    setState((s) => {
+      const nextCache = { ...s.fileViewCache };
+      for (const k of matchingKeys) {
+        if (k !== activeFileKey) {
+          delete nextCache[k];
+        }
+      }
+      return { ...s, fileViewCache: nextCache };
+    });
+
+    if (
+      activeFileKey &&
+      activeTab?.kind === "file" &&
+      activeTab.hostId &&
+      activeTab.cwd &&
+      activeTab.filePath &&
+      activeFileKey.startsWith(prefix)
+    ) {
+      void orbitActions.loadWorkspaceFile(activeTab.hostId, activeTab.cwd, activeTab.filePath, true);
+    }
   },
 
   focusSidePanelTab(tabId: string): void {
@@ -3735,10 +3840,43 @@ export const orbitActions = {
 
   clearSideQuestions(): void {
     const scope = sideQuestionScopeKey(state);
+    for (const e of state.sideQuestionsByScope[scope] ?? []) {
+      if (e.status === "streaming") cancelledSideQuestionIds.add(e.id);
+    }
     setState((s) => {
       const next = { ...s.sideQuestionsByScope };
       delete next[scope];
       return { ...s, sideQuestionsByScope: next };
+    });
+  },
+
+  cancelSideQuestion(scopeOverride?: string): void {
+    const scope = scopeOverride ?? sideQuestionScopeKey(state);
+    const list = state.sideQuestionsByScope[scope];
+    if (!list) return;
+    const streamingIds = list.filter((e) => e.status === "streaming").map((e) => e.id);
+    if (streamingIds.length === 0) return;
+    for (const id of streamingIds) {
+      cancelledSideQuestionIds.add(id);
+    }
+    setState((s) => {
+      const cur = s.sideQuestionsByScope[scope];
+      if (!cur) return s;
+      return {
+        ...s,
+        sideQuestionsByScope: {
+          ...s.sideQuestionsByScope,
+          [scope]: cur.map((e) =>
+            streamingIds.includes(e.id)
+              ? {
+                  ...e,
+                  status: e.answer.trim() ? ("done" as const) : ("error" as const),
+                  error: e.answer.trim() ? null : "Cancelled",
+                }
+              : e,
+          ),
+        },
+      };
     });
   },
 
@@ -3797,8 +3935,21 @@ export const orbitActions = {
             .buildSideQuestionContext(hostId, state.selectedAgentId, 3000)
             .catch(() => "")
         : "";
-    const contextSummary =
+    const priorSideTurns = (state.sideQuestionsByScope[scope] ?? [])
+      .filter((e) => e.status === "done" && e.answer.trim().length > 0)
+      .slice(-4);
+    const priorHistoryBlock =
+      priorSideTurns.length > 0
+        ? `\n\nPrior side-thread Q&A:\n${priorSideTurns
+            .map(
+              (e, i) =>
+                `Q${i + 1}: ${e.question.slice(0, 400)}\nA${i + 1}: ${e.answer.slice(0, 900)}`,
+            )
+            .join("\n\n")}`
+        : "";
+    const baseContext =
       rustContext || `Workspace: ${cwd || "~"}${branchName ? ` (branch: ${branchName})` : ""}`;
+    const contextSummary = `${baseContext}${priorHistoryBlock}`;
 
     const entryId = `sq_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const newEntry: SideQuestionEntry = {
@@ -3880,6 +4031,13 @@ export const orbitActions = {
           contextSummary,
         },
         (ev) => {
+          if (cancelledSideQuestionIds.has(entryId)) {
+            if (parseTimer) {
+              clearTimeout(parseTimer);
+              parseTimer = null;
+            }
+            return;
+          }
           if (ev.kind === "delta") {
             accumText += ev.text_delta;
             patchEntry((e) => ({ ...e, answer: accumText, status: "streaming" }));
@@ -3900,11 +4058,19 @@ export const orbitActions = {
         },
       );
     } catch (err) {
-      patchEntry((e) => ({
-        ...e,
-        status: "error",
-        error: String(err),
-      }));
+      if (parseTimer) {
+        clearTimeout(parseTimer);
+        parseTimer = null;
+      }
+      if (!cancelledSideQuestionIds.has(entryId)) {
+        patchEntry((e) => ({
+          ...e,
+          status: "error",
+          error: String(err),
+        }));
+      }
+    } finally {
+      cancelledSideQuestionIds.delete(entryId);
     }
   },
 
@@ -4051,6 +4217,21 @@ export const orbitActions = {
       state.selectedHostId &&
       state.selectedWorkspaceCwd
     ) {
+      const rKey = `${state.selectedHostId}::${state.selectedWorkspaceCwd}`;
+      const cached = state.gitReviews[rKey];
+      // Fast-path: if we already have the full diff cached and the requested file is present
+      // (or user clicked "All"), filter client-side in 0ms without spawning git subprocesses.
+      if (path === null && cached && cached.selected_path === null && cached.diff_files.length > 0) {
+        return;
+      }
+      if (
+        path !== null &&
+        cached &&
+        cached.selected_path === null &&
+        cached.diff_files.some((f) => f.path === path)
+      ) {
+        return;
+      }
       void orbitActions.refreshGit(
         state.selectedHostId,
         state.selectedWorkspaceCwd,
@@ -4123,8 +4304,11 @@ export const orbitActions = {
 
   closeTerminalTab(tabKey: string, killRemoteShim: boolean): void {
     const target = state.terminalTabs.find((t) => t.key === tabKey);
-    if (target && killRemoteShim && target.terminalId) {
-      void orbitIpc.killTerminal(target.hostId, target.terminalId);
+    if (target) {
+      if (killRemoteShim && target.terminalId) {
+        void orbitIpc.killTerminal(target.hostId, target.terminalId);
+      }
+      terminalChannels.delete(`${target.hostId}::${target.slot}`);
     }
     setState((s) => {
       const remaining = s.terminalTabs.filter((t) => t.key !== tabKey);

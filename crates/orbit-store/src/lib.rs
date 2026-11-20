@@ -112,6 +112,8 @@ impl OrbitStore {
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
+            PRAGMA wal_autocheckpoint = 1000;
+            PRAGMA journal_size_limit = 16777216;
 
             CREATE TABLE IF NOT EXISTS workspaces (
                 workspace_id TEXT PRIMARY KEY,
@@ -146,7 +148,9 @@ impl OrbitStore {
                 agent_id     TEXT NOT NULL REFERENCES agents(agent_id) ON DELETE CASCADE,
                 turn_id      TEXT,
                 timestamp    TEXT NOT NULL,
-                payload_json TEXT NOT NULL
+                payload_json TEXT NOT NULL,
+                event_type   TEXT,
+                coalesce_key TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_timeline_agent_seq
@@ -209,6 +213,8 @@ impl OrbitStore {
                 turn_id      TEXT,
                 timestamp    TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
+                event_type   TEXT,
+                coalesce_key TEXT,
                 PRIMARY KEY (agent_id, seq)
             );
 
@@ -235,6 +241,19 @@ impl OrbitStore {
             [],
         );
         let _ = conn.execute("ALTER TABLE client_hosts ADD COLUMN meta_json TEXT", []);
+        let _ = conn.execute("ALTER TABLE timeline_events ADD COLUMN event_type TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE timeline_events ADD COLUMN coalesce_key TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE client_replica_events ADD COLUMN event_type TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE client_replica_events ADD COLUMN coalesce_key TEXT",
+            [],
+        );
         // One-time schema v2 migration: self-heal legacy pre-v0.2.4 client replica caches once
         let user_ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -252,6 +271,66 @@ impl OrbitStore {
             let _ = conn.execute_batch("PRAGMA user_version = 2;");
         }
         orchestration::migrate_orchestration_schema(&conn)?;
+        let post_orch_ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if post_orch_ver < 4 {
+            conn.execute_batch(
+                "
+                BEGIN IMMEDIATE;
+
+                UPDATE timeline_events
+                SET event_type = json_extract(payload_json, '$.type'),
+                    coalesce_key = CASE
+                        WHEN json_extract(payload_json, '$.type') IN ('assistant_message', 'assistant_thinking')
+                             AND COALESCE(json_extract(payload_json, '$.item_id'), '') != ''
+                            THEN 'item_id:' || json_extract(payload_json, '$.item_id')
+                        WHEN json_extract(payload_json, '$.type') = 'tool_call'
+                             AND COALESCE(json_extract(payload_json, '$.call_id'), '') != ''
+                            THEN 'call_id:' || json_extract(payload_json, '$.call_id')
+                        ELSE NULL
+                    END
+                WHERE event_type IS NULL AND json_valid(payload_json);
+
+                UPDATE client_replica_events
+                SET event_type = json_extract(payload_json, '$.type'),
+                    coalesce_key = CASE
+                        WHEN json_extract(payload_json, '$.type') IN ('assistant_message', 'assistant_thinking')
+                             AND COALESCE(json_extract(payload_json, '$.item_id'), '') != ''
+                            THEN 'item_id:' || json_extract(payload_json, '$.item_id')
+                        WHEN json_extract(payload_json, '$.type') = 'tool_call'
+                             AND COALESCE(json_extract(payload_json, '$.call_id'), '') != ''
+                            THEN 'call_id:' || json_extract(payload_json, '$.call_id')
+                        ELSE NULL
+                    END
+                WHERE event_type IS NULL AND json_valid(payload_json);
+
+                PRAGMA user_version = 4;
+
+                COMMIT;
+                ",
+            )?;
+        }
+        conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_timeline_agent_type_seq
+                ON timeline_events(agent_id, event_type, seq);
+            CREATE INDEX IF NOT EXISTS idx_timeline_agent_coalesce_seq
+                ON timeline_events(agent_id, coalesce_key, seq);
+            CREATE INDEX IF NOT EXISTS idx_replica_agent_type_seq
+                ON client_replica_events(agent_id, event_type, seq);
+            CREATE INDEX IF NOT EXISTS idx_replica_agent_coalesce_seq
+                ON client_replica_events(agent_id, coalesce_key, seq);
+            CREATE INDEX IF NOT EXISTS idx_agents_workspace_id
+                ON agents(workspace_id);
+            CREATE INDEX IF NOT EXISTS idx_agents_parent_agent_id
+                ON agents(parent_agent_id);
+            CREATE INDEX IF NOT EXISTS idx_workspaces_cwd
+                ON workspaces(cwd);
+            CREATE INDEX IF NOT EXISTS idx_schedules_status_next_run
+                ON schedules(status, next_run_at);
+            ",
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -501,35 +580,46 @@ impl OrbitStore {
         let now = Utc::now();
         let now_str = now.to_rfc3339();
         let payload_json = serde_json::to_string(&payload)?;
+        let event_type = payload_event_type(&payload);
+        let ckey = coalesce_key(&payload);
 
-        if let Some((json_key, id_val)) = coalesce_identity(&payload) {
-            let boundary_seq =
-                query_coalesce_boundary_seq(&tx, "timeline_events", agent_id, &payload, None);
-            let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
-            let _ = tx.execute(
-                "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND payload_json LIKE ?3",
-                params![agent_id, boundary_seq, pattern],
-            );
+        if let Some(ref key_val) = ckey {
+            let boundary_seq = query_coalesce_boundary_seq(&tx, true, agent_id, &payload, None);
+            if let Ok(mut del_stmt) = tx.prepare_cached(
+                "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
+            ) {
+                let _ = del_stmt.execute(params![agent_id, boundary_seq, key_val]);
+            }
         }
 
-        tx.execute(
-            "INSERT INTO timeline_events (epoch, agent_id, turn_id, timestamp, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![epoch, agent_id, turn_id, now_str, payload_json],
-        )?;
+        {
+            let mut ins_stmt = tx.prepare_cached(
+                "INSERT INTO timeline_events (epoch, agent_id, turn_id, timestamp, payload_json, event_type, coalesce_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            ins_stmt.execute(params![
+                epoch,
+                agent_id,
+                turn_id,
+                now_str,
+                payload_json,
+                event_type,
+                ckey.as_deref()
+            ])?;
+        }
         let seq = tx.last_insert_rowid() as u64;
 
         if let TimelinePayload::StatusChanged { ref status } = payload {
             let status_json = serde_json::to_string(status)?;
-            tx.execute(
+            let mut upd_stmt = tx.prepare_cached(
                 "UPDATE agents SET latest_seq = ?1, status_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
-                params![seq as i64, status_json, now_str, agent_id],
             )?;
+            upd_stmt.execute(params![seq as i64, status_json, now_str, agent_id])?;
         } else {
-            tx.execute(
+            let mut upd_stmt = tx.prepare_cached(
                 "UPDATE agents SET latest_seq = ?1, updated_at = ?2 WHERE agent_id = ?3",
-                params![seq as i64, now_str, agent_id],
             )?;
+            upd_stmt.execute(params![seq as i64, now_str, agent_id])?;
         }
 
         tx.commit()?;
@@ -550,37 +640,41 @@ impl OrbitStore {
         let tx = conn.transaction()?;
         let payload_json = serde_json::to_string(&ev.payload)?;
         let ts_str = ev.timestamp.to_rfc3339();
+        let event_type = payload_event_type(&ev.payload);
+        let ckey = coalesce_key(&ev.payload);
 
-        if let Some((json_key, id_val)) = coalesce_identity(&ev.payload) {
-            let boundary_seq = query_coalesce_boundary_seq(
-                &tx,
-                "client_replica_events",
-                &ev.agent_id,
-                &ev.payload,
-                Some(ev.seq),
-            );
-            let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
-            let _ = tx.execute(
+        if let Some(ref key_val) = ckey {
+            let boundary_seq =
+                query_coalesce_boundary_seq(&tx, false, &ev.agent_id, &ev.payload, Some(ev.seq));
+            if let Ok(mut del_stmt) = tx.prepare_cached(
                 "DELETE FROM client_replica_events
-                 WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND payload_json LIKE ?4",
-                params![ev.agent_id, boundary_seq, ev.seq as i64, pattern],
-            );
+                 WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
+            ) {
+                let _ =
+                    del_stmt.execute(params![ev.agent_id, boundary_seq, ev.seq as i64, key_val]);
+            }
         }
 
-        tx.execute(
-            "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(agent_id, seq) DO UPDATE SET
-                payload_json = excluded.payload_json",
-            params![
+        {
+            let mut ins_stmt = tx.prepare_cached(
+                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json, event_type, coalesce_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(agent_id, seq) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    event_type = excluded.event_type,
+                    coalesce_key = excluded.coalesce_key",
+            )?;
+            ins_stmt.execute(params![
                 ev.agent_id,
                 ev.seq as i64,
                 ev.epoch,
                 ev.turn_id,
                 ts_str,
-                payload_json
-            ],
-        )?;
+                payload_json,
+                event_type,
+                ckey.as_deref()
+            ])?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -598,35 +692,48 @@ impl OrbitStore {
         for ev in events {
             let payload_json = serde_json::to_string(&ev.payload)?;
             let ts_str = ev.timestamp.to_rfc3339();
-            if let Some((json_key, id_val)) = coalesce_identity(&ev.payload) {
+            let event_type = payload_event_type(&ev.payload);
+            let ckey = coalesce_key(&ev.payload);
+            if let Some(ref key_val) = ckey {
                 let boundary_seq = query_coalesce_boundary_seq(
                     &tx,
-                    "client_replica_events",
+                    false,
                     &ev.agent_id,
                     &ev.payload,
                     Some(ev.seq),
                 );
-                let pattern = format!("%\"{json_key}\":\"{id_val}\"%");
-                let _ = tx.execute(
+                if let Ok(mut del_stmt) = tx.prepare_cached(
                     "DELETE FROM client_replica_events
-                     WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND payload_json LIKE ?4",
-                    params![ev.agent_id, boundary_seq, ev.seq as i64, pattern],
-                );
+                     WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
+                ) {
+                    let _ = del_stmt.execute(params![
+                        ev.agent_id,
+                        boundary_seq,
+                        ev.seq as i64,
+                        key_val
+                    ]);
+                }
             }
-            tx.execute(
-                "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(agent_id, seq) DO UPDATE SET
-                    payload_json = excluded.payload_json",
-                params![
+            {
+                let mut ins_stmt = tx.prepare_cached(
+                    "INSERT INTO client_replica_events (agent_id, seq, epoch, turn_id, timestamp, payload_json, event_type, coalesce_key)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(agent_id, seq) DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        event_type = excluded.event_type,
+                        coalesce_key = excluded.coalesce_key",
+                )?;
+                ins_stmt.execute(params![
                     ev.agent_id,
                     ev.seq as i64,
                     ev.epoch,
                     ev.turn_id,
                     ts_str,
-                    payload_json
-                ],
-            )?;
+                    payload_json,
+                    event_type,
+                    ckey.as_deref()
+                ])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1552,7 +1659,7 @@ impl OrbitStore {
 
 fn query_coalesce_boundary_seq(
     tx: &rusqlite::Transaction<'_>,
-    table: &str,
+    is_daemon_table: bool,
     agent_id: &str,
     payload: &TimelinePayload,
     upper_seq: Option<u64>,
@@ -1561,55 +1668,89 @@ fn query_coalesce_boundary_seq(
         payload,
         TimelinePayload::AssistantMessage { .. } | TimelinePayload::AssistantThinking { .. }
     );
-    let sql = match (stop_at_tool, upper_seq.is_some()) {
-        (true, true) => format!(
-            "SELECT COALESCE(MAX(seq), 0) FROM {table}
+    let sql = match (is_daemon_table, stop_at_tool, upper_seq.is_some()) {
+        (true, true, true) => {
+            "SELECT COALESCE(MAX(seq), 0) FROM timeline_events
              WHERE agent_id = ?1 AND seq < ?2
-               AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
-                    OR payload_json LIKE '%\"type\":\"agent_message\"%'
-                    OR payload_json LIKE '%\"type\":\"tool_call\"%')"
-        ),
-        (true, false) => format!(
-            "SELECT COALESCE(MAX(seq), 0) FROM {table}
+               AND event_type IN ('user_prompt', 'agent_message', 'tool_call')"
+        }
+        (true, true, false) => {
+            "SELECT COALESCE(MAX(seq), 0) FROM timeline_events
              WHERE agent_id = ?1
-               AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
-                    OR payload_json LIKE '%\"type\":\"agent_message\"%'
-                    OR payload_json LIKE '%\"type\":\"tool_call\"%')"
-        ),
-        (false, true) => format!(
-            "SELECT COALESCE(MAX(seq), 0) FROM {table}
+               AND event_type IN ('user_prompt', 'agent_message', 'tool_call')"
+        }
+        (true, false, true) => {
+            "SELECT COALESCE(MAX(seq), 0) FROM timeline_events
              WHERE agent_id = ?1 AND seq < ?2
-               AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
-                    OR payload_json LIKE '%\"type\":\"agent_message\"%')"
-        ),
-        (false, false) => format!(
-            "SELECT COALESCE(MAX(seq), 0) FROM {table}
+               AND event_type IN ('user_prompt', 'agent_message')"
+        }
+        (true, false, false) => {
+            "SELECT COALESCE(MAX(seq), 0) FROM timeline_events
              WHERE agent_id = ?1
-               AND (payload_json LIKE '%\"type\":\"user_prompt\"%'
-                    OR payload_json LIKE '%\"type\":\"agent_message\"%')"
-        ),
+               AND event_type IN ('user_prompt', 'agent_message')"
+        }
+        (false, true, true) => {
+            "SELECT COALESCE(MAX(seq), 0) FROM client_replica_events
+             WHERE agent_id = ?1 AND seq < ?2
+               AND event_type IN ('user_prompt', 'agent_message', 'tool_call')"
+        }
+        (false, true, false) => {
+            "SELECT COALESCE(MAX(seq), 0) FROM client_replica_events
+             WHERE agent_id = ?1
+               AND event_type IN ('user_prompt', 'agent_message', 'tool_call')"
+        }
+        (false, false, true) => {
+            "SELECT COALESCE(MAX(seq), 0) FROM client_replica_events
+             WHERE agent_id = ?1 AND seq < ?2
+               AND event_type IN ('user_prompt', 'agent_message')"
+        }
+        (false, false, false) => {
+            "SELECT COALESCE(MAX(seq), 0) FROM client_replica_events
+             WHERE agent_id = ?1
+               AND event_type IN ('user_prompt', 'agent_message')"
+        }
     };
 
+    let Ok(mut stmt) = tx.prepare_cached(sql) else {
+        return 0;
+    };
     if let Some(max_s) = upper_seq {
-        tx.query_row(&sql, params![agent_id, max_s as i64], |r| r.get(0))
+        stmt.query_row(params![agent_id, max_s as i64], |r| r.get(0))
             .unwrap_or(0)
     } else {
-        tx.query_row(&sql, params![agent_id], |r| r.get(0))
-            .unwrap_or(0)
+        stmt.query_row(params![agent_id], |r| r.get(0)).unwrap_or(0)
     }
+}
+
+fn payload_event_type(payload: &TimelinePayload) -> &'static str {
+    match payload {
+        TimelinePayload::UserPrompt { .. } => "user_prompt",
+        TimelinePayload::AssistantThinking { .. } => "assistant_thinking",
+        TimelinePayload::AssistantMessage { .. } => "assistant_message",
+        TimelinePayload::ToolCall { .. } => "tool_call",
+        TimelinePayload::PermissionRequest { .. } => "permission_request",
+        TimelinePayload::PermissionResolved { .. } => "permission_resolved",
+        TimelinePayload::QuestionRequest { .. } => "question_request",
+        TimelinePayload::QuestionResolved { .. } => "question_resolved",
+        TimelinePayload::Notice { .. } => "notice",
+        TimelinePayload::AgentMessage { .. } => "agent_message",
+        TimelinePayload::StatusChanged { .. } => "status_changed",
+    }
+}
+
+fn coalesce_key(payload: &TimelinePayload) -> Option<String> {
+    coalesce_identity(payload).map(|(k, v)| format!("{k}:{v}"))
 }
 
 fn coalesce_identity(payload: &TimelinePayload) -> Option<(&'static str, &str)> {
     match payload {
         TimelinePayload::AssistantMessage { item_id, .. }
         | TimelinePayload::AssistantThinking { item_id, .. }
-            if !item_id.is_empty() && !item_id.contains('"') && !item_id.contains('%') =>
+            if !item_id.is_empty() =>
         {
             Some(("item_id", item_id.as_str()))
         }
-        TimelinePayload::ToolCall { call_id, .. }
-            if !call_id.is_empty() && !call_id.contains('"') && !call_id.contains('%') =>
-        {
+        TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
             Some(("call_id", call_id.as_str()))
         }
         _ => None,

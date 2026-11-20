@@ -979,6 +979,8 @@ impl From<FfiDiffLine> for DiffLineView {
             old_line: v.old_line,
             new_line: v.new_line,
             content: v.content,
+            tokens: Vec::new(),
+            inline_changes: Vec::new(),
         }
     }
 }
@@ -2784,6 +2786,7 @@ impl From<FfiAgentStageDeltaRequest> for AgentStageDeltaRequest {
             host_id: v.host_id,
             agent_id: v.agent_id,
             since_revision: v.since_revision,
+            since_aux_revision: None,
         }
     }
 }
@@ -3081,6 +3084,18 @@ impl OrbitMobileCore {
     pub fn agent_stage_delta_request(&self, req: FfiAgentStageDeltaRequest) -> FfiAgentStageDelta {
         let core_req: AgentStageDeltaRequest = req.into();
         self.inner.agent_stage_delta_by_request(&core_req).into()
+    }
+
+    pub fn agent_stage_delta_with_aux(
+        &self,
+        host_id: String,
+        agent_id: String,
+        since_revision: u64,
+        since_aux_revision: Option<u64>,
+    ) -> FfiAgentStageDelta {
+        self.inner
+            .agent_stage_delta_with_aux(&host_id, &agent_id, since_revision, since_aux_revision)
+            .into()
     }
 
     pub fn create_session(&self, req: FfiCreateSessionRequest) -> String {

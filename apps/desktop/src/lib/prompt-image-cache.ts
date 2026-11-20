@@ -65,7 +65,12 @@ function base64ToBlob(base64: string, mimeType: string): Blob {
   return new Blob([bytes], { type: mimeType });
 }
 
-export function seedPromptImagePreview(hostId: string, path: string, blobUrl: string): void {
+export function seedPromptImagePreview(
+  hostId: string,
+  path: string,
+  blobUrl: string,
+  ownedBlob = false,
+): void {
   const cleanPath = path.trim();
   if (!hostId || !cleanPath || !blobUrl) return;
   const key = buildCacheKey(hostId, cleanPath);
@@ -73,7 +78,7 @@ export function seedPromptImagePreview(hostId: string, path: string, blobUrl: st
     status: "ready",
     url: blobUrl,
     resolvedPath: cleanPath,
-    ownedBlob: false,
+    ownedBlob,
   });
 }
 

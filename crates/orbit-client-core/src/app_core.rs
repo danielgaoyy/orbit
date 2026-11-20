@@ -881,6 +881,31 @@ impl OrbitAppCore {
         }
     }
 
+    pub fn replace_subscribers(
+        &self,
+        options: SubscribeOptions,
+        sub: Arc<dyn CoreEventSubscriber>,
+    ) {
+        let wrapped: Arc<dyn CoreEventSubscriber> = if options.min_interval_ms == 0 {
+            if options.include_terminal_raw_bytes {
+                sub
+            } else {
+                Arc::new(StripTerminalBytesSubscriber { downstream: sub })
+            }
+        } else {
+            Arc::new(CoalescingSubscriber::new(
+                sub,
+                self.runtime.handle().clone(),
+                Duration::from_millis(options.min_interval_ms),
+                options.include_terminal_raw_bytes,
+            ))
+        };
+        if let Ok(mut guard) = self.subscribers.lock() {
+            guard.clear();
+            guard.push(wrapped);
+        }
+    }
+
     pub fn discover_local_daemon_uri(&self) -> Option<String> {
         discover_local_daemon_pairing_uri()
     }
@@ -1001,6 +1026,22 @@ impl OrbitAppCore {
         agent_id: &str,
         reader: impl FnOnce(Option<&AgentCardView>, Option<&CachedAgentStage>) -> R,
     ) -> R {
+        // Fast path: serve warm, clean stage cache under a shared read lock.
+        if let Ok(read_guard) = self.hosts.read()
+            && let Some(host_state) = read_guard.get(host_id)
+            && !host_state.stage_dirty.contains_key(agent_id)
+            && let Some(cached) = host_state.stage_cache.get(agent_id)
+        {
+            let prefs_guard = self.thread_prefs.read().ok();
+            let current_agent_card = host_state.agents.get(agent_id).map(|ag| {
+                let pref = prefs_guard
+                    .as_ref()
+                    .and_then(|p| p.get(&(host_id.to_string(), ag.agent_id.clone())));
+                agent_to_card_view(ag, pref)
+            });
+            return reader(current_agent_card.as_ref(), Some(cached));
+        }
+
         let Ok(mut guard) = self.hosts.write() else {
             return reader(None, None);
         };
@@ -1511,52 +1552,56 @@ impl OrbitAppCore {
 
     pub fn git_review(&self, host_id: &str, cwd: &str, path: Option<&str>) -> GitReviewView {
         let rev = self.revision.load(Ordering::SeqCst);
-        let Ok(guard) = self.hosts.read() else {
-            return GitReviewView {
-                revision: rev,
-                host_id: host_id.to_string(),
-                cwd: cwd.to_string(),
-                status: None,
-                selected_path: path.map(ToOwned::to_owned),
-                raw_diff: String::new(),
-                diff_files: Vec::new(),
+        let (raw_diff, status) = {
+            let Ok(guard) = self.hosts.read() else {
+                return GitReviewView {
+                    revision: rev,
+                    host_id: host_id.to_string(),
+                    cwd: cwd.to_string(),
+                    status: None,
+                    selected_path: path.map(ToOwned::to_owned),
+                    raw_diff: String::new(),
+                    diff_files: Vec::new(),
+                };
             };
-        };
-        let Some(host_state) = guard.get(host_id) else {
-            return GitReviewView {
-                revision: rev,
-                host_id: host_id.to_string(),
-                cwd: cwd.to_string(),
-                status: None,
-                selected_path: path.map(ToOwned::to_owned),
-                raw_diff: String::new(),
-                diff_files: Vec::new(),
+            let Some(host_state) = guard.get(host_id) else {
+                return GitReviewView {
+                    revision: rev,
+                    host_id: host_id.to_string(),
+                    cwd: cwd.to_string(),
+                    status: None,
+                    selected_path: path.map(ToOwned::to_owned),
+                    raw_diff: String::new(),
+                    diff_files: Vec::new(),
+                };
             };
-        };
 
-        let path_suffix = format!("::{}", path.unwrap_or("__all__"));
-        let exact_key = format!("{cwd}{path_suffix}");
-        let raw_diff = host_state
-            .git_diffs
-            .get(&exact_key)
-            .or_else(|| {
-                host_state.git_diffs.iter().find_map(|(k, v)| {
-                    let stored_cwd = k.strip_suffix(&path_suffix)?;
-                    cwd_paths_equivalent(stored_cwd, cwd).then_some(v)
+            let path_suffix = format!("::{}", path.unwrap_or("__all__"));
+            let exact_key = format!("{cwd}{path_suffix}");
+            let raw_diff = host_state
+                .git_diffs
+                .get(&exact_key)
+                .or_else(|| {
+                    host_state.git_diffs.iter().find_map(|(k, v)| {
+                        let stored_cwd = k.strip_suffix(&path_suffix)?;
+                        cwd_paths_equivalent(stored_cwd, cwd).then_some(v)
+                    })
                 })
-            })
-            .cloned()
-            .unwrap_or_default();
-        let status = host_state
-            .git_statuses
-            .get(cwd)
-            .or_else(|| {
-                host_state
-                    .git_statuses
-                    .iter()
-                    .find_map(|(k, v)| cwd_paths_equivalent(k, cwd).then_some(v))
-            })
-            .cloned();
+                .cloned()
+                .unwrap_or_default();
+            let status = host_state
+                .git_statuses
+                .get(cwd)
+                .or_else(|| {
+                    host_state
+                        .git_statuses
+                        .iter()
+                        .find_map(|(k, v)| cwd_paths_equivalent(k, cwd).then_some(v))
+                })
+                .cloned();
+            (raw_diff, status)
+        };
+        // Parse & syntax-highlight diff outside `self.hosts` read lock so inbound WS/PTY never stalls.
         let diff_files = parse_unified_diff(&raw_diff);
         let capped_raw_diff = truncate_utf8_prefix(&raw_diff, 32_768);
         GitReviewView {
@@ -1746,7 +1791,12 @@ impl OrbitAppCore {
         &self,
         req: &crate::contract::AgentStageDeltaRequest,
     ) -> crate::stage::AgentStageDeltaView {
-        self.agent_stage_delta(&req.host_id, &req.agent_id, req.since_revision)
+        self.agent_stage_delta_with_aux(
+            &req.host_id,
+            &req.agent_id,
+            req.since_revision,
+            req.since_aux_revision,
+        )
     }
 
     pub fn create_session(self: &Arc<Self>, req: crate::contract::CreateSessionRequest) -> String {
@@ -6035,7 +6085,13 @@ impl CoreEventSubscriber for CoalescingSubscriber {
                             }) => {
                                 *prev_rev = revision;
                                 if self.include_terminal_raw_bytes {
+                                    const MAX_COALESCED_TERMINAL_BYTES: usize = 128 * 1024;
                                     prev_bytes.extend_from_slice(raw_bytes);
+                                    if prev_bytes.len() > MAX_COALESCED_TERMINAL_BYTES {
+                                        let excess =
+                                            prev_bytes.len() - MAX_COALESCED_TERMINAL_BYTES;
+                                        prev_bytes.drain(..excess);
+                                    }
                                 } else {
                                     prev_bytes.clear();
                                 }
@@ -6367,8 +6423,12 @@ fn payload_affects_auxiliary_state(payload: &TimelinePayload) -> bool {
     match payload {
         TimelinePayload::AssistantThinking { .. } => false,
         TimelinePayload::AssistantMessage { text, .. } => {
-            contains_ascii_case_insensitive_str(text, "http://")
-                || contains_ascii_case_insensitive_str(text, "https://")
+            (contains_ascii_case_insensitive_str(text, "http://")
+                || contains_ascii_case_insensitive_str(text, "https://"))
+                && (contains_ascii_case_insensitive_str(text, "localhost")
+                    || contains_ascii_case_insensitive_str(text, "127.0.0.1")
+                    || contains_ascii_case_insensitive_str(text, "0.0.0.0")
+                    || contains_ascii_case_insensitive_str(text, "[::1]"))
         }
         _ => true,
     }

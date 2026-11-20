@@ -10,6 +10,7 @@ import {
 } from "react";
 import { Check, Copy } from "lucide-react";
 import { DiagramBlock } from "@/components/diagram-block";
+import { adaptTokenColor } from "@/lib/code-highlight";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   type InlineSpanView,
@@ -58,40 +59,7 @@ export function MarkdownLinkProvider({
   return <MarkdownLinkContext.Provider value={value}>{children}</MarkdownLinkContext.Provider>;
 }
 
-const lightTokenColorCache = new Map<string, string>();
 const EMPTY_PACING_BLOCKS: RichBlockView[] = [];
-
-/**
- * `orbit-client-core` highlights tokens against `base16-ocean.dark` pastel foregrounds.
- * When the desktop UI follows macOS Light Mode, shift bright pastel tokens into deep ink tones
- * while preserving hue differentiation so code blocks sit naturally on a light paper surface.
- */
-function adaptTokenColor(hex: string, isDark: boolean): string {
-  if (isDark || !hex.startsWith("#") || hex.length !== 7) return hex;
-  const cached = lightTokenColorCache.get(hex);
-  if (cached !== undefined) return cached;
-
-  const r = Number.parseInt(hex.slice(1, 3), 16);
-  const g = Number.parseInt(hex.slice(3, 5), 16);
-  const b = Number.parseInt(hex.slice(5, 7), 16);
-  if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return hex;
-
-  // Neutral near-white default tokens (`#C0C5CE` / `#E2E8F0`) -> crisp charcoal ink
-  const spread = Math.max(r, g, b) - Math.min(r, g, b);
-  let computed: string;
-  if (spread < 24 && r > 150) {
-    computed = "#1F2937";
-  } else {
-    // Scale down luminance while keeping chromatic hue saturation
-    const scale = 0.52;
-    const dr = Math.max(0, Math.min(255, Math.round(r * scale)));
-    const dg = Math.max(0, Math.min(255, Math.round(g * scale)));
-    const db = Math.max(0, Math.min(255, Math.round(b * scale)));
-    computed = `rgb(${dr}, ${dg}, ${db})`;
-  }
-  lightTokenColorCache.set(hex, computed);
-  return computed;
-}
 
 function spansAreEqual(a: InlineSpanView[], b: InlineSpanView[]): boolean {
   if (a === b) return true;

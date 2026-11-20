@@ -119,14 +119,26 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     resizeCleanupRef.current?.();
     const startX = e.clientX;
     const startW = panelWidthPx;
+    let latestW = startW;
+    let rafId: number | null = null;
     setIsResizingRight(true);
     document.body.style.cursor = "col-resize";
 
     const onMove = (ev: MouseEvent) => {
-      const delta = startX - ev.clientX;
-      orbitActions.setSidePanelWidth(startW + delta);
+      latestW = startW + (startX - ev.clientX);
+      if (rafId === null) {
+        rafId = window.requestAnimationFrame(() => {
+          rafId = null;
+          orbitActions.setSidePanelWidth(latestW, false);
+        });
+      }
     };
     const cleanup = () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      orbitActions.setSidePanelWidth(latestW, true);
       setIsResizingRight(false);
       document.body.style.cursor = "";
       window.removeEventListener("mousemove", onMove);
@@ -267,10 +279,20 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
           <TerminalTab selectedHostId={selectedHostId} visible={isTerminalVisible} />
         )}
 
+        {/* Persistent Browser Preview Pool (kept alive across Side Panel tab switches) */}
+        {tabs
+          .filter((t) => t.kind === "browser")
+          .map((browserTab) => (
+            <BrowserTab
+              key={browserTab.id}
+              tab={browserTab}
+              visible={panelVisible && activeTab?.id === browserTab.id}
+            />
+          ))}
+
         {activeTab?.kind === "review" && <ReviewTab selectedHostId={selectedHostId} />}
         {activeTab?.kind === "files" && <FilesExplorerTab />}
         {activeTab?.kind === "file" && <FileViewerTab key={activeTab.id} tab={activeTab} />}
-        {activeTab?.kind === "browser" && <BrowserTab key={activeTab.id} tab={activeTab} />}
         {activeTab?.kind === "side_question" && <SideQuestionTab />}
         {activeTab?.kind === "subagent" && <SubagentTab key={activeTab.id} tab={activeTab} />}
 

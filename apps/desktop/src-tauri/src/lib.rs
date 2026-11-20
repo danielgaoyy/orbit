@@ -80,7 +80,7 @@ fn default_desktop_db_path() -> PathBuf {
 
 #[tauri::command]
 fn subscribe_core_events(state: State<'_, DesktopAppState>, on_event: Channel<CoreNotification>) {
-    state.core.subscribe_with_options(
+    state.core.replace_subscribers(
         SubscribeOptions {
             min_interval_ms: 28,
             include_terminal_raw_bytes: true,
@@ -100,11 +100,14 @@ fn get_fleet_overview(state: State<'_, DesktopAppState>) -> FleetOverviewView {
 }
 
 #[tauri::command]
-fn get_fleet_sidebar(
+async fn get_fleet_sidebar(
     state: State<'_, DesktopAppState>,
     req: FleetSidebarRequest,
-) -> FleetSidebarView {
-    state.core.fleet_sidebar_by_request(&req)
+) -> Result<FleetSidebarView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.fleet_sidebar_by_request(&req))
+        .await
+        .map_err(|e| format!("fleet sidebar task error: {e}"))
 }
 
 #[tauri::command]
@@ -113,25 +116,31 @@ fn get_host_detail(state: State<'_, DesktopAppState>, host_id: String) -> Option
 }
 
 #[tauri::command]
-fn get_agent_stage(
+async fn get_agent_stage(
     state: State<'_, DesktopAppState>,
     host_id: String,
     agent_id: String,
-) -> AgentStageView {
-    state.core.agent_stage(&host_id, &agent_id)
+) -> Result<AgentStageView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.agent_stage(&host_id, &agent_id))
+        .await
+        .map_err(|e| format!("agent stage task error: {e}"))
 }
 
 #[tauri::command]
-fn get_agent_stage_delta(
+async fn get_agent_stage_delta(
     state: State<'_, DesktopAppState>,
     host_id: String,
     agent_id: String,
     since_revision: u64,
     since_aux_revision: Option<u64>,
-) -> AgentStageDeltaView {
-    state
-        .core
-        .agent_stage_delta_with_aux(&host_id, &agent_id, since_revision, since_aux_revision)
+) -> Result<AgentStageDeltaView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.agent_stage_delta_with_aux(&host_id, &agent_id, since_revision, since_aux_revision)
+    })
+    .await
+    .map_err(|e| format!("agent stage delta task error: {e}"))
 }
 
 #[tauri::command]
@@ -274,13 +283,16 @@ fn get_agent_timeline_delta(
 }
 
 #[tauri::command]
-fn get_git_review(
+async fn get_git_review(
     state: State<'_, DesktopAppState>,
     host_id: String,
     cwd: String,
     path: Option<String>,
-) -> GitReviewView {
-    state.core.git_review(&host_id, &cwd, path.as_deref())
+) -> Result<GitReviewView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.git_review(&host_id, &cwd, path.as_deref()))
+        .await
+        .map_err(|e| format!("git review task error: {e}"))
 }
 
 #[tauri::command]
@@ -981,13 +993,17 @@ fn resize_terminal_slot(
 }
 
 #[tauri::command]
-fn list_ssh_hosts() -> Vec<SshHostItem> {
-    discover_user_ssh_hosts()
+async fn list_ssh_hosts() -> Result<Vec<SshHostItem>, String> {
+    tauri::async_runtime::spawn_blocking(discover_user_ssh_hosts)
+        .await
+        .map_err(|e| format!("list ssh hosts task error: {e}"))
 }
 
 #[tauri::command]
-fn list_external_editors() -> Vec<ExternalEditorInfo> {
-    detect_installed_editors()
+async fn list_external_editors() -> Result<Vec<ExternalEditorInfo>, String> {
+    tauri::async_runtime::spawn_blocking(detect_installed_editors)
+        .await
+        .map_err(|e| format!("list external editors task error: {e}"))
 }
 
 #[tauri::command]
@@ -1007,21 +1023,30 @@ async fn pick_project_folder(initial_dir: Option<String>) -> Result<Option<Strin
 }
 
 #[tauri::command]
-fn get_workspace_files(
+async fn get_workspace_files(
     state: State<'_, DesktopAppState>,
     host_id: String,
     cwd: String,
-) -> Vec<String> {
-    let cached = state.core.workspace_files(&host_id, &cwd);
-    if !cached.is_empty() {
-        return cached;
-    }
-    state.core.fetch_workspace_files(&host_id, &cwd);
-    if state.core.is_local_host(&host_id) {
-        list_local_workspace_files(&cwd, 2500).unwrap_or_default()
-    } else {
-        Vec::new()
-    }
+    force: Option<bool>,
+) -> Result<Vec<String>, String> {
+    let core = Arc::clone(&state.core);
+    let force_refresh = force.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        if !force_refresh {
+            let cached = core.workspace_files(&host_id, &cwd);
+            if !cached.is_empty() {
+                return cached;
+            }
+        }
+        core.fetch_workspace_files(&host_id, &cwd);
+        if core.is_local_host(&host_id) {
+            list_local_workspace_files(&cwd, 10_000).unwrap_or_default()
+        } else {
+            core.workspace_files(&host_id, &cwd)
+        }
+    })
+    .await
+    .map_err(|e| format!("workspace files task error: {e}"))
 }
 
 #[tauri::command]
@@ -1155,8 +1180,13 @@ async fn ask_side_question(
 }
 
 #[tauri::command]
-fn parse_markdown_preview(markdown: String, streaming: bool) -> Vec<RichBlockView> {
-    parse_markdown_blocks(&markdown, streaming)
+async fn parse_markdown_preview(
+    markdown: String,
+    streaming: bool,
+) -> Result<Vec<RichBlockView>, String> {
+    tauri::async_runtime::spawn_blocking(move || parse_markdown_blocks(&markdown, streaming))
+        .await
+        .map_err(|e| format!("markdown preview task error: {e}"))
 }
 
 #[tauri::command]

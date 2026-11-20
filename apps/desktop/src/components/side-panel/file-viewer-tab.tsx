@@ -29,31 +29,8 @@ import {
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
+import { adaptTokenColor } from "@/lib/code-highlight";
 import { cn } from "@/lib/utils";
-
-const lightTokenCache = new Map<string, string>();
-
-function adaptTokenColor(hex: string, isDark: boolean): string {
-  if (isDark || !hex.startsWith("#") || hex.length !== 7) return hex;
-  const cached = lightTokenCache.get(hex);
-  if (cached !== undefined) return cached;
-
-  const r = Number.parseInt(hex.slice(1, 3), 16);
-  const g = Number.parseInt(hex.slice(3, 5), 16);
-  const b = Number.parseInt(hex.slice(5, 7), 16);
-  if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return hex;
-
-  const spread = Math.max(r, g, b) - Math.min(r, g, b);
-  let computed: string;
-  if (spread < 24 && r > 150) {
-    computed = "#1F2937";
-  } else {
-    const scale = 0.52;
-    computed = `rgb(${Math.round(r * scale)}, ${Math.round(g * scale)}, ${Math.round(b * scale)})`;
-  }
-  lightTokenCache.set(hex, computed);
-  return computed;
-}
 
 export const FileViewerTab = memo(function FileViewerTab({
   tab,
@@ -123,18 +100,22 @@ export const FileViewerTab = memo(function FileViewerTab({
     );
   }, [gitStatusFiles, relPath, path]);
 
+  const rawLowerLines = useMemo(() => {
+    if (!data || data.content_kind !== "text") return [];
+    return data.content.split(/\r?\n/).map((l) => l.toLowerCase());
+  }, [data]);
+
   const matchLineNumbers = useMemo(() => {
     const q = findQuery.trim().toLowerCase();
-    if (!q || !data || data.content_kind !== "text") return [];
+    if (!q || rawLowerLines.length === 0) return [];
     const matched: number[] = [];
-    const rawLines = data.content.split(/\r?\n/);
-    for (let i = 0; i < rawLines.length; i += 1) {
-      if (rawLines[i].toLowerCase().includes(q)) {
+    for (let i = 0; i < rawLowerLines.length; i += 1) {
+      if (rawLowerLines[i].includes(q)) {
         matched.push(i + 1);
       }
     }
     return matched;
-  }, [findQuery, data]);
+  }, [findQuery, rawLowerLines]);
 
   const matchLineSet = useMemo(() => new Set(matchLineNumbers), [matchLineNumbers]);
 
@@ -193,6 +174,32 @@ export const FileViewerTab = memo(function FileViewerTab({
     if (isMarkdown) setMarkdownMode("source");
     requestAnimationFrame(() => findInputRef.current?.focus());
   };
+
+  useEffect(() => {
+    const onWindowKeyDown = (e: KeyboardEvent) => {
+      const snap = orbitActions.getSnapshot();
+      if (
+        !snap.sidePanelOpen ||
+        snap.terminalFocused ||
+        snap.commandPaletteOpen ||
+        snap.quickOpenFilesOpen
+      ) {
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        setFindOpen(true);
+        if (isMarkdown) setMarkdownMode("source");
+        requestAnimationFrame(() => findInputRef.current?.focus());
+      } else if (e.key === "Escape" && findOpen) {
+        e.preventDefault();
+        setFindOpen(false);
+        setFindQuery("");
+      }
+    };
+    window.addEventListener("keydown", onWindowKeyDown);
+    return () => window.removeEventListener("keydown", onWindowKeyDown);
+  }, [findOpen, isMarkdown]);
 
   const stepMatch = (delta: number) => {
     if (matchLineNumbers.length === 0) return;
@@ -478,7 +485,7 @@ export const FileViewerTab = memo(function FileViewerTab({
                   !isFocused && isMatched && "bg-amber-500/[0.12]",
                 )}
               >
-                <span className="tabular-nums w-10 shrink-0 pr-2 text-right text-[11px] text-zinc-400 select-none dark:text-zinc-600">
+                <span className="tabular-nums min-w-[2.75rem] shrink-0 pr-2 text-right text-[11px] text-zinc-400 select-none dark:text-zinc-600">
                   {line.line_number}
                 </span>
                 <button

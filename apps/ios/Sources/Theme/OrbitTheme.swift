@@ -617,13 +617,21 @@ public enum OrbitFormatters {
         return compact
     }
 
+    private static let isoFormatterWithFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private static let isoFormatterPlain: ISO8601DateFormatter = {
+        ISO8601DateFormatter()
+    }()
+
     public static func resetCountdown(rfc3339: String?) -> String? {
         guard let raw = rfc3339?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return nil
         }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        var date = formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+        var date = isoFormatterWithFractional.date(from: raw) ?? isoFormatterPlain.date(from: raw)
         if date == nil, let epoch = Double(raw) {
             let secs = epoch > 10_000_000_000 ? epoch / 1000.0 : epoch
             date = Date(timeIntervalSince1970: secs)
@@ -648,9 +656,7 @@ public enum OrbitFormatters {
 
     public static func relativeUpdatedTime(rfc3339: String) -> String {
         guard !rfc3339.isEmpty else { return "" }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let date = formatter.date(from: rfc3339) ?? ISO8601DateFormatter().date(from: rfc3339)
+        let date = isoFormatterWithFractional.date(from: rfc3339) ?? isoFormatterPlain.date(from: rfc3339)
         guard let parsed = date else { return "" }
         let elapsed = max(0, Int(Date().timeIntervalSince(parsed)))
         if elapsed < 45 {

@@ -1119,7 +1119,9 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         if (!curAfter.isNewSessionMode && curAfter.selectedHostId == hostId && curAfter.selectedAgentId == agentId) {
             val seenSeq = maxOf(stage.agent?.latestSeq ?: 0uL, stage.latestSeq)
             runCatching { core?.markAgentSeen(hostId, agentId, seenSeq) }
-            refreshSidebarInternal()
+            if (stage.agent?.isRunning != true) {
+                refreshSidebarInternal()
+            }
         }
 
         val queueKey = agentQueueKey(hostId, agentId)

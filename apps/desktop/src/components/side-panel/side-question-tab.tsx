@@ -1,32 +1,58 @@
-import { memo, useEffect, useRef } from "react";
+import { memo, useMemo } from "react";
 import {
   AlertTriangle,
-  ArrowUp,
   ArrowUpRight,
+  ChevronDown,
   Loader2,
-  MessageCircleQuestion,
+  Plus,
+  Shield,
   Trash2,
 } from "lucide-react";
+import {
+  ConversationMessageFooter,
+  ConversationUserBubble,
+  ConversationViewport,
+} from "@/components/conversation/conversation-viewport";
+import { ConversationComposer } from "@/components/conversation/conversation-composer";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { useImeCompositionGuard } from "@/lib/ime";
+import { ProviderIcon } from "@/components/ui/provider-icons";
 import {
   type SideQuestionEntry,
   orbitActions,
   sideQuestionScopeKey,
   useOrbitSelector,
 } from "@/state/orbit-store";
-import { cn } from "@/lib/utils";
 
 const EMPTY_ENTRIES: readonly SideQuestionEntry[] = [];
 
+const QUICK_SIDE_PROMPTS = [
+  "Summarize what changed so far",
+  "Explain the latest output",
+  "Check for potential edge cases",
+] as const;
+
 export const SideQuestionTab = memo(function SideQuestionTab() {
   const scope = useOrbitSelector((s) => sideQuestionScopeKey(s));
+  const hostId = useOrbitSelector((s) => s.selectedHostId);
+  const cwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const enterToSend = useOrbitSelector((s) => s.enterToSend);
   const entries = useOrbitSelector((s) => s.sideQuestionsByScope[scope] ?? EMPTY_ENTRIES);
   const draft = useOrbitSelector((s) => s.sideQuestionDrafts[scope] ?? "");
   const focusNonce = useOrbitSelector((s) => s.sideQuestionFocusNonce);
+
+  const activeProvider = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return s.draftProvider;
+    if (!s.isDraftNewSession && s.selectedAgentId) {
+      const ag = s.hostDetails[s.selectedHostId]?.agents.find(
+        (a) => a.agent_id === s.selectedAgentId,
+      );
+      if (ag) return ag.provider;
+    }
+    return s.draftProvider;
+  });
+
   const activeProviderLabel = useOrbitSelector((s) => {
-    if (!s.selectedHostId) return null;
+    if (!s.selectedHostId) return "Assistant";
     if (!s.isDraftNewSession && s.selectedAgentId) {
       const ag = s.hostDetails[s.selectedHostId]?.agents.find(
         (a) => a.agent_id === s.selectedAgentId,
@@ -40,19 +66,21 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         : "Codex";
   });
 
-  const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const bottomRef = useRef<HTMLDivElement | null>(null);
-  const ime = useImeCompositionGuard();
-
-  useEffect(() => {
-    requestAnimationFrame(() => inputRef.current?.focus());
-  }, [focusNonce]);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [entries.length, entries[entries.length - 1]?.answer.length]);
+  const activeModel = useOrbitSelector((s) => {
+    if (!s.selectedHostId) return null;
+    if (!s.isDraftNewSession && s.selectedAgentId) {
+      const ag = s.hostDetails[s.selectedHostId]?.agents.find(
+        (a) => a.agent_id === s.selectedAgentId,
+      );
+      if (ag) return ag.model ?? null;
+    }
+    return s.draftModels[s.draftProvider] ?? null;
+  });
 
   const isStreaming = entries.some((e) => e.status === "streaming");
+  const promptHistory = useMemo(() => entries.map((e) => e.question), [entries]);
+  const lastEntry = entries[entries.length - 1];
+  const contentVersion = `${entries.length}:${lastEntry?.id ?? ""}:${lastEntry?.answer.length ?? 0}:${lastEntry?.status ?? ""}`;
 
   const handleSubmit = () => {
     const trimmed = draft.trim();
@@ -62,62 +90,51 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
 
   return (
     <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
-      {/* Quiet Context Sub-Bar */}
-      <div className="border-border flex h-[36px] shrink-0 items-center justify-between gap-2 border-b px-3">
-        <div className="text-muted-foreground flex min-w-0 items-center gap-1.5 text-[11.5px]">
-          <span className="font-mono text-foreground/75">/btw</span>
-          <span className="truncate">Read-only · never alters main thread</span>
-        </div>
-
-        {entries.length > 0 && (
-          <button
-            type="button"
-            title="Clear side questions"
-            onClick={() => orbitActions.clearSideQuestions()}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] transition-colors"
-          >
-            <Trash2 className="h-[12px] w-[12px]" />
-            <span>Clear</span>
-          </button>
-        )}
-      </div>
-
-      {/* Ephemeral Q&A Stream */}
-      <ScrollArea className="bg-canvas min-h-0 flex-1" viewportClassName="px-4 py-4">
+      {/* Shared Conversation Viewport matching main StreamStage prose & bubbles */}
+      <ConversationViewport
+        hostId={hostId}
+        cwd={cwd}
+        resetKey={scope}
+        contentVersion={contentVersion}
+        viewportClassName="px-5 py-5"
+      >
         {entries.length === 0 ? (
-          <div className="flex min-h-[240px] flex-col items-center justify-center gap-3 px-4 text-center">
-            <div className="bg-muted text-muted-foreground inline-flex h-9 w-9 items-center justify-center rounded-xl">
-              <MessageCircleQuestion className="h-[18px] w-[18px] stroke-[1.65]" />
-            </div>
-            <div className="space-y-1">
-              <div className="text-foreground text-[13px] font-medium">
-                Ask a Side Question
+          <div className="flex min-h-[calc(100%-24px)] flex-col items-center justify-center px-4 py-12 text-center">
+            <div className="max-w-[300px] space-y-5">
+              <div className="space-y-1.5">
+                <h3 className="text-foreground text-[15px] font-medium tracking-[-0.015em]">
+                  Side Question
+                </h3>
+                <p className="text-muted-foreground text-[13px] leading-[1.55]">
+                  Ask in context without interrupting or modifying the active thread.
+                </p>
               </div>
-              <p className="text-muted-foreground max-w-[260px] text-[12px] leading-relaxed">
-                Ask anything about the active conversation while the main agent keeps working. Type{" "}
-                <code className="bg-muted text-foreground/85 rounded px-1 py-0.5 font-mono text-[11px]">
-                  /btw
-                </code>{" "}
-                in the main composer or ask below.
-              </p>
+
+              <div className="flex flex-col items-center gap-1.5">
+                {QUICK_SIDE_PROMPTS.map((prompt) => (
+                  <button
+                    key={prompt}
+                    type="button"
+                    onClick={() => void orbitActions.submitSideQuestion(prompt)}
+                    className="border-border/80 bg-elevated/45 text-foreground/80 hover:border-foreground/20 hover:bg-accent/70 hover:text-foreground inline-flex max-w-full cursor-pointer items-center rounded-full border px-3 py-1 text-[12px] transition-colors"
+                  >
+                    <span className="truncate">{prompt}</span>
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
         ) : (
-          <div className="space-y-5">
+          <div className="space-y-7">
             {entries.map((entry) => (
-              <div key={entry.id} className="orbit-bubble-enter space-y-2.5">
-                {/* User Side Question */}
-                <div className="flex justify-end">
-                  <div className="prompt-bubble-surface selectable-text text-foreground max-w-[90%] rounded-2xl rounded-tr-md px-3.5 py-2 text-[12.5px] leading-relaxed whitespace-pre-wrap">
-                    {entry.question}
-                  </div>
-                </div>
+              <div key={entry.id} className="orbit-bubble-enter space-y-4">
+                <ConversationUserBubble text={entry.question} />
 
-                {/* Assistant Side Answer */}
-                <div className="space-y-1.5">
+                {/* Assistant Side Answer (full primary conversation typography) */}
+                <div className="space-y-2">
                   {entry.status === "streaming" && !entry.answer ? (
-                    <div className="text-muted-foreground flex items-center gap-2 py-1 text-[12.5px]">
-                      <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
+                    <div className="text-muted-foreground flex items-center gap-2 py-1 text-[13.5px]">
+                      <Loader2 className="h-[14px] w-[14px] animate-spin" />
                       <span className="agent-text-shimmer">
                         Thinking with {entry.providerLabel}…
                       </span>
@@ -125,22 +142,21 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                   ) : (
                     <>
                       {entry.answer && (
-                        <div className="text-[13px]">
+                        <div className="min-w-0 text-[14.5px] leading-[1.68]">
                           {entry.blocks.length > 0 ? (
                             <MarkdownBlocksView
                               blocks={entry.blocks}
                               streaming={entry.status === "streaming"}
-                              compact
                             />
                           ) : (
-                            <div className="selectable-text text-foreground/90 leading-relaxed whitespace-pre-wrap">
+                            <div className="selectable-text text-foreground/92 leading-[1.68] whitespace-pre-wrap">
                               {entry.answer}
                             </div>
                           )}
                         </div>
                       )}
                       {entry.error && (
-                        <div className="border-rose-500/25 bg-rose-500/[0.05] text-foreground/85 flex items-start gap-2 rounded-xl border px-3 py-2 text-[12px]">
+                        <div className="border-rose-500/25 bg-rose-500/[0.05] text-foreground/85 flex items-start gap-2 rounded-xl border px-3 py-2 text-[12.5px]">
                           <AlertTriangle className="mt-0.5 h-[14px] w-[14px] shrink-0 text-rose-500" />
                           <span className="selectable-text break-words">{entry.error}</span>
                         </div>
@@ -149,75 +165,89 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                   )}
 
                   {entry.status === "done" && entry.answer.trim() && (
-                    <div className="flex items-center justify-between pt-0.5">
-                      <span className="text-muted-foreground/75 text-[11px]">
-                        {entry.providerLabel} · ephemeral
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          orbitActions.promoteSideQuestionToComposer(
-                            `Regarding "${entry.question}":\n${entry.answer}`,
-                          )
-                        }
-                        className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] transition-colors"
-                      >
-                        <span>Send to main chat</span>
-                        <ArrowUpRight className="h-[11.5px] w-[11.5px]" />
-                      </button>
-                    </div>
+                    <ConversationMessageFooter
+                      copyText={entry.answer}
+                      metaLabel={entry.providerLabel}
+                      rightSlot={
+                        <button
+                          type="button"
+                          onClick={() =>
+                            orbitActions.promoteSideQuestionToComposer(
+                              `Regarding "${entry.question}":\n${entry.answer}`,
+                            )
+                          }
+                          className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-[11.5px] transition-colors"
+                        >
+                          <span>Send to main chat</span>
+                          <ArrowUpRight className="h-[12px] w-[12px]" />
+                        </button>
+                      }
+                    />
                   )}
                 </div>
               </div>
             ))}
-            <div ref={bottomRef} />
           </div>
         )}
-      </ScrollArea>
+      </ConversationViewport>
 
-      {/* Compact Side Input */}
-      <div className="border-border bg-sidebar shrink-0 border-t p-2.5">
-        <div className="composer-surface flex items-end gap-2 rounded-xl px-3 py-2">
-          <textarea
-            ref={inputRef}
-            rows={1}
-            value={draft}
-            onChange={(e) => orbitActions.setSideQuestionDraft(e.target.value)}
-            {...ime.compositionProps}
-            onKeyDown={(e) => {
-              if (ime.shouldIgnoreKeyDown(e)) return;
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                handleSubmit();
-              }
-            }}
-            placeholder={
-              activeProviderLabel
-                ? `Ask ${activeProviderLabel} on the side…`
-                : "Ask a side question…"
-            }
-            className="text-foreground placeholder:text-muted-foreground max-h-28 min-h-[22px] flex-1 resize-none bg-transparent text-[12.5px] leading-[1.45] outline-none"
-          />
-          <button
-            type="button"
-            disabled={!draft.trim() || isStreaming}
-            onClick={handleSubmit}
-            aria-label="Send side question"
-            className={cn(
-              "orbit-press inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-lg transition-colors",
-              draft.trim() && !isStreaming
-                ? "bg-foreground text-background hover:opacity-90"
-                : "bg-muted text-muted-foreground cursor-default opacity-60",
+      {/* Twin Conversation Composer matching primary OmniComposer (read-only controls disabled) */}
+      <ConversationComposer
+        variant="docked"
+        value={draft}
+        onChange={(next) => orbitActions.setSideQuestionDraft(next)}
+        onSubmit={handleSubmit}
+        onInterrupt={isStreaming ? () => orbitActions.cancelSideQuestion(scope) : undefined}
+        isBusy={isStreaming}
+        enterToSend={enterToSend}
+        focusNonce={focusNonce}
+        promptHistory={promptHistory}
+        placeholder={`Ask ${activeProviderLabel} on the side…`}
+        leftControlsSlot={
+          <div className="flex min-w-0 items-center gap-0.5">
+            <button
+              type="button"
+              disabled
+              title="Attachments are disabled in side questions"
+              className="text-foreground/35 inline-flex size-8.5 shrink-0 cursor-not-allowed items-center justify-center rounded-full"
+            >
+              <Plus className="size-[18px] stroke-[1.75]" />
+            </button>
+            <button
+              type="button"
+              disabled
+              title={`Inherits active session engine (${activeProviderLabel})`}
+              className="text-foreground/65 inline-flex h-8.5 min-w-0 cursor-not-allowed items-center gap-1.5 rounded-full px-2 text-[13.5px] font-normal"
+            >
+              <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
+              <span className="truncate">{activeModel || activeProviderLabel}</span>
+              <ChevronDown className="text-foreground/30 size-3.5 shrink-0 stroke-[1.75]" />
+            </button>
+          </div>
+        }
+        rightControlsSlot={
+          <div className="flex items-center gap-1">
+            {entries.length > 0 && (
+              <button
+                type="button"
+                title="Clear side thread"
+                onClick={() => orbitActions.clearSideQuestions()}
+                className="text-muted-foreground hover:text-foreground inline-flex size-8 cursor-pointer items-center justify-center rounded-full transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
+              >
+                <Trash2 className="size-[14px]" />
+              </button>
             )}
-          >
-            {isStreaming ? (
-              <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
-            ) : (
-              <ArrowUp className="h-[14px] w-[14px] stroke-[2.2]" />
-            )}
-          </button>
-        </div>
-      </div>
+            <button
+              type="button"
+              disabled
+              title="Read-only — side questions never modify files or main thread"
+              className="text-foreground/45 inline-flex h-8.5 cursor-not-allowed items-center gap-1 rounded-full px-2 text-[13px]"
+            >
+              <Shield className="size-4 shrink-0 stroke-[1.75]" />
+            </button>
+          </div>
+        }
+      />
     </div>
   );
 });

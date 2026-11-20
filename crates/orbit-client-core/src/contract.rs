@@ -42,6 +42,8 @@ pub struct AgentStageDeltaRequest {
     pub agent_id: String,
     #[serde(default)]
     pub since_revision: u64,
+    #[serde(default)]
+    pub since_aux_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

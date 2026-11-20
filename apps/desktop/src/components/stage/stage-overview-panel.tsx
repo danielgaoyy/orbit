@@ -206,8 +206,29 @@ const StageOverviewBody = memo(function StageOverviewBody({
     return openForHost.length + detachedCount;
   }, [terminalTabs, hostId, hostDetail?.terminals]);
 
+  const [showAllSubagents, setShowAllSubagents] = useState(false);
+  const [showAllTasks, setShowAllTasks] = useState(false);
+
+  const orderedSubagents = useMemo(() => {
+    const running = insights.subagents.filter((s) => s.status === "running");
+    const rest = insights.subagents.filter((s) => s.status !== "running");
+    return [...running, ...rest];
+  }, [insights.subagents]);
+
+  const visibleSubagents = showAllSubagents ? orderedSubagents : orderedSubagents.slice(0, 1);
+  const hiddenSubagentCount = Math.max(0, orderedSubagents.length - visibleSubagents.length);
+
+  const orderedTasks = useMemo(() => {
+    const running = backgroundTasks.filter((t) => t.status === "running");
+    const rest = backgroundTasks.filter((t) => t.status !== "running");
+    return [...running, ...rest];
+  }, [backgroundTasks]);
+
+  const visibleTasks = showAllTasks ? orderedTasks : orderedTasks.slice(0, 1);
+  const hiddenTaskCount = Math.max(0, orderedTasks.length - visibleTasks.length);
+
   return (
-    <div className="flex max-h-full flex-col overflow-y-auto select-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="flex min-h-0 max-h-full flex-1 flex-col overflow-y-auto select-none">
       {/* Layer 1: Primary Overview Shortcuts */}
       <div className="px-2.5 pt-2.5 pb-2">
         <div className="flex h-[24px] items-center px-2 pb-0.5">
@@ -281,7 +302,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
           collapsed={collapsedSections.subagents}
           isRunning={insights.subagents.some((s) => s.status === "running")}
         >
-          {insights.subagents.map((sa) => (
+          {visibleSubagents.map((sa) => (
             <Button
               key={sa.id}
               type="button"
@@ -317,6 +338,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
               </span>
             </Button>
           ))}
+          {orderedSubagents.length > 1 && (
+            <button
+              type="button"
+              onClick={() => setShowAllSubagents((v) => !v)}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex h-[26px] w-full cursor-pointer items-center justify-center rounded-[8px] text-[11.5px] font-medium transition-colors"
+            >
+              {showAllSubagents ? "Show less" : `Show ${hiddenSubagentCount} more`}
+            </button>
+          )}
         </OverviewLayerSection>
       )}
 
@@ -329,7 +359,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
           collapsed={collapsedSections.tasks}
           isRunning={backgroundTasks.some((t) => t.status === "running")}
         >
-          {backgroundTasks.map((task) => {
+          {visibleTasks.map((task) => {
             const hasDetails = Boolean(task.command || task.output_preview || task.log_path);
             const isExpanded = Boolean(expandedTasks[task.id]);
             return (
@@ -400,6 +430,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
               </div>
             );
           })}
+          {orderedTasks.length > 1 && (
+            <button
+              type="button"
+              onClick={() => setShowAllTasks((v) => !v)}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex h-[26px] w-full cursor-pointer items-center justify-center rounded-[8px] text-[11.5px] font-medium transition-colors"
+            >
+              {showAllTasks ? "Show less" : `Show ${hiddenTaskCount} more`}
+            </button>
+          )}
         </OverviewLayerSection>
       )}
     </div>

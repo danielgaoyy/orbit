@@ -27,13 +27,16 @@ import {
   Globe,
   Layers,
   ListTodo,
+  Loader2,
   MessageSquareText,
   Quote,
+  RotateCcw,
   Scissors,
   Search,
   Sparkles,
   SquareTerminal,
   Terminal as TerminalIcon,
+  Undo2,
   Wrench,
   type LucideIcon,
 } from "lucide-react";
@@ -59,11 +62,20 @@ import { OmniComposer } from "@/components/composer/omni-composer";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { StickyApprovalDock } from "@/components/stage/stage-approval-dock";
 import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
+import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog-tabs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-const USER_PROMPT_PREVIEW_MAX_PX = 240;
+const USER_PROMPT_PREVIEW_MAX_PX = 124;
 
 interface TurnTimingRecord {
   startedAtMs: number;
@@ -314,8 +326,9 @@ const StepItemRow = memo(function StepItemRow({
   const triggerRef = useRef<HTMLButtonElement | null>(null);
 
   if (item.item_type === "assistant_thinking") {
-    const headline = extractThinkingHeadline(item.text, isActivelyThinking);
-    const canExpand = item.text.trim().length > 0;
+    const trimmedThinking = item.text.trim();
+    const headline = extractThinkingHeadline(trimmedThinking, isActivelyThinking);
+    const canExpand = trimmedThinking.length > 0;
     const showChevron = canExpand && (hovered || expanded);
     const thoughtLabel = isActivelyThinking
       ? "Thinking"
@@ -374,8 +387,8 @@ const StepItemRow = memo(function StepItemRow({
             className="border-border my-1 ml-4 border-l"
             viewportClassName="max-h-56 overscroll-contain pl-3"
           >
-            <pre className="selectable-text text-muted-foreground font-mono text-[12px] leading-relaxed whitespace-pre-wrap">
-              {item.text}
+            <pre className="selectable-text text-muted-foreground m-0 font-mono text-[12px] leading-relaxed whitespace-pre-wrap">
+              {trimmedThinking}
             </pre>
           </ScrollArea>
         )}
@@ -500,6 +513,8 @@ const StepItemRow = memo(function StepItemRow({
   const openFilePath = desc.openPath;
   const canOpenFileInDiff =
     Boolean(openFilePath) && (desc.kind === "file_edit" || desc.kind === "file_create");
+  const canOpenFileDirect = Boolean(openFilePath) && desc.kind === "file_read";
+  const isSubagentStep = item.detail.kind === "subagent";
 
   return (
     <div>
@@ -508,7 +523,8 @@ const StepItemRow = memo(function StepItemRow({
         onMouseLeave={() => setHovered(false)}
         className={cn(
           "group/tool -ml-1.5 flex items-center justify-between gap-2 rounded-md px-1.5 py-1 text-[13px] transition-colors",
-          (hasExpandableDetail || canOpenFileInDiff) && "hover:bg-accent/55",
+          (hasExpandableDetail || canOpenFileInDiff || canOpenFileDirect || isSubagentStep) &&
+            "hover:bg-accent/55",
         )}
       >
         <button
@@ -567,14 +583,23 @@ const StepItemRow = memo(function StepItemRow({
                       e.stopPropagation();
                       orbitActions.openInspectorForFile(openFilePath, "session_turns");
                     }
-                  : undefined
+                  : canOpenFileDirect && openFilePath
+                    ? (e) => {
+                        e.stopPropagation();
+                        orbitActions.openFileInSidePanel(openFilePath, {
+                          focusLine:
+                            item.detail.kind === "file_read" ? item.detail.start_line : null,
+                        });
+                      }
+                    : undefined
               }
               className={cn(
                 "truncate font-mono text-[12px]",
                 desc.isRunning
                   ? "agent-text-shimmer"
                   : "text-muted-foreground group-hover/tool:text-foreground/70",
-                canOpenFileInDiff && !hasExpandableDetail && "cursor-pointer hover:underline",
+                ((canOpenFileInDiff && !hasExpandableDetail) || canOpenFileDirect) &&
+                  "cursor-pointer hover:underline",
               )}
             >
               {desc.target}
@@ -616,6 +641,42 @@ const StepItemRow = memo(function StepItemRow({
               onClick={(e) => {
                 e.stopPropagation();
                 orbitActions.openInspectorForFile(openFilePath, "session_turns");
+              }}
+              className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
+            >
+              <FileSymlink className="size-3.5" />
+            </button>
+          )}
+
+          {canOpenFileDirect && openFilePath && (
+            <button
+              type="button"
+              title="Open File in Side Panel"
+              onClick={(e) => {
+                e.stopPropagation();
+                orbitActions.openFileInSidePanel(openFilePath, {
+                  focusLine: item.detail.kind === "file_read" ? item.detail.start_line : null,
+                });
+              }}
+              className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
+            >
+              <FileSymlink className="size-3.5" />
+            </button>
+          )}
+
+          {item.detail.kind === "subagent" && (
+            <button
+              type="button"
+              title="Inspect Subagent in Side Panel"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (item.detail.kind !== "subagent") return;
+                orbitActions.openSubagentTab({
+                  callId: item.call_id,
+                  role: item.detail.role || "Subagent",
+                  promptPreview: item.detail.prompt_preview || "",
+                  childAgentId: item.detail.child_agent_id,
+                });
               }}
               className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
             >
@@ -1062,26 +1123,30 @@ function extractUserPromptPresentation(
 
 /**
  * Orbit Native User Prompt Bubble:
- * - Crisp cool-neutral Orbit surface (`bg-secondary` + `border-border`) aligned flush right.
+ * - Crisp cool-neutral Orbit surface aligned flush right.
  * - Renders semantic context & slash workflow tokens (`/plan`, `/review`, `@file`, `Diff`)
  *   without exposing hidden wire scaffolding.
- * - Capped at `240px` height with smooth bottom EdgeFade + `Show more / Show less`.
- * - Quiet hover `[Copy]` action without layout shift.
+ * - Long messages preview smoothly with a bottom fade gradient; click anywhere on the bubble to
+ *   expand, and click outside while expanded to collapse back.
+ * - Quiet bottom-right hover toolbar (`timestamp` + `Copy` + `Undo to this point`) with zero layout shift.
  */
 const UserPromptBubble = memo(function UserPromptBubble({
   item,
   holdViewport,
   animateEntrance = false,
+  onRequestRewind,
 }: {
   item: Extract<TimelineItemView, { item_type: "user_prompt" }>;
   holdViewport: ViewportAnchorHoldFn;
   animateEntrance?: boolean;
+  onRequestRewind?: (seq: number, promptText: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
   const [copied, setCopied] = useState(false);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const bubbleRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef<HTMLDivElement | null>(null);
-  const toggleBtnRef = useRef<HTMLButtonElement | null>(null);
 
   const { cleanText, badges, sanitizedLegacy } = useMemo(
     () => extractUserPromptPresentation(item),
@@ -1091,8 +1156,43 @@ const UserPromptBubble = memo(function UserPromptBubble({
   useLayoutEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
-    setOverflowing(el.scrollHeight > USER_PROMPT_PREVIEW_MAX_PX + 12);
+    const measure = () => {
+      const nextOverflow = el.scrollHeight > USER_PROMPT_PREVIEW_MAX_PX + 10;
+      setOverflowing((prev) => (prev === nextOverflow ? prev : nextOverflow));
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
   }, [cleanText, badges.length]);
+
+  useEffect(() => {
+    if (!expanded) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!(event.target instanceof Element)) return;
+      if (containerRef.current?.contains(event.target)) return;
+      if (event.target.closest('[data-slot="dialog-content"], .orbit-dialog-overlay')) {
+        return;
+      }
+      const sel = window.getSelection();
+      if (
+        sel &&
+        !sel.isCollapsed &&
+        sel.toString().trim().length > 0 &&
+        bubbleRef.current &&
+        sel.anchorNode &&
+        bubbleRef.current.contains(sel.anchorNode)
+      ) {
+        return;
+      }
+      holdViewport(bubbleRef.current, () => setExpanded(false), "top");
+    };
+    document.addEventListener("click", handleClickOutside);
+    return () => {
+      document.removeEventListener("click", handleClickOutside);
+    };
+  }, [expanded, holdViewport]);
 
   const copyPayload = cleanText || badges.map((b) => b.label).join(" ");
 
@@ -1100,6 +1200,15 @@ const UserPromptBubble = memo(function UserPromptBubble({
     await navigator.clipboard.writeText(copyPayload);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1400);
+  };
+
+  const handleBubbleClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (!overflowing || expanded) return;
+    const target = event.target as HTMLElement | null;
+    if (target?.closest("a, button")) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim().length > 0) return;
+    holdViewport(bubbleRef.current, () => setExpanded(true), "top");
   };
 
   const slashBadge = useMemo(
@@ -1121,23 +1230,20 @@ const UserPromptBubble = memo(function UserPromptBubble({
 
   return (
     <div
+      ref={containerRef}
       className={cn(
-        "group/user flex items-end justify-end gap-1.5",
+        "group/user flex flex-col items-end",
         animateEntrance && "orbit-bubble-enter",
       )}
     >
-      <div className="flex shrink-0 items-center gap-1 pb-[9px] whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100">
-        {promptTimestampMs !== null && (
-          <RelativeTimestampPill timestampMs={promptTimestampMs} />
+      <div
+        ref={bubbleRef}
+        onClick={handleBubbleClick}
+        className={cn(
+          "prompt-bubble-surface text-foreground relative min-w-0 max-w-[80%] overflow-hidden rounded-[20px] px-4 py-2.5",
+          overflowing && !expanded && "cursor-pointer",
         )}
-        <CopyActionButton
-          copied={copied}
-          label="Copy"
-          onClick={() => void handleCopy()}
-        />
-      </div>
-
-      <div className="prompt-bubble-surface text-foreground relative min-w-0 max-w-[80%] rounded-[20px] px-4 py-2">
+      >
         <div
           ref={bodyRef}
           style={
@@ -1168,7 +1274,7 @@ const UserPromptBubble = memo(function UserPromptBubble({
           )}
 
           {slashBadge && SlashIcon ? (
-            <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
+            <p className="selectable-text text-foreground text-[14.5px] leading-[1.64] whitespace-pre-wrap">
               <span className="mr-1.5 inline-flex items-center gap-1.5 align-baseline select-none">
                 <SlashIcon className="text-muted-foreground relative top-[2px] size-[14px] shrink-0 stroke-[1.75]" />
                 <span className="text-foreground font-medium">{slashLabel}</span>
@@ -1178,37 +1284,41 @@ const UserPromptBubble = memo(function UserPromptBubble({
           ) : (
             cleanText.length > 0 &&
             (sanitizedLegacy ? (
-              <p className="selectable-text text-foreground text-[14.5px] leading-[1.68] whitespace-pre-wrap">
+              <p className="selectable-text text-foreground text-[14.5px] leading-[1.64] whitespace-pre-wrap">
                 {cleanText}
               </p>
             ) : (
-              <MarkdownBlocksView blocks={item.blocks} />
+              <MarkdownBlocksView blocks={item.blocks} bubble />
             ))
-          )}
-
-          {!expanded && overflowing && (
-            <div
-              aria-hidden="true"
-              className="pointer-events-none absolute inset-x-0 bottom-0 h-12"
-              style={{
-                background:
-                  "linear-gradient(to top, var(--surface-elevated) 0%, transparent 100%)",
-              }}
-            />
           )}
         </div>
 
-        {overflowing && (
-          <button
-            ref={toggleBtnRef}
-            type="button"
-            onClick={() =>
-              holdViewport(toggleBtnRef.current, () => setExpanded((v) => !v), "bottom")
-            }
-            className="text-muted-foreground hover:text-foreground mt-1 inline-flex cursor-pointer items-center text-[12px] font-medium transition-colors"
-          >
-            {expanded ? "Show less" : "Show more"}
-          </button>
+        {!expanded && overflowing && (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-14 rounded-b-[19px]"
+            style={{
+              background:
+                "linear-gradient(to top, var(--surface-elevated) 14%, color-mix(in oklab, var(--surface-elevated) 82%, transparent) 52%, transparent 100%)",
+            }}
+          />
+        )}
+      </div>
+
+      <div className="mt-1 -mb-1.5 flex h-[22px] shrink-0 items-center justify-end gap-1 pr-1 whitespace-nowrap opacity-0 transition-opacity duration-150 group-focus-within/user:opacity-100 group-hover/user:opacity-100">
+        {promptTimestampMs !== null && (
+          <RelativeTimestampPill timestampMs={promptTimestampMs} />
+        )}
+        <CopyActionButton
+          copied={copied}
+          label="Copy"
+          onClick={() => void handleCopy()}
+        />
+        {onRequestRewind && item.seq > 0 && (
+          <UndoActionButton
+            label="Undo to this point"
+            onClick={() => onRequestRewind(item.seq, copyPayload)}
+          />
         )}
       </div>
     </div>
@@ -1305,6 +1415,216 @@ function CopyActionButton({
         </BaseTooltip.Positioner>
       </BaseTooltip.Portal>
     </BaseTooltip.Root>
+  );
+}
+
+/** Semantic Undo / Rewind icon button matching `CopyActionButton` (`13px` icon in `22×22px` hit target). */
+function UndoActionButton({
+  label,
+  onClick,
+  className,
+}: {
+  label: string;
+  onClick: () => void;
+  className?: string;
+}) {
+  return (
+    <BaseTooltip.Root>
+      <BaseTooltip.Trigger
+        delay={240}
+        render={
+          <button
+            type="button"
+            aria-label={label}
+            onClick={onClick}
+            className={cn(
+              "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
+              className,
+            )}
+          />
+        }
+      >
+        <Undo2 className="size-[13px] stroke-[1.8]" />
+      </BaseTooltip.Trigger>
+      <BaseTooltip.Portal>
+        <BaseTooltip.Positioner side="top" sideOffset={6} className="pointer-events-none z-50">
+          <BaseTooltip.Popup className="bg-elevated text-foreground orbit-tooltip-content rounded-full border border-black/[0.08] px-2.5 py-0.5 text-[11.5px] leading-normal font-normal shadow-[0_4px_14px_rgba(0,0,0,0.08)] select-none dark:border-white/[0.11] dark:shadow-[0_4px_16px_rgba(0,0,0,0.36)]">
+            {label}
+          </BaseTooltip.Popup>
+        </BaseTooltip.Positioner>
+      </BaseTooltip.Portal>
+    </BaseTooltip.Root>
+  );
+}
+
+interface RewindRequestTarget {
+  seq: number;
+  promptText: string;
+  affectedTurnsCount: number;
+  editedFiles: string[];
+}
+
+function RewindTurnDialog({
+  target,
+  cwd,
+  isAgentRunning,
+  submitting,
+  onOpenChange,
+  onConfirm,
+}: {
+  target: RewindRequestTarget | null;
+  cwd: string;
+  isAgentRunning: boolean;
+  submitting: boolean;
+  onOpenChange: (open: boolean) => void;
+  onConfirm: (restoreFiles: boolean) => void;
+}) {
+  const [restoreFiles, setRestoreFiles] = useState(true);
+
+  useEffect(() => {
+    if (target) {
+      setRestoreFiles(target.editedFiles.length > 0);
+    }
+  }, [target]);
+
+  const previewText = target?.promptText.replace(/\s+/g, " ").trim() ?? "";
+  const visibleFiles = (target?.editedFiles ?? []).slice(0, 4);
+  const extraFilesCount = Math.max(0, (target?.editedFiles.length ?? 0) - visibleFiles.length);
+
+  return (
+    <Dialog open={target !== null} onOpenChange={(open) => !submitting && onOpenChange(open)}>
+      <DialogContent className="max-w-[440px] gap-4 p-5">
+        <DialogHeader className="gap-1 pr-6">
+          <DialogTitle className="flex items-center gap-2 text-[15px]">
+            <RotateCcw className="text-muted-foreground size-4 stroke-[1.9]" />
+            <span>Undo to this point</span>
+          </DialogTitle>
+          <DialogDescription className="text-[12.5px] leading-relaxed">
+            Rewinds{" "}
+            {target && target.affectedTurnsCount > 1
+              ? `${target.affectedTurnsCount} turns from this message onward`
+              : "this turn"}{" "}
+            and places the prompt back into the composer.
+          </DialogDescription>
+        </DialogHeader>
+
+        {previewText && (
+          <div className="border-border bg-muted/45 text-foreground/85 rounded-xl border px-3 py-2 text-[12.5px] leading-relaxed">
+            <p className="line-clamp-2 break-words">{previewText}</p>
+          </div>
+        )}
+
+        <div className="space-y-2">
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={() => setRestoreFiles(true)}
+            className={cn(
+              "flex w-full cursor-pointer items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60",
+              restoreFiles
+                ? "border-foreground/25 bg-accent/60"
+                : "border-border hover:bg-accent/35",
+            )}
+          >
+            <span
+              className={cn(
+                "mt-[3px] flex size-3.5 shrink-0 items-center justify-center rounded-full border",
+                restoreFiles ? "border-foreground bg-foreground" : "border-muted-foreground/50",
+              )}
+            >
+              {restoreFiles && <span className="bg-background size-1.5 rounded-full" />}
+            </span>
+            <span className="min-w-0 flex-1 space-y-1">
+              <span className="flex items-center gap-1.5 text-[13px] font-medium">
+                <span>Restore code &amp; conversation</span>
+                {target && target.editedFiles.length > 0 && (
+                  <span className="bg-muted text-muted-foreground tabular-nums rounded-full px-1.5 py-0.5 text-[11px] font-normal">
+                    {target.editedFiles.length}{" "}
+                    {target.editedFiles.length === 1 ? "file" : "files"}
+                  </span>
+                )}
+              </span>
+              <span className="text-muted-foreground block text-[12px] leading-snug">
+                Reverts workspace changes made since this message and rewinds the conversation.
+              </span>
+              {visibleFiles.length > 0 && (
+                <span className="flex flex-wrap gap-1 pt-0.5">
+                  {visibleFiles.map((filePath) => (
+                    <span
+                      key={filePath}
+                      className="border-border/80 bg-background/70 text-foreground/80 max-w-full truncate rounded-md border px-1.5 py-0.5 font-mono text-[11px]"
+                    >
+                      {stripWorkspacePrefix(filePath, cwd)}
+                    </span>
+                  ))}
+                  {extraFilesCount > 0 && (
+                    <span className="text-muted-foreground px-1 py-0.5 text-[11px]">
+                      +{extraFilesCount} more
+                    </span>
+                  )}
+                </span>
+              )}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            disabled={submitting}
+            onClick={() => setRestoreFiles(false)}
+            className={cn(
+              "flex w-full cursor-pointer items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors disabled:opacity-60",
+              !restoreFiles
+                ? "border-foreground/25 bg-accent/60"
+                : "border-border hover:bg-accent/35",
+            )}
+          >
+            <span
+              className={cn(
+                "mt-[3px] flex size-3.5 shrink-0 items-center justify-center rounded-full border",
+                !restoreFiles ? "border-foreground bg-foreground" : "border-muted-foreground/50",
+              )}
+            >
+              {!restoreFiles && <span className="bg-background size-1.5 rounded-full" />}
+            </span>
+            <span className="min-w-0 flex-1 space-y-0.5">
+              <span className="block text-[13px] font-medium">Rewind conversation only</span>
+              <span className="text-muted-foreground block text-[12px] leading-snug">
+                Keeps current workspace files untouched and only truncates the conversation.
+              </span>
+            </span>
+          </button>
+        </div>
+
+        {isAgentRunning && (
+          <div className="flex items-center gap-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] px-3 py-2 text-[12px] text-amber-700 dark:text-amber-300">
+            <AlertTriangle className="size-3.5 shrink-0" />
+            <span>The active turn will be stopped before rewinding.</span>
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={submitting}
+            onClick={() => onOpenChange(false)}
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            disabled={submitting}
+            onClick={() => onConfirm(restoreFiles)}
+            className="gap-1.5"
+          >
+            {submitting && <Loader2 className="size-3.5 animate-spin" />}
+            <span>{restoreFiles ? "Restore & Rewind" : "Rewind"}</span>
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -1482,6 +1802,7 @@ const TurnStageSection = memo(function TurnStageSection({
   getThinkingDurationMs,
   holdViewport,
   registerTurnEl,
+  onRequestRewind,
 }: {
   turn: StageTurn;
   isTurnActive: boolean;
@@ -1494,6 +1815,7 @@ const TurnStageSection = memo(function TurnStageSection({
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
   registerTurnEl: (seq: number, el: HTMLDivElement | null) => void;
+  onRequestRewind: (seq: number, promptText: string) => void;
 }) {
   const setRef = useCallback(
     (el: HTMLDivElement | null) => {
@@ -1560,6 +1882,7 @@ const TurnStageSection = memo(function TurnStageSection({
           item={turn.userPrompt}
           holdViewport={holdViewport}
           animateEntrance={animatePromptEntrance}
+          onRequestRewind={onRequestRewind}
         />
       )}
 
@@ -1651,7 +1974,8 @@ const TurnStageSection = memo(function TurnStageSection({
   prev.timing?.startedAtMs === next.timing?.startedAtMs &&
   prev.timing?.durationMs === next.timing?.durationMs &&
   prev.timing?.workDurationMs === next.timing?.workDurationMs &&
-  prev.timing?.completedAtMs === next.timing?.completedAtMs,
+  prev.timing?.completedAtMs === next.timing?.completedAtMs &&
+  prev.onRequestRewind === next.onRequestRewind,
 );
 
 function NewSessionLaunchpad() {
@@ -1683,8 +2007,14 @@ export function StreamStage() {
       ? (s.timelines[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
       : null,
   );
+  const wasSessionRewound = useOrbitSelector((s) =>
+    s.selectedHostId && s.selectedAgentId
+      ? Boolean(s.rewoundSessions[`${s.selectedHostId}::${s.selectedAgentId}`])
+      : false,
+  );
 
   const stageContainerRef = useRef<HTMLDivElement | null>(null);
+  const convoColumnRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const composerShelfRef = useRef<HTMLDivElement | null>(null);
@@ -1706,8 +2036,12 @@ export function StreamStage() {
   const [isOccludingText, setIsOccludingText] = useState(false);
   const [showJumpLatest, setShowJumpLatest] = useState(false);
   const [isStageWide, setIsStageWide] = useState(false);
+  const [canDockOverview, setCanDockOverview] = useState(false);
+  const canDockOverviewRef = useRef(false);
   const [activePromptSeq, setActivePromptSeq] = useState<number | null>(null);
   const [, setTimingTick] = useState(0);
+  const [rewindTarget, setRewindTarget] = useState<RewindRequestTarget | null>(null);
+  const [rewindSubmitting, setRewindSubmitting] = useState(false);
 
   const getThinkingDurationMs = useCallback<ThinkingDurationLookupFn>((thinkKey) => {
     return thinkingTimingsRef.current[thinkKey]?.durationMs ?? null;
@@ -1821,17 +2155,53 @@ export function StreamStage() {
     }
   }, [selectedAgentId, latestTurn, isLatestTurnActive, cachedTimeline?.items]);
 
-  // Measure only boolean threshold (`>= 940px`) so drag-resizing panels never triggers 1px re-renders
-  useEffect(() => {
-    const el = stageContainerRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver((entries) => {
+  // Hysteresis-guarded ResizeObserver for Stage Overview docking (`>= 1000px` dock, `< 960px` collapse)
+  // and independent conversation-column threshold (`>= 880px`) for the peripheral outline rail.
+  // Synchronous `useLayoutEffect` prevents first-paint layout shift when entering an active session.
+  useLayoutEffect(() => {
+    const stageEl = stageContainerRef.current;
+    const convoEl = convoColumnRef.current;
+    if (!stageEl || typeof ResizeObserver === "undefined") {
+      orbitActions.setStageCanDockOverview(false);
+      return;
+    }
+
+    const syncStageWidth = (w: number) => {
+      const nextCanDock = canDockOverviewRef.current ? w >= 960 : w >= 1000;
+      if (nextCanDock !== canDockOverviewRef.current) {
+        canDockOverviewRef.current = nextCanDock;
+        setCanDockOverview(nextCanDock);
+        orbitActions.setStageCanDockOverview(nextCanDock);
+      }
+    };
+
+    const initialW = stageEl.getBoundingClientRect().width;
+    const initialDock = initialW >= 1000;
+    canDockOverviewRef.current = initialDock;
+    setCanDockOverview(initialDock);
+    orbitActions.setStageCanDockOverview(initialDock);
+
+    const roStage = new ResizeObserver((entries) => {
       const w = entries[0]?.contentRect.width ?? 0;
-      const wide = w >= 940;
-      setIsStageWide((prev) => (prev === wide ? prev : wide));
+      syncStageWidth(w);
     });
-    ro.observe(el);
-    return () => ro.disconnect();
+    roStage.observe(stageEl);
+
+    let roConvo: ResizeObserver | null = null;
+    if (convoEl) {
+      setIsStageWide(convoEl.getBoundingClientRect().width >= 880);
+      roConvo = new ResizeObserver((entries) => {
+        const cw = entries[0]?.contentRect.width ?? 0;
+        const wide = cw >= 880;
+        setIsStageWide((prev) => (prev === wide ? prev : wide));
+      });
+      roConvo.observe(convoEl);
+    }
+
+    return () => {
+      roStage.disconnect();
+      roConvo?.disconnect();
+    };
   }, [isDraft, selectedAgentId]);
 
   const outlinePrompts = useMemo(
@@ -1853,8 +2223,57 @@ export function StreamStage() {
   // Refs for `syncScrollMetrics` so its callback identity (and `holdViewport`) stays 100% stable forever
   const outlinePromptsRef = useRef(outlinePrompts);
   outlinePromptsRef.current = outlinePrompts;
+  const stageTurnsRef = useRef(stage.turns);
+  stageTurnsRef.current = stage.turns;
   const turnsCountRef = useRef(stage.turns.length);
   turnsCountRef.current = stage.turns.length;
+
+  const handleRequestRewind = useCallback((seq: number, promptText: string) => {
+    const affected = stageTurnsRef.current.filter((t) => t.anchorSeq >= seq);
+    const editedSet = new Set<string>();
+    for (const turn of affected) {
+      for (const diff of turn.turnDiffs) {
+        if (diff.path) editedSet.add(diff.path);
+      }
+      for (const step of turn.foldedSteps) {
+        if (
+          step.item_type === "tool_call" &&
+          step.detail.kind === "file_edit" &&
+          step.detail.path
+        ) {
+          editedSet.add(step.detail.path);
+        }
+      }
+    }
+    setRewindTarget({
+      seq,
+      promptText,
+      affectedTurnsCount: Math.max(1, affected.length),
+      editedFiles: Array.from(editedSet),
+    });
+  }, []);
+
+  const handleConfirmRewind = useCallback(
+    async (restoreFiles: boolean) => {
+      if (!rewindTarget || !selectedHostId || !selectedAgentId || rewindSubmitting) return;
+      setRewindSubmitting(true);
+      try {
+        const ok = await orbitActions.rewindAgent(
+          selectedHostId,
+          selectedAgentId,
+          rewindTarget.seq,
+          restoreFiles,
+          rewindTarget.promptText,
+        );
+        if (ok) {
+          setRewindTarget(null);
+        }
+      } finally {
+        setRewindSubmitting(false);
+      }
+    },
+    [rewindTarget, selectedHostId, selectedAgentId, rewindSubmitting],
+  );
   const isStageWideRef = useRef(isStageWide);
   isStageWideRef.current = isStageWide;
 
@@ -2121,6 +2540,7 @@ export function StreamStage() {
     setIsOccludingText(false);
     setShowJumpLatest(false);
     setActivePromptSeq(null);
+    setRewindTarget(null);
     snapScrollerToBottom();
   }, [activeSessionScope, sessionScrollNonce, snapScrollerToBottom]);
 
@@ -2164,106 +2584,158 @@ export function StreamStage() {
         ? 0
         : (cachedTimeline?.latestSeq ?? Number.MAX_SAFE_INTEGER),
     };
+  } else if (
+    cachedTimeline &&
+    cachedTimeline.latestSeq < mountedBaselineRef.current.maxSeq
+  ) {
+    mountedBaselineRef.current = {
+      agentId: selectedAgentId,
+      maxSeq: cachedTimeline.latestSeq,
+    };
   }
   const baselineMaxSeq = mountedBaselineRef.current.maxSeq;
+
+  const effectiveCwd = selectedCwd || currentAgent?.cwd || "";
 
   return (
     <div
       ref={stageContainerRef}
-      className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+      className="relative flex min-h-0 flex-1 flex-row overflow-hidden"
     >
-      {/* Peripheral Megathread Outline Rail (wide screens >= 940px only) */}
-      {isStageWide && outlinePrompts.length >= 2 && (
-        <ChatOutlineRail
-          prompts={outlinePrompts}
-          activeSeq={activePromptSeq ?? outlinePrompts[outlinePrompts.length - 1]?.seq ?? null}
-          onJumpToSeq={jumpToPromptSeq}
-        />
-      )}
-
-      {/* 1. Scrollable Conversation Viewport — ends strictly ABOVE the Composer shelf */}
-      <ScrollArea
-        className="min-h-0 flex-1"
-        viewportRef={scrollRef}
-        onViewportScroll={handleScroll}
-        viewportClassName="px-6 pt-6 pb-11"
+      {/* Left: Unified Conversation Viewport + Docked Composer Column */}
+      <div
+        ref={convoColumnRef}
+        className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
       >
-        <div
-          key={selectedAgentId}
-          ref={contentRef}
-          className="orbit-stage-enter mx-auto w-full max-w-[768px] space-y-8"
-        >
-          {stage.turns.map((turn, idx) => {
-            const isLast = idx === stage.turns.length - 1;
-            const turnActive = isLast && isLatestTurnActive;
-            const isFreshLivePrompt =
-              turn.userPrompt !== null && turn.userPrompt.seq > baselineMaxSeq;
-            const timing = turnTimingsRef.current[`${selectedAgentId}::${turn.key}`];
-            const thinkingSignature = buildTurnThinkingSignature(
-              turn,
-              selectedAgentId,
-              thinkingTimingsRef.current,
-            );
-            return (
-              <TurnStageSection
-                key={turn.key}
-                turn={turn}
-                isTurnActive={turnActive}
-                animatePromptEntrance={isFreshLivePrompt}
-                autoFoldCompleted={coalesceExploration}
-                cwd={selectedCwd || currentAgent?.cwd || ""}
-                agentId={selectedAgentId}
-                timing={timing}
-                thinkingSignature={thinkingSignature}
-                getThinkingDurationMs={getThinkingDurationMs}
-                holdViewport={holdViewport}
-                registerTurnEl={registerTurnEl}
-              />
-            );
-          })}
-        </div>
-      </ScrollArea>
-
-      {/* 2. Docked Composer Shelf — normal flex sibling below scrollRef (scrollbar never enters here) */}
-      <div ref={composerShelfRef} className="bg-canvas relative z-20 shrink-0">
-        {/* Upward Occlusion Fade & `34×34` [↓] Button */}
-        <div className="pointer-events-none absolute inset-x-0 bottom-full h-7">
-          <div
-            className={cn(
-              "h-full w-full transition-opacity duration-150",
-              isOccludingText ? "opacity-100" : "opacity-0",
-            )}
-            style={{
-              background:
-                "linear-gradient(to top, var(--surface-canvas) 0%, color-mix(in oklab, var(--surface-canvas) 66%, transparent) 48%, transparent 100%)",
-            }}
+        {/* Peripheral Megathread Outline Rail (spacious conversation column >= 880px only) */}
+        {isStageWide && outlinePrompts.length >= 2 && (
+          <ChatOutlineRail
+            prompts={outlinePrompts}
+            activeSeq={activePromptSeq ?? outlinePrompts[outlinePrompts.length - 1]?.seq ?? null}
+            onJumpToSeq={jumpToPromptSeq}
           />
-          <button
-            type="button"
-            aria-label="Scroll to latest"
-            aria-hidden={!showJumpLatest}
-            tabIndex={showJumpLatest ? 0 : -1}
-            onClick={scrollToLatest}
-            className={cn(
-              "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute bottom-2 left-1/2 inline-flex size-8.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-all duration-150 ease-out dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
-              showJumpLatest
-                ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
-                : "pointer-events-none translate-y-1 scale-95 opacity-0",
-            )}
-          >
-            <ArrowDown className="size-4 stroke-[1.9]" />
-          </button>
-        </div>
+        )}
 
-        <StickyApprovalDock
-          hostId={selectedHostId}
-          agentId={selectedAgentId}
-          cwd={selectedCwd || currentAgent?.cwd || ""}
-          permissions={stage.pendingPermissions}
-          questions={stage.pendingQuestions}
-        />
-        <OmniComposer variant="docked" occluding={isOccludingText} />
+        {/* 1. Scrollable Conversation Viewport — ends strictly ABOVE the Composer shelf */}
+        <ScrollArea
+          className="min-h-0 flex-1"
+          viewportRef={scrollRef}
+          onViewportScroll={handleScroll}
+          viewportClassName="px-6 pt-6 pb-11"
+        >
+          <div
+            key={selectedAgentId}
+            ref={contentRef}
+            className="orbit-stage-enter mx-auto w-full max-w-[768px] space-y-8"
+          >
+            {stage.turns.length === 0 &&
+              wasSessionRewound &&
+              cachedTimeline !== null &&
+              (cachedTimeline.agent?.latest_seq ?? 0) === 0 &&
+              !isAgentRunning && (
+                <div className="text-muted-foreground flex flex-col items-center justify-center py-20 text-center">
+                  <RotateCcw className="mb-2.5 size-5 opacity-45" />
+                  <p className="text-[13.5px]">
+                    Rewound to the start of this session. Edit your prompt below to continue.
+                  </p>
+                </div>
+              )}
+
+            {stage.turns.map((turn, idx) => {
+              const isLast = idx === stage.turns.length - 1;
+              const turnActive = isLast && isLatestTurnActive;
+              const isFreshLivePrompt =
+                turn.userPrompt !== null && turn.userPrompt.seq > baselineMaxSeq;
+              const timing = turnTimingsRef.current[`${selectedAgentId}::${turn.key}`];
+              const thinkingSignature = buildTurnThinkingSignature(
+                turn,
+                selectedAgentId,
+                thinkingTimingsRef.current,
+              );
+              return (
+                <TurnStageSection
+                  key={turn.key}
+                  turn={turn}
+                  isTurnActive={turnActive}
+                  animatePromptEntrance={isFreshLivePrompt}
+                  autoFoldCompleted={coalesceExploration}
+                  cwd={effectiveCwd}
+                  agentId={selectedAgentId}
+                  timing={timing}
+                  thinkingSignature={thinkingSignature}
+                  getThinkingDurationMs={getThinkingDurationMs}
+                  holdViewport={holdViewport}
+                  registerTurnEl={registerTurnEl}
+                  onRequestRewind={handleRequestRewind}
+                />
+              );
+            })}
+          </div>
+        </ScrollArea>
+
+        {/* 2. Docked Composer Shelf — normal flex sibling below scrollRef (scrollbar never enters here) */}
+        <div ref={composerShelfRef} className="bg-canvas relative z-20 shrink-0">
+          {/* Upward Occlusion Fade & `34×34` [↓] Button */}
+          <div className="pointer-events-none absolute inset-x-0 bottom-full h-7">
+            <div
+              className={cn(
+                "h-full w-full transition-opacity duration-150",
+                isOccludingText ? "opacity-100" : "opacity-0",
+              )}
+              style={{
+                background:
+                  "linear-gradient(to top, var(--surface-canvas) 0%, color-mix(in oklab, var(--surface-canvas) 66%, transparent) 48%, transparent 100%)",
+              }}
+            />
+            <button
+              type="button"
+              aria-label="Scroll to latest"
+              aria-hidden={!showJumpLatest}
+              tabIndex={showJumpLatest ? 0 : -1}
+              onClick={scrollToLatest}
+              className={cn(
+                "border-border bg-elevated text-muted-foreground hover:text-foreground hover:border-foreground/20 absolute bottom-2 left-1/2 inline-flex size-8.5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full border shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition-all duration-150 ease-out dark:shadow-[0_2px_12px_rgba(0,0,0,0.36)]",
+                showJumpLatest
+                  ? "pointer-events-auto translate-y-0 scale-100 opacity-100"
+                  : "pointer-events-none translate-y-1 scale-95 opacity-0",
+              )}
+            >
+              <ArrowDown className="size-4 stroke-[1.9]" />
+            </button>
+          </div>
+
+          <StickyApprovalDock
+            hostId={selectedHostId}
+            agentId={selectedAgentId}
+            cwd={effectiveCwd}
+            permissions={stage.pendingPermissions}
+            questions={stage.pendingQuestions}
+          />
+          <OmniComposer variant="docked" occluding={isOccludingText} />
+        </div>
       </div>
+
+      {/* Right: Responsive In-Stage Overview Panel (Docked on spacious stage, Floating Popover on narrow/split stage) */}
+      <StageOverviewPanel
+        canDock={canDockOverview}
+        hostId={selectedHostId}
+        agentId={selectedAgentId}
+        cwd={effectiveCwd}
+        items={cachedTimeline?.items ?? EMPTY_TIMELINE_ITEMS}
+        sessionTurnDiffs={stage.sessionTurnDiffs}
+        currentAgent={currentAgent}
+      />
+
+      <RewindTurnDialog
+        target={rewindTarget}
+        cwd={effectiveCwd}
+        isAgentRunning={isAgentRunning}
+        submitting={rewindSubmitting}
+        onOpenChange={(open) => {
+          if (!open) setRewindTarget(null);
+        }}
+        onConfirm={(restoreFiles) => void handleConfirmRewind(restoreFiles)}
+      />
     </div>
   );
 }

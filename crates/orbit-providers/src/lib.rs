@@ -5,6 +5,7 @@ pub mod attachments;
 pub mod claude;
 pub mod codex;
 pub mod driver;
+pub mod side_question;
 
 use std::collections::HashMap;
 use std::env;
@@ -14,6 +15,7 @@ use orbit_protocol::{ModelOption, ProviderKind, ProviderModelCatalog, ProviderQu
 use serde::{Deserialize, Serialize};
 
 pub use driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
+pub use side_question::{SideQuestionSpec, run_side_question};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveredProvider {

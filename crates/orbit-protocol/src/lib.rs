@@ -237,6 +237,10 @@ pub struct AgentSummary {
     pub status: AgentStatus,
     pub parent_agent_id: Option<String>,
     pub latest_seq: u64,
+    /// Monotonic counter incremented on every server-side timeline rewind so offline/unsubscribed
+    /// clients detect history resets even after new post-rewind events surpass prior `latest_seq`.
+    #[serde(default)]
+    pub timeline_epoch: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -484,6 +488,26 @@ pub enum WireMessage {
         cwd: String,
         files: Vec<String>,
     },
+    ReadWorkspaceFile {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_bytes: Option<u64>,
+    },
+    WorkspaceFileContentResponse {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+        resolved_path: String,
+        /// `"text"` | `"image"` | `"binary"`
+        content_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        content: String,
+        size_bytes: u64,
+        truncated: bool,
+    },
 
     // Agents & Interactive Orchestration
     ListAgents {
@@ -561,6 +585,29 @@ pub enum WireMessage {
     ArchiveAgent {
         request_id: Uuid,
         agent_id: String,
+    },
+    /// Rewind an agent session to strictly before `to_before_seq` (removing that user prompt and all
+    /// subsequent events), optionally restoring workspace files back to the pre-turn checkpoint.
+    RewindAgent {
+        request_id: Uuid,
+        agent_id: String,
+        to_before_seq: u64,
+        #[serde(default)]
+        restore_files: bool,
+    },
+    /// Authoritative post-rewind timeline replacement broadcast to all subscribed clients.
+    AgentRewound {
+        #[serde(default)]
+        request_id: Option<Uuid>,
+        agent: AgentSummary,
+        to_before_seq: u64,
+        events: Vec<TimelineEvent>,
+        #[serde(default)]
+        restored_files: u32,
+        #[serde(default)]
+        restored_prompt: Option<String>,
+        #[serde(default)]
+        notice: Option<String>,
     },
     ResolvePermission {
         request_id: Uuid,
@@ -663,6 +710,30 @@ pub enum WireMessage {
         filename: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         size_bytes: Option<u64>,
+    },
+
+    // Ephemeral Side Question (/btw — zero-tool, read-only, zero main-thread history pollution)
+    AskSideQuestion {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        cwd: String,
+        provider: ProviderKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        question: String,
+        #[serde(default)]
+        context_summary: String,
+    },
+    SideQuestionDelta {
+        request_id: Uuid,
+        text_delta: String,
+    },
+    SideQuestionDone {
+        request_id: Uuid,
+        full_text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 
     RpcError {
@@ -877,6 +948,124 @@ mod tests {
                     Some("/home/user/.orbit/attachments/123_shot.png")
                 );
                 assert_eq!(size_bytes, Some(2048));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_file_and_side_question_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let read_req = WireMessage::ReadWorkspaceFile {
+            request_id: req_id,
+            cwd: "/workspace/orbit".into(),
+            path: "README.md".into(),
+            max_bytes: Some(1_048_576),
+        };
+        let encoded = read_req.encode_zstd(3).expect("encode read request");
+        match WireMessage::decode_zstd(&encoded).expect("decode read request") {
+            WireMessage::ReadWorkspaceFile {
+                request_id,
+                cwd,
+                path,
+                max_bytes,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(cwd, "/workspace/orbit");
+                assert_eq!(path, "README.md");
+                assert_eq!(max_bytes, Some(1_048_576));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let side_req = WireMessage::AskSideQuestion {
+            request_id: req_id,
+            agent_id: Some("ag_1".into()),
+            cwd: "/workspace/orbit".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("sonnet".into()),
+            question: "Why did we use RwLock here?".into(),
+            context_summary: "Active turn editing orbit-client-core.".into(),
+        };
+        let encoded2 = side_req.encode_zstd(3).expect("encode side question");
+        match WireMessage::decode_zstd(&encoded2).expect("decode side question") {
+            WireMessage::AskSideQuestion {
+                request_id,
+                provider,
+                question,
+                ..
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(provider, ProviderKind::ClaudeCode);
+                assert_eq!(question, "Why did we use RwLock here?");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewind_agent_wire_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let req = WireMessage::RewindAgent {
+            request_id: req_id,
+            agent_id: "ag_rewind".into(),
+            to_before_seq: 42,
+            restore_files: true,
+        };
+        let encoded = req.encode_zstd(3).expect("encode rewind request");
+        match WireMessage::decode_zstd(&encoded).expect("decode rewind request") {
+            WireMessage::RewindAgent {
+                request_id,
+                agent_id,
+                to_before_seq,
+                restore_files,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(agent_id, "ag_rewind");
+                assert_eq!(to_before_seq, 42);
+                assert!(restore_files);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let now = Utc::now();
+        let reply = WireMessage::AgentRewound {
+            request_id: Some(req_id),
+            agent: AgentSummary {
+                agent_id: "ag_rewind".into(),
+                workspace_id: "ws_1".into(),
+                cwd: "/workspace/orbit".into(),
+                title: "Refactor".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: Some("sonnet".into()),
+                effort: None,
+                mode: SessionMode::Default,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                latest_seq: 12,
+                timeline_epoch: 1,
+                created_at: now,
+                updated_at: now,
+            },
+            to_before_seq: 42,
+            events: Vec::new(),
+            restored_files: 3,
+            restored_prompt: Some("Update layout".into()),
+            notice: None,
+        };
+        let encoded_reply = reply.encode_zstd(3).expect("encode rewind reply");
+        match WireMessage::decode_zstd(&encoded_reply).expect("decode rewind reply") {
+            WireMessage::AgentRewound {
+                request_id,
+                to_before_seq,
+                restored_files,
+                restored_prompt,
+                ..
+            } => {
+                assert_eq!(request_id, Some(req_id));
+                assert_eq!(to_before_seq, 42);
+                assert_eq!(restored_files, 3);
+                assert_eq!(restored_prompt.as_deref(), Some("Update layout"));
             }
             other => panic!("unexpected variant: {other:?}"),
         }

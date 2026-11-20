@@ -384,6 +384,13 @@
   animation: orbit-floating-in 130ms var(--ease-out-expo);
 }
 
+.orbit-overview-popover {
+  --orbit-slide-x: 4px;
+  --orbit-slide-y: -6px;
+  transform-origin: top right;
+  animation: orbit-floating-in 150ms var(--ease-out-expo);
+}
+
 /* Modal Backdrop & Centered Dialog (`⌘K`, Settings, Remote Folder Browser) */
 @keyframes orbit-backdrop-in {
   from {

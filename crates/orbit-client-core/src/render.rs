@@ -135,14 +135,80 @@ fn heal_streaming_fences(markdown: &str) -> String {
     }
 }
 
+/// Map a file path or filename to a canonical syntax highlighting token for `syntect`.
+pub fn detect_language_for_path(path: &str) -> &'static str {
+    let norm = path.replace('\\', "/");
+    let basename = norm.rsplit('/').next().unwrap_or(norm.as_str());
+    let lower_base = basename.to_ascii_lowercase();
+    match lower_base.as_str() {
+        "dockerfile" => return "dockerfile",
+        "makefile" | "gnumakefile" => return "makefile",
+        "cargo.toml" | "pyproject.toml" => return "toml",
+        "cargo.lock" => return "toml",
+        ".gitignore" | ".env" | ".env.local" | ".env.example" => return "sh",
+        _ => {}
+    }
+    let Some((_, ext)) = basename.rsplit_once('.') else {
+        return "text";
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "rs" => "rs",
+        "ts" | "mts" | "cts" => "ts",
+        "tsx" => "tsx",
+        "js" | "mjs" | "cjs" => "js",
+        "jsx" => "jsx",
+        "json" | "jsonc" | "json5" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "md" | "mdx" | "markdown" => "markdown",
+        "py" | "pyi" => "py",
+        "go" => "go",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
+        "cs" => "cs",
+        "rb" => "rb",
+        "php" => "php",
+        "sh" | "bash" | "zsh" => "sh",
+        "fish" => "sh",
+        "css" => "css",
+        "scss" | "sass" => "scss",
+        "html" | "htm" | "xml" | "svg" => "html",
+        "sql" => "sql",
+        "graphql" | "gql" => "graphql",
+        "lua" => "lua",
+        "zig" => "zig",
+        "ets" => "ts",
+        "diff" | "patch" => "diff",
+        "ini" | "conf" | "cfg" => "ini",
+        _ => "text",
+    }
+}
+
 /// Highlight a code snippet into 24-bit `#RRGGBB` styled token lines in pure Rust.
 pub fn highlight_code_lines(language: &str, code: &str) -> Vec<HighlightedLineView> {
+    highlight_code_lines_capped(language, code, usize::MAX)
+}
+
+/// Highlight up to `max_highlighted_lines` with `syntect`, emitting fast plain-styled lines beyond the cap.
+pub fn highlight_code_lines_capped(
+    language: &str,
+    code: &str,
+    max_highlighted_lines: usize,
+) -> Vec<HighlightedLineView> {
     let ps = syntax_set();
     let lang_token = language.trim();
     let syntax = if lang_token.is_empty() {
         ps.find_syntax_plain_text()
     } else {
         ps.find_syntax_by_token(lang_token)
+            .or_else(|| match lang_token {
+                "ts" | "tsx" => ps.find_syntax_by_token("js"),
+                "toml" => ps.find_syntax_by_token("ini"),
+                _ => None,
+            })
             .unwrap_or_else(|| ps.find_syntax_plain_text())
     };
 
@@ -166,29 +232,38 @@ pub fn highlight_code_lines(language: &str, code: &str) -> Vec<HighlightedLineVi
     let mut out = Vec::new();
 
     for (idx, line) in LinesWithEndings::from(code).enumerate() {
-        let tokens = match highlighter.highlight_line(line, ps) {
-            Ok(ranges) => ranges
-                .into_iter()
-                .map(|(style, slice)| {
-                    let clean = slice.trim_end_matches(&['\r', '\n'][..]);
-                    HighlightedTokenView {
-                        text: clean.to_string(),
-                        fg_hex: format!(
-                            "#{:02X}{:02X}{:02X}",
-                            style.foreground.r, style.foreground.g, style.foreground.b
-                        ),
-                        bold: style.font_style.contains(FontStyle::BOLD),
-                        italic: style.font_style.contains(FontStyle::ITALIC),
-                    }
-                })
-                .filter(|t| !t.text.is_empty())
-                .collect(),
-            Err(_) => vec![HighlightedTokenView {
+        let tokens = if idx < max_highlighted_lines {
+            match highlighter.highlight_line(line, ps) {
+                Ok(ranges) => ranges
+                    .into_iter()
+                    .map(|(style, slice)| {
+                        let clean = slice.trim_end_matches(&['\r', '\n'][..]);
+                        HighlightedTokenView {
+                            text: clean.to_string(),
+                            fg_hex: format!(
+                                "#{:02X}{:02X}{:02X}",
+                                style.foreground.r, style.foreground.g, style.foreground.b
+                            ),
+                            bold: style.font_style.contains(FontStyle::BOLD),
+                            italic: style.font_style.contains(FontStyle::ITALIC),
+                        }
+                    })
+                    .filter(|t| !t.text.is_empty())
+                    .collect(),
+                Err(_) => vec![HighlightedTokenView {
+                    text: line.trim_end_matches(&['\r', '\n'][..]).to_string(),
+                    fg_hex: "#E2E8F0".to_string(),
+                    bold: false,
+                    italic: false,
+                }],
+            }
+        } else {
+            vec![HighlightedTokenView {
                 text: line.trim_end_matches(&['\r', '\n'][..]).to_string(),
                 fg_hex: "#E2E8F0".to_string(),
                 bold: false,
                 italic: false,
-            }],
+            }]
         };
 
         out.push(HighlightedLineView {

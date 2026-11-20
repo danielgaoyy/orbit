@@ -2,13 +2,13 @@ import { useEffect, useState } from "react";
 import { PanelLeft } from "lucide-react";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
-import { ReviewInspector } from "@/components/inspector/review-inspector";
 import { TopBar } from "@/components/layout/top-bar";
 import { SettingsView } from "@/components/settings/settings-view";
+import { QuickOpenFileDialog } from "@/components/side-panel/quick-open-file-dialog";
+import { WorkspaceSidePanel } from "@/components/side-panel/workspace-side-panel";
 import { FleetSidebar } from "@/components/sidebar/fleet-sidebar";
 import { RemoteFolderPickerDialog } from "@/components/sidebar/remote-folder-picker-dialog";
 import { StreamStage } from "@/components/stage/stream-stage";
-import { TerminalDock } from "@/components/terminal/terminal-dock";
 import { SimpleTooltip, TooltipProvider } from "@/components/ui/overlays";
 import { modSymbol, useGlobalErgonomicKeybindings } from "@/lib/keybindings";
 import { isMacDesktop } from "@/lib/orbit-ipc";
@@ -126,6 +126,9 @@ export default function App() {
       {/* Dedicated Full-Window Settings Center (`⌘,`) with Smooth Enter/Exit */}
       {settingsMounted && <SettingsView closing={settingsClosing} />}
 
+      {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow pointer events during resize */}
+      {isResizingSidebar && <div className="fixed inset-0 z-50 cursor-col-resize select-none" />}
+
       {/* Main Workspace Shell */}
       <div className="bg-canvas text-foreground relative flex h-screen w-screen overflow-hidden">
         {/* Single Stationary Titlebar Sidebar Toggle (`[◫]`, `⌘B`) — optically centered with macOS traffic lights & title */}
@@ -177,24 +180,25 @@ export default function App() {
           )}
         </div>
 
-        {/* 2. Center Narrative Stage + Omni-Composer + Persistent Bottom PTY Dock (`⌘J`) */}
+        {/* 2. Center Narrative Stage + In-Stage Overview + Unified Right Side Panel */}
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          <TopBar />
-
           <div className="flex min-h-0 flex-1 overflow-hidden">
-            <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-              {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
-              <TerminalDock />
-            </main>
+            <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+              <TopBar />
+              <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+                {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
+              </main>
+            </div>
 
-            {/* 3. Contextual Right-Hand Diff Review Inspector (`⌘D`) */}
-            <ReviewInspector />
+            {/* 3. Unified Multi-Tab Right Side Panel (Open File, Review, Terminal, Browser, Side Question, Subagent) */}
+            <WorkspaceSidePanel />
           </div>
         </div>
       </div>
 
-      {/* Global Command Palette (`⌘K`) & Remote Folder Browser */}
+      {/* Global Command Palette (`⌘K`), Quick Open File (`⌘P`) & Remote Folder Browser */}
       <CommandPalette />
+      <QuickOpenFileDialog />
       <RemoteFolderPickerDialog />
 
       {/* Restrained Ephemeral Status Toast with Smooth Enter/Exit */}

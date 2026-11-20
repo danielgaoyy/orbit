@@ -25,10 +25,11 @@ use uuid::Uuid;
 
 use crate::desktop_ops::{
     StagedAttachmentInfo, bootstrap_ssh_host_and_pair, discover_local_daemon_pairing_uri,
-    extract_ws_port, normalize_relay_input, stage_local_attachment,
+    extract_ws_port, normalize_relay_input, read_local_workspace_file, stage_local_attachment,
 };
 use crate::render::{
-    DiffFileView, RichBlockView, TerminalGridEmulator, TerminalScreenView, parse_markdown_blocks,
+    DiffFileView, HighlightedLineView, RichBlockView, TerminalGridEmulator, TerminalScreenView,
+    detect_language_for_path, highlight_code_lines_capped, parse_markdown_blocks,
     parse_unified_diff,
 };
 use crate::{
@@ -263,6 +264,17 @@ pub struct AgentTimelineDeltaView {
     pub upserted_items: Vec<TimelineItemView>,
     pub resolved_permissions: HashMap<String, String>,
     pub resolved_questions: HashMap<String, Vec<Vec<String>>>,
+    /// Set to `true` after an authoritative server-side rewind so clients replace their local list.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindAgentResultView {
+    pub agent: AgentCardView,
+    pub restored_files: u32,
+    pub restored_prompt: Option<String>,
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -274,6 +286,58 @@ pub struct GitReviewView {
     pub selected_path: Option<String>,
     pub raw_diff: String,
     pub diff_files: Vec<DiffFileView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceFileView {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+    pub resolved_path: String,
+    pub language: String,
+    /// `"text"` | `"image"` | `"binary"`
+    pub content_kind: String,
+    pub mime_type: Option<String>,
+    pub content: String,
+    pub size_bytes: u64,
+    pub truncated: bool,
+    pub highlighted_lines: Vec<HighlightedLineView>,
+    pub markdown_blocks: Vec<RichBlockView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SideQuestionStreamEvent {
+    Delta {
+        request_id: String,
+        text_delta: String,
+    },
+    Done {
+        request_id: String,
+        full_text: String,
+        error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AskSideQuestionRequest {
+    pub host_id: String,
+    pub agent_id: Option<String>,
+    pub cwd: String,
+    pub provider: ProviderKind,
+    pub model: Option<String>,
+    pub question: String,
+    pub context_summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct RawFileReadResponse {
+    resolved_path: String,
+    content_kind: String,
+    mime_type: Option<String>,
+    content: String,
+    size_bytes: u64,
+    truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +365,13 @@ struct HostMemoryState {
     pending_outbox: Vec<WireMessage>,
     pending_attachment_acks:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AttachmentStageAck, String>>>,
+    pending_file_reads:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RawFileReadResponse, String>>>,
+    pending_side_questions:
+        HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
+    pending_rewinds:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RewindAgentResultView, String>>>,
+    rewound_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
     agent_req_by_req_id: HashMap<Uuid, String>,
     replaced_optimistic_agents: HashMap<String, String>,
@@ -345,6 +416,10 @@ impl HostMemoryState {
             session: None,
             pending_outbox: Vec::new(),
             pending_attachment_acks: HashMap::new(),
+            pending_file_reads: HashMap::new(),
+            pending_side_questions: HashMap::new(),
+            pending_rewinds: HashMap::new(),
+            rewound_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
             agent_req_by_req_id: HashMap::new(),
             replaced_optimistic_agents: HashMap::new(),
@@ -690,6 +765,7 @@ impl OrbitAppCore {
                 upserted_items: Vec::new(),
                 resolved_permissions: HashMap::new(),
                 resolved_questions: HashMap::new(),
+                reset: false,
             };
         };
         let Some(host_state) = guard.get_mut(host_id) else {
@@ -701,6 +777,7 @@ impl OrbitAppCore {
                 upserted_items: Vec::new(),
                 resolved_permissions: HashMap::new(),
                 resolved_questions: HashMap::new(),
+                reset: false,
             };
         };
 
@@ -725,11 +802,20 @@ impl OrbitAppCore {
             .cloned()
             .unwrap_or_default();
 
+        let actual_max_seq = events.iter().map(|e| e.seq).max().unwrap_or(0);
+        let was_rewound = host_state.rewound_agents.remove(agent_id);
+        let needs_reset = was_rewound || (since_seq > 0 && actual_max_seq < since_seq);
+        let effective_since_seq = if needs_reset { 0 } else { since_seq };
+
         let mut all_resolved_perms: HashMap<String, String> = HashMap::new();
         let mut all_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         let mut delta_resolved_perms: HashMap<String, String> = HashMap::new();
         let mut delta_resolved_questions: HashMap<String, Vec<Vec<String>>> = HashMap::new();
-        let mut latest_seq = since_seq;
+        let mut latest_seq = if needs_reset {
+            actual_max_seq
+        } else {
+            since_seq
+        };
         for ev in &events {
             if ev.seq > latest_seq {
                 latest_seq = ev.seq;
@@ -740,7 +826,7 @@ impl OrbitAppCore {
                     decision,
                 } => {
                     all_resolved_perms.insert(request_id.clone(), decision.clone());
-                    if since_seq == 0 || ev.seq > since_seq {
+                    if effective_since_seq == 0 || ev.seq > effective_since_seq {
                         delta_resolved_perms.insert(request_id.clone(), decision.clone());
                     }
                 }
@@ -749,7 +835,7 @@ impl OrbitAppCore {
                     answers,
                 } => {
                     all_resolved_questions.insert(request_id.clone(), answers.clone());
-                    if since_seq == 0 || ev.seq > since_seq {
+                    if effective_since_seq == 0 || ev.seq > effective_since_seq {
                         delta_resolved_questions.insert(request_id.clone(), answers.clone());
                     }
                 }
@@ -761,7 +847,7 @@ impl OrbitAppCore {
         for ev in &events {
             let is_local_notice =
                 ev.seq == 0 && matches!(ev.payload, TimelinePayload::Notice { .. });
-            if since_seq > 0 && ev.seq <= since_seq && !is_local_notice {
+            if effective_since_seq > 0 && ev.seq <= effective_since_seq && !is_local_notice {
                 continue;
             }
             let ts_ms = Some(ev.timestamp.timestamp_millis());
@@ -793,7 +879,7 @@ impl OrbitAppCore {
                     upserted_items.push(TimelineItemView::AssistantThinking {
                         seq: ev.seq,
                         item_id: item_id.clone(),
-                        text: text.clone(),
+                        text: text.trim().to_string(),
                         timestamp_ms: ts_ms,
                     });
                 }
@@ -906,6 +992,7 @@ impl OrbitAppCore {
             upserted_items,
             resolved_permissions: delta_resolved_perms,
             resolved_questions: delta_resolved_questions,
+            reset: needs_reset,
         }
     }
 
@@ -1132,7 +1219,7 @@ impl OrbitAppCore {
                 .write()
                 .map_err(|_| ClientCoreError::LockPoisoned)?;
             if let Some(mut removed) = guard.remove(host_id) {
-                fail_pending_attachment_acks(&mut removed, "Host removed during attachment upload");
+                fail_pending_host_requests(&mut removed, "Host removed before request completed");
             }
         }
         if let Ok(mut projs) = self.projects.write() {
@@ -1272,7 +1359,7 @@ impl OrbitAppCore {
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
             }
-            fail_pending_attachment_acks(h, "Host reconnecting during attachment upload");
+            fail_pending_host_requests(h, "Host reconnecting before request completed");
             h.profile.clone()
         };
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -1494,7 +1581,7 @@ impl OrbitAppCore {
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
             }
-            fail_pending_attachment_acks(h, "Host disconnected during attachment upload");
+            fail_pending_host_requests(h, "Host disconnected before request completed");
             should_reconnect = true;
         }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
@@ -1536,6 +1623,8 @@ impl OrbitAppCore {
         let mut auto_subscribe_agent: Option<String> = None;
         let mut continue_catchup: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
+        let mut rewound_to_persist: Option<(AgentSummary, Vec<TimelineEvent>, bool)> = None;
+        let mut stale_replica_agents: Vec<(String, bool)> = Vec::new();
 
         if let Ok(mut guard) = self.hosts.write()
             && let Some(state) = guard.get_mut(host_id)
@@ -1600,9 +1689,29 @@ impl OrbitAppCore {
                 }
                 WireMessage::AgentsSnapshot { agents, .. } => {
                     // Keep any 0ms optimistic `opt_*` sessions while refreshing server-confirmed ones
+                    let prev_agents: HashMap<String, (u64, u64)> = state
+                        .agents
+                        .iter()
+                        .map(|(k, v)| (k.clone(), (v.timeline_epoch, v.latest_seq)))
+                        .collect();
                     state.agents.retain(|k, _| k.starts_with("opt_"));
                     for a in agents {
-                        state.agents.insert(a.agent_id.clone(), a);
+                        let ag_id = a.agent_id.clone();
+                        let prev = prev_agents.get(&ag_id).copied();
+                        let local_max_seq = state
+                            .timelines
+                            .get(&ag_id)
+                            .and_then(|evs| evs.iter().map(|e| e.seq).max())
+                            .unwrap_or(0);
+                        let epoch_advanced = prev.is_some_and(|(ep, _)| a.timeline_epoch > ep);
+                        let seq_regressed = local_max_seq > 0 && a.latest_seq < local_max_seq;
+                        if epoch_advanced || seq_regressed {
+                            let had_mem = state.timelines.remove(&ag_id).is_some();
+                            state.rewound_agents.insert(ag_id.clone());
+                            stale_replica_agents.push((ag_id.clone(), had_mem));
+                            notify_timeline_agent = Some(ag_id.clone());
+                        }
+                        state.agents.insert(ag_id, a);
                     }
                     notify_fleet = true;
                     notify_host = true;
@@ -1629,7 +1738,51 @@ impl OrbitAppCore {
                 }
                 WireMessage::AgentUpdated { agent } => {
                     let ag_id = agent.agent_id.clone();
+                    let prev_epoch = state.agents.get(&ag_id).map(|a| a.timeline_epoch);
+                    let local_max_seq = state
+                        .timelines
+                        .get(&ag_id)
+                        .and_then(|evs| evs.iter().map(|e| e.seq).max())
+                        .unwrap_or(0);
+                    let epoch_advanced = prev_epoch.is_some_and(|ep| agent.timeline_epoch > ep);
+                    let seq_regressed = local_max_seq > 0 && agent.latest_seq < local_max_seq;
+                    if epoch_advanced || seq_regressed {
+                        let had_mem = state.timelines.remove(&ag_id).is_some();
+                        state.rewound_agents.insert(ag_id.clone());
+                        stale_replica_agents.push((ag_id.clone(), had_mem));
+                    }
                     state.agents.insert(ag_id.clone(), agent);
+                    notify_fleet = true;
+                    notify_host = true;
+                    notify_timeline_agent = Some(ag_id);
+                }
+                WireMessage::AgentRewound {
+                    request_id,
+                    agent,
+                    events,
+                    restored_files,
+                    restored_prompt,
+                    notice,
+                    ..
+                } => {
+                    let ag_id = agent.agent_id.clone();
+                    let agent_card = agent_to_card_view(&agent);
+                    let mut ordered = events;
+                    ordered.sort_by_key(|e| e.seq);
+                    state.timelines.insert(ag_id.clone(), ordered.clone());
+                    state.rewound_agents.insert(ag_id.clone());
+                    state.agents.insert(ag_id.clone(), agent.clone());
+                    rewound_to_persist = Some((agent, ordered, restored_files > 0));
+                    if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_rewinds.remove(&req_id)
+                    {
+                        let _ = tx.send(Ok(RewindAgentResultView {
+                            agent: agent_card,
+                            restored_files,
+                            restored_prompt,
+                            notice,
+                        }));
+                    }
                     notify_fleet = true;
                     notify_host = true;
                     notify_timeline_agent = Some(ag_id);
@@ -1684,6 +1837,51 @@ impl OrbitAppCore {
                     state.workspace_files.insert(cwd.clone(), files);
                     notify_git_cwd = Some(cwd);
                 }
+                WireMessage::WorkspaceFileContentResponse {
+                    request_id,
+                    resolved_path,
+                    content_kind,
+                    mime_type,
+                    content,
+                    size_bytes,
+                    truncated,
+                    ..
+                } => {
+                    if let Some(tx) = state.pending_file_reads.remove(&request_id) {
+                        let _ = tx.send(Ok(RawFileReadResponse {
+                            resolved_path,
+                            content_kind,
+                            mime_type,
+                            content,
+                            size_bytes,
+                            truncated,
+                        }));
+                    }
+                }
+                WireMessage::SideQuestionDelta {
+                    request_id,
+                    text_delta,
+                } => {
+                    if let Some(tx) = state.pending_side_questions.get(&request_id) {
+                        let _ = tx.send(SideQuestionStreamEvent::Delta {
+                            request_id: request_id.to_string(),
+                            text_delta,
+                        });
+                    }
+                }
+                WireMessage::SideQuestionDone {
+                    request_id,
+                    full_text,
+                    error,
+                } => {
+                    if let Some(tx) = state.pending_side_questions.remove(&request_id) {
+                        let _ = tx.send(SideQuestionStreamEvent::Done {
+                            request_id: request_id.to_string(),
+                            full_text,
+                            error,
+                        });
+                    }
+                }
                 WireMessage::TerminalsSnapshot { terminals, .. } => {
                     state.terminals = terminals;
                     notify_host = true;
@@ -1735,6 +1933,22 @@ impl OrbitAppCore {
                         && let Some(tx) = state.pending_attachment_acks.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_file_reads.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_rewinds.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_side_questions.remove(&req_id)
+                    {
+                        let _ = tx.send(SideQuestionStreamEvent::Done {
+                            request_id: req_id.to_string(),
+                            full_text: String::new(),
+                            error: Some(formatted_err),
+                        });
                     } else {
                         state.last_error = Some(formatted_err.clone());
                         if let Some(req_id) = request_id {
@@ -1780,6 +1994,27 @@ impl OrbitAppCore {
 
         if let Some(stored) = host_to_persist {
             let _ = self.store.upsert_client_host(&stored);
+        }
+        if let Some((ag, evs, files_restored)) = rewound_to_persist {
+            let _ = self.store.replace_replica_timeline(&ag.agent_id, &evs);
+            let _ = self.store.upsert_single_replica_agent(host_id, &ag);
+            if files_restored {
+                self.fetch_git_status(host_id, &ag.cwd);
+                self.fetch_git_diff(host_id, &ag.cwd, None, false);
+            }
+        }
+        for (stale_ag_id, should_resubscribe) in stale_replica_agents {
+            let _ = self.store.replace_replica_timeline(&stale_ag_id, &[]);
+            if should_resubscribe {
+                self.dispatch_wire(
+                    host_id,
+                    WireMessage::SubscribeTimeline {
+                        request_id: Uuid::new_v4(),
+                        agent_id: stale_ag_id,
+                        since_seq: 0,
+                    },
+                );
+            }
         }
         if let Some(new_agent_id) = auto_subscribe_agent {
             self.open_agent_timeline(host_id, &new_agent_id);
@@ -2071,6 +2306,7 @@ impl OrbitAppCore {
                 status: AgentStatus::Initializing,
                 parent_agent_id: None,
                 latest_seq: 0,
+                timeline_epoch: 0,
                 created_at: now,
                 updated_at: now,
             };
@@ -2963,6 +3199,390 @@ impl OrbitAppCore {
 
         Err("Attachment upload ended without confirmation".into())
     }
+
+    pub fn is_local_host(&self, host_id: &str) -> bool {
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|g| g.get(host_id).map(|h| h.is_local))
+            .unwrap_or(false)
+    }
+
+    /// Rewind an agent conversation (and optionally restore workspace files) to strictly before `to_before_seq`.
+    pub async fn rewind_agent_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        to_before_seq: u64,
+        restore_files: bool,
+    ) -> Result<RewindAgentResultView, String> {
+        if agent_id.starts_with("opt_") {
+            return Err("Wait for the session to finish initializing before rewinding".into());
+        }
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to rewind this session".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let owned_agent_id = agent_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_rewinds.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before rewinding session".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::RewindAgent {
+                    request_id: req_id,
+                    agent_id: owned_agent_id,
+                    to_before_seq,
+                    restore_files,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_rewinds.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send rewind request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(Ok(view))) => Ok(view),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while rewinding session".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_rewinds.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to rewind session (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Rewind task terminated unexpectedly".to_string())?
+    }
+
+    /// Read a workspace file from a local or remote Orbit host and pre-render syntax highlighting / Markdown AST.
+    pub async fn read_workspace_file_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        cwd: &str,
+        path: &str,
+    ) -> Result<WorkspaceFileView, String> {
+        let (session, is_local) = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            (h.session.clone(), h.is_local)
+        };
+
+        let Some(session) = session else {
+            if is_local {
+                let owned_host = host_id.to_string();
+                let owned_cwd = cwd.to_string();
+                let owned_path = path.to_string();
+                return tokio::task::spawn_blocking(move || {
+                    let raw = read_local_workspace_file(&owned_cwd, &owned_path, None)?;
+                    Ok(build_workspace_file_view(
+                        &owned_host,
+                        &owned_cwd,
+                        &owned_path,
+                        RawFileReadResponse {
+                            resolved_path: raw.resolved_path,
+                            content_kind: raw.content_kind,
+                            mime_type: raw.mime_type,
+                            content: raw.content,
+                            size_bytes: raw.size_bytes,
+                            truncated: raw.truncated,
+                        },
+                    ))
+                })
+                .await
+                .map_err(|_| "local file read task cancelled".to_string())?;
+            }
+            return Err("Remote host is disconnected; reconnect to open files".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let owned_cwd = cwd.to_string();
+        let owned_path = path.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_file_reads.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before reading file".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let send_res = session
+                .send_wire(WireMessage::ReadWorkspaceFile {
+                    request_id: req_id,
+                    cwd: owned_cwd.clone(),
+                    path: owned_path.clone(),
+                    max_bytes: Some(2 * 1024 * 1024),
+                })
+                .await;
+
+            if let Err(e) = send_res {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_file_reads.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to request file read: {e}")));
+                return;
+            }
+
+            // Shorter wait on local hosts so older local daemons fall back cleanly to local fs read
+            let timeout_secs = if is_local { 3 } else { 15 };
+            let raw_res = match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await
+            {
+                Ok(Ok(Ok(raw))) => Ok(raw),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while reading file".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_file_reads.remove(&req_id);
+                    }
+                    if is_local {
+                        let fallback_cwd = owned_cwd.clone();
+                        let fallback_path = owned_path.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            read_local_workspace_file(&fallback_cwd, &fallback_path, None)
+                        })
+                        .await
+                        {
+                            Ok(Ok(local)) => Ok(RawFileReadResponse {
+                                resolved_path: local.resolved_path,
+                                content_kind: local.content_kind,
+                                mime_type: local.mime_type,
+                                content: local.content,
+                                size_bytes: local.size_bytes,
+                                truncated: local.truncated,
+                            }),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err("local file read task cancelled".to_string()),
+                        }
+                    } else {
+                        Err(
+                            "Timed out waiting for remote daemon to read file (ensure remote orbit daemon is up to date)"
+                                .to_string(),
+                        )
+                    }
+                }
+            };
+
+            let final_view = match raw_res {
+                Ok(raw) => tokio::task::spawn_blocking(move || {
+                    build_workspace_file_view(&owned_host_id, &owned_cwd, &owned_path, raw)
+                })
+                .await
+                .map_err(|_| "file highlight task cancelled".to_string()),
+                Err(e) => Err(e),
+            };
+            let _ = res_tx.send(final_view);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "file read task cancelled".to_string())?
+    }
+
+    /// Execute an ephemeral side question (`/btw`) on the target host and stream chunks via `event_tx`.
+    /// Returns `Ok(request_id)` if dispatched to the host daemon, or `Err(reason)` if unavailable.
+    pub async fn ask_side_question_on_host(
+        self: &Arc<Self>,
+        req: AskSideQuestionRequest,
+        event_tx: tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>,
+    ) -> Result<String, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect before asking a side question".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let req_id_str = req_id.to_string();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_side_questions.insert(req_id, event_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before sending side question".into()),
+                        None => Some(format!("host `{}` removed", req.host_id)),
+                    },
+                    Err(_) => Some("host state lock poisoned".into()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let wire_msg = WireMessage::AskSideQuestion {
+                request_id: req_id,
+                agent_id: req.agent_id,
+                cwd: req.cwd,
+                provider: req.provider,
+                model: req.model,
+                question: req.question,
+                context_summary: req.context_summary,
+            };
+
+            if let Err(e) = session.send_wire(wire_msg).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_side_questions.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send side question: {e}")));
+                return;
+            }
+
+            let _ = res_tx.send(Ok(req_id_str));
+
+            // Reap orphaned pending side-question channels if an older remote daemon never replies.
+            let host_for_timeout = req.host_id;
+            let core_for_timeout = Arc::clone(&core);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(105)).await;
+                if let Ok(mut guard) = core_for_timeout.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_for_timeout)
+                    && let Some(tx) = h.pending_side_questions.remove(&req_id)
+                {
+                    let _ = tx.send(SideQuestionStreamEvent::Done {
+                        request_id: req_id.to_string(),
+                        full_text: String::new(),
+                        error: Some(
+                            "Timed out waiting for side question response (ensure remote orbit daemon is up to date)"
+                                .to_string(),
+                        ),
+                    });
+                }
+            });
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "side question dispatch cancelled".to_string())?
+    }
+}
+
+fn build_workspace_file_view(
+    host_id: &str,
+    cwd: &str,
+    path: &str,
+    raw: RawFileReadResponse,
+) -> WorkspaceFileView {
+    let language = detect_language_for_path(path).to_string();
+    let (highlighted_lines, markdown_blocks) = if raw.content_kind == "text" {
+        let lines = highlight_code_lines_capped(&language, &raw.content, 2500);
+        let md = if language == "markdown" {
+            parse_markdown_blocks(&raw.content, false)
+        } else {
+            Vec::new()
+        };
+        (lines, md)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    WorkspaceFileView {
+        host_id: host_id.to_string(),
+        cwd: cwd.to_string(),
+        path: path.to_string(),
+        resolved_path: raw.resolved_path,
+        language,
+        content_kind: raw.content_kind,
+        mime_type: raw.mime_type,
+        content: raw.content,
+        size_bytes: raw.size_bytes,
+        truncated: raw.truncated,
+        highlighted_lines,
+        markdown_blocks,
+    }
 }
 
 struct AttachmentUploadTarget<'a> {
@@ -2972,9 +3592,22 @@ struct AttachmentUploadTarget<'a> {
     daemon_protocol_version: Option<u32>,
 }
 
-fn fail_pending_attachment_acks(h: &mut HostMemoryState, reason: &str) {
+fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_attachment_acks.drain() {
         let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_file_reads.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_rewinds.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (req_id, tx) in h.pending_side_questions.drain() {
+        let _ = tx.send(SideQuestionStreamEvent::Done {
+            request_id: req_id.to_string(),
+            full_text: String::new(),
+            error: Some(reason.to_string()),
+        });
     }
 }
 
@@ -4168,6 +4801,7 @@ mod tests {
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
                     latest_seq: 5,
+                    timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
                 }],

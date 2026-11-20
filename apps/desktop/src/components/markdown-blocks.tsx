@@ -1,8 +1,9 @@
-import { memo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 import { Check, Copy } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { InlineSpanView, RichBlockView, TableAlignmentView } from "@/lib/orbit-ipc";
 import { usePacedRichBlocks } from "@/lib/text-reveal";
+import { cn } from "@/lib/utils";
 import { useOrbitSelector } from "@/state/orbit-store";
 
 const lightTokenColorCache = new Map<string, string>();
@@ -247,27 +248,110 @@ const MarkdownTableBlock = memo(function MarkdownTableBlock({
   );
 });
 
+type ListItemBlock = Extract<RichBlockView, { kind: "list_item" }>;
+type ListGroupKind = "ordered" | "unordered" | "checklist";
+
+type GroupedRenderNode =
+  | { kind: "block"; block: RichBlockView; keyIndex: number }
+  | { kind: "list_group"; listKind: ListGroupKind; items: ListItemBlock[]; keyIndex: number };
+
+function classifyListItem(item: ListItemBlock): ListGroupKind {
+  if (item.checked !== null) return "checklist";
+  return item.ordered ? "ordered" : "unordered";
+}
+
+function groupMarkdownBlocks(blocks: RichBlockView[]): GroupedRenderNode[] {
+  const nodes: GroupedRenderNode[] = [];
+  for (let i = 0; i < blocks.length; i += 1) {
+    const block = blocks[i];
+    if (block.kind === "list_item") {
+      const listKind = classifyListItem(block);
+      const prev = nodes[nodes.length - 1];
+      if (prev && prev.kind === "list_group" && prev.listKind === listKind) {
+        prev.items.push(block);
+      } else {
+        nodes.push({ kind: "list_group", listKind, items: [block], keyIndex: i });
+      }
+    } else {
+      nodes.push({ kind: "block", block, keyIndex: i });
+    }
+  }
+  return nodes;
+}
+
 export const MarkdownBlocksView = memo(function MarkdownBlocksView({
   blocks,
   streaming = false,
   compact = false,
+  bubble = false,
 }: {
   blocks: RichBlockView[];
   streaming?: boolean;
   compact?: boolean;
+  bubble?: boolean;
 }) {
   const isDark = useOrbitSelector((s) => s.resolvedTheme === "dark");
   const visibleBlocks = usePacedRichBlocks(blocks, streaming);
+  const groupedNodes = useMemo(() => groupMarkdownBlocks(visibleBlocks), [visibleBlocks]);
+
+  const containerClass = compact
+    ? "selectable-text text-foreground/78 space-y-1 text-[13px] leading-[1.5] break-words"
+    : bubble
+      ? "selectable-text text-foreground/95 space-y-2 text-[14.5px] leading-[1.64] break-words"
+      : "selectable-text text-foreground/95 space-y-3 text-[14.5px] leading-[1.72] break-words";
+  const listSpacingClass = compact || bubble ? "space-y-0.5" : "space-y-1";
 
   return (
-    <div
-      className={
-        compact
-          ? "selectable-text text-foreground/78 space-y-1 text-[13px] leading-[1.5] break-words"
-          : "selectable-text text-foreground/95 space-y-3 text-[14.5px] leading-[1.72] break-words"
-      }
-    >
-      {visibleBlocks.map((block, idx) => {
+    <div className={containerClass}>
+      {groupedNodes.map((node) => {
+        if (node.kind === "list_group") {
+          if (node.listKind === "ordered") {
+            return (
+              <ol
+                key={node.keyIndex}
+                start={node.items[0]?.index ?? 1}
+                className={cn(
+                  "marker:text-foreground/70 marker:tabular-nums list-decimal pl-6",
+                  listSpacingClass,
+                )}
+              >
+                {node.items.map((item, itemIdx) => (
+                  <li key={itemIdx} value={item.index} className="pl-1 whitespace-pre-wrap">
+                    <InlineSpans spans={item.spans} />
+                  </li>
+                ))}
+              </ol>
+            );
+          }
+          if (node.listKind === "unordered") {
+            return (
+              <ul
+                key={node.keyIndex}
+                className={cn("marker:text-foreground/65 list-disc pl-[20px]", listSpacingClass)}
+              >
+                {node.items.map((item, itemIdx) => (
+                  <li key={itemIdx} className="pl-1 whitespace-pre-wrap">
+                    <InlineSpans spans={item.spans} />
+                  </li>
+                ))}
+              </ul>
+            );
+          }
+          return (
+            <ul key={node.keyIndex} className={cn("list-none pl-0.5", listSpacingClass)}>
+              {node.items.map((item, itemIdx) => (
+                <li key={itemIdx} className="relative pl-5 whitespace-pre-wrap">
+                  <span className="text-foreground/75 absolute top-0 left-0 select-none">
+                    {item.checked ? "✓" : "○"}
+                  </span>
+                  <InlineSpans spans={item.spans} />
+                </li>
+              ))}
+            </ul>
+          );
+        }
+
+        const { block, keyIndex: idx } = node;
         switch (block.kind) {
           case "heading": {
             const sizeClass =
@@ -290,23 +374,6 @@ export const MarkdownBlocksView = memo(function MarkdownBlocksView({
             );
           case "code_block":
             return <HighlightedCodeBlock key={idx} {...block} isDark={isDark} />;
-          case "list_item":
-            return (
-              <div key={idx} className="flex items-start gap-2.5 pl-1">
-                <span className="text-foreground/75 tabular-nums shrink-0 select-none">
-                  {block.checked !== null
-                    ? block.checked
-                      ? "✓"
-                      : "○"
-                    : block.ordered
-                      ? `${block.index}.`
-                      : "•"}
-                </span>
-                <div className="flex-1 whitespace-pre-wrap">
-                  <InlineSpans spans={block.spans} />
-                </div>
-              </div>
-            );
           case "block_quote":
             return (
               <blockquote
@@ -328,6 +395,8 @@ export const MarkdownBlocksView = memo(function MarkdownBlocksView({
             );
           case "horizontal_rule":
             return <hr key={idx} className="border-border my-3.5 select-none" />;
+          case "list_item":
+            return null;
         }
       })}
     </div>

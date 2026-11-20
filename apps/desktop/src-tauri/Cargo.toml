@@ -1,6 +1,6 @@
 [package]
 name = "orbit-desktop"
-version = "0.6.0"
+version = "0.6.1"
 description = "Orbit Multi-Host AI Coding Agent Desktop Control Plane (macOS & Linux)"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -24,6 +24,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+base64 = "0.22"
+gtk = "0.18"
+gdk = "0.18"
 
 [lints.rust]
 unsafe_code = "deny"

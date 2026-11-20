@@ -1449,6 +1449,175 @@ fn decode_percent_utf8(raw: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClipboardImagePayload {
+    filename: String,
+    mime_type: String,
+    data_b64: String,
+}
+
+#[cfg(target_os = "linux")]
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_CLIPBOARD_URI_IMAGES: usize = 10;
+
+#[cfg(target_os = "linux")]
+fn image_mime_for_extension(ext_lower: &str) -> Option<&'static str> {
+    match ext_lower {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "avif" => Some("image/avif"),
+        "ico" => Some("image/x-icon"),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_gtk_clipboard_images() -> Vec<ClipboardImagePayload> {
+    use base64::Engine as _;
+
+    let clipboard = gtk::Clipboard::get(&gdk::SELECTION_CLIPBOARD);
+    let Some(targets) = clipboard.wait_for_targets() else {
+        return Vec::new();
+    };
+    let target_names: Vec<String> = targets.iter().map(|a| a.name().to_string()).collect();
+
+    // 1. Prefer raw encoded image MIME targets directly so PNG/JPEG/WebP/GIF bytes are preserved verbatim.
+    const PREFERRED_MIMES: [(&str, &str); 5] = [
+        ("image/png", "png"),
+        ("image/jpeg", "jpg"),
+        ("image/webp", "webp"),
+        ("image/gif", "gif"),
+        ("image/bmp", "bmp"),
+    ];
+    for (mime, ext) in PREFERRED_MIMES {
+        if target_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(mime))
+        {
+            let atom = gdk::Atom::intern(mime);
+            if let Some(sel) = clipboard.wait_for_contents(&atom) {
+                let bytes = sel.data();
+                if !bytes.is_empty() && bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES {
+                    return vec![ClipboardImagePayload {
+                        filename: format!("clipboard-image.{ext}"),
+                        mime_type: mime.to_string(),
+                        data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    }];
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to GdkPixbuf conversion (e.g., TIFF / X11 pixmap / BMP variants) -> PNG.
+    let has_any_image_target = target_names
+        .iter()
+        .any(|name| name.to_ascii_lowercase().starts_with("image/"));
+    if has_any_image_target
+        && let Some(pixbuf) = clipboard.wait_for_image()
+        && let Ok(bytes) = pixbuf.save_to_bufferv("png", &[])
+        && !bytes.is_empty()
+        && bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES
+    {
+        return vec![ClipboardImagePayload {
+            filename: "clipboard-image.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }];
+    }
+
+    // 3. Support image files copied from Linux file managers (`text/uri-list` / `x-special/gnome-copied-files`).
+    let has_uri_target = target_names.iter().any(|name| {
+        name.eq_ignore_ascii_case("text/uri-list")
+            || name.eq_ignore_ascii_case("x-special/gnome-copied-files")
+    });
+    if has_uri_target {
+        let mut out = Vec::new();
+        for uri in clipboard.wait_for_uris() {
+            if out.len() >= MAX_CLIPBOARD_URI_IMAGES {
+                break;
+            }
+            let raw_uri = uri.trim();
+            let Some(encoded_path) = raw_uri.strip_prefix("file://") else {
+                continue;
+            };
+            // Strip optional `localhost` authority (`file://localhost/path`)
+            let encoded_path = encoded_path
+                .strip_prefix("localhost/")
+                .map(|rest| format!("/{rest}"))
+                .unwrap_or_else(|| encoded_path.to_string());
+            let decoded_path = decode_percent_utf8(&encoded_path);
+            let path = std::path::Path::new(&decoded_path);
+            let Ok(meta) = fs::metadata(path) else {
+                continue;
+            };
+            if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_CLIPBOARD_IMAGE_BYTES as u64 {
+                continue;
+            }
+            let Some(ext) = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+            else {
+                continue;
+            };
+            let Some(mime) = image_mime_for_extension(&ext) else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(path) else {
+                continue;
+            };
+            if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+                continue;
+            }
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("clipboard-image.{ext}"));
+            out.push(ClipboardImagePayload {
+                filename,
+                mime_type: mime.to_string(),
+                data_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            });
+        }
+        return out;
+    }
+
+    Vec::new()
+}
+
+/// Reads images from the native Linux GTK clipboard, bypassing WebKitGTK's `DataTransfer::allowsFileAccess()`
+/// restriction (CVE-2025-13947 regression) that leaves `e.clipboardData.items` empty for pasted images.
+#[tauri::command]
+async fn read_clipboard_images(app: AppHandle) -> Result<Vec<ClipboardImagePayload>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let images = read_linux_gtk_clipboard_images();
+            let _ = tx.send(images);
+        })
+        .map_err(|e| format!("Failed to dispatch GTK clipboard read: {e}"))?;
+
+        match tokio::time::timeout(std::time::Duration::from_secs(3), rx).await {
+            Ok(Ok(images)) => Ok(images),
+            Ok(Err(_)) => Err("Clipboard reader channel closed".into()),
+            Err(_) => Err("Timed out reading Linux clipboard".into()),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Ok(Vec::new())
+    }
+}
+
 #[tauri::command]
 async fn stage_host_attachment(
     state: State<'_, DesktopAppState>,
@@ -1738,6 +1907,7 @@ pub fn run() {
             open_external_browser_url,
             stage_host_attachment,
             stage_host_attachment_bytes,
+            read_clipboard_images,
             provision_ssh_relay,
             get_app_version,
             check_app_update,

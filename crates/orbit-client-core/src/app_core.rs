@@ -8058,12 +8058,22 @@ fn render_timeline_event_view(
         }),
         TimelinePayload::StatusChanged {
             status: AgentStatus::AutonomousWakeup { source, .. },
-        } => Some(TimelineItemView::Notice {
-            seq: ev.seq,
-            level: "wakeup".into(),
-            message: format_autonomous_wakeup_notice(source),
-            timestamp_ms: ts_ms,
-        }),
+        } => {
+            // `waiting:*` transitions represent passive background-task wait state, not a new
+            // wakeup boundary: the stage's trailing live indicator already renders
+            // `Waiting for N background tasks…` directly from `currentAgent.status_label`, so
+            // emitting a `WakeupDivider` here would duplicate the exact same text right above it.
+            if source.trim().starts_with("waiting:") {
+                None
+            } else {
+                Some(TimelineItemView::Notice {
+                    seq: ev.seq,
+                    level: "wakeup".into(),
+                    message: format_autonomous_wakeup_notice(source),
+                    timestamp_ms: ts_ms,
+                })
+            }
+        }
         TimelinePayload::PermissionResolved { .. }
         | TimelinePayload::QuestionResolved { .. }
         | TimelinePayload::StatusChanged { .. } => None,
@@ -8129,9 +8139,11 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
             if let Some(rest) = source.trim().strip_prefix("waiting:") {
                 let desc = rest.trim();
                 let label = if desc.is_empty() {
-                    "Background task".to_string()
-                } else {
+                    "Waiting for background tasks".to_string()
+                } else if desc.to_ascii_lowercase().starts_with("waiting") {
                     desc.to_string()
+                } else {
+                    format!("Waiting for {desc}")
                 };
                 (label, false, true, false)
             } else {
@@ -9080,6 +9092,19 @@ mod tests {
                             streaming: false,
                         },
                     },
+                    TimelineEvent {
+                        seq: 4,
+                        epoch: 1,
+                        agent_id: "ag_w".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::StatusChanged {
+                            status: AgentStatus::AutonomousWakeup {
+                                turn_id: "bgwait_1".into(),
+                                source: "waiting:3 background tasks".into(),
+                            },
+                        },
+                    },
                 ],
             },
         );
@@ -9100,6 +9125,13 @@ mod tests {
             TimelineItemView::AssistantMessage { seq: 3, text, .. }
                 if text.contains("Normal assistant reply")
         )));
+        // Passive `waiting:*` transitions must NOT emit a duplicate `WakeupDivider` notice row!
+        assert!(
+            !full
+                .items
+                .iter()
+                .any(|it| matches!(it, TimelineItemView::Notice { seq: 4, .. }))
+        );
     }
 
     #[test]

@@ -74,7 +74,8 @@ pub(crate) fn build_compact_unified_diff(
 }
 
 pub use driver::{
-    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, ProviderSessionHandle, SessionLaunchConfig,
+    DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, ProviderSessionHandle,
+    SessionLaunchConfig,
 };
 pub use side_question::{SideQuestionSpec, run_side_question};
 

@@ -20,9 +20,9 @@ export interface ConversationComposerProps {
 }
 
 /**
- * Reusable conversation composer matching Orbit's primary composer surface, keyboard semantics
- * (`enterToSend`, `Cmd/Ctrl+Enter`, prompt history recall via ArrowUp/ArrowDown), auto-growing
- * textarea, and busy-state Stop control.
+ * Reusable conversation composer matching Orbit's primary `OmniComposer` surface, typography,
+ * deterministic off-flow div mirror auto-height (handles both typing and large multi-line pastes),
+ * keyboard semantics (`enterToSend`, `Cmd/Ctrl+Enter`, prompt history recall), and Stop control.
  */
 export const ConversationComposer = memo(function ConversationComposer({
   value,
@@ -34,18 +34,20 @@ export const ConversationComposer = memo(function ConversationComposer({
   placeholder = "Ask a follow-up…",
   focusNonce,
   promptHistory,
-  variant = "compact",
+  variant = "docked",
   topSlot,
   leftControlsSlot,
   rightControlsSlot,
   className,
 }: ConversationComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const mirrorRef = useRef<HTMLDivElement | null>(null);
   const [historyIdx, setHistoryIdx] = useState<number>(-1);
+  const [widthTick, setWidthTick] = useState(0);
   const savedDraftRef = useRef<string>("");
 
-  const minHeight = variant === "compact" ? 34 : 46;
-  const maxHeight = variant === "compact" ? 160 : 220;
+  const minHeight = variant === "compact" ? 38 : 46;
+  const maxHeight = variant === "compact" ? 180 : 220;
 
   useEffect(() => {
     if (focusNonce === undefined) return;
@@ -53,17 +55,36 @@ export const ConversationComposer = memo(function ConversationComposer({
     return () => cancelAnimationFrame(raf);
   }, [focusNonce]);
 
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    let lastW = el.clientWidth;
+    const ro = new ResizeObserver((entries) => {
+      const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
+      if (nextW > 0 && nextW !== lastW) {
+        lastW = nextW;
+        setWidthTick((n) => n + 1);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
     if (!value) {
       el.style.height = `${minHeight}px`;
+      el.style.overflowY = "hidden";
       return;
     }
-    el.style.height = `${minHeight}px`;
-    const nextH = Math.min(maxHeight, Math.max(minHeight, el.scrollHeight));
+    const mirror = mirrorRef.current;
+    if (!mirror) return;
+    const measured = Math.max(mirror.offsetHeight, mirror.scrollHeight);
+    const nextH = Math.min(maxHeight, Math.max(minHeight, measured));
     el.style.height = `${nextH}px`;
-  }, [value, minHeight, maxHeight]);
+    el.style.overflowY = measured > maxHeight ? "auto" : "hidden";
+  }, [value, minHeight, maxHeight, widthTick]);
 
   const canSend = value.trim().length > 0 && !isBusy;
   const showStop = isBusy && Boolean(onInterrupt) && value.trim().length === 0;
@@ -118,33 +139,54 @@ export const ConversationComposer = memo(function ConversationComposer({
     }
   };
 
+  const textStyleClass =
+    variant === "compact"
+      ? "px-[12px] py-[9px] text-[13.5px] leading-[20px]"
+      : "px-[14px] py-[13px] text-[15px] leading-[20px]";
+
   return (
-    <div className={cn("border-border bg-sidebar shrink-0 border-t p-2.5", className)}>
+    <div className={cn("bg-canvas shrink-0 px-3 pt-1 pb-3", className)}>
       {topSlot}
       <div
         className={cn(
-          "composer-surface flex flex-col gap-1.5",
-          variant === "compact" ? "rounded-xl px-3 py-2" : "rounded-2xl px-3.5 py-2.5",
+          "composer-surface flex flex-col",
+          variant === "compact" ? "rounded-[16px]" : "rounded-[20px]",
         )}
       >
-        <textarea
-          ref={textareaRef}
-          rows={1}
-          value={value}
-          onChange={(e) => {
-            if (historyIdx !== -1) setHistoryIdx(-1);
-            onChange(e.target.value);
-          }}
-          onKeyDown={handleKeyDown}
-          placeholder={placeholder}
-          style={{ minHeight: `${minHeight}px`, maxHeight: `${maxHeight}px` }}
-          className={cn(
-            "text-foreground placeholder:text-muted-foreground w-full resize-none bg-transparent leading-[1.48] outline-none",
-            variant === "compact" ? "text-[12.5px]" : "text-[13.5px]",
-          )}
-        />
+        <div className="relative">
+          {/* Off-flow div mirror sizer for deterministic multi-line & paste expansion */}
+          <div
+            ref={mirrorRef}
+            aria-hidden="true"
+            className={cn(
+              "pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full whitespace-pre-wrap break-words",
+              textStyleClass,
+            )}
+          >
+            {value}
+            {"\u200b"}
+          </div>
 
-        <div className="flex items-center justify-between gap-2">
+          <textarea
+            ref={textareaRef}
+            rows={1}
+            value={value}
+            onChange={(e) => {
+              if (historyIdx !== -1) setHistoryIdx(-1);
+              onChange(e.target.value);
+            }}
+            onKeyDown={handleKeyDown}
+            placeholder={placeholder}
+            style={{ minHeight: `${minHeight}px`, maxHeight: `${maxHeight}px` }}
+            className={cn(
+              "text-foreground placeholder:text-foreground/45 block w-full resize-none overflow-y-hidden bg-transparent outline-none",
+              textStyleClass,
+            )}
+          />
+        </div>
+
+        {/* Bottom Control Bar matching primary OmniComposer rhythm */}
+        <div className="flex items-center justify-between gap-2 px-2.5 pt-0 pb-2">
           <div className="flex min-w-0 items-center gap-1.5">{leftControlsSlot}</div>
           <div className="flex shrink-0 items-center gap-1.5">
             {rightControlsSlot}
@@ -154,9 +196,9 @@ export const ConversationComposer = memo(function ConversationComposer({
                 onClick={onInterrupt}
                 title="Stop generating (Esc)"
                 aria-label="Stop generating"
-                className="orbit-press inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-lg bg-rose-500/90 text-white transition-opacity hover:opacity-90"
+                className="orbit-press inline-flex h-[30px] w-[30px] cursor-pointer items-center justify-center rounded-full bg-rose-500/90 text-white transition-opacity hover:opacity-90"
               >
-                <Square className="h-[10.5px] w-[10.5px] fill-current" />
+                <Square className="h-[11px] w-[11px] fill-current" />
               </button>
             ) : (
               <button
@@ -169,13 +211,13 @@ export const ConversationComposer = memo(function ConversationComposer({
                 }}
                 aria-label="Send message"
                 className={cn(
-                  "orbit-press inline-flex h-[26px] w-[26px] shrink-0 cursor-pointer items-center justify-center rounded-lg transition-colors",
+                  "orbit-press inline-flex h-[30px] w-[30px] shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors",
                   canSend
                     ? "bg-foreground text-background hover:opacity-90"
                     : "bg-muted text-muted-foreground cursor-default opacity-60",
                 )}
               >
-                <ArrowUp className="h-[14px] w-[14px] stroke-[2.2]" />
+                <ArrowUp className="h-[15px] w-[15px] stroke-[2.2]" />
               </button>
             )}
           </div>

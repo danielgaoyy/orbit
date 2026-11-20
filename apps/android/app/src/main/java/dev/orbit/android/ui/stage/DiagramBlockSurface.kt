@@ -188,8 +188,11 @@ internal fun DiagramBlockSurface(
             isLoading = false
             return@LaunchedEffect
         }
+        val hadRendered = rendered != null
         isLoading = true
-        delay(180L)
+        if (hadRendered) {
+            delay(180L)
+        }
         rendered = renderer(kind, block.rawCode, colors.isDark)
         isLoading = false
     }

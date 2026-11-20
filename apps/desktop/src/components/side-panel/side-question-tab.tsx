@@ -78,25 +78,26 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         )}
       </div>
 
-      {/* Shared Conversation Viewport */}
+      {/* Shared Conversation Viewport matching main StreamStage prose & bubbles */}
       <ConversationViewport
         hostId={hostId}
         cwd={cwd}
         resetKey={scope}
         contentVersion={contentVersion}
+        viewportClassName="px-5 py-5"
       >
         {entries.length === 0 ? (
-          <div className="flex min-h-[240px] flex-col items-center justify-center gap-3 px-4 text-center">
-            <div className="bg-muted text-muted-foreground inline-flex h-9 w-9 items-center justify-center rounded-xl">
-              <MessageCircleQuestion className="h-[18px] w-[18px] stroke-[1.65]" />
+          <div className="flex min-h-[260px] flex-col items-center justify-center gap-3 px-4 text-center">
+            <div className="bg-muted text-muted-foreground inline-flex h-10 w-10 items-center justify-center rounded-xl">
+              <MessageCircleQuestion className="h-[19px] w-[19px] stroke-[1.65]" />
             </div>
             <div className="space-y-1">
-              <div className="text-foreground text-[13px] font-medium">
+              <div className="text-foreground text-[14px] font-medium">
                 Ask a Side Question
               </div>
-              <p className="text-muted-foreground max-w-[260px] text-[12px] leading-relaxed">
+              <p className="text-muted-foreground max-w-[280px] text-[12.5px] leading-relaxed">
                 Ask anything about the active conversation while the main agent keeps working. Type{" "}
-                <code className="bg-muted text-foreground/85 rounded px-1 py-0.5 font-mono text-[11px]">
+                <code className="bg-muted text-foreground/85 rounded px-1 py-0.5 font-mono text-[11.5px]">
                   /btw
                 </code>{" "}
                 in the main composer or ask below.
@@ -104,16 +105,16 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
             </div>
           </div>
         ) : (
-          <div className="space-y-5">
+          <div className="space-y-7">
             {entries.map((entry) => (
-              <div key={entry.id} className="orbit-bubble-enter space-y-2.5">
-                <ConversationUserBubble text={entry.question} compact />
+              <div key={entry.id} className="orbit-bubble-enter space-y-4">
+                <ConversationUserBubble text={entry.question} />
 
-                {/* Assistant Side Answer */}
-                <div className="space-y-1.5">
+                {/* Assistant Side Answer (full primary conversation typography) */}
+                <div className="space-y-2">
                   {entry.status === "streaming" && !entry.answer ? (
-                    <div className="text-muted-foreground flex items-center gap-2 py-1 text-[12.5px]">
-                      <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
+                    <div className="text-muted-foreground flex items-center gap-2 py-1 text-[13.5px]">
+                      <Loader2 className="h-[14px] w-[14px] animate-spin" />
                       <span className="agent-text-shimmer">
                         Thinking with {entry.providerLabel}…
                       </span>
@@ -121,22 +122,21 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                   ) : (
                     <>
                       {entry.answer && (
-                        <div className="text-[13px]">
+                        <div className="min-w-0 text-[14.5px] leading-[1.68]">
                           {entry.blocks.length > 0 ? (
                             <MarkdownBlocksView
                               blocks={entry.blocks}
                               streaming={entry.status === "streaming"}
-                              compact
                             />
                           ) : (
-                            <div className="selectable-text text-foreground/90 leading-relaxed whitespace-pre-wrap">
+                            <div className="selectable-text text-foreground/92 leading-[1.68] whitespace-pre-wrap">
                               {entry.answer}
                             </div>
                           )}
                         </div>
                       )}
                       {entry.error && (
-                        <div className="border-rose-500/25 bg-rose-500/[0.05] text-foreground/85 flex items-start gap-2 rounded-xl border px-3 py-2 text-[12px]">
+                        <div className="border-rose-500/25 bg-rose-500/[0.05] text-foreground/85 flex items-start gap-2 rounded-xl border px-3 py-2 text-[12.5px]">
                           <AlertTriangle className="mt-0.5 h-[14px] w-[14px] shrink-0 text-rose-500" />
                           <span className="selectable-text break-words">{entry.error}</span>
                         </div>
@@ -156,10 +156,10 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
                               `Regarding "${entry.question}":\n${entry.answer}`,
                             )
                           }
-                          className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] transition-colors"
+                          className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-1.5 py-0.5 text-[11.5px] transition-colors"
                         >
                           <span>Send to main chat</span>
-                          <ArrowUpRight className="h-[11.5px] w-[11.5px]" />
+                          <ArrowUpRight className="h-[12px] w-[12px]" />
                         </button>
                       }
                     />
@@ -171,9 +171,9 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         )}
       </ConversationViewport>
 
-      {/* Shared Conversation Composer */}
+      {/* Shared Conversation Composer matching primary OmniComposer */}
       <ConversationComposer
-        variant="compact"
+        variant="docked"
         value={draft}
         onChange={(next) => orbitActions.setSideQuestionDraft(next)}
         onSubmit={handleSubmit}
@@ -189,7 +189,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
         }
         leftControlsSlot={
           activeProviderLabel ? (
-            <span className="text-muted-foreground/80 truncate text-[11px]">
+            <span className="text-muted-foreground/80 truncate px-1.5 text-[12px]">
               {activeProviderLabel}
             </span>
           ) : null

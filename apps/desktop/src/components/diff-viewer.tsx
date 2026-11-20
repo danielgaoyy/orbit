@@ -250,6 +250,7 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
         value={text}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => {
+          if (e.nativeEvent.isComposing) return;
           if (e.key === "Escape") {
             e.preventDefault();
             onCancel();
@@ -863,9 +864,9 @@ export const DiffFilesViewer = memo(function DiffFilesViewer({
 
   return (
     <div className="space-y-3">
-      {files.map((file) => (
+      {files.map((file, idx) => (
         <SingleFileDiffCard
-          key={file.path}
+          key={`${file.path}-${idx}`}
           file={file}
           layout={layout}
           wrapLines={wrapLines}

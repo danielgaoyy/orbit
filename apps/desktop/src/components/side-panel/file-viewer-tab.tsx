@@ -176,7 +176,14 @@ export const FileViewerTab = memo(function FileViewerTab({
   useEffect(() => {
     const onWindowKeyDown = (e: KeyboardEvent) => {
       const snap = orbitActions.getSnapshot();
-      if (snap.terminalFocused || snap.commandPaletteOpen || snap.quickOpenFilesOpen) return;
+      if (
+        !snap.sidePanelOpen ||
+        snap.terminalFocused ||
+        snap.commandPaletteOpen ||
+        snap.quickOpenFilesOpen
+      ) {
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") {
         e.preventDefault();
         setFindOpen(true);

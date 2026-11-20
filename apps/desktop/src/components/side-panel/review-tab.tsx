@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Check,
   ChevronsDownUp,
@@ -57,6 +57,13 @@ export const ReviewTab = memo(function ReviewTab({
   const [viewedPaths, setViewedPaths] = useState<Set<string>>(() => new Set());
   const [draftComments, setDraftComments] = useState<ReviewCommentDraft[]>([]);
 
+  useEffect(() => {
+    setCollapsedPaths(new Set());
+    setViewedPaths(new Set());
+    setDraftComments([]);
+    setFileQuery("");
+  }, [selectedHostId, selectedCwd]);
+
   const displayedDiffFiles = useMemo(() => {
     const base =
       reviewScope === "session_turns" ? sessionTurnDiffs : (gitReview?.diff_files ?? EMPTY_DIFFS);
@@ -111,12 +118,15 @@ export const ReviewTab = memo(function ReviewTab({
     });
   }, []);
 
-  const handleToggleViewed = useCallback((path: string) => {
-    setViewedPaths((prev) => {
-      const next = new Set(prev);
-      const markingViewed = !next.has(path);
-      if (markingViewed) next.add(path);
-      else next.delete(path);
+  const handleToggleViewed = useCallback(
+    (path: string) => {
+      const markingViewed = !viewedPaths.has(path);
+      setViewedPaths((prev) => {
+        const next = new Set(prev);
+        if (markingViewed) next.add(path);
+        else next.delete(path);
+        return next;
+      });
       if (markingViewed) {
         setCollapsedPaths((cPrev) => {
           const cNext = new Set(cPrev);
@@ -124,9 +134,9 @@ export const ReviewTab = memo(function ReviewTab({
           return cNext;
         });
       }
-      return next;
-    });
-  }, []);
+    },
+    [viewedPaths],
+  );
 
   const handleToggleAllCollapse = useCallback(() => {
     if (allCollapsed) {

@@ -614,7 +614,7 @@ fn handle_daemon_attach(
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     if let Some(ref sb_arc) = pty_scrollback {
                         let snap_bytes: Vec<u8> = sb_arc
                             .lock()
@@ -631,6 +631,9 @@ fn handle_daemon_attach(
                                 }
                             }
                         }
+                    } else {
+                        let _ = skipped;
+                        break;
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,

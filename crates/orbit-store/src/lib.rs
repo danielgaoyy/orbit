@@ -273,8 +273,10 @@ impl OrbitStore {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
         if post_orch_ver < 4 {
-            let _ = conn.execute_batch(
+            conn.execute_batch(
                 "
+                BEGIN IMMEDIATE;
+
                 UPDATE timeline_events
                 SET event_type = json_extract(payload_json, '$.type'),
                     coalesce_key = CASE
@@ -286,7 +288,7 @@ impl OrbitStore {
                             THEN 'call_id:' || json_extract(payload_json, '$.call_id')
                         ELSE NULL
                     END
-                WHERE event_type IS NULL;
+                WHERE event_type IS NULL AND json_valid(payload_json);
 
                 UPDATE client_replica_events
                 SET event_type = json_extract(payload_json, '$.type'),
@@ -299,11 +301,13 @@ impl OrbitStore {
                             THEN 'call_id:' || json_extract(payload_json, '$.call_id')
                         ELSE NULL
                     END
-                WHERE event_type IS NULL;
+                WHERE event_type IS NULL AND json_valid(payload_json);
 
                 PRAGMA user_version = 4;
+
+                COMMIT;
                 ",
-            );
+            )?;
         }
         conn.execute_batch(
             "
@@ -1740,13 +1744,11 @@ fn coalesce_identity(payload: &TimelinePayload) -> Option<(&'static str, &str)> 
     match payload {
         TimelinePayload::AssistantMessage { item_id, .. }
         | TimelinePayload::AssistantThinking { item_id, .. }
-            if !item_id.is_empty() && !item_id.contains('"') && !item_id.contains('%') =>
+            if !item_id.is_empty() =>
         {
             Some(("item_id", item_id.as_str()))
         }
-        TimelinePayload::ToolCall { call_id, .. }
-            if !call_id.is_empty() && !call_id.contains('"') && !call_id.contains('%') =>
-        {
+        TimelinePayload::ToolCall { call_id, .. } if !call_id.is_empty() => {
             Some(("call_id", call_id.as_str()))
         }
         _ => None,

@@ -195,10 +195,11 @@ export function XtermPane({
       },
     });
 
-    // Handle terminal-local Cmd+K (clear) and Cmd+F (search)
+    // Handle terminal-local Cmd+K (clear) and Cmd/Ctrl+F (search)
+    const isMac = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
     term.attachCustomKeyEventHandler((ev) => {
       if (ev.type !== "keydown") return true;
-      const isMod = ev.metaKey || ev.ctrlKey;
+      const isMod = isMac ? ev.metaKey : ev.ctrlKey;
       const key = ev.key.toLowerCase();
       if (ev.metaKey && !ev.shiftKey && !ev.altKey && key === "k") {
         ev.preventDefault();

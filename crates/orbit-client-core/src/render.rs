@@ -1196,25 +1196,14 @@ pub fn diff_two_texts(path: &str, old_text: &str, new_text: &str) -> DiffFileVie
     file
 }
 
-fn diff_lang_hint_from_path(path: &str) -> &str {
-    let base = path.rsplit('/').next().unwrap_or(path);
-    if base.eq_ignore_ascii_case("Dockerfile") {
-        return "dockerfile";
-    }
-    if base.eq_ignore_ascii_case("Makefile") {
-        return "makefile";
-    }
-    base.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("")
-}
-
 fn enrich_diff_file_highlights_and_intraline(file: &mut DiffFileView) {
     if file.lines.is_empty() || is_generated_or_lockfile_path(&file.path) {
         return;
     }
 
     // 1. Syntax-highlight code lines via cached syntect pipeline
-    let lang = diff_lang_hint_from_path(&file.path);
-    if !lang.is_empty() {
+    let lang = detect_language_for_path(&file.path);
+    if !lang.is_empty() && lang != "text" {
         let mut code_indices: Vec<usize> = Vec::with_capacity(file.lines.len());
         let mut joined = String::new();
         for (idx, line) in file.lines.iter().enumerate() {

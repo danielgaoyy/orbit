@@ -129,7 +129,7 @@ pub async fn compute_git_diff(
 
     let diff_text = if out.stdout.len() > MAX_GIT_DIFF_BYTES {
         let mut cut = MAX_GIT_DIFF_BYTES;
-        while cut > 0 && !std::str::from_utf8(&out.stdout[..cut]).is_ok() {
+        while cut > 0 && (out.stdout[cut] & 0b1100_0000) == 0b1000_0000 {
             cut -= 1;
         }
         let mut s = String::from_utf8_lossy(&out.stdout[..cut]).to_string();

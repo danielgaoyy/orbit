@@ -156,8 +156,9 @@ export const OmniComposer = memo(function OmniComposer({
   );
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const mirrorTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const mirrorTextareaRef = useRef<HTMLDivElement | null>(null);
   const lastTextareaHeightRef = useRef<number>(46);
+  const [composerWidthTick, setComposerWidthTick] = useState(0);
   const draftTextRef = useRef<string>(draftText);
   draftTextRef.current = draftText;
   const directivePrefixRef = useRef<HTMLSpanElement | null>(null);
@@ -200,8 +201,23 @@ export const OmniComposer = memo(function OmniComposer({
     setDirectiveIndentPx((prev) => (prev === nextIndent ? prev : nextIndent));
   }, [slashDirective]);
 
-  // Measure wrapped textarea height from the invisible off-flow mirror BEFORE paint (`useLayoutEffect`),
-  // fast-pathing empty drafts to `minTextareaHeight` without forcing a layout read.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    let lastW = el.clientWidth;
+    const ro = new ResizeObserver((entries) => {
+      const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
+      if (nextW > 0 && nextW !== lastW) {
+        lastW = nextW;
+        setComposerWidthTick((n) => n + 1);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Measure wrapped textarea height from the invisible off-flow `<div>` mirror BEFORE paint (`useLayoutEffect`),
+  // ensuring both incremental typing and large multi-line pastes expand deterministically in WKWebView.
   useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -219,7 +235,7 @@ export const OmniComposer = memo(function OmniComposer({
 
     const mirror = mirrorTextareaRef.current;
     if (!mirror) return;
-    const measured = mirror.scrollHeight;
+    const measured = Math.max(mirror.offsetHeight, mirror.scrollHeight);
     const nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
     if (lastTextareaHeightRef.current !== nextHeight || el.style.height !== `${nextHeight}px`) {
       lastTextareaHeightRef.current = nextHeight;
@@ -229,7 +245,7 @@ export const OmniComposer = memo(function OmniComposer({
     if (el.style.overflowY !== nextOverflow) {
       el.style.overflowY = nextOverflow;
     }
-  }, [draftText, scopeKey, slashDirective, directiveIndentPx]);
+  }, [draftText, scopeKey, slashDirective, directiveIndentPx, composerWidthTick]);
 
   useEffect(() => {
     return orbitActions.onComposerFocusRequest(() => {
@@ -848,21 +864,20 @@ export const OmniComposer = memo(function OmniComposer({
                 </div>
               )}
 
-              {/* Off-flow mirror sizer: measures exact wrapped height without collapsing live `<textarea>` to `0px` */}
-              <textarea
+              {/* Off-flow div mirror sizer: deterministically measures wrapped height on both typing and large pastes */}
+              <div
                 ref={mirrorTextareaRef}
-                value={draftText}
-                readOnly
-                tabIndex={-1}
                 aria-hidden="true"
-                rows={1}
                 style={
                   slashDirective && directiveIndentPx > 0
-                    ? { height: "0px", textIndent: `${directiveIndentPx}px` }
-                    : { height: "0px" }
+                    ? { textIndent: `${directiveIndentPx}px` }
+                    : undefined
                 }
-                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full resize-none overflow-hidden px-[14px] py-[13px] text-[15px] leading-[20px]"
-              />
+                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] py-[13px] text-[15px] leading-[20px] whitespace-pre-wrap break-words"
+              >
+                {draftText}
+                {"\u200b"}
+              </div>
 
               <textarea
                 ref={textareaRef}

@@ -897,7 +897,7 @@ export struct RichMarkdownView {
       }
 
       out.push({
-        key: `${blk.kind}_${idx}`,
+        key: `${blk.kind}_${idx}_${blk.raw_code?.length ?? blk.spans?.length ?? 0}`,
         kind: blk.kind === 'list_item' ? 'task_item' : blk.kind,
         tableHeaders: [],
         tableRows: [],

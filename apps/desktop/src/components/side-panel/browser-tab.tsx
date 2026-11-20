@@ -436,9 +436,7 @@ export const BrowserTab = memo(function BrowserTab({
               style={
                 presetWidth
                   ? {
-                      width: `${presetWidth}px`,
-                      transform: presetScale < 1 ? `scale(${presetScale})` : undefined,
-                      transformOrigin: "top center",
+                      width: `${Math.round(presetWidth * presetScale)}px`,
                     }
                   : undefined
               }
@@ -449,18 +447,32 @@ export const BrowserTab = memo(function BrowserTab({
                   : "border-border rounded-xl border shadow-sm",
               )}
             >
-              <iframe
-                ref={iframeRef}
-                key={`${activeUrl}::${reloadNonce}`}
-                src={activeUrl}
-                title={`Preview ${activeUrl}`}
-                onLoad={() => setIsLoading(false)}
-                sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
-                className={cn(
-                  "h-full w-full flex-1 border-0 bg-white",
-                  isReadOnlyOverlay && "pointer-events-none select-none",
-                )}
-              />
+              <div
+                style={
+                  presetWidth && presetScale < 1
+                    ? {
+                        width: `${presetWidth}px`,
+                        height: `${(100 / presetScale).toFixed(2)}%`,
+                        transform: `scale(${presetScale})`,
+                        transformOrigin: "top left",
+                      }
+                    : { width: "100%", height: "100%" }
+                }
+                className="relative flex shrink-0 flex-1"
+              >
+                <iframe
+                  ref={iframeRef}
+                  key={`${activeUrl}::${reloadNonce}`}
+                  src={activeUrl}
+                  title={`Preview ${activeUrl}`}
+                  onLoad={() => setIsLoading(false)}
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads"
+                  className={cn(
+                    "h-full w-full flex-1 border-0 bg-white",
+                    isReadOnlyOverlay && "pointer-events-none select-none",
+                  )}
+                />
+              </div>
 
               {/* Dedicated Top Stacking Layer Reserved for Future Automation Read-Only Animations */}
               {isReadOnlyOverlay && (

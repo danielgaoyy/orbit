@@ -285,6 +285,9 @@ export interface OrbitUiState {
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
   toastNotice: string | null;
+  appVersion: string | null;
+  isBrowserOffline: boolean;
+  dismissedVersionMismatchHosts: Record<string, string>;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -581,6 +584,9 @@ let state: OrbitUiState = {
   sshHosts: [],
   externalEditors: [],
   toastNotice: null,
+  appVersion: null,
+  isBrowserOffline: typeof navigator !== "undefined" ? !navigator.onLine : false,
+  dismissedVersionMismatchHosts: {},
 
   theme: initialTheme,
   resolvedTheme: initialResolvedTheme,
@@ -1048,11 +1054,17 @@ export const orbitActions = {
     if (initialized) return;
     initialized = true;
 
-    const [editors, sshList] = await Promise.all([
+    const [editors, sshList, version] = await Promise.all([
       orbitIpc.listExternalEditors(),
       orbitIpc.listSshHosts(),
+      orbitIpc.getAppVersion().catch(() => null),
     ]);
-    setState((s) => ({ ...s, externalEditors: editors, sshHosts: sshList }));
+    setState((s) => ({
+      ...s,
+      externalEditors: editors,
+      sshHosts: sshList,
+      appVersion: version,
+    }));
 
     await orbitActions.reloadFleetAndHosts(true);
 
@@ -1132,6 +1144,39 @@ export const orbitActions = {
       };
     });
     syncAttentionIndicators(state.fleet, state.hostDetails);
+  },
+
+  setBrowserOffline(offline: boolean): void {
+    const prev = state.isBrowserOffline;
+    if (prev === offline) return;
+    setState((s) => ({ ...s, isBrowserOffline: offline }));
+    if (!offline) {
+      notifyToast("Back online");
+      for (const h of state.fleet.hosts) {
+        if (h.connection_state === "disconnected") {
+          void orbitActions.reconnectHost(h.host_id);
+        }
+      }
+    }
+  },
+
+  dismissVersionMismatch(hostId: string, daemonVersion: string): void {
+    setState((s) => ({
+      ...s,
+      dismissedVersionMismatchHosts: {
+        ...s.dismissedVersionMismatchHosts,
+        [hostId]: daemonVersion,
+      },
+    }));
+  },
+
+  async reconnectHost(hostId: string): Promise<void> {
+    try {
+      await orbitIpc.updateHostConfig({ hostId, reconnect: true });
+      await orbitActions.reloadFleetAndHosts(false);
+    } catch (err) {
+      notifyToast(`Reconnect failed: ${String(err)}`);
+    }
   },
 
   async reloadFleetAndHosts(initialBootstrap = false): Promise<void> {

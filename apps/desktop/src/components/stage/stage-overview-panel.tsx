@@ -1,106 +1,114 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle,
-  Check,
+  AlertCircle,
   ChevronRight,
+  CircleCheck,
   Clock,
-  FileCode2,
-  FolderTree,
-  GitCompareArrows,
-  Globe,
-  Layers,
+  File,
+  FileDiff,
   Loader2,
-  MessageCircleQuestion,
-  Plus,
-  Search,
   SquareTerminal,
-  Terminal as TerminalIcon,
   X,
   type LucideIcon,
 } from "lucide-react";
-import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { SimpleTooltip } from "@/components/ui/overlays";
-import { modSymbol } from "@/lib/keybindings";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { Separator } from "@/components/ui/separator";
 import type { AgentCardView, TimelineItemView } from "@/lib/orbit-ipc";
 import { deriveSessionInsights } from "@/lib/session-insights";
-import {
-  type TurnFileDiffSummary,
-  basenameOfPath,
-} from "@/lib/timeline-coalesce";
+import type { TurnFileDiffSummary } from "@/lib/timeline-coalesce";
 import {
   type OverviewSectionId,
   type QueuedPromptItem,
   orbitActions,
-  sideQuestionScopeKey,
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 const EMPTY_QUEUED: readonly QueuedPromptItem[] = [];
 
-function shortDirName(p: string): string {
-  if (!p || p === "~") return "~";
-  const clean = p.replace(/\/+$/, "");
-  return clean.split("/").pop() || clean;
-}
+const OverviewActionRow = memo(function OverviewActionRow({
+  icon: Icon,
+  label,
+  trailing,
+  onClick,
+}: {
+  icon: LucideIcon;
+  label: string;
+  trailing?: React.ReactNode;
+  onClick: () => void;
+}) {
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      onClick={onClick}
+      className="group/ovrow text-foreground/88 hover:bg-accent/65 hover:text-foreground h-[32px] w-full justify-between gap-2 rounded-[8px] px-2 text-[13px] font-normal shadow-none transition-colors"
+    >
+      <span className="flex min-w-0 items-center gap-2.5">
+        <Icon className="text-muted-foreground group-hover/ovrow:text-foreground/85 size-[15px] shrink-0 stroke-[1.65] transition-colors" />
+        <span className="truncate">{label}</span>
+      </span>
+      {trailing && <span className="shrink-0">{trailing}</span>}
+    </Button>
+  );
+});
 
-const OverviewSection = memo(function OverviewSection({
+const OverviewLayerSection = memo(function OverviewLayerSection({
   id,
   label,
-  icon: Icon,
+  count,
   collapsed,
-  meta,
-  action,
-  pulseDot = false,
+  isRunning = false,
   children,
 }: {
   id: OverviewSectionId;
   label: string;
-  icon: LucideIcon;
+  count: number;
   collapsed: boolean;
-  meta?: React.ReactNode;
-  action?: React.ReactNode;
-  pulseDot?: boolean;
+  isRunning?: boolean;
   children: React.ReactNode;
 }) {
   return (
-    <section className="space-y-0.5">
-      <div className="group/ovsec flex h-[26px] items-center justify-between gap-1 rounded-md px-1.5 transition-colors hover:bg-black/[0.035] dark:hover:bg-white/[0.045]">
-        <button
-          type="button"
-          onClick={() => orbitActions.toggleOverviewSection(id)}
-          className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
-        >
-          <ChevronRight
-            className={cn(
-              "text-muted-foreground/75 h-[11px] w-[11px] shrink-0 transition-transform duration-150",
-              !collapsed && "rotate-90",
-            )}
-          />
-          <Icon className="text-muted-foreground h-[13px] w-[13px] shrink-0 stroke-[1.75]" />
-          <span className="text-foreground/82 truncate text-[12px] font-medium">
-            {label}
+    <>
+      <Separator className="bg-black/[0.058] dark:bg-white/[0.07]" />
+      <Collapsible
+        open={!collapsed}
+        onOpenChange={() => orbitActions.toggleOverviewSection(id)}
+        className="px-2.5 py-2"
+      >
+        <CollapsibleTrigger className="group/trigger hover:bg-accent/65 focus-visible:ring-ring/50 flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left transition-colors outline-none focus-visible:ring-2">
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="text-muted-foreground group-hover/trigger:text-foreground truncate text-[12.5px] font-medium transition-colors">
+              {label}
+            </span>
+            <Badge
+              variant="secondary"
+              className="text-muted-foreground tabular-nums h-[18px] min-w-[18px] rounded-full border-transparent bg-black/[0.05] px-1.5 py-0 text-[11px] leading-none font-medium dark:bg-white/[0.08]"
+            >
+              {count}
+            </Badge>
           </span>
-          {pulseDot && (
-            <span className="bg-primary h-1.5 w-1.5 shrink-0 animate-pulse rounded-full" />
-          )}
-        </button>
+          <span className="flex shrink-0 items-center gap-1.5">
+            {collapsed && isRunning && (
+              <Loader2 className="text-muted-foreground size-3 shrink-0 animate-spin" />
+            )}
+            <ChevronRight className="text-muted-foreground/70 size-3.5 shrink-0 transition-transform duration-[220ms] ease-[var(--ease-panel)] group-data-[panel-open]/trigger:rotate-90" />
+          </span>
+        </CollapsibleTrigger>
 
-        <div className="flex shrink-0 items-center gap-1">
-          {meta && (
-            <span className="text-muted-foreground tabular-nums text-[11px]">{meta}</span>
-          )}
-          {action}
-        </div>
-      </div>
-
-      <div className="orbit-collapse-grid" data-open={!collapsed}>
-        <div className="orbit-collapse-inner">
-          <div className="space-y-0.5 pt-0.5 pl-2">{children}</div>
-        </div>
-      </div>
-    </section>
+        <CollapsibleContent>
+          <div className="space-y-0.5 pt-1">{children}</div>
+        </CollapsibleContent>
+      </Collapsible>
+    </>
   );
 });
 
@@ -111,8 +119,6 @@ interface StageOverviewContentProps {
   items: readonly TimelineItemView[];
   sessionTurnDiffs: readonly TurnFileDiffSummary[];
   currentAgent: AgentCardView | null;
-  onClose: () => void;
-  closeTooltip: string;
 }
 
 const StageOverviewBody = memo(function StageOverviewBody({
@@ -122,8 +128,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
   items,
   sessionTurnDiffs,
   currentAgent,
-  onClose,
-  closeTooltip,
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
@@ -134,12 +138,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const queuedPrompts = useOrbitSelector(
     (s) => s.queuedPrompts[`${hostId}::${agentId}`] ?? EMPTY_QUEUED,
   );
-  const sideQuestionCount = useOrbitSelector((s) => {
-    const scope = sideQuestionScopeKey(s);
-    return s.sideQuestionsByScope[scope]?.length ?? 0;
-  });
-
-  const mod = modSymbol();
 
   const insights = useMemo(
     () =>
@@ -153,8 +151,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
     [items, cwd, currentAgent, hostDetail, queuedPrompts],
   );
 
-  const sessionDiffs = sessionTurnDiffs;
-
   const reviewSummary = useMemo(() => {
     const gitFiles = gitReview?.diff_files ?? [];
     const statusFiles = gitReview?.status?.files ?? [];
@@ -163,17 +159,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
     if (statusFiles.length > 0 || gitFiles.length > 0) {
       const mergedMap = new Map<
         string,
-        { path: string; additions: number; deletions: number; status: string }
+        { path: string; additions: number; deletions: number }
       >();
       for (const sf of statusFiles) {
         const df = diffByPath.get(sf.path);
-        const existing = mergedMap.get(sf.path);
-        if (!existing) {
+        if (!mergedMap.has(sf.path)) {
           mergedMap.set(sf.path, {
             path: sf.path,
             additions: df?.additions ?? 0,
             deletions: df?.deletions ?? 0,
-            status: sf.status,
           });
         }
       }
@@ -183,7 +177,6 @@ const StageOverviewBody = memo(function StageOverviewBody({
             path: df.path,
             additions: df.additions,
             deletions: df.deletions,
-            status: "M",
           });
         }
       }
@@ -195,448 +188,226 @@ const StageOverviewBody = memo(function StageOverviewBody({
         count: allMerged.length,
         additions,
         deletions,
-        files: allMerged.slice(0, 5),
       };
     }
-    if (sessionDiffs.length > 0) {
-      const additions = sessionDiffs.reduce((acc, f) => acc + f.additions, 0);
-      const deletions = sessionDiffs.reduce((acc, f) => acc + f.deletions, 0);
+
+    if (sessionTurnDiffs.length > 0) {
+      const additions = sessionTurnDiffs.reduce((acc, f) => acc + f.additions, 0);
+      const deletions = sessionTurnDiffs.reduce((acc, f) => acc + f.deletions, 0);
       return {
         scope: "session_turns" as const,
-        count: sessionDiffs.length,
+        count: sessionTurnDiffs.length,
         additions,
         deletions,
-        files: sessionDiffs.slice(0, 5).map((f) => ({
-          path: f.path,
-          additions: f.additions,
-          deletions: f.deletions,
-          status: "E",
-        })),
       };
     }
+
     return {
       scope: "working_tree" as const,
       count: 0,
       additions: 0,
       deletions: 0,
-      files: [],
     };
-  }, [gitReview, sessionDiffs]);
+  }, [gitReview, sessionTurnDiffs]);
 
-  const hostTerminals = useMemo(() => {
+  const terminalCount = useMemo(() => {
     const openForHost = terminalTabs.filter((t) => t.hostId === hostId);
     const openIds = new Set(openForHost.map((t) => t.terminalId).filter(Boolean));
-    const detached = (hostDetail?.terminals ?? []).filter(
+    const detachedCount = (hostDetail?.terminals ?? []).filter(
       (t) => !openIds.has(t.terminal_id),
-    );
-    return { openForHost, detached, total: openForHost.length + detached.length };
+    ).length;
+    return openForHost.length + detachedCount;
   }, [terminalTabs, hostId, hostDetail?.terminals]);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden select-none">
-      {/* Quiet Header */}
-      <div className="flex h-[32px] shrink-0 items-center justify-between px-3 pt-1">
-        <span className="text-muted-foreground/85 text-[11px] font-medium tracking-[0.04em] uppercase">
-          Overview
-        </span>
-        <SimpleTooltip label={closeTooltip} shortcut={`${mod}⌥O`}>
-          <button
-            type="button"
-            aria-label={closeTooltip}
-            onClick={onClose}
-            className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-          >
-            <X className="h-[13px] w-[13px] stroke-[1.8]" />
-          </button>
-        </SimpleTooltip>
+    <div className="flex max-h-full flex-col overflow-y-auto select-none [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      {/* Layer 1: Primary Overview Shortcuts */}
+      <div className="px-2.5 pt-2.5 pb-2">
+        <div className="flex h-[24px] items-center px-2 pb-0.5">
+          <span className="text-muted-foreground text-[12px] font-medium">Overview</span>
+        </div>
+
+        <div className="space-y-0.5">
+          <OverviewActionRow
+            icon={FileDiff}
+            label="Review"
+            onClick={() =>
+              orbitActions.openReviewTab({ path: null, scope: reviewSummary.scope })
+            }
+            trailing={
+              reviewSummary.count > 0 ? (
+                reviewSummary.additions > 0 || reviewSummary.deletions > 0 ? (
+                  <span className="tabular-nums inline-flex items-center gap-1 font-mono text-[11px]">
+                    {reviewSummary.additions > 0 && (
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        +{reviewSummary.additions}
+                      </span>
+                    )}
+                    {reviewSummary.deletions > 0 && (
+                      <span className="text-rose-600 dark:text-rose-400">
+                        -{reviewSummary.deletions}
+                      </span>
+                    )}
+                  </span>
+                ) : (
+                  <Badge
+                    variant="secondary"
+                    className="text-muted-foreground tabular-nums h-[18px] min-w-[18px] rounded-full border-transparent bg-black/[0.05] px-1.5 py-0 text-[11px] leading-none font-medium dark:bg-white/[0.08]"
+                  >
+                    {reviewSummary.count}
+                  </Badge>
+                )
+              ) : undefined
+            }
+          />
+
+          <OverviewActionRow
+            icon={File}
+            label="Files"
+            onClick={() => orbitActions.openFilesExplorerTab()}
+          />
+
+          <OverviewActionRow
+            icon={SquareTerminal}
+            label="Terminal"
+            onClick={() => orbitActions.openTerminalTab()}
+            trailing={
+              terminalCount > 0 ? (
+                <Badge
+                  variant="secondary"
+                  className="text-muted-foreground tabular-nums h-[18px] min-w-[18px] rounded-full border-transparent bg-black/[0.05] px-1.5 py-0 text-[11px] leading-none font-medium dark:bg-white/[0.08]"
+                >
+                  {terminalCount}
+                </Badge>
+              ) : undefined
+            }
+          />
+        </div>
       </div>
 
-      <ScrollArea className="min-h-0 flex-1" viewportClassName="space-y-3.5 px-2.5 pt-1.5 pb-4">
-        {/* 1. Review (Code Diff) */}
-        <OverviewSection
-          id="review"
-          label="Review"
-          icon={GitCompareArrows}
-          collapsed={collapsedSections.review}
-          meta={
-            reviewSummary.count > 0 ? (
-              <span className="inline-flex items-center gap-1 font-mono text-[10.5px]">
-                {reviewSummary.additions > 0 && (
-                  <span className="text-emerald-600 dark:text-emerald-400">
-                    +{reviewSummary.additions}
-                  </span>
-                )}
-                {reviewSummary.deletions > 0 && (
-                  <span className="text-rose-600 dark:text-rose-400">
-                    -{reviewSummary.deletions}
-                  </span>
-                )}
-                {reviewSummary.additions === 0 && reviewSummary.deletions === 0 && (
-                  <span>{reviewSummary.count}</span>
-                )}
-              </span>
-            ) : (
-              <span className="opacity-65">Clean</span>
-            )
-          }
+      {/* Layer 2: Subagents (progressive disclosure when present) */}
+      {insights.subagents.length > 0 && (
+        <OverviewLayerSection
+          id="subagents"
+          label="Subagents"
+          count={insights.subagents.length}
+          collapsed={collapsedSections.subagents}
+          isRunning={insights.subagents.some((s) => s.status === "running")}
         >
-          {reviewSummary.files.length === 0 ? (
-            <button
+          {insights.subagents.map((sa) => (
+            <Button
+              key={sa.id}
               type="button"
-              onClick={() => orbitActions.openReviewTab({ scope: "working_tree", path: null })}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between rounded-md px-2 py-1 text-left text-[12px] transition-colors"
+              variant="ghost"
+              size="sm"
+              title={sa.promptPreview || sa.role}
+              onClick={() =>
+                orbitActions.openSubagentTab({
+                  callId: sa.id,
+                  role: sa.role,
+                  promptPreview: sa.promptPreview,
+                  childAgentId: sa.childAgentId,
+                })
+              }
+              className="text-foreground/86 hover:bg-accent/65 hover:text-foreground h-[30px] w-full justify-start gap-2 rounded-[8px] px-2 text-[13px] font-normal shadow-none transition-colors"
             >
-              <span>Inspect diff…</span>
-              <span className="font-mono text-[10.5px] opacity-60">{mod}D</span>
-            </button>
-          ) : (
-            <>
-              {reviewSummary.files.map((f) => {
-                const Icon = resolveSemanticFileIcon(f.path);
-                return (
-                  <button
-                    key={f.path}
-                    type="button"
-                    title={f.path}
-                    onClick={() =>
-                      orbitActions.openReviewTab({
-                        path: f.path,
-                        scope: reviewSummary.scope,
-                      })
-                    }
-                    className="text-foreground/80 hover:text-foreground hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors"
-                  >
-                    <span className="flex min-w-0 items-center gap-1.5">
-                      <Icon className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0 stroke-[1.7]" />
-                      <span className="truncate">{basenameOfPath(f.path)}</span>
-                    </span>
-                    <span className="tabular-nums shrink-0 font-mono text-[10.5px]">
-                      {f.additions > 0 || f.deletions > 0 ? (
-                        <span className="inline-flex items-center gap-1">
-                          {f.additions > 0 && (
-                            <span className="text-emerald-600 dark:text-emerald-400">
-                              +{f.additions}
-                            </span>
-                          )}
-                          {f.deletions > 0 && (
-                            <span className="text-rose-600 dark:text-rose-400">
-                              -{f.deletions}
-                            </span>
-                          )}
-                        </span>
-                      ) : (
-                        <span className="text-muted-foreground">{f.status}</span>
-                      )}
-                    </span>
-                  </button>
-                );
-              })}
+              {sa.status === "running" ? (
+                <Loader2 className="text-muted-foreground size-[14px] shrink-0 animate-spin" />
+              ) : sa.status === "completed" ? (
+                <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
+              ) : (
+                <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
+              )}
+              <span
+                className={cn(
+                  "truncate",
+                  sa.status === "running" && "agent-text-shimmer",
+                )}
+              >
+                {sa.role}
+              </span>
+            </Button>
+          ))}
+        </OverviewLayerSection>
+      )}
 
-              {reviewSummary.count > reviewSummary.files.length && (
+      {/* Layer 3: Background Tasks (progressive disclosure when active) */}
+      {insights.backgroundTasks.length > 0 && (
+        <OverviewLayerSection
+          id="tasks"
+          label="Background Tasks"
+          count={insights.backgroundTasks.length}
+          collapsed={collapsedSections.tasks}
+          isRunning={insights.backgroundTasks.some((t) => t.status === "running")}
+        >
+          {insights.backgroundTasks.map((task) => {
+            const queuedIdx =
+              task.kind === "queued"
+                ? queuedPrompts.findIndex((q) => `queue:${q.id}` === task.id)
+                : -1;
+            return (
+              <div
+                key={task.id}
+                className="group/bgtask hover:bg-accent/65 flex w-full items-start gap-1 rounded-[8px] transition-colors"
+              >
                 <button
                   type="button"
-                  onClick={() =>
-                    orbitActions.openReviewTab({ path: null, scope: reviewSummary.scope })
-                  }
-                  className="text-muted-foreground hover:text-foreground hover:bg-accent/45 w-full cursor-pointer rounded-md px-2 py-1 text-left text-[11.5px] transition-colors"
+                  title={task.command || task.title}
+                  onClick={() => {
+                    if (task.kind === "shell") {
+                      orbitActions.openTerminalTab();
+                    }
+                  }}
+                  className="flex min-w-0 flex-1 cursor-pointer items-start gap-2 px-2 py-1.5 text-left"
                 >
-                  View all {reviewSummary.count} files →
+                  {task.status === "running" ? (
+                    <Loader2 className="text-muted-foreground mt-0.5 size-3.5 shrink-0 animate-spin" />
+                  ) : (
+                    <Clock className="text-muted-foreground mt-0.5 size-3.5 shrink-0" />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div
+                      className={cn(
+                        "truncate font-mono text-[12.5px]",
+                        task.status === "running"
+                          ? "agent-text-shimmer"
+                          : "text-foreground/85",
+                      )}
+                    >
+                      {task.title}
+                    </div>
+                    <div className="text-muted-foreground/80 truncate text-[11px]">
+                      {task.subtitle}
+                    </div>
+                  </div>
                 </button>
-              )}
-            </>
-          )}
-        </OverviewSection>
-
-        {/* 2. Files */}
-        <OverviewSection
-          id="files"
-          label="Files"
-          icon={FileCode2}
-          collapsed={collapsedSections.files}
-          meta={insights.touchedFiles.length > 0 ? insights.touchedFiles.length : undefined}
-          action={
-            <SimpleTooltip label="Quick Open File" shortcut={`${mod}P`}>
-              <button
-                type="button"
-                aria-label="Quick open file"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  orbitActions.setQuickOpenFilesOpen(true);
-                }}
-                className="text-muted-foreground hover:text-foreground inline-flex h-[20px] w-[20px] cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover/ovsec:opacity-100 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-              >
-                <Search className="h-[11.5px] w-[11.5px]" />
-              </button>
-            </SimpleTooltip>
-          }
-        >
-          {insights.touchedFiles.slice(0, 6).map((file) => {
-            const Icon = resolveSemanticFileIcon(file.displayPath);
-            return (
-              <button
-                key={file.displayPath}
-                type="button"
-                title={file.displayPath}
-                onClick={() =>
-                  orbitActions.openFileInSidePanel(file.path, { hostId, cwd })
-                }
-                className="text-foreground/80 hover:text-foreground hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors"
-              >
-                <span className="flex min-w-0 items-center gap-1.5">
-                  <Icon className="text-muted-foreground h-[12.5px] w-[12.5px] shrink-0 stroke-[1.7]" />
-                  <span className="truncate">{basenameOfPath(file.displayPath)}</span>
-                </span>
-                <span className="text-muted-foreground/70 shrink-0 font-mono text-[10px]">
-                  {file.action === "created" ? "New" : file.action === "edited" ? "Mod" : "Read"}
-                </span>
-              </button>
+                {queuedIdx >= 0 && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    title="Cancel queued prompt"
+                    onClick={() => orbitActions.removeQueuedPrompt(queuedIdx)}
+                    className="text-muted-foreground hover:text-foreground mt-1 mr-1 size-5 shrink-0 rounded-md opacity-0 transition-opacity group-hover/bgtask:opacity-100 hover:bg-black/[0.08] dark:hover:bg-white/[0.12]"
+                  >
+                    <X className="size-3" />
+                  </Button>
+                )}
+              </div>
             );
           })}
-
-          <button
-            type="button"
-            onClick={() => orbitActions.openFilesExplorerTab()}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between rounded-md px-2 py-1 text-left text-[11.5px] transition-colors"
-          >
-            <span className="flex items-center gap-1.5">
-              <FolderTree className="h-[12px] w-[12px] opacity-75" />
-              <span>Browse workspace…</span>
-            </span>
-            <span className="font-mono text-[10.5px] opacity-60">{mod}P</span>
-          </button>
-        </OverviewSection>
-
-        {/* 3. Terminal */}
-        <OverviewSection
-          id="terminal"
-          label="Terminal"
-          icon={SquareTerminal}
-          collapsed={collapsedSections.terminal}
-          meta={hostTerminals.total > 0 ? hostTerminals.total : undefined}
-          action={
-            <SimpleTooltip label="New Terminal">
-              <button
-                type="button"
-                aria-label="New terminal"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  orbitActions.openTerminalTab({ spawnIfEmpty: false });
-                  orbitActions.spawnNewTerminalTab(hostId, cwd || "~");
-                }}
-                className="text-muted-foreground hover:text-foreground inline-flex h-[20px] w-[20px] cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover/ovsec:opacity-100 hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
-              >
-                <Plus className="h-[12px] w-[12px]" />
-              </button>
-            </SimpleTooltip>
-          }
-        >
-          {hostTerminals.total === 0 ? (
-            <button
-              type="button"
-              onClick={() => orbitActions.openTerminalTab()}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between rounded-md px-2 py-1 text-left text-[12px] transition-colors"
-            >
-              <span>Open shell…</span>
-              <span className="font-mono text-[10.5px] opacity-60">{mod}J</span>
-            </button>
-          ) : (
-            <>
-              {hostTerminals.openForHost.map((t) => (
-                <button
-                  key={t.key}
-                  type="button"
-                  onClick={() => {
-                    orbitActions.setActiveTerminalTab(t.key);
-                    orbitActions.openTerminalTab({ spawnIfEmpty: false });
-                  }}
-                  className="text-foreground/80 hover:text-foreground hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors"
-                >
-                  <span className="flex min-w-0 items-center gap-1.5">
-                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500/80" />
-                    <span className="truncate font-mono text-[11.5px]">
-                      {t.title} · {shortDirName(t.cwd)}
-                    </span>
-                  </span>
-                </button>
-              ))}
-              {hostTerminals.detached.slice(0, 3).map((t) => (
-                <button
-                  key={t.terminal_id}
-                  type="button"
-                  onClick={() =>
-                    orbitActions.attachExistingTerminal(hostId, t.terminal_id, t.cwd, t.title)
-                  }
-                  className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors"
-                >
-                  <span className="flex min-w-0 items-center gap-1.5">
-                    <TerminalIcon className="h-[11.5px] w-[11.5px] shrink-0 opacity-70" />
-                    <span className="truncate font-mono text-[11.5px]">
-                      {t.title} · {shortDirName(t.cwd)}
-                    </span>
-                  </span>
-                </button>
-              ))}
-            </>
-          )}
-        </OverviewSection>
-
-        {/* 4. Background Tasks (Conditional — 0px footprint when idle) */}
-        {insights.backgroundTasks.length > 0 && (
-          <OverviewSection
-            id="tasks"
-            label="Background Tasks"
-            icon={Clock}
-            collapsed={collapsedSections.tasks}
-            meta={insights.backgroundTasks.length}
-            pulseDot={insights.backgroundTasks.some((t) => t.status === "running")}
-          >
-            {insights.backgroundTasks.map((task) => {
-              const queuedIdx =
-                task.kind === "queued"
-                  ? queuedPrompts.findIndex((q) => `queue:${q.id}` === task.id)
-                  : -1;
-              return (
-                <div
-                  key={task.id}
-                  className="group/bgtask text-foreground/82 hover:bg-accent/55 flex w-full items-start gap-1.5 rounded-md px-2 py-1 transition-colors"
-                >
-                  <button
-                    type="button"
-                    title={task.command || task.title}
-                    onClick={() => {
-                      if (task.kind === "shell") {
-                        orbitActions.openTerminalTab();
-                      }
-                    }}
-                    className="flex min-w-0 flex-1 cursor-pointer items-start gap-1.5 text-left"
-                  >
-                    {task.status === "running" ? (
-                      <Loader2 className="text-muted-foreground mt-0.5 h-[12px] w-[12px] shrink-0 animate-spin" />
-                    ) : (
-                      <Clock className="text-muted-foreground mt-0.5 h-[12px] w-[12px] shrink-0" />
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div
-                        className={cn(
-                          "truncate font-mono text-[11.5px]",
-                          task.status === "running"
-                            ? "agent-text-shimmer"
-                            : "text-foreground/80",
-                        )}
-                      >
-                        {task.title}
-                      </div>
-                      <div className="text-muted-foreground/75 truncate text-[10.5px]">
-                        {task.subtitle}
-                      </div>
-                    </div>
-                  </button>
-                  {queuedIdx >= 0 && (
-                    <button
-                      type="button"
-                      title="Cancel queued prompt"
-                      onClick={() => orbitActions.removeQueuedPrompt(queuedIdx)}
-                      className="text-muted-foreground hover:text-foreground mt-0.5 inline-flex h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded opacity-0 transition-opacity group-hover/bgtask:opacity-100 hover:bg-black/[0.08] dark:hover:bg-white/[0.12]"
-                    >
-                      <X className="h-[11px] w-[11px]" />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
-          </OverviewSection>
-        )}
-
-        {/* 5. Subagents (Conditional — 0px footprint when empty) */}
-        {insights.subagents.length > 0 && (
-          <OverviewSection
-            id="subagents"
-            label="Subagents"
-            icon={Layers}
-            collapsed={collapsedSections.subagents}
-            meta={insights.subagents.length}
-            pulseDot={insights.subagents.some((s) => s.status === "running")}
-          >
-            {insights.subagents.map((sa) => (
-              <button
-                key={sa.id}
-                type="button"
-                title={sa.promptPreview || sa.role}
-                onClick={() =>
-                  orbitActions.openSubagentTab({
-                    callId: sa.id,
-                    role: sa.role,
-                    promptPreview: sa.promptPreview,
-                    childAgentId: sa.childAgentId,
-                  })
-                }
-                className="text-foreground/82 hover:text-foreground hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors"
-              >
-                <span className="flex min-w-0 items-center gap-1.5">
-                  {sa.status === "running" ? (
-                    <Loader2 className="text-primary h-[11.5px] w-[11.5px] shrink-0 animate-spin" />
-                  ) : sa.status === "completed" ? (
-                    <Check className="h-[11.5px] w-[11.5px] shrink-0 text-emerald-600 dark:text-emerald-400" />
-                  ) : (
-                    <AlertTriangle className="h-[11.5px] w-[11.5px] shrink-0 text-rose-500" />
-                  )}
-                  <span
-                    className={cn(
-                      "truncate",
-                      sa.status === "running" && "agent-text-shimmer",
-                    )}
-                  >
-                    {sa.role}
-                  </span>
-                </span>
-              </button>
-            ))}
-          </OverviewSection>
-        )}
-
-        {/* Subtle Utility Shortcuts: Browser & Side Question (/btw) */}
-        <div className="border-border/80 space-y-0.5 border-t pt-2.5">
-          <button
-            type="button"
-            onClick={() => orbitActions.openBrowserTab(insights.detectedLocalUrls[0])}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex h-[27px] w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2 text-left text-[12px] transition-colors"
-          >
-            <span className="flex min-w-0 items-center gap-1.5">
-              <Globe className="h-[13px] w-[13px] shrink-0 stroke-[1.75]" />
-              <span className="truncate">Browser</span>
-            </span>
-            {insights.detectedLocalUrls.length > 0 && (
-              <span className="inline-flex shrink-0 items-center gap-1 text-[10.5px] text-emerald-600 dark:text-emerald-400">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                Live
-              </span>
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={() => orbitActions.openSideQuestionTab()}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex h-[27px] w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2 text-left text-[12px] transition-colors"
-          >
-            <span className="flex min-w-0 items-center gap-1.5">
-              <MessageCircleQuestion className="h-[13px] w-[13px] shrink-0 stroke-[1.75]" />
-              <span className="truncate">Side Question</span>
-            </span>
-            <span className="tabular-nums font-mono text-[10.5px] opacity-65">
-              {sideQuestionCount > 0 ? sideQuestionCount : `${mod};`}
-            </span>
-          </button>
-        </div>
-      </ScrollArea>
+        </OverviewLayerSection>
+      )}
     </div>
   );
 });
 
 /**
- * Responsive In-Stage Overview Panel:
- * - Spacious stage (`canDock = true`): docks cleanly on the right margin with smooth horizontal glide & fade.
- * - Compact/split stage (`canDock = false`): automatically yields horizontal space and opens on demand as a
- *   restrained floating popover anchored at the top-right corner of the stage.
+ * Responsive Floating Overview Card:
+ * - Spacious stage (`canDock = true`): floats cleanly in the top-right corner inside the unified
+ *   stage so the stage scrollbar remains on the far right edge and the card adapts to content height.
+ * - Compact/split stage (`canDock = false`): opens on demand as the same floating card anchored
+ *   at the top-right corner of the stage.
  */
 export const StageOverviewPanel = memo(function StageOverviewPanel({
   canDock,
@@ -661,17 +432,50 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
 
   const isDockedVisible = canDock && desktopPrefOpen;
   const isPopoverVisible = !canDock && popoverOpen;
-  const [mountDockedBody, setMountDockedBody] = useState(isDockedVisible);
+  const [dockedMounted, setDockedMounted] = useState(isDockedVisible);
+  const [dockedVisualOpen, setDockedVisualOpen] = useState(isDockedVisible);
+  const [popoverMounted, setPopoverMounted] = useState(isPopoverVisible);
+  const [popoverVisualOpen, setPopoverVisualOpen] = useState(isPopoverVisible);
 
-  // Unmount docked body cleanly after its 195ms glide-out so closed Overview incurs zero streaming cost
+  // Double-rAF glide-in so mounted card always paints once before animating, and cleanly unmount after exit
   useEffect(() => {
     if (isDockedVisible) {
-      setMountDockedBody(true);
-      return;
+      setDockedMounted(true);
+      let raf2 = 0;
+      const raf1 = window.requestAnimationFrame(() => {
+        raf2 = window.requestAnimationFrame(() => {
+          setDockedVisualOpen(true);
+        });
+      });
+      return () => {
+        window.cancelAnimationFrame(raf1);
+        if (raf2) window.cancelAnimationFrame(raf2);
+      };
     }
-    const timer = window.setTimeout(() => setMountDockedBody(false), 210);
+    setDockedVisualOpen(false);
+    const timer = window.setTimeout(() => setDockedMounted(false), 250);
     return () => window.clearTimeout(timer);
   }, [isDockedVisible]);
+
+  // Symmetric interruptible enter & exit for compact floating popover
+  useEffect(() => {
+    if (isPopoverVisible) {
+      setPopoverMounted(true);
+      let raf2 = 0;
+      const raf1 = window.requestAnimationFrame(() => {
+        raf2 = window.requestAnimationFrame(() => {
+          setPopoverVisualOpen(true);
+        });
+      });
+      return () => {
+        window.cancelAnimationFrame(raf1);
+        if (raf2) window.cancelAnimationFrame(raf2);
+      };
+    }
+    setPopoverVisualOpen(false);
+    const timer = window.setTimeout(() => setPopoverMounted(false), 165);
+    return () => window.clearTimeout(timer);
+  }, [isPopoverVisible]);
 
   // Auto-dismiss floating popover cleanly on outside click or Escape
   useEffect(() => {
@@ -679,8 +483,10 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     const onPointerDown = (ev: MouseEvent) => {
       const target = ev.target as Node | null;
       if (popoverRef.current && target && !popoverRef.current.contains(target)) {
-        // Ignore clicks on the TopBar overview toggle itself so toggle doesn't immediately reopen
-        const el = target instanceof Element ? target.closest("[data-overview-trigger]") : null;
+        const el =
+          target instanceof Element
+            ? target.closest("[data-overview-trigger],[data-slot='dropdown-menu-content']")
+            : null;
         if (!el) {
           orbitActions.setOverviewPopoverOpen(false);
         }
@@ -708,55 +514,55 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
 
   return (
     <>
-      {/* 1. Spacious Stage: Smoothly Gliding Docked Right Rail */}
-      <aside
-        aria-label="Session overview"
-        inert={!isDockedVisible}
-        style={{
-          width: "232px",
-          marginRight: isDockedVisible ? "0px" : "-232px",
-        }}
-        className={cn(
-          "border-border/75 bg-canvas relative flex h-full shrink-0 flex-col overflow-hidden border-l pt-2",
-          !isDockedVisible && "pointer-events-none",
-          "transition-[margin-right,opacity,transform] duration-[195ms] ease-[cubic-bezier(0.22,1,0.36,1)]",
-          isDockedVisible
-            ? "translate-x-0 opacity-100"
-            : "translate-x-2.5 opacity-0",
-        )}
-      >
-        {mountDockedBody && (
-          <StageOverviewBody
-            hostId={hostId}
-            agentId={agentId}
-            cwd={cwd}
-            items={items}
-            sessionTurnDiffs={sessionTurnDiffs}
-            currentAgent={currentAgent}
-            onClose={() => orbitActions.toggleOverviewPanel(false)}
-            closeTooltip="Hide overview"
-          />
-        )}
-      </aside>
+      {/* 1. Spacious Stage: Floating Top-Right Card (keeps scrollbar on far right edge) */}
+      {dockedMounted && (
+        <aside
+          aria-label="Session overview"
+          inert={!dockedVisualOpen}
+          className={cn(
+            "absolute top-3 right-4 z-25 w-[312px] origin-top-right will-change-[transform,opacity]",
+            dockedVisualOpen
+              ? "translate-x-0 scale-100 opacity-100 transition-[opacity,transform] duration-[240ms] ease-[var(--ease-panel)]"
+              : "pointer-events-none translate-x-2.5 scale-[0.985] opacity-0 transition-[opacity,transform] duration-[200ms] ease-[var(--ease-panel-out)]",
+          )}
+        >
+          <Card className="overview-card-surface flex h-fit max-h-[calc(100%-24px)] w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0">
+            <StageOverviewBody
+              hostId={hostId}
+              agentId={agentId}
+              cwd={cwd}
+              items={items}
+              sessionTurnDiffs={sessionTurnDiffs}
+              currentAgent={currentAgent}
+            />
+          </Card>
+        </aside>
+      )}
 
-      {/* 2. Compact / Split Stage: Floating Top-Right Popover Overlay */}
-      {isPopoverVisible && (
+      {/* 2. Compact / Split Stage: On-Demand Top-Right Floating Popover Card */}
+      {popoverMounted && (
         <div
           ref={popoverRef}
           role="dialog"
           aria-label="Session overview"
-          className="bg-elevated/95 border-border floating-surface orbit-overview-popover absolute top-3 right-3 z-30 flex max-h-[min(560px,calc(100%-24px))] w-[248px] flex-col overflow-hidden rounded-2xl border backdrop-blur-md"
+          inert={!popoverVisualOpen}
+          className={cn(
+            "absolute top-3 right-4 z-30 w-[312px] max-w-[calc(100%-32px)] origin-top-right will-change-[transform,opacity]",
+            popoverVisualOpen
+              ? "translate-x-0 translate-y-0 scale-100 opacity-100 transition-[opacity,transform] duration-[190ms] ease-[var(--ease-out-expo)]"
+              : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[145ms] ease-[var(--ease-exit)]",
+          )}
         >
-          <StageOverviewBody
-            hostId={hostId}
-            agentId={agentId}
-            cwd={cwd}
-            items={items}
-            sessionTurnDiffs={sessionTurnDiffs}
-            currentAgent={currentAgent}
-            onClose={() => orbitActions.setOverviewPopoverOpen(false)}
-            closeTooltip="Close overview"
-          />
+          <Card className="overview-card-surface floating-surface flex h-fit max-h-[min(560px,calc(100%-24px))] w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0 backdrop-blur-md">
+            <StageOverviewBody
+              hostId={hostId}
+              agentId={agentId}
+              cwd={cwd}
+              items={items}
+              sessionTurnDiffs={sessionTurnDiffs}
+              currentAgent={currentAgent}
+            />
+          </Card>
         </div>
       )}
     </>

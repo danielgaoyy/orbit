@@ -508,6 +508,14 @@ impl OrbitAppCore {
         auto_discover_local_daemon: bool,
     ) -> Result<Arc<Self>, ClientCoreError> {
         let store = Arc::new(OrbitStore::open(local_db_path)?);
+        if let Ok(purged) = store.purge_legacy_client_timeline_events()
+            && purged > 0
+        {
+            tracing::info!(
+                purged_rows = purged,
+                "Purged legacy daemon timeline_events rows from client replica database"
+            );
+        }
         Self::from_store(store, auto_discover_local_daemon)
     }
 
@@ -784,7 +792,7 @@ impl OrbitAppCore {
         // Hydrate from local SQLite replica on first open for 0ms offline-first rendering
         if !host_state.timelines.contains_key(agent_id)
             && !agent_id.starts_with("opt_")
-            && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 500)
+            && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 50_000)
             && !cached.is_empty()
         {
             let mut coalesced = Vec::with_capacity(cached.len());
@@ -888,23 +896,32 @@ impl OrbitAppCore {
                     text,
                     streaming,
                 } => {
-                    let key = (agent_id.to_string(), ev.seq, text.len(), *streaming);
-                    if host_state.markdown_cache.len() > 2048 {
-                        host_state.markdown_cache.clear();
+                    if let Some(warning_msg) = extract_legacy_provider_warning_text(text) {
+                        upserted_items.push(TimelineItemView::Notice {
+                            seq: ev.seq,
+                            level: "warning".into(),
+                            message: warning_msg,
+                            timestamp_ms: ts_ms,
+                        });
+                    } else {
+                        let key = (agent_id.to_string(), ev.seq, text.len(), *streaming);
+                        if host_state.markdown_cache.len() > 2048 {
+                            host_state.markdown_cache.clear();
+                        }
+                        let blocks = host_state
+                            .markdown_cache
+                            .entry(key)
+                            .or_insert_with(|| parse_markdown_blocks(text, *streaming))
+                            .clone();
+                        upserted_items.push(TimelineItemView::AssistantMessage {
+                            seq: ev.seq,
+                            item_id: item_id.clone(),
+                            text: text.clone(),
+                            streaming: *streaming,
+                            blocks,
+                            timestamp_ms: ts_ms,
+                        });
                     }
-                    let blocks = host_state
-                        .markdown_cache
-                        .entry(key)
-                        .or_insert_with(|| parse_markdown_blocks(text, *streaming))
-                        .clone();
-                    upserted_items.push(TimelineItemView::AssistantMessage {
-                        seq: ev.seq,
-                        item_id: item_id.clone(),
-                        text: text.clone(),
-                        streaming: *streaming,
-                        blocks,
-                        timestamp_ms: ts_ms,
-                    });
                 }
                 TimelinePayload::ToolCall {
                     call_id,
@@ -977,6 +994,17 @@ impl OrbitAppCore {
                             timestamp_ms: ts_ms,
                         });
                     }
+                }
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::AutonomousWakeup { source, .. },
+                } => {
+                    let label = format_autonomous_wakeup_notice(source);
+                    upserted_items.push(TimelineItemView::Notice {
+                        seq: ev.seq,
+                        level: "wakeup".into(),
+                        message: label,
+                        timestamp_ms: ts_ms,
+                    });
                 }
                 TimelinePayload::PermissionResolved { .. }
                 | TimelinePayload::QuestionResolved { .. }
@@ -1480,6 +1508,7 @@ impl OrbitAppCore {
                 });
             }
             Err(err) => {
+                tracing::warn!(host_id = %host_id, error = %err, "Host connection attempt failed");
                 let is_identity_mismatch =
                     matches!(err, ClientCoreError::HostIdentityMismatch { .. });
                 if is_identity_mismatch {
@@ -1570,6 +1599,7 @@ impl OrbitAppCore {
     }
 
     fn handle_unexpected_disconnect(self: &Arc<Self>, host_id: &str) {
+        tracing::warn!(host_id = %host_id, "Host session disconnected unexpectedly; scheduling reconnect");
         let mut should_reconnect = false;
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
@@ -1622,8 +1652,10 @@ impl OrbitAppCore {
         let mut notify_git_cwd: Option<String> = None;
         let mut auto_subscribe_agent: Option<String> = None;
         let mut continue_catchup: Option<(String, u64)> = None;
+        let mut catchup_completed_cursor: Option<(String, u64)> = None;
+        let mut live_event_cursor: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
-        let mut rewound_to_persist: Option<(AgentSummary, Vec<TimelineEvent>, bool)> = None;
+        let mut rewound_to_persist: Option<(AgentSummary, Vec<TimelineEvent>, bool, bool)> = None;
         let mut stale_replica_agents: Vec<(String, bool)> = Vec::new();
 
         if let Ok(mut guard) = self.hosts.write()
@@ -1769,10 +1801,15 @@ impl OrbitAppCore {
                     let agent_card = agent_to_card_view(&agent);
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
+                    let last_seq = ordered.last().map(|e| e.seq).unwrap_or(0);
+                    let is_complete = last_seq >= agent.latest_seq;
                     state.timelines.insert(ag_id.clone(), ordered.clone());
                     state.rewound_agents.insert(ag_id.clone());
                     state.agents.insert(ag_id.clone(), agent.clone());
-                    rewound_to_persist = Some((agent, ordered, restored_files > 0));
+                    rewound_to_persist = Some((agent, ordered, restored_files > 0, is_complete));
+                    if !is_complete {
+                        continue_catchup = Some((ag_id.clone(), last_seq));
+                    }
                     if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_rewinds.remove(&req_id)
                     {
@@ -1796,17 +1833,39 @@ impl OrbitAppCore {
                     let list = state.timelines.entry(agent_id.clone()).or_default();
                     let mut ordered = events;
                     ordered.sort_by_key(|e| e.seq);
+                    let min_incoming_seq = ordered.first().map(|e| e.seq);
                     let max_seq = ordered.last().map(|e| e.seq);
-                    for ev in ordered {
-                        coalesce_or_push_timeline(list, ev);
+                    let existing_max_seq = list.iter().map(|e| e.seq).max().unwrap_or(0);
+                    let is_backfill = min_incoming_seq
+                        .is_some_and(|min_s| existing_max_seq > 0 && min_s <= existing_max_seq);
+
+                    if is_backfill {
+                        let mut combined = std::mem::take(list);
+                        combined.extend(ordered);
+                        combined.sort_by_key(|e| (e.seq == 0, e.seq));
+                        let mut rebuilt = Vec::with_capacity(combined.len());
+                        for ev in combined {
+                            coalesce_or_push_timeline(&mut rebuilt, ev);
+                        }
+                        *list = rebuilt;
+                        state.rewound_agents.insert(agent_id.clone());
+                    } else {
+                        for ev in ordered {
+                            coalesce_or_push_timeline(list, ev);
+                        }
                     }
+
                     if has_more && let Some(next_since) = max_seq {
                         continue_catchup = Some((agent_id.clone(), next_since));
+                    } else {
+                        let final_max = list.iter().map(|e| e.seq).max().unwrap_or(0);
+                        catchup_completed_cursor = Some((agent_id.clone(), final_max));
                     }
                     notify_timeline_agent = Some(agent_id);
                 }
                 WireMessage::TimelineLive { event } => {
                     let agent_id = event.agent_id.clone();
+                    let live_seq = event.seq;
                     if let TimelinePayload::StatusChanged { ref status } = event.payload
                         && let Some(ag) = state.agents.get_mut(&agent_id)
                     {
@@ -1816,6 +1875,9 @@ impl OrbitAppCore {
                     }
                     let list = state.timelines.entry(agent_id.clone()).or_default();
                     coalesce_or_push_timeline(list, event);
+                    if live_seq > 0 {
+                        live_event_cursor = Some((agent_id.clone(), live_seq));
+                    }
                     notify_timeline_agent = Some(agent_id);
                 }
                 WireMessage::GitStatusResponse { status, .. } => {
@@ -1995,13 +2057,28 @@ impl OrbitAppCore {
         if let Some(stored) = host_to_persist {
             let _ = self.store.upsert_client_host(&stored);
         }
-        if let Some((ag, evs, files_restored)) = rewound_to_persist {
+        if let Some((ag, evs, files_restored, is_complete)) = rewound_to_persist {
             let _ = self.store.replace_replica_timeline(&ag.agent_id, &evs);
+            if is_complete {
+                let _ = self
+                    .store
+                    .set_replica_contiguous_seq(&ag.agent_id, ag.latest_seq);
+            }
             let _ = self.store.upsert_single_replica_agent(host_id, &ag);
             if files_restored {
                 self.fetch_git_status(host_id, &ag.cwd);
                 self.fetch_git_diff(host_id, &ag.cwd, None, false);
             }
+        }
+        if let Some((ag_id, max_seq)) = catchup_completed_cursor
+            && max_seq > 0
+        {
+            let _ = self.store.set_replica_contiguous_seq(&ag_id, max_seq);
+        }
+        if let Some((ag_id, live_seq)) = live_event_cursor
+            && self.store.get_replica_contiguous_seq(&ag_id).unwrap_or(0) > 0
+        {
+            let _ = self.store.set_replica_contiguous_seq(&ag_id, live_seq);
         }
         for (stale_ag_id, should_resubscribe) in stale_replica_agents {
             let _ = self.store.replace_replica_timeline(&stale_ag_id, &[]);
@@ -2370,16 +2447,34 @@ impl OrbitAppCore {
         if agent_id.starts_with("opt_") {
             return;
         }
-        let since_seq = self
-            .hosts
-            .read()
-            .ok()
-            .and_then(|g| {
-                g.get(host_id)
-                    .and_then(|h| h.timelines.get(agent_id))
-                    .and_then(|list| list.iter().map(|e| e.seq).max())
-            })
-            .unwrap_or(0);
+        let contiguous_seq = self.store.get_replica_contiguous_seq(agent_id).unwrap_or(0);
+        let mem_max_seq = if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            if !h.timelines.contains_key(agent_id)
+                && let Ok(cached) = self.store.fetch_replica_timeline(agent_id, 50_000)
+                && !cached.is_empty()
+            {
+                let mut coalesced = Vec::with_capacity(cached.len());
+                for ev in cached {
+                    coalesce_or_push_timeline(&mut coalesced, ev);
+                }
+                h.timelines.insert(agent_id.to_string(), coalesced);
+            }
+            h.timelines
+                .get(agent_id)
+                .and_then(|list| list.iter().map(|e| e.seq).max())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        // Only perform incremental catchup when a contiguous replica cursor has been confirmed;
+        // otherwise start from `0` so any historical gap from a prior interrupted sync self-heals.
+        let since_seq = if contiguous_seq == 0 {
+            0
+        } else {
+            contiguous_seq.min(mem_max_seq)
+        };
         self.dispatch_wire_queued(
             host_id,
             WireMessage::SubscribeTimeline {
@@ -4064,6 +4159,47 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
     list.push(incoming);
 }
 
+fn extract_legacy_provider_warning_text(text: &str) -> Option<String> {
+    if !text.contains('⚠') {
+        return None;
+    }
+    let mut warnings = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let rest = trimmed.strip_prefix('⚠')?.trim();
+        let lower = rest.to_ascii_lowercase();
+        let is_runtime_warning = lower.starts_with("api error")
+            || lower.starts_with("the stream was interrupted")
+            || lower.starts_with("rate limit")
+            || lower.starts_with("request failed")
+            || lower.starts_with("connection ")
+            || lower.starts_with("network ")
+            || lower.starts_with("retrying")
+            || lower.starts_with("error:");
+        if !is_runtime_warning {
+            return None;
+        }
+        warnings.push(rest);
+    }
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("\n"))
+    }
+}
+
+fn format_autonomous_wakeup_notice(source: &str) -> String {
+    let cleaned = source.trim().replace('_', " ");
+    if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("background task") {
+        "Resumed from background task".to_string()
+    } else {
+        format!("Resumed from {cleaned}")
+    }
+}
+
 fn agent_to_card_view(a: &AgentSummary) -> AgentCardView {
     let (status_label, is_running, is_awaiting_permission) = match &a.status {
         AgentStatus::Initializing => ("Starting".to_string(), true, false),
@@ -4864,6 +5000,113 @@ mod tests {
                 message,
                 ..
             } if level == "error" && message.contains("agent session not active")
+        )));
+    }
+
+    #[test]
+    fn projects_autonomous_wakeup_and_legacy_provider_warnings_as_notices() {
+        let core = OrbitAppCore::open_in_memory().expect("in-memory core");
+        let now = Utc::now();
+        {
+            let mut guard = core.hosts.write().expect("write");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "host_warn".into(),
+                hostname: "local".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_w".into(),
+                AgentSummary {
+                    agent_id: "ag_w".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/tmp".into(),
+                    title: "Test".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::Default,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    latest_seq: 3,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                },
+            );
+            guard.insert("host_warn".into(), mem);
+        }
+
+        core.handle_inbound_wire(
+            "host_warn",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag_w".into(),
+                has_more: false,
+                events: vec![
+                    TimelineEvent {
+                        seq: 1,
+                        epoch: 1,
+                        agent_id: "ag_w".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m1".into(),
+                            text: "\n⚠ API error (attempt 1): dial tcp i/o timeout\n".into(),
+                            streaming: false,
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 2,
+                        epoch: 1,
+                        agent_id: "ag_w".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::StatusChanged {
+                            status: AgentStatus::AutonomousWakeup {
+                                turn_id: "wk1".into(),
+                                source: "background_task".into(),
+                            },
+                        },
+                    },
+                    TimelineEvent {
+                        seq: 3,
+                        epoch: 1,
+                        agent_id: "ag_w".into(),
+                        turn_id: None,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "m2".into(),
+                            text: "Normal assistant reply with ⚠ symbol inline.".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+            },
+        );
+
+        let full = core.agent_timeline("host_warn", "ag_w");
+        assert!(full.items.iter().any(|it| matches!(
+            it,
+            TimelineItemView::Notice { seq: 1, level, message, .. }
+                if level == "warning" && message.contains("i/o timeout")
+        )));
+        assert!(full.items.iter().any(|it| matches!(
+            it,
+            TimelineItemView::Notice { seq: 2, level, message, .. }
+                if level == "wakeup" && message.contains("background task")
+        )));
+        assert!(full.items.iter().any(|it| matches!(
+            it,
+            TimelineItemView::AssistantMessage { seq: 3, text, .. }
+                if text.contains("Normal assistant reply")
         )));
     }
 }

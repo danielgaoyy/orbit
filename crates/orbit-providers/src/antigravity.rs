@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
+use tracing::warn;
 
 use crate::attachments::{build_agy_prompt_blocks, is_path_within_dir};
 use crate::driver::{
@@ -153,6 +154,7 @@ async fn run_agy_actor(
         .await
         .is_err()
     {
+        warn!(agent_id = %cfg.agent_id, "Antigravity ACP initialize failed");
         let _ = evt_tx
             .send(DriverEvent::StatusChanged(AgentStatus::Error {
                 message: "Antigravity ACP initialize failed".into(),
@@ -197,6 +199,7 @@ async fn run_agy_actor(
     let sess_val = match wait_rpc_during_boot(&mut shim, &mut pending_rpcs, sess_rx).await {
         Ok(v) => v,
         Err(e) => {
+            warn!(agent_id = %cfg.agent_id, error = %e, "Antigravity session open failed");
             let _ = evt_tx
                 .send(DriverEvent::StatusChanged(AgentStatus::Error {
                     message: format!("Antigravity session open failed: {e}"),
@@ -615,6 +618,12 @@ async fn run_agy_actor(
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("Antigravity turn failed")
                                             .to_string();
+                                        warn!(
+                                            agent_id = %cfg.agent_id,
+                                            session_id = %session_id,
+                                            error = %msg,
+                                            "Antigravity ACP session/prompt failed"
+                                        );
                                         let _ = evt_tx
                                             .send(DriverEvent::StatusChanged(AgentStatus::Error {
                                                 message: msg,
@@ -665,6 +674,14 @@ async fn run_agy_actor(
                         }
                     }
                     ShimFrame::Exited { code } => {
+                        if code != Some(0) {
+                            warn!(
+                                agent_id = %cfg.agent_id,
+                                session_id = %session_id,
+                                exit_code = ?code,
+                                "Antigravity shim process exited"
+                            );
+                        }
                         let _ = evt_tx.send(DriverEvent::Exited { code }).await;
                         break;
                     }
@@ -709,6 +726,33 @@ async fn run_agy_actor(
                                         status,
                                         detail,
                                     })
+                                    .await;
+                            }
+                            WakeupStep::Notice { level, message } => {
+                                warn!(
+                                    agent_id = %cfg.agent_id,
+                                    session_id = %session_id,
+                                    level = %level,
+                                    notice = %message,
+                                    "Antigravity post-turn wakeup reported runtime warning"
+                                );
+                                let _ = evt_tx
+                                    .send(DriverEvent::Notice { level, message })
+                                    .await;
+                            }
+                            WakeupStep::Failed { message } => {
+                                warn!(
+                                    agent_id = %cfg.agent_id,
+                                    session_id = %session_id,
+                                    error = %message,
+                                    "Antigravity post-turn wakeup failed after retries"
+                                );
+                                autonomous_turn_id = None;
+                                let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                        message,
+                                        recoverable: true,
+                                    }))
                                     .await;
                             }
                             WakeupStep::Settled => {
@@ -874,6 +918,19 @@ async fn handle_acp_session_update(
             if chunk.is_empty() {
                 return;
             }
+            let (warnings, cleaned_text) = split_acp_runtime_warnings(chunk);
+            for warning_msg in warnings {
+                warn!(notice = %warning_msg, "Antigravity ACP stream warning");
+                let _ = evt_tx
+                    .send(DriverEvent::Notice {
+                        level: "warning".into(),
+                        message: warning_msg,
+                    })
+                    .await;
+            }
+            if cleaned_text.is_empty() {
+                return;
+            }
             seg_state.active_thought_id = None;
             let mid = if let Some(explicit) = update
                 .get("messageId")
@@ -890,7 +947,7 @@ async fn handle_acp_session_update(
                 id
             };
             let entry = seg_state.msg_accum.entry(mid.clone()).or_default();
-            entry.push_str(chunk);
+            entry.push_str(&cleaned_text);
             let _ = evt_tx
                 .send(DriverEvent::AssistantText {
                     item_id: mid,
@@ -1053,7 +1110,7 @@ fn map_agy_tool_detail(update: &Value, prev: Option<&ToolCallDetail>) -> ToolCal
                     if item.get("type").and_then(|t| t.as_str()) == Some("diff") {
                         let old_t = item.get("oldText").and_then(|v| v.as_str()).unwrap_or("");
                         let new_t = item.get("newText").and_then(|v| v.as_str()).unwrap_or("");
-                        Some(format!("--- old\n+++ new\n-{old_t}\n+{new_t}"))
+                        crate::build_compact_unified_diff(&path, old_t, new_t)
                     } else {
                         None
                     }
@@ -1676,7 +1733,232 @@ enum WakeupStep {
         status: ToolCallStatus,
         detail: ToolCallDetail,
     },
+    Notice {
+        level: String,
+        message: String,
+    },
+    Failed {
+        message: String,
+    },
     Settled,
+}
+
+const WAKEUP_ERROR_STALL_TIMEOUT: Duration = Duration::from_secs(90);
+const WAKEUP_ERROR_EXHAUSTED_TIMEOUT: Duration = Duration::from_secs(15);
+const WAKEUP_ERROR_EXHAUSTED_COUNT: u32 = 8;
+
+/// Split provider-injected runtime warning lines (e.g. `\n⚠ API error (attempt 1): ...` or
+/// `\n⚠ The stream was interrupted...`) out of an ACP `agent_message_chunk` so they surface as
+/// visible `Notice` alerts rather than getting merged/folded as assistant prose.
+fn split_acp_runtime_warnings(chunk: &str) -> (Vec<String>, String) {
+    if !chunk.contains('⚠') {
+        return (Vec::new(), chunk.to_string());
+    }
+
+    let mut warnings = Vec::new();
+    let mut kept_lines = Vec::new();
+
+    for segment in chunk.split_inclusive('\n') {
+        let trimmed = segment.trim();
+        if let Some(rest) = trimmed.strip_prefix('⚠') {
+            let clean = rest.trim();
+            if is_acp_runtime_warning_body(clean) {
+                warnings.push(clean.to_string());
+                continue;
+            }
+        }
+        kept_lines.push(segment);
+    }
+
+    if warnings.is_empty() {
+        return (Vec::new(), chunk.to_string());
+    }
+
+    let kept = kept_lines.concat();
+    if kept.trim().is_empty() {
+        (warnings, String::new())
+    } else {
+        (warnings, kept)
+    }
+}
+
+fn is_acp_runtime_warning_body(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.starts_with("api error")
+        || lower.starts_with("the stream was interrupted")
+        || lower.starts_with("rate limit")
+        || lower.starts_with("request failed")
+        || lower.starts_with("connection ")
+        || lower.starts_with("network ")
+        || lower.starts_with("retrying")
+        || lower.starts_with("error:")
+}
+
+/// Unwrap double-encoded JSON string arguments emitted in `transcript.jsonl` `tool_calls[].args`.
+fn unquote_transcript_arg(val: &Value) -> Option<String> {
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        if trimmed.starts_with('"')
+            && trimmed.ends_with('"')
+            && trimmed.len() >= 2
+            && let Ok(parsed) = serde_json::from_str::<String>(trimmed)
+        {
+            return Some(parsed);
+        }
+        return Some(s.to_string());
+    }
+    if val.is_number() || val.is_boolean() {
+        return Some(val.to_string());
+    }
+    None
+}
+
+fn transcript_arg_str(args: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let obj = args?.as_object()?;
+    for key in keys {
+        if let Some(val) = obj.get(*key).and_then(unquote_transcript_arg)
+            && !val.trim().is_empty()
+        {
+            return Some(val);
+        }
+    }
+    None
+}
+
+fn transcript_arg_u32(args: Option<&Value>, keys: &[&str]) -> Option<u32> {
+    let obj = args?.as_object()?;
+    for key in keys {
+        if let Some(v) = obj.get(*key) {
+            if let Some(n) = v.as_u64() {
+                return u32::try_from(n).ok();
+            }
+            if let Some(s) = unquote_transcript_arg(v)
+                && let Ok(n) = s.trim().parse::<u32>()
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn map_transcript_tool_detail(tool_name: &str, args: Option<&Value>) -> ToolCallDetail {
+    let lower = tool_name.to_ascii_lowercase();
+
+    if matches!(
+        lower.as_str(),
+        "run_command" | "execute_command" | "bash" | "shell" | "terminal"
+    ) {
+        let cmd = transcript_arg_str(args, &["CommandLine", "command", "cmd"])
+            .unwrap_or_else(|| tool_name.to_string());
+        let cwd = transcript_arg_str(args, &["Cwd", "cwd"]);
+        return ToolCallDetail::Shell {
+            command: cmd,
+            cwd,
+            exit_code: None,
+            output_preview: None,
+        };
+    }
+
+    if matches!(lower.as_str(), "read_file" | "view_file" | "open_file") {
+        let path = transcript_arg_str(args, &["Path", "AbsolutePath", "file_path", "path"])
+            .unwrap_or_else(|| tool_name.to_string());
+        let start_line = transcript_arg_u32(args, &["StartLine", "start_line", "offset"]);
+        let end_line = transcript_arg_u32(args, &["EndLine", "end_line"]);
+        return ToolCallDetail::FileRead {
+            path,
+            start_line,
+            end_line,
+        };
+    }
+
+    if matches!(
+        lower.as_str(),
+        "edit_file"
+            | "write_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
+            | "write_to_file"
+    ) {
+        let path = transcript_arg_str(args, &["Path", "TargetFile", "file_path", "path"])
+            .unwrap_or_else(|| tool_name.to_string());
+        let unified_diff = match (
+            transcript_arg_str(args, &["Target", "old_string"]),
+            transcript_arg_str(args, &["Replacement", "new_string", "Content"]),
+        ) {
+            (Some(old_t), Some(new_t)) => crate::build_compact_unified_diff(&path, &old_t, &new_t),
+            (None, Some(new_t)) if lower.starts_with("write") => {
+                crate::build_compact_unified_diff(&path, "", &new_t)
+            }
+            _ => None,
+        };
+        return ToolCallDetail::FileEdit { path, unified_diff };
+    }
+
+    if matches!(
+        lower.as_str(),
+        "search_web" | "grep_search" | "find_by_name" | "grep" | "glob" | "search"
+    ) {
+        let query = transcript_arg_str(args, &["query", "Query", "Pattern", "pattern"])
+            .unwrap_or_else(|| tool_name.to_string());
+        let scope = transcript_arg_str(
+            args,
+            &["domain", "SearchPath", "SearchDirectory", "path", "scope"],
+        );
+        return ToolCallDetail::Search { query, scope };
+    }
+
+    if lower.contains("subagent") {
+        let role = transcript_arg_str(args, &["Role", "TypeName", "role"])
+            .unwrap_or_else(|| "subagent".into());
+        let prompt = transcript_arg_str(args, &["Prompt", "prompt"]).unwrap_or_default();
+        return ToolCallDetail::Subagent {
+            child_agent_id: None,
+            role,
+            prompt_preview: truncate_preview(&prompt, 240),
+        };
+    }
+
+    ToolCallDetail::Generic {
+        tool_name: tool_name.to_string(),
+        arguments_json: args
+            .map(|v| truncate_preview(&v.to_string(), 400))
+            .unwrap_or_default(),
+    }
+}
+
+fn attach_transcript_tool_result(mut detail: ToolCallDetail, content: &str) -> ToolCallDetail {
+    let preview = (!content.trim().is_empty()).then(|| truncate_preview(content.trim(), 800));
+    match &mut detail {
+        ToolCallDetail::Shell {
+            output_preview,
+            exit_code,
+            ..
+        } => {
+            if preview.is_some() {
+                *output_preview = preview;
+            }
+            if let Some(code_line) = content
+                .lines()
+                .find(|l| l.starts_with("Command exited with code "))
+                && let Some(num_str) = code_line
+                    .strip_prefix("Command exited with code ")
+                    .map(|s| s.trim_end_matches('.').trim())
+                && let Ok(code) = num_str.parse::<i32>()
+            {
+                *exit_code = Some(code);
+            }
+        }
+        ToolCallDetail::Generic { arguments_json, .. } => {
+            if arguments_json.is_empty()
+                && let Some(p) = preview
+            {
+                *arguments_json = p;
+            }
+        }
+        _ => {}
+    }
+    detail
 }
 
 struct AgyTranscriptMonitor {
@@ -1685,7 +1967,10 @@ struct AgyTranscriptMonitor {
     byte_offset: u64,
     seen_steps: HashSet<u64>,
     in_wakeup: bool,
-    pending_tools: Vec<String>,
+    pending_tools: Vec<(String, ToolCallDetail)>,
+    consecutive_errors: u32,
+    last_error_at: Option<Instant>,
+    last_error_message: Option<String>,
 }
 
 impl AgyTranscriptMonitor {
@@ -1702,6 +1987,9 @@ impl AgyTranscriptMonitor {
             seen_steps: HashSet::new(),
             in_wakeup: false,
             pending_tools: Vec::new(),
+            consecutive_errors: 0,
+            last_error_at: None,
+            last_error_message: None,
         }
     }
 
@@ -1719,10 +2007,42 @@ impl AgyTranscriptMonitor {
         let _ = self.read_new_lines(true);
         self.in_wakeup = false;
         self.pending_tools.clear();
+        self.consecutive_errors = 0;
+        self.last_error_at = None;
+        self.last_error_message = None;
     }
 
     fn poll_post_turn_wakeup(&mut self) -> Vec<WakeupStep> {
-        self.read_new_lines(false)
+        let mut out = self.read_new_lines(false);
+        self.check_error_stall(&mut out, Instant::now());
+        out
+    }
+
+    fn check_error_stall(&mut self, out: &mut Vec<WakeupStep>, now: Instant) {
+        if !self.in_wakeup || self.consecutive_errors == 0 {
+            return;
+        }
+        let Some(last_err) = self.last_error_at else {
+            return;
+        };
+        let elapsed = now.saturating_duration_since(last_err);
+        let timed_out = elapsed >= WAKEUP_ERROR_STALL_TIMEOUT
+            || (self.consecutive_errors >= WAKEUP_ERROR_EXHAUSTED_COUNT
+                && elapsed >= WAKEUP_ERROR_EXHAUSTED_TIMEOUT);
+        if timed_out {
+            let reason = self
+                .last_error_message
+                .take()
+                .unwrap_or_else(|| "Background task stalled after repeated API errors".into());
+            let attempts = self.consecutive_errors;
+            self.in_wakeup = false;
+            self.pending_tools.clear();
+            self.consecutive_errors = 0;
+            self.last_error_at = None;
+            out.push(WakeupStep::Failed {
+                message: format!("Background wakeup stopped after {attempts} error(s): {reason}"),
+            });
+        }
     }
 
     fn read_new_lines(&mut self, silent: bool) -> Vec<WakeupStep> {
@@ -1803,11 +2123,36 @@ impl AgyTranscriptMonitor {
             if step_type == "SYSTEM_MESSAGE" || content.contains("<SYSTEM_MESSAGE>") {
                 if !self.in_wakeup {
                     self.in_wakeup = true;
+                    self.consecutive_errors = 0;
+                    self.last_error_at = None;
+                    self.last_error_message = None;
                     out.push(WakeupStep::Started {
                         source: "background_task".into(),
                     });
                 }
+            } else if step_type == "ERROR_MESSAGE" {
+                let err_msg = step
+                    .get("error")
+                    .or_else(|| step.get("content"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Upstream API request failed during background task");
+                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+                self.last_error_at = Some(Instant::now());
+                self.last_error_message = Some(err_msg.to_string());
+                out.push(WakeupStep::Notice {
+                    level: if self.consecutive_errors >= WAKEUP_ERROR_EXHAUSTED_COUNT {
+                        "error".into()
+                    } else {
+                        "warning".into()
+                    },
+                    message: err_msg.to_string(),
+                });
             } else if self.in_wakeup && step_type == "PLANNER_RESPONSE" {
+                self.consecutive_errors = 0;
+                self.last_error_at = None;
+                self.last_error_message = None;
                 if let Some(th) = step.get("thinking").and_then(|v| v.as_str())
                     && !th.trim().is_empty()
                 {
@@ -1829,35 +2174,32 @@ impl AgyTranscriptMonitor {
                     .unwrap_or_default();
                 if calls.is_empty() && status == "DONE" {
                     self.in_wakeup = false;
+                    self.pending_tools.clear();
                     out.push(WakeupStep::Settled);
                 } else {
-                    for c in calls {
+                    for (call_idx, c) in calls.into_iter().enumerate() {
                         let cid = c
                             .get("id")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("wake_tool")
-                            .to_string();
-                        let tname = c
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("tool")
-                            .to_string();
-                        self.pending_tools.push(cid.clone());
+                            .filter(|s| !s.trim().is_empty())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| format!("wake_tool_{step_idx}_{call_idx}"));
+                        let tname = c.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                        let detail = map_transcript_tool_detail(tname, c.get("args"));
+                        self.pending_tools.push((cid.clone(), detail.clone()));
                         out.push(WakeupStep::Tool {
                             call_id: cid,
                             status: ToolCallStatus::Running,
-                            detail: ToolCallDetail::Generic {
-                                tool_name: tname,
-                                arguments_json: c
-                                    .get("args")
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_default(),
-                            },
+                            detail,
                         });
                     }
                 }
             } else if self.in_wakeup && step_type == "GENERIC" && !self.pending_tools.is_empty() {
-                let cid = self.pending_tools.remove(0);
+                self.consecutive_errors = 0;
+                self.last_error_at = None;
+                self.last_error_message = None;
+                let (cid, orig_detail) = self.pending_tools.remove(0);
+                let detail = attach_transcript_tool_result(orig_detail, content);
                 out.push(WakeupStep::Tool {
                     call_id: cid,
                     status: if status == "ERROR" {
@@ -1865,10 +2207,7 @@ impl AgyTranscriptMonitor {
                     } else {
                         ToolCallStatus::Completed
                     },
-                    detail: ToolCallDetail::Generic {
-                        tool_name: "result".into(),
-                        arguments_json: truncate_preview(content, 400),
-                    },
+                    detail,
                 });
             }
         }
@@ -2700,5 +3039,178 @@ mod tests {
         );
 
         assert!(evt_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn compact_unified_diff_shrinks_large_file_edits_and_formats_multiline_hunks() {
+        let mut lines: Vec<String> = (1..=1500).map(|i| format!("line_{i}")).collect();
+        let old_doc = lines.join("\n") + "\n";
+        lines[749] = "line_750_updated_a".into();
+        lines.insert(750, "line_750_inserted_b".into());
+        let new_doc = lines.join("\n") + "\n";
+
+        let diff = crate::build_compact_unified_diff("crates/demo/lib.rs", &old_doc, &new_doc)
+            .expect("non-empty diff");
+        assert!(
+            diff.len() < 1024,
+            "expected compact diff, got {} bytes",
+            diff.len()
+        );
+        assert!(diff.contains("--- a/crates/demo/lib.rs"));
+        assert!(diff.contains("+++ b/crates/demo/lib.rs"));
+        assert!(diff.contains("@@"));
+        assert!(diff.contains("-line_750\n"));
+        assert!(diff.contains("+line_750_updated_a\n+line_750_inserted_b\n"));
+    }
+
+    #[tokio::test]
+    async fn acp_runtime_warning_chunks_route_to_notice_not_assistant_text() {
+        let synthesized_wakeup_tools = HashSet::new();
+        let mut seg_state = AgyStreamSegmentState {
+            turn_tag: "turn_net".into(),
+            ..AgyStreamSegmentState::default()
+        };
+        let mut tool_cache = HashMap::new();
+        let mut last_ask_raw = None;
+        let (evt_tx, mut evt_rx) = mpsc::channel(16);
+
+        handle_acp_session_update(
+            &json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "text": "\n⚠ API error (attempt 1): request failed: read: connection reset by peer\n\n⚠ The stream was interrupted. Please continue the task you were working on.\n"
+                }
+            }),
+            &synthesized_wakeup_tools,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+
+        let ev1 = evt_rx.try_recv().expect("first warning notice");
+        assert!(matches!(
+            ev1,
+            DriverEvent::Notice { ref level, ref message }
+                if level == "warning" && message.starts_with("API error (attempt 1):")
+        ));
+        let ev2 = evt_rx.try_recv().expect("second warning notice");
+        assert!(matches!(
+            ev2,
+            DriverEvent::Notice { ref level, ref message }
+                if level == "warning" && message.starts_with("The stream was interrupted")
+        ));
+        assert!(evt_rx.try_recv().is_err());
+        assert!(seg_state.msg_accum.is_empty());
+    }
+
+    #[test]
+    fn transcript_monitor_maps_structured_wakeup_tools_and_surfaces_network_errors() {
+        let dir = std::env::temp_dir().join(format!("orbit_wake_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let transcript_path = dir.join("transcript.jsonl");
+        let lines = [
+            json!({
+                "step_index": 10,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": "<SYSTEM_MESSAGE>background task done</SYSTEM_MESSAGE>"
+            }),
+            json!({
+                "step_index": 11,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "thinking": "Running check",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "run_command",
+                        "args": { "CommandLine": "\"cargo test --workspace\"" }
+                    },
+                    {
+                        "name": "read_file",
+                        "args": { "Path": "\"src/lib.rs\"", "StartLine": "1", "EndLine": "50" }
+                    }
+                ]
+            }),
+            json!({
+                "step_index": 12,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Command exited with code 0.\nok"
+            }),
+            json!({
+                "step_index": 13,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Showing lines 1-50"
+            }),
+            json!({
+                "step_index": 14,
+                "type": "ERROR_MESSAGE",
+                "status": "DONE",
+                "error": "API error (attempt 1): dial tcp 1.2.3.4:443: i/o timeout"
+            }),
+        ];
+        let payload = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&transcript_path, payload).expect("write transcript");
+
+        let mut monitor = AgyTranscriptMonitor {
+            full_path: dir.join("missing.jsonl"),
+            compact_path: transcript_path,
+            byte_offset: 0,
+            seen_steps: HashSet::new(),
+            in_wakeup: false,
+            pending_tools: Vec::new(),
+            consecutive_errors: 0,
+            last_error_at: None,
+            last_error_message: None,
+        };
+
+        let steps = monitor.poll_post_turn_wakeup();
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, WakeupStep::Started { .. }))
+        );
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            WakeupStep::Tool {
+                call_id,
+                status: ToolCallStatus::Completed,
+                detail: ToolCallDetail::Shell { command, exit_code: Some(0), .. }
+            } if call_id == "wake_tool_11_0" && command == "cargo test --workspace"
+        )));
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            WakeupStep::Tool {
+                call_id,
+                status: ToolCallStatus::Completed,
+                detail: ToolCallDetail::FileRead { path, start_line: Some(1), end_line: Some(50) }
+            } if call_id == "wake_tool_11_1" && path == "src/lib.rs"
+        )));
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            WakeupStep::Notice { level, message }
+                if level == "warning" && message.contains("i/o timeout")
+        )));
+
+        // Simulate stall past WAKEUP_ERROR_STALL_TIMEOUT -> should emit Failed and exit in_wakeup
+        let mut stall_out = Vec::new();
+        let future_now = Instant::now() + WAKEUP_ERROR_STALL_TIMEOUT + Duration::from_secs(1);
+        monitor.check_error_stall(&mut stall_out, future_now);
+        assert!(!monitor.in_wakeup);
+        assert!(stall_out.iter().any(|s| matches!(
+            s,
+            WakeupStep::Failed { message } if message.contains("i/o timeout")
+        )));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

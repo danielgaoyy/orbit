@@ -38,6 +38,7 @@ import {
   SlashCommandMenu,
   filterSlashCommands,
 } from "@/components/composer/slash-menu";
+import { modSymbol } from "@/lib/keybindings";
 import {
   type GitFileEntry,
   type SessionMode,
@@ -620,24 +621,20 @@ export const OmniComposer = memo(function OmniComposer({
       }
     }
 
-    if (e.key === "Enter" && e.altKey) {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
       e.preventDefault();
       setHistoryCursor(null);
-      void orbitActions.submitComposer(true);
+      void orbitActions.submitComposer(isTurnBusy);
       return;
     }
 
     if (enterToSend) {
-      if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+      if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault();
         setHistoryCursor(null);
         void orbitActions.submitComposer(false);
         return;
       }
-    } else if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-      e.preventDefault();
-      setHistoryCursor(null);
-      void orbitActions.submitComposer(false);
     }
   };
 
@@ -927,31 +924,11 @@ export const OmniComposer = memo(function OmniComposer({
                   >
                     <span className="size-[11px] rounded-[2.5px] bg-[#EF4444]" />
                   </button>
-                ) : isTurnBusy && hasPayload ? (
-                  <div className="orbit-pill-enter flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      title="Interrupt and steer immediately (⌥↵)"
-                      onClick={() => void orbitActions.submitComposer(true)}
-                      className="border-border bg-secondary/85 text-foreground hover:bg-accent orbit-press inline-flex h-8.5 cursor-pointer items-center gap-1 rounded-full border px-3 text-[13px] font-medium"
-                    >
-                      <Zap className="size-3.5" />
-                      <span>Steer</span>
-                    </button>
-                    <button
-                      type="button"
-                      title="Queue follow-up"
-                      onClick={() => void orbitActions.submitComposer(false)}
-                      className="orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full bg-[#141416] text-white hover:bg-[#27272A] dark:bg-[#F4F4F6] dark:text-[#141416] dark:hover:bg-white"
-                    >
-                      <ArrowUp className="size-[17px] stroke-[2.2]" />
-                    </button>
-                  </div>
                 ) : (
                   <button
                     type="button"
                     disabled={!hasPayload}
-                    title="Send"
+                    title={isTurnBusy ? `Queue follow-up (${modSymbol()}↵ to steer)` : "Send"}
                     onClick={() => void orbitActions.submitComposer(false)}
                     className={cn(
                       "orbit-press inline-flex size-8.5 cursor-pointer items-center justify-center rounded-full",

@@ -48,7 +48,7 @@ export function ShortcutsSection() {
         keys: enterToSend ? "⇧Enter" : "Enter",
       },
       { group: "Composer", action: "Cycle Access Permissions", keys: "⇧Tab" },
-      { group: "Composer", action: "Steer Running Agent", keys: "⌥Enter" },
+      { group: "Composer", action: "Steer Running Agent", keys: `${mod}Enter` },
       { group: "Composer", action: "Stop Generation", keys: "Esc Esc" },
 
       { group: "Approvals", action: "Allow Request", keys: `${mod}Y` },

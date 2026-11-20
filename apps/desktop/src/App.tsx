@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { PanelLeft } from "lucide-react";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
+import { ConnectionStatusBanner } from "@/components/layout/connection-status-banner";
 import { TopBar } from "@/components/layout/top-bar";
 import { SettingsView } from "@/components/settings/settings-view";
 import { QuickOpenFileDialog } from "@/components/side-panel/quick-open-file-dialog";
@@ -47,6 +48,19 @@ export default function App() {
     return () => window.cancelAnimationFrame(raf);
   }, []);
 
+  // Track OS/WebView internet connectivity so offline states surface immediately even with a local daemon
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const syncOnline = () => orbitActions.setBrowserOffline(!navigator.onLine);
+    syncOnline();
+    window.addEventListener("offline", syncOnline);
+    window.addEventListener("online", syncOnline);
+    return () => {
+      window.removeEventListener("offline", syncOnline);
+      window.removeEventListener("online", syncOnline);
+    };
+  }, []);
+
   // Deterministic responsive viewport sync (`< 800px` auto-collapses, `>= 824px` restores desktop preference)
   useEffect(() => {
     orbitActions.updateViewportWidth(window.innerWidth);
@@ -78,7 +92,7 @@ export default function App() {
       const id = window.setTimeout(() => {
         setSettingsMounted(false);
         setSettingsClosing(false);
-      }, 120);
+      }, 165);
       return () => window.clearTimeout(id);
     }
   }, [isSettingsOpen, settingsMounted]);
@@ -94,7 +108,7 @@ export default function App() {
       const id = window.setTimeout(() => {
         setRenderedToast(null);
         setToastExiting(false);
-      }, 145);
+      }, 170);
       return () => window.clearTimeout(id);
     }
   }, [toastNotice, renderedToast]);
@@ -158,16 +172,17 @@ export default function App() {
         {/* 1. Collapsible & Resizable Single Unified Fleet Sidebar (`⌘B` — Single Source of Truth) */}
         <div
           inert={!sidebarOpen}
+          data-open={sidebarOpen ? "true" : "false"}
+          data-ready={transitionsReady ? "true" : "false"}
+          data-resizing={isResizingSidebar ? "true" : "false"}
           style={{
             width: `${sidebarWidth}px`,
             marginLeft: sidebarOpen ? "0px" : `-${sidebarWidth}px`,
+            opacity: sidebarOpen ? 1 : 0,
           }}
           className={cn(
-            "relative h-full shrink-0 overflow-hidden",
+            "orbit-panel-left relative h-full shrink-0 overflow-hidden",
             !sidebarOpen && "pointer-events-none",
-            transitionsReady &&
-              !isResizingSidebar &&
-              "transition-[margin-left] duration-[190ms] ease-[cubic-bezier(0.22,1,0.36,1)]",
           )}
         >
           <FleetSidebar />
@@ -185,6 +200,7 @@ export default function App() {
           <div className="flex min-h-0 flex-1 overflow-hidden">
             <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
               <TopBar />
+              <ConnectionStatusBanner />
               <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                 {workspacePanel === "automations" ? <AutomationsView /> : <StreamStage />}
               </main>

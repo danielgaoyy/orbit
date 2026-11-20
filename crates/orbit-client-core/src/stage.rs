@@ -1531,7 +1531,12 @@ fn build_live_segments(body_items: &[TimelineItemView]) -> Vec<TurnLiveSegmentVi
                         label: message.clone(),
                     });
                 } else {
-                    flush_steps(&mut raw_segments, &mut step_buf, false, Some(it));
+                    flush_steps(
+                        &mut raw_segments,
+                        &mut step_buf,
+                        level == "wakeup",
+                        Some(it),
+                    );
                     raw_segments.push(TurnLiveSegmentView::Notice {
                         key: format!("notice-{seq}"),
                         item: it.clone(),

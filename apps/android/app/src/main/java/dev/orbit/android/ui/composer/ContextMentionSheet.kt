@@ -88,6 +88,10 @@ fun ContextMentionSheet(
         }
     }
 
+    val workflowCommands = remember(slashCommands) {
+        slashCommands.filter { it.id == "plan" || it.id == "review" || it.id == "compact" }
+    }
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
@@ -219,10 +223,6 @@ fun ContextMentionSheet(
                         color = colors.fgMuted,
                         modifier = Modifier.padding(vertical = OrbitSpacing.xs),
                     )
-                }
-
-                val workflowCommands = remember(slashCommands) {
-                    slashCommands.filter { it.id == "plan" || it.id == "review" || it.id == "compact" }
                 }
 
                 items(workflowCommands, key = { it.command }) { wf ->

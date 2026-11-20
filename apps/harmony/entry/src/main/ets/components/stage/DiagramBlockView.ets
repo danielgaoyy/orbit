@@ -48,13 +48,13 @@ export struct DiagramBlockView {
   private lastFullHtml: string = '';
   private requestSeq: number = 0;
 
-  private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
+  @Local private store: OrbitHarmonyStore = OrbitHarmonyStore.getInstance();
 
   aboutToAppear(): void {
     void this.requestRender();
   }
 
-  @Monitor('diagramKind', 'diagramSource', 'store.palette.isDark')
+  @Monitor('diagramKind', 'diagramSource', 'store.palette')
   onDiagramInputsChanged(): void {
     void this.requestRender();
   }

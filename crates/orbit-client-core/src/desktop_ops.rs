@@ -1796,6 +1796,7 @@ pub fn open_external_url(raw_url: &str) -> Result<(), String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
+        let _ = validated;
         Err("External URL launch is unsupported on this platform".into())
     }
 }

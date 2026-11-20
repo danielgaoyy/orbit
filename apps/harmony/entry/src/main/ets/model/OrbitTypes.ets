@@ -1136,7 +1136,7 @@ export function slashCommandSymbol(id: string): Resource {
   if (id === 'settings') {
     return $r('sys.symbol.gearshape');
   }
-  return $r('sys.symbol.bubble_left');
+  return $r('sys.symbol.message');
 }
 
 export function formatRelativeTimeLabel(unixSecs: number): string {

@@ -149,6 +149,8 @@ export interface SidePanelTab {
   subagentRole?: string;
   subagentPrompt?: string;
   childAgentId?: string | null;
+  providerSubagentId?: string | null;
+  parentAgentId?: string | null;
 }
 
 export interface FileViewCacheEntry {
@@ -3859,9 +3861,12 @@ export const orbitActions = {
     role: string;
     promptPreview: string;
     childAgentId: string | null;
+    providerSubagentId?: string | null;
+    parentAgentId?: string | null;
   }): void {
-    const tabId = `tab:subagent:${params.childAgentId || params.callId}`;
+    const tabId = `tab:subagent:${params.childAgentId || params.providerSubagentId || params.callId}`;
     const hostId = state.selectedHostId;
+    const parentAgentId = params.parentAgentId ?? state.selectedAgentId;
     setState((s) => {
       const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
       let nextTabs = s.sidePanelTabs;
@@ -3874,6 +3879,8 @@ export const orbitActions = {
         subagentRole: params.role,
         subagentPrompt: params.promptPreview,
         childAgentId: params.childAgentId,
+        providerSubagentId: params.providerSubagentId ?? null,
+        parentAgentId: parentAgentId ?? null,
       };
       if (existingIdx >= 0) {
         nextTabs = [...s.sidePanelTabs];
@@ -3896,6 +3903,8 @@ export const orbitActions = {
     if (hostId && params.childAgentId) {
       void orbitIpc.openAgentTimeline(hostId, params.childAgentId);
       void orbitActions.pullStageDelta(hostId, params.childAgentId, false);
+    } else if (hostId && parentAgentId && params.providerSubagentId) {
+      void orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, params.providerSubagentId);
     }
   },
 

@@ -1397,6 +1397,7 @@ impl From<TimelineItemView> for FfiTimelineItem {
                 step_descriptor,
                 diff_files,
                 timestamp_ms,
+                ..
             } => {
                 let resolved_desc = step_descriptor
                     .or_else(|| {

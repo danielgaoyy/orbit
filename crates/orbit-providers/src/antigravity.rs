@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
-    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus, QuestionItem,
-    QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload, ToolCallDetail,
-    ToolCallStatus,
+    ActiveTurnBehavior, AgentStatus, BackgroundTaskInfo, ProviderKind, ProviderModelCatalog,
+    ProviderModelSpec, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentStatus,
+    QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload,
+    ToolCallDetail, ToolCallStatus,
 };
 use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, spawn_detached_shim};
 use serde::Deserialize;
@@ -448,10 +448,16 @@ async fn run_agy_actor(
 
     // Post-turn autonomous wakeup (`transcript_full.jsonl`) + first-class background-task tracking
     let mut transcript_monitor = AgyTranscriptMonitor::new(&session_id);
-    // Skip any historical steps already recorded on disk when attaching/resuming
-    transcript_monitor.sync_silent();
+    // Skip any historical steps already recorded on disk when attaching/resuming, while remembering
+    // already-finished background task IDs so shim ring-buffer replay can never resurrect them.
+    let historical_bg_deltas = transcript_monitor.sync_silent_with_bg_tasks();
     let mut wakeup_tools = WakeupToolRegistry::default();
     let mut bg_tracker = BackgroundTaskTracker::default();
+    for delta in historical_bg_deltas {
+        if let BgTaskDelta::Completed { task_id, .. } = delta {
+            bg_tracker.mark_finished(task_id);
+        }
+    }
     let mut autonomous_turn_id: Option<String> = None;
     let mut user_interrupted = false;
     let mut pending_self_heal: Option<PendingSelfHeal> = None;
@@ -530,12 +536,15 @@ async fn run_agy_actor(
                         bg_tracker.clear();
                         if autonomous_turn_id.take().is_some() {
                             transcript_monitor.sync_silent();
-                            for (cid, detail) in wakeup_tools.settle_open_tools(&HashSet::new()) {
+                            for (cid, detail, bg_info) in
+                                wakeup_tools.settle_open_tools(&HashSet::new())
+                            {
                                 let _ = evt_tx
                                     .send(DriverEvent::ToolCall {
                                         call_id: cid,
                                         status: ToolCallStatus::Failed,
                                         detail,
+                                        background_task: bg_info,
                                     })
                                     .await;
                             }
@@ -759,18 +768,118 @@ async fn run_agy_actor(
                                             BgTaskDelta::Started {
                                                 task_id,
                                                 call_id,
+                                                description,
                                                 log_path,
                                             } => {
+                                                let bg_info = BackgroundTaskInfo {
+                                                    task_id: Some(task_id.clone()),
+                                                    label: description.clone(),
+                                                    log_path: log_path.clone(),
+                                                };
+                                                let resolved_cid = call_id
+                                                    .or_else(|| {
+                                                        bg_tracker
+                                                            .call_id_for(&task_id)
+                                                            .map(ToOwned::to_owned)
+                                                    })
+                                                    .or_else(|| {
+                                                        wakeup_tools
+                                                            .find_matching_call_id_for_bg_task(
+                                                                description.as_deref(),
+                                                            )
+                                                    });
+                                                let (final_cid, emit_detail) =
+                                                    if let Some(cid) = resolved_cid {
+                                                        let det = wakeup_tools
+                                                            .mark_background_task(
+                                                                &cid,
+                                                                bg_info.clone(),
+                                                            );
+                                                        (cid, det)
+                                                    } else {
+                                                        let synth_id = format!(
+                                                            "bg_task_{}",
+                                                            sanitize_bg_task_id(&task_id)
+                                                        );
+                                                        let det = ToolCallDetail::Shell {
+                                                            command: description
+                                                                .clone()
+                                                                .unwrap_or_else(|| {
+                                                                    "Background task".to_string()
+                                                                }),
+                                                            cwd: None,
+                                                            exit_code: None,
+                                                            output_preview: None,
+                                                        };
+                                                        wakeup_tools.register_synthetic_bg_task(
+                                                            &synth_id,
+                                                            det.clone(),
+                                                            bg_info.clone(),
+                                                        );
+                                                        (synth_id, Some(det))
+                                                    };
                                                 bg_tracker.record_started(
                                                     task_id,
-                                                    call_id,
+                                                    Some(final_cid.clone()),
                                                     log_path,
+                                                    Some(bg_info.clone()),
                                                 );
+                                                if let Some(detail) = emit_detail {
+                                                    tool_cache
+                                                        .insert(final_cid.clone(), detail.clone());
+                                                    let _ = evt_tx
+                                                        .send(DriverEvent::ToolCall {
+                                                            call_id: final_cid,
+                                                            status: ToolCallStatus::Running,
+                                                            detail,
+                                                            background_task: Some(bg_info),
+                                                        })
+                                                        .await;
+                                                }
                                             }
-                                            BgTaskDelta::Completed { task_id, .. } => {
-                                                bg_tracker.remove(&task_id);
+                                            BgTaskDelta::Completed { task_id, canceled } => {
+                                                if let Some(info) = bg_tracker.remove(&task_id)
+                                                    && let Some(ref cid) = info.call_id
+                                                {
+                                                    let final_st = if canceled {
+                                                        ToolCallStatus::Failed
+                                                    } else {
+                                                        ToolCallStatus::Completed
+                                                    };
+                                                    if let Some((detail, bg_info)) =
+                                                        wakeup_tools.finish_tool(cid, final_st)
+                                                    {
+                                                        let _ = evt_tx
+                                                            .send(DriverEvent::ToolCall {
+                                                                call_id: cid.clone(),
+                                                                status: final_st,
+                                                                detail,
+                                                                background_task: bg_info,
+                                                            })
+                                                            .await;
+                                                    }
+                                                }
                                             }
                                         }
+                                    }
+                                    // Settle any non-background foreground tools left open when the turn ended
+                                    let active_bg_calls = bg_tracker.active_call_ids();
+                                    let settle_status = if val.get("error").is_some() {
+                                        ToolCallStatus::Failed
+                                    } else {
+                                        ToolCallStatus::Completed
+                                    };
+                                    for (cid, detail, bg_info) in
+                                        wakeup_tools.settle_open_tools(&active_bg_calls)
+                                    {
+                                        let _ = evt_tx
+                                            .send(DriverEvent::ToolCall {
+                                                call_id: cid,
+                                                status: settle_status,
+                                                detail,
+                                                background_task: bg_info,
+                                            })
+                                            .await;
                                     }
                                     // Drain queued / steered / interrupted-replacement prompt
                                     if let Some((next_turn_id, next_prompt)) =
@@ -852,7 +961,9 @@ async fn run_agy_actor(
                                 if allow_update
                                     && let Some(sig_cancel) = handle_acp_session_update(
                                         &cfg.agent_id,
+                                        &session_id,
                                         update,
+                                        in_post_turn_wakeup,
                                         &mut wakeup_tools,
                                         &mut bg_tracker,
                                         &mut seg_state,
@@ -950,6 +1061,7 @@ async fn run_agy_actor(
                                             call_id,
                                             status,
                                             detail,
+                                            background_task: None,
                                         },
                                     })
                                     .await;
@@ -1003,15 +1115,57 @@ async fn run_agy_actor(
                             WakeupStep::BackgroundTaskStarted {
                                 task_id,
                                 call_id,
+                                description,
                                 log_path,
                             } => {
-                                if let Some(ref cid) = call_id {
-                                    wakeup_tools.mark_background_task(cid);
+                                let bg_info = BackgroundTaskInfo {
+                                    task_id: Some(task_id.clone()),
+                                    label: description.clone(),
+                                    log_path: log_path.clone(),
+                                };
+                                let canon_cid = call_id
+                                    .map(|cid| {
+                                        wakeup_tools.canonical_id_for_wakeup(&cid).to_string()
+                                    })
+                                    .or_else(|| {
+                                        bg_tracker.call_id_for(&task_id).map(ToOwned::to_owned)
+                                    })
+                                    .or_else(|| {
+                                        wakeup_tools
+                                            .find_matching_call_id_for_bg_task(description.as_deref())
+                                    });
+                                if let Some(ref cid) = canon_cid {
+                                    wakeup_tools.mark_background_task(cid, bg_info.clone());
                                 }
-                                bg_tracker.record_started(task_id, call_id, log_path);
+                                bg_tracker.record_started(
+                                    task_id,
+                                    canon_cid,
+                                    log_path,
+                                    Some(bg_info),
+                                );
                             }
                             WakeupStep::BackgroundTaskCompleted { task_id, canceled } => {
-                                bg_tracker.remove(&task_id);
+                                if let Some(info) = bg_tracker.remove(&task_id)
+                                    && let Some(ref cid) = info.call_id
+                                {
+                                    let final_st = if canceled {
+                                        ToolCallStatus::Failed
+                                    } else {
+                                        ToolCallStatus::Completed
+                                    };
+                                    if let Some((detail, bg_info)) =
+                                        wakeup_tools.finish_tool(cid, final_st)
+                                    {
+                                        let _ = evt_tx
+                                            .send(DriverEvent::ToolCall {
+                                                call_id: cid.clone(),
+                                                status: final_st,
+                                                detail,
+                                                background_task: bg_info,
+                                            })
+                                            .await;
+                                    }
+                                }
                                 if !canceled {
                                     consecutive_self_heals = 0;
                                 }
@@ -1031,18 +1185,23 @@ async fn run_agy_actor(
                                     .await;
                             }
                             WakeupStep::Tool { call_id, status, detail } => {
-                                wakeup_tools.record_wakeup_tool(
-                                    &call_id,
-                                    status,
-                                    detail.clone(),
-                                );
-                                let _ = evt_tx
-                                    .send(DriverEvent::ToolCall {
-                                        call_id,
-                                        status,
-                                        detail,
-                                    })
-                                    .await;
+                                if let WakeupToolResolution::Emit {
+                                    call_id: canon_id,
+                                    status: emit_status,
+                                    detail: emit_detail,
+                                    background_task,
+                                } = wakeup_tools.resolve_wakeup_tool(&call_id, status, detail)
+                                {
+                                    tool_cache.insert(canon_id.clone(), emit_detail.clone());
+                                    let _ = evt_tx
+                                        .send(DriverEvent::ToolCall {
+                                            call_id: canon_id,
+                                            status: emit_status,
+                                            detail: emit_detail,
+                                            background_task,
+                                        })
+                                        .await;
+                                }
                             }
                             WakeupStep::Notice { level, message } => {
                                 if level != "info" {
@@ -1066,7 +1225,7 @@ async fn run_agy_actor(
                                     "Antigravity post-turn wakeup failed after retries"
                                 );
                                 autonomous_turn_id = None;
-                                for (cid, detail) in
+                                for (cid, detail, bg_info) in
                                     wakeup_tools.settle_open_tools(&bg_tracker.active_call_ids())
                                 {
                                     let _ = evt_tx
@@ -1074,6 +1233,7 @@ async fn run_agy_actor(
                                             call_id: cid,
                                             status: ToolCallStatus::Failed,
                                             detail,
+                                            background_task: bg_info,
                                         })
                                         .await;
                                 }
@@ -1085,15 +1245,17 @@ async fn run_agy_actor(
                                     .await;
                             }
                             WakeupStep::Settled => {
-                                // Close any synthesized wakeup tools not tied to still-running background tasks
+                                // Close any open wakeup/ACP tools not tied to still-running background tasks
                                 let active_bg_calls = bg_tracker.active_call_ids();
-                                for (cid, detail) in wakeup_tools.settle_open_tools(&active_bg_calls)
+                                for (cid, detail, bg_info) in
+                                    wakeup_tools.settle_open_tools(&active_bg_calls)
                                 {
                                     let _ = evt_tx
                                         .send(DriverEvent::ToolCall {
                                             call_id: cid,
                                             status: ToolCallStatus::Completed,
                                             detail,
+                                            background_task: bg_info,
                                         })
                                         .await;
                                 }
@@ -1138,13 +1300,15 @@ async fn run_agy_actor(
                                 .and_then(|p| read_log_tail(Path::new(p), 1500));
                             if let Some(ref info) = tracked_info
                                 && let Some(ref cid) = info.call_id
-                                && let Some(detail) = wakeup_tools.close_tool(cid)
+                                && let Some((detail, bg_info)) =
+                                    wakeup_tools.finish_tool(cid, ToolCallStatus::Failed)
                             {
                                 let _ = evt_tx
                                     .send(DriverEvent::ToolCall {
                                         call_id: cid.clone(),
                                         status: ToolCallStatus::Failed,
                                         detail,
+                                        background_task: bg_info,
                                     })
                                     .await;
                             }
@@ -1361,7 +1525,9 @@ async fn wait_rpc_during_boot(
 #[allow(clippy::too_many_arguments)]
 async fn handle_acp_session_update(
     parent_agent_id: &str,
+    session_id: &str,
     update: &Value,
+    in_post_turn_wakeup: bool,
     wakeup_tools: &mut WakeupToolRegistry,
     bg_tracker: &mut BackgroundTaskTracker,
     seg_state: &mut AgyStreamSegmentState,
@@ -1486,40 +1652,81 @@ async fn handle_acp_session_update(
                 .or_else(|| tool_cache.get(raw_call_id));
             let incoming_detail = map_agy_tool_detail(update, cached_prev);
             let raw_output_text = extract_acp_raw_output_text(update.get("rawOutput"));
+            let parsed_bg_start = if status == ToolCallStatus::Failed {
+                None
+            } else {
+                raw_output_text
+                    .as_deref()
+                    .and_then(|out| parse_bg_task_started(out, session_id))
+                    .filter(|(tid, _, _)| !bg_tracker.is_finished(tid))
+            };
+            let effective_status = if parsed_bg_start.is_some() {
+                ToolCallStatus::Running
+            } else {
+                status
+            };
+            let incoming_bg_info =
+                parsed_bg_start
+                    .as_ref()
+                    .map(|(tid, desc, lp)| BackgroundTaskInfo {
+                        task_id: Some(tid.clone()),
+                        label: desc.clone(),
+                        log_path: lp.clone(),
+                    });
 
-            let resolved = wakeup_tools.resolve_acp_tool(raw_call_id, status, incoming_detail);
-            let (call_id, detail) = match resolved {
+            let resolved = wakeup_tools.resolve_acp_tool(
+                raw_call_id,
+                effective_status,
+                incoming_detail,
+                incoming_bg_info,
+                in_post_turn_wakeup,
+            );
+            let (call_id, detail, background_task) = match resolved {
                 AcpToolResolution::SkipDuplicate => {
                     // Even if duplicate card suppressed, still inspect signal-cancellation telemetry
+                    let canon_or_raw = wakeup_tools
+                        .lookup_canonical_id(raw_call_id)
+                        .unwrap_or(raw_call_id);
                     return detect_acp_signal_cancel(
-                        raw_call_id,
-                        status,
+                        canon_or_raw,
+                        effective_status,
                         raw_output_text.as_deref(),
                         bg_tracker,
                     );
                 }
-                AcpToolResolution::Emit { call_id, detail } => (call_id, detail),
+                AcpToolResolution::Emit {
+                    call_id,
+                    detail,
+                    background_task,
+                } => (call_id, detail, background_task),
             };
 
             // Track background tasks launched / completed / signal-terminated via ACP
             let mut signal_cancel = None;
-            if let Some(ref out_str) = raw_output_text {
-                if let Some((task_id, log_path)) = parse_bg_task_started(out_str) {
-                    wakeup_tools.mark_background_task(&call_id);
-                    bg_tracker.record_started(task_id, Some(call_id.clone()), log_path);
-                } else if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+            if let Some((task_id, _desc, log_path)) = parsed_bg_start {
+                bg_tracker.record_started(
+                    task_id,
+                    Some(call_id.clone()),
+                    log_path,
+                    background_task.clone(),
+                );
+            } else if matches!(
+                effective_status,
+                ToolCallStatus::Completed | ToolCallStatus::Failed
+            ) {
+                if let Some(ref out_str) = raw_output_text {
                     signal_cancel = detect_acp_signal_cancel(
                         &call_id,
-                        status,
+                        effective_status,
                         Some(out_str.as_str()),
                         bg_tracker,
                     );
                     if signal_cancel.is_none() {
                         bg_tracker.remove_by_call_id(&call_id);
                     }
+                } else {
+                    bg_tracker.remove_by_call_id(&call_id);
                 }
-            } else if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
-                bg_tracker.remove_by_call_id(&call_id);
             }
 
             seg_state.active_thought_id = None;
@@ -1571,8 +1778,9 @@ async fn handle_acp_session_update(
             let _ = evt_tx
                 .send(DriverEvent::ToolCall {
                     call_id,
-                    status,
+                    status: effective_status,
                     detail,
+                    background_task,
                 })
                 .await;
             signal_cancel
@@ -2274,6 +2482,7 @@ enum WakeupStep {
     BackgroundTaskStarted {
         task_id: String,
         call_id: Option<String>,
+        description: Option<String>,
         log_path: Option<String>,
     },
     BackgroundTaskCompleted {
@@ -2302,6 +2511,7 @@ struct BgTaskInfo {
     task_id: String,
     call_id: Option<String>,
     log_path: Option<String>,
+    meta: Option<BackgroundTaskInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -2309,16 +2519,19 @@ enum BgTaskDelta {
     Started {
         task_id: String,
         call_id: Option<String>,
+        description: Option<String>,
         log_path: Option<String>,
     },
     Completed {
         task_id: String,
+        canceled: bool,
     },
 }
 
 #[derive(Debug, Default)]
 struct BackgroundTaskTracker {
     tasks: HashMap<String, BgTaskInfo>,
+    finished_tasks: HashSet<String>,
 }
 
 impl BackgroundTaskTracker {
@@ -2327,7 +2540,11 @@ impl BackgroundTaskTracker {
         task_id: String,
         call_id: Option<String>,
         log_path: Option<String>,
+        meta: Option<BackgroundTaskInfo>,
     ) {
+        if self.finished_tasks.contains(&task_id) {
+            return;
+        }
         let entry = self
             .tasks
             .entry(task_id.clone())
@@ -2335,6 +2552,7 @@ impl BackgroundTaskTracker {
                 task_id,
                 call_id: None,
                 log_path: None,
+                meta: None,
             });
         if call_id.is_some() {
             entry.call_id = call_id;
@@ -2342,9 +2560,26 @@ impl BackgroundTaskTracker {
         if log_path.is_some() {
             entry.log_path = log_path;
         }
+        if meta.is_some() {
+            entry.meta = meta;
+        }
+    }
+
+    fn mark_finished(&mut self, task_id: String) {
+        self.tasks.remove(&task_id);
+        self.finished_tasks.insert(task_id);
+    }
+
+    fn is_finished(&self, task_id: &str) -> bool {
+        self.finished_tasks.contains(task_id)
+    }
+
+    fn call_id_for(&self, task_id: &str) -> Option<&str> {
+        self.tasks.get(task_id).and_then(|t| t.call_id.as_deref())
     }
 
     fn remove(&mut self, task_id: &str) -> Option<BgTaskInfo> {
+        self.finished_tasks.insert(task_id.to_string());
         self.tasks.remove(task_id)
     }
 
@@ -2354,6 +2589,7 @@ impl BackgroundTaskTracker {
             .iter()
             .find(|(_, info)| info.call_id.as_deref() == Some(call_id))
             .map(|(k, _)| k.clone())?;
+        self.finished_tasks.insert(key.clone());
         self.tasks.remove(&key)
     }
 
@@ -2479,6 +2715,9 @@ struct WakeupToolEntry {
     detail: ToolCallDetail,
     status: ToolCallStatus,
     has_bg_task: bool,
+    bg_info: Option<BackgroundTaskInfo>,
+    in_wakeup_acp: bool,
+    claimed_by_wake: bool,
 }
 
 #[derive(Debug)]
@@ -2487,30 +2726,160 @@ enum AcpToolResolution {
     Emit {
         call_id: String,
         detail: ToolCallDetail,
+        background_task: Option<BackgroundTaskInfo>,
     },
 }
 
-/// Reconciles synthetic `wake_tool_{step}_{idx}` IDs from `transcript_full.jsonl` with native
-/// ACP `call_*` IDs so tool updates converge onto one card and never leave zombie `running` items.
+#[derive(Debug)]
+enum WakeupToolResolution {
+    SkipDuplicate,
+    Emit {
+        call_id: String,
+        status: ToolCallStatus,
+        detail: ToolCallDetail,
+        background_task: Option<BackgroundTaskInfo>,
+    },
+}
+
+/// Bidirectionally reconciles synthetic `wake_tool_{step}_{idx}` IDs from `transcript_full.jsonl`
+/// with native ACP `call_*` IDs (whichever arrives first) so tool updates always converge onto one
+/// canonical card and never leave zombie `running` items or duplicate background-task entries.
 #[derive(Debug, Default)]
 struct WakeupToolRegistry {
     entries: HashMap<String, WakeupToolEntry>,
     order: Vec<String>,
     acp_to_canonical: HashMap<String, String>,
+    wake_to_canonical: HashMap<String, String>,
 }
 
 impl WakeupToolRegistry {
-    fn record_wakeup_tool(
+    fn canonical_id_for_wakeup<'a>(&'a self, wake_call_id: &'a str) -> &'a str {
+        self.wake_to_canonical
+            .get(wake_call_id)
+            .map(String::as_str)
+            .unwrap_or(wake_call_id)
+    }
+
+    fn resolve_wakeup_tool(
+        &mut self,
+        wake_call_id: &str,
+        status: ToolCallStatus,
+        incoming_detail: ToolCallDetail,
+    ) -> WakeupToolResolution {
+        let incoming_sig = normalize_tool_signature(&incoming_detail);
+
+        // 1. Already mapped to an existing canonical (e.g. ACP `call_*`) entry
+        if let Some(canon_id) = self.wake_to_canonical.get(wake_call_id).cloned()
+            && let Some(entry) = self.entries.get_mut(&canon_id)
+        {
+            return Self::apply_wakeup_update(entry, status, incoming_detail, incoming_sig);
+        }
+
+        // 2. Direct ID match
+        if let Some(entry) = self.entries.get_mut(wake_call_id) {
+            return Self::apply_wakeup_update(entry, status, incoming_detail, incoming_sig);
+        }
+
+        // 3. Reverse-reconcile synthetic `wake_tool_*` against an already-emitted ACP `call_*`
+        //    (FIFO scan so parallel identical calls map cleanly 1-to-1).
+        if wake_call_id.starts_with("wake_tool_") {
+            let matched_id = self
+                .order
+                .iter()
+                .find(|cid| {
+                    self.entries.get(*cid).is_some_and(|e| {
+                        !e.call_id.starts_with("wake_tool_")
+                            && !e.claimed_by_wake
+                            && (e.status == ToolCallStatus::Running
+                                || e.has_bg_task
+                                || e.in_wakeup_acp)
+                            && signatures_match(&e.signature, &incoming_sig)
+                    })
+                })
+                .cloned();
+
+            if let Some(canon_id) = matched_id
+                && let Some(entry) = self.entries.get_mut(&canon_id)
+            {
+                entry.claimed_by_wake = true;
+                self.wake_to_canonical
+                    .insert(wake_call_id.to_string(), canon_id);
+                return Self::apply_wakeup_update(entry, status, incoming_detail, incoming_sig);
+            }
+        }
+
+        // 4. First time seeing this wakeup tool -> register as canonical
+        self.order.push(wake_call_id.to_string());
+        self.entries.insert(
+            wake_call_id.to_string(),
+            WakeupToolEntry {
+                call_id: wake_call_id.to_string(),
+                signature: incoming_sig,
+                detail: incoming_detail.clone(),
+                status,
+                has_bg_task: false,
+                bg_info: None,
+                in_wakeup_acp: false,
+                claimed_by_wake: true,
+            },
+        );
+        WakeupToolResolution::Emit {
+            call_id: wake_call_id.to_string(),
+            status,
+            detail: incoming_detail,
+            background_task: None,
+        }
+    }
+
+    fn apply_wakeup_update(
+        entry: &mut WakeupToolEntry,
+        incoming_status: ToolCallStatus,
+        incoming_detail: ToolCallDetail,
+        incoming_sig: ToolSignature,
+    ) -> WakeupToolResolution {
+        // Never regress an already-settled (Completed/Failed) non-background entry back to Running
+        if entry.status != ToolCallStatus::Running
+            && incoming_status == ToolCallStatus::Running
+            && !entry.has_bg_task
+        {
+            return WakeupToolResolution::SkipDuplicate;
+        }
+        let had_exit_or_out = tool_detail_has_result(&entry.detail);
+        let merged = merge_tool_details(&entry.detail, incoming_detail);
+        let now_has_exit_or_out = tool_detail_has_result(&merged);
+        let same_status = entry.status == incoming_status;
+        entry.detail = merged.clone();
+        entry.status = incoming_status;
+        if !incoming_sig.target.is_empty() {
+            entry.signature = incoming_sig;
+        }
+        if same_status
+            && incoming_status == ToolCallStatus::Running
+            && !entry.has_bg_task
+            && had_exit_or_out == now_has_exit_or_out
+        {
+            return WakeupToolResolution::SkipDuplicate;
+        }
+        WakeupToolResolution::Emit {
+            call_id: entry.call_id.clone(),
+            status: entry.status,
+            detail: merged,
+            background_task: entry.bg_info.clone(),
+        }
+    }
+
+    fn register_synthetic_bg_task(
         &mut self,
         call_id: &str,
-        status: ToolCallStatus,
         detail: ToolCallDetail,
+        bg_info: BackgroundTaskInfo,
     ) {
         let sig = normalize_tool_signature(&detail);
-        if let Some(existing) = self.entries.get_mut(call_id) {
-            existing.status = status;
-            existing.detail = merge_tool_details(&existing.detail, detail);
-            existing.signature = sig;
+        if let Some(entry) = self.entries.get_mut(call_id) {
+            entry.has_bg_task = true;
+            entry.bg_info = Some(bg_info);
+            entry.status = ToolCallStatus::Running;
+            entry.detail = merge_tool_details(&entry.detail, detail);
         } else {
             self.order.push(call_id.to_string());
             self.entries.insert(
@@ -2519,26 +2888,76 @@ impl WakeupToolRegistry {
                     call_id: call_id.to_string(),
                     signature: sig,
                     detail,
-                    status,
-                    has_bg_task: false,
+                    status: ToolCallStatus::Running,
+                    has_bg_task: true,
+                    bg_info: Some(bg_info),
+                    in_wakeup_acp: false,
+                    claimed_by_wake: true,
                 },
             );
         }
     }
 
-    fn mark_background_task(&mut self, call_id: &str) {
-        if let Some(entry) = self.entries.get_mut(call_id) {
-            entry.has_bg_task = true;
-        }
+    fn mark_background_task(
+        &mut self,
+        call_id: &str,
+        info: BackgroundTaskInfo,
+    ) -> Option<ToolCallDetail> {
+        let canon = self.canonical_id_for_wakeup(call_id).to_string();
+        let entry = self.entries.get_mut(&canon)?;
+        entry.has_bg_task = true;
+        entry.status = ToolCallStatus::Running;
+        entry.bg_info = Some(merge_bg_task_info(entry.bg_info.as_ref(), info));
+        Some(entry.detail.clone())
     }
 
-    fn close_tool(&mut self, call_id: &str) -> Option<ToolCallDetail> {
-        let entry = self.entries.get_mut(call_id)?;
+    fn find_matching_call_id_for_bg_task(&self, description: Option<&str>) -> Option<String> {
+        if let Some(desc) = description.map(str::trim).filter(|s| !s.is_empty()) {
+            let norm_desc = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+            let desc_sig = ToolSignature {
+                kind: "shell",
+                target: norm_desc.clone(),
+            };
+            if let Some(cid) = self.order.iter().rev().find(|cid| {
+                self.entries.get(*cid).is_some_and(|e| {
+                    (e.status == ToolCallStatus::Running || e.has_bg_task)
+                        && (signatures_match(&e.signature, &desc_sig)
+                            || (!e.signature.target.is_empty()
+                                && (norm_desc.contains(&e.signature.target)
+                                    || e.signature.target.contains(&norm_desc))))
+                })
+            }) {
+                return Some(cid.clone());
+            }
+        }
+        // Fallback: if there is exactly one currently-running shell tool, bind to it
+        let open_shells: Vec<&String> = self
+            .order
+            .iter()
+            .filter(|cid| {
+                self.entries.get(*cid).is_some_and(|e| {
+                    e.status == ToolCallStatus::Running && e.signature.kind == "shell"
+                })
+            })
+            .collect();
+        if open_shells.len() == 1 {
+            return Some(open_shells[0].clone());
+        }
+        None
+    }
+
+    fn finish_tool(
+        &mut self,
+        call_id: &str,
+        final_status: ToolCallStatus,
+    ) -> Option<(ToolCallDetail, Option<BackgroundTaskInfo>)> {
+        let canon = self.canonical_id_for_wakeup(call_id).to_string();
+        let entry = self.entries.get_mut(&canon)?;
         if entry.status != ToolCallStatus::Running {
             return None;
         }
-        entry.status = ToolCallStatus::Failed;
-        Some(entry.detail.clone())
+        entry.status = final_status;
+        Some((entry.detail.clone(), entry.bg_info.clone()))
     }
 
     fn lookup_canonical_id(&self, acp_call_id: &str) -> Option<&str> {
@@ -2553,37 +2972,22 @@ impl WakeupToolRegistry {
         acp_call_id: &str,
         status: ToolCallStatus,
         incoming_detail: ToolCallDetail,
+        incoming_bg: Option<BackgroundTaskInfo>,
+        in_post_turn_wakeup: bool,
     ) -> AcpToolResolution {
         // 1. Already mapped from an earlier ACP update to a canonical wakeup tool ID
         if let Some(canon_id) = self.acp_to_canonical.get(acp_call_id).cloned()
             && let Some(entry) = self.entries.get_mut(&canon_id)
         {
-            let merged = merge_tool_details(&entry.detail, incoming_detail);
-            let same_terminal = entry.status == status && status != ToolCallStatus::Running;
-            entry.detail = merged.clone();
-            entry.status = status;
-            if same_terminal {
-                return AcpToolResolution::SkipDuplicate;
-            }
-            return AcpToolResolution::Emit {
-                call_id: canon_id,
-                detail: merged,
-            };
+            return Self::apply_acp_update(entry, status, incoming_detail, incoming_bg);
         }
 
-        // 2. Direct ID match (transcript recorded native call ID)
+        // 2. Direct ID match (ACP `call_*` already registered when it started, or transcript recorded native call ID)
         if let Some(entry) = self.entries.get_mut(acp_call_id) {
-            let merged = merge_tool_details(&entry.detail, incoming_detail);
-            let same_terminal = entry.status == status && status != ToolCallStatus::Running;
-            if same_terminal {
-                return AcpToolResolution::SkipDuplicate;
+            if in_post_turn_wakeup {
+                entry.in_wakeup_acp = true;
             }
-            entry.detail = merged.clone();
-            entry.status = status;
-            return AcpToolResolution::Emit {
-                call_id: acp_call_id.to_string(),
-                detail: merged,
-            };
+            return Self::apply_acp_update(entry, status, incoming_detail, incoming_bg);
         }
 
         // 3. Reconcile ACP native `call_*` against an open/synthetic `wake_tool_*` by signature
@@ -2625,27 +3029,70 @@ impl WakeupToolRegistry {
             && let Some(entry) = self.entries.get_mut(&canon_id)
         {
             self.acp_to_canonical
-                .insert(acp_call_id.to_string(), canon_id.clone());
-            let merged = merge_tool_details(&entry.detail, incoming_detail);
-            entry.detail = merged.clone();
-            entry.status = status;
-            return AcpToolResolution::Emit {
-                call_id: canon_id,
-                detail: merged,
-            };
+                .insert(acp_call_id.to_string(), canon_id);
+            return Self::apply_acp_update(entry, status, incoming_detail, incoming_bg);
         }
 
+        // 4. First time seeing this ACP `call_*`: register it as canonical so subsequent
+        //    ACP updates AND delayed `transcript_full.jsonl` `wake_tool_*` steps converge onto it!
+        let has_bg = incoming_bg.is_some();
+        self.order.push(acp_call_id.to_string());
+        self.entries.insert(
+            acp_call_id.to_string(),
+            WakeupToolEntry {
+                call_id: acp_call_id.to_string(),
+                signature: incoming_sig,
+                detail: incoming_detail.clone(),
+                status,
+                has_bg_task: has_bg,
+                bg_info: incoming_bg.clone(),
+                in_wakeup_acp: in_post_turn_wakeup,
+                claimed_by_wake: false,
+            },
+        );
         AcpToolResolution::Emit {
             call_id: acp_call_id.to_string(),
             detail: incoming_detail,
+            background_task: incoming_bg,
         }
     }
 
-    /// Close all still-open synthetic `wake_tool_*` entries except those tied to active background tasks.
+    fn apply_acp_update(
+        entry: &mut WakeupToolEntry,
+        status: ToolCallStatus,
+        incoming_detail: ToolCallDetail,
+        incoming_bg: Option<BackgroundTaskInfo>,
+    ) -> AcpToolResolution {
+        let bg_newly_attached = if let Some(bg) = incoming_bg {
+            let prev = entry.bg_info.clone();
+            let merged_bg = merge_bg_task_info(prev.as_ref(), bg);
+            let changed = prev.as_ref() != Some(&merged_bg);
+            entry.has_bg_task = true;
+            entry.bg_info = Some(merged_bg);
+            changed
+        } else {
+            false
+        };
+        let merged = merge_tool_details(&entry.detail, incoming_detail);
+        let same_terminal =
+            entry.status == status && status != ToolCallStatus::Running && !bg_newly_attached;
+        entry.detail = merged.clone();
+        entry.status = status;
+        if same_terminal {
+            return AcpToolResolution::SkipDuplicate;
+        }
+        AcpToolResolution::Emit {
+            call_id: entry.call_id.clone(),
+            detail: merged,
+            background_task: entry.bg_info.clone(),
+        }
+    }
+
+    /// Close all still-open entries (both `wake_tool_*` and ACP `call_*`) except those tied to active background tasks.
     fn settle_open_tools(
         &mut self,
         active_bg_call_ids: &HashSet<String>,
-    ) -> Vec<(String, ToolCallDetail)> {
+    ) -> Vec<(String, ToolCallDetail, Option<BackgroundTaskInfo>)> {
         let mut closed = Vec::new();
         for cid in &self.order {
             if active_bg_call_ids.contains(cid) {
@@ -2655,11 +3102,52 @@ impl WakeupToolRegistry {
                 && entry.status == ToolCallStatus::Running
             {
                 entry.status = ToolCallStatus::Completed;
-                closed.push((entry.call_id.clone(), entry.detail.clone()));
+                closed.push((
+                    entry.call_id.clone(),
+                    entry.detail.clone(),
+                    entry.bg_info.clone(),
+                ));
             }
         }
         closed
     }
+}
+
+fn tool_detail_has_result(detail: &ToolCallDetail) -> bool {
+    match detail {
+        ToolCallDetail::Shell {
+            exit_code,
+            output_preview,
+            ..
+        } => exit_code.is_some() || output_preview.as_ref().is_some_and(|s| !s.is_empty()),
+        _ => false,
+    }
+}
+
+fn merge_bg_task_info(
+    prev: Option<&BackgroundTaskInfo>,
+    incoming: BackgroundTaskInfo,
+) -> BackgroundTaskInfo {
+    match prev {
+        Some(p) => BackgroundTaskInfo {
+            task_id: incoming.task_id.or_else(|| p.task_id.clone()),
+            label: incoming.label.or_else(|| p.label.clone()),
+            log_path: incoming.log_path.or_else(|| p.log_path.clone()),
+        },
+        None => incoming,
+    }
+}
+
+fn sanitize_bg_task_id(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn signatures_match(a: &ToolSignature, b: &ToolSignature) -> bool {
@@ -2702,21 +3190,119 @@ fn extract_log_path_from_text(text: &str) -> Option<String> {
     None
 }
 
-fn parse_bg_task_started(text: &str) -> Option<(String, Option<String>)> {
-    let marker = "Tool is running as a background task with task id:";
-    let idx = text.find(marker)?;
-    let rest = text[idx + marker.len()..].trim_start();
-    let task_id = rest
-        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('.')
-        .to_string();
-    if task_id.is_empty() {
+fn parse_bg_task_started(
+    text: &str,
+    expected_session_id: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let expected_session = expected_session_id.trim();
+    if expected_session.is_empty() {
         return None;
     }
-    let log_path = extract_log_path_from_text(text);
-    Some((task_id, log_path))
+    const MARKER: &str = "Tool is running as a background task with task id:";
+
+    // Anchor strictly to the top metadata header emitted by `agy` when a tool transitions to a
+    // background task: only leading blank lines and `Created At:` lines may precede the marker
+    // at column 0. Completed tool outputs (`Completed At:`, `Command exited with code`,
+    // `Showing lines `, `Command output:`), source code, or JSON quotes are immediately rejected.
+    let mut lines = text.lines().enumerate();
+    let mut marker_rest: Option<&str> = None;
+    let mut marker_idx: usize = 0;
+
+    for (idx, raw_line) in lines.by_ref() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            if idx >= 4 {
+                return None;
+            }
+            continue;
+        }
+        if line.starts_with("Created At:") {
+            if idx >= 4 {
+                return None;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix(MARKER) {
+            marker_rest = Some(rest);
+            marker_idx = idx;
+        }
+        break;
+    }
+
+    let rest = marker_rest?.trim();
+    let task_id = rest.trim_end_matches('.');
+    if task_id.is_empty()
+        || !task_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | ':' | '.'))
+    {
+        return None;
+    }
+
+    // Strict session ownership check: reject foreign session task IDs and test literals.
+    let expected_prefix = format!("{expected_session}/");
+    if !task_id.starts_with(&expected_prefix) || task_id.len() <= expected_prefix.len() {
+        return None;
+    }
+
+    // Extract optional metadata headers immediately following the marker, stopping before `Log output:`.
+    let mut description: Option<String> = None;
+    let mut log_path: Option<String> = None;
+    for (idx, raw_line) in lines {
+        if idx > marker_idx + 10 {
+            break;
+        }
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with("Log output:") {
+            break;
+        }
+        if description.is_none()
+            && let Some(desc) = line.strip_prefix("Task Description:")
+        {
+            let trimmed = desc.trim();
+            if !trimmed.is_empty() {
+                description = Some(truncate_preview(trimmed, 240));
+            }
+        } else if log_path.is_none() {
+            for log_marker in ["Task logs are available at: file://", "Log: file://"] {
+                if let Some(lp) = line.strip_prefix(log_marker) {
+                    let path = lp
+                        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')')
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('.');
+                    if !path.is_empty() {
+                        log_path = Some(path.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    Some((task_id.to_string(), description, log_path))
+}
+
+fn is_system_message_step(step_type: &str, content: &str) -> bool {
+    if step_type == "SYSTEM_MESSAGE" {
+        return true;
+    }
+    // Never treat tool results (`GENERIC`), planner replies, user inputs, checkpoints, or API
+    // errors as system wakeup messages just because their body quotes `<SYSTEM_MESSAGE>`.
+    if matches!(
+        step_type,
+        "GENERIC" | "PLANNER_RESPONSE" | "USER_INPUT" | "CHECKPOINT" | "ERROR_MESSAGE"
+    ) {
+        return false;
+    }
+    for raw_line in content.lines().take(4) {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("Created At:") {
+            continue;
+        }
+        return trimmed.starts_with("<SYSTEM_MESSAGE>");
+    }
+    false
 }
 
 fn parse_bg_task_completed_or_canceled(text: &str) -> Vec<(String, bool, Option<String>)> {
@@ -3044,6 +3630,7 @@ fn attach_transcript_tool_result(mut detail: ToolCallDetail, content: &str) -> T
 }
 
 struct AgyTranscriptMonitor {
+    session_id: String,
     brain_dir: PathBuf,
     full_path: PathBuf,
     compact_path: PathBuf,
@@ -3064,12 +3651,13 @@ impl AgyTranscriptMonitor {
     fn new(session_id: &str) -> Self {
         let data_dir = resolve_agy_data_dir();
         let brain_dir = data_dir.join("brain").join(session_id);
-        Self::from_brain_dir(brain_dir)
+        Self::from_brain_dir_with_session(brain_dir, session_id)
     }
 
-    fn from_brain_dir(brain_dir: PathBuf) -> Self {
+    fn from_brain_dir_with_session(brain_dir: PathBuf, session_id: impl Into<String>) -> Self {
         let logs_dir = brain_dir.join(".system_generated/logs");
         Self {
+            session_id: session_id.into(),
             brain_dir,
             full_path: logs_dir.join("transcript_full.jsonl"),
             compact_path: logs_dir.join("transcript.jsonl"),
@@ -3319,18 +3907,24 @@ impl AgyTranscriptMonitor {
 
             let content = step.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Capture background-task lifecycle even in silent foreground sync mode
+            // Capture background-task lifecycle even in silent foreground sync mode.
+            // Only `GENERIC` steps in `RUNNING` state with strict session-scoped header match
+            // count as a real background task start; `DONE` tool outputs (read_file, grep, sqlite)
+            // can never enqueue phantom background tasks.
             if step_type == "GENERIC"
-                && let Some((task_id, log_path)) = parse_bg_task_started(content)
+                && status == "RUNNING"
+                && let Some((task_id, description, log_path)) =
+                    parse_bg_task_started(content, &self.session_id)
             {
                 bg_deltas.push(BgTaskDelta::Started {
                     task_id,
                     call_id: None,
+                    description,
                     log_path,
                 });
-            } else if step_type == "SYSTEM_MESSAGE" || content.contains("<SYSTEM_MESSAGE>") {
-                for (task_id, _, _) in parse_bg_task_completed_or_canceled(content) {
-                    bg_deltas.push(BgTaskDelta::Completed { task_id });
+            } else if is_system_message_step(step_type, content) {
+                for (task_id, canceled, _) in parse_bg_task_completed_or_canceled(content) {
+                    bg_deltas.push(BgTaskDelta::Completed { task_id, canceled });
                 }
             }
 
@@ -3347,7 +3941,7 @@ impl AgyTranscriptMonitor {
                     level: "info".into(),
                     message: "Context compacted automatically".into(),
                 });
-            } else if step_type == "SYSTEM_MESSAGE" || content.contains("<SYSTEM_MESSAGE>") {
+            } else if is_system_message_step(step_type, content) {
                 for (task_id, canceled, _) in parse_bg_task_completed_or_canceled(content) {
                     out.push(WakeupStep::BackgroundTaskCompleted { task_id, canceled });
                 }
@@ -3433,10 +4027,14 @@ impl AgyTranscriptMonitor {
                 self.last_in_progress_heartbeat = Some(Instant::now());
                 let (cid, orig_detail) = self.pending_tools.remove(0);
                 let detail = attach_transcript_tool_result(orig_detail, content);
-                if let Some((task_id, log_path)) = parse_bg_task_started(content) {
+                if status == "RUNNING"
+                    && let Some((task_id, description, log_path)) =
+                        parse_bg_task_started(content, &self.session_id)
+                {
                     out.push(WakeupStep::BackgroundTaskStarted {
                         task_id,
                         call_id: Some(cid.clone()),
+                        description,
                         log_path,
                     });
                     // Keep the tool call visibly running while the background task executes
@@ -3457,11 +4055,14 @@ impl AgyTranscriptMonitor {
                     });
                 }
             } else if step_type == "GENERIC"
-                && let Some((task_id, log_path)) = parse_bg_task_started(content)
+                && status == "RUNNING"
+                && let Some((task_id, description, log_path)) =
+                    parse_bg_task_started(content, &self.session_id)
             {
                 out.push(WakeupStep::BackgroundTaskStarted {
                     task_id,
                     call_id: None,
+                    description,
                     log_path,
                 });
             }
@@ -4213,7 +4814,7 @@ mod tests {
     #[tokio::test]
     async fn acp_session_update_streams_without_user_message_chunk_and_skips_wakeup_dups() {
         let mut wakeup_tools = WakeupToolRegistry::default();
-        wakeup_tools.record_wakeup_tool(
+        let _ = wakeup_tools.resolve_wakeup_tool(
             "call_wakeup_dup",
             ToolCallStatus::Completed,
             ToolCallDetail::Generic {
@@ -4233,10 +4834,12 @@ mod tests {
 
         handle_acp_session_update(
             "ag_test",
+            "conv_test",
             &json!({
                 "sessionUpdate": "agent_thought_chunk",
                 "content": { "text": "Inspecting code" }
             }),
+            false,
             &mut wakeup_tools,
             &mut bg_tracker,
             &mut seg_state,
@@ -4249,12 +4852,14 @@ mod tests {
 
         handle_acp_session_update(
             "ag_test",
+            "conv_test",
             &json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": "call_wakeup_dup",
                 "title": "Duplicate tool",
                 "status": "completed"
             }),
+            false,
             &mut wakeup_tools,
             &mut bg_tracker,
             &mut seg_state,
@@ -4267,6 +4872,7 @@ mod tests {
 
         handle_acp_session_update(
             "ag_test",
+            "conv_test",
             &json!({
                 "sessionUpdate": "tool_call",
                 "toolCallId": "call_live",
@@ -4275,6 +4881,7 @@ mod tests {
                 "status": "completed",
                 "rawInput": { "Path": "src/main.rs" }
             }),
+            false,
             &mut wakeup_tools,
             &mut bg_tracker,
             &mut seg_state,
@@ -4287,10 +4894,12 @@ mod tests {
 
         handle_acp_session_update(
             "ag_test",
+            "conv_test",
             &json!({
                 "sessionUpdate": "agent_message_chunk",
                 "content": { "text": "Done!" }
             }),
+            false,
             &mut wakeup_tools,
             &mut bg_tracker,
             &mut seg_state,
@@ -4354,12 +4963,14 @@ mod tests {
 
         handle_acp_session_update(
             "ag_test",
+            "conv_net",
             &json!({
                 "sessionUpdate": "agent_message_chunk",
                 "content": {
                     "text": "\n⚠ API error (attempt 1): request failed: read: connection reset by peer\n\n⚠ The stream was interrupted. Please continue the task you were working on.\n"
                 }
             }),
+            false,
             &mut wakeup_tools,
             &mut bg_tracker,
             &mut seg_state,
@@ -4442,7 +5053,8 @@ mod tests {
             + "\n";
         std::fs::write(&transcript_path, payload).expect("write transcript");
 
-        let mut monitor = AgyTranscriptMonitor::from_brain_dir(dir.clone());
+        let mut monitor =
+            AgyTranscriptMonitor::from_brain_dir_with_session(dir.clone(), "conv_wake");
         monitor.full_path = dir.join("missing.jsonl");
         monitor.compact_path = transcript_path;
 
@@ -4501,7 +5113,7 @@ mod tests {
         let (evt_tx, mut evt_rx) = mpsc::channel(16);
 
         // 1. Transcript emits synthetic `wake_tool_684_0` running a background command
-        wakeup_tools.record_wakeup_tool(
+        let _ = wakeup_tools.resolve_wakeup_tool(
             "wake_tool_684_0",
             ToolCallStatus::Running,
             ToolCallDetail::Shell {
@@ -4511,11 +5123,17 @@ mod tests {
                 output_preview: None,
             },
         );
-        wakeup_tools.mark_background_task("wake_tool_684_0");
+        let bg_meta = BackgroundTaskInfo {
+            task_id: Some("conv_1/task-685".into()),
+            label: Some("Run e2e tests".into()),
+            log_path: Some("/tmp/task-685.log".into()),
+        };
+        wakeup_tools.mark_background_task("wake_tool_684_0", bg_meta.clone());
         bg_tracker.record_started(
             "conv_1/task-685".into(),
             Some("wake_tool_684_0".into()),
             Some("/tmp/task-685.log".into()),
+            Some(bg_meta),
         );
 
         // 2. Wakeup round settles while background task is STILL running -> tool stays open!
@@ -4528,6 +5146,7 @@ mod tests {
         // 3. Background task gets killed by signal; ACP delivers native `call_2135459364435572431` failed!
         let sig_cancel = handle_acp_session_update(
             "ag_test",
+            "conv_1",
             &json!({
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": "call_2135459364435572431",
@@ -4537,6 +5156,7 @@ mod tests {
                 "rawInput": { "CommandLine": "cargo test -p orbit-cli --test e2e_orchestration" },
                 "rawOutput": "Command was terminated by signal or canceled."
             }),
+            true,
             &mut wakeup_tools,
             &mut bg_tracker,
             &mut seg_state,
@@ -4554,8 +5174,9 @@ mod tests {
             DriverEvent::ToolCall {
                 ref call_id,
                 status: ToolCallStatus::Failed,
+                background_task: Some(ref bt),
                 ..
-            } if call_id == "wake_tool_684_0"
+            } if call_id == "wake_tool_684_0" && bt.task_id.as_deref() == Some("conv_1/task-685")
         ));
         assert!(evt_rx.try_recv().is_err());
 
@@ -4566,7 +5187,7 @@ mod tests {
         assert!(bg_tracker.is_empty());
 
         // 4. Orphan non-bg running tool is cleanly closed on Settled
-        wakeup_tools.record_wakeup_tool(
+        let _ = wakeup_tools.resolve_wakeup_tool(
             "wake_tool_700_0",
             ToolCallStatus::Running,
             ToolCallDetail::FileRead {
@@ -4578,6 +5199,245 @@ mod tests {
         let settled = wakeup_tools.settle_open_tools(&bg_tracker.active_call_ids());
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].0, "wake_tool_700_0");
+    }
+
+    #[tokio::test]
+    async fn wakeup_tool_registry_reconciles_acp_first_without_zombie_running_or_bg_duplicates() {
+        let mut wakeup_tools = WakeupToolRegistry::default();
+        let mut bg_tracker = BackgroundTaskTracker::default();
+        let mut seg_state = AgyStreamSegmentState {
+            turn_tag: "turn_acp_first".into(),
+            ..AgyStreamSegmentState::default()
+        };
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let mut last_ask_raw = None;
+        let (evt_tx, mut evt_rx) = mpsc::channel(32);
+
+        // Scenario A: Foreground shell during wakeup arrives via ACP FIRST (`call_1834`),
+        // then transcript produces `wake_tool_1228_0`, then command finishes!
+        handle_acp_session_update(
+            "ag_test",
+            "conv_1",
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1834",
+                "kind": "execute",
+                "title": "Run command",
+                "status": "in_progress",
+                "rawInput": { "CommandLine": "echo hello && git status" }
+            }),
+            true,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+
+        let ev_start = evt_rx.try_recv().expect("acp running emitted");
+        assert!(matches!(
+            ev_start,
+            DriverEvent::ToolCall {
+                ref call_id,
+                status: ToolCallStatus::Running,
+                background_task: None,
+                ..
+            } if call_id == "call_1834"
+        ));
+
+        // Transcript poll sees `wake_tool_1228_0` Running -> must map onto `call_1834` (no duplicate!)
+        let res_wake_run = wakeup_tools.resolve_wakeup_tool(
+            "wake_tool_1228_0",
+            ToolCallStatus::Running,
+            ToolCallDetail::Shell {
+                command: "echo hello && git status".into(),
+                cwd: None,
+                exit_code: None,
+                output_preview: None,
+            },
+        );
+        assert!(matches!(res_wake_run, WakeupToolResolution::SkipDuplicate));
+
+        // Transcript poll sees `wake_tool_1228_0` Completed -> must emit Completed under `call_1834`!
+        let res_wake_done = wakeup_tools.resolve_wakeup_tool(
+            "wake_tool_1228_0",
+            ToolCallStatus::Completed,
+            ToolCallDetail::Shell {
+                command: "echo hello && git status".into(),
+                cwd: None,
+                exit_code: Some(0),
+                output_preview: Some("hello".into()),
+            },
+        );
+        assert!(matches!(
+            res_wake_done,
+            WakeupToolResolution::Emit {
+                ref call_id,
+                status: ToolCallStatus::Completed,
+                background_task: None,
+                ..
+            } if call_id == "call_1834"
+        ));
+
+        // Subsequent ACP Completed for `call_1834` must be suppressed as duplicate (already completed)
+        handle_acp_session_update(
+            "ag_test",
+            "conv_1",
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_1834",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": { "CommandLine": "echo hello && git status" }
+            }),
+            true,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "duplicate terminal ACP update suppressed"
+        );
+
+        // Scenario B: Fast <10ms ACP tool completes BEFORE transcript poll arrives
+        handle_acp_session_update(
+            "ag_test",
+            "conv_1",
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_fast_read",
+                "kind": "read",
+                "status": "completed",
+                "rawInput": { "Path": "Cargo.toml" }
+            }),
+            true,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        let _ = evt_rx.try_recv().expect("fast read completed");
+
+        let res_fast_wake = wakeup_tools.resolve_wakeup_tool(
+            "wake_tool_1246_0",
+            ToolCallStatus::Running,
+            ToolCallDetail::FileRead {
+                path: "Cargo.toml".into(),
+                start_line: None,
+                end_line: None,
+            },
+        );
+        assert!(
+            matches!(res_fast_wake, WakeupToolResolution::SkipDuplicate),
+            "late transcript Running must NOT regress fast Completed ACP tool or create duplicate"
+        );
+
+        // Scenario C: Real background task arrives ACP-first (`call_1041`), then transcript marks it
+        // as background task `conv_1/task-1290` -> must stay ONE card with `background_task: Some(...)`
+        handle_acp_session_update(
+            "ag_test",
+            "conv_1",
+            &json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_1041",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": { "CommandLine": "python render_video.py --hd" }
+            }),
+            true,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        let _ = evt_rx
+            .try_recv()
+            .expect("bg shell initially running foreground");
+
+        // Transcript step starts the tool (`wake_tool_1289_0` maps to `call_1041`)
+        let _ = wakeup_tools.resolve_wakeup_tool(
+            "wake_tool_1289_0",
+            ToolCallStatus::Running,
+            ToolCallDetail::Shell {
+                command: "python render_video.py --hd".into(),
+                cwd: None,
+                exit_code: None,
+                output_preview: None,
+            },
+        );
+        let canon = wakeup_tools
+            .canonical_id_for_wakeup("wake_tool_1289_0")
+            .to_string();
+        assert_eq!(canon, "call_1041");
+
+        let bg_info = BackgroundTaskInfo {
+            task_id: Some("conv_1/task-1290".into()),
+            label: Some("python render_video.py --hd".into()),
+            log_path: Some("/tmp/task-1290.log".into()),
+        };
+        wakeup_tools.mark_background_task(&canon, bg_info.clone());
+        bg_tracker.record_started(
+            "conv_1/task-1290".into(),
+            Some(canon.clone()),
+            Some("/tmp/task-1290.log".into()),
+            Some(bg_info),
+        );
+
+        let res_bg_emit = wakeup_tools.resolve_wakeup_tool(
+            "wake_tool_1289_0",
+            ToolCallStatus::Running,
+            ToolCallDetail::Shell {
+                command: "python render_video.py --hd".into(),
+                cwd: None,
+                exit_code: None,
+                output_preview: Some(
+                    "Tool is running as a background task with task id: conv_1/task-1290".into(),
+                ),
+            },
+        );
+        assert!(matches!(
+            res_bg_emit,
+            WakeupToolResolution::Emit {
+                ref call_id,
+                status: ToolCallStatus::Running,
+                background_task: Some(ref bt),
+                ..
+            } if call_id == "call_1041" && bt.task_id.as_deref() == Some("conv_1/task-1290")
+        ));
+
+        // On Settled, ONLY `call_1041` remains open (ZERO zombie foreground calls!)
+        let settled = wakeup_tools.settle_open_tools(&bg_tracker.active_call_ids());
+        assert!(settled.is_empty());
+
+        // When BackgroundTaskCompleted arrives, `finish_tool` closes `call_1041` immediately
+        let info = bg_tracker.remove("conv_1/task-1290").expect("tracked");
+        let cid = info.call_id.expect("bound call_id");
+        assert_eq!(cid, "call_1041");
+        let (_, closed_bg) = wakeup_tools
+            .finish_tool(&cid, ToolCallStatus::Completed)
+            .expect("closed");
+        assert_eq!(
+            closed_bg.and_then(|b| b.task_id).as_deref(),
+            Some("conv_1/task-1290")
+        );
     }
 
     #[test]
@@ -4621,7 +5481,7 @@ mod tests {
             + "\n";
         std::fs::write(&transcript_path, &initial).expect("write initial");
 
-        let mut monitor = AgyTranscriptMonitor::from_brain_dir(dir.clone());
+        let mut monitor = AgyTranscriptMonitor::from_brain_dir_with_session(dir.clone(), "conv_1");
         let steps1 = monitor.poll_post_turn_wakeup();
         // Must surface compaction divider notice AND incremental thinking while PLANNER_RESPONSE is still RUNNING!
         assert!(steps1.iter().any(|s| matches!(
@@ -4687,6 +5547,7 @@ mod tests {
             "conv_1/task-716".into(),
             Some("wake_tool_22_0".into()),
             Some(log_file.to_string_lossy().to_string()),
+            None,
         );
         assert_eq!(tracker.waiting_source_label(), "waiting:1 background task");
 
@@ -4722,5 +5583,289 @@ mod tests {
         assert!(prompt.contains("NOT canceled by the user"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bg_task_parser_rejects_source_code_completed_outputs_and_foreign_sessions() {
+        // Positive: real Antigravity background-task start header belonging to current session
+        let real_start = "Created At: 2026-11-20T14:56:09+08:00\n\
+Tool is running as a background task with task id: sess_abc/task-1290\n\
+Task Description: Render HD video\n\
+Task logs are available at: file:///tmp/task-1290.log\n\
+Log output:\n\
+Task Description: spoofed inside log stdout\n\
+Log: file:///tmp/spoofed.log\n";
+        let (tid, desc, log) =
+            parse_bg_task_started(real_start, "sess_abc").expect("must match own bg task");
+        assert_eq!(tid, "sess_abc/task-1290");
+        assert_eq!(desc.as_deref(), Some("Render HD video"));
+        assert_eq!(log.as_deref(), Some("/tmp/task-1290.log"));
+
+        // Positive: header without leading Created At
+        let minimal = "Tool is running as a background task with task id: sess_abc/task-42\n\
+Task logs are available at: file:///tmp/task-42.log\n";
+        let (tid2, desc2, log2) =
+            parse_bg_task_started(minimal, "sess_abc").expect("must match minimal header");
+        assert_eq!(tid2, "sess_abc/task-42");
+        assert_eq!(desc2, None);
+        assert_eq!(log2.as_deref(), Some("/tmp/task-42.log"));
+
+        // Negative 1: `read_file` reading `antigravity.rs` source code containing test literals
+        let read_file_out = "Created At: 2026-11-20T15:00:00+08:00\n\
+Completed At: 2026-11-20T15:00:01+08:00\n\
+Showing lines 4650-4670 of 4726\n\
+4667: \"content\": \"Tool is running as a background task with task id: conv_1/task-716\"\n";
+        assert!(parse_bg_task_started(read_file_out, "sess_abc").is_none());
+        assert!(parse_bg_task_started(read_file_out, "conv_1").is_none());
+
+        // Negative 2: completed shell/sqlite output printing another session's (or even same session's) task ID
+        let sqlite_out = "Created At: 2026-11-20T15:17:37+08:00\n\
+Completed At: 2026-11-20T15:17:40+08:00\n\
+Command exited with code 0.\n\n\
+Command output:\n\
+6205|wake_tool_1293_1|running|shell|Created At: 2026-11-20T15:13:56+08:00\n\
+Tool is running as a background task with task id: sess_abc/task-1295\n";
+        assert!(parse_bg_task_started(sqlite_out, "sess_abc").is_none());
+
+        // Negative 3: foreign session ID even with valid header structure
+        let foreign_start = "Created At: 2026-11-20T15:13:56+08:00\n\
+Tool is running as a background task with task id: 403bd6c2-other/task-1295\n\
+Task logs are available at: file:///tmp/task-1295.log\n";
+        assert!(parse_bg_task_started(foreign_start, "sess_abc").is_none());
+
+        // Negative 4: indented / quoted marker line
+        let quoted = "  \"Tool is running as a background task with task id: sess_abc/task-1\"\n";
+        assert!(parse_bg_task_started(quoted, "sess_abc").is_none());
+    }
+
+    #[test]
+    fn transcript_monitor_ignores_generic_done_and_embedded_system_message_in_tool_outputs() {
+        let dir = std::env::temp_dir().join(format!("orbit_strict_bg_{}", uuid::Uuid::new_v4()));
+        let logs_dir = dir.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs_dir).expect("mkdir logs");
+        let transcript_path = logs_dir.join("transcript_full.jsonl");
+
+        // Steps 1-4 are ordinary DONE tool outputs / planner text quoting bg markers & `<SYSTEM_MESSAGE>`
+        let noisy_steps = [
+            json!({
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Showing lines 4390-4680\n\"content\": \"<SYSTEM_MESSAGE>background task done</SYSTEM_MESSAGE>\"\nTool is running as a background task with task id: conv_self/task-999\n"
+            }),
+            json!({
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created At: 2026-11-20T15:00:00+08:00\nTool is running as a background task with task id: conv_self/task-888\n"
+            }),
+            json!({
+                "step_index": 3,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": "Created At: 2026-11-20T15:00:01+08:00\nTool is running as a background task with task id: other_session/task-777\n"
+            }),
+            json!({
+                "step_index": 4,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "content": "Note: `<SYSTEM_MESSAGE>` is only for real system notifications."
+            }),
+        ];
+        let payload1 = noisy_steps
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&transcript_path, &payload1).expect("write noisy");
+
+        let mut monitor =
+            AgyTranscriptMonitor::from_brain_dir_with_session(dir.clone(), "conv_self");
+        let steps1 = monitor.poll_post_turn_wakeup();
+        assert!(
+            steps1.is_empty(),
+            "read_file/DONE/foreign/planner steps must NEVER trigger wakeup or bg tasks, got: {}",
+            steps1.len()
+        );
+        assert!(!monitor.in_wakeup);
+
+        // Also check silent foreground sync on noisy steps yields ZERO BgTaskDelta
+        let mut silent_mon =
+            AgyTranscriptMonitor::from_brain_dir_with_session(dir.clone(), "conv_self");
+        let silent_deltas = silent_mon.sync_silent_with_bg_tasks();
+        assert!(silent_deltas.is_empty());
+
+        // Now append a REAL self-session RUNNING background task + its real SYSTEM_MESSAGE completion
+        let real_steps = [
+            json!({
+                "step_index": 5,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": "Created At: 2026-11-20T15:10:00+08:00\nTool is running as a background task with task id: conv_self/task-500\nTask Description: Generate video\nTask logs are available at: file:///tmp/task-500.log\n"
+            }),
+            json!({
+                "step_index": 6,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": "<SYSTEM_MESSAGE>Task id \"conv_self/task-500\" finished with result: ok</SYSTEM_MESSAGE>"
+            }),
+        ];
+        let payload2 = format!(
+            "{payload1}{}\n",
+            real_steps
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        std::fs::write(&transcript_path, &payload2).expect("append real");
+
+        let steps2 = monitor.poll_post_turn_wakeup();
+        assert!(steps2.iter().any(|s| matches!(
+            s,
+            WakeupStep::BackgroundTaskStarted { task_id, description, log_path, .. }
+                if task_id == "conv_self/task-500"
+                    && description.as_deref() == Some("Generate video")
+                    && log_path.as_deref() == Some("/tmp/task-500.log")
+        )));
+        assert!(steps2.iter().any(|s| matches!(
+            s,
+            WakeupStep::BackgroundTaskCompleted { task_id, canceled: false }
+                if task_id == "conv_self/task-500"
+        )));
+        assert!(
+            steps2
+                .iter()
+                .any(|s| matches!(s, WakeupStep::Started { .. }))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn acp_session_update_rejects_foreign_or_completed_replayed_bg_tasks() {
+        let mut wakeup_tools = WakeupToolRegistry::default();
+        let mut bg_tracker = BackgroundTaskTracker::default();
+        // Simulate shim reattach having already observed `conv_self/task-10` as completed on disk
+        bg_tracker.mark_finished("conv_self/task-10".into());
+
+        let mut seg_state = AgyStreamSegmentState {
+            turn_tag: "turn_reattach".into(),
+            ..AgyStreamSegmentState::default()
+        };
+        let mut tool_cache = HashMap::new();
+        let mut subagent_monitors = HashMap::new();
+        let mut last_ask_raw = None;
+        let (evt_tx, mut evt_rx) = mpsc::channel(16);
+
+        // 1. Replayed historical ACP frame for already-finished `conv_self/task-10` must NOT
+        //    force status back to Running or re-add to `bg_tracker`!
+        handle_acp_session_update(
+            "ag_test",
+            "conv_self",
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_replayed_done",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": { "CommandLine": "cargo test" },
+                "rawOutput": "Created At: 2026-11-20T15:00:00+08:00\nTool is running as a background task with task id: conv_self/task-10\n"
+            }),
+            false,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        let ev1 = evt_rx.try_recv().expect("replayed frame emitted");
+        assert!(matches!(
+            ev1,
+            DriverEvent::ToolCall {
+                ref call_id,
+                status: ToolCallStatus::Completed,
+                background_task: None,
+                ..
+            } if call_id == "call_replayed_done"
+        ));
+        assert!(bg_tracker.is_empty());
+
+        // 2. Completed `read_file` containing test marker for `conv_1/task-716` must stay Completed
+        handle_acp_session_update(
+            "ag_test",
+            "conv_self",
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_read_src",
+                "kind": "read",
+                "status": "completed",
+                "rawInput": { "Path": "crates/orbit-providers/src/antigravity.rs" },
+                "rawOutput": "Showing lines 4660-4670\n\"Tool is running as a background task with task id: conv_1/task-716\""
+            }),
+            false,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        let ev2 = evt_rx.try_recv().expect("read_file emitted");
+        assert!(matches!(
+            ev2,
+            DriverEvent::ToolCall {
+                ref call_id,
+                status: ToolCallStatus::Completed,
+                background_task: None,
+                ..
+            } if call_id == "call_read_src"
+        ));
+        assert!(bg_tracker.is_empty());
+
+        // 3. Genuine live background task for `conv_self/task-20` MUST be tracked & marked Running
+        handle_acp_session_update(
+            "ag_test",
+            "conv_self",
+            &json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call_live_bg",
+                "kind": "execute",
+                "status": "completed",
+                "rawInput": { "CommandLine": "python generate_video.py" },
+                "rawOutput": "Created At: 2026-11-20T15:20:00+08:00\nTool is running as a background task with task id: conv_self/task-20\nTask Description: Video generation\nTask logs are available at: file:///tmp/task-20.log\n"
+            }),
+            false,
+            &mut wakeup_tools,
+            &mut bg_tracker,
+            &mut seg_state,
+            &mut tool_cache,
+            &mut subagent_monitors,
+            &mut last_ask_raw,
+            &evt_tx,
+        )
+        .await;
+        let ev3 = evt_rx.try_recv().expect("live bg emitted");
+        assert!(matches!(
+            ev3,
+            DriverEvent::ToolCall {
+                ref call_id,
+                status: ToolCallStatus::Running,
+                background_task: Some(ref bt),
+                ..
+            } if call_id == "call_live_bg"
+                && bt.task_id.as_deref() == Some("conv_self/task-20")
+                && bt.label.as_deref() == Some("Video generation")
+        ));
+        assert!(!bg_tracker.is_empty());
+        assert_eq!(
+            bg_tracker.waiting_source_label(),
+            "waiting:1 background task"
+        );
     }
 }

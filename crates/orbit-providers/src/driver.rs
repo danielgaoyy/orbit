@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, ProviderKind, ProviderSubagentDescriptor, QuestionItem,
-    ReasoningEffort, SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus,
+    ActiveTurnBehavior, AgentStatus, BackgroundTaskInfo, ProviderKind, ProviderSubagentDescriptor,
+    QuestionItem, ReasoningEffort, SessionMode, TimelinePayload, ToolCallDetail, ToolCallStatus,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -89,6 +89,7 @@ pub enum DriverEvent {
         call_id: String,
         status: ToolCallStatus,
         detail: ToolCallDetail,
+        background_task: Option<BackgroundTaskInfo>,
     },
     PermissionRequest {
         request_id: String,

@@ -18,7 +18,6 @@ import {
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { QueuedPromptItem } from "@/state/orbit-store";
 import { orbitActions, sideQuestionScopeKey, useOrbitSelector } from "@/state/orbit-store";
 import type { DiffFileView, SessionInsightsView } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
@@ -30,7 +29,6 @@ const EMPTY_INSIGHTS: SessionInsightsView = {
   detected_local_urls: [],
 };
 const EMPTY_DIFFS: readonly DiffFileView[] = [];
-const EMPTY_QUEUED: QueuedPromptItem[] = [];
 const EMPTY_FILES: string[] = [];
 
 const WEB_TLD_URL_RE =
@@ -190,6 +188,7 @@ export function SidePanelLaunchpad({
   const [query, setQuery] = useState("");
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
   const [showAllTasks, setShowAllTasks] = useState(false);
+  const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
@@ -197,7 +196,6 @@ export function SidePanelLaunchpad({
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const stages = useOrbitSelector((s) => s.stages);
-  const queuedPrompts = useOrbitSelector((s) => s.queuedPrompts);
   const gitReviews = useOrbitSelector((s) => s.gitReviews);
   const workspaceFilesCache = useOrbitSelector((s) => s.workspaceFilesCache);
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
@@ -221,29 +219,8 @@ export function SidePanelLaunchpad({
   }, [hostDetail, isDraftNewSession, selectedAgentId, selectedHostId, stage?.agent]);
 
   const cwd = currentAgent?.cwd || selectedWorkspaceCwd || "~";
-  const queued = stageKey ? (queuedPrompts[stageKey] ?? EMPTY_QUEUED) : EMPTY_QUEUED;
   const insights = stage?.insights ?? EMPTY_INSIGHTS;
-
-  const backgroundTasks = useMemo(() => {
-    if (queued.length === 0) return insights.background_tasks;
-    const merged = [...insights.background_tasks];
-    const seenIds = new Set(merged.map((t) => t.id));
-    for (const qp of queued) {
-      const qId = `queue:${qp.id}`;
-      if (seenIds.has(qId)) continue;
-      merged.push({
-        id: qId,
-        kind: "queued",
-        title: (qp.displayText || "Queued follow-up").slice(0, 72),
-        subtitle: "Queued · runs when turn finishes",
-        status: "queued",
-        started_at_ms: null,
-        command: null,
-        output_preview: null,
-      });
-    }
-    return merged;
-  }, [insights.background_tasks, queued]);
+  const backgroundTasks = insights.background_tasks;
 
   const sessionTurnDiffs = stage?.session_turn_diffs ?? EMPTY_DIFFS;
   const gitReview =
@@ -722,6 +699,8 @@ export function SidePanelLaunchpad({
                                 role: subagent.role,
                                 promptPreview: subagent.prompt_preview,
                                 childAgentId: subagent.child_agent_id,
+                                providerSubagentId: subagent.provider_subagent_id ?? null,
+                                parentAgentId: selectedAgentId,
                               })
                             }
                             className="group/item text-foreground/85 flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2.5 text-left text-[12.5px] transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
@@ -759,31 +738,67 @@ export function SidePanelLaunchpad({
                       {visibleBackgroundTasks.map((task) => {
                         const isRunning = task.status === "running";
                         const isTimerLike =
-                          task.kind === "wakeup" ||
-                          task.kind === "queued" ||
-                          /\btimer\b/i.test(task.title);
+                          task.kind === "wakeup" || /\btimer\b/i.test(task.title);
+                        const hasDetails = Boolean(
+                          task.command || task.output_preview || task.log_path,
+                        );
+                        const isExpanded = Boolean(expandedTasks[task.id]);
                         return (
-                          <button
-                            key={task.id}
-                            type="button"
-                            onClick={() => {
-                              if (task.kind === "shell") {
-                                orbitActions.openTerminalTab({ spawnIfEmpty: false });
-                              }
-                            }}
-                            className="text-foreground/85 flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[7px] px-2.5 text-left text-[12.5px] transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
-                          >
-                            <span className="flex min-w-0 items-center gap-2.5">
-                              {isRunning ? (
-                                <Loader2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 animate-spin" />
-                              ) : isTimerLike ? (
-                                <Clock className="text-muted-foreground/75 h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-                              ) : (
-                                <SquareTerminal className="text-muted-foreground/75 h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                          <div key={task.id} className="flex flex-col rounded-[7px]">
+                            <button
+                              type="button"
+                              title={task.command || task.title}
+                              onClick={() => {
+                                if (!hasDetails) return;
+                                setExpandedTasks((prev) => ({
+                                  ...prev,
+                                  [task.id]: !prev[task.id],
+                                }));
+                              }}
+                              className={cn(
+                                "text-foreground/85 flex min-h-[32px] w-full items-center justify-between gap-2 rounded-[7px] px-2.5 py-1 text-left text-[12.5px] transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]",
+                                hasDetails ? "cursor-pointer" : "cursor-default",
                               )}
-                              <span className="truncate">{task.title}</span>
-                            </span>
-                          </button>
+                            >
+                              <span className="flex min-w-0 items-center gap-2.5">
+                                {isRunning ? (
+                                  <Loader2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 animate-spin" />
+                                ) : isTimerLike ? (
+                                  <Clock className="text-muted-foreground/75 h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                                ) : (
+                                  <SquareTerminal className="text-muted-foreground/75 h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+                                )}
+                                <span className="min-w-0 truncate">{task.title}</span>
+                              </span>
+                              {hasDetails && (
+                                <ChevronRight
+                                  className={cn(
+                                    "text-muted-foreground/50 h-[13px] w-[13px] shrink-0 transition-transform",
+                                    isExpanded && "rotate-90",
+                                  )}
+                                />
+                              )}
+                            </button>
+                            {hasDetails && isExpanded && (
+                              <div className="border-border/60 selectable-text mx-2.5 mb-1.5 space-y-1 rounded-md border bg-black/[0.03] px-2.5 py-1.5 font-mono text-[11px] dark:bg-white/[0.04]">
+                                {task.command && (
+                                  <div className="text-foreground/85 break-all whitespace-pre-wrap">
+                                    $ {task.command}
+                                  </div>
+                                )}
+                                {task.log_path && (
+                                  <div className="text-muted-foreground break-all">
+                                    Log: {task.log_path}
+                                  </div>
+                                )}
+                                {task.output_preview && (
+                                  <pre className="text-muted-foreground max-h-[120px] overflow-auto break-words whitespace-pre-wrap">
+                                    {task.output_preview.slice(0, 600)}
+                                  </pre>
+                                )}
+                              </div>
+                            )}
+                          </div>
                         );
                       })}
                       {backgroundTasks.length > 4 && (

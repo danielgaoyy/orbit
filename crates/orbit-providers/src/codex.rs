@@ -742,6 +742,7 @@ async fn handle_codex_notification(
                                 exit_code,
                                 output_preview: out_prev,
                             },
+                            background_task: None,
                         })
                         .await;
                 }
@@ -778,6 +779,7 @@ async fn handle_codex_notification(
                             call_id: item_id,
                             status,
                             detail,
+                            background_task: None,
                         })
                         .await;
                 }
@@ -794,6 +796,7 @@ async fn handle_codex_notification(
                             call_id: item_id,
                             status,
                             detail: ToolCallDetail::Search { query, scope: None },
+                            background_task: None,
                         })
                         .await;
                 }
@@ -811,6 +814,7 @@ async fn handle_codex_notification(
                                 tool_name: format!("{server}/{tool}"),
                                 arguments_json: truncate_str(&args, 800),
                             },
+                            background_task: None,
                         })
                         .await;
                 }
@@ -878,6 +882,7 @@ async fn handle_codex_notification(
                                 role: "Codex Subagent".into(),
                                 prompt_preview: title,
                             },
+                            background_task: None,
                         })
                         .await;
                 }

@@ -8,7 +8,6 @@ import {
   FileDiff,
   Loader2,
   SquareTerminal,
-  X,
   type LucideIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -28,13 +27,10 @@ import type {
 } from "@/lib/orbit-ipc";
 import {
   type OverviewSectionId,
-  type QueuedPromptItem,
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
-
-const EMPTY_QUEUED: readonly QueuedPromptItem[] = [];
 
 const OverviewActionRow = memo(function OverviewActionRow({
   icon: Icon,
@@ -137,32 +133,10 @@ const StageOverviewBody = memo(function StageOverviewBody({
     cwd ? (s.gitReviews[`${hostId}::${cwd}`] ?? null) : null,
   );
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
-  const queuedPrompts = useOrbitSelector(
-    (s) => s.queuedPrompts[`${hostId}::${agentId}`] ?? EMPTY_QUEUED,
-  );
-
-  const backgroundTasks = useMemo(() => {
-    if (queuedPrompts.length === 0) return baseInsights.background_tasks;
-    const merged = [...baseInsights.background_tasks];
-    const seenIds = new Set(merged.map((t) => t.id));
-    for (const qp of queuedPrompts) {
-      const qId = `queue:${qp.id}`;
-      if (seenIds.has(qId)) continue;
-      merged.push({
-        id: qId,
-        kind: "queued",
-        title: (qp.displayText || "Queued follow-up").slice(0, 72),
-        subtitle: "Queued · runs when turn finishes",
-        status: "queued",
-        started_at_ms: null,
-        command: null,
-        output_preview: null,
-      });
-    }
-    return merged;
-  }, [baseInsights.background_tasks, queuedPrompts]);
+  const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
 
   const insights = baseInsights;
+  const backgroundTasks = insights.background_tasks;
 
   const reviewSummary = useMemo(() => {
     const gitFiles = gitReview?.diff_files ?? [];
@@ -320,6 +294,8 @@ const StageOverviewBody = memo(function StageOverviewBody({
                   role: sa.role,
                   promptPreview: sa.prompt_preview,
                   childAgentId: sa.child_agent_id,
+                  providerSubagentId: sa.provider_subagent_id ?? null,
+                  parentAgentId: agentId,
                 })
               }
               className="text-foreground/86 hover:bg-accent/65 hover:text-foreground h-[30px] w-full justify-start gap-2 rounded-[8px] px-2 text-[13px] font-normal shadow-none transition-colors"
@@ -354,24 +330,24 @@ const StageOverviewBody = memo(function StageOverviewBody({
           isRunning={backgroundTasks.some((t) => t.status === "running")}
         >
           {backgroundTasks.map((task) => {
-            const queuedIdx =
-              task.kind === "queued"
-                ? queuedPrompts.findIndex((q) => `queue:${q.id}` === task.id)
-                : -1;
+            const hasDetails = Boolean(task.command || task.output_preview || task.log_path);
+            const isExpanded = Boolean(expandedTasks[task.id]);
             return (
               <div
                 key={task.id}
-                className="group/bgtask hover:bg-accent/65 flex w-full items-start gap-1 rounded-[8px] transition-colors"
+                className="group/bgtask hover:bg-accent/65 flex w-full flex-col rounded-[8px] transition-colors"
               >
                 <button
                   type="button"
                   title={task.command || task.title}
                   onClick={() => {
-                    if (task.kind === "shell") {
-                      orbitActions.openTerminalTab();
-                    }
+                    if (!hasDetails) return;
+                    setExpandedTasks((prev) => ({ ...prev, [task.id]: !prev[task.id] }));
                   }}
-                  className="flex min-w-0 flex-1 cursor-pointer items-start gap-2 px-2 py-1.5 text-left"
+                  className={cn(
+                    "flex min-w-0 w-full items-start gap-2 px-2 py-1.5 text-left",
+                    hasDetails ? "cursor-pointer" : "cursor-default",
+                  )}
                 >
                   {task.status === "running" ? (
                     <Loader2 className="text-muted-foreground mt-0.5 size-3.5 shrink-0 animate-spin" />
@@ -393,18 +369,33 @@ const StageOverviewBody = memo(function StageOverviewBody({
                       {task.subtitle}
                     </div>
                   </div>
+                  {hasDetails && (
+                    <ChevronRight
+                      className={cn(
+                        "text-muted-foreground/60 mt-0.5 size-3.5 shrink-0 transition-transform",
+                        isExpanded && "rotate-90",
+                      )}
+                    />
+                  )}
                 </button>
-                {queuedIdx >= 0 && (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    title="Cancel queued prompt"
-                    onClick={() => orbitActions.removeQueuedPrompt(queuedIdx)}
-                    className="text-muted-foreground hover:text-foreground mt-1 mr-1 size-5 shrink-0 rounded-md opacity-0 transition-opacity group-hover/bgtask:opacity-100 hover:bg-black/[0.08] dark:hover:bg-white/[0.12]"
-                  >
-                    <X className="size-3" />
-                  </Button>
+                {hasDetails && isExpanded && (
+                  <div className="border-border/60 selectable-text mx-2 mb-2 space-y-1.5 rounded-md border bg-black/[0.03] px-2 py-1.5 font-mono text-[11px] dark:bg-white/[0.04]">
+                    {task.command && (
+                      <div className="text-foreground/85 break-all whitespace-pre-wrap">
+                        $ {task.command}
+                      </div>
+                    )}
+                    {task.log_path && (
+                      <div className="text-muted-foreground break-all">
+                        Log: {task.log_path}
+                      </div>
+                    )}
+                    {task.output_preview && (
+                      <pre className="text-muted-foreground max-h-[120px] overflow-auto break-words whitespace-pre-wrap">
+                        {task.output_preview.slice(0, 600)}
+                      </pre>
+                    )}
+                  </div>
                 )}
               </div>
             );

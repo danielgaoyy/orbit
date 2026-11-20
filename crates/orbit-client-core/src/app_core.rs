@@ -14,10 +14,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
-    AgentStatus, AgentSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot, ModelOption,
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot, QuestionItem,
-    ReasoningEffort, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
-    TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceSummary,
+    ActiveTurnBehavior, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary, AttentionState,
+    ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot, ModelOption,
+    OrchestrationConfig, OrchestrationSkillInfo, PendingPermissionSummary, PermissionCheckpointRef,
+    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
+    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort,
+    ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode, TerminalBinaryFrame,
+    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
+    WorkspaceIsolation, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -158,6 +162,20 @@ pub struct AgentCardView {
     pub is_running: bool,
     pub is_awaiting_permission: bool,
     pub parent_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub background: bool,
+    #[serde(default)]
+    pub auto_archive: bool,
+    #[serde(default)]
+    pub attention: AttentionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at_rfc3339: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
     pub latest_seq: u64,
     pub updated_at_rfc3339: String,
     #[serde(default)]
@@ -199,6 +217,22 @@ pub struct HostDetailView {
     pub terminals: Vec<TerminalSummary>,
     pub active_terminal_id: Option<String>,
     pub active_terminal_slot: u8,
+    #[serde(default)]
+    pub profiles: Vec<AgentProfile>,
+    #[serde(default)]
+    pub schedules: Vec<ScheduleSpec>,
+    #[serde(default)]
+    pub connected_hosts: Vec<ConnectedHostSummary>,
+    #[serde(default)]
+    pub orchestration_config: OrchestrationConfig,
+    #[serde(default)]
+    pub orchestration_skills: Vec<OrchestrationSkillInfo>,
+    #[serde(default)]
+    pub workspace_scripts: HashMap<String, Vec<WorkspaceScriptInfo>>,
+    #[serde(default)]
+    pub pending_permissions: Vec<PendingPermissionSummary>,
+    #[serde(default)]
+    pub provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +298,25 @@ pub enum TimelineItemView {
         seq: u64,
         level: String,
         message: String,
+        #[serde(default)]
+        timestamp_ms: Option<i64>,
+    },
+    AgentMessage {
+        seq: u64,
+        message_id: String,
+        kind: AgentMessageKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_agent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_host_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<String>,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_context: Option<PermissionCheckpointRef>,
+        blocks: Vec<RichBlockView>,
         #[serde(default)]
         timestamp_ms: Option<i64>,
     },
@@ -449,6 +502,16 @@ struct HostMemoryState {
     git_statuses: HashMap<String, GitStatusSnapshot>,
     git_diffs: HashMap<String, String>,
     workspace_files: HashMap<String, Vec<String>>,
+    profiles: Vec<AgentProfile>,
+    schedules: Vec<ScheduleSpec>,
+    schedule_runs: HashMap<String, Vec<ScheduleRunRecord>>,
+    connected_hosts: Vec<ConnectedHostSummary>,
+    orchestration_config: OrchestrationConfig,
+    orchestration_skills: Vec<OrchestrationSkillInfo>,
+    workspace_scripts: HashMap<String, Vec<WorkspaceScriptInfo>>,
+    pending_permissions: Vec<PendingPermissionSummary>,
+    provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
+    provider_subagent_timelines: HashMap<(String, String), Vec<ProviderSubagentEvent>>,
 }
 
 impl HostMemoryState {
@@ -504,6 +567,16 @@ impl HostMemoryState {
             git_statuses: HashMap::new(),
             git_diffs: HashMap::new(),
             workspace_files: HashMap::new(),
+            profiles: Vec::new(),
+            schedules: Vec::new(),
+            schedule_runs: HashMap::new(),
+            connected_hosts: Vec::new(),
+            orchestration_config: OrchestrationConfig::default(),
+            orchestration_skills: Vec::new(),
+            workspace_scripts: HashMap::new(),
+            pending_permissions: Vec::new(),
+            provider_subagents: HashMap::new(),
+            provider_subagent_timelines: HashMap::new(),
         }
     }
 
@@ -561,7 +634,20 @@ impl HostMemoryState {
         let pending_approval_count = self
             .agents
             .values()
-            .filter(|a| matches!(a.status, AgentStatus::AwaitingPermission { .. }))
+            .filter(|a| {
+                a.archived_at.is_none()
+                    && matches!(a.status, AgentStatus::AwaitingPermission { .. })
+            })
+            .count() as u32;
+        let active_workspace_count = self
+            .workspaces
+            .iter()
+            .filter(|w| w.archived_at.is_none() && !w.background)
+            .count() as u32;
+        let active_agent_count = self
+            .agents
+            .values()
+            .filter(|a| a.archived_at.is_none() && !a.background)
             .count() as u32;
         HostCardView {
             host_id: self.profile.host_id.clone(),
@@ -582,8 +668,8 @@ impl HostMemoryState {
             connection_state: self.profile.state,
             last_error: self.last_error.clone(),
             available_providers: self.available_providers.clone(),
-            workspace_count: self.workspaces.len() as u32,
-            agent_count: self.agents.len() as u32,
+            workspace_count: active_workspace_count,
+            agent_count: active_agent_count,
             pending_approval_count,
         }
     }
@@ -874,6 +960,14 @@ impl OrbitAppCore {
             terminals: state.terminals.clone(),
             active_terminal_id: state.active_terminal_id.clone(),
             active_terminal_slot: state.active_terminal_slot,
+            profiles: state.profiles.clone(),
+            schedules: state.schedules.clone(),
+            connected_hosts: state.connected_hosts.clone(),
+            orchestration_config: state.orchestration_config.clone(),
+            orchestration_skills: state.orchestration_skills.clone(),
+            workspace_scripts: state.workspace_scripts.clone(),
+            pending_permissions: state.pending_permissions.clone(),
+            provider_subagents: state.provider_subagents.clone(),
         })
     }
 
@@ -2347,16 +2441,21 @@ impl OrbitAppCore {
                 }
 
                 // Fast SQLite state (`< 2ms`) FIRST so sidebar sessions appear immediately,
-                // followed by filesystem project discovery & background quota probes!
+                // followed by orchestration state, filesystem project discovery & background quota probes!
                 let _ = handle
                     .send_wire(WireMessage::ListWorkspaces {
                         request_id: Uuid::new_v4(),
+                        include_archived: true,
+                        include_background: false,
                     })
                     .await;
                 let _ = handle
                     .send_wire(WireMessage::ListAgents {
                         request_id: Uuid::new_v4(),
                         workspace_id: None,
+                        include_archived: true,
+                        include_background: false,
+                        parent_agent_id: None,
                     })
                     .await;
                 let _ = handle
@@ -2367,6 +2466,38 @@ impl OrbitAppCore {
                 let _ = handle
                     .send_wire(WireMessage::ListTerminals {
                         request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListProfiles {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListSchedules {
+                        request_id: Uuid::new_v4(),
+                        include_completed: true,
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListConnectedHosts {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::GetOrchestrationConfig {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListOrchestrationSkills {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
+                    .send_wire(WireMessage::ListPendingPermissions {
+                        request_id: Uuid::new_v4(),
+                        agent_id: None,
                     })
                     .await;
                 let _ = handle
@@ -2629,12 +2760,36 @@ impl OrbitAppCore {
                     notify_fleet = true;
                     notify_host = true;
                 }
-                WireMessage::WorkspaceCreated { workspace, .. } => {
+                WireMessage::WorkspaceCreated { workspace, .. }
+                | WireMessage::WorkspaceUpdated { workspace } => {
                     state
                         .workspaces
                         .retain(|w| w.workspace_id != workspace.workspace_id);
                     state.workspaces.insert(0, workspace);
                     notify_fleet = true;
+                    notify_host = true;
+                }
+                WireMessage::WorkspaceSetupProgress { .. } => {
+                    notify_host = true;
+                }
+                WireMessage::WorkspaceScriptsSnapshot {
+                    workspace_id,
+                    scripts,
+                    ..
+                } => {
+                    state.workspace_scripts.insert(workspace_id, scripts);
+                    notify_host = true;
+                }
+                WireMessage::WorkspaceScriptUpdated { script } => {
+                    let list = state
+                        .workspace_scripts
+                        .entry(script.workspace_id.clone())
+                        .or_default();
+                    if let Some(slot) = list.iter_mut().find(|s| s.name == script.name) {
+                        *slot = script;
+                    } else {
+                        list.push(script);
+                    }
                     notify_host = true;
                 }
                 WireMessage::AgentsSnapshot { agents, .. } => {
@@ -2736,6 +2891,143 @@ impl OrbitAppCore {
                     notify_fleet = true;
                     notify_host = true;
                     notify_timeline_agent = Some(ag_id);
+                }
+                WireMessage::AgentDeleted { agent_id } => {
+                    state.agents.remove(&agent_id);
+                    state.timelines.remove(&agent_id);
+                    state.provider_subagents.remove(&agent_id);
+                    notify_fleet = true;
+                    notify_host = true;
+                }
+                WireMessage::PendingPermissionsSnapshot { permissions, .. } => {
+                    state.pending_permissions = permissions;
+                    notify_host = true;
+                }
+                WireMessage::ProfilesSnapshot { profiles, .. } => {
+                    state.profiles = profiles;
+                    notify_host = true;
+                }
+                WireMessage::ProfileUpserted { profile, .. } => {
+                    if let Some(slot) = state
+                        .profiles
+                        .iter_mut()
+                        .find(|p| p.profile_id == profile.profile_id)
+                    {
+                        *slot = profile;
+                    } else {
+                        state.profiles.push(profile);
+                    }
+                    notify_host = true;
+                }
+                WireMessage::SchedulesSnapshot { schedules, .. } => {
+                    state.schedules = schedules;
+                    notify_host = true;
+                }
+                WireMessage::ScheduleCreated { schedule, .. }
+                | WireMessage::ScheduleUpdated { schedule } => {
+                    if let Some(slot) = state
+                        .schedules
+                        .iter_mut()
+                        .find(|s| s.schedule_id == schedule.schedule_id)
+                    {
+                        *slot = schedule;
+                    } else {
+                        state.schedules.insert(0, schedule);
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ScheduleDeleted { schedule_id } => {
+                    state.schedules.retain(|s| s.schedule_id != schedule_id);
+                    state.schedule_runs.remove(&schedule_id);
+                    notify_host = true;
+                }
+                WireMessage::ScheduleRunsSnapshot {
+                    schedule_id, runs, ..
+                } => {
+                    state.schedule_runs.insert(schedule_id, runs);
+                    notify_host = true;
+                }
+                WireMessage::ConnectedHostsSnapshot { hosts, .. } => {
+                    state.connected_hosts = hosts;
+                    notify_host = true;
+                }
+                WireMessage::ConnectedHostAdded { host, .. }
+                | WireMessage::ConnectedHostUpdated { host } => {
+                    if let Some(slot) = state
+                        .connected_hosts
+                        .iter_mut()
+                        .find(|h| h.registration_id == host.registration_id)
+                    {
+                        *slot = host;
+                    } else {
+                        state.connected_hosts.push(host);
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ConnectedHostRemoved { registration_id } => {
+                    state
+                        .connected_hosts
+                        .retain(|h| h.registration_id != registration_id);
+                    notify_host = true;
+                }
+                WireMessage::OrchestrationConfigSnapshot { config, .. } => {
+                    state.orchestration_config = config;
+                    notify_host = true;
+                }
+                WireMessage::OrchestrationSkillsSnapshot { skills, .. } => {
+                    state.orchestration_skills = skills;
+                    notify_host = true;
+                }
+                WireMessage::ProviderSubagentsSnapshot {
+                    parent_agent_id,
+                    subagents,
+                    ..
+                } => {
+                    state.provider_subagents.insert(parent_agent_id, subagents);
+                    notify_host = true;
+                }
+                WireMessage::ProviderSubagentUpdated { subagent } => {
+                    let list = state
+                        .provider_subagents
+                        .entry(subagent.parent_agent_id.clone())
+                        .or_default();
+                    if let Some(slot) = list
+                        .iter_mut()
+                        .find(|s| s.subagent_id == subagent.subagent_id)
+                    {
+                        *slot = subagent;
+                    } else {
+                        list.push(subagent);
+                    }
+                    notify_host = true;
+                }
+                WireMessage::ProviderSubagentTimelineCatchup {
+                    parent_agent_id,
+                    subagent_id,
+                    events,
+                    ..
+                } => {
+                    let key = (parent_agent_id, subagent_id);
+                    let list = state.provider_subagent_timelines.entry(key).or_default();
+                    for ev in events {
+                        if let Some(slot) = list.iter_mut().find(|e| e.seq == ev.seq) {
+                            *slot = ev;
+                        } else {
+                            list.push(ev);
+                        }
+                    }
+                    list.sort_by_key(|e| e.seq);
+                    notify_host = true;
+                }
+                WireMessage::ProviderSubagentTimelineLive { event } => {
+                    let key = (event.parent_agent_id.clone(), event.subagent_id.clone());
+                    let list = state.provider_subagent_timelines.entry(key).or_default();
+                    if let Some(slot) = list.iter_mut().find(|e| e.seq == event.seq) {
+                        *slot = event;
+                    } else {
+                        list.push(event);
+                    }
+                    notify_host = true;
                 }
                 WireMessage::AgentRewound {
                     request_id,
@@ -3292,6 +3584,8 @@ impl OrbitAppCore {
             host_id,
             WireMessage::ListWorkspaces {
                 request_id: Uuid::new_v4(),
+                include_archived: true,
+                include_background: false,
             },
         );
         self.dispatch_wire(
@@ -3299,12 +3593,53 @@ impl OrbitAppCore {
             WireMessage::ListAgents {
                 request_id: Uuid::new_v4(),
                 workspace_id: None,
+                include_archived: true,
+                include_background: false,
+                parent_agent_id: None,
             },
         );
         self.dispatch_wire(
             host_id,
             WireMessage::ListTerminals {
                 request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListProfiles {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListSchedules {
+                request_id: Uuid::new_v4(),
+                include_completed: true,
+            },
+        );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListConnectedHosts {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::GetOrchestrationConfig {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListOrchestrationSkills {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::ListPendingPermissions {
+                request_id: Uuid::new_v4(),
+                agent_id: None,
             },
         );
         self.dispatch_wire(
@@ -3389,6 +3724,14 @@ impl OrbitAppCore {
     }
 
     pub fn create_agent_with_config(self: &Arc<Self>, req: CreateAgentRequest<'_>) -> String {
+        self.create_agent_with_profile(req, None)
+    }
+
+    pub fn create_agent_with_profile(
+        self: &Arc<Self>,
+        req: CreateAgentRequest<'_>,
+        profile_id: Option<String>,
+    ) -> String {
         let clean_branch = req.worktree_branch.map(str::trim).filter(|b| !b.is_empty());
         let use_auto_worktree = clean_branch == Some("auto");
         if let Some(branch) = clean_branch.filter(|b| *b != "auto") {
@@ -3400,6 +3743,12 @@ impl OrbitAppCore {
                     title: Some(branch.to_string()),
                     worktree_branch: Some(branch.to_string()),
                     base_ref: None,
+                    isolation: WorkspaceIsolation::Worktree,
+                    worktree_mode: WorktreeCreateMode::BranchOff,
+                    pr_number: None,
+                    parent_workspace_id: None,
+                    background: false,
+                    idempotency_key: None,
                 },
             );
         }
@@ -3440,6 +3789,14 @@ impl OrbitAppCore {
                 mode: req.mode.clone(),
                 status: AgentStatus::Initializing,
                 parent_agent_id: None,
+                parent_host_id: None,
+                profile_id: profile_id.clone(),
+                background: false,
+                auto_archive: false,
+                attention: AttentionState::None,
+                archived_at: None,
+                last_activity_at: Some(now),
+                labels: HashMap::new(),
                 latest_seq: 0,
                 timeline_epoch: 0,
                 created_at: now,
@@ -3496,6 +3853,17 @@ impl OrbitAppCore {
                 initial_display_prompt: req.initial_display_prompt,
                 initial_badges: req.initial_badges,
                 worktree: use_auto_worktree,
+                workspace_id: None,
+                parent_agent_id: None,
+                parent_host_id: None,
+                profile_id,
+                background: false,
+                auto_archive: false,
+                notify_on_finish: None,
+                idempotency_key: None,
+                base_ref: None,
+                worktree_mode: WorktreeCreateMode::BranchOff,
+                branch: clean_branch.filter(|b| *b != "auto").map(ToOwned::to_owned),
             },
         );
 
@@ -3558,6 +3926,25 @@ impl OrbitAppCore {
         display_prompt: Option<String>,
         badges: Vec<PromptBadge>,
     ) {
+        self.send_prompt_with_behavior(
+            host_id,
+            agent_id,
+            prompt,
+            display_prompt,
+            badges,
+            ActiveTurnBehavior::Steer,
+        );
+    }
+
+    pub fn send_prompt_with_behavior(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        prompt: &str,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
+        active_turn_behavior: ActiveTurnBehavior,
+    ) {
         let now = Utc::now();
         let req_id = Uuid::new_v4();
         let visible_text = display_prompt.clone().unwrap_or_else(|| prompt.to_string());
@@ -3568,6 +3955,7 @@ impl OrbitAppCore {
                 ag.status = AgentStatus::Running {
                     turn_id: "pending".into(),
                 };
+                ag.archived_at = None;
                 ag.updated_at = now;
             }
             if !agent_id.starts_with("opt_") {
@@ -3609,6 +3997,10 @@ impl OrbitAppCore {
                 prompt: prompt.to_string(),
                 display_prompt,
                 badges,
+                active_turn_behavior,
+                message_id: None,
+                caller_agent_id: None,
+                notify_on_finish: None,
             },
         );
     }
@@ -3782,16 +4174,17 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
-            h.agents.remove(agent_id);
-            h.timelines.remove(agent_id);
-            h.stage_cache.remove(agent_id);
-            h.stage_dirty.remove(agent_id);
+            if agent_id.starts_with("opt_") {
+                h.agents.remove(agent_id);
+                h.timelines.remove(agent_id);
+                h.stage_cache.remove(agent_id);
+                h.stage_dirty.remove(agent_id);
+            } else if let Some(ag) = h.agents.get_mut(agent_id) {
+                ag.archived_at = Some(Utc::now());
+                ag.attention = AttentionState::None;
+                ag.status = AgentStatus::Closed;
+            }
         }
-        if let Ok(mut prefs) = self.thread_prefs.write() {
-            prefs.remove(&(host_id.to_string(), agent_id.to_string()));
-        }
-        let _ = self.store.delete_client_thread_pref(host_id, agent_id);
-        let _ = self.store.delete_replica_agent(host_id, agent_id);
         if !agent_id.starts_with("opt_") {
             self.dispatch_wire_queued(
                 host_id,
@@ -3806,6 +4199,587 @@ impl OrbitAppCore {
             revision,
             host_id: host_id.to_string(),
         });
+    }
+
+    pub fn unarchive_agent(self: &Arc<Self>, host_id: &str, agent_id: &str) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.archived_at = None;
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UnarchiveAgent {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+            },
+        );
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn delete_agent(self: &Arc<Self>, host_id: &str, agent_id: &str) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.agents.remove(agent_id);
+            h.timelines.remove(agent_id);
+            h.stage_cache.remove(agent_id);
+            h.stage_dirty.remove(agent_id);
+        }
+        if let Ok(mut prefs) = self.thread_prefs.write() {
+            prefs.remove(&(host_id.to_string(), agent_id.to_string()));
+        }
+        let _ = self.store.delete_client_thread_pref(host_id, agent_id);
+        let _ = self.store.delete_replica_agent(host_id, agent_id);
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::DeleteAgent {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                },
+            );
+        }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn detach_agent(self: &Arc<Self>, host_id: &str, agent_id: &str) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.parent_agent_id = None;
+            ag.parent_host_id = None;
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::DetachAgent {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+            },
+        );
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn mark_agent_read(self: &Arc<Self>, host_id: &str, agent_id: &str) {
+        let mut changed = false;
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+            && ag.attention != AttentionState::None
+        {
+            ag.attention = AttentionState::None;
+            changed = true;
+        }
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::MarkAgentRead {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                },
+            );
+        }
+        if changed {
+            self.emit(|revision| CoreNotification::HostChanged {
+                revision,
+                host_id: host_id.to_string(),
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        title: Option<String>,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+        mode: Option<SessionMode>,
+        labels: Option<HashMap<String, String>>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UpdateAgent {
+                request_id: Uuid::new_v4(),
+                agent_id: agent_id.to_string(),
+                title,
+                model,
+                effort,
+                mode,
+                labels,
+            },
+        );
+    }
+
+    // --- Workspace Orchestration & Scripts ---
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_workspace_v2(
+        self: &Arc<Self>,
+        host_id: &str,
+        source_cwd: &str,
+        title: Option<String>,
+        isolation: WorkspaceIsolation,
+        worktree_mode: WorktreeCreateMode,
+        worktree_branch: Option<String>,
+        base_ref: Option<String>,
+        pr_number: Option<u32>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::CreateWorkspace {
+                request_id: Uuid::new_v4(),
+                source_cwd: source_cwd.to_string(),
+                title,
+                worktree_branch,
+                base_ref,
+                isolation,
+                worktree_mode,
+                pr_number,
+                parent_workspace_id: None,
+                background: false,
+                idempotency_key: None,
+            },
+        );
+    }
+
+    pub fn rename_workspace(self: &Arc<Self>, host_id: &str, workspace_id: &str, title: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::RenameWorkspace {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+                title: title.to_string(),
+            },
+        );
+    }
+
+    pub fn archive_workspace(self: &Arc<Self>, host_id: &str, workspace_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ArchiveWorkspace {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+            },
+        );
+    }
+
+    pub fn unarchive_workspace(self: &Arc<Self>, host_id: &str, workspace_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UnarchiveWorkspace {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+            },
+        );
+    }
+
+    pub fn list_workspace_scripts(self: &Arc<Self>, host_id: &str, workspace_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ListWorkspaceScripts {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+            },
+        );
+    }
+
+    pub fn start_workspace_script(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: &str,
+        script_name: &str,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::StartWorkspaceScript {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+                script_name: script_name.to_string(),
+            },
+        );
+    }
+
+    pub fn stop_workspace_script(
+        self: &Arc<Self>,
+        host_id: &str,
+        workspace_id: &str,
+        script_name: &str,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::StopWorkspaceScript {
+                request_id: Uuid::new_v4(),
+                workspace_id: workspace_id.to_string(),
+                script_name: script_name.to_string(),
+            },
+        );
+    }
+
+    // --- Profiles, Schedules, Connected Hosts, Orchestration Config & Skills ---
+
+    pub fn upsert_profile(self: &Arc<Self>, host_id: &str, profile: AgentProfile) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UpsertProfile {
+                request_id: Uuid::new_v4(),
+                profile,
+            },
+        );
+    }
+
+    pub fn delete_profile(self: &Arc<Self>, host_id: &str, profile_id: &str) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.profiles.retain(|p| p.profile_id != profile_id);
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::DeleteProfile {
+                request_id: Uuid::new_v4(),
+                profile_id: profile_id.to_string(),
+            },
+        );
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_schedule(
+        self: &Arc<Self>,
+        host_id: &str,
+        name: String,
+        cron_expr: String,
+        timezone: Option<String>,
+        prompt: String,
+        target: ScheduleTarget,
+        max_runs: Option<u32>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::CreateSchedule {
+                request_id: Uuid::new_v4(),
+                name,
+                cron_expr,
+                timezone,
+                prompt,
+                target,
+                max_runs,
+                expires_at: None,
+                created_by_agent: None,
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_schedule(
+        self: &Arc<Self>,
+        host_id: &str,
+        schedule_id: &str,
+        name: Option<String>,
+        cron_expr: Option<String>,
+        prompt: Option<String>,
+        max_runs: Option<u32>,
+        archive_on_finish: Option<bool>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UpdateSchedule {
+                request_id: Uuid::new_v4(),
+                schedule_id: schedule_id.to_string(),
+                name,
+                cron_expr,
+                prompt,
+                max_runs,
+                expires_at: None,
+                archive_on_finish,
+            },
+        );
+    }
+
+    pub fn pause_schedule(self: &Arc<Self>, host_id: &str, schedule_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::PauseSchedule {
+                request_id: Uuid::new_v4(),
+                schedule_id: schedule_id.to_string(),
+            },
+        );
+    }
+
+    pub fn resume_schedule(self: &Arc<Self>, host_id: &str, schedule_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ResumeSchedule {
+                request_id: Uuid::new_v4(),
+                schedule_id: schedule_id.to_string(),
+            },
+        );
+    }
+
+    pub fn run_schedule_once(self: &Arc<Self>, host_id: &str, schedule_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::RunScheduleOnce {
+                request_id: Uuid::new_v4(),
+                schedule_id: schedule_id.to_string(),
+            },
+        );
+    }
+
+    pub fn delete_schedule(self: &Arc<Self>, host_id: &str, schedule_id: &str) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.schedules.retain(|s| s.schedule_id != schedule_id);
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::DeleteSchedule {
+                request_id: Uuid::new_v4(),
+                schedule_id: schedule_id.to_string(),
+            },
+        );
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn fetch_schedule_runs(
+        self: &Arc<Self>,
+        host_id: &str,
+        schedule_id: &str,
+        limit: Option<u32>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ListScheduleRuns {
+                request_id: Uuid::new_v4(),
+                schedule_id: schedule_id.to_string(),
+                limit,
+            },
+        );
+    }
+
+    pub fn schedule_runs(&self, host_id: &str, schedule_id: &str) -> Vec<ScheduleRunRecord> {
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|g| g.get(host_id)?.schedule_runs.get(schedule_id).cloned())
+            .unwrap_or_default()
+    }
+
+    pub fn add_connected_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        label: Option<String>,
+        pairing_uri: &str,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::AddConnectedHost {
+                request_id: Uuid::new_v4(),
+                label,
+                pairing_uri: pairing_uri.to_string(),
+            },
+        );
+    }
+
+    pub fn update_connected_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        registration_id: &str,
+        label: Option<String>,
+        enabled: Option<bool>,
+    ) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UpdateConnectedHost {
+                request_id: Uuid::new_v4(),
+                registration_id: registration_id.to_string(),
+                label,
+                enabled,
+            },
+        );
+    }
+
+    pub fn remove_connected_host(self: &Arc<Self>, host_id: &str, registration_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::RemoveConnectedHost {
+                request_id: Uuid::new_v4(),
+                registration_id: registration_id.to_string(),
+            },
+        );
+    }
+
+    /// 1-click Mesh Sync: generates pairing URIs for all other saved hosts in the user's fleet
+    /// and registers them as Daemon-to-Daemon Connected Hosts on `target_host_id`.
+    pub fn sync_fleet_connected_hosts(self: &Arc<Self>, target_host_id: &str) -> u32 {
+        let peers: Vec<(String, String)> = {
+            let Ok(guard) = self.hosts.read() else {
+                return 0;
+            };
+            guard
+                .values()
+                .filter(|h| h.profile.host_id != target_host_id)
+                .filter_map(|h| {
+                    let mut endpoints = h.profile.direct_endpoints.clone();
+                    if let Some(ref custom) = h.profile.custom_direct_endpoint
+                        && !endpoints.contains(custom)
+                    {
+                        endpoints.insert(0, custom.clone());
+                    }
+                    // Strip loopback-only endpoints when syncing across different machines if another route exists,
+                    // preventing remote daemons from dialing a local process on `127.0.0.1`.
+                    let non_loopback: Vec<String> = endpoints
+                        .iter()
+                        .filter(|ep| {
+                            let lower = ep.to_ascii_lowercase();
+                            !lower.contains("://127.0.0.1")
+                                && !lower.contains("://localhost")
+                                && !lower.contains("://[::1]")
+                        })
+                        .cloned()
+                        .collect();
+                    if !non_loopback.is_empty() || h.profile.relay_url.is_some() {
+                        endpoints = non_loopback;
+                    }
+                    let offer = PairingOffer {
+                        host_id: h.profile.host_id.clone(),
+                        hostname: h.profile.hostname.clone(),
+                        daemon_pubkey_b64: h.profile.daemon_pubkey_b64.clone(),
+                        direct_endpoints: endpoints,
+                        relay_url: h.profile.relay_url.clone(),
+                        pairing_secret: Uuid::new_v4().to_string(),
+                    };
+                    let uri = offer.to_qr_uri().ok()?;
+                    Some((h.profile.effective_display_name(), uri))
+                })
+                .collect()
+        };
+        let count = peers.len() as u32;
+        for (label, uri) in peers {
+            self.add_connected_host(target_host_id, Some(label), &uri);
+        }
+        count
+    }
+
+    pub fn update_orchestration_config(
+        self: &Arc<Self>,
+        host_id: &str,
+        config: OrchestrationConfig,
+    ) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+        {
+            h.orchestration_config = config.clone();
+        }
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::UpdateOrchestrationConfig {
+                request_id: Uuid::new_v4(),
+                config,
+            },
+        );
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+    }
+
+    pub fn sync_orchestration_skills(self: &Arc<Self>, host_id: &str, skill_ids: Vec<String>) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::SyncOrchestrationSkills {
+                request_id: Uuid::new_v4(),
+                skill_ids,
+            },
+        );
+    }
+
+    pub fn list_provider_subagents(self: &Arc<Self>, host_id: &str, parent_agent_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ListProviderSubagents {
+                request_id: Uuid::new_v4(),
+                parent_agent_id: parent_agent_id.to_string(),
+            },
+        );
+    }
+
+    pub fn open_provider_subagent_timeline(
+        self: &Arc<Self>,
+        host_id: &str,
+        parent_agent_id: &str,
+        subagent_id: &str,
+    ) {
+        let since_seq = self
+            .hosts
+            .read()
+            .ok()
+            .and_then(|g| {
+                g.get(host_id)?
+                    .provider_subagent_timelines
+                    .get(&(parent_agent_id.to_string(), subagent_id.to_string()))
+                    .and_then(|list| list.iter().map(|e| e.seq).max())
+            })
+            .unwrap_or(0);
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::SubscribeProviderSubagent {
+                request_id: Uuid::new_v4(),
+                parent_agent_id: parent_agent_id.to_string(),
+                subagent_id: subagent_id.to_string(),
+                since_seq,
+            },
+        );
+    }
+
+    pub fn provider_subagent_timeline(
+        &self,
+        host_id: &str,
+        parent_agent_id: &str,
+        subagent_id: &str,
+    ) -> Vec<ProviderSubagentEvent> {
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|g| {
+                g.get(host_id)?
+                    .provider_subagent_timelines
+                    .get(&(parent_agent_id.to_string(), subagent_id.to_string()))
+                    .cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn refresh_pending_permissions(self: &Arc<Self>, host_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ListPendingPermissions {
+                request_id: Uuid::new_v4(),
+                agent_id: None,
+            },
+        );
     }
 
     pub fn resolve_permission(
@@ -4105,12 +5079,17 @@ impl OrbitAppCore {
                 let _ = handle
                     .send_wire(WireMessage::ListWorkspaces {
                         request_id: Uuid::new_v4(),
+                        include_archived: true,
+                        include_background: false,
                     })
                     .await;
                 let _ = handle
                     .send_wire(WireMessage::ListAgents {
                         request_id: Uuid::new_v4(),
                         workspace_id: None,
+                        include_archived: true,
+                        include_background: false,
+                        parent_agent_id: None,
                     })
                     .await;
                 for (agent_id, since_seq) in resubs {
@@ -5159,7 +6138,11 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
     let turn_start_idx = list[..active_end]
         .iter()
         .rposition(|ev| {
-            precedes_incoming(ev) && matches!(ev.payload, TimelinePayload::UserPrompt { .. })
+            precedes_incoming(ev)
+                && matches!(
+                    ev.payload,
+                    TimelinePayload::UserPrompt { .. } | TimelinePayload::AgentMessage { .. }
+                )
         })
         .map(|i| i + 1)
         .unwrap_or(0);
@@ -5170,7 +6153,9 @@ fn coalesce_or_push_timeline(list: &mut Vec<TimelineEvent>, mut incoming: Timeli
             precedes_incoming(ev)
                 && matches!(
                     ev.payload,
-                    TimelinePayload::UserPrompt { .. } | TimelinePayload::ToolCall { .. }
+                    TimelinePayload::UserPrompt { .. }
+                        | TimelinePayload::AgentMessage { .. }
+                        | TimelinePayload::ToolCall { .. }
                 )
         })
         .map(|i| i + 1)
@@ -5550,6 +6535,38 @@ fn render_timeline_event_view(
             message: message.clone(),
             timestamp_ms: ts_ms,
         }),
+        TimelinePayload::AgentMessage {
+            message_id,
+            kind,
+            source_agent_id,
+            source_host_id,
+            source_title,
+            event,
+            text,
+            permission_context,
+        } => {
+            let key = (agent_id.to_string(), ev.seq, text.len());
+            if markdown_cache.len() > 2048 {
+                markdown_cache.clear();
+            }
+            let blocks = markdown_cache
+                .entry(key)
+                .or_insert_with(|| parse_markdown_blocks(text, false))
+                .clone();
+            Some(TimelineItemView::AgentMessage {
+                seq: ev.seq,
+                message_id: message_id.clone(),
+                kind: *kind,
+                source_agent_id: source_agent_id.clone(),
+                source_host_id: source_host_id.clone(),
+                source_title: source_title.clone(),
+                event: event.clone(),
+                text: text.clone(),
+                permission_context: permission_context.clone(),
+                blocks,
+                timestamp_ms: ts_ms,
+            })
+        }
         TimelinePayload::StatusChanged {
             status: AgentStatus::Error { message, .. },
         } => (!message.trim().is_empty()).then(|| TimelineItemView::Notice {
@@ -5605,7 +6622,16 @@ fn extract_legacy_provider_warning_text(text: &str) -> Option<String> {
 }
 
 fn format_autonomous_wakeup_notice(source: &str) -> String {
-    let cleaned = source.trim().replace('_', " ");
+    let trimmed = source.trim();
+    if let Some(rest) = trimmed.strip_prefix("waiting:") {
+        let desc = rest.trim();
+        return if desc.is_empty() {
+            "Waiting for background task(s)".to_string()
+        } else {
+            format!("Waiting for {desc}")
+        };
+    }
+    let cleaned = trimmed.replace('_', " ");
     if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("background task") {
         "Resumed from background task".to_string()
     } else {
@@ -5618,14 +6644,28 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         AgentStatus::Initializing => ("Starting".to_string(), true, false),
         AgentStatus::Idle => ("Idle".to_string(), false, false),
         AgentStatus::Running { .. } => ("Working".to_string(), true, false),
-        AgentStatus::AutonomousWakeup { source, .. } => (format!("Waking ({source})"), true, false),
+        AgentStatus::AutonomousWakeup { source, .. } => {
+            if let Some(rest) = source.trim().strip_prefix("waiting:") {
+                let desc = rest.trim();
+                let label = if desc.is_empty() {
+                    "Background task".to_string()
+                } else {
+                    format!("Running ({desc})")
+                };
+                (label, true, false)
+            } else {
+                (format!("Waking ({source})"), true, false)
+            }
+        }
         AgentStatus::AwaitingPermission { .. } => ("Needs approval".to_string(), false, true),
         AgentStatus::Error { .. } => ("Error".to_string(), false, false),
         AgentStatus::Closed => ("Closed".to_string(), false, false),
     };
     let seen_seq = pref.map(|p| p.seen_seq).unwrap_or(0);
     let is_pinned = pref.is_some_and(|p| p.is_pinned);
-    let is_unread = !a.agent_id.starts_with("opt_") && a.latest_seq > seen_seq && !is_running;
+    let is_unread = !a.agent_id.starts_with("opt_")
+        && !is_running
+        && (a.latest_seq > seen_seq || a.attention != AttentionState::None);
     AgentCardView {
         agent_id: a.agent_id.clone(),
         workspace_id: a.workspace_id.clone(),
@@ -5641,6 +6681,13 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         is_running,
         is_awaiting_permission,
         parent_agent_id: a.parent_agent_id.clone(),
+        parent_host_id: a.parent_host_id.clone(),
+        profile_id: a.profile_id.clone(),
+        background: a.background,
+        auto_archive: a.auto_archive,
+        attention: a.attention,
+        archived_at_rfc3339: a.archived_at.map(|ts| ts.to_rfc3339()),
+        labels: a.labels.clone(),
         latest_seq: a.latest_seq,
         updated_at_rfc3339: a.updated_at.to_rfc3339(),
         is_pinned,
@@ -6355,10 +7402,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 5,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
                 }],
             },
         );
@@ -6454,10 +7509,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 3,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
                 },
             );
             guard.insert("host_warn".into(), mem);
@@ -6563,10 +7626,18 @@ mod tests {
                         turn_id: "t2".into(),
                     },
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 5,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
                 },
             );
             guard.insert("h1".into(), mem);
@@ -6723,10 +7794,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 3,
                     timeline_epoch: 2,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
                 },
                 to_before_seq: 4,
                 events: vec![TimelineEvent {
@@ -6778,6 +7857,12 @@ mod tests {
                 is_worktree: false,
                 git_branch: Some("main".into()),
                 updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
             });
             guard.insert("h1".into(), mem);
         }
@@ -6798,10 +7883,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 10,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
                 }],
             },
         );
@@ -6828,10 +7921,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Initializing,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 0,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
                 },
             );
         }
@@ -6851,10 +7952,18 @@ mod tests {
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
+                    parent_host_id: None,
                     latest_seq: 3,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: None,
                 },
             },
         );
@@ -7019,10 +8128,18 @@ mod tests {
                     turn_id: "t1".into(),
                 },
                 parent_agent_id: None,
+                parent_host_id: None,
                 latest_seq: 2,
                 timeline_epoch: 1,
                 created_at: now,
                 updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: None,
             },
         );
         core.hosts

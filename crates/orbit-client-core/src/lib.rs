@@ -815,7 +815,8 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
                 let _ = store.upsert_replica_workspaces(host_id, workspaces);
             }
         }
-        WireMessage::WorkspaceCreated { workspace, .. } => {
+        WireMessage::WorkspaceCreated { workspace, .. }
+        | WireMessage::WorkspaceUpdated { workspace } => {
             let _ = store.upsert_workspace(workspace);
         }
         WireMessage::AgentsSnapshot { agents, .. } => {
@@ -830,6 +831,11 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
             let _ = store.upsert_agent(agent, None);
             if !host_id.is_empty() {
                 let _ = store.upsert_single_replica_agent(host_id, agent);
+            }
+        }
+        WireMessage::AgentDeleted { agent_id } => {
+            if !host_id.is_empty() {
+                let _ = store.delete_replica_agent(host_id, agent_id);
             }
         }
         WireMessage::TimelineCatchup { events, .. } => {

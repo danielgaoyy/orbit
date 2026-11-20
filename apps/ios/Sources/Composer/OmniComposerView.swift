@@ -282,6 +282,10 @@ struct OmniComposerView: View {
                 store.hapticWarning()
                 store.showToast("Start an active session first to compact context")
             }
+        case "orbit", "orbit-handoff", "orbit-committee", "orbit-advisor":
+            if let dir = OrbitSlashDirective(rawValue: cmd.id) {
+                store.applyQuickWorkflow(dir)
+            }
         case "ask":
             store.applySessionMode(.default)
         case "edits":

@@ -2000,6 +2000,10 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
             "plan" -> FfiSlashDirective.PLAN
             "review" -> FfiSlashDirective.REVIEW
             "compact" -> FfiSlashDirective.COMPACT
+            "orbit" -> FfiSlashDirective.ORBIT
+            "orbit-handoff" -> FfiSlashDirective.ORBIT_HANDOFF
+            "orbit-committee" -> FfiSlashDirective.ORBIT_COMMITTEE
+            "orbit-advisor" -> FfiSlashDirective.ORBIT_ADVISOR
             else -> null
         }
 

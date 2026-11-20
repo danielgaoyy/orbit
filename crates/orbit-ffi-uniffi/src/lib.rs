@@ -689,8 +689,18 @@ impl From<HostDetailView> for FfiHostDetail {
             discovered_projects: v.discovered_projects.into_iter().map(Into::into).collect(),
             directory_listing: v.directory_listing.map(Into::into),
             provider_catalogs: v.provider_catalogs.into_iter().map(Into::into).collect(),
-            workspaces: v.workspaces.into_iter().map(Into::into).collect(),
-            agents: v.agents.into_iter().map(Into::into).collect(),
+            workspaces: v
+                .workspaces
+                .into_iter()
+                .filter(|w| w.archived_at.is_none() && !w.background)
+                .map(Into::into)
+                .collect(),
+            agents: v
+                .agents
+                .into_iter()
+                .filter(|a| a.archived_at_rfc3339.is_none() && !a.background)
+                .map(Into::into)
+                .collect(),
             last_created_agent_id: v.last_created_agent_id,
             replaced_optimistic_agents: v.replaced_optimistic_agents,
             quotas: v.quotas.into_iter().map(Into::into).collect(),
@@ -1457,6 +1467,25 @@ impl From<TimelineItemView> for FfiTimelineItem {
                 message,
                 timestamp_ms,
             },
+            TimelineItemView::AgentMessage {
+                seq,
+                source_title,
+                text,
+                timestamp_ms,
+                ..
+            } => {
+                let prefix = source_title
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|t| format!("[{t}] "))
+                    .unwrap_or_default();
+                Self::Notice {
+                    seq,
+                    level: "info".to_string(),
+                    message: format!("{prefix}{text}"),
+                    timestamp_ms,
+                }
+            }
         }
     }
 }
@@ -1683,6 +1712,7 @@ pub struct FfiStageTurn {
     pub turn_index: u32,
     pub anchor_seq: u64,
     pub user_prompt: Option<FfiTimelineItem>,
+    pub agent_message: Option<FfiTimelineItem>,
     pub is_compaction_command: bool,
     pub folded_steps: Vec<FfiTimelineItem>,
     pub work_counts: FfiTurnWorkCounts,
@@ -1713,6 +1743,7 @@ impl From<StageTurnView> for FfiStageTurn {
             turn_index: v.turn_index,
             anchor_seq: v.anchor_seq,
             user_prompt: v.user_prompt.map(Into::into),
+            agent_message: v.agent_message.map(Into::into),
             is_compaction_command: v.is_compaction_command,
             folded_steps: v.folded_steps.into_iter().map(Into::into).collect(),
             work_counts: v.work_counts.into(),
@@ -2341,6 +2372,10 @@ pub enum FfiSlashDirective {
     Plan,
     Review,
     Compact,
+    Orbit,
+    OrbitHandoff,
+    OrbitCommittee,
+    OrbitAdvisor,
 }
 
 impl From<SlashDirective> for FfiSlashDirective {
@@ -2349,6 +2384,10 @@ impl From<SlashDirective> for FfiSlashDirective {
             SlashDirective::Plan => Self::Plan,
             SlashDirective::Review => Self::Review,
             SlashDirective::Compact => Self::Compact,
+            SlashDirective::Orbit => Self::Orbit,
+            SlashDirective::OrbitHandoff => Self::OrbitHandoff,
+            SlashDirective::OrbitCommittee => Self::OrbitCommittee,
+            SlashDirective::OrbitAdvisor => Self::OrbitAdvisor,
         }
     }
 }
@@ -2359,6 +2398,10 @@ impl From<FfiSlashDirective> for SlashDirective {
             FfiSlashDirective::Plan => Self::Plan,
             FfiSlashDirective::Review => Self::Review,
             FfiSlashDirective::Compact => Self::Compact,
+            FfiSlashDirective::Orbit => Self::Orbit,
+            FfiSlashDirective::OrbitHandoff => Self::OrbitHandoff,
+            FfiSlashDirective::OrbitCommittee => Self::OrbitCommittee,
+            FfiSlashDirective::OrbitAdvisor => Self::OrbitAdvisor,
         }
     }
 }

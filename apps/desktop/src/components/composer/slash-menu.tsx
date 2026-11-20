@@ -5,15 +5,19 @@ import {
   FolderTree,
   GitCompareArrows,
   Globe,
+  Layers,
   ListTodo,
   MessageCircleQuestion,
+  Send,
   Settings,
   Shield,
   ShieldCheck,
   ShieldOff,
+  Sparkles,
   SquarePen,
   SquareTerminal,
   Terminal,
+  Users,
   type LucideIcon,
 } from "lucide-react";
 import { modSymbol } from "@/lib/keybindings";
@@ -38,6 +42,14 @@ function resolveSlashCommandIcon(cmd: SlashCommandView): LucideIcon {
       return Globe;
     case "compact":
       return FoldVertical;
+    case "orbit":
+      return Layers;
+    case "orbit-handoff":
+      return Send;
+    case "orbit-committee":
+      return Users;
+    case "orbit-advisor":
+      return Sparkles;
     case "supervised":
       return Shield;
     case "auto":

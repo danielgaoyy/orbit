@@ -2173,15 +2173,17 @@ export class OrbitHarmonyStore {
   }
 
   private parseSlashDirectiveEnum(rawDirective: string): string | null {
-    const clean = rawDirective.trim().toLowerCase();
-    if (clean === '/plan' || clean === 'plan') {
-      return 'plan';
-    }
-    if (clean === '/review' || clean === 'review') {
-      return 'review';
-    }
-    if (clean === '/compact' || clean === 'compact') {
-      return 'compact';
+    const clean = rawDirective.trim().toLowerCase().replace(/^\//, '');
+    if (
+      clean === 'plan' ||
+      clean === 'review' ||
+      clean === 'compact' ||
+      clean === 'orbit' ||
+      clean === 'orbit-handoff' ||
+      clean === 'orbit-committee' ||
+      clean === 'orbit-advisor'
+    ) {
+      return clean;
     }
     return null;
   }

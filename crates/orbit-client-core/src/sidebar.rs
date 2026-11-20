@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::DateTime;
-use orbit_protocol::{DiscoveredProject, GitStatusSnapshot, WorkspaceSummary};
+use orbit_protocol::{AttentionState, DiscoveredProject, GitStatusSnapshot, WorkspaceSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::app_core::{AgentCardView, ClientProjectView, cwd_paths_equivalent};
@@ -365,12 +365,23 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
         }
 
         // 2. Group active conversations
+        let agents_by_id: HashMap<&str, &AgentCardView> = host
+            .agents
+            .iter()
+            .map(|(a, _)| (a.agent_id.as_str(), a))
+            .collect();
+
         for (raw_agent, pinned_order) in &host.agents {
+            if raw_agent.background || raw_agent.archived_at_rfc3339.is_some() {
+                continue;
+            }
             let mut agent = raw_agent.clone();
             let is_selected = params.active_host_id == Some(host_id)
                 && params.active_agent_id == Some(agent.agent_id.as_str());
             if is_selected || agent.is_running || agent.is_awaiting_permission {
                 agent.is_unread = false;
+            } else if agent.attention != AttentionState::None {
+                agent.is_unread = true;
             }
 
             let clean_cwd = normalize_project_path(&agent.cwd);
@@ -391,6 +402,17 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
             if agent.is_awaiting_permission {
                 needs_attention.push(conv.clone());
             }
+
+            // Collapse same-workspace managed subagents under their parent's Subagents Track
+            if let Some(ref parent_id) = agent.parent_agent_id
+                && agent.parent_host_id.is_none()
+                && let Some(parent) = agents_by_id.get(parent_id.as_str())
+                && parent.archived_at_rfc3339.is_none()
+                && parent.workspace_id == agent.workspace_id
+            {
+                continue;
+            }
+
             if agent.is_pinned && matches_conversation_filter(&conv, params.filter) {
                 pinned_with_order.push((*pinned_order, conv.clone()));
             }
@@ -779,6 +801,13 @@ mod tests {
             is_running,
             is_awaiting_permission,
             parent_agent_id: None,
+            parent_host_id: None,
+            profile_id: None,
+            background: false,
+            auto_archive: false,
+            attention: AttentionState::None,
+            archived_at_rfc3339: None,
+            labels: HashMap::new(),
             latest_seq: 5,
             updated_at_rfc3339: updated_at_rfc3339.to_string(),
             is_pinned,
@@ -804,6 +833,12 @@ mod tests {
                 git_branch: None,
                 is_worktree: false,
                 updated_at: chrono::Utc::now(),
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
             },
             WorkspaceSummary {
                 workspace_id: "ws_wt".into(),
@@ -812,6 +847,12 @@ mod tests {
                 git_branch: Some("feat/ui".into()),
                 is_worktree: true,
                 updated_at: chrono::Utc::now(),
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
             },
         ];
         let discovered = vec![
@@ -929,5 +970,93 @@ mod tests {
         });
         assert_eq!(filtered.projects.len(), 1);
         assert_eq!(filtered.projects[0].conversations[0].agent.agent_id, "a2");
+    }
+
+    #[test]
+    fn hides_background_archived_and_same_workspace_subagents_and_promotes_attention_unread() {
+        let workspaces = vec![WorkspaceSummary {
+            workspace_id: "ws_1".into(),
+            title: "Orbit".into(),
+            cwd: "/Users/jess/Code/orbit".into(),
+            git_branch: Some("main".into()),
+            is_worktree: false,
+            updated_at: chrono::Utc::now(),
+            source_cwd: None,
+            base_ref: None,
+            parent_workspace_id: None,
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+        }];
+        let mut parent = sample_agent(
+            "parent",
+            "/Users/jess/Code/orbit",
+            "2026-11-20T10:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        parent.attention = AttentionState::Finished;
+
+        let mut bg = sample_agent(
+            "bg",
+            "/Users/jess/Code/orbit",
+            "2026-11-20T10:01:00Z",
+            true,
+            true,
+            false,
+            true,
+        );
+        bg.background = true;
+
+        let mut archived = sample_agent(
+            "arch",
+            "/Users/jess/Code/orbit",
+            "2026-11-20T10:02:00Z",
+            true,
+            true,
+            false,
+            true,
+        );
+        archived.archived_at_rfc3339 = Some("2026-11-20T10:02:00Z".into());
+
+        let mut sub_same_ws = sample_agent(
+            "sub_same",
+            "/Users/jess/Code/orbit",
+            "2026-11-20T10:03:00Z",
+            true,
+            true,
+            false,
+            true,
+        );
+        sub_same_ws.parent_agent_id = Some("parent".into());
+
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 3,
+            hosts: vec![SidebarHostInput {
+                host_id: "h1",
+                workspaces: &workspaces,
+                discovered_projects: &[],
+                agents: vec![(parent, 0), (bg, 10), (archived, 20), (sub_same_ws, 30)],
+                active_git_branch: Some("main".into()),
+            }],
+            pinned_projects: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h1"),
+            active_agent_id: None,
+            active_cwd: Some("/Users/jess/Code/orbit"),
+        });
+
+        // Only `parent` appears in the project list; subagent still surfaces under needs_attention
+        assert_eq!(view.projects.len(), 1);
+        assert_eq!(view.projects[0].conversations.len(), 1);
+        assert_eq!(view.projects[0].conversations[0].agent.agent_id, "parent");
+        assert!(view.projects[0].conversations[0].is_unread);
+        assert_eq!(view.pinned_conversations.len(), 0);
+        assert_eq!(view.needs_attention.len(), 1);
+        assert_eq!(view.needs_attention[0].agent.agent_id, "sub_same");
     }
 }

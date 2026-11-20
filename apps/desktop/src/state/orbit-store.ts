@@ -39,13 +39,20 @@ import {
   type SessionMode,
   type SidebarProjectGroupView,
   type SlashCommandView,
+  type SlashDirective,
   type SshHostItem,
   type WorkspaceFileView,
   isMacDesktop,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 
-export type SlashDirective = "plan" | "review" | "compact";
+export type { SlashDirective };
+
+export interface UndoArchiveEntry {
+  hostId: string;
+  agentId: string;
+  title: string;
+}
 
 export interface PastedAttachment {
   id: string;
@@ -218,6 +225,7 @@ export interface OrbitUiState {
   draftModels: Record<ProviderKind, string | null>;
   draftEffort: ReasoningEffort;
   draftMode: SessionMode;
+  draftProfileId: string | null;
   draftUseWorktree: boolean;
   draftWorktreeBranch: string;
 
@@ -294,6 +302,7 @@ export interface OrbitUiState {
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
   toastNotice: string | null;
+  lastArchivedUndo: UndoArchiveEntry | null;
   appVersion: string | null;
   isBrowserOffline: boolean;
   dismissedVersionMismatchHosts: Record<string, string>;
@@ -496,6 +505,7 @@ let state: OrbitUiState = {
     initialPrefs.draftMode && initialPrefs.draftMode !== "plan"
       ? initialPrefs.draftMode
       : "accept_edits",
+  draftProfileId: null,
   draftUseWorktree: initialPrefs.draftUseWorktree ?? true,
   draftWorktreeBranch: "",
 
@@ -576,6 +586,7 @@ let state: OrbitUiState = {
   sshHosts: [],
   externalEditors: [],
   toastNotice: null,
+  lastArchivedUndo: null,
   appVersion: null,
   isBrowserOffline: typeof navigator !== "undefined" ? !navigator.onLine : false,
   dismissedVersionMismatchHosts: {},
@@ -703,12 +714,16 @@ let initialized = false;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const notifiedApprovalAgents = new Set<string>();
 
-function notifyToast(msg: string): void {
+function notifyToast(msg: string, undo?: UndoArchiveEntry | null): void {
   if (toastTimer) clearTimeout(toastTimer);
-  setState((s) => ({ ...s, toastNotice: msg }));
+  setState((s) => ({
+    ...s,
+    toastNotice: msg,
+    lastArchivedUndo: undo ?? null,
+  }));
   toastTimer = setTimeout(() => {
-    setState((s) => ({ ...s, toastNotice: null }));
-  }, 3000);
+    setState((s) => ({ ...s, toastNotice: null, lastArchivedUndo: null }));
+  }, undo ? 6000 : 3000);
 }
 
 function syncAttentionIndicators(overview: FleetOverviewView, details: Record<string, HostDetailView>): void {
@@ -1537,6 +1552,8 @@ export const orbitActions = {
     markThreadSeenInCore(hostId, agentId, seenSeq);
     orbitActions.refreshSidebarView();
     void orbitIpc.openAgentTimeline(hostId, agentId);
+    void orbitIpc.markAgentRead(hostId, agentId);
+    void orbitIpc.listProviderSubagents(hostId, agentId);
     void orbitActions.pullStageDelta(hostId, agentId, false);
     if (nextCwd && nextCwd !== "~") {
       void orbitActions.refreshGit(hostId, nextCwd, null, state.diffStaged);
@@ -1647,6 +1664,7 @@ export const orbitActions = {
     model?: string | null;
     effort?: ReasoningEffort;
     mode?: SessionMode;
+    profileId?: string | null;
     useWorktree?: boolean;
     worktreeBranch?: string;
   }): void {
@@ -1663,6 +1681,12 @@ export const orbitActions = {
           draftModels: nextModels,
           draftEffort: patch.effort ?? s.draftEffort,
           draftMode: patch.mode ?? s.draftMode,
+          draftProfileId:
+            patch.profileId !== undefined
+              ? patch.profileId
+              : patch.provider !== undefined || patch.model !== undefined
+                ? null
+                : s.draftProfileId,
           draftUseWorktree: patch.useWorktree ?? s.draftUseWorktree,
           draftWorktreeBranch: patch.worktreeBranch ?? s.draftWorktreeBranch,
         };
@@ -2317,8 +2341,13 @@ export const orbitActions = {
         initialDisplayPrompt: cleanUserText,
         initialBadges: badges,
         worktreeBranch,
+        profileId: state.draftProfileId,
       });
-      setState((s) => ({ ...s, draftProvider: effectiveProvider, draftWorktreeBranch: "" }));
+      setState((s) => ({
+        ...s,
+        draftProvider: effectiveProvider,
+        draftWorktreeBranch: "",
+      }));
       return;
     }
 
@@ -2328,10 +2357,10 @@ export const orbitActions = {
 
     if (activeAgent?.is_running || activeAgent?.is_awaiting_permission) {
       if (steerImmediately) {
-        await orbitIpc.interruptAgent(hostId, agentId);
         await orbitIpc.sendPrompt(hostId, agentId, assembledWirePrompt, {
           displayPrompt: cleanUserText,
           badges,
+          activeTurnBehavior: "steer",
         });
       } else {
         const queuedItem: QueuedPromptItem = {
@@ -2679,12 +2708,14 @@ export const orbitActions = {
       state.selectedHostId === hostId &&
       state.selectedAgentId === agentId;
 
+    const detail = state.hostDetails[hostId];
+    const targetAgent = detail?.agents.find((a) => a.agent_id === agentId);
     let fallbackAgentId: string | null = null;
     if (wasSelected) {
-      const detail = state.hostDetails[hostId];
       const nextCandidate = detail?.agents.find(
         (a) =>
           a.agent_id !== agentId &&
+          !a.archived_at_rfc3339 &&
           !state.archivedThreads[threadScopeKey(hostId, a.agent_id)],
       );
       fallbackAgentId = nextCandidate?.agent_id ?? null;
@@ -2712,10 +2743,16 @@ export const orbitActions = {
       true,
     );
 
+    void orbitIpc.archiveAgent(hostId, agentId);
+    orbitActions.refreshSidebarView();
     if (wasSelected && fallbackAgentId) {
       orbitActions.selectAgent(hostId, fallbackAgentId);
     }
-    notifyToast("Conversation archived");
+    notifyToast("Conversation archived", {
+      hostId,
+      agentId,
+      title: targetAgent?.title ?? agentId,
+    });
   },
 
   restoreArchivedThread(hostId: string, agentId: string): void {
@@ -2727,12 +2764,27 @@ export const orbitActions = {
         return {
           ...s,
           archivedThreads: nextArchived,
+          lastArchivedUndo: null,
         };
       },
       true,
     );
+    void orbitIpc.unarchiveAgent(hostId, agentId);
+    orbitActions.refreshSidebarView();
     orbitActions.selectAgent(hostId, agentId);
     notifyToast("Conversation restored");
+  },
+
+  undoLastArchive(): void {
+    const entry = state.lastArchivedUndo;
+    if (!entry) return;
+    orbitActions.restoreArchivedThread(entry.hostId, entry.agentId);
+  },
+
+  async detachAgent(hostId: string, agentId: string): Promise<void> {
+    await orbitIpc.detachAgent(hostId, agentId);
+    orbitActions.refreshSidebarView();
+    notifyToast("Detached subagent to standalone thread");
   },
 
   async deleteThreadPermanently(hostId: string, agentId: string): Promise<void> {
@@ -2759,8 +2811,9 @@ export const orbitActions = {
     );
 
     lastReportedSeenSeq.delete(tKey);
-    await orbitIpc.archiveAgent(hostId, agentId);
+    await orbitIpc.deleteAgent(hostId, agentId);
     orbitActions.refreshSidebarView();
+    notifyToast("Conversation deleted");
   },
 
   setSidebarViewPrefs(patch: {
@@ -2956,7 +3009,7 @@ export const orbitActions = {
 
       if (project.conversations.length > 0) {
         await Promise.allSettled(
-          project.conversations.map(({ agent }) => orbitIpc.archiveAgent(hostId, agent.agent_id)),
+          project.conversations.map(({ agent }) => orbitIpc.deleteAgent(hostId, agent.agent_id)),
         );
       }
 

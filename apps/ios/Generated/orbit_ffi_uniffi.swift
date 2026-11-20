@@ -5944,6 +5944,7 @@ public struct FfiStageTurn: Equatable, Hashable {
     public var turnIndex: UInt32
     public var anchorSeq: UInt64
     public var userPrompt: FfiTimelineItem?
+    public var agentMessage: FfiTimelineItem?
     public var isCompactionCommand: Bool
     public var foldedSteps: [FfiTimelineItem]
     public var workCounts: FfiTurnWorkCounts
@@ -5968,11 +5969,12 @@ public struct FfiStageTurn: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(key: String, turnIndex: UInt32, anchorSeq: UInt64, userPrompt: FfiTimelineItem?, isCompactionCommand: Bool, foldedSteps: [FfiTimelineItem], workCounts: FfiTurnWorkCounts, workSummaryLabel: String, workSummaryLiveLabel: String, workSummaryLiveDetail: String?, workSummaryIncludesFailure: Bool, thoughtDurationMs: Int64?, workDurationMs: Int64?, turnDurationMs: Int64?, terminalReply: FfiTimelineItem?, lastAssistantReply: FfiTimelineItem?, notices: [FfiTimelineItem], compactions: [FfiTurnCompactionItem], liveSegments: [FfiTurnLiveSegment], turnDiffs: [FfiTurnFileDiffSummary], hasError: Bool, hasUnrecoveredError: Bool, hasActiveItem: Bool, startedAtMs: Int64?, completedAtMs: Int64?) {
+    public init(key: String, turnIndex: UInt32, anchorSeq: UInt64, userPrompt: FfiTimelineItem?, agentMessage: FfiTimelineItem?, isCompactionCommand: Bool, foldedSteps: [FfiTimelineItem], workCounts: FfiTurnWorkCounts, workSummaryLabel: String, workSummaryLiveLabel: String, workSummaryLiveDetail: String?, workSummaryIncludesFailure: Bool, thoughtDurationMs: Int64?, workDurationMs: Int64?, turnDurationMs: Int64?, terminalReply: FfiTimelineItem?, lastAssistantReply: FfiTimelineItem?, notices: [FfiTimelineItem], compactions: [FfiTurnCompactionItem], liveSegments: [FfiTurnLiveSegment], turnDiffs: [FfiTurnFileDiffSummary], hasError: Bool, hasUnrecoveredError: Bool, hasActiveItem: Bool, startedAtMs: Int64?, completedAtMs: Int64?) {
         self.key = key
         self.turnIndex = turnIndex
         self.anchorSeq = anchorSeq
         self.userPrompt = userPrompt
+        self.agentMessage = agentMessage
         self.isCompactionCommand = isCompactionCommand
         self.foldedSteps = foldedSteps
         self.workCounts = workCounts
@@ -6016,6 +6018,7 @@ public struct FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer {
                 turnIndex: FfiConverterUInt32.read(from: &buf), 
                 anchorSeq: FfiConverterUInt64.read(from: &buf), 
                 userPrompt: FfiConverterOptionTypeFfiTimelineItem.read(from: &buf), 
+                agentMessage: FfiConverterOptionTypeFfiTimelineItem.read(from: &buf), 
                 isCompactionCommand: FfiConverterBool.read(from: &buf), 
                 foldedSteps: FfiConverterSequenceTypeFfiTimelineItem.read(from: &buf), 
                 workCounts: FfiConverterTypeFfiTurnWorkCounts.read(from: &buf), 
@@ -6045,6 +6048,7 @@ public struct FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.turnIndex, into: &buf)
         FfiConverterUInt64.write(value.anchorSeq, into: &buf)
         FfiConverterOptionTypeFfiTimelineItem.write(value.userPrompt, into: &buf)
+        FfiConverterOptionTypeFfiTimelineItem.write(value.agentMessage, into: &buf)
         FfiConverterBool.write(value.isCompactionCommand, into: &buf)
         FfiConverterSequenceTypeFfiTimelineItem.write(value.foldedSteps, into: &buf)
         FfiConverterTypeFfiTurnWorkCounts.write(value.workCounts, into: &buf)
@@ -8850,6 +8854,10 @@ public enum FfiSlashDirective: Equatable, Hashable {
     case plan
     case review
     case compact
+    case orbit
+    case orbitHandoff
+    case orbitCommittee
+    case orbitAdvisor
 
 
 
@@ -8877,6 +8885,14 @@ public struct FfiConverterTypeFfiSlashDirective: FfiConverterRustBuffer {
         
         case 3: return .compact
         
+        case 4: return .orbit
+        
+        case 5: return .orbitHandoff
+        
+        case 6: return .orbitCommittee
+        
+        case 7: return .orbitAdvisor
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -8895,6 +8911,22 @@ public struct FfiConverterTypeFfiSlashDirective: FfiConverterRustBuffer {
         
         case .compact:
             writeInt(&buf, Int32(3))
+        
+        
+        case .orbit:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .orbitHandoff:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .orbitCommittee:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .orbitAdvisor:
+            writeInt(&buf, Int32(7))
         
         }
     }

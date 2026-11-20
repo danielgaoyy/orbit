@@ -133,6 +133,14 @@ export const FleetSidebar = memo(function FleetSidebar() {
 
   const rawProjects = sidebarView?.projects ?? [];
 
+  const isAgentArchived = useCallback(
+    (hostId: string, ag: AgentCardView): boolean => {
+      if (ag.archived_at_rfc3339) return true;
+      return Boolean(archivedThreads[threadScopeKey(hostId, ag.agent_id)]);
+    },
+    [archivedThreads],
+  );
+
   const isConvUnread = useCallback(
     (conv: SidebarConversationView): boolean => {
       const isSelected =
@@ -141,6 +149,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
         selectedHostId === conv.host_id &&
         selectedAgentId === conv.agent.agent_id;
       if (isSelected || conv.agent.is_running) return false;
+      if (conv.agent.attention && conv.agent.attention !== "none") return true;
       return conv.is_unread;
     },
     [workspacePanel, isDraftNewSession, selectedHostId, selectedAgentId],
@@ -156,7 +165,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
     }[] = [];
     for (const conv of sidebarView?.needs_attention ?? []) {
       const tKey = threadScopeKey(conv.host_id, conv.agent.agent_id);
-      if (archivedThreads[tKey]) continue;
+      if (isAgentArchived(conv.host_id, conv.agent)) continue;
       const host = hostById.get(conv.host_id);
       if (!host) continue;
       const matchedProj = rawProjects.find(
@@ -172,7 +181,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       });
     }
     return items;
-  }, [sidebarView?.needs_attention, archivedThreads, hostById, rawProjects, threadCustomTitles]);
+  }, [sidebarView?.needs_attention, isAgentArchived, hostById, rawProjects, threadCustomTitles]);
 
   // 2. Conditional Pinned conversations (0px when empty)
   const pinnedEntries = useMemo(() => {
@@ -184,7 +193,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
     }[] = [];
     for (const conv of sidebarView?.pinned_conversations ?? []) {
       const tKey = threadScopeKey(conv.host_id, conv.agent.agent_id);
-      if (archivedThreads[tKey]) continue;
+      if (isAgentArchived(conv.host_id, conv.agent)) continue;
       const host = hostById.get(conv.host_id);
       if (!host) continue;
       const matchedProj = rawProjects.find(
@@ -200,7 +209,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
       });
     }
     return ordered;
-  }, [sidebarView?.pinned_conversations, archivedThreads, hostById, rawProjects]);
+  }, [sidebarView?.pinned_conversations, isAgentArchived, hostById, rawProjects]);
 
   // 3. Projects tree (sorted & filtered by Rust, plus Desktop-local archived/hidden overlays)
   const displayProjects = useMemo(() => {
@@ -227,9 +236,25 @@ export const FleetSidebar = memo(function FleetSidebar() {
         continue;
       }
 
-      const visibleConversations = proj.conversations.filter(
-        (c) => !archivedThreads[threadScopeKey(proj.host_id, c.agent.agent_id)],
-      );
+      const detail = hostDetails[proj.host_id];
+      const agentsById = new Map((detail?.agents ?? []).map((a) => [a.agent_id, a]));
+
+      const visibleConversations = proj.conversations.filter((c) => {
+        if (c.agent.background) return false;
+        if (isAgentArchived(proj.host_id, c.agent)) return false;
+        // Collapse same-workspace managed subagents under their parent's Subagents Track
+        if (c.agent.parent_agent_id && !c.agent.parent_host_id) {
+          const parent = agentsById.get(c.agent.parent_agent_id);
+          if (
+            parent &&
+            !isAgentArchived(proj.host_id, parent) &&
+            parent.workspace_id === c.agent.workspace_id
+          ) {
+            return false;
+          }
+        }
+        return true;
+      });
 
       const allArchived =
         proj.conversations.length > 0 && visibleConversations.length === 0;
@@ -248,16 +273,16 @@ export const FleetSidebar = memo(function FleetSidebar() {
   }, [
     rawProjects,
     hostById,
+    hostDetails,
     hiddenProjectKeys,
-    archivedThreads,
+    isAgentArchived,
     selectedHostId,
     selectedWorkspaceCwd,
   ]);
 
-  // 4. Restorable Archived Conversations for Footer Drawer
+  // 4. Restorable Archived Conversations (synced from Daemon `archived_at` + local drawer state)
   const archivedEntries = useMemo(() => {
-    const keys = Object.keys(archivedThreads);
-    if (keys.length === 0) return [];
+    const seen = new Set<string>();
     const entries: {
       key: string;
       hostId: string;
@@ -267,22 +292,29 @@ export const FleetSidebar = memo(function FleetSidebar() {
       archivedAtMs: number;
     }[] = [];
 
-    for (const meta of Object.values(archivedThreads)) {
-      const detail = hostDetails[meta.hostId];
-      const ag = detail?.agents.find((a) => a.agent_id === meta.agentId);
-      if (!ag) continue;
-      const matchedProj = rawProjects.find(
-        (p) =>
-          p.host_id === meta.hostId && matchesProjectDirectory(p.directories, ag.cwd),
-      );
-      entries.push({
-        key: meta.key,
-        hostId: meta.hostId,
-        agent: ag,
-        projectName: matchedProj?.name || basenameOfProjectPath(ag.cwd),
-        effectiveTitle: threadCustomTitles[meta.key] || ag.title,
-        archivedAtMs: meta.archivedAtMs,
-      });
+    for (const [hostId, detail] of Object.entries(hostDetails)) {
+      for (const ag of detail.agents) {
+        if (ag.background) continue;
+        const tKey = threadScopeKey(hostId, ag.agent_id);
+        const localMeta = archivedThreads[tKey];
+        if (!ag.archived_at_rfc3339 && !localMeta) continue;
+        if (seen.has(tKey)) continue;
+        seen.add(tKey);
+        const matchedProj = rawProjects.find(
+          (p) => p.host_id === hostId && matchesProjectDirectory(p.directories, ag.cwd),
+        );
+        const archivedAtMs = ag.archived_at_rfc3339
+          ? Date.parse(ag.archived_at_rfc3339) || Date.now()
+          : (localMeta?.archivedAtMs ?? Date.now());
+        entries.push({
+          key: tKey,
+          hostId,
+          agent: ag,
+          projectName: matchedProj?.name || basenameOfProjectPath(ag.cwd),
+          effectiveTitle: threadCustomTitles[tKey] || ag.title,
+          archivedAtMs,
+        });
+      }
     }
 
     entries.sort((a, b) => b.archivedAtMs - a.archivedAtMs);

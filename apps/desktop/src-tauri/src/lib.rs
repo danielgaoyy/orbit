@@ -1,5 +1,6 @@
 mod updater;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,7 +48,9 @@ use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
 use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView};
 use orbit_protocol::{
-    PromptBadge, ProviderKind, ProviderModelCatalog, ReasoningEffort, SessionMode,
+    ActiveTurnBehavior, AgentProfile, OrchestrationConfig, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
+    ScheduleTarget, SessionMode, WorkspaceIsolation, WorktreeCreateMode,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -453,20 +456,24 @@ fn create_agent(
     initial_display_prompt: Option<String>,
     initial_badges: Option<Vec<PromptBadge>>,
     worktree_branch: Option<String>,
+    profile_id: Option<String>,
 ) -> String {
-    state.core.create_agent_with_config(CreateAgentRequest {
-        host_id: &host_id,
-        cwd: &cwd,
-        extra_dirs: extra_dirs.unwrap_or_default(),
-        provider,
-        model,
-        effort,
-        mode,
-        initial_prompt: &initial_prompt,
-        initial_display_prompt,
-        initial_badges: initial_badges.unwrap_or_default(),
-        worktree_branch: worktree_branch.as_deref(),
-    })
+    state.core.create_agent_with_profile(
+        CreateAgentRequest {
+            host_id: &host_id,
+            cwd: &cwd,
+            extra_dirs: extra_dirs.unwrap_or_default(),
+            provider,
+            model,
+            effort,
+            mode,
+            initial_prompt: &initial_prompt,
+            initial_display_prompt,
+            initial_badges: initial_badges.unwrap_or_default(),
+            worktree_branch: worktree_branch.as_deref(),
+        },
+        profile_id,
+    )
 }
 
 #[tauri::command]
@@ -482,13 +489,15 @@ fn send_prompt(
     prompt: String,
     display_prompt: Option<String>,
     badges: Option<Vec<PromptBadge>>,
+    active_turn_behavior: Option<ActiveTurnBehavior>,
 ) {
-    state.core.send_prompt_with_meta(
+    state.core.send_prompt_with_behavior(
         &host_id,
         &agent_id,
         &prompt,
         display_prompt,
         badges.unwrap_or_default(),
+        active_turn_behavior.unwrap_or_default(),
     );
 }
 
@@ -547,6 +556,311 @@ fn switch_agent_provider(
 #[tauri::command]
 fn archive_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
     state.core.archive_agent(&host_id, &agent_id);
+}
+
+#[tauri::command]
+fn unarchive_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
+    state.core.unarchive_agent(&host_id, &agent_id);
+}
+
+#[tauri::command]
+fn delete_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
+    state.core.delete_agent(&host_id, &agent_id);
+}
+
+#[tauri::command]
+fn detach_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
+    state.core.detach_agent(&host_id, &agent_id);
+}
+
+#[tauri::command]
+fn mark_agent_read(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
+    state.core.mark_agent_read(&host_id, &agent_id);
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    title: Option<String>,
+    model: Option<String>,
+    effort: Option<ReasoningEffort>,
+    mode: Option<SessionMode>,
+    labels: Option<HashMap<String, String>>,
+) {
+    state
+        .core
+        .update_agent(&host_id, &agent_id, title, model, effort, mode, labels);
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn create_workspace_v2(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    source_cwd: String,
+    title: Option<String>,
+    isolation: WorkspaceIsolation,
+    worktree_mode: WorktreeCreateMode,
+    worktree_branch: Option<String>,
+    base_ref: Option<String>,
+    pr_number: Option<u32>,
+) {
+    state.core.create_workspace_v2(
+        &host_id,
+        &source_cwd,
+        title,
+        isolation,
+        worktree_mode,
+        worktree_branch,
+        base_ref,
+        pr_number,
+    );
+}
+
+#[tauri::command]
+fn rename_workspace(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+    title: String,
+) {
+    state.core.rename_workspace(&host_id, &workspace_id, &title);
+}
+
+#[tauri::command]
+fn archive_workspace(state: State<'_, DesktopAppState>, host_id: String, workspace_id: String) {
+    state.core.archive_workspace(&host_id, &workspace_id);
+}
+
+#[tauri::command]
+fn unarchive_workspace(state: State<'_, DesktopAppState>, host_id: String, workspace_id: String) {
+    state.core.unarchive_workspace(&host_id, &workspace_id);
+}
+
+#[tauri::command]
+fn list_workspace_scripts(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+) {
+    state.core.list_workspace_scripts(&host_id, &workspace_id);
+}
+
+#[tauri::command]
+fn start_workspace_script(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+    script_name: String,
+) {
+    state
+        .core
+        .start_workspace_script(&host_id, &workspace_id, &script_name);
+}
+
+#[tauri::command]
+fn stop_workspace_script(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+    script_name: String,
+) {
+    state
+        .core
+        .stop_workspace_script(&host_id, &workspace_id, &script_name);
+}
+
+#[tauri::command]
+fn upsert_profile(state: State<'_, DesktopAppState>, host_id: String, profile: AgentProfile) {
+    state.core.upsert_profile(&host_id, profile);
+}
+
+#[tauri::command]
+fn delete_profile(state: State<'_, DesktopAppState>, host_id: String, profile_id: String) {
+    state.core.delete_profile(&host_id, &profile_id);
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn create_schedule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    name: String,
+    cron_expr: String,
+    timezone: Option<String>,
+    prompt: String,
+    target: ScheduleTarget,
+    max_runs: Option<u32>,
+) {
+    state
+        .core
+        .create_schedule(&host_id, name, cron_expr, timezone, prompt, target, max_runs);
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_schedule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    schedule_id: String,
+    name: Option<String>,
+    cron_expr: Option<String>,
+    prompt: Option<String>,
+    max_runs: Option<u32>,
+    archive_on_finish: Option<bool>,
+) {
+    state.core.update_schedule(
+        &host_id,
+        &schedule_id,
+        name,
+        cron_expr,
+        prompt,
+        max_runs,
+        archive_on_finish,
+    );
+}
+
+#[tauri::command]
+fn pause_schedule(state: State<'_, DesktopAppState>, host_id: String, schedule_id: String) {
+    state.core.pause_schedule(&host_id, &schedule_id);
+}
+
+#[tauri::command]
+fn resume_schedule(state: State<'_, DesktopAppState>, host_id: String, schedule_id: String) {
+    state.core.resume_schedule(&host_id, &schedule_id);
+}
+
+#[tauri::command]
+fn run_schedule_once(state: State<'_, DesktopAppState>, host_id: String, schedule_id: String) {
+    state.core.run_schedule_once(&host_id, &schedule_id);
+}
+
+#[tauri::command]
+fn delete_schedule(state: State<'_, DesktopAppState>, host_id: String, schedule_id: String) {
+    state.core.delete_schedule(&host_id, &schedule_id);
+}
+
+#[tauri::command]
+fn fetch_schedule_runs(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    schedule_id: String,
+    limit: Option<u32>,
+) {
+    state
+        .core
+        .fetch_schedule_runs(&host_id, &schedule_id, limit);
+}
+
+#[tauri::command]
+fn get_schedule_runs(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    schedule_id: String,
+) -> Vec<ScheduleRunRecord> {
+    state.core.schedule_runs(&host_id, &schedule_id)
+}
+
+#[tauri::command]
+fn add_connected_host(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    label: Option<String>,
+    pairing_uri: String,
+) {
+    state
+        .core
+        .add_connected_host(&host_id, label, &pairing_uri);
+}
+
+#[tauri::command]
+fn update_connected_host(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    registration_id: String,
+    label: Option<String>,
+    enabled: Option<bool>,
+) {
+    state
+        .core
+        .update_connected_host(&host_id, &registration_id, label, enabled);
+}
+
+#[tauri::command]
+fn remove_connected_host(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    registration_id: String,
+) {
+    state
+        .core
+        .remove_connected_host(&host_id, &registration_id);
+}
+
+#[tauri::command]
+fn sync_fleet_connected_hosts(state: State<'_, DesktopAppState>, target_host_id: String) -> u32 {
+    state.core.sync_fleet_connected_hosts(&target_host_id)
+}
+
+#[tauri::command]
+fn update_orchestration_config(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    config: OrchestrationConfig,
+) {
+    state.core.update_orchestration_config(&host_id, config);
+}
+
+#[tauri::command]
+fn sync_orchestration_skills(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    skill_ids: Vec<String>,
+) {
+    state.core.sync_orchestration_skills(&host_id, skill_ids);
+}
+
+#[tauri::command]
+fn list_provider_subagents(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    parent_agent_id: String,
+) {
+    state
+        .core
+        .list_provider_subagents(&host_id, &parent_agent_id);
+}
+
+#[tauri::command]
+fn open_provider_subagent_timeline(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    parent_agent_id: String,
+    subagent_id: String,
+) {
+    state
+        .core
+        .open_provider_subagent_timeline(&host_id, &parent_agent_id, &subagent_id);
+}
+
+#[tauri::command]
+fn get_provider_subagent_timeline(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    parent_agent_id: String,
+    subagent_id: String,
+) -> Vec<ProviderSubagentEvent> {
+    state
+        .core
+        .provider_subagent_timeline(&host_id, &parent_agent_id, &subagent_id)
+}
+
+#[tauri::command]
+fn refresh_pending_permissions(state: State<'_, DesktopAppState>, host_id: String) {
+    state.core.refresh_pending_permissions(&host_id);
 }
 
 #[tauri::command]
@@ -1093,6 +1407,38 @@ pub fn run() {
             set_agent_model,
             switch_agent_provider,
             archive_agent,
+            unarchive_agent,
+            delete_agent,
+            detach_agent,
+            mark_agent_read,
+            update_agent,
+            create_workspace_v2,
+            rename_workspace,
+            archive_workspace,
+            unarchive_workspace,
+            list_workspace_scripts,
+            start_workspace_script,
+            stop_workspace_script,
+            upsert_profile,
+            delete_profile,
+            create_schedule,
+            update_schedule,
+            pause_schedule,
+            resume_schedule,
+            run_schedule_once,
+            delete_schedule,
+            fetch_schedule_runs,
+            get_schedule_runs,
+            add_connected_host,
+            update_connected_host,
+            remove_connected_host,
+            sync_fleet_connected_hosts,
+            update_orchestration_config,
+            sync_orchestration_skills,
+            list_provider_subagents,
+            open_provider_subagent_timeline,
+            get_provider_subagent_timeline,
+            refresh_pending_permissions,
             rewind_agent,
             resolve_permission,
             answer_question,

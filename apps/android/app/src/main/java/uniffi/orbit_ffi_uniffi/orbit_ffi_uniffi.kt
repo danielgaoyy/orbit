@@ -7306,6 +7306,8 @@ data class FfiStageTurn (
     , 
     var `userPrompt`: FfiTimelineItem?
     , 
+    var `agentMessage`: FfiTimelineItem?
+    , 
     var `isCompactionCommand`: kotlin.Boolean
     , 
     var `foldedSteps`: List<FfiTimelineItem>
@@ -7367,6 +7369,7 @@ public object FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer<FfiStageTurn>
             FfiConverterUInt.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterOptionalTypeFfiTimelineItem.read(buf),
+            FfiConverterOptionalTypeFfiTimelineItem.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceTypeFfiTimelineItem.read(buf),
             FfiConverterTypeFfiTurnWorkCounts.read(buf),
@@ -7396,6 +7399,7 @@ public object FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer<FfiStageTurn>
             FfiConverterUInt.allocationSize(value.`turnIndex`) +
             FfiConverterULong.allocationSize(value.`anchorSeq`) +
             FfiConverterOptionalTypeFfiTimelineItem.allocationSize(value.`userPrompt`) +
+            FfiConverterOptionalTypeFfiTimelineItem.allocationSize(value.`agentMessage`) +
             FfiConverterBoolean.allocationSize(value.`isCompactionCommand`) +
             FfiConverterSequenceTypeFfiTimelineItem.allocationSize(value.`foldedSteps`) +
             FfiConverterTypeFfiTurnWorkCounts.allocationSize(value.`workCounts`) +
@@ -7424,6 +7428,7 @@ public object FfiConverterTypeFfiStageTurn: FfiConverterRustBuffer<FfiStageTurn>
             FfiConverterUInt.write(value.`turnIndex`, buf)
             FfiConverterULong.write(value.`anchorSeq`, buf)
             FfiConverterOptionalTypeFfiTimelineItem.write(value.`userPrompt`, buf)
+            FfiConverterOptionalTypeFfiTimelineItem.write(value.`agentMessage`, buf)
             FfiConverterBoolean.write(value.`isCompactionCommand`, buf)
             FfiConverterSequenceTypeFfiTimelineItem.write(value.`foldedSteps`, buf)
             FfiConverterTypeFfiTurnWorkCounts.write(value.`workCounts`, buf)
@@ -9765,7 +9770,11 @@ enum class FfiSlashDirective {
     
     PLAN,
     REVIEW,
-    COMPACT;
+    COMPACT,
+    ORBIT,
+    ORBIT_HANDOFF,
+    ORBIT_COMMITTEE,
+    ORBIT_ADVISOR;
 
     
 

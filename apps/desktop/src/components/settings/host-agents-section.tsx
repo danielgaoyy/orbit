@@ -1,12 +1,27 @@
 import { useState } from "react";
-import { Check, RefreshCw } from "lucide-react";
+import {
+  Check,
+  Download,
+  Link2,
+  Plus,
+  RefreshCw,
+  Server,
+  Sparkles,
+  Trash2,
+} from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
   SettingRow,
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
-import { type ProviderKind, orbitIpc } from "@/lib/orbit-ipc";
+import {
+  type AgentProfile,
+  type OrchestrationConfig,
+  type ProviderKind,
+  type SessionMode,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
@@ -18,9 +33,19 @@ const PROVIDERS: { id: ProviderKind; label: string; bin: string }[] = [
   { id: "antigravity", label: "Antigravity", bin: "agy" },
 ];
 
+const DEFAULT_ORCH_CONFIG: OrchestrationConfig = {
+  mcp_inject_enabled: true,
+  idle_cleanup_enabled: true,
+  idle_timeout_secs: 1800,
+  resume_on_startup: false,
+  resume_prompt: "Continue where you left off.",
+  installed_skills: [],
+};
+
 export function HostAgentsSection({ hostId }: { hostId: string }) {
   const fleet = useOrbitSelector((s) => s.fleet);
   const hostCard = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
+  const otherFleetHostsCount = fleet.hosts.filter((h) => h.host_id !== hostId).length;
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
 
@@ -30,9 +55,28 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
     Boolean(hostCard) &&
     (fleet.hosts.length > 1 || (hostCard !== null && !isLocalHostCard(hostCard)));
 
+  // New Profile form state
+  const [addingProfile, setAddingProfile] = useState(false);
+  const [profName, setProfName] = useState("");
+  const [profProvider, setProfProvider] = useState<ProviderKind>("claude_code");
+  const [profModel, setProfModel] = useState("");
+  const [profMode, setProfMode] = useState<SessionMode>("accept_edits");
+  const [profWhenToUse, setProfWhenToUse] = useState("");
+  const [profSystemPrompt, setProfSystemPrompt] = useState("");
+  const [profDisabledTools, setProfDisabledTools] = useState("");
+  const [profMcpEnabled, setProfMcpEnabled] = useState(true);
+
+  // Connected Host form state
+  const [peerUri, setPeerUri] = useState("");
+  const [peerLabel, setPeerLabel] = useState("");
+
   const available =
     hostDetail?.host.available_providers ?? hostCard?.available_providers ?? [];
   const catalogs = hostDetail?.provider_catalogs ?? [];
+  const orchConfig = hostDetail?.orchestration_config ?? DEFAULT_ORCH_CONFIG;
+  const profiles = hostDetail?.profiles ?? [];
+  const skills = hostDetail?.orchestration_skills ?? [];
+  const connectedHosts = hostDetail?.connected_hosts ?? [];
 
   const handleRefreshModels = async () => {
     setRefreshingModels(true);
@@ -44,11 +88,94 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
     }
   };
 
+  const patchOrchConfig = async (patch: Partial<OrchestrationConfig>) => {
+    await orbitIpc.updateOrchestrationConfig(hostId, {
+      ...orchConfig,
+      ...patch,
+    });
+    orbitActions.showToast("Updated orchestration runtime settings");
+  };
+
+  const handleCreateProfile = async () => {
+    if (!profName.trim()) {
+      orbitActions.showToast("Profile name is required");
+      return;
+    }
+    const now = new Date().toISOString();
+    const disabled = profDisabledTools
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const profile: AgentProfile = {
+      profile_id: "",
+      name: profName.trim(),
+      provider: profProvider,
+      model: profModel.trim() || null,
+      effort: null,
+      mode: profMode,
+      when_to_use: profWhenToUse.trim(),
+      system_prompt_append: profSystemPrompt.trim() || null,
+      mcp_policy: {
+        enabled: profMcpEnabled,
+        disabled_tools: disabled,
+      },
+      created_at: now,
+      updated_at: now,
+    };
+    await orbitIpc.upsertProfile(hostId, profile);
+    setProfName("");
+    setProfModel("");
+    setProfWhenToUse("");
+    setProfSystemPrompt("");
+    setProfDisabledTools("");
+    setAddingProfile(false);
+    orbitActions.showToast(`Saved profile "${profile.name}"`);
+  };
+
+  const handleToggleSkill = async (skillId: string, currentlyInstalled: boolean) => {
+    const installedIds = new Set(skills.filter((s) => s.installed).map((s) => s.id));
+    if (currentlyInstalled) {
+      installedIds.delete(skillId);
+    } else {
+      installedIds.add(skillId);
+    }
+    await orbitIpc.syncOrchestrationSkills(hostId, Array.from(installedIds));
+    orbitActions.showToast(
+      currentlyInstalled ? `Removed /${skillId} skill` : `Installed /${skillId} skill`,
+    );
+  };
+
+  const handleInstallAllSkills = async () => {
+    const allIds = skills.map((s) => s.id);
+    await orbitIpc.syncOrchestrationSkills(hostId, allIds);
+    orbitActions.showToast(`Synced ${allIds.length} orchestration skills`);
+  };
+
+  const handleAddPeer = async () => {
+    if (!peerUri.trim()) {
+      orbitActions.showToast("Paste an orbit://pair/... URI");
+      return;
+    }
+    await orbitIpc.addConnectedHost(hostId, peerUri.trim(), peerLabel.trim() || null);
+    setPeerUri("");
+    setPeerLabel("");
+    orbitActions.showToast("Added connected host");
+  };
+
+  const handleSyncFleetHosts = async () => {
+    const count = await orbitIpc.syncFleetConnectedHosts(hostId);
+    orbitActions.showToast(
+      count > 0
+        ? `Synced ${count} fleet host(s) into daemon mesh`
+        : "No other fleet hosts available to sync",
+    );
+  };
+
   return (
     <div className="space-y-6">
       <SettingSectionHeader
-        title="Agents"
-        description="Installed coding agents and available models on this host."
+        title="Agents & Orchestration"
+        description="Installed CLIs, built-in Orbit MCP orchestration, reusable Profiles, bundled Skills, and Cross-Host Mesh."
         badge={
           showHostBadge && hostCard ? (
             <span className="bg-muted text-muted-foreground rounded-md px-2 py-0.5 text-[11.5px] font-medium">
@@ -71,7 +198,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
         }
       />
 
-      {/* Installed CLIs on this Host */}
+      {/* 1. Installed CLIs */}
       <div className="space-y-2">
         <SettingGroupLabel>Installed CLIs</SettingGroupLabel>
         <SettingCard>
@@ -133,6 +260,353 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
               </SettingRow>
             );
           })}
+        </SettingCard>
+      </div>
+
+      {/* 2. Orchestration Runtime Settings */}
+      <div className="space-y-2">
+        <SettingGroupLabel>Orchestration & Runtime</SettingGroupLabel>
+        <SettingCard>
+          <SettingRow
+            title="Built-in Orbit MCP Orchestrator"
+            description="Auto-inject the local Streamable HTTP MCP server (/mcp/agents) into Claude, Codex, and Antigravity sessions so agents can delegate subagents, create worktrees, and schedule tasks."
+          >
+            <input
+              type="checkbox"
+              checked={orchConfig.mcp_inject_enabled}
+              onChange={(e) => void patchOrchConfig({ mcp_inject_enabled: e.target.checked })}
+              className="h-4 w-4 cursor-pointer"
+            />
+          </SettingRow>
+
+          <SettingRow
+            title="Idle Runtime Cleanup"
+            description="Automatically release idle provider processes after inactivity while preserving full session resume state and protecting active subagent trees."
+          >
+            <div className="flex items-center gap-2">
+              <select
+                value={orchConfig.idle_timeout_secs}
+                disabled={!orchConfig.idle_cleanup_enabled}
+                onChange={(e) =>
+                  void patchOrchConfig({ idle_timeout_secs: Number(e.target.value) })
+                }
+                className="border-border bg-canvas text-foreground rounded-md border px-2 py-1 text-[12px] disabled:opacity-50"
+              >
+                <option value={600}>10 min</option>
+                <option value={1200}>20 min</option>
+                <option value={1800}>30 min</option>
+                <option value={3600}>60 min</option>
+              </select>
+              <input
+                type="checkbox"
+                checked={orchConfig.idle_cleanup_enabled}
+                onChange={(e) => void patchOrchConfig({ idle_cleanup_enabled: e.target.checked })}
+                className="h-4 w-4 cursor-pointer"
+              />
+            </div>
+          </SettingRow>
+
+          <SettingRow
+            title="Auto-Resume on Daemon Startup"
+            description="Automatically send a resume prompt to non-background agents that were mid-turn if the host rebooted."
+          >
+            <input
+              type="checkbox"
+              checked={orchConfig.resume_on_startup}
+              onChange={(e) => void patchOrchConfig({ resume_on_startup: e.target.checked })}
+              className="h-4 w-4 cursor-pointer"
+            />
+          </SettingRow>
+        </SettingCard>
+      </div>
+
+      {/* 3. Agent Profiles */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <SettingGroupLabel>Agent Profiles ({profiles.length})</SettingGroupLabel>
+          <button
+            type="button"
+            onClick={() => setAddingProfile((v) => !v)}
+            className="border-border hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium"
+          >
+            <Plus className="h-[12px] w-[12px]" />
+            <span>New Profile</span>
+          </button>
+        </div>
+
+        {addingProfile && (
+          <div className="border-border bg-elevated/70 space-y-3 rounded-xl border p-3.5 text-[12.5px]">
+            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+              <input
+                value={profName}
+                onChange={(e) => setProfName(e.target.value)}
+                placeholder="Profile Name (e.g. Claude Architect)"
+                className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 outline-none"
+              />
+              <select
+                value={profProvider}
+                onChange={(e) => setProfProvider(e.target.value as ProviderKind)}
+                className="border-border bg-canvas rounded-lg border px-2 py-1.5"
+              >
+                <option value="claude_code">Claude Code</option>
+                <option value="codex">Codex</option>
+                <option value="antigravity">Antigravity</option>
+              </select>
+              <input
+                value={profModel}
+                onChange={(e) => setProfModel(e.target.value)}
+                placeholder="Model slug (optional)"
+                className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 outline-none"
+              />
+              <select
+                value={typeof profMode === "string" ? profMode : "accept_edits"}
+                onChange={(e) => setProfMode(e.target.value as SessionMode)}
+                className="border-border bg-canvas rounded-lg border px-2 py-1.5"
+              >
+                <option value="accept_edits">Accept Edits</option>
+                <option value="plan">Plan (Read-only)</option>
+                <option value="full_access">Full Access</option>
+                <option value="default">Ask</option>
+              </select>
+            </div>
+            <input
+              value={profWhenToUse}
+              onChange={(e) => setProfWhenToUse(e.target.value)}
+              placeholder="When to use (helps orchestrators pick this profile automatically)"
+              className="border-border bg-canvas w-full rounded-lg border px-2.5 py-1.5 outline-none"
+            />
+            <textarea
+              rows={2}
+              value={profSystemPrompt}
+              onChange={(e) => setProfSystemPrompt(e.target.value)}
+              placeholder="System prompt append (optional)"
+              className="border-border bg-canvas w-full rounded-lg border px-2.5 py-1.5 outline-none"
+            />
+            <input
+              value={profDisabledTools}
+              onChange={(e) => setProfDisabledTools(e.target.value)}
+              placeholder="Disabled MCP tools (comma-separated, e.g. delete_agent,kill_terminal)"
+              className="border-border bg-canvas w-full rounded-lg border px-2.5 py-1.5 font-mono text-[11.5px] outline-none"
+            />
+            <div className="flex items-center justify-between">
+              <label className="inline-flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={profMcpEnabled}
+                  onChange={(e) => setProfMcpEnabled(e.target.checked)}
+                />
+                <span>Inject Orbit MCP tools</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAddingProfile(false)}
+                  className="border-border hover:bg-accent cursor-pointer rounded-lg border px-2.5 py-1"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleCreateProfile()}
+                  className="bg-foreground text-background cursor-pointer rounded-lg px-3 py-1 font-medium"
+                >
+                  Save Profile
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <SettingCard>
+          {profiles.length === 0 ? (
+            <div className="text-muted-foreground px-4 py-4 text-[12.5px]">
+              No specialist profiles yet. Create profiles like &ldquo;Claude Architect&rdquo;,
+              &ldquo;Codex Implementer&rdquo;, or &ldquo;Antigravity Reviewer&rdquo; so
+              orchestrating agents can discover and delegate by role.
+            </div>
+          ) : (
+            profiles.map((p) => (
+              <SettingRow
+                key={p.profile_id}
+                title={
+                  <span className="flex items-center gap-2">
+                    <ProviderIcon provider={p.provider} className="size-3.5" />
+                    <span>{p.name}</span>
+                    {p.model && (
+                      <code className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[11px]">
+                        {p.model}
+                      </code>
+                    )}
+                  </span>
+                }
+                description={
+                  p.when_to_use ||
+                  `Mode: ${typeof p.mode === "string" ? p.mode : "custom"} · MCP ${p.mcp_policy.enabled ? "on" : "off"}`
+                }
+              >
+                <button
+                  type="button"
+                  onClick={() => void orbitIpc.deleteProfile(hostId, p.profile_id)}
+                  className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5"
+                >
+                  <Trash2 className="h-[13.5px] w-[13.5px]" />
+                </button>
+              </SettingRow>
+            ))
+          )}
+        </SettingCard>
+      </div>
+
+      {/* 4. Bundled Orchestration Skills */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <SettingGroupLabel>Orchestration Skills</SettingGroupLabel>
+          {skills.length > 0 && (
+            <button
+              type="button"
+              onClick={() => void handleInstallAllSkills()}
+              className="border-border hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium"
+            >
+              <Download className="h-[12px] w-[12px]" />
+              <span>Install / Update All</span>
+            </button>
+          )}
+        </div>
+        <SettingCard>
+          {skills.map((s) => (
+            <SettingRow
+              key={s.id}
+              title={
+                <span className="flex items-center gap-2">
+                  <Sparkles className="text-muted-foreground h-[13.5px] w-[13.5px]" />
+                  <span>{s.name}</span>
+                  <code className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[11px]">
+                    {s.slash_command}
+                  </code>
+                  {s.outdated && (
+                    <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10.5px] text-amber-600 dark:text-amber-400">
+                      Outdated
+                    </span>
+                  )}
+                </span>
+              }
+              description={s.description}
+            >
+              <button
+                type="button"
+                onClick={() => void handleToggleSkill(s.id, s.installed && !s.outdated)}
+                className={cn(
+                  "cursor-pointer rounded-lg border px-2.5 py-1 text-[11.5px] font-medium transition-colors",
+                  s.installed && !s.outdated
+                    ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-600 hover:bg-rose-500/10 hover:text-rose-600 dark:text-emerald-400"
+                    : "border-border hover:bg-accent text-foreground",
+                )}
+              >
+                {s.outdated ? "Update" : s.installed ? "Installed" : "Install"}
+              </button>
+            </SettingRow>
+          ))}
+        </SettingCard>
+      </div>
+
+      {/* 5. Connected Hosts (Cross-Host Orchestration Mesh) */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <SettingGroupLabel>Connected Hosts Mesh ({connectedHosts.length})</SettingGroupLabel>
+          {otherFleetHostsCount > 0 && (
+            <button
+              type="button"
+              onClick={() => void handleSyncFleetHosts()}
+              className="border-border hover:bg-accent inline-flex h-[26px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium"
+            >
+              <Link2 className="h-[12px] w-[12px]" />
+              <span>Sync {otherFleetHostsCount} Fleet Host(s)</span>
+            </button>
+          )}
+        </div>
+
+        <SettingCard>
+          {connectedHosts.length === 0 ? (
+            <div className="text-muted-foreground px-4 py-3.5 text-[12.5px]">
+              No peer daemons connected yet. Register another Orbit Daemon so agents on this host
+              can delegate tasks across machines via <code className="text-[11.5px]">host_id</code>.
+            </div>
+          ) : (
+            connectedHosts.map((peer) => (
+              <SettingRow
+                key={peer.registration_id}
+                title={
+                  <span className="flex items-center gap-2">
+                    <Server className="text-muted-foreground h-[13.5px] w-[13.5px]" />
+                    <span>{peer.label}</span>
+                    <span
+                      className={cn(
+                        "rounded px-1.5 py-0.5 text-[10.5px] font-medium",
+                        peer.status === "online"
+                          ? "bg-emerald-500/12 text-emerald-600 dark:text-emerald-400"
+                          : peer.status === "connecting"
+                            ? "bg-blue-500/12 text-blue-600 dark:text-blue-400"
+                            : peer.status === "error"
+                              ? "bg-rose-500/12 text-rose-600 dark:text-rose-400"
+                              : "bg-muted text-muted-foreground",
+                      )}
+                    >
+                      {peer.status}
+                    </span>
+                  </span>
+                }
+                description={
+                  peer.last_error
+                    ? peer.last_error
+                    : `${peer.hostname ?? peer.host_id ?? "pending handshake"}${peer.available_providers.length > 0 ? ` · ${peer.available_providers.join(", ")}` : ""}`
+                }
+              >
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={peer.enabled}
+                    onChange={(e) =>
+                      void orbitIpc.updateConnectedHost(hostId, peer.registration_id, {
+                        enabled: e.target.checked,
+                      })
+                    }
+                    className="h-4 w-4 cursor-pointer"
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void orbitIpc.removeConnectedHost(hostId, peer.registration_id)
+                    }
+                    className="text-muted-foreground hover:text-rose-500 hover:bg-accent cursor-pointer rounded-md p-1.5"
+                  >
+                    <Trash2 className="h-[13.5px] w-[13.5px]" />
+                  </button>
+                </div>
+              </SettingRow>
+            ))
+          )}
+
+          <div className="border-border flex flex-wrap items-center gap-2 border-t px-4 py-3">
+            <input
+              value={peerLabel}
+              onChange={(e) => setPeerLabel(e.target.value)}
+              placeholder="Label (optional)"
+              className="border-border bg-canvas w-36 rounded-lg border px-2.5 py-1.5 text-[12px] outline-none"
+            />
+            <input
+              value={peerUri}
+              onChange={(e) => setPeerUri(e.target.value)}
+              placeholder="Paste orbit://pair/... URI from another daemon"
+              className="border-border bg-canvas min-w-[200px] flex-1 rounded-lg border px-2.5 py-1.5 font-mono text-[12px] outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => void handleAddPeer()}
+              className="bg-foreground text-background cursor-pointer rounded-lg px-3 py-1.5 text-[12px] font-medium"
+            >
+              Add Peer
+            </button>
+          </div>
         </SettingCard>
       </div>
     </div>

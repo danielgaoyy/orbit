@@ -81,6 +81,11 @@ import {
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import { StickyApprovalDock } from "@/components/stage/stage-approval-dock";
 import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
+import {
+  AgentMessageCard,
+  ParentSubagentBanner,
+  SubagentsTrack,
+} from "@/components/stage/subagents-track";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
 import { Button } from "@/components/ui/button";
 import {
@@ -354,6 +359,8 @@ function stableStepItemKey(item: TimelineItemView, idx: number): string {
       return item.request_id ? `q-${item.request_id}` : `q-seq-${item.seq}-${idx}`;
     case "user_prompt":
       return item.message_id ? `prompt-${item.message_id}` : `prompt-seq-${item.seq}-${idx}`;
+    case "agent_message":
+      return item.message_id ? `am-${item.message_id}` : `am-seq-${item.seq}-${idx}`;
     case "notice":
       return `notice-${item.seq}-${idx}`;
   }
@@ -1345,6 +1352,9 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
           alt={badge.label}
           decoding="async"
           draggable={false}
+          onError={() =>
+            setThumbState({ status: "fallback", url: null, resolvedPath: imgPath })
+          }
           className="size-full object-cover transition-transform duration-200 ease-[var(--ease-out-expo)] group-hover/img:scale-[1.03]"
         />
       </button>
@@ -2398,6 +2408,10 @@ const TurnStageSection = memo(function TurnStageSection({
         />
       )}
 
+      {turn.agent_message?.item_type === "agent_message" && (
+        <AgentMessageCard hostId={hostId} item={turn.agent_message} />
+      )}
+
       {hasBody && (
         <div className="min-w-0 px-[10px]">
           <div className="min-w-0 space-y-3">
@@ -2459,8 +2473,15 @@ const TurnStageSection = memo(function TurnStageSection({
               }
 
               // `step_group`
+              // Never render an already-failed trailing segment (with no running step) as active
+              // `Running ... waiting for response` — keep its failure visible while any new turn work
+              // shows cleanly in the trailing indicator below.
+              const isTrailingFailedGroup =
+                !seg.has_running_step && seg.summary.counts.unrecovered_failure_count > 0;
               const isGroupActive =
-                isTurnActive && (seg.has_running_step || (isLastSeg && !seg.has_following_content));
+                isTurnActive &&
+                (seg.has_running_step ||
+                  (isLastSeg && !seg.has_following_content && !isTrailingFailedGroup));
               const groupThoughtMs =
                 computeTotalThinkingDurationMs(seg.items, agentId, getThinkingDurationMs) ??
                 seg.thought_duration_ms ??
@@ -2802,6 +2823,9 @@ function estimateTurnSizeFallback(turn: StageTurnView | undefined): number {
       Math.min(124, Math.ceil(promptLen / 56) * 24) +
       (otherBadgeCount > 0 ? 28 : 0) +
       (imageCount > 0 ? Math.min(204, Math.ceil(imageCount / 5) * 102) : 0);
+  }
+  if (turn.agent_message?.item_type === "agent_message") {
+    est += 110;
   }
   for (const seg of turn.live_segments) {
     if (seg.kind === "assistant_message" && seg.item.item_type === "assistant_message") {
@@ -3384,9 +3408,10 @@ export function StreamStage() {
   const stageInsights = stageView?.insights ?? EMPTY_INSIGHTS;
 
   const latestTurn = stageTurns[stageTurns.length - 1] ?? null;
-  const isLatestTurnActive = Boolean(
-    latestTurn && (isAgentRunning || latestTurn.has_active_item),
-  );
+  // Single source of truth: trust authoritative backend `currentAgent.is_running` (which covers
+  // Initializing, Running, background-task waiting, and AutonomousWakeup) so stale historical
+  // running tool items can never hold an Idle/Error/Closed turn in a phantom Running state.
+  const isLatestTurnActive = Boolean(latestTurn && isAgentRunning);
 
   // Record live turn & per-thinking-block start/completion durations for the active session
   useEffect(() => {
@@ -3984,6 +4009,20 @@ export function StreamStage() {
         />
       )}
 
+      {/* Parent Back Banner when inspecting a managed subagent */}
+      {selectedHostId && currentAgent?.parent_agent_id && (
+        <div
+          className={cn(
+            "shrink-0 pl-6",
+            dockedOverviewLayout ? "pr-[348px]" : "pr-6",
+          )}
+        >
+          <div style={stagePushStyle}>
+            <ParentSubagentBanner hostId={selectedHostId} agent={currentAgent} />
+          </div>
+        </div>
+      )}
+
       {/* 1. Unified Scrollable Conversation Viewport — scrollbar stays on far right edge */}
       <ScrollArea
         className="min-h-0 flex-1"
@@ -4053,6 +4092,7 @@ export function StreamStage() {
 
         <div className={dockedOverviewLayout ? "pr-[324px]" : "pr-0"}>
           <div style={stagePushStyle}>
+            <SubagentsTrack hostId={selectedHostId} agentId={selectedAgentId} />
             <StickyApprovalDock
               hostId={selectedHostId}
               agentId={selectedAgentId}

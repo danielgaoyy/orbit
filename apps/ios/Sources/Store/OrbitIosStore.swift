@@ -26,6 +26,10 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
     case plan
     case review
     case compact
+    case orbit
+    case orbitHandoff = "orbit-handoff"
+    case orbitCommittee = "orbit-committee"
+    case orbitAdvisor = "orbit-advisor"
 
     public var id: String { rawValue }
 
@@ -36,6 +40,10 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
         case .plan: return "Plan Architecture"
         case .review: return "Review Changes"
         case .compact: return "Compact Context"
+        case .orbit: return "Orbit Multi-Agent"
+        case .orbitHandoff: return "Task Handoff"
+        case .orbitCommittee: return "Committee Planning"
+        case .orbitAdvisor: return "Read-Only Advisor"
         }
     }
 
@@ -44,6 +52,10 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
         case .plan: return "Draft step-by-step plan first"
         case .review: return "Audit working tree changes"
         case .compact: return "Compress session context"
+        case .orbit: return "Coordinate specialist agents across profiles"
+        case .orbitHandoff: return "Hand off cleanly to a specialist worktree"
+        case .orbitCommittee: return "Multi-model planning, implementation & review"
+        case .orbitAdvisor: return "Independent read-only second opinion"
         }
     }
 
@@ -52,6 +64,10 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
         case .plan: return "checklist"
         case .review: return "doc.text.magnifyingglass"
         case .compact: return "rectangle.compress.vertical"
+        case .orbit: return "square.3.layers.3d"
+        case .orbitHandoff: return "paperplane"
+        case .orbitCommittee: return "person.3"
+        case .orbitAdvisor: return "sparkles"
         }
     }
 
@@ -60,6 +76,10 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
         case .plan: return .plan
         case .review: return .review
         case .compact: return .compact
+        case .orbit: return .orbit
+        case .orbitHandoff: return .orbitHandoff
+        case .orbitCommittee: return .orbitCommittee
+        case .orbitAdvisor: return .orbitAdvisor
         }
     }
 
@@ -69,6 +89,10 @@ public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
         case .plan: self = .plan
         case .review: self = .review
         case .compact: self = .compact
+        case .orbit: self = .orbit
+        case .orbitHandoff: self = .orbitHandoff
+        case .orbitCommittee: self = .orbitCommittee
+        case .orbitAdvisor: self = .orbitAdvisor
         }
     }
 }
@@ -80,6 +104,10 @@ public extension OrbitSlashDirective {
         case "review": return "doc.text.magnifyingglass"
         case "diff": return "arrow.left.arrow.right"
         case "compact": return "rectangle.compress.vertical"
+        case "orbit": return "square.3.layers.3d"
+        case "orbit-handoff": return "paperplane"
+        case "orbit-committee": return "person.3"
+        case "orbit-advisor": return "sparkles"
         case "ask": return "shield"
         case "edits": return "checkmark.shield"
         case "full": return "shield.slash"

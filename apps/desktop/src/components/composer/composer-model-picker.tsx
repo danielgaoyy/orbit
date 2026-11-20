@@ -1,5 +1,5 @@
 import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, ChevronRight } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Sparkles } from "lucide-react";
 import {
   DEFAULT_CUSTOM_THINKING_OPTIONS,
   PROVIDERS,
@@ -14,6 +14,7 @@ import {
   stripAgyEffortSuffix,
 } from "@/lib/model-catalog";
 import {
+  type AgentProfile,
   type ProviderKind,
   type ProviderModelCatalog,
   type ReasoningEffort,
@@ -32,6 +33,7 @@ import { cn } from "@/lib/utils";
 
 const EMPTY_PROVIDERS: readonly ProviderKind[] = [];
 const EMPTY_CATALOGS: readonly ProviderModelCatalog[] = [];
+const EMPTY_PROFILES: readonly AgentProfile[] = [];
 
 /**
  * Isolated Agent + Model + Thinking Mode Selector (`[ProviderIcon Model Effort ▾]`).
@@ -45,6 +47,13 @@ export const ComposerModelPicker = memo(function ComposerModelPicker() {
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
   const draftModels = useOrbitSelector((s) => s.draftModels);
   const draftEffort = useOrbitSelector((s) => s.draftEffort);
+  const draftProfileId = useOrbitSelector((s) => s.draftProfileId);
+
+  const profiles = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? (s.hostDetails[s.selectedHostId]?.profiles ?? EMPTY_PROFILES)
+      : EMPTY_PROFILES,
+  );
 
   const availableProviders = useOrbitSelector((s) =>
     s.selectedHostId
@@ -251,6 +260,14 @@ export const ComposerModelPicker = memo(function ComposerModelPicker() {
     );
   }, [modelPopoverOpen, hoveredRow]);
 
+  const activeDraftProfile = useMemo(
+    () =>
+      canSwitchAgentEngine && draftProfileId
+        ? (profiles.find((p) => p.profile_id === draftProfileId) ?? null)
+        : null,
+    [canSwitchAgentEngine, draftProfileId, profiles],
+  );
+
   const showAgentRail = canSwitchAgentEngine && detectedProviders.length > 1;
 
   return (
@@ -274,9 +291,11 @@ export const ComposerModelPicker = memo(function ComposerModelPicker() {
         >
           <ProviderIcon provider={activeProvider} className="size-4" />
           <span className="text-foreground/88 truncate font-normal">
-            {formatCatalogModelLabel(activeCatalog, rawActiveModel)}
+            {activeDraftProfile
+              ? activeDraftProfile.name
+              : formatCatalogModelLabel(activeCatalog, rawActiveModel)}
           </span>
-          {effectiveActiveEffort && (
+          {!activeDraftProfile && effectiveActiveEffort && (
             <span className="text-foreground/48 shrink-0 font-normal">
               {formatEffortLabel(effectiveActiveEffort)}
             </span>
@@ -350,6 +369,47 @@ export const ComposerModelPicker = memo(function ComposerModelPicker() {
               onViewportScroll={() => setHoveredModelKey(null)}
               viewportClassName="max-h-[min(448px,calc(var(--available-height,540px)-42px))]"
             >
+              {canSwitchAgentEngine && profiles.length > 0 && (
+                <div className="border-border mb-1.5 space-y-0.5 border-b pb-1.5">
+                  <div className="text-muted-foreground/75 flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-medium uppercase">
+                    <Sparkles className="size-3" />
+                    <span>Profiles</span>
+                  </div>
+                  {profiles.map((prof) => {
+                    const isActiveProf = draftProfileId === prof.profile_id;
+                    return (
+                      <button
+                        key={prof.profile_id}
+                        type="button"
+                        onMouseEnter={() => setHoveredModelKey(null)}
+                        onClick={() => {
+                          orbitActions.setDraftConfig({
+                            provider: prof.provider,
+                            model: prof.model,
+                            ...(prof.effort ? { effort: prof.effort } : {}),
+                            mode: prof.mode,
+                            profileId: prof.profile_id,
+                          });
+                          setModelPopoverOpen(false);
+                        }}
+                        className={cn(
+                          "flex w-full cursor-pointer items-center justify-between gap-2 rounded-[9px] px-2.5 py-1.5 text-left text-[13px] transition-colors",
+                          isActiveProf
+                            ? "bg-black/[0.06] font-medium dark:bg-white/[0.09]"
+                            : "hover:bg-black/[0.04] dark:hover:bg-white/[0.06]",
+                        )}
+                      >
+                        <span className="flex min-w-0 items-center gap-2">
+                          <ProviderIcon provider={prof.provider} className="size-3.5 shrink-0" />
+                          <span className="truncate">{prof.name}</span>
+                        </span>
+                        {isActiveProf && <Check className="size-3.5 shrink-0 opacity-75" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
               <div className="space-y-0.5">
               {browsedRows.map((row) => {
                 const isModelActive =

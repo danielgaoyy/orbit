@@ -387,6 +387,7 @@ export interface StageTurnDto {
   turn_index: number;
   anchor_seq: number;
   user_prompt: TimelineItemDto | null;
+  agent_message?: TimelineItemDto | null;
   is_compaction_command: boolean;
   folded_steps: TimelineItemDto[];
   work_counts: TurnWorkCountsDto;

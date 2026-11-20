@@ -2118,9 +2118,10 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "orbit-cli"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "futures-util",
  "orbit-client-core",
@@ -2131,6 +2132,7 @@ dependencies = [
  "orbit-relay",
  "orbit-relay-transport",
  "orbit-shim",
+ "orbit-store",
  "reqwest",
  "russh",
  "serde_json",
@@ -2143,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-client-core"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2169,7 +2171,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-crypto"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -2181,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-daemon"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2194,17 +2196,20 @@ dependencies = [
  "orbit-relay-transport",
  "orbit-shim",
  "orbit-store",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
  "uuid",
+ "vt100",
 ]
 
 [[package]]
 name = "orbit-ffi-ohos"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "napi-build-ohos",
  "napi-derive-ohos",
@@ -2218,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-ffi-uniffi"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "orbit-client-core",
  "orbit-crypto",
@@ -2229,7 +2234,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-protocol"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "serde",
@@ -2241,7 +2246,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-providers"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2259,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-relay"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2273,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-relay-transport"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -2286,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-shim"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "portable-pty",
@@ -2298,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-store"
-version = "0.3.7"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "orbit-protocol",

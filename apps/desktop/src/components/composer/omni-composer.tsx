@@ -13,10 +13,14 @@ import {
   Clock,
   FileSearch,
   FoldVertical,
+  Layers,
   ListTodo,
   Paperclip,
   Plus,
+  Send,
+  Sparkles,
   SquareSlash,
+  Users,
   X,
   Zap,
 } from "lucide-react";
@@ -353,6 +357,12 @@ export const OmniComposer = memo(function OmniComposer({
           orbitActions.showToast("Start an active session first to compact context");
         }
         break;
+      case "orbit":
+      case "orbit-handoff":
+      case "orbit-committee":
+      case "orbit-advisor":
+        orbitActions.setSlashDirective(cmd.id);
+        break;
       case "terminal":
         orbitActions.toggleTerminalTab();
         return;
@@ -548,7 +558,13 @@ export const OmniComposer = memo(function OmniComposer({
       if (e.key === " ") {
         const exactCmd = slashTrigger.items.find(
           (c) =>
-            (c.id === "plan" || c.id === "review" || c.id === "compact") &&
+            (c.id === "plan" ||
+              c.id === "review" ||
+              c.id === "compact" ||
+              c.id === "orbit" ||
+              c.id === "orbit-handoff" ||
+              c.id === "orbit-committee" ||
+              c.id === "orbit-advisor") &&
             c.command.slice(1).toLowerCase() === slashTrigger.query.toLowerCase(),
         );
         if (exactCmd) {
@@ -806,6 +822,14 @@ export const OmniComposer = memo(function OmniComposer({
                     <ListTodo className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
                   ) : slashDirective === "review" ? (
                     <FileSearch className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
+                  ) : slashDirective === "orbit" ? (
+                    <Layers className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
+                  ) : slashDirective === "orbit-handoff" ? (
+                    <Send className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
+                  ) : slashDirective === "orbit-committee" ? (
+                    <Users className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
+                  ) : slashDirective === "orbit-advisor" ? (
+                    <Sparkles className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
                   ) : (
                     <FoldVertical className="text-muted-foreground size-[15px] shrink-0 stroke-[1.75]" />
                   )}

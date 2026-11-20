@@ -131,6 +131,8 @@ pub struct StageTurnView {
     pub turn_index: u32,
     pub anchor_seq: u64,
     pub user_prompt: Option<TimelineItemView>,
+    #[serde(default)]
+    pub agent_message: Option<TimelineItemView>,
     pub is_compaction_command: bool,
     /// Intermediate steps prior to `terminal_reply` (eligible for pre-reply auto-fold).
     pub folded_steps: Vec<TimelineItemView>,
@@ -294,6 +296,7 @@ pub enum SearchSubkind {
 pub fn timeline_item_seq(item: &TimelineItemView) -> u64 {
     match item {
         TimelineItemView::UserPrompt { seq, .. }
+        | TimelineItemView::AgentMessage { seq, .. }
         | TimelineItemView::AssistantThinking { seq, .. }
         | TimelineItemView::AssistantMessage { seq, .. }
         | TimelineItemView::ToolCall { seq, .. }
@@ -313,6 +316,15 @@ pub fn stable_timeline_item_key(item: &TimelineItemView) -> String {
                 format!("prompt-{message_id}")
             } else {
                 format!("prompt-seq-{seq}")
+            }
+        }
+        TimelineItemView::AgentMessage {
+            message_id, seq, ..
+        } => {
+            if !message_id.is_empty() {
+                format!("am-{message_id}")
+            } else {
+                format!("am-seq-{seq}")
             }
         }
         TimelineItemView::AssistantThinking { item_id, seq, .. } => {
@@ -361,6 +373,7 @@ pub fn stable_timeline_item_key(item: &TimelineItemView) -> String {
 pub fn timeline_item_timestamp_ms(item: &TimelineItemView) -> Option<i64> {
     let raw = match item {
         TimelineItemView::UserPrompt { timestamp_ms, .. }
+        | TimelineItemView::AgentMessage { timestamp_ms, .. }
         | TimelineItemView::AssistantThinking { timestamp_ms, .. }
         | TimelineItemView::AssistantMessage { timestamp_ms, .. }
         | TimelineItemView::ToolCall { timestamp_ms, .. }
@@ -1376,7 +1389,10 @@ pub fn process_timeline_turns_slice(
             continue;
         }
 
-        if matches!(item, TimelineItemView::UserPrompt { .. }) {
+        if matches!(
+            item,
+            TimelineItemView::UserPrompt { .. } | TimelineItemView::AgentMessage { .. }
+        ) {
             flush_turn(
                 &mut turns,
                 &mut turn_item_starts,
@@ -1509,18 +1525,26 @@ fn enrich_item_descriptor(item: &TimelineItemView, cwd: Option<&str>) -> Timelin
 
 fn finalize_turn(
     turn_index: u32,
-    user_prompt: Option<TimelineItemView>,
+    opener: Option<TimelineItemView>,
     body_items: Vec<TimelineItemView>,
     cwd: Option<&str>,
 ) -> StageTurnView {
-    let anchor_seq = user_prompt
-        .as_ref()
+    let (user_prompt, agent_message) = match opener {
+        Some(item @ TimelineItemView::AgentMessage { .. }) => (None, Some(item)),
+        other => (other, None),
+    };
+    let anchor_opener = user_prompt.as_ref().or(agent_message.as_ref());
+
+    let anchor_seq = anchor_opener
         .map(timeline_item_seq)
         .or_else(|| body_items.first().map(timeline_item_seq))
         .unwrap_or(u64::from(turn_index));
 
-    let key = match &user_prompt {
-        Some(TimelineItemView::UserPrompt { message_id, .. }) => format!("turn-{message_id}"),
+    let key = match (&user_prompt, &agent_message) {
+        (Some(TimelineItemView::UserPrompt { message_id, .. }), _) => format!("turn-{message_id}"),
+        (_, Some(TimelineItemView::AgentMessage { message_id, .. })) => {
+            format!("turn-am-{message_id}")
+        }
         _ => body_items
             .first()
             .map(|it| format!("turn-init-{}", stable_timeline_item_key(it)))
@@ -1680,15 +1704,14 @@ fn finalize_turn(
     let summary = summarize_work_items(&folded_steps, thought_duration_ms);
     let full_turn_tool_summary = summarize_work_items(&non_notice_body, thought_duration_ms);
 
-    let started_at_ms = user_prompt
-        .as_ref()
+    let started_at_ms = anchor_opener
         .and_then(timeline_item_timestamp_ms)
         .or_else(|| body_items.iter().find_map(timeline_item_timestamp_ms));
 
     let work_start_ms = folded_steps
         .iter()
         .find_map(timeline_item_timestamp_ms)
-        .or_else(|| user_prompt.as_ref().and_then(timeline_item_timestamp_ms));
+        .or_else(|| anchor_opener.and_then(timeline_item_timestamp_ms));
     let work_end_ms = terminal_reply
         .as_ref()
         .and_then(timeline_item_timestamp_ms)
@@ -1730,6 +1753,7 @@ fn finalize_turn(
         turn_index,
         anchor_seq,
         user_prompt,
+        agent_message,
         is_compaction_command,
         folded_steps,
         work_counts: summary.counts,
@@ -3107,6 +3131,13 @@ mod tests {
             is_running: true,
             is_awaiting_permission: false,
             parent_agent_id: None,
+            parent_host_id: None,
+            profile_id: None,
+            background: false,
+            auto_archive: false,
+            attention: orbit_protocol::AttentionState::None,
+            archived_at_rfc3339: None,
+            labels: HashMap::new(),
             latest_seq: 7,
             updated_at_rfc3339: "2026-11-20T00:00:00Z".into(),
             is_pinned: false,

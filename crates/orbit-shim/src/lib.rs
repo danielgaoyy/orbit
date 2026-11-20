@@ -7,8 +7,17 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+static TEST_PARENT_PID_WATCHDOG: AtomicU32 = AtomicU32::new(0);
+
+/// Enable an opt-in test watchdog so detached shims spawned by integration tests automatically
+/// self-terminate if the test runner process exits or crashes (never enabled in production daemons).
+pub fn set_test_parent_pid_watchdog(pid: Option<u32>) {
+    TEST_PARENT_PID_WATCHDOG.store(pid.unwrap_or(0), Ordering::Relaxed);
+}
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
@@ -144,6 +153,59 @@ impl ShimClient {
     }
 }
 
+/// Attempt to reconnect to an already-running `orbit shim` UDS socket (e.g. after Daemon hot-restart).
+/// If the socket file exists on disk but the shim process is gone (`ECONNREFUSED`), removes the stale file.
+pub async fn connect_existing_shim(socket_path: &Path) -> Option<ShimClient> {
+    if !socket_path.exists() {
+        return None;
+    }
+    match tokio::time::timeout(Duration::from_millis(300), ShimClient::connect(socket_path)).await {
+        Ok(Ok(client)) => Some(client),
+        _ => {
+            let _ = std::fs::remove_file(socket_path);
+            None
+        }
+    }
+}
+
+/// Best-effort kill for a surviving shim socket that should be closed before replacement.
+pub async fn kill_existing_shim(socket_path: &Path) {
+    if let Some(client) = connect_existing_shim(socket_path).await {
+        let _ = client.kill().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = std::fs::remove_file(socket_path);
+}
+
+/// Synchronous best-effort kill for a shim socket (safe to call from RAII `Drop` guards in tests).
+pub fn kill_existing_shim_sync(socket_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixStream;
+        if let Ok(mut stream) = UnixStream::connect(socket_path) {
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+            let _ = stream.write_all(b"{\"type\":\"kill\"}\n");
+            let _ = stream.flush();
+            drop(stream);
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+    let _ = std::fs::remove_file(socket_path);
+}
+
+/// Synchronously kill every active shim whose `.sock` lives in `shims_dir`.
+pub fn kill_all_shims_in_dir_sync(shims_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(shims_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sock") {
+            kill_existing_shim_sync(&path);
+        }
+    }
+}
+
 /// Spawn a detached `orbit shim` process in its own OS process group and connect to its UDS.
 pub async fn spawn_detached_shim(
     orbit_exe: &Path,
@@ -168,6 +230,10 @@ pub async fn spawn_detached_shim(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    let watchdog_pid = TEST_PARENT_PID_WATCHDOG.load(Ordering::Relaxed);
+    if watchdog_pid > 0 {
+        std_cmd.env("ORBIT_SHIM_WATCHDOG_PID", watchdog_pid.to_string());
+    }
 
     #[cfg(unix)]
     {
@@ -290,6 +356,7 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
     });
 
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
+    spawn_optional_parent_watchdog(&spec, kill_tx.clone());
     tokio::spawn(async move {
         while let Some(frame) = in_rx.recv().await {
             match frame {
@@ -421,6 +488,7 @@ async fn run_pty_shim(
     });
 
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
+    spawn_optional_parent_watchdog(&spec, kill_tx.clone());
     let master_ctrl = master.clone();
     tokio::spawn(async move {
         while let Some(frame) = in_rx.recv().await {
@@ -538,6 +606,54 @@ fn handle_daemon_attach(
     });
 }
 
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn spawn_optional_parent_watchdog(spec: &ShimSpawnSpec, kill_tx: mpsc::Sender<()>) {
+    let pid_opt = spec
+        .env
+        .get("ORBIT_SHIM_WATCHDOG_PID")
+        .cloned()
+        .or_else(|| std::env::var("ORBIT_SHIM_WATCHDOG_PID").ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&p| p > 0);
+    let Some(pid) = pid_opt else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tick.tick().await;
+            if !is_pid_alive(pid) {
+                let _ = kill_tx.send(()).await;
+                break;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +749,29 @@ mod tests {
         assert!(live_sock.exists(), "live socket must remain untouched");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn parent_watchdog_terminates_shim_when_watched_pid_is_gone() {
+        let sock_path =
+            std::env::temp_dir().join(format!("orbit_watchdog_shim_{}.sock", std::process::id()));
+        let mut env = HashMap::new();
+        // Guaranteed non-existent PID
+        env.insert("ORBIT_SHIM_WATCHDOG_PID".into(), "4194300".into());
+        let spec = ShimSpawnSpec {
+            shim_id: "test_watchdog".into(),
+            mode: ShimMode::Stdio,
+            program: "/bin/cat".into(),
+            args: vec![],
+            cwd: std::env::temp_dir(),
+            env,
+        };
+        let sock_bg = sock_path.clone();
+        let res = tokio::time::timeout(Duration::from_secs(3), run_shim(&sock_bg, spec)).await;
+        assert!(
+            res.is_ok(),
+            "shim with dead watchdog PID must self-terminate promptly"
+        );
+        assert!(!sock_path.exists(), "socket file must be unlinked on exit");
     }
 }

@@ -12,11 +12,15 @@ use serde::{Deserialize, Serialize};
 use crate::stage::basename_of_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum SlashDirective {
     Plan,
     Review,
     Compact,
+    Orbit,
+    OrbitHandoff,
+    OrbitCommittee,
+    OrbitAdvisor,
 }
 
 impl SlashDirective {
@@ -25,6 +29,10 @@ impl SlashDirective {
             Self::Plan => "plan",
             Self::Review => "review",
             Self::Compact => "compact",
+            Self::Orbit => "orbit",
+            Self::OrbitHandoff => "orbit-handoff",
+            Self::OrbitCommittee => "orbit-committee",
+            Self::OrbitAdvisor => "orbit-advisor",
         }
     }
 
@@ -33,6 +41,10 @@ impl SlashDirective {
             Self::Plan => "/plan",
             Self::Review => "/review",
             Self::Compact => "/compact",
+            Self::Orbit => "/orbit",
+            Self::OrbitHandoff => "/orbit-handoff",
+            Self::OrbitCommittee => "/orbit-committee",
+            Self::OrbitAdvisor => "/orbit-advisor",
         }
     }
 }
@@ -165,6 +177,72 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
             desktop_only: false,
         },
         SlashCommandView {
+            id: "orbit".into(),
+            command: "/orbit".into(),
+            label: "Orbit Multi-Agent".into(),
+            description: "Enable structured multi-agent delegation across profiles & hosts".into(),
+            shortcut_key: None,
+            icon_key: "orbit".into(),
+            keywords: vec![
+                "orbit".into(),
+                "orchestrate".into(),
+                "multi".into(),
+                "subagent".into(),
+                "delegate".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "orbit-handoff".into(),
+            command: "/orbit-handoff".into(),
+            label: "Task Handoff".into(),
+            description: "Hand off the current task cleanly to a specialist profile or worktree"
+                .into(),
+            shortcut_key: None,
+            icon_key: "orbit-handoff".into(),
+            keywords: vec![
+                "handoff".into(),
+                "transfer".into(),
+                "delegate".into(),
+                "specialist".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "orbit-committee".into(),
+            command: "/orbit-committee".into(),
+            label: "Committee Planning".into(),
+            description:
+                "Fan out planning to 2 distinct model families, synthesize, implement & review"
+                    .into(),
+            shortcut_key: None,
+            icon_key: "orbit-committee".into(),
+            keywords: vec![
+                "committee".into(),
+                "consensus".into(),
+                "multi-model".into(),
+                "plan".into(),
+                "review".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "orbit-advisor".into(),
+            command: "/orbit-advisor".into(),
+            label: "Read-Only Advisor".into(),
+            description:
+                "Get an independent second opinion or diff review from another model family".into(),
+            shortcut_key: None,
+            icon_key: "orbit-advisor".into(),
+            keywords: vec![
+                "advisor".into(),
+                "second-opinion".into(),
+                "critique".into(),
+                "audit".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
             id: "supervised".into(),
             command: "/ask".into(),
             label: "Always Ask Permissions".into(),
@@ -287,6 +365,10 @@ pub fn parse_leading_slash_directive(raw_text: &str) -> (Option<SlashDirective>,
     }
     let lower = trimmed.to_ascii_lowercase();
     for (prefix, dir) in [
+        ("/orbit-committee", SlashDirective::OrbitCommittee),
+        ("/orbit-handoff", SlashDirective::OrbitHandoff),
+        ("/orbit-advisor", SlashDirective::OrbitAdvisor),
+        ("/orbit", SlashDirective::Orbit),
         ("/plan", SlashDirective::Plan),
         ("/review", SlashDirective::Review),
         ("/compact", SlashDirective::Compact),
@@ -343,6 +425,39 @@ pub fn build_workflow_instruction(directive: SlashDirective) -> &'static str {
             "1. Core goal & user preferences\n",
             "2. Key architectural decisions & completed changes (with file paths)\n",
             "3. Open issues & immediate next steps\n",
+            "</WORKFLOW_INSTRUCTION>"
+        ),
+        SlashDirective::Orbit => concat!(
+            "<WORKFLOW_INSTRUCTION command=\"/orbit\">\n",
+            "You are using Orbit Multi-Agent Orchestration.\n",
+            "Use your built-in Orbit MCP tools (`list_profiles`, `list_hosts`, `create_workspace`, `create_agent`, `send_agent_prompt`, `get_agent_status`, `create_heartbeat`, `delete_heartbeat`) to coordinate specialist agents.\n",
+            "Always create isolated worktrees via `create_workspace(isolation='worktree')` for parallel edits, and rely on automatic finish notifications rather than polling loops.\n",
+            "</WORKFLOW_INSTRUCTION>"
+        ),
+        SlashDirective::OrbitHandoff => concat!(
+            "<WORKFLOW_INSTRUCTION command=\"/orbit-handoff\">\n",
+            "Hand off this task cleanly to a specialist Orbit agent.\n",
+            "1. Call `list_profiles` to choose the best-fit specialist profile.\n",
+            "2. Create an isolated worktree if file edits are needed.\n",
+            "3. Spawn the specialist with `create_agent` using a concise, self-contained briefing (goal, exact file paths, constraints, acceptance criteria).\n",
+            "4. Rely on automatic finish notification unless the user explicitly asks to detach.\n",
+            "</WORKFLOW_INSTRUCTION>"
+        ),
+        SlashDirective::OrbitCommittee => concat!(
+            "<WORKFLOW_INSTRUCTION command=\"/orbit-committee\">\n",
+            "Run the Orbit Committee Planning & Cross-Provider Review workflow:\n",
+            "1. Call `list_profiles` and spawn 2 independent planning/architect agents from distinct model families in read-only/plan mode.\n",
+            "2. End your turn and wait for their automatic finish notifications.\n",
+            "3. Synthesize the strongest unified plan, then delegate implementation to a dedicated worktree agent.\n",
+            "4. After implementation finishes, spawn an independent reviewer agent from another model family to audit the diff before reporting final results.\n",
+            "</WORKFLOW_INSTRUCTION>"
+        ),
+        SlashDirective::OrbitAdvisor => concat!(
+            "<WORKFLOW_INSTRUCTION command=\"/orbit-advisor\">\n",
+            "Consult an independent read-only Advisor agent from a different model family.\n",
+            "1. Call `list_profiles` and spawn a `plan`-mode reviewer agent with the focused question, relevant file paths, and constraints.\n",
+            "2. Instruct the advisor NOT to edit any files.\n",
+            "3. Wait for its automatic finish notification and critically evaluate its feedback before replying.\n",
             "</WORKFLOW_INSTRUCTION>"
         ),
     }
@@ -910,8 +1025,9 @@ mod tests {
         assert!(ios.iter().any(|c| c.id == "btw"));
 
         let rev = filter_slash_commands("audit", ClientPlatform::Harmony);
-        assert_eq!(rev.len(), 1);
+        assert_eq!(rev.len(), 2);
         assert_eq!(rev[0].id, "review");
+        assert_eq!(rev[1].id, "orbit-advisor");
     }
 
     #[test]
@@ -1082,5 +1198,60 @@ mod tests {
         assert_eq!(composed.badges[5].path.as_deref(), Some("src/main.rs:12"));
         assert_eq!(composed.badges[6].kind, "paste");
         assert_eq!(composed.badges[6].path, None);
+    }
+
+    #[test]
+    fn orchestration_slash_directives_parse_serialize_and_render_instructions() {
+        assert_eq!(
+            parse_leading_slash_directive("/orbit-handoff delegate tests"),
+            (
+                Some(SlashDirective::OrbitHandoff),
+                "delegate tests".to_string()
+            )
+        );
+        assert_eq!(
+            parse_leading_slash_directive("/orbit split work"),
+            (Some(SlashDirective::Orbit), "split work".to_string())
+        );
+        assert_eq!(
+            parse_leading_slash_directive("/orbit-committee design review"),
+            (
+                Some(SlashDirective::OrbitCommittee),
+                "design review".to_string()
+            )
+        );
+        assert_eq!(
+            parse_leading_slash_directive("/orbit-advisor check locking"),
+            (
+                Some(SlashDirective::OrbitAdvisor),
+                "check locking".to_string()
+            )
+        );
+
+        assert_eq!(
+            serde_json::to_string(&SlashDirective::OrbitHandoff)
+                .ok()
+                .as_deref(),
+            Some("\"orbit-handoff\"")
+        );
+
+        let catalog = slash_commands(ClientPlatform::Desktop);
+        for id in ["orbit", "orbit-handoff", "orbit-committee", "orbit-advisor"] {
+            assert!(catalog.iter().any(|c| c.id == id), "missing {id}");
+        }
+
+        assert!(build_workflow_instruction(SlashDirective::Orbit).contains("command=\"/orbit\""));
+        assert!(
+            build_workflow_instruction(SlashDirective::OrbitHandoff)
+                .contains("command=\"/orbit-handoff\"")
+        );
+        assert!(
+            build_workflow_instruction(SlashDirective::OrbitCommittee)
+                .contains("command=\"/orbit-committee\"")
+        );
+        assert!(
+            build_workflow_instruction(SlashDirective::OrbitAdvisor)
+                .contains("command=\"/orbit-advisor\"")
+        );
     }
 }

@@ -12,9 +12,9 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    AgentStatus, AgentSummary, BackgroundTaskInfo, ProviderKind, ReasoningEffort, SessionMode,
-    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
-    WorkspaceClusterSuggestion, WorkspaceSetupStatus, WorkspaceSummary,
+    AgentStatus, AgentSummary, BackgroundTaskInfo, PromptBadge, ProviderKind, QueuedPromptView,
+    ReasoningEffort, SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
+    ToolCallStatus, WorkspaceClusterSuggestion, WorkspaceSetupStatus, WorkspaceSummary,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,17 @@ pub struct RewoundTimeline {
     pub agent: AgentSummary,
     pub events: Vec<TimelineEvent>,
     pub restored_prompt: Option<String>,
+}
+
+/// Full daemon-persisted queued follow-up prompt (including full wire prompt for offline drain).
+#[derive(Debug, Clone)]
+pub struct StoredQueuedPrompt {
+    pub queue_id: String,
+    pub agent_id: String,
+    pub wire_prompt: String,
+    pub display_prompt: String,
+    pub badges: Vec<PromptBadge>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -240,6 +251,19 @@ impl OrbitStore {
                 updated_at_ms INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (host_id, agent_id)
             );
+
+            CREATE TABLE IF NOT EXISTS agent_queued_prompts (
+                queue_id       TEXT PRIMARY KEY,
+                agent_id       TEXT NOT NULL,
+                sort_order     INTEGER NOT NULL,
+                wire_prompt    TEXT NOT NULL,
+                display_prompt TEXT NOT NULL,
+                badges_json    TEXT NOT NULL DEFAULT '[]',
+                created_at     TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_queued_prompts_agent
+                ON agent_queued_prompts (agent_id, sort_order);
             ",
         )?;
         // Non-destructive forward-compatible column migrations for pre-existing databases
@@ -510,9 +534,192 @@ impl OrbitStore {
     pub fn get_agent(&self, agent_id: &str) -> Result<Option<AgentSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
-        conn.query_row(&sql, params![agent_id], map_agent_row)
-            .optional()
-            .map_err(Into::into)
+        let mut agent = conn
+            .query_row(&sql, params![agent_id], map_agent_row)
+            .optional()?;
+        if let Some(ref mut ag) = agent {
+            ag.queued_prompts = load_queued_prompts_for_agent(&conn, &ag.agent_id)?;
+        }
+        Ok(agent)
+    }
+
+    pub fn enqueue_agent_prompt(
+        &self,
+        agent_id: &str,
+        queue_id: &str,
+        wire_prompt: &str,
+        display_prompt: &str,
+        badges: &[PromptBadge],
+    ) -> Result<QueuedPromptView, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let next_order: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM agent_queued_prompts WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        // Never let a client-supplied `queue_id` collide with and overwrite another agent's row.
+        let existing_owner: Option<String> = tx
+            .query_row(
+                "SELECT agent_id FROM agent_queued_prompts WHERE queue_id = ?1",
+                params![queue_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let now = Utc::now();
+        let effective_qid = match existing_owner {
+            Some(owner) if owner != agent_id => {
+                format!(
+                    "{agent_id}_{queue_id}_{}",
+                    now.timestamp_nanos_opt().unwrap_or(0)
+                )
+            }
+            _ => queue_id.to_string(),
+        };
+        let badges_json = serde_json::to_string(badges)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO agent_queued_prompts
+             (queue_id, agent_id, sort_order, wire_prompt, display_prompt, badges_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                effective_qid,
+                agent_id,
+                next_order,
+                wire_prompt,
+                display_prompt,
+                badges_json,
+                now.to_rfc3339(),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(QueuedPromptView {
+            queue_id: effective_qid,
+            display_text: display_prompt.to_string(),
+            badges: badges.to_vec(),
+            created_at: now,
+        })
+    }
+
+    pub fn remove_queued_prompt(&self, agent_id: &str, queue_id: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let affected = conn.execute(
+            "DELETE FROM agent_queued_prompts WHERE agent_id = ?1 AND queue_id = ?2",
+            params![agent_id, queue_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn take_queued_prompt(
+        &self,
+        agent_id: &str,
+        queue_id: &str,
+    ) -> Result<Option<StoredQueuedPrompt>, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let item = tx
+            .query_row(
+                "SELECT queue_id, agent_id, wire_prompt, display_prompt, badges_json, created_at
+                 FROM agent_queued_prompts
+                 WHERE agent_id = ?1 AND queue_id = ?2",
+                params![agent_id, queue_id],
+                map_stored_queued_prompt_row,
+            )
+            .optional()?;
+        if item.is_some() {
+            tx.execute(
+                "DELETE FROM agent_queued_prompts WHERE agent_id = ?1 AND queue_id = ?2",
+                params![agent_id, queue_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(item)
+    }
+
+    pub fn pop_next_queued_prompt(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<StoredQueuedPrompt>, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let item = tx
+            .query_row(
+                "SELECT queue_id, agent_id, wire_prompt, display_prompt, badges_json, created_at
+                 FROM agent_queued_prompts
+                 WHERE agent_id = ?1
+                 ORDER BY sort_order ASC, rowid ASC
+                 LIMIT 1",
+                params![agent_id],
+                map_stored_queued_prompt_row,
+            )
+            .optional()?;
+        if let Some(ref found) = item {
+            tx.execute(
+                "DELETE FROM agent_queued_prompts WHERE queue_id = ?1",
+                params![found.queue_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(item)
+    }
+
+    pub fn clear_queued_prompts(&self, agent_id: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let affected = conn.execute(
+            "DELETE FROM agent_queued_prompts WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        Ok(affected)
+    }
+
+    pub fn reorder_queued_prompts(
+        &self,
+        agent_id: &str,
+        queue_ids: &[String],
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        let current_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT queue_id FROM agent_queued_prompts
+                 WHERE agent_id = ?1
+                 ORDER BY sort_order ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map(params![agent_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if current_ids.len() < 2 {
+            return Ok(false);
+        }
+
+        let current_set: std::collections::HashSet<&str> =
+            current_ids.iter().map(String::as_str).collect();
+        let mut next_order: Vec<String> = Vec::with_capacity(current_ids.len());
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(current_ids.len());
+        for qid in queue_ids {
+            if current_set.contains(qid.as_str()) && seen.insert(qid.as_str()) {
+                next_order.push(qid.clone());
+            }
+        }
+        // Preserve any concurrently enqueued items not yet known to the caller at the tail.
+        for qid in &current_ids {
+            if seen.insert(qid.as_str()) {
+                next_order.push(qid.clone());
+            }
+        }
+
+        if next_order == current_ids {
+            return Ok(false);
+        }
+
+        for (idx, qid) in next_order.iter().enumerate() {
+            tx.execute(
+                "UPDATE agent_queued_prompts SET sort_order = ?1 WHERE agent_id = ?2 AND queue_id = ?3",
+                params![(idx as i64) + 1, agent_id, qid],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn update_agent_mode(&self, agent_id: &str, mode: &SessionMode) -> Result<(), StoreError> {
@@ -591,8 +798,14 @@ impl OrbitStore {
     }
 
     pub fn delete_agent(&self, agent_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute("DELETE FROM agents WHERE agent_id = ?1", params![agent_id])?;
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM agent_queued_prompts WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        tx.execute("DELETE FROM agents WHERE agent_id = ?1", params![agent_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1304,6 +1517,10 @@ impl OrbitStore {
         tx.execute(
             "DELETE FROM turn_checkpoints WHERE agent_id = ?1 AND prompt_seq >= ?2",
             params![agent_id, to_before_i64],
+        )?;
+        tx.execute(
+            "DELETE FROM agent_queued_prompts WHERE agent_id = ?1",
+            params![agent_id],
         )?;
 
         let new_latest_seq: i64 = tx
@@ -2023,12 +2240,82 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         labels,
         attention,
         last_activity_at: last_activity_opt.as_deref().map(parse_ts),
+        queued_prompts: Vec::new(),
         read_seq,
         is_pinned,
         pinned_order,
         handle,
         cluster_suggestion,
     })
+}
+
+fn map_stored_queued_prompt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQueuedPrompt> {
+    let badges_str: String = row.get(4)?;
+    let created_str: String = row.get(5)?;
+    let badges: Vec<PromptBadge> = serde_json::from_str(&badges_str).unwrap_or_default();
+    Ok(StoredQueuedPrompt {
+        queue_id: row.get(0)?,
+        agent_id: row.get(1)?,
+        wire_prompt: row.get(2)?,
+        display_prompt: row.get(3)?,
+        badges,
+        created_at: parse_ts(&created_str),
+    })
+}
+
+pub(crate) fn load_queued_prompts_for_agent(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<Vec<QueuedPromptView>, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT queue_id, display_prompt, badges_json, created_at
+         FROM agent_queued_prompts
+         WHERE agent_id = ?1
+         ORDER BY sort_order ASC, rowid ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![agent_id], |row| {
+            let badges_str: String = row.get(2)?;
+            let created_str: String = row.get(3)?;
+            Ok(QueuedPromptView {
+                queue_id: row.get(0)?,
+                display_text: row.get(1)?,
+                badges: serde_json::from_str(&badges_str).unwrap_or_default(),
+                created_at: parse_ts(&created_str),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub(crate) fn load_all_queued_prompts_grouped(
+    conn: &Connection,
+) -> Result<HashMap<String, Vec<QueuedPromptView>>, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT agent_id, queue_id, display_prompt, badges_json, created_at
+         FROM agent_queued_prompts
+         ORDER BY sort_order ASC, rowid ASC",
+    )?;
+    let mut grouped: HashMap<String, Vec<QueuedPromptView>> = HashMap::new();
+    let rows = stmt.query_map([], |row| {
+        let agent_id: String = row.get(0)?;
+        let badges_str: String = row.get(3)?;
+        let created_str: String = row.get(4)?;
+        Ok((
+            agent_id,
+            QueuedPromptView {
+                queue_id: row.get(1)?,
+                display_text: row.get(2)?,
+                badges: serde_json::from_str(&badges_str).unwrap_or_default(),
+                created_at: parse_ts(&created_str),
+            },
+        ))
+    })?;
+    for entry in rows {
+        let (agent_id, item) = entry?;
+        grouped.entry(agent_id).or_default().push(item);
+    }
+    Ok(grouped)
 }
 
 pub(crate) fn parse_ts(s: &str) -> DateTime<Utc> {
@@ -2094,6 +2381,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
                     read_seq: 0,
                     is_pinned: false,
                     pinned_order: 0,
@@ -2199,6 +2487,7 @@ mod tests {
             labels: HashMap::new(),
             attention: AttentionState::Finished,
             last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
             read_seq: 0,
             is_pinned: false,
             pinned_order: 0,
@@ -2403,6 +2692,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
                     read_seq: 0,
                     is_pinned: false,
                     pinned_order: 0,
@@ -2562,6 +2852,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
                     read_seq: 0,
                     is_pinned: false,
                     pinned_order: 0,
@@ -2653,6 +2944,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
                     read_seq: 0,
                     is_pinned: false,
                     pinned_order: 0,
@@ -2809,6 +3101,131 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompts_persist_hydrate_fifo_pop_and_clear_on_archive() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_q".into(),
+                title: "Queue WS".into(),
+                cwd: "/repo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::default(),
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_q".into(),
+                    workspace_id: "ws_q".into(),
+                    cwd: "/repo".into(),
+                    title: "Queue Agent".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::FullAccess,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 1,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                },
+                None,
+            )
+            .expect("agent");
+
+        store
+            .enqueue_agent_prompt("ag_q", "q1", "wire 1", "First follow-up", &[])
+            .expect("enqueue 1");
+        store
+            .enqueue_agent_prompt("ag_q", "q2", "wire 2", "Second follow-up", &[])
+            .expect("enqueue 2");
+        store
+            .enqueue_agent_prompt("ag_q", "q3", "wire 3", "Third follow-up", &[])
+            .expect("enqueue 3");
+
+        let ag = store.get_agent("ag_q").expect("get").expect("some");
+        assert_eq!(ag.queued_prompts.len(), 3);
+        assert_eq!(ag.queued_prompts[0].queue_id, "q1");
+        assert_eq!(ag.queued_prompts[1].queue_id, "q2");
+        assert_eq!(ag.queued_prompts[2].queue_id, "q3");
+
+        let listed = store.list_agents(None).expect("list");
+        assert_eq!(listed[0].queued_prompts.len(), 3);
+
+        // Reorder queue: move q3 to front, q2 to back (partial list preserves remaining q2 at tail)
+        let changed = store
+            .reorder_queued_prompts("ag_q", &["q3".to_string(), "q1".to_string()])
+            .expect("reorder");
+        assert!(changed);
+        let reordered = store.get_agent("ag_q").expect("get").expect("some");
+        let ids: Vec<&str> = reordered
+            .queued_prompts
+            .iter()
+            .map(|q| q.queue_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["q3", "q1", "q2"]);
+
+        // Reordering with identical order is a no-op
+        assert!(
+            !store
+                .reorder_queued_prompts(
+                    "ag_q",
+                    &["q3".to_string(), "q1".to_string(), "q2".to_string()]
+                )
+                .expect("noop reorder")
+        );
+
+        // Take specific item out of order (flush now)
+        let taken = store
+            .take_queued_prompt("ag_q", "q1")
+            .expect("take")
+            .expect("found q1");
+        assert_eq!(taken.wire_prompt, "wire 1");
+
+        // FIFO pop now gets q3 (new head after reorder)
+        let popped = store
+            .pop_next_queued_prompt("ag_q")
+            .expect("pop")
+            .expect("found q3");
+        assert_eq!(popped.queue_id, "q3");
+
+        // Archiving clears remaining queued prompts (q2)
+        store.archive_agent_soft("ag_q").expect("archive");
+        let after_archive = store.get_agent("ag_q").expect("get").expect("some");
+        assert!(after_archive.queued_prompts.is_empty());
+    }
+
+    #[test]
     fn running_background_tool_calls_list_and_settle_in_place_bump_epoch() {
         let store = OrbitStore::open_in_memory().expect("open store");
         let now = Utc::now();
@@ -2858,6 +3275,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: orbit_protocol::AttentionState::None,
                     last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
                     read_seq: 0,
                     is_pinned: false,
                     pinned_order: 0,

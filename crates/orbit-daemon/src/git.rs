@@ -321,12 +321,35 @@ fn image_mime_for_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Resolve a path that points directly into `$ORBIT_HOME/attachments` even when `cwd` is `"~"` or missing.
-async fn resolve_attachment_file_if_allowed(
+fn managed_artifact_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let orbit_home = std::env::var_os("ORBIT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".orbit")));
+    if let Some(oh) = orbit_home {
+        roots.push(oh.join("attachments"));
+    }
+    if let Some(h) = home {
+        roots.push(h.join(".gemini").join("antigravity-cli").join("brain"));
+        roots.push(h.join(".claude").join("projects"));
+    }
+    roots.push(std::env::temp_dir().join("claude"));
+    let tmp_claude = PathBuf::from("/tmp/claude");
+    if !roots.contains(&tmp_claude) {
+        roots.push(tmp_claude);
+    }
+    roots
+}
+
+/// Resolve a path that points directly into an explicitly allowed read-only agent artifact/log root
+/// (such as `$ORBIT_HOME/attachments`, Antigravity brain task logs, or Claude Code task outputs)
+/// even when `cwd` is `"~"` or outside that root.
+async fn resolve_managed_artifact_file_if_allowed(
     trimmed: &str,
-    allow_attachments: bool,
+    allow_managed_artifacts: bool,
 ) -> Option<PathBuf> {
-    if !allow_attachments {
+    if !allow_managed_artifacts {
         return None;
     }
     let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
@@ -339,30 +362,34 @@ async fn resolve_attachment_file_if_allowed(
         p.to_path_buf()
     };
 
-    let orbit_home = std::env::var_os("ORBIT_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".orbit")))?;
-    let canon_att = tokio::fs::canonicalize(orbit_home.join("attachments"))
-        .await
-        .ok()?;
     let canonical = tokio::fs::canonicalize(&candidate).await.ok()?;
-    canonical.starts_with(&canon_att).then_some(canonical)
+    for root in managed_artifact_roots() {
+        if let Ok(canon_root) = tokio::fs::canonicalize(&root).await
+            && canonical.starts_with(&canon_root)
+        {
+            return Some(canonical);
+        }
+    }
+    None
 }
 
-/// Resolve a canonical file path strictly contained inside `cwd` (or `$ORBIT_HOME/attachments`
-/// when `allow_attachments` is true), blocking path-traversal and symlink escapes.
+/// Resolve a canonical file path strictly contained inside `cwd` (or an explicitly allowed
+/// read-only agent artifact/log root when `allow_managed_artifacts` is true), blocking
+/// path-traversal and symlink escapes.
 async fn resolve_contained_file_path(
     cwd: &Path,
     raw_path: &str,
-    allow_attachments: bool,
+    allow_managed_artifacts: bool,
 ) -> Result<PathBuf, String> {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         return Err("File path cannot be empty".to_string());
     }
 
-    if let Some(att_path) = resolve_attachment_file_if_allowed(trimmed, allow_attachments).await {
-        return Ok(att_path);
+    if let Some(artifact_path) =
+        resolve_managed_artifact_file_if_allowed(trimmed, allow_managed_artifacts).await
+    {
+        return Ok(artifact_path);
     }
 
     let canonical_cwd = tokio::fs::canonicalize(cwd)
@@ -395,15 +422,13 @@ async fn resolve_contained_file_path(
         return Ok(canonical);
     }
 
-    if allow_attachments {
-        let orbit_home = std::env::var_os("ORBIT_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".orbit")));
-        if let Some(home) = orbit_home
-            && let Ok(canon_att) = tokio::fs::canonicalize(home.join("attachments")).await
-            && canonical.starts_with(&canon_att)
-        {
-            return Ok(canonical);
+    if allow_managed_artifacts {
+        for root in managed_artifact_roots() {
+            if let Ok(canon_root) = tokio::fs::canonicalize(&root).await
+                && canonical.starts_with(&canon_root)
+            {
+                return Ok(canonical);
+            }
         }
     }
 

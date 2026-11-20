@@ -5,8 +5,10 @@ export interface ScrollAreaProps extends React.HTMLAttributes<HTMLDivElement> {
   orientation?: "vertical" | "horizontal" | "both";
   viewportRef?: React.Ref<HTMLDivElement>;
   viewportClassName?: string;
+  viewportStyle?: React.CSSProperties;
   contentClassName?: string;
   onViewportScroll?: React.UIEventHandler<HTMLDivElement>;
+  onViewportTransitionEnd?: React.TransitionEventHandler<HTMLDivElement>;
 }
 
 /**
@@ -20,8 +22,10 @@ function ScrollArea({
   orientation = "vertical",
   viewportRef,
   viewportClassName,
+  viewportStyle,
   contentClassName,
   onViewportScroll,
+  onViewportTransitionEnd,
   ...props
 }: ScrollAreaProps) {
   return (
@@ -35,6 +39,8 @@ function ScrollArea({
         data-slot="scroll-area-viewport"
         data-orientation={orientation}
         onScroll={onViewportScroll}
+        onTransitionEnd={onViewportTransitionEnd}
+        style={viewportStyle}
         className={cn(
           "orbit-native-scroll size-full rounded-[inherit] outline-none",
           orientation === "vertical" && "overflow-x-hidden overflow-y-auto",

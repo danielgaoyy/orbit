@@ -1,36 +1,84 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   AlertCircle,
+  ArrowUpRight,
   ChevronRight,
   CircleCheck,
   Clock,
   File,
   FileDiff,
-  Loader2,
+  Square,
   SquareTerminal,
   type LucideIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import { SimpleTooltip } from "@/components/ui/overlays";
 import { Separator } from "@/components/ui/separator";
-import type {
-  AgentCardView,
-  DiffFileView,
-  SessionInsightsView,
+import {
+  type AgentCardView,
+  type DiffFileView,
+  type SessionInsightsView,
+  isAgentBackgroundWaiting,
+  isAgentForegroundRunning,
+  orbitIpc,
 } from "@/lib/orbit-ipc";
+import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
   type OverviewSectionId,
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
+
+function cleanBackgroundOutputPreview(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const kept: string[] = [];
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (
+      /^Created At:\s*/i.test(line) ||
+      /^Completed At:\s*/i.test(line) ||
+      /^Tool is running as a background task\b/i.test(line) ||
+      /^Task logs are available at:\s*/i.test(line) ||
+      /^Task Description:\s*/i.test(line) ||
+      /^Log output:\s*$/i.test(line) ||
+      /^<truncated \d+ lines>$/i.test(line)
+    ) {
+      continue;
+    }
+    kept.push(rawLine);
+  }
+  const joined = kept.join("\n").trim();
+  return joined.length > 0 ? joined : null;
+}
+
+function TaskElapsedLabel({ startedAtMs }: { startedAtMs: number }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const elapsed = Math.max(0, nowMs - startedAtMs);
+  if (elapsed < 1000) return null;
+
+  return (
+    <span className="text-muted-foreground/60 tabular-nums shrink-0 font-mono text-[11px]">
+      {formatDurationCompact(elapsed)}
+    </span>
+  );
+}
 
 const OverviewActionRow = memo(function OverviewActionRow({
   icon: Icon,
@@ -66,6 +114,7 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
   count,
   collapsed,
   isRunning = false,
+  runningTone = "spinner",
   children,
 }: {
   id: OverviewSectionId;
@@ -73,6 +122,7 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
   count: number;
   collapsed: boolean;
   isRunning?: boolean;
+  runningTone?: "spinner" | "emerald";
   children: React.ReactNode;
 }) {
   return (
@@ -96,9 +146,13 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
             </Badge>
           </span>
           <span className="flex shrink-0 items-center gap-1.5">
-            {collapsed && isRunning && (
-              <Loader2 className="text-muted-foreground size-3 shrink-0 animate-spin" />
-            )}
+            {collapsed &&
+              isRunning &&
+              (runningTone === "emerald" ? (
+                <span className="size-[6px] shrink-0 rounded-full bg-emerald-500/85" />
+              ) : (
+                <OrbitSpinner size={13} className="text-foreground/65" />
+              ))}
             <ChevronRight className="text-muted-foreground/70 size-3.5 shrink-0 transition-transform duration-[220ms] ease-[var(--ease-panel)] group-data-[panel-open]/trigger:rotate-90" />
           </span>
         </CollapsibleTrigger>
@@ -126,6 +180,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
   cwd,
   insights: baseInsights,
   sessionTurnDiffs,
+  currentAgent,
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
@@ -134,9 +189,19 @@ const StageOverviewBody = memo(function StageOverviewBody({
   );
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
+  const [stoppingBg, setStoppingBg] = useState(false);
 
   const insights = baseInsights;
   const backgroundTasks = insights.background_tasks;
+  const hasRunningBgTask = backgroundTasks.some((t) => t.status === "running");
+  const canStopBackground =
+    hasRunningBgTask &&
+    isAgentBackgroundWaiting(currentAgent) &&
+    !isAgentForegroundRunning(currentAgent);
+
+  useEffect(() => {
+    setStoppingBg(false);
+  }, [agentId, backgroundTasks.length]);
 
   const reviewSummary = useMemo(() => {
     const gitFiles = gitReview?.diff_files ?? [];
@@ -319,18 +384,20 @@ const StageOverviewBody = memo(function StageOverviewBody({
                   parentAgentId: agentId,
                 })
               }
-              className="text-foreground/86 hover:bg-accent/65 hover:text-foreground h-[30px] w-full justify-start gap-2 rounded-[8px] px-2 text-[13px] font-normal shadow-none transition-colors"
+              className="text-foreground/86 hover:bg-accent/65 hover:text-foreground h-[32px] w-full justify-start gap-2.5 rounded-[8px] px-2 text-[13px] font-normal shadow-none transition-colors"
             >
-              {sa.status === "running" ? (
-                <Loader2 className="text-muted-foreground size-[14px] shrink-0 animate-spin" />
-              ) : sa.status === "completed" ? (
-                <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
-              ) : (
-                <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
-              )}
+              <span className="flex size-[15px] shrink-0 items-center justify-center">
+                {sa.status === "running" ? (
+                  <OrbitSpinner size={13.5} className="text-foreground/70" />
+                ) : sa.status === "completed" ? (
+                  <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
+                ) : (
+                  <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
+                )}
+              </span>
               <span
                 className={cn(
-                  "truncate",
+                  "truncate leading-[18px]",
                   sa.status === "running" && "agent-text-shimmer",
                 )}
               >
@@ -350,80 +417,168 @@ const StageOverviewBody = memo(function StageOverviewBody({
         </OverviewLayerSection>
       )}
 
-      {/* Layer 3: Background Tasks (progressive disclosure when active) */}
+      {/* Layer 3: Background Tasks (minimal single-line rows; actions appear quietly on hover) */}
       {backgroundTasks.length > 0 && (
         <OverviewLayerSection
           id="tasks"
           label="Background Tasks"
           count={backgroundTasks.length}
           collapsed={collapsedSections.tasks}
-          isRunning={backgroundTasks.some((t) => t.status === "running")}
+          isRunning={hasRunningBgTask}
+          runningTone="emerald"
         >
           {visibleTasks.map((task) => {
-            const hasDetails = Boolean(task.command || task.output_preview || task.log_path);
+            const cleanPreview = cleanBackgroundOutputPreview(task.output_preview);
+            const hasDetails = Boolean(task.command || cleanPreview || task.log_path);
             const isExpanded = Boolean(expandedTasks[task.id]);
+            const showStopAction = canStopBackground && task.status === "running";
+            const hasHoverActions = Boolean(task.log_path || showStopAction);
             return (
               <div
                 key={task.id}
-                className="group/bgtask hover:bg-accent/65 flex w-full flex-col rounded-[8px] transition-colors"
+                className={cn(
+                  "group/bgtask flex w-full flex-col rounded-[8px] transition-colors",
+                  isExpanded
+                    ? "bg-black/[0.025] dark:bg-white/[0.03]"
+                    : "hover:bg-accent/65",
+                )}
               >
-                <button
-                  type="button"
-                  title={task.command || task.title}
-                  onClick={() => {
-                    if (!hasDetails) return;
-                    setExpandedTasks((prev) => ({ ...prev, [task.id]: !prev[task.id] }));
-                  }}
-                  className={cn(
-                    "flex min-w-0 w-full items-start gap-2 px-2 py-1.5 text-left",
-                    hasDetails ? "cursor-pointer" : "cursor-default",
-                  )}
-                >
-                  {task.status === "running" ? (
-                    <Loader2 className="text-muted-foreground mt-0.5 size-3.5 shrink-0 animate-spin" />
-                  ) : (
-                    <Clock className="text-muted-foreground mt-0.5 size-3.5 shrink-0" />
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <div
-                      className={cn(
-                        "truncate font-mono text-[12.5px]",
-                        task.status === "running"
-                          ? "agent-text-shimmer"
-                          : "text-foreground/85",
+                <div className="relative flex h-[32px] min-w-0 w-full items-center">
+                  <button
+                    type="button"
+                    aria-expanded={hasDetails ? isExpanded : undefined}
+                    onClick={() => {
+                      if (!hasDetails) return;
+                      setExpandedTasks((prev) => ({ ...prev, [task.id]: !prev[task.id] }));
+                    }}
+                    className={cn(
+                      "flex h-full min-w-0 flex-1 items-center gap-2.5 px-2 text-left",
+                      hasDetails ? "cursor-pointer" : "cursor-default",
+                    )}
+                  >
+                    <span className="flex size-[15px] shrink-0 items-center justify-center">
+                      {task.status === "running" ? (
+                        <span className="size-[6px] rounded-full bg-emerald-500/85" />
+                      ) : (
+                        <Clock className="text-muted-foreground/75 size-[13.5px] stroke-[1.7]" />
                       )}
-                    >
+                    </span>
+                    <span className="text-foreground/86 min-w-0 flex-1 truncate font-mono text-[12px] leading-[18px]">
                       {task.title}
-                    </div>
-                    <div className="text-muted-foreground/80 truncate text-[11px]">
-                      {task.subtitle}
-                    </div>
+                    </span>
+                  </button>
+
+                  {/* Resting: quiet elapsed timer; Hover/Expanded: minimalist icon actions */}
+                  <div className="flex shrink-0 items-center pr-1.5">
+                    {typeof task.started_at_ms === "number" && (
+                      <div
+                        className={cn(
+                          "pr-0.5 transition-opacity duration-150",
+                          hasHoverActions &&
+                            (isExpanded
+                              ? "hidden"
+                              : "group-hover/bgtask:hidden group-focus-within/bgtask:hidden"),
+                        )}
+                      >
+                        <TaskElapsedLabel startedAtMs={task.started_at_ms} />
+                      </div>
+                    )}
+
+                    {hasHoverActions && (
+                      <div
+                        className={cn(
+                          "items-center gap-0.5",
+                          isExpanded
+                            ? "flex"
+                            : "hidden group-hover/bgtask:flex group-focus-within/bgtask:flex",
+                        )}
+                      >
+                        {task.log_path && (
+                          <SimpleTooltip label="Open log">
+                            <button
+                              type="button"
+                              aria-label="Open task log"
+                              onClick={() => {
+                                if (task.log_path) {
+                                  orbitActions.openFileInSidePanel(task.log_path, {
+                                    hostId,
+                                    cwd,
+                                  });
+                                }
+                              }}
+                              className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                            >
+                              <ArrowUpRight className="size-[13px] stroke-[1.8]" />
+                            </button>
+                          </SimpleTooltip>
+                        )}
+                        {showStopAction && (
+                          <SimpleTooltip
+                            label={
+                              backgroundTasks.length > 1
+                                ? "Stop background tasks"
+                                : "Stop background task"
+                            }
+                          >
+                            <button
+                              type="button"
+                              disabled={stoppingBg}
+                              aria-label="Stop background task"
+                              onClick={() => {
+                                if (stoppingBg) return;
+                                setStoppingBg(true);
+                                void orbitIpc.interruptAgent(hostId, agentId).then(
+                                  () => {
+                                    orbitActions.showToast("Stopped background tasks");
+                                  },
+                                  (err) => {
+                                    setStoppingBg(false);
+                                    orbitActions.showToast(
+                                      `Failed to stop background tasks: ${String(err)}`,
+                                    );
+                                  },
+                                );
+                              }}
+                              className={cn(
+                                "text-muted-foreground hover:bg-rose-500/12 hover:text-rose-600 dark:hover:text-rose-400 inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors",
+                                stoppingBg && "pointer-events-none opacity-45",
+                              )}
+                            >
+                              <Square className="size-[9.5px] fill-current" />
+                            </button>
+                          </SimpleTooltip>
+                        )}
+                      </div>
+                    )}
                   </div>
-                  {hasDetails && (
-                    <ChevronRight
-                      className={cn(
-                        "text-muted-foreground/60 mt-0.5 size-3.5 shrink-0 transition-transform",
-                        isExpanded && "rotate-90",
-                      )}
-                    />
-                  )}
-                </button>
+                </div>
+
                 {hasDetails && isExpanded && (
-                  <div className="border-border/60 selectable-text mx-2 mb-2 space-y-1.5 rounded-md border bg-black/[0.03] px-2 py-1.5 font-mono text-[11px] dark:bg-white/[0.04]">
+                  <div className="selectable-text space-y-1.5 px-2.5 pt-0.5 pb-2 font-mono text-[11px] leading-relaxed">
                     {task.command && (
-                      <div className="text-foreground/85 break-all whitespace-pre-wrap">
-                        $ {task.command}
+                      <div className="text-foreground/78 break-all whitespace-pre-wrap">
+                        <span className="text-muted-foreground/50 select-none">$ </span>
+                        {task.command}
                       </div>
                     )}
-                    {task.log_path && (
-                      <div className="text-muted-foreground break-all">
-                        Log: {task.log_path}
-                      </div>
-                    )}
-                    {task.output_preview && (
-                      <pre className="text-muted-foreground max-h-[120px] overflow-auto break-words whitespace-pre-wrap">
-                        {task.output_preview.slice(0, 600)}
+                    {cleanPreview && (
+                      <pre className="text-muted-foreground/75 max-h-[88px] overflow-hidden break-words whitespace-pre-wrap">
+                        {cleanPreview.slice(0, 320)}
                       </pre>
+                    )}
+                    {!task.command && !cleanPreview && task.log_path && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (task.log_path) {
+                            orbitActions.openFileInSidePanel(task.log_path, { hostId, cwd });
+                          }
+                        }}
+                        className="text-muted-foreground hover:text-foreground inline-flex max-w-full cursor-pointer items-center gap-1 text-left transition-colors"
+                      >
+                        <span className="truncate">{task.log_path}</span>
+                        <ArrowUpRight className="size-3 shrink-0" />
+                      </button>
                     )}
                   </div>
                 )}

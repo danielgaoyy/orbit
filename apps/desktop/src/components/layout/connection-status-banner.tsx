@@ -1,12 +1,8 @@
-import { memo, useState } from "react";
-import { AlertTriangle, Loader2, RefreshCw, Settings2, WifiOff, X } from "lucide-react";
+import { memo, useEffect, useState } from "react";
+import { AlertTriangle, RefreshCw, WifiOff, X } from "lucide-react";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { compareSemver, normalizeSemver } from "@/lib/orbit-ipc";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
-
-function normalizeSemver(raw: string | null | undefined): string | null {
-  if (!raw) return null;
-  const trimmed = raw.trim().replace(/^v/i, "");
-  return trimmed.length > 0 ? trimmed : null;
-}
 
 export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
   const isBrowserOffline = useOrbitSelector((s) => s.isBrowserOffline);
@@ -20,7 +16,22 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
   const dismissedDaemonVer = useOrbitSelector((s) =>
     s.selectedHostId ? (s.dismissedVersionMismatchHosts[s.selectedHostId] ?? null) : null,
   );
+  const upgradeState = useOrbitSelector((s) =>
+    s.selectedHostId ? (s.hostUpgradeStates[s.selectedHostId] ?? null) : null,
+  );
+
   const [reconnecting, setReconnecting] = useState(false);
+  const [showLocalUpgradeStrip, setShowLocalUpgradeStrip] = useState(false);
+
+  // Local sidecar upgrades usually complete in < 600ms; delay showing any strip so fast swaps are 100% invisible
+  useEffect(() => {
+    if (upgradeState?.status !== "upgrading" || upgradeState.mode !== "local") {
+      setShowLocalUpgradeStrip(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setShowLocalUpgradeStrip(true), 1200);
+    return () => window.clearTimeout(timer);
+  }, [upgradeState?.status, upgradeState?.mode, upgradeState?.startedAt]);
 
   // 1. OS/WebView internet offline — highest priority (loopback daemon stays green even when internet drops)
   if (isBrowserOffline) {
@@ -39,7 +50,27 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
     );
   }
 
-  // 2. Selected host disconnected / reconnecting
+  // 2. Active silent background daemon upgrade (remote SSH/E2EE wire or slow local fallback)
+  if (
+    selectedHost &&
+    upgradeState?.status === "upgrading" &&
+    (upgradeState.mode !== "local" || showLocalUpgradeStrip)
+  ) {
+    return (
+      <div
+        role="status"
+        className="orbit-stage-enter border-border/80 bg-muted/40 text-muted-foreground flex shrink-0 items-center gap-2 border-b px-4 py-1.5 text-[12px]"
+      >
+        <OrbitSpinner size={12} className="text-muted-foreground/80 shrink-0" />
+        <span className="truncate">
+          Updating <span className="text-foreground/85 font-medium">{selectedHost.display_name}</span>{" "}
+          in background… Running tasks stay uninterrupted.
+        </span>
+      </div>
+    );
+  }
+
+  // 3. Selected host disconnected / reconnecting
   if (selectedHost && selectedHost.connection_state === "disconnected") {
     const errSnippet = selectedHost.last_error?.trim() || null;
     return (
@@ -87,26 +118,37 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
         role="status"
         className="orbit-stage-enter border-border/80 bg-muted/45 text-muted-foreground flex shrink-0 items-center gap-2 border-b px-4 py-1.5 text-[12.5px]"
       >
-        <Loader2 className="size-3.5 shrink-0 animate-spin opacity-80" />
+        <OrbitSpinner size={12} className="text-muted-foreground/80 shrink-0" />
         <span className="truncate">
-          Connecting to <span className="text-foreground/85 font-medium">{selectedHost.display_name}</span>{" "}
+          Connecting to{" "}
+          <span className="text-foreground/85 font-medium">{selectedHost.display_name}</span>{" "}
           {modeLabel}…
         </span>
       </div>
     );
   }
 
-  // 3. Online daemon version mismatch (dismissible per host + version)
+  // 4. Protocol-lagging daemon fallback (ONLY when protocol is behind AND automatic upgrade hasn't completed)
+  // Always offers a direct 1-click Update button — never asks the user to copy/paste shell commands.
   const normApp = normalizeSemver(appVersion);
   const normDaemon = normalizeSemver(selectedHost?.daemon_version);
+  const isOnline =
+    selectedHost?.connection_state === "online_direct" ||
+    selectedHost?.connection_state === "online_relay";
+  const daemonPv = selectedHost?.daemon_protocol_version ?? null;
+  const clientPv = selectedHost?.client_protocol_version ?? null;
+  const isProtocolBehind =
+    daemonPv !== null && clientPv !== null && clientPv > 0 && daemonPv < clientPv;
+  const isDaemonOlder = Boolean(normApp && normDaemon && compareSemver(normDaemon, normApp) < 0);
+
   if (
     selectedHost &&
-    (selectedHost.connection_state === "online_direct" ||
-      selectedHost.connection_state === "online_relay") &&
-    normApp &&
+    isOnline &&
+    isProtocolBehind &&
+    isDaemonOlder &&
     normDaemon &&
-    normApp !== normDaemon &&
-    dismissedDaemonVer !== normDaemon
+    dismissedDaemonVer !== normDaemon &&
+    upgradeState?.status !== "upgrading"
   ) {
     return (
       <div
@@ -114,28 +156,25 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
         className="orbit-stage-enter border-border/80 bg-muted/40 text-muted-foreground flex shrink-0 items-center justify-between gap-3 border-b px-4 py-1.5 text-[12px]"
       >
         <div className="flex min-w-0 items-center gap-2">
-          <AlertTriangle className="size-3.5 shrink-0 text-amber-500" />
           <span className="truncate">
-            Host <span className="text-foreground/85 font-medium">{selectedHost.display_name}</span>{" "}
-            is running Daemon <span className="font-mono">v{normDaemon}</span> while Desktop is{" "}
-            <span className="font-mono">v{normApp}</span>. Restart or upgrade the daemon to keep
-            features in sync.
+            <span className="text-foreground/85 font-medium">{selectedHost.display_name}</span> is
+            on an older version (<span className="font-mono">v{normDaemon}</span>) — update to unlock
+            the latest features.
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
           <button
             type="button"
             onClick={() =>
-              orbitActions.openSettings(`host:${selectedHost.host_id}:connection`)
+              void orbitActions.upgradeHostDaemon(selectedHost.host_id, { force: true })
             }
-            className="text-foreground/80 hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors"
+            className="text-foreground/85 hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors"
           >
-            <Settings2 className="size-3" />
-            <span>Host settings</span>
+            <span>{upgradeState?.status === "failed" ? "Retry update" : "Update"}</span>
           </button>
           <button
             type="button"
-            aria-label="Dismiss version mismatch notice"
+            aria-label="Dismiss update notice"
             onClick={() => orbitActions.dismissVersionMismatch(selectedHost.host_id, normDaemon)}
             className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-5 cursor-pointer items-center justify-center rounded-md transition-colors"
           >

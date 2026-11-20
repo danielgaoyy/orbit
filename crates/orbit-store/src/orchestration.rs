@@ -360,9 +360,19 @@ impl OrbitStore {
         let mut stmt = conn.prepare(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             bound.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let rows = stmt
+        let mut rows = stmt
             .query_map(params_refs.as_slice(), map_agent_row)?
             .collect::<Result<Vec<_>, _>>()?;
+        if !rows.is_empty()
+            && let Ok(mut grouped) = crate::load_all_queued_prompts_grouped(&conn)
+            && !grouped.is_empty()
+        {
+            for ag in &mut rows {
+                if let Some(items) = grouped.remove(&ag.agent_id) {
+                    ag.queued_prompts = items;
+                }
+            }
+        }
         Ok(rows)
     }
 
@@ -402,6 +412,10 @@ impl OrbitStore {
              WHERE agent_id = ?3",
             params![now, normalized_status, agent_id],
         )?;
+        let _ = conn.execute(
+            "DELETE FROM agent_queued_prompts WHERE agent_id = ?1",
+            params![agent_id],
+        );
         Ok(())
     }
 

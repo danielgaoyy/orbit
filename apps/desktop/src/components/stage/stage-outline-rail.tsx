@@ -8,7 +8,7 @@ export interface OutlinePromptItem {
 
 /**
  * Peripheral left-margin Turn Outline Rail:
- * Appears only when effective conversation width grants a real left gutter (`>= 900px` open / `< 868px` close)
+ * Appears when effective conversation width grants a clean left gutter (`>= 800px` open / `< 776px` close)
  * and `>= 2` user prompts exist, synchronizing sidebar slides and visibility transitions strictly on the GPU.
  */
 export const ChatOutlineRail = memo(
@@ -45,7 +45,7 @@ export const ChatOutlineRail = memo(
     return (
       <div
         style={wrapperStyle}
-        className="pointer-events-none absolute top-[14%] bottom-[16%] left-1.5 z-20 w-7"
+        className="pointer-events-none absolute top-[14%] bottom-[16%] left-[6px] z-20 w-6"
       >
         <nav
           aria-label="Conversation outline"
@@ -62,8 +62,8 @@ export const ChatOutlineRail = memo(
             const isActive = p.seq === activeSeq;
             const dist = !visible || hoveredIdx === null ? 99 : Math.abs(idx - hoveredIdx);
             const mag = dist === 0 ? 1 : dist === 1 ? 0.48 : dist === 2 ? 0.18 : 0;
-            const baseW = isActive ? 12 : 6;
-            const pillW = Math.round(baseW + mag * (18 - baseW));
+            const baseW = isActive ? 11 : 6;
+            const pillW = Math.round(baseW + mag * (16 - baseW));
             const pillH = dist === 0 ? 3 : 2;
 
             return (
@@ -72,7 +72,7 @@ export const ChatOutlineRail = memo(
                 onMouseEnter={() => {
                   if (visible) setHoveredIdx(idx);
                 }}
-                className="relative flex max-h-3.5 min-h-1.5 w-full flex-1 items-center pl-0.5"
+                className="relative flex max-h-3.5 min-h-1.5 w-full flex-1 items-center"
               >
                 <button
                   type="button"
@@ -85,10 +85,10 @@ export const ChatOutlineRail = memo(
                 >
                   <span
                     style={{
-                      transform: `scale3d(${(pillW / 18).toFixed(3)}, ${(pillH / 3).toFixed(3)}, 1)`,
+                      transform: `scale3d(${(pillW / 16).toFixed(3)}, ${(pillH / 3).toFixed(3)}, 1)`,
                     }}
                     className={cn(
-                      "h-[3px] w-[18px] origin-left rounded-full transition-[transform,background-color] duration-150 ease-out will-change-transform",
+                      "h-[3px] w-[16px] origin-left rounded-full transition-[transform,background-color] duration-150 ease-out will-change-transform",
                       dist === 0
                         ? "bg-foreground"
                         : isActive
@@ -99,7 +99,7 @@ export const ChatOutlineRail = memo(
                 </button>
 
                 {visible && hoveredIdx === idx && (
-                  <div className="bg-popover text-popover-foreground border-border floating-surface orbit-inline-flyout-side pointer-events-none absolute top-1/2 left-7 z-30 w-56 -translate-y-1/2 rounded-xl border px-3 py-2 text-[12px] leading-snug">
+                  <div className="bg-popover text-popover-foreground border-border floating-surface orbit-inline-flyout-side pointer-events-none absolute top-1/2 left-6 z-30 w-56 -translate-y-1/2 rounded-xl border px-3 py-2 text-[12px] leading-snug">
                     <div className="line-clamp-2 break-words">{p.preview}</div>
                   </div>
                 )}

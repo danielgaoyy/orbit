@@ -40,7 +40,13 @@ const EMPTY_PROFILES: readonly AgentProfile[] = [];
  * Never subscribes to `composerDrafts`, and subscribes narrowly to provider/catalog slices
  * so keystrokes and unrelated background ticks trigger zero re-renders.
  */
-export const ComposerModelPicker = memo(function ComposerModelPicker() {
+export const ComposerModelPicker = memo(function ComposerModelPicker({
+  disabled = false,
+  disabledTitle,
+}: {
+  disabled?: boolean;
+  disabledTitle?: string;
+} = {}) {
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
@@ -269,6 +275,30 @@ export const ComposerModelPicker = memo(function ComposerModelPicker() {
   );
 
   const showAgentRail = canSwitchAgentEngine && detectedProviders.length > 1;
+
+  if (disabled) {
+    return (
+      <button
+        type="button"
+        disabled
+        title={disabledTitle}
+        className="inline-flex h-8.5 max-w-76 cursor-not-allowed items-center gap-1.5 rounded-full px-2.5 text-[13.5px] opacity-65"
+      >
+        <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
+        <span className="text-foreground/88 truncate font-normal">
+          {activeDraftProfile
+            ? activeDraftProfile.name
+            : formatCatalogModelLabel(activeCatalog, rawActiveModel)}
+        </span>
+        {!activeDraftProfile && effectiveActiveEffort && (
+          <span className="text-foreground/48 shrink-0 font-normal">
+            {formatEffortLabel(effectiveActiveEffort)}
+          </span>
+        )}
+        <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
+      </button>
+    );
+  }
 
   return (
     <Popover

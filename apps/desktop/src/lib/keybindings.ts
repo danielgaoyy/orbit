@@ -1,5 +1,9 @@
 import { useEffect, useRef } from "react";
-import { isMacDesktop, orbitIpc } from "@/lib/orbit-ipc";
+import {
+  isAgentForegroundRunning,
+  isMacDesktop,
+  orbitIpc,
+} from "@/lib/orbit-ipc";
 import {
   getFocusedDecisionTarget,
   isAlwaysDecision,
@@ -253,7 +257,7 @@ export function useGlobalErgonomicKeybindings(): void {
           if (!snap.isDraftNewSession && snap.selectedHostId && snap.selectedAgentId) {
             const detail = snap.hostDetails[snap.selectedHostId];
             const ag = detail?.agents.find((a) => a.agent_id === snap.selectedAgentId);
-            if (ag?.is_running || ag?.is_awaiting_permission) {
+            if (isAgentForegroundRunning(ag) || ag?.is_awaiting_permission) {
               e.preventDefault();
               void orbitIpc.interruptAgent(snap.selectedHostId, snap.selectedAgentId);
               orbitActions.showToast("Interrupted active turn");

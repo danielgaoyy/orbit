@@ -194,6 +194,7 @@ pub struct DaemonRuntime {
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
     catalog_refresh_lock: AsyncMutex<()>,
+    upgrade_lock: AsyncMutex<()>,
 }
 
 impl DaemonRuntime {
@@ -300,6 +301,7 @@ impl DaemonRuntime {
             idle_cleanup,
             provider_catalogs: RwLock::new(None),
             catalog_refresh_lock: AsyncMutex::new(()),
+            upgrade_lock: AsyncMutex::new(()),
         }))
     }
 
@@ -1644,6 +1646,83 @@ async fn handle_wire_rpc(
                 }
             }
         }
+        WireMessage::EnqueuePrompt {
+            request_id,
+            agent_id,
+            prompt,
+            display_prompt,
+            badges,
+            queue_id,
+        } => {
+            subscribed_agents.insert(agent_id.clone());
+            match runtime
+                .orchestrator
+                .enqueue_user_prompt(&agent_id, prompt, display_prompt, badges, queue_id)
+                .await
+            {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Err(e) => Some(rpc_err(request_id, "enqueue_prompt_failed", e)),
+            }
+        }
+        WireMessage::RemoveQueuedPrompt {
+            request_id,
+            agent_id,
+            queue_id,
+        } => {
+            match runtime
+                .orchestrator
+                .remove_queued_user_prompt(&agent_id, &queue_id)
+                .await
+            {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Err(e) => Some(rpc_err(request_id, "remove_queued_prompt_failed", e)),
+            }
+        }
+        WireMessage::FlushQueuedPromptNow {
+            request_id,
+            agent_id,
+            queue_id,
+        } => {
+            subscribed_agents.insert(agent_id.clone());
+            match runtime
+                .orchestrator
+                .flush_queued_user_prompt_now(&agent_id, &queue_id)
+                .await
+            {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Err(e) => Some(rpc_err(request_id, "flush_queued_prompt_failed", e)),
+            }
+        }
+        WireMessage::ReorderQueuedPrompts {
+            request_id,
+            agent_id,
+            queue_ids,
+        } => {
+            match runtime
+                .orchestrator
+                .reorder_queued_user_prompts(&agent_id, &queue_ids)
+                .await
+            {
+                Ok(()) => Some(WireMessage::Ack { request_id }),
+                Err(e) => Some(rpc_err(request_id, "reorder_queued_prompts_failed", e)),
+            }
+        }
+        WireMessage::UpgradeDaemon {
+            request_id,
+            target_version,
+        } => {
+            let rt = Arc::clone(runtime);
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            tokio::spawn(async move {
+                let reply = match rt.self_upgrade_and_restart(target_version).await {
+                    Ok(()) => WireMessage::Ack { request_id },
+                    Err(e) => rpc_err(request_id, "upgrade_daemon_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
         WireMessage::InterruptTurn {
             request_id,
             agent_id,
@@ -2626,4 +2705,236 @@ fn hostname_string() -> String {
         })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "orbit-host".to_string())
+}
+
+fn shell_single_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn daemon_release_asset_name() -> anyhow::Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("orbit-cli-macos-arm64"),
+        ("linux", "x86_64") => Ok("orbit-cli-linux-x64"),
+        ("linux", "aarch64") => Ok("orbit-cli-linux-arm64"),
+        (os, arch) => anyhow::bail!("Unsupported platform for self-upgrade: {os}/{arch}"),
+    }
+}
+
+impl DaemonRuntime {
+    /// Download the matching Orbit release binary, verify `--version`, atomically install to
+    /// `~/.local/bin/orbit`, and trigger a detached `orbit daemon up` hot-restart so all
+    /// `orbit shim` agent & PTY sessions stay alive uninterrupted.
+    pub async fn self_upgrade_and_restart(
+        &self,
+        target_version: Option<String>,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let _upgrade_guard = self.upgrade_lock.lock().await;
+
+        let asset = daemon_release_asset_name()?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("Unable to resolve HOME directory"))?;
+        let install_dir = home.join(".local/bin");
+        std::fs::create_dir_all(&install_dir)?;
+        let install_path = install_dir.join("orbit");
+        let tmp_path = install_dir.join(format!(
+            "orbit.upgrade.{}.{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+
+        let repo = std::env::var("ORBIT_REPO")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "danielgaoyy/orbit".to_string());
+
+        let mut urls: Vec<String> = Vec::new();
+        if let Some(raw_ver) = target_version
+            .as_deref()
+            .map(str::trim)
+            .map(|s| s.trim_start_matches(['v', 'V']))
+            .filter(|s| !s.is_empty())
+        {
+            if !is_valid_release_semver(raw_ver) {
+                anyhow::bail!("Invalid target version format: {raw_ver}");
+            }
+            urls.push(format!(
+                "https://github.com/{repo}/releases/download/v{raw_ver}/{asset}"
+            ));
+        }
+        urls.push(format!(
+            "https://github.com/{repo}/releases/latest/download/{asset}"
+        ));
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(90))
+            .user_agent(format!("orbit-daemon/{}", env!("CARGO_PKG_VERSION")))
+            .build()?;
+
+        let mut downloaded = false;
+        let mut last_err = anyhow::anyhow!("Failed to download Orbit binary");
+        for url in &urls {
+            match client.get(url).send().await {
+                Ok(mut resp) if resp.status().is_success() => {
+                    let mut file = tokio::fs::File::create(&tmp_path).await?;
+                    let mut stream_err: Option<anyhow::Error> = None;
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(bytes)) => {
+                                if let Err(e) = file.write_all(&bytes).await {
+                                    stream_err = Some(e.into());
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                stream_err = Some(e.into());
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(err) = stream_err {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        last_err = err;
+                        continue;
+                    }
+                    if let Err(e) = file.flush().await {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        return Err(e.into());
+                    }
+                    drop(file);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Err(e) = std::fs::set_permissions(
+                            &tmp_path,
+                            std::fs::Permissions::from_mode(0o755),
+                        ) {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(e.into());
+                        }
+                    }
+                    downloaded = true;
+                    break;
+                }
+                Ok(resp) => {
+                    last_err = anyhow::anyhow!("HTTP {} downloading {url}", resp.status());
+                }
+                Err(e) => {
+                    last_err = anyhow::anyhow!("Network error downloading {url}: {e}");
+                }
+            }
+        }
+
+        if !downloaded {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(last_err);
+        }
+
+        let check = tokio::process::Command::new(&tmp_path)
+            .arg("--version")
+            .output()
+            .await;
+        match check {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !stdout.trim().to_ascii_lowercase().starts_with("orbit ") {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    anyhow::bail!("Downloaded binary returned unexpected --version output");
+                }
+            }
+            Ok(out) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                anyhow::bail!("Downloaded binary failed --version check ({})", out.status);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                anyhow::bail!("Downloaded binary could not be executed: {e}");
+            }
+        }
+
+        if let Err(e) = std::fs::rename(&tmp_path, &install_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            anyhow::bail!("Failed to replace {}: {e}", install_path.display());
+        }
+
+        let port = *self.listen_port.read().await;
+        let default_home = home.join(".orbit");
+        let is_default_home = std::fs::canonicalize(&self.home_dir)
+            .unwrap_or_else(|_| self.home_dir.clone())
+            == std::fs::canonicalize(&default_home).unwrap_or(default_home);
+
+        let sq_bin = shell_single_quote(&install_path.to_string_lossy());
+        let home_flag = if is_default_home {
+            String::new()
+        } else {
+            format!(
+                " --home {}",
+                shell_single_quote(&self.home_dir.to_string_lossy())
+            )
+        };
+        let port_flag = if port > 0 {
+            format!(" --port {port}")
+        } else {
+            String::new()
+        };
+        let restart_script = format!("sleep 0.35 && {sq_bin}{home_flag} daemon up{port_flag}");
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &restart_script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd.spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn daemon hot-restart: {e}"))?;
+
+        tracing::info!(
+            install_path = %install_path.display(),
+            port,
+            "Scheduled self-upgrade hot-restart via `orbit daemon up`"
+        );
+        Ok(())
+    }
+}
+
+/// Strictly validate a release semver tag (`X.Y.Z` with optional `-prerelease`) before
+/// interpolating it into a GitHub Releases download URL, preventing path traversal (`../`).
+fn is_valid_release_semver(ver: &str) -> bool {
+    if ver.is_empty() || ver.len() > 64 {
+        return false;
+    }
+    let (core, prerelease) = match ver.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (ver, None),
+    };
+    let mut parts = core.split('.');
+    let valid_core = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None)
+            if !a.is_empty()
+                && !b.is_empty()
+                && !c.is_empty()
+                && a.bytes().all(|ch| ch.is_ascii_digit())
+                && b.bytes().all(|ch| ch.is_ascii_digit())
+                && c.bytes().all(|ch| ch.is_ascii_digit())
+    );
+    if !valid_core {
+        return false;
+    }
+    if let Some(pre) = prerelease {
+        if pre.is_empty() || pre.contains("..") {
+            return false;
+        }
+        return pre
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'.' || ch == b'-');
+    }
+    true
 }

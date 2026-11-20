@@ -26,12 +26,37 @@ export const ComposerModePicker = memo(function ComposerModePicker({
   mode,
   onSelectMode,
   iconOnly = false,
+  disabled = false,
+  disabledTitle,
 }: {
   mode: SessionMode;
-  onSelectMode: (m: SessionMode) => void;
+  onSelectMode?: (m: SessionMode) => void;
   iconOnly?: boolean;
+  disabled?: boolean;
+  disabledTitle?: string;
 }) {
   const activeMode = normalizePermissionMode(mode);
+
+  if (disabled) {
+    return (
+      <button
+        type="button"
+        disabled
+        title={disabledTitle ?? modeLabel(activeMode)}
+        aria-label={`Access permissions: ${modeLabel(activeMode)}`}
+        className={cn(
+          "text-foreground/78 inline-flex h-8.5 shrink-0 cursor-not-allowed items-center rounded-full text-[13.5px] font-normal opacity-60",
+          iconOnly ? "justify-center gap-0.5 px-2" : "gap-1.5 px-2.5",
+        )}
+      >
+        <ModeIcon mode={activeMode} className="opacity-75" />
+        {!iconOnly && (
+          <span className="hidden whitespace-nowrap sm:inline">{modeLabel(activeMode)}</span>
+        )}
+        <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
+      </button>
+    );
+  }
 
   return (
     <DropdownMenu>
@@ -63,7 +88,7 @@ export const ComposerModePicker = memo(function ComposerModePicker({
           return (
             <DropdownMenuItem
               key={m.id}
-              onSelect={() => onSelectMode(m.id)}
+              onSelect={() => onSelectMode?.(m.id)}
               className="items-start gap-3 px-2.5 py-2"
             >
               <div className="flex min-w-0 flex-1 items-start gap-2.5">

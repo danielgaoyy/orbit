@@ -322,6 +322,8 @@ pub struct FfiHostCard {
     pub via_ssh_tunnel: bool,
     pub last_ping_ms: Option<u32>,
     pub daemon_version: Option<String>,
+    pub daemon_protocol_version: Option<u32>,
+    pub client_protocol_version: u32,
     pub os_arch: Option<String>,
     pub daemon_pubkey_b64: String,
     pub direct_endpoints: Vec<String>,
@@ -332,6 +334,7 @@ pub struct FfiHostCard {
     pub workspace_count: u32,
     pub agent_count: u32,
     pub pending_approval_count: u32,
+    pub supports_server_queue: bool,
 }
 
 impl From<HostCardView> for FfiHostCard {
@@ -348,6 +351,8 @@ impl From<HostCardView> for FfiHostCard {
             via_ssh_tunnel: v.via_ssh_tunnel,
             last_ping_ms: v.last_ping_ms,
             daemon_version: v.daemon_version,
+            daemon_protocol_version: v.daemon_protocol_version,
+            client_protocol_version: v.client_protocol_version,
             os_arch: v.os_arch,
             daemon_pubkey_b64: v.daemon_pubkey_b64,
             direct_endpoints: v.direct_endpoints,
@@ -358,6 +363,7 @@ impl From<HostCardView> for FfiHostCard {
             workspace_count: v.workspace_count,
             agent_count: v.agent_count,
             pending_approval_count: v.pending_approval_count,
+            supports_server_queue: v.supports_server_queue,
         }
     }
 }
@@ -577,6 +583,25 @@ impl From<WorkspaceSummary> for FfiWorkspaceSummary {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiQueuedPrompt {
+    pub queue_id: String,
+    pub display_text: String,
+    pub badges: Vec<FfiPromptBadge>,
+    pub created_at_rfc3339: String,
+}
+
+impl From<orbit_protocol::QueuedPromptView> for FfiQueuedPrompt {
+    fn from(q: orbit_protocol::QueuedPromptView) -> Self {
+        Self {
+            queue_id: q.queue_id,
+            display_text: q.display_text,
+            badges: q.badges.into_iter().map(Into::into).collect(),
+            created_at_rfc3339: q.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiAgentCard {
     pub agent_id: String,
     pub workspace_id: String,
@@ -589,6 +614,7 @@ pub struct FfiAgentCard {
     pub mode: FfiSessionMode,
     pub status_label: String,
     pub is_running: bool,
+    pub has_background_tasks: bool,
     pub is_awaiting_permission: bool,
     pub parent_agent_id: Option<String>,
     pub latest_seq: u64,
@@ -596,6 +622,7 @@ pub struct FfiAgentCard {
     pub is_pinned: bool,
     pub seen_seq: u64,
     pub is_unread: bool,
+    pub queued_prompts: Vec<FfiQueuedPrompt>,
 }
 
 impl From<AgentCardView> for FfiAgentCard {
@@ -612,6 +639,7 @@ impl From<AgentCardView> for FfiAgentCard {
             mode: v.mode.into(),
             status_label: v.status_label,
             is_running: v.is_running,
+            has_background_tasks: v.has_background_tasks,
             is_awaiting_permission: v.is_awaiting_permission,
             parent_agent_id: v.parent_agent_id,
             latest_seq: v.latest_seq,
@@ -619,6 +647,7 @@ impl From<AgentCardView> for FfiAgentCard {
             is_pinned: v.is_pinned,
             seen_seq: v.seen_seq,
             is_unread: v.is_unread,
+            queued_prompts: v.queued_prompts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -3490,6 +3519,55 @@ impl OrbitMobileCore {
             display_prompt,
             badges.into_iter().map(Into::into).collect(),
         );
+    }
+
+    pub fn enqueue_prompt(
+        &self,
+        host_id: String,
+        agent_id: String,
+        prompt: String,
+        display_prompt: Option<String>,
+        badges: Vec<FfiPromptBadge>,
+        queue_id: Option<String>,
+    ) -> String {
+        self.inner.enqueue_prompt(
+            &host_id,
+            &agent_id,
+            &prompt,
+            display_prompt,
+            badges.into_iter().map(Into::into).collect(),
+            queue_id,
+        )
+    }
+
+    pub fn remove_queued_prompt(&self, host_id: String, agent_id: String, queue_id: String) {
+        self.inner
+            .remove_queued_prompt(&host_id, &agent_id, &queue_id);
+    }
+
+    pub fn flush_queued_prompt_now(&self, host_id: String, agent_id: String, queue_id: String) {
+        self.inner
+            .flush_queued_prompt_now(&host_id, &agent_id, &queue_id);
+    }
+
+    pub fn reorder_queued_prompts(
+        &self,
+        host_id: String,
+        agent_id: String,
+        queue_ids: Vec<String>,
+    ) {
+        self.inner
+            .reorder_queued_prompts(&host_id, &agent_id, queue_ids);
+    }
+
+    pub fn upgrade_host_daemon_over_wire(
+        &self,
+        host_id: String,
+        target_version: Option<String>,
+    ) -> Result<String, FfiOrbitError> {
+        self.inner
+            .upgrade_host_daemon_over_wire_blocking(&host_id, target_version)
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     pub fn interrupt_agent(&self, host_id: String, agent_id: String) {

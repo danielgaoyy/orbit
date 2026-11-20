@@ -18,8 +18,8 @@ fn next_unique_local_tag(prefix: &str) -> String {
 }
 
 use crate::updater::{
-    AppUpdateProgress, CURRENT_APP_VERSION, ReleaseUpdateInfo, check_latest_release,
-    perform_one_click_update,
+    AppUpdateProgress, CURRENT_APP_VERSION, LocalDaemonSyncResult, ReleaseUpdateInfo,
+    check_latest_release, perform_one_click_update, sync_local_daemon as run_sync_local_daemon,
 };
 
 use orbit_client_core::HostRouteMode;
@@ -556,6 +556,60 @@ fn send_prompt(
         badges.unwrap_or_default(),
         active_turn_behavior.unwrap_or_default(),
     );
+}
+
+#[tauri::command]
+fn enqueue_prompt(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    prompt: String,
+    display_prompt: Option<String>,
+    badges: Option<Vec<PromptBadge>>,
+    queue_id: Option<String>,
+) -> String {
+    state.core.enqueue_prompt(
+        &host_id,
+        &agent_id,
+        &prompt,
+        display_prompt,
+        badges.unwrap_or_default(),
+        queue_id,
+    )
+}
+
+#[tauri::command]
+fn remove_queued_prompt(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    queue_id: String,
+) {
+    state.core.remove_queued_prompt(&host_id, &agent_id, &queue_id);
+}
+
+#[tauri::command]
+fn flush_queued_prompt_now(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    queue_id: String,
+) {
+    state
+        .core
+        .flush_queued_prompt_now(&host_id, &agent_id, &queue_id);
+}
+
+#[tauri::command]
+fn reorder_queued_prompts(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    queue_ids: Vec<String>,
+) {
+    state
+        .core
+        .reorder_queued_prompts(&host_id, &agent_id, queue_ids);
 }
 
 #[tauri::command]
@@ -1657,6 +1711,34 @@ async fn perform_app_self_update(
     perform_one_click_update(release, on_progress).await
 }
 
+#[tauri::command]
+async fn sync_local_daemon(
+    state: State<'_, DesktopAppState>,
+    host_id: Option<String>,
+    force: Option<bool>,
+) -> Result<LocalDaemonSyncResult, String> {
+    let result = run_sync_local_daemon(force.unwrap_or(false)).await?;
+    if result.status != "skipped_dev"
+        && let Some(hid) = host_id
+    {
+        state.core.connect_host_async(hid.clone());
+        state.core.refresh_host(&hid);
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn upgrade_host_daemon_over_wire(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    target_version: Option<String>,
+) -> Result<String, String> {
+    state
+        .core
+        .upgrade_host_daemon_over_wire(&host_id, target_version)
+        .await
+}
+
 fn init_desktop_file_logging() {
     let log_path = resolve_user_home()
         .map(|home| home.join(".orbit").join("logs").join("desktop.log"))
@@ -1695,7 +1777,7 @@ pub fn run() {
     let core = OrbitAppCore::open(&db_path, true)
         .or_else(|err| {
             tracing::error!(error = %err, "Failed to open desktop replica SQLite; falling back to in-memory store");
-            OrbitAppCore::open_in_memory()
+            OrbitAppCore::open_in_memory_with_discovery(true)
         })
         .expect("failed to initialize OrbitAppCore");
     core.connect_all_hosts();
@@ -1748,6 +1830,10 @@ pub fn run() {
             create_agent,
             open_agent_timeline,
             send_prompt,
+            enqueue_prompt,
+            remove_queued_prompt,
+            flush_queued_prompt_now,
+            reorder_queued_prompts,
             interrupt_agent,
             set_session_mode,
             set_agent_config,
@@ -1826,6 +1912,8 @@ pub fn run() {
             get_app_version,
             check_app_update,
             perform_app_self_update,
+            sync_local_daemon,
+            upgrade_host_daemon_over_wire,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Orbit Tauri desktop application");

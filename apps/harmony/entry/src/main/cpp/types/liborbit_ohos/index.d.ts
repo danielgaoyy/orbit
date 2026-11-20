@@ -102,6 +102,17 @@ export class OrbitHarmonyCore {
     displayPrompt?: string | null,
     badgesJson?: string | null
   ): void;
+  enqueuePrompt(
+    hostId: string,
+    agentId: string,
+    prompt: string,
+    displayPrompt?: string | null,
+    badgesJson?: string | null,
+    queueId?: string | null
+  ): string;
+  removeQueuedPrompt(hostId: string, agentId: string, queueId: string): void;
+  flushQueuedPromptNow(hostId: string, agentId: string, queueId: string): void;
+  reorderQueuedPrompts(hostId: string, agentId: string, queueIdsJson: string): void;
   interruptAgent(hostId: string, agentId: string): void;
   setSessionMode(hostId: string, agentId: string, mode: string): void;
   setAgentConfig(

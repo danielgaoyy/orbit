@@ -39,6 +39,15 @@ pub struct AppUpdateProgress {
     pub done: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalDaemonSyncResult {
+    /// "updated" | "restarted" | "skipped_dev"
+    pub status: String,
+    pub daemon_version: Option<String>,
+    /// "bundled" | "github" | "existing" | "dev"
+    pub source: String,
+}
+
 pub fn compare_semver(a: &str, b: &str) -> Ordering {
     fn parse_parts(v: &str) -> [u32; 3] {
         let clean = v
@@ -524,6 +533,18 @@ async fn update_macos_dmg_and_relaunch(
             ditto {sq_src_app} \"$DEST\"
           fi
           xattr -cr \"$DEST\" 2>/dev/null || true
+          if [ -x \"$DEST/Contents/MacOS/orbit\" ] && [ -d \"$HOME/.orbit\" ]; then
+            PLIST=\"$HOME/Library/LaunchAgents/dev.orbit.daemon.plist\"
+            if [ ! -f \"$PLIST\" ] || ! grep -q '/target/debug/' \"$PLIST\" 2>/dev/null; then
+              mkdir -p \"$HOME/.local/bin\"
+              TMP_ORBIT=\"$HOME/.local/bin/orbit.new.$$\"
+              if cp -f \"$DEST/Contents/MacOS/orbit\" \"$TMP_ORBIT\" && chmod 755 \"$TMP_ORBIT\" && mv -f \"$TMP_ORBIT\" \"$HOME/.local/bin/orbit\"; then
+                \"$HOME/.local/bin/orbit\" daemon up >/dev/null 2>&1 || true
+              else
+                rm -f \"$TMP_ORBIT\"
+              fi
+            fi
+          fi
           hdiutil detach {sq_mount} -quiet 2>/dev/null || hdiutil detach {sq_mount} -force -quiet 2>/dev/null || true
           rm -f {sq_dmg}
           open \"$DEST\"
@@ -619,6 +640,18 @@ async fn update_linux_deb_and_relaunch(
             cp -f {sq_extracted} \"$TMP_DEST\" && chmod 755 \"$TMP_DEST\" && mv -f \"$TMP_DEST\" \"$DEST\"
             LAUNCH_TARGET=\"$DEST\"
           fi
+          if [ -x {sq_stage}/usr/bin/orbit ] && [ -d \"$HOME/.orbit\" ]; then
+            UNIT=\"$HOME/.config/systemd/user/orbit-daemon.service\"
+            if [ ! -f \"$UNIT\" ] || ! grep -q '/target/debug/' \"$UNIT\" 2>/dev/null; then
+              mkdir -p \"$HOME/.local/bin\"
+              TMP_ORBIT=\"$HOME/.local/bin/orbit.new.$$\"
+              if cp -f {sq_stage}/usr/bin/orbit \"$TMP_ORBIT\" && chmod 755 \"$TMP_ORBIT\" && mv -f \"$TMP_ORBIT\" \"$HOME/.local/bin/orbit\"; then
+                \"$HOME/.local/bin/orbit\" daemon up >/dev/null 2>&1 || true
+              else
+                rm -f \"$TMP_ORBIT\"
+              fi
+            fi
+          fi
           rm -rf {sq_stage} {sq_deb}
           nohup \"$LAUNCH_TARGET\" >/dev/null 2>&1 &
         ) >/dev/null 2>&1 &"
@@ -629,9 +662,305 @@ async fn update_linux_deb_and_relaunch(
     std::process::exit(0);
 }
 
+fn parse_orbit_cli_version(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("orbit ") {
+            let token = rest.split_whitespace().next().unwrap_or("").trim();
+            if !token.is_empty() {
+                return Some(token.trim_start_matches(['v', 'V']).to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn probe_orbit_binary_version(bin: &Path) -> Option<String> {
+    if !bin.is_file() {
+        return None;
+    }
+    let out = tokio::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_orbit_cli_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn is_dev_daemon_configured() -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    let supervisor_files = [
+        home.join("Library/LaunchAgents/dev.orbit.daemon.plist"),
+        home.join(".config/systemd/user/orbit-daemon.service"),
+    ];
+    for file in supervisor_files {
+        if let Ok(content) = std::fs::read_to_string(&file)
+            && content.contains("/target/debug/")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn bundled_orbit_sidecar_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidate = dir.join("orbit");
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    None
+}
+
+fn orbit_cli_release_asset_name() -> Result<&'static str, String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("orbit-cli-macos-arm64"),
+        ("linux", "x86_64") => Ok("orbit-cli-linux-x64"),
+        ("linux", "aarch64") => Ok("orbit-cli-linux-arm64"),
+        (os, arch) => Err(format!("Unsupported platform for local daemon sync: {os}/{arch}")),
+    }
+}
+
+static LOCAL_DAEMON_SYNC_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+static LOCAL_DAEMON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_unique_temp_suffix() -> String {
+    let seq = LOCAL_DAEMON_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}.{seq}", std::process::id())
+}
+
+fn atomic_install_executable(src: &Path, dst: &Path) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
+    let tmp = dst.with_extension(format!("new.{}", next_unique_temp_suffix()));
+    if let Err(e) = std::fs::copy(src, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to stage {}: {e}", tmp.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Failed to chmod {}: {e}", tmp.display()));
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to replace {}: {e}", dst.display()));
+    }
+    Ok(())
+}
+
+async fn download_orbit_cli_binary(dst_tmp: &Path) -> Result<(), String> {
+    let asset = orbit_cli_release_asset_name()?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(90))
+        .user_agent(format!("Orbit-Desktop/{CURRENT_APP_VERSION}"))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    let candidates = [
+        format!(
+            "https://github.com/{GITHUB_REPO}/releases/download/v{CURRENT_APP_VERSION}/{asset}"
+        ),
+        format!("https://github.com/{GITHUB_REPO}/releases/latest/download/{asset}"),
+    ];
+
+    let mut last_err = String::from("Failed to download Orbit daemon binary");
+    for url in candidates {
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let mut file = tokio::fs::File::create(dst_tmp)
+                    .await
+                    .map_err(|e| format!("Failed to create temp binary: {e}"))?;
+                let mut stream = resp.bytes_stream();
+                let mut write_failed: Option<String> = None;
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if let Err(e) = file.write_all(&bytes).await {
+                                write_failed = Some(format!("Failed to write binary: {e}"));
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            write_failed = Some(format!("Download interrupted: {e}"));
+                            break;
+                        }
+                    }
+                }
+                if let Some(err) = write_failed {
+                    let _ = tokio::fs::remove_file(dst_tmp).await;
+                    last_err = err;
+                    continue;
+                }
+                if let Err(e) = file.flush().await {
+                    let _ = tokio::fs::remove_file(dst_tmp).await;
+                    return Err(format!("Failed to flush binary: {e}"));
+                }
+                drop(file);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) =
+                        std::fs::set_permissions(dst_tmp, std::fs::Permissions::from_mode(0o755))
+                    {
+                        let _ = std::fs::remove_file(dst_tmp);
+                        return Err(format!("Failed to chmod downloaded binary: {e}"));
+                    }
+                }
+                return Ok(());
+            }
+            Ok(resp) => {
+                last_err = format!("HTTP {} fetching {url}", resp.status());
+            }
+            Err(e) => {
+                last_err = format!("Network error fetching {url}: {e}");
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// Silently synchronize & hot-restart the local `orbit daemon` to match Desktop's version.
+///
+/// - Preserves all running `orbit shim` agent & PTY sessions uninterrupted.
+/// - Prefers the bundled `orbit` sidecar inside `Orbit.app/Contents/MacOS/orbit` (0ms network, offline-capable).
+/// - Falls back to downloading the matching release binary if no sidecar is bundled.
+/// - Skips automatic overwrite in dev builds (`debug_assertions` or `/target/debug/` LaunchAgent) unless `force` is true.
+pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, String> {
+    if !force && (cfg!(debug_assertions) || is_dev_daemon_configured()) {
+        return Ok(LocalDaemonSyncResult {
+            status: "skipped_dev".to_string(),
+            daemon_version: None,
+            source: "dev".to_string(),
+        });
+    }
+
+    let _sync_guard = LOCAL_DAEMON_SYNC_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "Unable to resolve HOME directory".to_string())?;
+    let install_dir = home.join(".local/bin");
+    let install_path = install_dir.join("orbit");
+
+    let mut source = "existing";
+    let mut installed_version = probe_orbit_binary_version(&install_path).await;
+
+    // 1. Prefer bundled sidecar if it matches or is newer than what is currently installed
+    // (never silently downgrade a newer CLI binary already present on disk).
+    if let Some(sidecar) = bundled_orbit_sidecar_path()
+        && let Some(sidecar_ver) = probe_orbit_binary_version(&sidecar).await
+    {
+        let should_copy = installed_version
+            .as_deref()
+            .map(|cur| {
+                let ord = compare_semver(&sidecar_ver, cur);
+                ord == Ordering::Greater || (force && ord == Ordering::Equal)
+            })
+            .unwrap_or(true);
+        if should_copy {
+            atomic_install_executable(&sidecar, &install_path)?;
+            installed_version = Some(sidecar_ver);
+            source = "bundled";
+        }
+    }
+
+    // 2. Fallback to GitHub Release download if installed CLI is missing or older than Desktop
+    let still_outdated = installed_version
+        .as_deref()
+        .map(|cur| compare_semver(cur, CURRENT_APP_VERSION) == Ordering::Less)
+        .unwrap_or(true);
+    if still_outdated {
+        std::fs::create_dir_all(&install_dir)
+            .map_err(|e| format!("Failed to create {}: {e}", install_dir.display()))?;
+        let tmp_dl = install_dir.join(format!("orbit.dl.{}", next_unique_temp_suffix()));
+        let dl_res = download_orbit_cli_binary(&tmp_dl).await;
+        if let Err(err) = dl_res {
+            let _ = std::fs::remove_file(&tmp_dl);
+            // If force-restarting an existing binary and offline, still allow restarting existing binary
+            if force && installed_version.is_some() {
+                tracing::warn!(error = %err, "Offline fallback: restarting existing local orbit binary");
+            } else {
+                return Err(err);
+            }
+        } else {
+            let verified_ver = probe_orbit_binary_version(&tmp_dl).await;
+            if verified_ver.is_none() {
+                let _ = std::fs::remove_file(&tmp_dl);
+                return Err("Downloaded orbit binary failed self-check (--version)".to_string());
+            }
+            if let Err(e) = std::fs::rename(&tmp_dl, &install_path) {
+                let _ = std::fs::remove_file(&tmp_dl);
+                return Err(format!("Failed to install {}: {e}", install_path.display()));
+            }
+            installed_version = verified_ver;
+            source = "github";
+        }
+    }
+
+    if !install_path.is_file() {
+        return Err("Local orbit binary is not installed".to_string());
+    }
+
+    // 3. Hot-restart local daemon cleanly (all `orbit shim` sessions survive uninterrupted)
+    let out = tokio::process::Command::new(&install_path)
+        .args(["daemon", "up"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run `orbit daemon up`: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(if detail.is_empty() {
+            format!("`orbit daemon up` exited with {}", out.status)
+        } else {
+            detail
+        });
+    }
+
+    Ok(LocalDaemonSyncResult {
+        status: if source == "existing" {
+            "restarted".to_string()
+        } else {
+            "updated".to_string()
+        },
+        daemon_version: installed_version,
+        source: source.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_orbit_cli_version_extracts_semver() {
+        assert_eq!(
+            parse_orbit_cli_version("orbit 0.5.5\n").as_deref(),
+            Some("0.5.5")
+        );
+        assert_eq!(
+            parse_orbit_cli_version("orbit v0.6.0 (abc123)\n").as_deref(),
+            Some("0.6.0")
+        );
+        assert_eq!(parse_orbit_cli_version("unknown output"), None);
+    }
 
     #[test]
     fn semver_comparison_handles_v_prefix_and_prerelease() {

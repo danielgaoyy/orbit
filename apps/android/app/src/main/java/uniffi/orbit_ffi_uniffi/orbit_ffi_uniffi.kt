@@ -777,6 +777,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_dismiss_cluster_suggestion(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_enqueue_prompt(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fallback_provider_catalogs(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_git_diff(
@@ -790,6 +792,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fleet_sidebar(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fleet_sidebar_request(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_flush_queued_prompt_now(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_review(
     ): Int
@@ -837,9 +841,13 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_project(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_queued_prompt(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_projects(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_queued_prompts(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal(
     ): Int
@@ -896,6 +904,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config_request(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_relay(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upgrade_host_daemon_over_wire(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upsert_project(
     ): Int
@@ -991,6 +1001,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_dismiss_cluster_suggestion(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_enqueue_prompt(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`prompt`: RustBuffer.ByValue,`displayPrompt`: RustBuffer.ByValue,`badges`: RustBuffer.ByValue,`queueId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fallback_provider_catalogs(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_git_diff(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`staged`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -1005,6 +1017,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fleet_sidebar_request(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_flush_queued_prompt_now(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`queueId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_git_review(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_host_detail(`ptr`: Long,`hostId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1051,10 +1065,14 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_remove_project(`ptr`: Long,`projectId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_remove_queued_prompt(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`queueId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_render_diagram(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_projects(`ptr`: Long,`orderedKeys`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_queued_prompts(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`queueIds`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_resize_terminal(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cols`: Short,`rows`: Short,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_resize_terminal_slot(`ptr`: Long,`hostId`: RustBuffer.ByValue,`slot`: Byte,`cols`: Short,`rows`: Short,uniffi_out_err: UniffiRustCallStatus, 
@@ -1111,6 +1129,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_host_relay(`ptr`: Long,`hostId`: RustBuffer.ByValue,`relayUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_upgrade_host_daemon_over_wire(`ptr`: Long,`hostId`: RustBuffer.ByValue,`targetVersion`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_upsert_project(`ptr`: Long,`projectId`: RustBuffer.ByValue,`hostId`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`directories`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_workspace_files(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1343,6 +1363,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_dismiss_cluster_suggestion() and 0xFFFF) != 28765) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_enqueue_prompt() and 0xFFFF) != 38455) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fallback_provider_catalogs() and 0xFFFF) != 44914) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1362,6 +1385,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fleet_sidebar_request() and 0xFFFF) != 966) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_flush_queued_prompt_now() and 0xFFFF) != 60554) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_review() and 0xFFFF) != 29779) {
@@ -1433,10 +1459,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_project() and 0xFFFF) != 26180) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_queued_prompt() and 0xFFFF) != 22264) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram() and 0xFFFF) != 2210) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_projects() and 0xFFFF) != 42270) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_queued_prompts() and 0xFFFF) != 39769) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal() and 0xFFFF) != 57060) {
@@ -1521,6 +1553,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_relay() and 0xFFFF) != 50634) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upgrade_host_daemon_over_wire() and 0xFFFF) != 62597) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upsert_project() and 0xFFFF) != 43684) {
@@ -2471,6 +2506,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `dismissClusterSuggestion`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
+    fun `enqueuePrompt`(`hostId`: kotlin.String, `agentId`: kotlin.String, `prompt`: kotlin.String, `displayPrompt`: kotlin.String?, `badges`: List<FfiPromptBadge>, `queueId`: kotlin.String?): kotlin.String
+    
     fun `fallbackProviderCatalogs`(): List<FfiProviderModelCatalog>
     
     fun `fetchGitDiff`(`hostId`: kotlin.String, `cwd`: kotlin.String, `path`: kotlin.String?, `staged`: kotlin.Boolean)
@@ -2484,6 +2521,8 @@ public interface OrbitMobileCoreInterface {
     fun `fleetSidebar`(`sort`: FfiSidebarProjectSort, `filter`: FfiSidebarThreadFilter, `query`: kotlin.String, `activeHostId`: kotlin.String?, `activeAgentId`: kotlin.String?, `activeCwd`: kotlin.String?): FfiFleetSidebar
     
     fun `fleetSidebarRequest`(`req`: FfiFleetSidebarRequest): FfiFleetSidebar
+    
+    fun `flushQueuedPromptNow`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueId`: kotlin.String)
     
     fun `gitReview`(`hostId`: kotlin.String, `cwd`: kotlin.String, `path`: kotlin.String?): FfiGitReview
     
@@ -2531,9 +2570,13 @@ public interface OrbitMobileCoreInterface {
     
     fun `removeProject`(`projectId`: kotlin.String)
     
+    fun `removeQueuedPrompt`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueId`: kotlin.String)
+    
     fun `renderDiagram`(`req`: FfiRenderDiagramRequest): FfiRenderDiagramView
     
     fun `reorderProjects`(`orderedKeys`: List<kotlin.String>): List<kotlin.String>
+    
+    fun `reorderQueuedPrompts`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueIds`: List<kotlin.String>)
     
     fun `resizeTerminal`(`hostId`: kotlin.String, `cols`: kotlin.UShort, `rows`: kotlin.UShort)
     
@@ -2590,6 +2633,8 @@ public interface OrbitMobileCoreInterface {
     fun `updateHostConfigRequest`(`req`: FfiUpdateHostConfigRequest): FfiHostCard
     
     fun `updateHostRelay`(`hostId`: kotlin.String, `relayUrl`: kotlin.String?)
+    
+    fun `upgradeHostDaemonOverWire`(`hostId`: kotlin.String, `targetVersion`: kotlin.String?): kotlin.String
     
     fun `upsertProject`(`projectId`: kotlin.String?, `hostId`: kotlin.String, `name`: kotlin.String, `directories`: List<kotlin.String>): FfiClientProject
     
@@ -3019,6 +3064,25 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `enqueuePrompt`(`hostId`: kotlin.String, `agentId`: kotlin.String, `prompt`: kotlin.String, `displayPrompt`: kotlin.String?, `badges`: List<FfiPromptBadge>, `queueId`: kotlin.String?): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_enqueue_prompt(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterString.lower(`prompt`),
+        FfiConverterOptionalString.lower(`displayPrompt`),
+        FfiConverterSequenceTypeFfiPromptBadge.lower(`badges`),
+        FfiConverterOptionalString.lower(`queueId`),_status)
+}
+    }
+    )
+    }
+    
+
     override fun `fallbackProviderCatalogs`(): List<FfiProviderModelCatalog> {
             return FfiConverterSequenceTypeFfiProviderModelCatalog.lift(
     callWithHandle {
@@ -3120,6 +3184,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     )
     }
+    
+
+    override fun `flushQueuedPromptNow`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_flush_queued_prompt_now(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterString.lower(`queueId`),_status)
+}
+    }
+    
     
 
     override fun `gitReview`(`hostId`: kotlin.String, `cwd`: kotlin.String, `path`: kotlin.String?): FfiGitReview {
@@ -3445,6 +3524,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `removeQueuedPrompt`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_remove_queued_prompt(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterString.lower(`queueId`),_status)
+}
+    }
+    
+    
+
     override fun `renderDiagram`(`req`: FfiRenderDiagramRequest): FfiRenderDiagramView {
             return FfiConverterTypeFfiRenderDiagramView.lift(
     callWithHandle {
@@ -3472,6 +3566,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     )
     }
+    
+
+    override fun `reorderQueuedPrompts`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueIds`: List<kotlin.String>)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_queued_prompts(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterSequenceString.lower(`queueIds`),_status)
+}
+    }
+    
     
 
     override fun `resizeTerminal`(`hostId`: kotlin.String, `cols`: kotlin.UShort, `rows`: kotlin.UShort)
@@ -3903,6 +4012,22 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
 }
     }
     
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `upgradeHostDaemonOverWire`(`hostId`: kotlin.String, `targetVersion`: kotlin.String?): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_upgrade_host_daemon_over_wire(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterOptionalString.lower(`targetVersion`),_status)
+}
+    }
+    )
+    }
     
 
     
@@ -4349,6 +4474,8 @@ data class FfiAgentCard (
     , 
     var `isRunning`: kotlin.Boolean
     , 
+    var `hasBackgroundTasks`: kotlin.Boolean
+    , 
     var `isAwaitingPermission`: kotlin.Boolean
     , 
     var `parentAgentId`: kotlin.String?
@@ -4362,6 +4489,8 @@ data class FfiAgentCard (
     var `seenSeq`: kotlin.ULong
     , 
     var `isUnread`: kotlin.Boolean
+    , 
+    var `queuedPrompts`: List<FfiQueuedPrompt>
     
 ){
     
@@ -4390,12 +4519,14 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterSequenceTypeFfiQueuedPrompt.read(buf),
         )
     }
 
@@ -4411,13 +4542,15 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterTypeFfiSessionMode.allocationSize(value.`mode`) +
             FfiConverterString.allocationSize(value.`statusLabel`) +
             FfiConverterBoolean.allocationSize(value.`isRunning`) +
+            FfiConverterBoolean.allocationSize(value.`hasBackgroundTasks`) +
             FfiConverterBoolean.allocationSize(value.`isAwaitingPermission`) +
             FfiConverterOptionalString.allocationSize(value.`parentAgentId`) +
             FfiConverterULong.allocationSize(value.`latestSeq`) +
             FfiConverterString.allocationSize(value.`updatedAtRfc3339`) +
             FfiConverterBoolean.allocationSize(value.`isPinned`) +
             FfiConverterULong.allocationSize(value.`seenSeq`) +
-            FfiConverterBoolean.allocationSize(value.`isUnread`)
+            FfiConverterBoolean.allocationSize(value.`isUnread`) +
+            FfiConverterSequenceTypeFfiQueuedPrompt.allocationSize(value.`queuedPrompts`)
     )
 
     override fun write(value: FfiAgentCard, buf: ByteBuffer) {
@@ -4432,6 +4565,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterTypeFfiSessionMode.write(value.`mode`, buf)
             FfiConverterString.write(value.`statusLabel`, buf)
             FfiConverterBoolean.write(value.`isRunning`, buf)
+            FfiConverterBoolean.write(value.`hasBackgroundTasks`, buf)
             FfiConverterBoolean.write(value.`isAwaitingPermission`, buf)
             FfiConverterOptionalString.write(value.`parentAgentId`, buf)
             FfiConverterULong.write(value.`latestSeq`, buf)
@@ -4439,6 +4573,7 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterBoolean.write(value.`isPinned`, buf)
             FfiConverterULong.write(value.`seenSeq`, buf)
             FfiConverterBoolean.write(value.`isUnread`, buf)
+            FfiConverterSequenceTypeFfiQueuedPrompt.write(value.`queuedPrompts`, buf)
     }
 }
 
@@ -5862,6 +5997,10 @@ data class FfiHostCard (
     , 
     var `daemonVersion`: kotlin.String?
     , 
+    var `daemonProtocolVersion`: kotlin.UInt?
+    , 
+    var `clientProtocolVersion`: kotlin.UInt
+    , 
     var `osArch`: kotlin.String?
     , 
     var `daemonPubkeyB64`: kotlin.String
@@ -5881,6 +6020,8 @@ data class FfiHostCard (
     var `agentCount`: kotlin.UInt
     , 
     var `pendingApprovalCount`: kotlin.UInt
+    , 
+    var `supportsServerQueue`: kotlin.Boolean
     
 ){
     
@@ -5908,6 +6049,8 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalUInt.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+            FfiConverterUInt.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterSequenceString.read(buf),
@@ -5918,6 +6061,7 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -5933,6 +6077,8 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterBoolean.allocationSize(value.`viaSshTunnel`) +
             FfiConverterOptionalUInt.allocationSize(value.`lastPingMs`) +
             FfiConverterOptionalString.allocationSize(value.`daemonVersion`) +
+            FfiConverterOptionalUInt.allocationSize(value.`daemonProtocolVersion`) +
+            FfiConverterUInt.allocationSize(value.`clientProtocolVersion`) +
             FfiConverterOptionalString.allocationSize(value.`osArch`) +
             FfiConverterString.allocationSize(value.`daemonPubkeyB64`) +
             FfiConverterSequenceString.allocationSize(value.`directEndpoints`) +
@@ -5942,7 +6088,8 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterSequenceTypeFfiProviderKind.allocationSize(value.`availableProviders`) +
             FfiConverterUInt.allocationSize(value.`workspaceCount`) +
             FfiConverterUInt.allocationSize(value.`agentCount`) +
-            FfiConverterUInt.allocationSize(value.`pendingApprovalCount`)
+            FfiConverterUInt.allocationSize(value.`pendingApprovalCount`) +
+            FfiConverterBoolean.allocationSize(value.`supportsServerQueue`)
     )
 
     override fun write(value: FfiHostCard, buf: ByteBuffer) {
@@ -5957,6 +6104,8 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterBoolean.write(value.`viaSshTunnel`, buf)
             FfiConverterOptionalUInt.write(value.`lastPingMs`, buf)
             FfiConverterOptionalString.write(value.`daemonVersion`, buf)
+            FfiConverterOptionalUInt.write(value.`daemonProtocolVersion`, buf)
+            FfiConverterUInt.write(value.`clientProtocolVersion`, buf)
             FfiConverterOptionalString.write(value.`osArch`, buf)
             FfiConverterString.write(value.`daemonPubkeyB64`, buf)
             FfiConverterSequenceString.write(value.`directEndpoints`, buf)
@@ -5967,6 +6116,7 @@ public object FfiConverterTypeFfiHostCard: FfiConverterRustBuffer<FfiHostCard> {
             FfiConverterUInt.write(value.`workspaceCount`, buf)
             FfiConverterUInt.write(value.`agentCount`, buf)
             FfiConverterUInt.write(value.`pendingApprovalCount`, buf)
+            FfiConverterBoolean.write(value.`supportsServerQueue`, buf)
     }
 }
 
@@ -6595,6 +6745,54 @@ public object FfiConverterTypeFfiQuestionItem: FfiConverterRustBuffer<FfiQuestio
             FfiConverterString.write(value.`question`, buf)
             FfiConverterSequenceString.write(value.`options`, buf)
             FfiConverterBoolean.write(value.`isMultiSelect`, buf)
+    }
+}
+
+
+
+data class FfiQueuedPrompt (
+    var `queueId`: kotlin.String
+    , 
+    var `displayText`: kotlin.String
+    , 
+    var `badges`: List<FfiPromptBadge>
+    , 
+    var `createdAtRfc3339`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiQueuedPrompt: FfiConverterRustBuffer<FfiQueuedPrompt> {
+    override fun read(buf: ByteBuffer): FfiQueuedPrompt {
+        return FfiQueuedPrompt(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterSequenceTypeFfiPromptBadge.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiQueuedPrompt) = (
+            FfiConverterString.allocationSize(value.`queueId`) +
+            FfiConverterString.allocationSize(value.`displayText`) +
+            FfiConverterSequenceTypeFfiPromptBadge.allocationSize(value.`badges`) +
+            FfiConverterString.allocationSize(value.`createdAtRfc3339`)
+    )
+
+    override fun write(value: FfiQueuedPrompt, buf: ByteBuffer) {
+            FfiConverterString.write(value.`queueId`, buf)
+            FfiConverterString.write(value.`displayText`, buf)
+            FfiConverterSequenceTypeFfiPromptBadge.write(value.`badges`, buf)
+            FfiConverterString.write(value.`createdAtRfc3339`, buf)
     }
 }
 
@@ -12054,6 +12252,34 @@ public object FfiConverterSequenceTypeFfiQuestionItem: FfiConverterRustBuffer<Li
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFfiQuestionItem.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiQueuedPrompt: FfiConverterRustBuffer<List<FfiQueuedPrompt>> {
+    override fun read(buf: ByteBuffer): List<FfiQueuedPrompt> {
+        val len = buf.getInt()
+        return List<FfiQueuedPrompt>(len) {
+            FfiConverterTypeFfiQueuedPrompt.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiQueuedPrompt>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiQueuedPrompt.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiQueuedPrompt>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiQueuedPrompt.write(it, buf)
         }
     }
 }

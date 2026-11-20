@@ -22,6 +22,8 @@ import {
   type AgentCardView,
   type HostCardView,
   type SidebarProjectGroupView,
+  isAgentBackgroundWaiting,
+  isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
@@ -166,7 +168,7 @@ export function SharedConversationMenu({
         </DropdownMenuItem>
 
         <DropdownMenuItem
-          disabled={agent.is_running}
+          disabled={isAgentForegroundRunning(agent)}
           onSelect={() => {
             if (isUnread) {
               orbitActions.markThreadRead(host.host_id, agent.agent_id);
@@ -472,7 +474,11 @@ export function DeleteProjectDialog({
         archivedCount += 1;
       } else {
         activeCount += 1;
-        if (agent.is_running || agent.is_awaiting_permission) {
+        if (
+          isAgentForegroundRunning(agent) ||
+          isAgentBackgroundWaiting(agent) ||
+          agent.is_awaiting_permission
+        ) {
           runningCount += 1;
         }
       }

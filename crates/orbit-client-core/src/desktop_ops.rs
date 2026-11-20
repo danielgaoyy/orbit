@@ -1577,7 +1577,29 @@ pub fn read_local_workspace_file(
         .map(PathBuf::from)
         .or_else(|| resolve_user_home().map(|h| h.join(".orbit")));
 
-    let attachment_direct = (|| -> Option<PathBuf> {
+    let mut managed_artifact_roots: Vec<PathBuf> = Vec::new();
+    if let Some(oh) = orbit_home_dir.as_ref() {
+        managed_artifact_roots.push(oh.join("attachments"));
+    }
+    if let Some(h) = resolve_user_home() {
+        managed_artifact_roots.push(h.join(".gemini").join("antigravity-cli").join("brain"));
+        managed_artifact_roots.push(h.join(".claude").join("projects"));
+    }
+    managed_artifact_roots.push(std::env::temp_dir().join("claude"));
+    let tmp_claude = PathBuf::from("/tmp/claude");
+    if !managed_artifact_roots.contains(&tmp_claude) {
+        managed_artifact_roots.push(tmp_claude);
+    }
+
+    let is_in_managed_root = |canon: &Path| -> bool {
+        managed_artifact_roots.iter().any(|root| {
+            fs::canonicalize(root)
+                .ok()
+                .is_some_and(|canon_root| canon.starts_with(&canon_root))
+        })
+    };
+
+    let artifact_direct = (|| -> Option<PathBuf> {
         let cand = if let Some(rest) = trimmed.strip_prefix("~/") {
             resolve_user_home()?.join(rest)
         } else {
@@ -1587,13 +1609,11 @@ pub fn read_local_workspace_file(
             }
             p.to_path_buf()
         };
-        let home = orbit_home_dir.as_ref()?;
-        let canon_att = fs::canonicalize(home.join("attachments")).ok()?;
         let canon_cand = fs::canonicalize(&cand).ok()?;
-        canon_cand.starts_with(&canon_att).then_some(canon_cand)
+        is_in_managed_root(&canon_cand).then_some(canon_cand)
     })();
 
-    let canonical = if let Some(att_path) = attachment_direct {
+    let canonical = if let Some(att_path) = artifact_direct {
         att_path
     } else {
         let resolved_cwd = if cwd.trim().is_empty() || cwd.trim() == "~" {
@@ -1628,14 +1648,7 @@ pub fn read_local_workspace_file(
 
         let canon =
             fs::canonicalize(&candidate).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
-        let mut allowed = canon.starts_with(&canonical_cwd);
-        if !allowed
-            && let Some(home) = orbit_home_dir.as_ref()
-            && let Ok(canon_att) = fs::canonicalize(home.join("attachments"))
-            && canon.starts_with(&canon_att)
-        {
-            allowed = true;
-        }
+        let allowed = canon.starts_with(&canonical_cwd) || is_in_managed_root(&canon);
         if !allowed {
             return Err(format!(
                 "Access denied: `{trimmed}` is outside the workspace directory"

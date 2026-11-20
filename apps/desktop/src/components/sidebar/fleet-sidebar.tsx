@@ -12,7 +12,6 @@ import {
   GripVertical,
   Layers,
   ListFilter,
-  Loader2,
   MoreHorizontal,
   Plus,
   RefreshCw,
@@ -26,6 +25,7 @@ import {
   type HostCardView,
   type SidebarConversationView,
   type SidebarProjectGroupView,
+  isAgentForegroundRunning,
   isMacDesktop,
   orbitIpc,
 } from "@/lib/orbit-ipc";
@@ -35,6 +35,7 @@ import {
   projectPathScopeKey,
 } from "@/lib/projects";
 import { SidebarConversationRow } from "@/components/sidebar/sidebar-conversation-row";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import {
   type ActiveConversationMenuState,
   type ActiveProjectMenuState,
@@ -87,6 +88,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const sidebarProjectSort = useOrbitSelector((s) => s.sidebarProjectSort);
   const sidebarThreadFilter = useOrbitSelector((s) => s.sidebarThreadFilter);
   const hiddenProjectKeys = useOrbitSelector((s) => s.hiddenProjectKeys);
+  const fleetHydrated = useOrbitSelector((s) => s.fleetHydrated);
 
   const [expandedMoreProjects, setExpandedMoreProjects] = useState<Record<string, boolean>>({});
   const [renamingThreadKey, setRenamingThreadKey] = useState<string | null>(null);
@@ -167,7 +169,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
         !isDraftNewSession &&
         selectedHostId === conv.host_id &&
         selectedAgentId === conv.agent.agent_id;
-      if (isSelected || conv.agent.is_running) return false;
+      if (isSelected || isAgentForegroundRunning(conv.agent)) return false;
       if (conv.agent.attention && conv.agent.attention !== "none") return true;
       return conv.is_unread;
     },
@@ -563,7 +565,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
             </div>
           </div>
 
-          {fleet.hosts.length === 0 ? (
+          {!fleetHydrated && fleet.hosts.length === 0 ? null : fleet.hosts.length === 0 ? (
             <div className="text-muted-foreground mx-1 mt-1 space-y-2.5 rounded-xl border border-dashed p-4 text-center text-[13px]">
               <p>No host connected</p>
               <button
@@ -684,7 +686,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 const hasCollapsedRunning =
                   collapsed &&
                   !hasCollapsedApproval &&
-                  visibleConversations.some((c) => c.agent.is_running);
+                  visibleConversations.some((c) => isAgentForegroundRunning(c.agent));
                 const hasCollapsedUnread =
                   collapsed &&
                   !hasCollapsedApproval &&
@@ -802,7 +804,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                             {hasCollapsedApproval ? (
                               <span className="h-[6px] w-[6px] rounded-full bg-amber-500" />
                             ) : hasCollapsedRunning ? (
-                              <Loader2 className="text-muted-foreground h-[12px] w-[12px] animate-spin" />
+                              <OrbitSpinner size={13} className="text-foreground/65" />
                             ) : (
                               <span className="h-[6px] w-[6px] rounded-full bg-sky-500" />
                             )}
@@ -928,8 +930,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                   const wsCollapsed = Boolean(
                                     collapsedWorkspaceIds[ws.workspace_id],
                                   );
-                                  const wsHasRunning = ws.visiblePeers.some(
-                                    (c) => c.agent.is_running,
+                                  const wsHasRunning = ws.visiblePeers.some((c) =>
+                                    isAgentForegroundRunning(c.agent),
                                   );
                                   const wsHasUnread = ws.visiblePeers.some((c) =>
                                     isConvUnread(c),
@@ -961,7 +963,10 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                             <AlertTriangle className="h-[11.5px] w-[11.5px] shrink-0 text-amber-500" />
                                           )}
                                           {!ws.has_conflict && wsHasRunning && (
-                                            <Loader2 className="h-[11px] w-[11px] shrink-0 animate-spin text-sky-500" />
+                                            <OrbitSpinner
+                                              size={11}
+                                              className="shrink-0 text-sky-500"
+                                            />
                                           )}
                                           {!ws.has_conflict &&
                                             !wsHasRunning &&

@@ -145,7 +145,7 @@ jobs:
             APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH \
             APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
 
-          TAURI_EXTRA_ARGS=()
+          TAURI_EXTRA_ARGS=(--config '{"bundle":{"externalBin":["binaries/orbit"]}}')
           if [ "$SIGNING_MODE" = "developer-id" ]; then
             export APPLE_CERTIFICATE="$CERT_B64"
             export APPLE_CERTIFICATE_PASSWORD="$CERT_PASSWORD"
@@ -163,8 +163,14 @@ jobs:
             fi
           else
             export APPLE_SIGNING_IDENTITY="-"
-            TAURI_EXTRA_ARGS=(--config '{"bundle":{"macOS":{"hardenedRuntime":false}}}')
+            TAURI_EXTRA_ARGS=(--config '{"bundle":{"externalBin":["binaries/orbit"],"macOS":{"hardenedRuntime":false}}}')
           fi
+
+          # Bundle matching `orbit` daemon/CLI binary inside Orbit.app for zero-friction local daemon upgrades
+          cargo build --release -p orbit-cli --target aarch64-apple-darwin --manifest-path ../../Cargo.toml
+          mkdir -p src-tauri/binaries
+          cp ../../target/aarch64-apple-darwin/release/orbit src-tauri/binaries/orbit-aarch64-apple-darwin
+          chmod +x src-tauri/binaries/orbit-aarch64-apple-darwin
 
           npm ci
           npx tauri build --target aarch64-apple-darwin --bundles app,dmg "${TAURI_EXTRA_ARGS[@]}"
@@ -249,8 +255,12 @@ jobs:
       - name: Build Tauri v2 Linux .deb Package
         working-directory: apps/desktop
         run: |
+          cargo build --release -p orbit-cli --target ${{ matrix.target }} --manifest-path ../../Cargo.toml
+          mkdir -p src-tauri/binaries
+          cp ../../target/${{ matrix.target }}/release/orbit src-tauri/binaries/orbit-${{ matrix.target }}
+          chmod +x src-tauri/binaries/orbit-${{ matrix.target }}
           npm ci
-          npx tauri build --target ${{ matrix.target }} --bundles deb
+          npx tauri build --target ${{ matrix.target }} --bundles deb --config '{"bundle":{"externalBin":["binaries/orbit"]}}'
           cp src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb "../${{ matrix.artifact }}"
       - uses: actions/upload-artifact@v4
         with:

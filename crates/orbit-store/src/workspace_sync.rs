@@ -859,6 +859,7 @@ mod tests {
             labels: HashMap::new(),
             attention: AttentionState::Finished,
             last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
             read_seq: 0,
             is_pinned: false,
             pinned_order: 0,

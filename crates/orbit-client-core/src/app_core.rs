@@ -19,11 +19,11 @@ use orbit_protocol::{
     HostProjectEntry, HostSyncState, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
     PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, ReasoningEffort, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
-    TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
-    ToolCallStatus, WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceScriptInfo,
-    WorkspaceSummary, WorktreeCreateMode,
+    QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
+    TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
+    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
+    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -130,6 +130,10 @@ pub struct HostCardView {
     pub via_ssh_tunnel: bool,
     pub last_ping_ms: Option<u32>,
     pub daemon_version: Option<String>,
+    #[serde(default)]
+    pub daemon_protocol_version: Option<u32>,
+    #[serde(default)]
+    pub client_protocol_version: u32,
     pub os_arch: Option<String>,
     pub daemon_pubkey_b64: String,
     pub direct_endpoints: Vec<String>,
@@ -140,6 +144,8 @@ pub struct HostCardView {
     pub workspace_count: u32,
     pub agent_count: u32,
     pub pending_approval_count: u32,
+    #[serde(default)]
+    pub supports_server_queue: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +172,8 @@ pub struct AgentCardView {
     pub status: AgentStatus,
     pub status_label: String,
     pub is_running: bool,
+    #[serde(default)]
+    pub has_background_tasks: bool,
     pub is_awaiting_permission: bool,
     pub parent_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +200,8 @@ pub struct AgentCardView {
     pub read_seq: u64,
     #[serde(default)]
     pub is_unread: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<QueuedPromptView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -503,6 +513,8 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
     pending_rewinds:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RewindAgentResultView, String>>>,
+    pending_daemon_upgrades: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), String>>>,
+    pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
@@ -575,6 +587,8 @@ impl HostMemoryState {
             pending_file_reads: HashMap::new(),
             pending_side_questions: HashMap::new(),
             pending_rewinds: HashMap::new(),
+            pending_daemon_upgrades: HashMap::new(),
+            pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -701,6 +715,8 @@ impl HostMemoryState {
             via_ssh_tunnel: self.via_ssh_tunnel,
             last_ping_ms: self.last_ping_ms,
             daemon_version: self.daemon_version.clone(),
+            daemon_protocol_version: self.daemon_protocol_version,
+            client_protocol_version: orbit_protocol::PROTOCOL_VERSION,
             os_arch: self.os_arch.clone(),
             daemon_pubkey_b64: self.profile.daemon_pubkey_b64.clone(),
             direct_endpoints: self.profile.direct_endpoints.clone(),
@@ -711,6 +727,7 @@ impl HostMemoryState {
             workspace_count: active_workspace_count,
             agent_count: active_agent_count,
             pending_approval_count,
+            supports_server_queue: self.daemon_protocol_version.is_some_and(|pv| pv >= 4),
         }
     }
 }
@@ -746,8 +763,14 @@ impl OrbitAppCore {
     }
 
     pub fn open_in_memory() -> Result<Arc<Self>, ClientCoreError> {
+        Self::open_in_memory_with_discovery(false)
+    }
+
+    pub fn open_in_memory_with_discovery(
+        auto_discover_local_daemon: bool,
+    ) -> Result<Arc<Self>, ClientCoreError> {
         let store = Arc::new(OrbitStore::open_in_memory()?);
-        Self::from_store(store, false)
+        Self::from_store(store, auto_discover_local_daemon)
     }
 
     fn from_store(
@@ -3765,19 +3788,27 @@ impl OrbitAppCore {
                     state.terminals = terminals;
                     notify_host = true;
                 }
-                WireMessage::TerminalAttached { terminal, slot, .. } => {
-                    let slot = slot.max(1);
-                    state
-                        .slot_terminal_ids
-                        .insert(slot, terminal.terminal_id.clone());
-                    let _ = state.emulator_slot_mut(slot);
-                    state.active_terminal_id = Some(terminal.terminal_id.clone());
-                    state.active_terminal_slot = slot;
-                    state
-                        .terminals
-                        .retain(|t| t.terminal_id != terminal.terminal_id);
-                    state.terminals.insert(0, terminal);
-                    notify_host = true;
+                WireMessage::TerminalAttached {
+                    request_id,
+                    terminal,
+                    slot,
+                } => {
+                    if let Some(tx) = state.pending_upgrade_terminals.remove(&request_id) {
+                        let _ = tx.send(Ok(terminal.terminal_id));
+                    } else {
+                        let slot = slot.max(1);
+                        state
+                            .slot_terminal_ids
+                            .insert(slot, terminal.terminal_id.clone());
+                        let _ = state.emulator_slot_mut(slot);
+                        state.active_terminal_id = Some(terminal.terminal_id.clone());
+                        state.active_terminal_slot = slot;
+                        state
+                            .terminals
+                            .retain(|t| t.terminal_id != terminal.terminal_id);
+                        state.terminals.insert(0, terminal);
+                        notify_host = true;
+                    }
                 }
                 WireMessage::QuotaReport { snapshots, .. } => {
                     state.quotas = snapshots;
@@ -3789,6 +3820,9 @@ impl OrbitAppCore {
                 }
                 WireMessage::Ack { request_id } => {
                     state.agent_req_by_req_id.remove(&request_id);
+                    if let Some(tx) = state.pending_daemon_upgrades.remove(&request_id) {
+                        let _ = tx.send(Ok(()));
+                    }
                 }
                 WireMessage::AttachmentStaged {
                     request_id,
@@ -3823,6 +3857,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_rewinds.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_daemon_upgrades.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_upgrade_terminals.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -4537,6 +4579,7 @@ impl OrbitAppCore {
                 attention: AttentionState::None,
                 archived_at: None,
                 last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
                 labels: HashMap::new(),
                 latest_seq: 0,
                 read_seq: 0,
@@ -4749,6 +4792,157 @@ impl OrbitAppCore {
                 message_id: None,
                 caller_agent_id: None,
                 notify_on_finish: None,
+            },
+        );
+    }
+
+    pub fn enqueue_prompt(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        prompt: &str,
+        display_prompt: Option<String>,
+        badges: Vec<PromptBadge>,
+        queue_id: Option<String>,
+    ) -> String {
+        let qid = queue_id
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| format!("q_{}", Uuid::new_v4().simple()));
+        let now = Utc::now();
+        let req_id = Uuid::new_v4();
+        let visible_text = display_prompt.clone().unwrap_or_else(|| prompt.to_string());
+
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            if !ag.queued_prompts.iter().any(|q| q.queue_id == qid) {
+                ag.queued_prompts.push(QueuedPromptView {
+                    queue_id: qid.clone(),
+                    display_text: visible_text,
+                    badges: badges.clone(),
+                    created_at: now,
+                });
+            }
+            h.mark_stage_meta_dirty(agent_id);
+        }
+
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::EnqueuePrompt {
+                request_id: req_id,
+                agent_id: agent_id.to_string(),
+                prompt: prompt.to_string(),
+                display_prompt,
+                badges,
+                queue_id: Some(qid.clone()),
+            },
+        );
+        qid
+    }
+
+    pub fn remove_queued_prompt(self: &Arc<Self>, host_id: &str, agent_id: &str, queue_id: &str) {
+        let req_id = Uuid::new_v4();
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.queued_prompts.retain(|q| q.queue_id != queue_id);
+            h.mark_stage_meta_dirty(agent_id);
+        }
+
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::RemoveQueuedPrompt {
+                request_id: req_id,
+                agent_id: agent_id.to_string(),
+                queue_id: queue_id.to_string(),
+            },
+        );
+    }
+
+    pub fn flush_queued_prompt_now(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        queue_id: &str,
+    ) {
+        let req_id = Uuid::new_v4();
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+        {
+            ag.queued_prompts.retain(|q| q.queue_id != queue_id);
+            h.mark_stage_meta_dirty(agent_id);
+        }
+
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::FlushQueuedPromptNow {
+                request_id: req_id,
+                agent_id: agent_id.to_string(),
+                queue_id: queue_id.to_string(),
+            },
+        );
+    }
+
+    pub fn reorder_queued_prompts(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        queue_ids: Vec<String>,
+    ) {
+        let req_id = Uuid::new_v4();
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(host_id)
+            && let Some(ag) = h.agents.get_mut(agent_id)
+            && ag.queued_prompts.len() >= 2
+        {
+            let mut by_id: std::collections::HashMap<String, orbit_protocol::QueuedPromptView> = ag
+                .queued_prompts
+                .drain(..)
+                .map(|q| (q.queue_id.clone(), q))
+                .collect();
+            let mut reordered = Vec::with_capacity(by_id.len());
+            for qid in &queue_ids {
+                if let Some(item) = by_id.remove(qid) {
+                    reordered.push(item);
+                }
+            }
+            // Append any concurrently received items not present in `queue_ids`
+            let mut remaining: Vec<_> = by_id.into_values().collect();
+            remaining.sort_by_key(|q| q.created_at);
+            reordered.extend(remaining);
+            ag.queued_prompts = reordered;
+            h.mark_stage_meta_dirty(agent_id);
+        }
+
+        self.emit(|revision| CoreNotification::HostChanged {
+            revision,
+            host_id: host_id.to_string(),
+        });
+
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ReorderQueuedPrompts {
+                request_id: req_id,
+                agent_id: agent_id.to_string(),
+                queue_ids,
             },
         );
     }
@@ -6511,6 +6705,186 @@ impl OrbitAppCore {
             .map_err(|_| "Rewind task terminated unexpectedly".to_string())?
     }
 
+    /// Upgrade a remote Orbit daemon directly over the existing E2EE WebSocket/Relay channel
+    /// (works even without SSH access!).
+    ///
+    /// - Protocol v4+: sends `WireMessage::UpgradeDaemon` so the remote daemon downloads, verifies,
+    ///   atomically installs, and hot-restarts itself (`orbit shim` keeps all agents alive).
+    /// - Pre-v4 fallback: creates a hidden one-shot remote PTY (`CreateTerminal` + `SendTerminalKeys`)
+    ///   to run `install.sh && orbit daemon up; exit` automatically with zero user copy-pasting.
+    pub async fn upgrade_host_daemon_over_wire(
+        self: &Arc<Self>,
+        host_id: &str,
+        target_version: Option<String>,
+    ) -> Result<String, String> {
+        let (session, daemon_pv) = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            let session = h.session.clone().ok_or_else(|| {
+                format!(
+                    "Host `{}` is currently offline",
+                    h.profile.effective_display_name()
+                )
+            })?;
+            (session, h.daemon_protocol_version.unwrap_or(0))
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+
+        self.runtime.spawn(async move {
+            if daemon_pv >= 4 {
+                let req_id = Uuid::new_v4();
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                {
+                    let Ok(mut guard) = core.hosts.write() else {
+                        let _ = res_tx.send(Err("host state lock poisoned".to_string()));
+                        return;
+                    };
+                    let Some(h) = guard.get_mut(&owned_host_id) else {
+                        let _ = res_tx.send(Err(format!("host `{owned_host_id}` removed")));
+                        return;
+                    };
+                    h.pending_daemon_upgrades.insert(req_id, ack_tx);
+                }
+
+                if let Err(e) = session
+                    .send_wire(WireMessage::UpgradeDaemon {
+                        request_id: req_id,
+                        target_version,
+                    })
+                    .await
+                {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_daemon_upgrades.remove(&req_id);
+                    }
+                    let _ = res_tx.send(Err(format!("Failed to send upgrade request: {e}")));
+                    return;
+                }
+
+                let outcome = match tokio::time::timeout(Duration::from_secs(95), ack_rx).await {
+                    Ok(Ok(Ok(()))) => {
+                        tokio::time::sleep(Duration::from_millis(1800)).await;
+                        core.connect_host_async(owned_host_id.clone());
+                        Ok("Daemon upgraded and restarting".to_string())
+                    }
+                    Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                    // Connection drop right after daemon starts restarting is expected & healthy
+                    Ok(Err(_)) => {
+                        tokio::time::sleep(Duration::from_millis(1800)).await;
+                        core.connect_host_async(owned_host_id.clone());
+                        Ok("Daemon restarting with update".to_string())
+                    }
+                    Err(_) => {
+                        if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&owned_host_id)
+                        {
+                            h.pending_daemon_upgrades.remove(&req_id);
+                        }
+                        Err("Timed out waiting for remote daemon self-upgrade".to_string())
+                    }
+                };
+                let _ = res_tx.send(outcome);
+                return;
+            }
+
+            // Pre-v4 remote daemon fallback: execute installer + `orbit daemon up` over a one-shot remote PTY
+            let req_id = Uuid::new_v4();
+            let (term_tx, term_rx) = tokio::sync::oneshot::channel();
+            {
+                let Ok(mut guard) = core.hosts.write() else {
+                    let _ = res_tx.send(Err("host state lock poisoned".to_string()));
+                    return;
+                };
+                let Some(h) = guard.get_mut(&owned_host_id) else {
+                    let _ = res_tx.send(Err(format!("host `{owned_host_id}` removed")));
+                    return;
+                };
+                h.pending_upgrade_terminals.insert(req_id, term_tx);
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::CreateTerminal {
+                    request_id: req_id,
+                    cwd: "~".to_string(),
+                    title: Some("Orbit Auto-Update".to_string()),
+                    cols: 120,
+                    rows: 30,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_upgrade_terminals.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("Failed to open remote update shell: {e}")));
+                return;
+            }
+
+            let terminal_id = match tokio::time::timeout(Duration::from_secs(12), term_rx).await {
+                Ok(Ok(Ok(tid))) => tid,
+                Ok(Ok(Err(rpc_err))) => {
+                    let _ = res_tx.send(Err(rpc_err));
+                    return;
+                }
+                Ok(Err(_)) => {
+                    let _ = res_tx.send(Err("Host disconnected before update started".to_string()));
+                    return;
+                }
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_upgrade_terminals.remove(&req_id);
+                    }
+                    let _ = res_tx.send(Err("Timed out starting remote update shell".to_string()));
+                    return;
+                }
+            };
+
+            let cmd = "export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\" && curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh && orbit daemon up; exit";
+            if let Err(e) = session
+                .send_wire(WireMessage::SendTerminalKeys {
+                    request_id: Uuid::new_v4(),
+                    terminal_id,
+                    text: Some(cmd.to_string()),
+                    keys: vec!["Enter".to_string()],
+                })
+                .await
+            {
+                let _ = res_tx.send(Err(format!("Failed to dispatch remote update command: {e}")));
+                return;
+            }
+
+            // Give the remote host a few seconds to download, swap, and restart `orbit daemon up`
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            core.connect_host_async(owned_host_id);
+            let _ = res_tx.send(Ok("Remote daemon update triggered".to_string()));
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Remote upgrade task terminated unexpectedly".to_string())?
+    }
+
+    pub fn upgrade_host_daemon_over_wire_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        target_version: Option<String>,
+    ) -> Result<String, String> {
+        self.runtime
+            .block_on(self.upgrade_host_daemon_over_wire(host_id, target_version))
+    }
+
     /// Read a workspace file from a local or remote Orbit host and pre-render syntax highlighting / Markdown AST.
     pub async fn read_workspace_file_on_host(
         self: &Arc<Self>,
@@ -6609,7 +6983,29 @@ impl OrbitAppCore {
             let raw_res = match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await
             {
                 Ok(Ok(Ok(raw))) => Ok(raw),
-                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Ok(Err(rpc_err))) => {
+                    if is_local && rpc_err.contains("outside the workspace directory") {
+                        let fallback_cwd = owned_cwd.clone();
+                        let fallback_path = owned_path.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            read_local_workspace_file(&fallback_cwd, &fallback_path, None)
+                        })
+                        .await
+                        {
+                            Ok(Ok(local)) => Ok(RawFileReadResponse {
+                                resolved_path: local.resolved_path,
+                                content_kind: local.content_kind,
+                                mime_type: local.mime_type,
+                                content: local.content,
+                                size_bytes: local.size_bytes,
+                                truncated: local.truncated,
+                            }),
+                            _ => Err(rpc_err),
+                        }
+                    } else {
+                        Err(rpc_err)
+                    }
+                }
                 Ok(Err(_)) => Err("Host disconnected while reading file".to_string()),
                 Err(_) => {
                     if let Ok(mut guard) = core.hosts.write()
@@ -6864,6 +7260,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
             full_text: String::new(),
             error: Some(reason.to_string()),
         });
+    }
+    // Dropping pending daemon-upgrade ack senders lets `upgrade_host_daemon_over_wire` observe
+    // `RecvError` immediately when the remote daemon disconnects to hot-restart.
+    h.pending_daemon_upgrades.clear();
+    for (_, tx) in h.pending_upgrade_terminals.drain() {
+        let _ = tx.send(Err(reason.to_string()));
     }
 }
 
@@ -7735,26 +8137,30 @@ fn format_autonomous_wakeup_notice(source: &str) -> String {
 }
 
 fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> AgentCardView {
-    let (status_label, is_running, is_awaiting_permission) = match &a.status {
-        AgentStatus::Initializing => ("Starting".to_string(), true, false),
-        AgentStatus::Idle => ("Idle".to_string(), false, false),
-        AgentStatus::Running { .. } => ("Working".to_string(), true, false),
+    let (status_label, is_running, has_background_tasks, is_awaiting_permission) = match &a.status {
+        AgentStatus::Initializing => ("Starting".to_string(), true, false, false),
+        AgentStatus::Idle => ("Idle".to_string(), false, false, false),
+        AgentStatus::Running { .. } => ("Working".to_string(), true, false, false),
         AgentStatus::AutonomousWakeup { source, .. } => {
             if let Some(rest) = source.trim().strip_prefix("waiting:") {
                 let desc = rest.trim();
                 let label = if desc.is_empty() {
                     "Waiting for background tasks".to_string()
+                } else if desc.to_ascii_lowercase().starts_with("waiting") {
+                    desc.to_string()
                 } else {
                     format!("Waiting for {desc}")
                 };
-                (label, true, false)
+                (label, false, true, false)
             } else {
-                (format!("Waking ({source})"), true, false)
+                (format!("Waking ({source})"), true, false, false)
             }
         }
-        AgentStatus::AwaitingPermission { .. } => ("Needs approval".to_string(), false, true),
-        AgentStatus::Error { .. } => ("Error".to_string(), false, false),
-        AgentStatus::Closed => ("Closed".to_string(), false, false),
+        AgentStatus::AwaitingPermission { .. } => {
+            ("Needs approval".to_string(), false, false, true)
+        }
+        AgentStatus::Error { .. } => ("Error".to_string(), false, false, false),
+        AgentStatus::Closed => ("Closed".to_string(), false, false, false),
     };
     let local_seen_seq = pref.map(|p| p.seen_seq).unwrap_or(0);
     let effective_seen_seq = a.read_seq.max(local_seen_seq);
@@ -7777,6 +8183,7 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         status: a.status.clone(),
         status_label,
         is_running,
+        has_background_tasks,
         is_awaiting_permission,
         parent_agent_id: a.parent_agent_id.clone(),
         parent_host_id: a.parent_host_id.clone(),
@@ -7792,6 +8199,7 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         seen_seq: effective_seen_seq,
         read_seq: a.read_seq,
         is_unread,
+        queued_prompts: a.queued_prompts.clone(),
         handle: a.handle.clone(),
         cluster_suggestion: a.cluster_suggestion.clone(),
         worktree_branch,
@@ -8527,6 +8935,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
                 }],
             },
         );
@@ -8639,6 +9048,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
                 },
             );
             guard.insert("host_warn".into(), mem);
@@ -8781,6 +9191,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: None,
+                    queued_prompts: Vec::new(),
                 },
             );
             guard.insert("h1".into(), mem);
@@ -8954,6 +9365,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: None,
+                    queued_prompts: Vec::new(),
                 },
                 to_before_seq: 4,
                 events: vec![TimelineEvent {
@@ -9053,6 +9465,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: None,
+                    queued_prompts: Vec::new(),
                 }],
             },
         );
@@ -9096,6 +9509,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: None,
+                    queued_prompts: Vec::new(),
                 },
             );
         }
@@ -9132,6 +9546,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: None,
+                    queued_prompts: Vec::new(),
                 },
             },
         );
@@ -9313,6 +9728,7 @@ mod tests {
                 labels: HashMap::new(),
                 attention: AttentionState::None,
                 last_activity_at: None,
+                queued_prompts: Vec::new(),
             },
         );
         core.hosts
@@ -9483,6 +9899,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: None,
+                    queued_prompts: Vec::new(),
                 },
             );
             core.hosts
@@ -9532,6 +9949,7 @@ mod tests {
                     labels: HashMap::new(),
                     attention: AttentionState::None,
                     last_activity_at: None,
+                    queued_prompts: Vec::new(),
                 },
             },
         );
@@ -9580,5 +9998,75 @@ mod tests {
         );
         assert!(!delta.aux_unchanged);
         assert_eq!(delta.insights.subagents.len(), 2);
+    }
+
+    #[test]
+    fn agent_to_card_view_splits_foreground_running_from_background_waiting() {
+        let now = Utc::now();
+        let make_summary = |status: AgentStatus| AgentSummary {
+            agent_id: "ag_bg_split".into(),
+            workspace_id: "ws_1".into(),
+            cwd: "/repo".into(),
+            title: "Preview".into(),
+            provider: ProviderKind::Antigravity,
+            model: None,
+            effort: None,
+            mode: SessionMode::FullAccess,
+            status,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 10,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::Finished,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+        };
+
+        let pref = ClientThreadPref {
+            host_id: "h1".into(),
+            agent_id: "ag_bg_split".into(),
+            seen_seq: 5,
+            is_pinned: false,
+            pinned_order: 0,
+            updated_at_ms: 0,
+        };
+
+        // 1. Waiting on background task: foreground is NOT busy, background flag IS true, unread works
+        let waiting = agent_to_card_view(
+            &make_summary(AgentStatus::AutonomousWakeup {
+                turn_id: "bgwait_1".into(),
+                source: "waiting:1 background task".into(),
+            }),
+            Some(&pref),
+        );
+        assert!(!waiting.is_running);
+        assert!(waiting.has_background_tasks);
+        assert!(!waiting.is_awaiting_permission);
+        assert_eq!(waiting.status_label, "Waiting for 1 background task");
+        assert!(waiting.is_unread);
+
+        // 2. Active post-turn wakeup: foreground IS busy
+        let waking = agent_to_card_view(
+            &make_summary(AgentStatus::AutonomousWakeup {
+                turn_id: "wakeup_1".into(),
+                source: "background_task".into(),
+            }),
+            Some(&pref),
+        );
+        assert!(waking.is_running);
+        assert!(!waking.has_background_tasks);
+        assert!(!waking.is_unread);
     }
 }

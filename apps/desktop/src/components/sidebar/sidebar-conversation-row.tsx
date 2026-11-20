@@ -1,12 +1,17 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { Archive, MoreHorizontal } from "lucide-react";
-import type { AgentCardView, HostCardView } from "@/lib/orbit-ipc";
+import {
+  type AgentCardView,
+  type HostCardView,
+  isAgentForegroundRunning,
+} from "@/lib/orbit-ipc";
 import { useImeCompositionGuard } from "@/lib/ime";
 import type { MenuAnchorBox } from "@/components/sidebar/sidebar-menus";
 import {
   ConversationStatusGlyph,
   formatCompactRelativeTime,
 } from "@/components/sidebar/sidebar-primitives";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { orbitActions } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -61,9 +66,8 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   const renameCancelledRef = useRef(false);
   const ime = useImeCompositionGuard();
 
-  const relativeLabel = agent.is_running
-    ? "now"
-    : formatCompactRelativeTime(agent.updated_at_rfc3339, nowMs);
+  const isForegroundRunning = isAgentForegroundRunning(agent);
+  const relativeLabel = formatCompactRelativeTime(agent.updated_at_rfc3339, nowMs);
 
   useEffect(() => {
     if (!isRenaming) return;
@@ -173,17 +177,28 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         )}
       </div>
 
-      {/* Right Fixed-Width Slot (`46px`): Resting Relative Time ↔ Hover Actions (Zero Radix Instances!) */}
+      {/* Right Fixed-Width Slot (`46px`): Resting Loading / Relative Time ↔ Hover Actions */}
       {!isRenaming && (
         <div className="flex w-[46px] shrink-0 items-center justify-end">
-          <span
-            className={cn(
-              "text-muted-foreground/58 tabular-nums text-[12px] leading-none",
-              menuOpen ? "hidden" : "group-hover/item:hidden",
-            )}
-          >
-            {relativeLabel}
-          </span>
+          {isForegroundRunning ? (
+            <span
+              className={cn(
+                "text-foreground/65 items-center justify-center pr-0.5",
+                menuOpen ? "hidden" : "inline-flex group-hover/item:hidden",
+              )}
+            >
+              <OrbitSpinner size={13.5} />
+            </span>
+          ) : (
+            <span
+              className={cn(
+                "text-muted-foreground/58 tabular-nums text-[12px] leading-none",
+                menuOpen ? "hidden" : "group-hover/item:hidden",
+              )}
+            >
+              {relativeLabel}
+            </span>
+          )}
 
           <div
             className={cn(

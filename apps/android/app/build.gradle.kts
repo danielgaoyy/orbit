@@ -14,8 +14,8 @@ android {
         applicationId = "dev.orbit.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 5002
-        versionName = "0.5.2"
+        versionCode = 5003
+        versionName = "0.5.3"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")

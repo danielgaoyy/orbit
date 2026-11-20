@@ -930,8 +930,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                   const wsCollapsed = Boolean(
                                     collapsedWorkspaceIds[ws.workspace_id],
                                   );
-                                  const wsHasRunning = ws.visiblePeers.some(
-                                    (c) => c.agent.is_running,
+                                  const wsHasRunning = ws.visiblePeers.some((c) =>
+                                    isAgentForegroundRunning(c.agent),
                                   );
                                   const wsHasUnread = ws.visiblePeers.some((c) =>
                                     isConvUnread(c),

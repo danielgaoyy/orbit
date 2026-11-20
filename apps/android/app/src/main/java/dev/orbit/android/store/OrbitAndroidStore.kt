@@ -257,7 +257,10 @@ data class OrbitUiState(
             val key = "$hId::$aId"
             val localList = queuedPromptsByAgent[key].orEmpty()
             if (selectedHost?.supportsServerQueue == true) {
-                val serverList = activeAgent?.queuedPrompts.orEmpty()
+                // Prefer fresh `hostDetail.agents` over `agentStage.agent` because queue mutations
+                // broadcast `HostChanged` without necessarily triggering `TimelineChanged`.
+                val freshCard = hostDetail?.agents?.firstOrNull { it.agentId == aId } ?: activeAgent
+                val serverList = freshCard?.queuedPrompts.orEmpty()
                 return serverList.map { q ->
                     val cached = localList.firstOrNull { it.id == q.queueId }
                     if (cached != null) {

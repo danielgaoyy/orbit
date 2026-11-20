@@ -165,6 +165,9 @@ pub struct AgentOrchestrator {
     roster_fingerprints: RwLock<HashMap<String, String>>,
     /// Conflict radar cooldown keyed by `(workspace_id, canonical_file_path)`.
     conflict_cooldowns: RwLock<HashMap<(String, String), std::time::Instant>>,
+    /// Agents whose next idle transition was caused by explicit interrupt or flush-now,
+    /// suppressing automatic queue drain for that transition.
+    suppress_auto_drain: RwLock<std::collections::HashSet<String>>,
     pub broadcast_tx: broadcast::Sender<DaemonBroadcast>,
 }
 
@@ -196,6 +199,7 @@ impl AgentOrchestrator {
             pending_permissions: RwLock::new(HashMap::new()),
             roster_fingerprints: RwLock::new(HashMap::new()),
             conflict_cooldowns: RwLock::new(HashMap::new()),
+            suppress_auto_drain: RwLock::new(std::collections::HashSet::new()),
             broadcast_tx,
         })
     }
@@ -1315,8 +1319,36 @@ impl AgentOrchestrator {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("q_{}", Uuid::new_v4().simple()));
         let visible = display_prompt.unwrap_or_else(|| prompt.clone());
-        self.store
+        let saved = self
+            .store
             .enqueue_agent_prompt(agent_id, &qid, &prompt, &visible, &badges)?;
+
+        // Re-check status after persisting to close the lost-wakeup race where the agent
+        // became foreground-idle between our initial check and SQLite insert.
+        let still_busy = self.store.get_agent(agent_id)?.is_some_and(|cur| {
+            cur.status.is_foreground_busy()
+                || matches!(cur.status, AgentStatus::AwaitingPermission { .. })
+        }) || self.has_pending_permissions(agent_id).await;
+        if !still_busy
+            && let Some(item) = self.store.take_queued_prompt(agent_id, &saved.queue_id)?
+        {
+            if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::AgentUpdated(updated));
+            }
+            return self
+                .send_prompt_with_options(
+                    agent_id,
+                    item.wire_prompt,
+                    Some(item.display_prompt),
+                    item.badges,
+                    ActiveTurnBehavior::Steer,
+                    None,
+                )
+                .await;
+        }
+
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
             let _ = self
                 .broadcast_tx
@@ -1551,6 +1583,10 @@ impl AgentOrchestrator {
     }
 
     pub async fn interrupt_agent(&self, agent_id: &str) -> anyhow::Result<()> {
+        self.suppress_auto_drain
+            .write()
+            .await
+            .insert(agent_id.to_string());
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx.send(DriverCommand::Interrupt).await;
         }
@@ -2950,6 +2986,7 @@ impl AgentOrchestrator {
 
         let mut should_check_auto_archive = false;
         let mut should_drain_queued_prompt = false;
+        let mut should_mark_finished = false;
         let payload = match evt {
             DriverEvent::StatusChanged(status) => {
                 let prev = self.store.get_agent(agent_id).ok().flatten();
@@ -2964,15 +3001,14 @@ impl AgentOrchestrator {
                 match &status {
                     AgentStatus::Idle => {
                         self.clear_pending_requests(agent_id).await;
-                        if was_foreground_busy || was_awaiting_permission {
+                        let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
+                        if (was_foreground_busy || was_awaiting_permission) && !suppressed {
                             should_drain_queued_prompt = true;
                         }
                         if was_foreground_busy {
                             let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                             if prev.as_ref().is_some_and(|a| !a.background) {
-                                let _ = self
-                                    .store
-                                    .set_agent_attention(agent_id, AttentionState::Finished);
+                                should_mark_finished = true;
                             }
                             should_check_auto_archive = true;
                         } else if was_background_waiting {
@@ -2981,25 +3017,26 @@ impl AgentOrchestrator {
                     }
                     AgentStatus::AutonomousWakeup { .. } if status.is_background_waiting() => {
                         self.clear_pending_requests(agent_id).await;
-                        if was_foreground_busy || was_awaiting_permission {
+                        let suppressed = self.suppress_auto_drain.write().await.remove(agent_id);
+                        if (was_foreground_busy || was_awaiting_permission) && !suppressed {
                             should_drain_queued_prompt = true;
                         }
                         if was_foreground_busy {
                             let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                             if prev.as_ref().is_some_and(|a| !a.background) {
-                                let _ = self
-                                    .store
-                                    .set_agent_attention(agent_id, AttentionState::Finished);
+                                should_mark_finished = true;
                             }
                         }
                     }
                     AgentStatus::AutonomousWakeup { .. } => {
+                        self.suppress_auto_drain.write().await.remove(agent_id);
                         let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                     }
                     AgentStatus::Error {
                         message,
                         recoverable,
                     } => {
+                        self.suppress_auto_drain.write().await.remove(agent_id);
                         tracing::warn!(
                             agent_id = %agent_id,
                             recoverable,
@@ -3022,6 +3059,7 @@ impl AgentOrchestrator {
                         }
                     }
                     AgentStatus::Running { .. } => {
+                        self.suppress_auto_drain.write().await.remove(agent_id);
                         let _ = self.store.touch_agent_activity(agent_id, Utc::now());
                     }
                     _ => {}
@@ -3145,6 +3183,14 @@ impl AgentOrchestrator {
                     ag = refreshed;
                 }
                 drained_prompt = Some(next_item);
+            }
+
+            // Only emit `AttentionState::Finished` when no queued follow-up is about to run immediately.
+            if should_mark_finished && drained_prompt.is_none() {
+                let _ = self
+                    .store
+                    .set_agent_attention(agent_id, AttentionState::Finished);
+                ag.attention = AttentionState::Finished;
             }
 
             let auto_arch = ag.auto_archive && ag.archived_at.is_none() && drained_prompt.is_none();

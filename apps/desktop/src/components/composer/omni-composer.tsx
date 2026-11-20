@@ -228,6 +228,7 @@ export const OmniComposer = memo(function OmniComposer({
   const mirrorTextareaRef = useRef<HTMLDivElement | null>(null);
   const lastTextareaHeightRef = useRef<number>(46);
   const [composerWidthPx, setComposerWidthPx] = useState(0);
+  const [isCompactBar, setIsCompactBar] = useState(false);
   const draftTextRef = useRef<string>(draftText);
   draftTextRef.current = draftText;
   const directivePrefixRef = useRef<HTMLSpanElement | null>(null);
@@ -246,13 +247,12 @@ export const OmniComposer = memo(function OmniComposer({
   } | null>(null);
   const queueRowRefs = useRef<(HTMLDivElement | null)[]>([]);
   const queueDragCleanupRef = useRef<(() => void) | null>(null);
+  const queuedSignature = useMemo(() => queued.map((q) => q.id).join("\0"), [queued]);
 
   useEffect(() => {
-    // Abort any in-flight drag cleanly if the queue shrinks or swaps underneath us
-    if (queueDrag && queueDrag.fromIndex >= queued.length) {
-      queueDragCleanupRef.current?.();
-    }
-  }, [queueDrag, queued.length]);
+    // Abort any in-flight drag cleanly whenever the queue mutates (e.g. daemon drain/sync) underneath us
+    queueDragCleanupRef.current?.();
+  }, [queuedSignature]);
 
   useEffect(() => {
     return () => {
@@ -376,6 +376,8 @@ export const OmniComposer = memo(function OmniComposer({
       const nextW = Math.round(entries[0]?.contentRect.width ?? 0);
       if (nextW > 0 && nextW !== lastW) {
         lastW = nextW;
+        // Always update compact-bar threshold (at most 1 render when crossing 440px)
+        setIsCompactBar(nextW < 440);
         // Avoid re-rendering the entire composer tree on every sidebar animation frame when empty.
         if (el.value.length > 0) {
           setComposerWidthPx(nextW);
@@ -1333,7 +1335,7 @@ export const OmniComposer = memo(function OmniComposer({
                 <ComposerModePicker
                   mode={activeMode}
                   onSelectMode={handleSelectMode}
-                  iconOnly={composerWidthPx > 0 && composerWidthPx < 440}
+                  iconOnly={isCompactBar}
                 />
 
                 {isTurnBusy && !hasPayload ? (

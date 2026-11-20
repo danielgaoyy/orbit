@@ -643,6 +643,7 @@ const composerFocusListeners = new Set<() => void>();
 const autoUpgradeAttempted = new Map<string, string>();
 
 function maybeAutoSyncOutdatedHosts(): void {
+  if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV) return;
   const normApp = normalizeSemver(state.appVersion);
   if (!normApp || state.isBrowserOffline) return;
 
@@ -1693,7 +1694,9 @@ export const orbitActions = {
             Boolean(prevAgent.has_background_tasks) !== Boolean(nextAgent.has_background_tasks) ||
             prevAgent.is_awaiting_permission !== nextAgent.is_awaiting_permission ||
             (prevAgent.queued_prompts?.length ?? 0) !== (nextAgent.queued_prompts?.length ?? 0) ||
-            prevAgent.queued_prompts?.[0]?.queue_id !== nextAgent.queued_prompts?.[0]?.queue_id ||
+            (prevAgent.queued_prompts ?? []).some(
+              (q, i) => q.queue_id !== nextAgent.queued_prompts?.[i]?.queue_id,
+            ) ||
             prevAgent.model !== nextAgent.model ||
             prevAgent.effort !== nextAgent.effort ||
             prevAgent.title !== nextAgent.title ||

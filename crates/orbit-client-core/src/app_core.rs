@@ -7261,6 +7261,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
             error: Some(reason.to_string()),
         });
     }
+    // Dropping pending daemon-upgrade ack senders lets `upgrade_host_daemon_over_wire` observe
+    // `RecvError` immediately when the remote daemon disconnects to hot-restart.
+    h.pending_daemon_upgrades.clear();
+    for (_, tx) in h.pending_upgrade_terminals.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
 }
 
 fn version_supports_remote_attachments(raw: &str) -> bool {
@@ -10048,7 +10054,7 @@ mod tests {
         assert!(!waiting.is_running);
         assert!(waiting.has_background_tasks);
         assert!(!waiting.is_awaiting_permission);
-        assert_eq!(waiting.status_label, "1 background task");
+        assert_eq!(waiting.status_label, "Waiting for 1 background task");
         assert!(waiting.is_unread);
 
         // 2. Active post-turn wakeup: foreground IS busy

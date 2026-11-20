@@ -585,10 +585,13 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public var activeQueuedPrompts: [QueuedPromptItem] {
-        guard let key = activeAgentQueueKey else { return [] }
+        guard let key = activeAgentQueueKey, let aid = selectedAgentId else { return [] }
         let localList = queuedPromptsByAgent[key] ?? []
         if currentHostDetail?.host.supportsServerQueue == true {
-            let serverList = activeAgent?.queuedPrompts ?? []
+            // Prefer the freshly refreshed `currentHostDetail` card over `agentStage?.agent`
+            // because queue mutations emit `HostChanged` without necessarily emitting `TimelineChanged`.
+            let freshCard = currentHostDetail?.agents.first(where: { $0.agentId == aid }) ?? activeAgent
+            let serverList = freshCard?.queuedPrompts ?? []
             return serverList.map { q in
                 if let cached = localList.first(where: { $0.id == q.queueId }) {
                     return cached

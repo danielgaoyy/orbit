@@ -1102,6 +1102,7 @@ export class OrbitHarmonyStore {
           }
         }
         this.currentAgent = matchedAgent;
+        this.syncActiveQueuedPrompts();
       } else if (
         !this.isNewSessionDraft &&
         detail.agents.length > 0 &&

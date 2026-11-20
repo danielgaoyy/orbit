@@ -4144,7 +4144,7 @@ export function StreamStage() {
       virtualizerRef.current?.scrollToIndex(stageTurns.length - 1, { align: "end" });
       snapScrollerToBottom();
       const raf = window.requestAnimationFrame(() => {
-        if (stickToBottomRef.current && !programmaticScrollRef.current) {
+        if (stickToBottomRef.current && !programmaticScrollRef.current && turnsCountRef.current > 0) {
           virtualizerRef.current?.scrollToIndex(turnsCountRef.current - 1, { align: "end" });
           snapScrollerToBottom();
           syncScrollMetrics();

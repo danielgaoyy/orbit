@@ -92,9 +92,9 @@ export const FileViewerTab = memo(function FileViewerTab({
   }, [hostId, cwd, path, cacheEntry]);
 
   // Gently auto-refresh live background task logs while Follow mode is active
+  const isCacheError = cacheEntry?.status === "error";
   useEffect(() => {
-    if (!isLogFile || !logFollow || !hostId || !path) return;
-    if (cacheEntry?.status === "error") return;
+    if (!isLogFile || !logFollow || !hostId || !path || isCacheError) return;
     const id = window.setInterval(() => {
       const snap = orbitActions.getSnapshot();
       if (!snap.sidePanelOpen || snap.activeSidePanelTabId !== tab.id) return;
@@ -102,7 +102,7 @@ export const FileViewerTab = memo(function FileViewerTab({
       void orbitActions.loadWorkspaceFile(hostId, cwd, path, true);
     }, 2000);
     return () => window.clearInterval(id);
-  }, [isLogFile, logFollow, hostId, cwd, path, tab.id, cacheEntry?.status]);
+  }, [isLogFile, logFollow, hostId, cwd, path, tab.id, isCacheError]);
 
   const data = cacheEntry?.data ?? null;
   const relPath = useMemo(() => stripWorkspacePrefix(path, cwd), [path, cwd]);
@@ -547,63 +547,93 @@ export const FileViewerTab = memo(function FileViewerTab({
             )}
 
             <div className="space-y-[1px]">
-              {logLines.map((line, idx) => {
-                const lineNumber = idx + 1;
-                const isMatched = matchLineSet.has(lineNumber);
-                const isFocused =
-                  matchLineNumbers.length > 0 &&
-                  matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)] ===
-                    lineNumber;
-
+              {(() => {
+                // Tail-window large logs to keep WebView rendering fast while live-tailing
+                let effectiveCap = renderedLineCap;
+                if (activeTargetLine != null && logLines.length - activeTargetLine + 20 > effectiveCap) {
+                  effectiveCap = logLines.length - activeTargetLine + 40;
+                }
+                const logStartIdx = Math.max(0, logLines.length - effectiveCap);
+                const visibleLogLines =
+                  logStartIdx > 0 ? logLines.slice(logStartIdx) : logLines;
                 return (
-                  <div
-                    key={lineNumber}
-                    ref={(el) => {
-                      if (el) lineRefs.current.set(lineNumber, el);
-                      else lineRefs.current.delete(lineNumber);
-                    }}
-                    className={cn(
-                      "text-foreground/84 rounded-[4px] px-1 py-[0.5px]",
-                      logWrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
-                      isFocused && "bg-primary/[0.14] shadow-[inset_2px_0_0_0_var(--color-primary)]",
-                      !isFocused && isMatched && "bg-amber-500/[0.14]",
+                  <>
+                    {logStartIdx > 0 && (
+                      <div className="mb-1.5 flex items-center justify-between rounded-md bg-black/[0.03] px-2.5 py-1 font-sans text-[11px] text-muted-foreground dark:bg-white/[0.04]">
+                        <span>
+                          Showing latest {visibleLogLines.length.toLocaleString()} of{" "}
+                          {logLines.length.toLocaleString()} lines
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setRenderedLineCap((c) => c + 1200)}
+                          className="text-foreground/85 hover:text-foreground cursor-pointer font-medium transition-colors"
+                        >
+                          Show earlier lines
+                        </button>
+                      </div>
                     )}
-                  >
-                    {line.plain.length === 0 ? (
-                      <span className="block h-[6px]" />
-                    ) : line.spans ? (
-                      line.spans.map((span, sIdx) =>
-                        span.style ? (
-                          <span
-                            key={sIdx}
-                            style={{
-                              color: resolveAnsiColor(span.style.fg, isDark),
-                              backgroundColor: resolveAnsiColor(span.style.bg, isDark),
-                              fontWeight: span.style.bold ? 600 : undefined,
-                              opacity: span.style.dim ? 0.58 : undefined,
-                              fontStyle: span.style.italic ? "italic" : undefined,
-                              textDecoration:
-                                span.style.underline && span.style.strike
-                                  ? "underline line-through"
-                                  : span.style.underline
-                                    ? "underline"
-                                    : span.style.strike
-                                      ? "line-through"
-                                      : undefined,
-                            }}
-                          >
-                            {span.text}
-                          </span>
-                        ) : (
-                          <span key={sIdx}>{span.text}</span>
-                        ),
-                      )
-                    ) : (
-                      line.plain
-                    )}
-                  </div>
+                    {visibleLogLines.map((line, relIdx) => {
+                      const lineNumber = logStartIdx + relIdx + 1;
+                      const isMatched = matchLineSet.has(lineNumber);
+                      const isFocused =
+                        matchLineNumbers.length > 0 &&
+                        matchLineNumbers[Math.min(activeMatchIdx, matchLineNumbers.length - 1)] ===
+                          lineNumber;
+
+                      return (
+                        <div
+                          key={lineNumber}
+                          ref={(el) => {
+                            if (el) lineRefs.current.set(lineNumber, el);
+                            else lineRefs.current.delete(lineNumber);
+                          }}
+                          className={cn(
+                            "text-foreground/84 rounded-[4px] px-1 py-[0.5px]",
+                            logWrapLines ? "break-words whitespace-pre-wrap" : "whitespace-pre",
+                            isFocused &&
+                              "bg-primary/[0.14] shadow-[inset_2px_0_0_0_var(--color-primary)]",
+                            !isFocused && isMatched && "bg-amber-500/[0.14]",
+                          )}
+                        >
+                          {line.plain.length === 0 ? (
+                            <span className="block h-[6px]" />
+                          ) : line.spans ? (
+                            line.spans.map((span, sIdx) =>
+                              span.style ? (
+                                <span
+                                  key={sIdx}
+                                  style={{
+                                    color: resolveAnsiColor(span.style.fg, isDark),
+                                    backgroundColor: resolveAnsiColor(span.style.bg, isDark),
+                                    fontWeight: span.style.bold ? 600 : undefined,
+                                    opacity: span.style.dim ? 0.58 : undefined,
+                                    fontStyle: span.style.italic ? "italic" : undefined,
+                                    textDecoration:
+                                      span.style.underline && span.style.strike
+                                        ? "underline line-through"
+                                        : span.style.underline
+                                          ? "underline"
+                                          : span.style.strike
+                                            ? "line-through"
+                                            : undefined,
+                                  }}
+                                >
+                                  {span.text}
+                                </span>
+                              ) : (
+                                <span key={sIdx}>{span.text}</span>
+                              ),
+                            )
+                          ) : (
+                            line.plain
+                          )}
+                        </div>
+                      );
+                    })}
+                  </>
                 );
-              })}
+              })()}
             </div>
           </ScrollArea>
 

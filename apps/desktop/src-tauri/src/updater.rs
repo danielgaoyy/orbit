@@ -727,18 +727,32 @@ fn orbit_cli_release_asset_name() -> Result<&'static str, String> {
     }
 }
 
+static LOCAL_DAEMON_SYNC_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+static LOCAL_DAEMON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_unique_temp_suffix() -> String {
+    let seq = LOCAL_DAEMON_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}.{seq}", std::process::id())
+}
+
 fn atomic_install_executable(src: &Path, dst: &Path) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
     }
-    let tmp = dst.with_extension(format!("new.{}", std::process::id()));
-    std::fs::copy(src, &tmp).map_err(|e| format!("Failed to stage {}: {e}", tmp.display()))?;
+    let tmp = dst.with_extension(format!("new.{}", next_unique_temp_suffix()));
+    if let Err(e) = std::fs::copy(src, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("Failed to stage {}: {e}", tmp.display()));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("Failed to chmod {}: {e}", tmp.display()))?;
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Failed to chmod {}: {e}", tmp.display()));
+        }
     }
     if let Err(e) = std::fs::rename(&tmp, dst) {
         let _ = std::fs::remove_file(&tmp);
@@ -790,15 +804,20 @@ async fn download_orbit_cli_binary(dst_tmp: &Path) -> Result<(), String> {
                     last_err = err;
                     continue;
                 }
-                file.flush()
-                    .await
-                    .map_err(|e| format!("Failed to flush binary: {e}"))?;
+                if let Err(e) = file.flush().await {
+                    let _ = tokio::fs::remove_file(dst_tmp).await;
+                    return Err(format!("Failed to flush binary: {e}"));
+                }
                 drop(file);
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(dst_tmp, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| format!("Failed to chmod downloaded binary: {e}"))?;
+                    if let Err(e) =
+                        std::fs::set_permissions(dst_tmp, std::fs::Permissions::from_mode(0o755))
+                    {
+                        let _ = std::fs::remove_file(dst_tmp);
+                        return Err(format!("Failed to chmod downloaded binary: {e}"));
+                    }
                 }
                 return Ok(());
             }
@@ -828,6 +847,11 @@ pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, Str
         });
     }
 
+    let _sync_guard = LOCAL_DAEMON_SYNC_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "Unable to resolve HOME directory".to_string())?;
@@ -838,14 +862,17 @@ pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, Str
     let mut installed_version = probe_orbit_binary_version(&install_path).await;
 
     // 1. Prefer bundled sidecar if it matches or is newer than what is currently installed
+    // (never silently downgrade a newer CLI binary already present on disk).
     if let Some(sidecar) = bundled_orbit_sidecar_path()
         && let Some(sidecar_ver) = probe_orbit_binary_version(&sidecar).await
     {
-        let should_copy = force
-            || installed_version
-                .as_deref()
-                .map(|cur| compare_semver(&sidecar_ver, cur) == Ordering::Greater)
-                .unwrap_or(true);
+        let should_copy = installed_version
+            .as_deref()
+            .map(|cur| {
+                let ord = compare_semver(&sidecar_ver, cur);
+                ord == Ordering::Greater || (force && ord == Ordering::Equal)
+            })
+            .unwrap_or(true);
         if should_copy {
             atomic_install_executable(&sidecar, &install_path)?;
             installed_version = Some(sidecar_ver);
@@ -861,7 +888,7 @@ pub async fn sync_local_daemon(force: bool) -> Result<LocalDaemonSyncResult, Str
     if still_outdated {
         std::fs::create_dir_all(&install_dir)
             .map_err(|e| format!("Failed to create {}: {e}", install_dir.display()))?;
-        let tmp_dl = install_dir.join(format!("orbit.dl.{}", std::process::id()));
+        let tmp_dl = install_dir.join(format!("orbit.dl.{}", next_unique_temp_suffix()));
         let dl_res = download_orbit_cli_binary(&tmp_dl).await;
         if let Err(err) = dl_res {
             let _ = std::fs::remove_file(&tmp_dl);

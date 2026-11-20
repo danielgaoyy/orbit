@@ -194,6 +194,7 @@ pub struct DaemonRuntime {
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
     catalog_refresh_lock: AsyncMutex<()>,
+    upgrade_lock: AsyncMutex<()>,
 }
 
 impl DaemonRuntime {
@@ -300,6 +301,7 @@ impl DaemonRuntime {
             idle_cleanup,
             provider_catalogs: RwLock::new(None),
             catalog_refresh_lock: AsyncMutex::new(()),
+            upgrade_lock: AsyncMutex::new(()),
         }))
     }
 
@@ -2728,6 +2730,8 @@ impl DaemonRuntime {
     ) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
 
+        let _upgrade_guard = self.upgrade_lock.lock().await;
+
         let asset = daemon_release_asset_name()?;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -2735,7 +2739,11 @@ impl DaemonRuntime {
         let install_dir = home.join(".local/bin");
         std::fs::create_dir_all(&install_dir)?;
         let install_path = install_dir.join("orbit");
-        let tmp_path = install_dir.join(format!("orbit.upgrade.{}", std::process::id()));
+        let tmp_path = install_dir.join(format!(
+            "orbit.upgrade.{}.{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
 
         let repo = std::env::var("ORBIT_REPO")
             .ok()
@@ -2743,14 +2751,17 @@ impl DaemonRuntime {
             .unwrap_or_else(|| "danielgaoyy/orbit".to_string());
 
         let mut urls: Vec<String> = Vec::new();
-        if let Some(ver) = target_version
+        if let Some(raw_ver) = target_version
             .as_deref()
             .map(str::trim)
             .map(|s| s.trim_start_matches(['v', 'V']))
             .filter(|s| !s.is_empty())
         {
+            if !is_valid_release_semver(raw_ver) {
+                anyhow::bail!("Invalid target version format: {raw_ver}");
+            }
             urls.push(format!(
-                "https://github.com/{repo}/releases/download/v{ver}/{asset}"
+                "https://github.com/{repo}/releases/download/v{raw_ver}/{asset}"
             ));
         }
         urls.push(format!(
@@ -2789,15 +2800,21 @@ impl DaemonRuntime {
                         last_err = err;
                         continue;
                     }
-                    file.flush().await?;
+                    if let Err(e) = file.flush().await {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        return Err(e.into());
+                    }
                     drop(file);
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(
+                        if let Err(e) = std::fs::set_permissions(
                             &tmp_path,
                             std::fs::Permissions::from_mode(0o755),
-                        )?;
+                        ) {
+                            let _ = std::fs::remove_file(&tmp_path);
+                            return Err(e.into());
+                        }
                     }
                     downloaded = true;
                     break;
@@ -2821,7 +2838,13 @@ impl DaemonRuntime {
             .output()
             .await;
         match check {
-            Ok(out) if out.status.success() => {}
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if !stdout.trim().to_ascii_lowercase().starts_with("orbit ") {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    anyhow::bail!("Downloaded binary returned unexpected --version output");
+                }
+            }
             Ok(out) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 anyhow::bail!("Downloaded binary failed --version check ({})", out.status);
@@ -2879,4 +2902,39 @@ impl DaemonRuntime {
         );
         Ok(())
     }
+}
+
+/// Strictly validate a release semver tag (`X.Y.Z` with optional `-prerelease`) before
+/// interpolating it into a GitHub Releases download URL, preventing path traversal (`../`).
+fn is_valid_release_semver(ver: &str) -> bool {
+    if ver.is_empty() || ver.len() > 64 {
+        return false;
+    }
+    let (core, prerelease) = match ver.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (ver, None),
+    };
+    let mut parts = core.split('.');
+    let valid_core = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None)
+            if !a.is_empty()
+                && !b.is_empty()
+                && !c.is_empty()
+                && a.bytes().all(|ch| ch.is_ascii_digit())
+                && b.bytes().all(|ch| ch.is_ascii_digit())
+                && c.bytes().all(|ch| ch.is_ascii_digit())
+    );
+    if !valid_core {
+        return false;
+    }
+    if let Some(pre) = prerelease {
+        if pre.is_empty() || pre.contains("..") {
+            return false;
+        }
+        return pre
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == b'.' || ch == b'-');
+    }
+    true
 }

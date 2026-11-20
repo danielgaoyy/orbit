@@ -553,21 +553,36 @@ impl OrbitStore {
     ) -> Result<QueuedPromptView, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
-        let next_order: i64 = tx
+        let next_order: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM agent_queued_prompts WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        // Never let a client-supplied `queue_id` collide with and overwrite another agent's row.
+        let existing_owner: Option<String> = tx
             .query_row(
-                "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM agent_queued_prompts WHERE agent_id = ?1",
-                params![agent_id],
+                "SELECT agent_id FROM agent_queued_prompts WHERE queue_id = ?1",
+                params![queue_id],
                 |r| r.get(0),
             )
-            .unwrap_or(1);
+            .optional()?;
         let now = Utc::now();
+        let effective_qid = match existing_owner {
+            Some(owner) if owner != agent_id => {
+                format!(
+                    "{agent_id}_{queue_id}_{}",
+                    now.timestamp_nanos_opt().unwrap_or(0)
+                )
+            }
+            _ => queue_id.to_string(),
+        };
         let badges_json = serde_json::to_string(badges)?;
         tx.execute(
             "INSERT OR REPLACE INTO agent_queued_prompts
              (queue_id, agent_id, sort_order, wire_prompt, display_prompt, badges_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                queue_id,
+                effective_qid,
                 agent_id,
                 next_order,
                 wire_prompt,
@@ -578,7 +593,7 @@ impl OrbitStore {
         )?;
         tx.commit()?;
         Ok(QueuedPromptView {
-            queue_id: queue_id.to_string(),
+            queue_id: effective_qid,
             display_text: display_prompt.to_string(),
             badges: badges.to_vec(),
             created_at: now,
@@ -783,12 +798,14 @@ impl OrbitStore {
     }
 
     pub fn delete_agent(&self, agent_id: &str) -> Result<(), StoreError> {
-        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let _ = conn.execute(
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM agent_queued_prompts WHERE agent_id = ?1",
             params![agent_id],
-        );
-        conn.execute("DELETE FROM agents WHERE agent_id = ?1", params![agent_id])?;
+        )?;
+        tx.execute("DELETE FROM agents WHERE agent_id = ?1", params![agent_id])?;
+        tx.commit()?;
         Ok(())
     }
 

@@ -65,7 +65,7 @@ const ANSI_16_DARK: readonly string[] = [
 const XTERM_CUBE = [0, 95, 135, 175, 215, 255] as const;
 
 function xterm256ToColor(code: number): number | string | undefined {
-  if (code < 0 || code > 255) return undefined;
+  if (!Number.isInteger(code) || code < 0 || code > 255) return undefined;
   if (code < 16) return code;
   if (code < 232) {
     const idx = code - 16;

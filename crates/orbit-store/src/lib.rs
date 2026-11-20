@@ -240,9 +240,18 @@ impl OrbitStore {
         );
         let _ = conn.execute("ALTER TABLE client_hosts ADD COLUMN meta_json TEXT", []);
         let _ = conn.execute("ALTER TABLE timeline_events ADD COLUMN event_type TEXT", []);
-        let _ = conn.execute("ALTER TABLE timeline_events ADD COLUMN coalesce_key TEXT", []);
-        let _ = conn.execute("ALTER TABLE client_replica_events ADD COLUMN event_type TEXT", []);
-        let _ = conn.execute("ALTER TABLE client_replica_events ADD COLUMN coalesce_key TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE timeline_events ADD COLUMN coalesce_key TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE client_replica_events ADD COLUMN event_type TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE client_replica_events ADD COLUMN coalesce_key TEXT",
+            [],
+        );
         // One-time schema v2 migration: self-heal legacy pre-v0.2.4 client replica caches once
         let user_ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -569,8 +578,7 @@ impl OrbitStore {
         let ckey = coalesce_key(&payload);
 
         if let Some(ref key_val) = ckey {
-            let boundary_seq =
-                query_coalesce_boundary_seq(&tx, true, agent_id, &payload, None);
+            let boundary_seq = query_coalesce_boundary_seq(&tx, true, agent_id, &payload, None);
             if let Ok(mut del_stmt) = tx.prepare_cached(
                 "DELETE FROM timeline_events WHERE agent_id = ?1 AND seq > ?2 AND coalesce_key = ?3",
             ) {
@@ -630,18 +638,14 @@ impl OrbitStore {
         let ckey = coalesce_key(&ev.payload);
 
         if let Some(ref key_val) = ckey {
-            let boundary_seq = query_coalesce_boundary_seq(
-                &tx,
-                false,
-                &ev.agent_id,
-                &ev.payload,
-                Some(ev.seq),
-            );
+            let boundary_seq =
+                query_coalesce_boundary_seq(&tx, false, &ev.agent_id, &ev.payload, Some(ev.seq));
             if let Ok(mut del_stmt) = tx.prepare_cached(
                 "DELETE FROM client_replica_events
                  WHERE agent_id = ?1 AND seq > ?2 AND seq < ?3 AND coalesce_key = ?4",
             ) {
-                let _ = del_stmt.execute(params![ev.agent_id, boundary_seq, ev.seq as i64, key_val]);
+                let _ =
+                    del_stmt.execute(params![ev.agent_id, boundary_seq, ev.seq as i64, key_val]);
             }
         }
 

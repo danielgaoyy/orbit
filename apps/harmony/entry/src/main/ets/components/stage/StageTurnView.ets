@@ -638,9 +638,12 @@ export struct StageTurnView {
   }
 
   private syncElapsedTimer(): void {
-    this.clearElapsedTimer();
     const active = this.isTurnActive || this.turn.has_active_item;
     if (!active) {
+      this.clearElapsedTimer();
+      return;
+    }
+    if (this.timerHandle >= 0) {
       return;
     }
     const updateTick = () => {

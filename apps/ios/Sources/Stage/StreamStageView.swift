@@ -186,9 +186,7 @@ struct StreamStageView: View {
                 }
                 .onChange(of: store.agentStage?.latestSeq) { _ in
                     guard !showScrollToBottomPill && !store.keepStageScrolledToTop else { return }
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(bottomAnchorId, anchor: .bottom)
-                    }
+                    proxy.scrollTo(bottomAnchorId, anchor: .bottom)
                 }
                 .onChange(of: turns.count) { _ in
                     guard !store.keepStageScrolledToTop else { return }

@@ -938,7 +938,12 @@ pub struct DiffLineView {
 }
 
 impl DiffLineView {
-    fn plain(kind: DiffLineKind, old_line: Option<u32>, new_line: Option<u32>, content: String) -> Self {
+    fn plain(
+        kind: DiffLineKind,
+        old_line: Option<u32>,
+        new_line: Option<u32>,
+        content: String,
+    ) -> Self {
         Self {
             kind,
             old_line,
@@ -1223,7 +1228,8 @@ fn enrich_diff_file_highlights_and_intraline(file: &mut DiffFileView) {
             }
         }
         if !code_indices.is_empty() {
-            let highlighted = highlight_code_lines_capped(lang, &joined, MAX_RENDERED_DIFF_LINES_PER_FILE);
+            let highlighted =
+                highlight_code_lines_capped(lang, &joined, MAX_RENDERED_DIFF_LINES_PER_FILE);
             for (line_pos, &line_idx) in code_indices.iter().enumerate() {
                 if let Some(hl) = highlighted.get(line_pos) {
                     file.lines[line_idx].tokens = hl.tokens.clone();

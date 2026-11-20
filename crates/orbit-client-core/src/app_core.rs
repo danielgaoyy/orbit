@@ -881,7 +881,11 @@ impl OrbitAppCore {
         }
     }
 
-    pub fn replace_subscribers(&self, options: SubscribeOptions, sub: Arc<dyn CoreEventSubscriber>) {
+    pub fn replace_subscribers(
+        &self,
+        options: SubscribeOptions,
+        sub: Arc<dyn CoreEventSubscriber>,
+    ) {
         let wrapped: Arc<dyn CoreEventSubscriber> = if options.min_interval_ms == 0 {
             if options.include_terminal_raw_bytes {
                 sub
@@ -6049,7 +6053,8 @@ impl CoreEventSubscriber for CoalescingSubscriber {
                                     const MAX_COALESCED_TERMINAL_BYTES: usize = 128 * 1024;
                                     prev_bytes.extend_from_slice(raw_bytes);
                                     if prev_bytes.len() > MAX_COALESCED_TERMINAL_BYTES {
-                                        let excess = prev_bytes.len() - MAX_COALESCED_TERMINAL_BYTES;
+                                        let excess =
+                                            prev_bytes.len() - MAX_COALESCED_TERMINAL_BYTES;
                                         prev_bytes.drain(..excess);
                                     }
                                 } else {

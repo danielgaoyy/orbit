@@ -795,7 +795,11 @@ export class OrbitHarmonyStore {
       ) {
         this.reloadGitDiff(this.activeCwd);
         this.reloadWorkspaceFiles();
-      } else if (ev.kind === 'terminal_changed' && ev.host_id === this.selectedHostId) {
+      } else if (
+        ev.kind === 'terminal_changed' &&
+        ev.host_id === this.selectedHostId &&
+        this.showPtySheet
+      ) {
         this.reloadTerminal();
       }
     } catch (err) {
@@ -1171,43 +1175,58 @@ export class OrbitHarmonyStore {
       this.sessionDiffs = delta.session_turn_diffs;
 
       if (delta.agent !== null) {
+        const prevAgent = this.currentAgent;
+        const modelChanged =
+          prevAgent === null ||
+          prevAgent.agent_id !== delta.agent.agent_id ||
+          prevAgent.provider !== delta.agent.provider ||
+          prevAgent.model !== delta.agent.model ||
+          prevAgent.effort !== delta.agent.effort;
         this.currentAgent = delta.agent;
-        this.activeCwd = delta.agent.cwd;
-        this.composerProvider = delta.agent.provider;
-        const resolved = this.resolveDefaultModelAndEffort(
-          delta.agent.provider,
-          delta.agent.model ?? '',
-          delta.agent.effort ?? ''
-        );
-        this.composerModel = (
-          delta.agent.model !== null &&
-          delta.agent.model !== undefined &&
-          delta.agent.model.trim().length > 0 &&
-          resolved.model.length === 0
-        )
-          ? delta.agent.model
-          : resolved.model;
-        this.composerEffort = (
-          delta.agent.effort !== null &&
-          delta.agent.effort !== undefined &&
-          delta.agent.effort.trim().length > 0 &&
-          resolved.effort.length === 0
-        )
-          ? delta.agent.effort
-          : resolved.effort;
-        this.composerMode = normalizeModeSlug(delta.agent.mode);
+        if (this.activeCwd !== delta.agent.cwd) {
+          this.activeCwd = delta.agent.cwd;
+        }
+        if (modelChanged) {
+          this.composerProvider = delta.agent.provider;
+          const resolved = this.resolveDefaultModelAndEffort(
+            delta.agent.provider,
+            delta.agent.model ?? '',
+            delta.agent.effort ?? ''
+          );
+          this.composerModel = (
+            delta.agent.model !== null &&
+            delta.agent.model !== undefined &&
+            delta.agent.model.trim().length > 0 &&
+            resolved.model.length === 0
+          )
+            ? delta.agent.model
+            : resolved.model;
+          this.composerEffort = (
+            delta.agent.effort !== null &&
+            delta.agent.effort !== undefined &&
+            delta.agent.effort.trim().length > 0 &&
+            resolved.effort.length === 0
+          )
+            ? delta.agent.effort
+            : resolved.effort;
+        }
+        const nextMode = normalizeModeSlug(delta.agent.mode);
+        if (this.composerMode !== nextMode) {
+          this.composerMode = nextMode;
+        }
         if (!this.isNewSessionDraft && this.selectedAgentId === delta.agent.agent_id) {
           this.core.markAgentSeen(
             this.selectedHostId,
             delta.agent.agent_id,
             Math.max(delta.agent.latest_seq, delta.latest_seq)
           );
-          this.refreshSidebar();
+          if (!delta.agent.is_running) {
+            this.refreshSidebar();
+          }
         }
         this.drainQueuedPromptsForAgentIfIdle(this.selectedHostId, delta.agent);
       } else if (!this.isNewSessionDraft && this.selectedAgentId.length > 0) {
         this.core.markAgentSeen(this.selectedHostId, this.selectedAgentId, delta.latest_seq);
-        this.refreshSidebar();
       }
     } catch (e) {
       orbitLogWarn('OrbitStore', 'reloadStage failed', e as Object);

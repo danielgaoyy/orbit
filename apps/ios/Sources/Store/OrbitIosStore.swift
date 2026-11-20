@@ -671,9 +671,16 @@ public final class OrbitIosStore: ObservableObject {
         hapticLight()
     }
 
-    public func markAgentSeen(hostId: String, agentId: String, seq: UInt64) {
+    public func markAgentSeen(
+        hostId: String,
+        agentId: String,
+        seq: UInt64,
+        refreshSidebarAfter: Bool = true
+    ) {
         core?.markAgentSeen(hostId: hostId, agentId: agentId, seq: seq)
-        refreshSidebar()
+        if refreshSidebarAfter {
+            refreshSidebar()
+        }
     }
 
     public func markAgentUnread(hostId: String, agentId: String) {
@@ -1098,7 +1105,7 @@ public final class OrbitIosStore: ObservableObject {
             }
 
         case let .terminalChanged(_, hostId, _):
-            if hostId == selectedHostId {
+            if hostId == selectedHostId && activeSheet == .pty {
                 terminalScreen = core?.terminalScreen(hostId: hostId)
             }
         }
@@ -1332,18 +1339,23 @@ public final class OrbitIosStore: ObservableObject {
 
         agentStage = stage
         if let card = stage.agent {
-            selectedProvider = card.provider
-            if let m = card.model { selectedModel = m }
-            if let e = card.effort { selectedEffort = e }
-            selectedMode = card.mode
+            if selectedProvider != card.provider { selectedProvider = card.provider }
+            if let m = card.model, selectedModel != m { selectedModel = m }
+            if let e = card.effort, selectedEffort != e { selectedEffort = e }
+            if selectedMode != card.mode { selectedMode = card.mode }
             if !card.cwd.isEmpty && card.cwd != activeCwd {
                 updateActiveWorkspaceCwd(card.cwd)
             }
             if hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
-                markAgentSeen(hostId: hostId, agentId: agentId, seq: max(card.latestSeq, stage.latestSeq))
+                markAgentSeen(
+                    hostId: hostId,
+                    agentId: agentId,
+                    seq: max(card.latestSeq, stage.latestSeq),
+                    refreshSidebarAfter: !card.isRunning
+                )
             }
         } else if hostId == selectedHostId && agentId == selectedAgentId && !isDraftNewSession {
-            markAgentSeen(hostId: hostId, agentId: agentId, seq: stage.latestSeq)
+            markAgentSeen(hostId: hostId, agentId: agentId, seq: stage.latestSeq, refreshSidebarAfter: false)
         }
 
         if hostId == selectedHostId && agentId == selectedAgentId {

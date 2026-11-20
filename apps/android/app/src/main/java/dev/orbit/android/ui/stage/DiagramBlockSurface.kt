@@ -145,6 +145,12 @@ private fun SvgWebCanvas(
                 web.loadDataWithBaseURL(null, htmlTag, "text/html", "UTF-8", null)
             }
         },
+        onRelease = { web ->
+            web.stopLoading()
+            web.loadUrl("about:blank")
+            web.removeAllViews()
+            web.destroy()
+        },
     )
 }
 
@@ -183,6 +189,7 @@ internal fun DiagramBlockSurface(
             return@LaunchedEffect
         }
         isLoading = true
+        delay(180L)
         rendered = renderer(kind, block.rawCode, colors.isDark)
         isLoading = false
     }

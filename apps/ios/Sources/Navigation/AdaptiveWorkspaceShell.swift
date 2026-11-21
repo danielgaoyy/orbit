@@ -7,6 +7,8 @@ struct AdaptiveWorkspaceShell: View {
     @Environment(\.orbitPalette) private var palette
 
     @State private var activeSheetDetent: PresentationDetent = .large
+    @State private var renamePrimaryField: String = ""
+    @State private var renameSecondaryField: String = ""
     @GestureState private var drawerDragTranslation: CGFloat = 0
 
     private var appearanceMode: OrbitAppearanceMode {
@@ -53,6 +55,68 @@ struct AdaptiveWorkspaceShell: View {
                     activeSheetDetent = destination.defaultDetent
                 }
         }
+        .onChange(of: store.renameTarget) { target in
+            switch target {
+            case let .agent(_, _, currentTitle, currentHandle):
+                renamePrimaryField = currentTitle
+                renameSecondaryField = currentHandle ?? ""
+            case let .workspace(_, _, currentTitle):
+                renamePrimaryField = currentTitle
+                renameSecondaryField = ""
+            case nil:
+                break
+            }
+        }
+        .alert(
+            renameAlertTitle,
+            isPresented: Binding(
+                get: { store.renameTarget != nil },
+                set: { if !$0 { store.renameTarget = nil } }
+            )
+        ) {
+            TextField("Title", text: $renamePrimaryField)
+            if case .agent = store.renameTarget {
+                TextField("Peer @handle (optional)", text: $renameSecondaryField)
+            }
+            Button("Save") {
+                commitRename()
+            }
+            Button("Cancel", role: .cancel) {
+                store.renameTarget = nil
+            }
+        }
+    }
+
+    private var renameAlertTitle: String {
+        switch store.renameTarget {
+        case .agent: return "Rename Conversation"
+        case .workspace: return "Rename Workspace"
+        case nil: return "Rename"
+        }
+    }
+
+    private func commitRename() {
+        guard let target = store.renameTarget else { return }
+        let title = renamePrimaryField.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch target {
+        case let .agent(hid, aid, _, _):
+            let handle = renameSecondaryField
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+            store.updateAgentIdentity(
+                hostId: hid,
+                agentId: aid,
+                handle: handle.isEmpty ? nil : handle,
+                title: title.isEmpty ? nil : title,
+                lockHandle: !handle.isEmpty,
+                lockTitle: !title.isEmpty
+            )
+        case let .workspace(hid, wid, _):
+            if !title.isEmpty {
+                store.renameWorkspace(hostId: hid, workspaceId: wid, title: title)
+            }
+        }
+        store.renameTarget = nil
     }
 
     // MARK: - iPad Responsive Split Workspace (>= 700pt)
@@ -82,7 +146,7 @@ struct AdaptiveWorkspaceShell: View {
 
             if canShowInlineInspector && store.isPadDiffInspectorVisible {
                 OrbitHairline(axis: .vertical)
-                GitDiffInspectorView(store: store)
+                PadMultiTabInspectorView(store: store)
                     .frame(width: OrbitSpacing.inspectorWidth)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
@@ -222,6 +286,28 @@ struct AdaptiveWorkspaceShell: View {
             DirectoryBrowserSheet(store: store)
         case .settings:
             SettingsAndQuotasSheet(store: store, appearanceRaw: $appearanceRaw)
+        case let .workspaceBoard(workspaceId):
+            WorkspaceBoardSheet(store: store, workspaceId: workspaceId)
+        case .sessionOverview:
+            SessionOverviewSheet(store: store)
+        case .sideQuestion:
+            SideQuestionSheet(store: store)
+        case let .workspaceFiles(initialPath):
+            WorkspaceFilesSheet(store: store, initialPath: initialPath)
+        case .automations:
+            AutomationsSheet(store: store)
+        case .archivedThreads:
+            ArchivedThreadsSheet(store: store)
+        case let .spawnPeer(workspaceId):
+            SpawnPeerSheet(store: store, workspaceId: workspaceId)
+        case let .createWorkspace(projectRoot, projectName, isGitRepo, moveAgentId):
+            CreateWorkspaceSheet(
+                store: store,
+                projectRoot: projectRoot,
+                projectName: projectName,
+                isGitRepo: isGitRepo,
+                moveAgentId: moveAgentId
+            )
         }
     }
 
@@ -444,32 +530,58 @@ private func workspaceHeaderMoreMenuItems(
     ctx: WorkspaceHeaderContext
 ) -> some View {
     Section {
+        if store.activeAgent != nil {
+            Button {
+                store.openSessionOverview()
+            } label: {
+                let bgCount = store.activeRunningBackgroundTaskCount
+                Text("Session Overview")
+                if bgCount > 0 {
+                    Text("\(bgCount) running")
+                }
+                Image(systemName: "sidebar.right")
+            }
+        }
+
+        if let ws = store.activeWorkspace, ws.isCurated || store.activeWorkspacePeers.count > 1 {
+            Button {
+                store.openWorkspaceBoard(workspaceId: ws.workspaceId)
+            } label: {
+                Text("Mission Board")
+                if ws.boardRevision > 0 {
+                    Text("v\(ws.boardRevision)")
+                }
+                Image(systemName: "doc.richtext")
+            }
+        }
+
+        Button {
+            store.openWorkspaceFiles()
+        } label: {
+            Text("Files")
+            if !store.workspaceFilesList.isEmpty {
+                Text("\(store.workspaceFilesList.count)")
+            }
+            Image(systemName: "folder")
+        }
+
         Button {
             store.hapticLight()
             if canShowInlineInspector {
                 store.refreshGitReview()
+                store.padInspectorTab = .diff
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                    store.isPadDiffInspectorVisible.toggle()
+                    store.isPadDiffInspectorVisible = true
                 }
             } else {
                 store.openGitDiff()
             }
         } label: {
-            Text(canShowInlineInspector && store.isPadDiffInspectorVisible ? "Hide Diff Review" : "Diff Review")
+            Text("Diff Review")
             if let diffSubtitle = ctx.diffSubtitle {
                 Text(diffSubtitle)
             }
             Image(systemName: "arrow.left.arrow.right")
-        }
-
-        if canShowInlineInspector && store.isPadDiffInspectorVisible {
-            Button {
-                store.hapticLight()
-                store.refreshGitReview()
-                store.activeSheet = .gitDiff
-            } label: {
-                Label("Full Diff", systemImage: "arrow.up.left.and.arrow.down.right")
-            }
         }
 
         Button {
@@ -482,10 +594,39 @@ private func workspaceHeaderMoreMenuItems(
             }
             Image(systemName: "terminal")
         }
+
+        Button {
+            store.openSideQuestion()
+        } label: {
+            Text("Side Question (/btw)")
+            if !store.activeSideQuestions.isEmpty {
+                Text("\(store.activeSideQuestions.count)")
+            }
+            Image(systemName: "bubble.left.and.text.bubble.right")
+        }
     }
 
     if let agent = store.activeAgent {
         Section {
+            if let hid = store.selectedHostId {
+                Button {
+                    store.renameTarget = .agent(
+                        hostId: hid,
+                        agentId: agent.agentId,
+                        currentTitle: agent.title,
+                        currentHandle: agent.handle
+                    )
+                } label: {
+                    Label("Rename Conversation", systemImage: "pencil")
+                }
+            }
+
+            Button {
+                store.summarizeAgent(agent.agentId)
+            } label: {
+                Label("AI Summarize Session", systemImage: "sparkles")
+            }
+
             Button(role: .destructive) {
                 store.hapticLight()
                 store.archiveSession(agent.agentId)
@@ -614,6 +755,21 @@ private struct WorkspaceStagePane: View {
             }
         } else if store.activeAgent != nil {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    store.openSessionOverview()
+                } label: {
+                    Image(systemName: "sidebar.right")
+                        .overlay(alignment: .topTrailing) {
+                            if store.activeRunningBackgroundTaskCount > 0 {
+                                Circle()
+                                    .fill(palette.direct)
+                                    .frame(width: 6.5, height: 6.5)
+                                    .offset(x: 2, y: -2)
+                            }
+                        }
+                }
+                .accessibilityLabel("Session Overview")
+
                 Menu {
                     workspaceHeaderMoreMenuItems(
                         store: store,
@@ -759,6 +915,29 @@ struct WorkspaceTopBar: View {
                 .accessibilityLabel("Settings")
                 .padding(.trailing, -OrbitSpacing.sm)
             } else {
+                if store.activeAgent != nil {
+                    Button {
+                        store.openSessionOverview()
+                    } label: {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: "sidebar.right")
+                                .font(OrbitTypography.icon)
+                                .foregroundStyle(palette.fgPrimary)
+                                .padding(OrbitSpacing.xs)
+                            if store.activeRunningBackgroundTaskCount > 0 {
+                                Circle()
+                                    .fill(palette.direct)
+                                    .frame(width: 6, height: 6)
+                                    .offset(x: 1, y: 1)
+                            }
+                        }
+                        .frame(width: OrbitSpacing.hitTarget, height: OrbitSpacing.hitTarget)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Session Overview")
+                }
+
                 Menu {
                     workspaceHeaderMoreMenuItems(
                         store: store,
@@ -796,5 +975,96 @@ struct WorkspaceTopBar: View {
         .padding(.horizontal, OrbitSpacing.lg)
         .frame(height: OrbitSpacing.hitTarget)
         .background(palette.canvas)
+    }
+}
+
+// MARK: - iPad 3rd-Column Multi-Tab Inspector (Overview / Diff / Board / Files / Side Q&A)
+
+private struct PadMultiTabInspectorView: View {
+    @ObservedObject var store: OrbitIosStore
+    @Environment(\.orbitPalette) private var palette
+
+    private var availableTabs: [OrbitPadInspectorTab] {
+        var tabs: [OrbitPadInspectorTab] = [.overview, .diff]
+        if let ws = store.activeWorkspace, ws.isCurated || store.activeWorkspacePeers.count > 1 {
+            tabs.append(.board)
+        }
+        tabs.append(.files)
+        tabs.append(.sideQuestion)
+        return tabs
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 4) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 4) {
+                        ForEach(availableTabs) { tab in
+                            let selected = store.padInspectorTab == tab
+                            Button {
+                                store.hapticLight()
+                                store.padInspectorTab = tab
+                                if tab == .diff {
+                                    store.refreshGitReview()
+                                } else if tab == .files && store.workspaceFilesList.isEmpty {
+                                    store.refreshWorkspaceFiles()
+                                } else if tab == .board, let wsId = store.activeWorkspace?.workspaceId {
+                                    store.fetchWorkspaceBoardAndEvents(wsId)
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: tab.systemImage)
+                                        .font(.system(size: 11, weight: .medium))
+                                    Text(tab.label)
+                                        .font(OrbitTypography.meta(selected ? .semibold : .medium))
+                                }
+                                .foregroundStyle(selected ? palette.fgPrimary : palette.fgMuted)
+                                .padding(.horizontal, 9)
+                                .frame(height: 28)
+                                .background(selected ? palette.activeRowFill : Color.clear, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                Button {
+                    store.hapticLight()
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.88)) {
+                        store.isPadDiffInspectorVisible = false
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(palette.fgMuted)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close Inspector")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(palette.drawer)
+
+            OrbitHairline()
+
+            switch store.padInspectorTab {
+            case .overview:
+                SessionOverviewPanel(store: store)
+            case .diff:
+                GitDiffInspectorView(store: store)
+            case .board:
+                if let wsId = store.activeWorkspace?.workspaceId {
+                    WorkspaceBoardPanel(store: store, workspaceId: wsId)
+                } else {
+                    SessionOverviewPanel(store: store)
+                }
+            case .files:
+                WorkspaceFilesPanel(store: store, initialPath: store.activeWorkspaceFilePath)
+            case .sideQuestion:
+                SideQuestionPanel(store: store)
+            }
+        }
+        .background(palette.drawer)
     }
 }

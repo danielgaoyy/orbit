@@ -28,6 +28,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: Orbit
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false

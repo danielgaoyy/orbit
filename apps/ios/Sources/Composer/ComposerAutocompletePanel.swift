@@ -96,6 +96,10 @@ struct ComposerMentionPanel: View {
 
     private func iconName(for item: FfiMentionCandidate) -> String {
         switch item.kind {
+        case "peer":
+            return "at"
+        case "all":
+            return "person.3"
         case "staged":
             return "arrow.left.arrow.right"
         case "git_diff":

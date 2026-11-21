@@ -334,6 +334,10 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
 
     if platform == ClientPlatform::Desktop {
         all
+    } else if platform == ClientPlatform::Ios {
+        all.into_iter()
+            .filter(|c| !c.desktop_only || c.id == "files")
+            .collect()
     } else {
         all.into_iter().filter(|c| !c.desktop_only).collect()
     }
@@ -1121,8 +1125,11 @@ mod tests {
     fn slash_commands_filters_platform_and_query() {
         let desktop = slash_commands(ClientPlatform::Desktop);
         let ios = slash_commands(ClientPlatform::Ios);
+        let android = slash_commands(ClientPlatform::Android);
         assert!(desktop.iter().any(|c| c.id == "files"));
-        assert!(!ios.iter().any(|c| c.id == "files"));
+        assert!(ios.iter().any(|c| c.id == "files"));
+        assert!(!ios.iter().any(|c| c.id == "browser"));
+        assert!(!android.iter().any(|c| c.id == "files"));
         assert!(ios.iter().any(|c| c.id == "btw"));
 
         let rev = filter_slash_commands("audit", ClientPlatform::Harmony);

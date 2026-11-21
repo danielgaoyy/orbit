@@ -2768,16 +2768,65 @@ fn rpc_err(request_id: uuid::Uuid, code: &str, message: impl ToString) -> WireMe
     }
 }
 
+fn non_empty_trimmed(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(unix)]
+fn run_hostname_cmd(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout.lines().find_map(non_empty_trimmed)
+}
+
 fn hostname_string() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|s| s.trim().to_string())
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "orbit-host".to_string())
+    if let Ok(env_host) = std::env::var("HOSTNAME")
+        && let Some(clean) = non_empty_trimmed(&env_host)
+    {
+        return clean;
+    }
+    if let Ok(file_host) = std::fs::read_to_string("/etc/hostname")
+        && let Some(clean) = non_empty_trimmed(&file_host)
+    {
+        return clean;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(clean) = run_hostname_cmd("/usr/sbin/scutil", &["--get", "LocalHostName"])
+            .or_else(|| run_hostname_cmd("/usr/sbin/scutil", &["--get", "ComputerName"]))
+        {
+            return clean;
+        }
+    }
+    #[cfg(unix)]
+    {
+        if let Some(clean) = run_hostname_cmd("/bin/hostname", &["-s"])
+            .or_else(|| run_hostname_cmd("hostname", &["-s"]))
+            .or_else(|| run_hostname_cmd("hostname", &[]))
+        {
+            return clean;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(win_host) = std::env::var("COMPUTERNAME")
+            && let Some(clean) = non_empty_trimmed(&win_host)
+        {
+            return clean;
+        }
+    }
+    "orbit-host".to_string()
 }
 
 fn shell_single_quote(raw: &str) -> String {
@@ -3087,5 +3136,12 @@ mod self_upgrade_tests {
             build_self_upgrade_restart_script(bin, Some(Path::new("/tmp/o home")), 7474, true);
         assert!(with_relay.contains("--home '/tmp/o home' daemon up --port 7474"));
         assert!(with_relay.contains("relay up >/dev/null 2>&1 || true"));
+    }
+
+    #[test]
+    fn hostname_string_resolves_real_non_fallback_host_name() {
+        let resolved = hostname_string();
+        assert!(!resolved.trim().is_empty());
+        assert_ne!(resolved, "orbit-host");
     }
 }

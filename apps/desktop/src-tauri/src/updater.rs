@@ -834,6 +834,22 @@ async fn download_orbit_cli_binary(dst_tmp: &Path) -> Result<(), String> {
     Err(last_err)
 }
 
+/// Install the bundled `orbit` CLI sidecar into `~/.local/bin/orbit` ONLY if no local `orbit`
+/// binary exists yet. Called strictly on explicit user opt-in ("Connect This Machine").
+pub fn ensure_bundled_sidecar_installed() -> Result<(), String> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let install_path = home.join(".local/bin/orbit");
+    if install_path.is_file() {
+        return Ok(());
+    }
+    if let Some(sidecar) = bundled_orbit_sidecar_path() {
+        atomic_install_executable(&sidecar, &install_path)?;
+    }
+    Ok(())
+}
+
 /// Silently synchronize & hot-restart the local `orbit daemon` to match Desktop's version.
 ///
 /// - Preserves all running `orbit shim` agent & PTY sessions uninterrupted.

@@ -19,7 +19,8 @@ fn next_unique_local_tag(prefix: &str) -> String {
 
 use crate::updater::{
     AppUpdateProgress, CURRENT_APP_VERSION, LocalDaemonSyncResult, ReleaseUpdateInfo,
-    check_latest_release, perform_one_click_update, sync_local_daemon as run_sync_local_daemon,
+    check_latest_release, ensure_bundled_sidecar_installed, perform_one_click_update,
+    sync_local_daemon as run_sync_local_daemon,
 };
 
 use orbit_client_core::HostRouteMode;
@@ -39,10 +40,10 @@ use orbit_client_core::contract::{
     ModelSelectionRequest, RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
 };
 use orbit_client_core::desktop_ops::{
-    ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
-    detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
-    open_external_url, open_in_external_editor, pick_local_directory, provision_relay_over_ssh,
-    resolve_user_home, upgrade_remote_daemon_over_ssh,
+    ExternalEditorInfo, ExternalEditorKind, LocalMachineInfo, SshHostItem, StagedAttachmentInfo,
+    detect_installed_editors, discover_user_ssh_hosts, inspect_local_machine_info,
+    list_local_workspace_files, open_external_url, open_in_external_editor, pick_local_directory,
+    provision_relay_over_ssh, resolve_user_home, upgrade_remote_daemon_over_ssh,
 };
 use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
 use orbit_client_core::sidebar::FleetSidebarView;
@@ -320,6 +321,24 @@ async fn pair_ssh_host(
     })
     .await
     .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+async fn get_local_machine_info() -> Result<LocalMachineInfo, String> {
+    tauri::async_runtime::spawn_blocking(inspect_local_machine_info)
+        .await
+        .map_err(|e| format!("inspect local machine task error: {e}"))
+}
+
+#[tauri::command]
+async fn pair_local_host(state: State<'_, DesktopAppState>) -> Result<HostCardView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = ensure_bundled_sidecar_installed();
+        core.pair_local_host_blocking().map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("pair local host task error: {e}"))?
 }
 
 #[tauri::command]
@@ -1882,10 +1901,10 @@ pub fn run() {
         db_path = %db_path.display(),
         "Starting Orbit Desktop"
     );
-    let core = OrbitAppCore::open(&db_path, true)
+    let core = OrbitAppCore::open(&db_path, false)
         .or_else(|err| {
             tracing::error!(error = %err, "Failed to open desktop replica SQLite; falling back to in-memory store");
-            OrbitAppCore::open_in_memory_with_discovery(true)
+            OrbitAppCore::open_in_memory_with_discovery(false)
         })
         .expect("failed to initialize OrbitAppCore");
     core.connect_all_hosts();
@@ -1919,6 +1938,8 @@ pub fn run() {
             get_git_review,
             pair_host,
             pair_ssh_host,
+            get_local_machine_info,
+            pair_local_host,
             remove_host,
             update_host_config,
             update_host_relay,

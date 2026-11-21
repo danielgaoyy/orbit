@@ -27,6 +27,13 @@ pub struct SshHostItem {
     pub display_target: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalMachineInfo {
+    pub hostname: String,
+    pub host_id: Option<String>,
+    pub os_arch: String,
+}
+
 /// RAII guard for a dedicated background `ssh -N -L` tunnel process.
 ///
 /// Uses `ControlMaster=no` + `ControlPath=none` + `ServerAliveInterval=10` so user `~/.ssh/config`
@@ -154,7 +161,100 @@ pub fn extract_ws_port(endpoints: &[String]) -> Option<u16> {
     None
 }
 
-/// Automatically discover and ensure the current user's isolated local Orbit Daemon on Desktop (or Xcode iOS Simulator).
+fn non_empty_trimmed(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(unix)]
+fn run_hostname_cmd(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout.lines().find_map(non_empty_trimmed)
+}
+
+/// Detect the real OS hostname without ever falling back to `"orbit-host"` on macOS.
+pub fn detect_system_hostname() -> String {
+    if let Ok(env_host) = std::env::var("HOSTNAME")
+        && let Some(clean) = non_empty_trimmed(&env_host)
+    {
+        return clean;
+    }
+    if let Ok(file_host) = fs::read_to_string("/etc/hostname")
+        && let Some(clean) = non_empty_trimmed(&file_host)
+    {
+        return clean;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(clean) = run_hostname_cmd("/usr/sbin/scutil", &["--get", "LocalHostName"])
+            .or_else(|| run_hostname_cmd("/usr/sbin/scutil", &["--get", "ComputerName"]))
+        {
+            return clean;
+        }
+    }
+    #[cfg(unix)]
+    {
+        if let Some(clean) = run_hostname_cmd("/bin/hostname", &["-s"])
+            .or_else(|| run_hostname_cmd("hostname", &["-s"]))
+            .or_else(|| run_hostname_cmd("hostname", &[]))
+        {
+            return clean;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(win_host) = std::env::var("COMPUTERNAME")
+            && let Some(clean) = non_empty_trimmed(&win_host)
+        {
+            return clean;
+        }
+    }
+    "localhost".to_string()
+}
+
+/// Pure read-only lookup of the local Orbit daemon identity (`(host_id, public_key_b64)`), if a
+/// keypair already exists on disk. Never spawns `orbit daemon up` or creates files.
+pub fn read_local_daemon_identity() -> Option<(String, String)> {
+    let is_desktop = cfg!(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    ));
+    let is_ios_simulator =
+        cfg!(target_os = "ios") && std::env::var_os("SIMULATOR_HOST_HOME").is_some();
+    if !is_desktop && !is_ios_simulator {
+        return None;
+    }
+    let home = resolve_user_home()?;
+    let keypair_path = home.join(".orbit").join("host-keypair.json");
+    if !keypair_path.is_file() {
+        return None;
+    }
+    let raw = fs::read_to_string(&keypair_path).ok()?;
+    let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
+    let host_id = kp.host_id().ok()?;
+    Some((host_id, kp.public_key_b64))
+}
+
+/// Pure read-only metadata about this local machine for the explicit "Add Host -> This Machine" UI.
+pub fn inspect_local_machine_info() -> LocalMachineInfo {
+    let host_id = read_local_daemon_identity().map(|(id, _)| id);
+    LocalMachineInfo {
+        hostname: detect_system_hostname(),
+        host_id,
+        os_arch: format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
+    }
+}
+
+/// Explicitly ensure and obtain the local Orbit Daemon pairing URI on Desktop (or Xcode iOS Simulator).
 pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     let is_desktop = cfg!(any(
         target_os = "macos",
@@ -167,13 +267,21 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
         return None;
     }
     let home = resolve_user_home()?;
-    let candidates = [
+    let mut candidates = vec![
         home.join(".local/bin/orbit"),
         home.join(".cargo/bin/orbit"),
         home.join(".cargo/bin/orbit.exe"),
         PathBuf::from("/usr/local/bin/orbit"),
         PathBuf::from("/opt/homebrew/bin/orbit"),
     ];
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sidecar = dir.join("orbit");
+        if sidecar != exe {
+            candidates.push(sidecar);
+        }
+    }
     if is_desktop && let Some(orbit_bin) = candidates.into_iter().find(|p| p.is_file()) {
         let status_out = Command::new(&orbit_bin)
             .args(["daemon", "status"])
@@ -208,10 +316,7 @@ pub fn discover_local_daemon_pairing_uri() -> Option<String> {
     let raw = fs::read_to_string(&keypair_path).ok()?;
     let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
     let host_id = kp.host_id().ok()?;
-    let hostname = std::env::var("HOSTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "localhost".to_string());
+    let hostname = detect_system_hostname();
     let relay_url = fs::read_to_string(home.join(".orbit").join("config.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())

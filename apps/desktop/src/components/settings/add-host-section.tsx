@@ -1,23 +1,61 @@
-import { useState } from "react";
-import { Check, Loader2, Plus, Server } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Check, Laptop, Loader2, Plus, Server } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
 import { useImeCompositionGuard } from "@/lib/ime";
-import { type SshHostItem, orbitIpc } from "@/lib/orbit-ipc";
+import { type LocalMachineInfo, type SshHostItem, orbitIpc } from "@/lib/orbit-ipc";
+import { isLocalHostCard } from "@/lib/projects";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 export function AddHostSection() {
   const fleet = useOrbitSelector((s) => s.fleet);
   const sshHosts = useOrbitSelector((s) => s.sshHosts);
 
+  const [localMachine, setLocalMachine] = useState<LocalMachineInfo | null>(null);
+  const [connectingLocal, setConnectingLocal] = useState(false);
   const [pairingUri, setPairingUri] = useState("");
   const [showManualUri, setShowManualUri] = useState(false);
   const [connectingSshAlias, setConnectingSshAlias] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const ime = useImeCompositionGuard();
+
+  useEffect(() => {
+    let active = true;
+    void orbitIpc
+      .getLocalMachineInfo()
+      .then((info) => {
+        if (active) setLocalMachine(info);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [fleet.hosts.length]);
+
+  const localAlreadyPaired = fleet.hosts.some(
+    (h) =>
+      (localMachine?.host_id && h.host_id === localMachine.host_id) ||
+      isLocalHostCard(h),
+  );
+
+  const handlePairLocal = async () => {
+    setErrorMsg(null);
+    setConnectingLocal(true);
+    try {
+      const card = await orbitIpc.pairLocalHost();
+      await orbitActions.reloadFleetAndHosts();
+      orbitActions.selectHost(card.host_id);
+      orbitActions.setSettingsSection(`host:${card.host_id}:agents`);
+      orbitActions.showToast(`Connected ${card.display_name}`);
+    } catch (err) {
+      setErrorMsg(String(err));
+    } finally {
+      setConnectingLocal(false);
+    }
+  };
 
   const handlePairSsh = async (ssh: SshHostItem) => {
     setErrorMsg(null);
@@ -55,8 +93,55 @@ export function AddHostSection() {
     <div className="space-y-6">
       <SettingSectionHeader
         title="Add Host"
-        description="Connect a remote server or workstation running Orbit."
+        description="Connect this machine or a remote server running Orbit."
       />
+
+      {localMachine && (
+        <div className="space-y-2">
+          <SettingGroupLabel>This Machine</SettingGroupLabel>
+          <SettingCard>
+            <div className="flex items-center justify-between gap-3 px-4 py-3">
+              <div className="min-w-0">
+                <div className="text-foreground flex items-center gap-2 text-[13.5px] font-medium">
+                  <Laptop className="text-muted-foreground h-[14.5px] w-[14.5px] shrink-0" />
+                  <span className="truncate">{localMachine.hostname}</span>
+                  <span className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 text-[10.5px] font-medium">
+                    Local
+                  </span>
+                </div>
+                <div className="text-muted-foreground truncate pl-6 text-[12px]">
+                  {localAlreadyPaired
+                    ? "Running locally on this device."
+                    : "Optional — add this device as a host to run agents locally."}
+                </div>
+              </div>
+
+              {localAlreadyPaired ? (
+                <span className="text-muted-foreground inline-flex h-[30px] shrink-0 items-center gap-1.5 px-2 text-[12px] font-medium">
+                  <Check className="h-[13.5px] w-[13.5px] text-emerald-500" />
+                  Connected
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  disabled={connectingLocal || connectingSshAlias !== null}
+                  onClick={() => void handlePairLocal()}
+                  className="bg-foreground text-background inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-3 text-[12.5px] font-medium transition-opacity hover:opacity-90 disabled:pointer-events-none disabled:opacity-45"
+                >
+                  {connectingLocal ? (
+                    <>
+                      <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
+                      <span>Connecting…</span>
+                    </>
+                  ) : (
+                    <span>Connect</span>
+                  )}
+                </button>
+              )}
+            </div>
+          </SettingCard>
+        </div>
+      )}
 
       {sshHosts.length > 0 && (
         <div className="space-y-2">

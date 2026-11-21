@@ -111,9 +111,10 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   };
 
   const handleRemoveHost = async () => {
+    const remainingCount = fleet.hosts.filter((h) => h.host_id !== host.host_id).length;
     await orbitIpc.removeHost(host.host_id);
     await orbitActions.reloadFleetAndHosts();
-    orbitActions.setSettingsSection("general");
+    orbitActions.setSettingsSection(remainingCount > 0 ? "general" : "add_host");
     orbitActions.showToast(`Removed ${host.display_name}`);
   };
 
@@ -376,24 +377,22 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
         </div>
       </div>
 
-      {/* Danger Zone: Remove non-sole host */}
-      {fleet.hosts.length > 1 && (
-        <SettingCard>
-          <SettingRow
-            title="Remove host"
-            description="Unpair this machine from Orbit Desktop."
+      {/* Danger Zone: Remove host */}
+      <SettingCard>
+        <SettingRow
+          title="Remove host"
+          description="Unpair this machine from Orbit Desktop. It will not be re-added automatically."
+        >
+          <button
+            type="button"
+            onClick={() => void handleRemoveHost()}
+            className="inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border border-rose-500/25 px-3 text-[12px] font-medium text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
           >
-            <button
-              type="button"
-              onClick={() => void handleRemoveHost()}
-              className="inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border border-rose-500/25 px-3 text-[12px] font-medium text-rose-600 transition-colors hover:bg-rose-500/10 dark:text-rose-400"
-            >
-              <Trash2 className="h-[13px] w-[13px]" />
-              <span>Remove</span>
-            </button>
-          </SettingRow>
-        </SettingCard>
-      )}
+            <Trash2 className="h-[13px] w-[13px]" />
+            <span>Remove</span>
+          </button>
+        </SettingRow>
+      </SettingCard>
     </div>
   );
 }

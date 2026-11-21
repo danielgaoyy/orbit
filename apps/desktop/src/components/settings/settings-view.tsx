@@ -267,7 +267,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
 
                 <div className="border-border/60 border-t pt-3">
                   <SettingsRailButton
-                    label="Connect Remote Host"
+                    label="Add Host"
                     icon={Plus}
                     active={section === "add_host"}
                     onClick={() => orbitActions.setSettingsSection("add_host")}
@@ -294,7 +294,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
 
                 <div className="border-border/60 border-t pt-3">
                   <SettingsRailButton
-                    label="Connect Remote Host"
+                    label="Add Host"
                     icon={Plus}
                     active={section === "add_host"}
                     onClick={() => orbitActions.setSettingsSection("add_host")}

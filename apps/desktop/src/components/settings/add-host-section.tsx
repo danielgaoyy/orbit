@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, Loader2, Plus, Server } from "lucide-react";
+import { ArrowRight, Check, Cloud, Loader2, Plus, Server } from "lucide-react";
 import {
   SettingCard,
   SettingGroupLabel,
@@ -12,6 +12,7 @@ import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 export function AddHostSection() {
   const fleet = useOrbitSelector((s) => s.fleet);
   const sshHosts = useOrbitSelector((s) => s.sshHosts);
+  const cloudSyncStatus = useOrbitSelector((s) => s.cloudSyncStatus);
 
   const [pairingUri, setPairingUri] = useState("");
   const [showManualUri, setShowManualUri] = useState(false);
@@ -57,6 +58,36 @@ export function AddHostSection() {
         title="Add Host"
         description="Connect a remote server or workstation running Orbit."
       />
+
+      {cloudSyncStatus?.state !== "ready" && (
+        <div className="border-border/80 bg-background/60 flex items-center justify-between gap-3 rounded-[13px] border px-4 py-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="bg-muted flex h-8 w-8 shrink-0 items-center justify-center rounded-lg">
+              <Cloud className="text-foreground/80 h-4 w-4" />
+            </div>
+            <div className="min-w-0">
+              <div className="text-foreground text-[13px] font-medium">
+                {cloudSyncStatus?.state === "locked"
+                  ? `Unlock Cloud Sync (@${cloudSyncStatus.account_login})`
+                  : "Sync existing hosts via GitHub"}
+              </div>
+              <div className="text-muted-foreground truncate text-[12px]">
+                {cloudSyncStatus?.state === "locked"
+                  ? "Enter your Sync Passphrase to pull all paired hosts automatically."
+                  : "Zero-server E2EE sync — skip entering pairing codes on every device."}
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => orbitActions.setSettingsSection("cloud_sync")}
+            className="border-border bg-background hover:bg-accent inline-flex h-[30px] shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border px-3 text-[12px] font-medium transition-colors"
+          >
+            <span>{cloudSyncStatus?.state === "locked" ? "Unlock" : "Sign in"}</span>
+            <ArrowRight className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
 
       {sshHosts.length > 0 && (
         <div className="space-y-2">

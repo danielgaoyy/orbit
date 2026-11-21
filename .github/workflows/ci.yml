@@ -12,6 +12,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  ORBIT_GITHUB_CLIENT_ID: ${{ vars.ORBIT_GITHUB_CLIENT_ID }}
+
 jobs:
   rust-quality-and-e2e:
     name: Rust Clippy & E2E Tests

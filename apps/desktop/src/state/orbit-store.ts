@@ -25,12 +25,15 @@ import {
 import {
   type AgentStageView,
   type ClientThreadPrefSeed,
+  type CloudSyncResultView,
+  type CloudSyncStatusView,
   type ComposerContextInput,
   type CoreNotification,
   type ExternalEditorInfo,
   type ExternalEditorKind,
   type FleetOverviewView,
   type FleetSidebarView,
+  type GitHubDeviceFlowStartView,
   type GitReposInspectionView,
   type GitReviewView,
   type HostDetailView,
@@ -241,6 +244,7 @@ export type WorkspacePanelMode = "conversation" | "automations";
 export type HostSettingsTab = "agents" | "usage" | "connection";
 export type SettingsSection =
   | "general"
+  | "cloud_sync"
   | "appearance"
   | "shortcuts"
   | "notifications"
@@ -416,6 +420,13 @@ export interface OrbitUiState {
   checkingReleaseUpdate: boolean;
   releaseCheckError: string | null;
   fleetUpdate: FleetUpdateState;
+
+  // Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist)
+  cloudSyncStatus: CloudSyncStatusView | null;
+  cloudSyncBusy: boolean;
+  cloudSyncError: string | null;
+  cloudSyncDeviceFlow: GitHubDeviceFlowStartView | null;
+  cloudSyncLastResult: CloudSyncResultView | null;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -732,6 +743,12 @@ let state: OrbitUiState = {
     summaryMessage: null,
     pendingDesktopUpdate: false,
   },
+
+  cloudSyncStatus: null,
+  cloudSyncBusy: false,
+  cloudSyncError: null,
+  cloudSyncDeviceFlow: null,
+  cloudSyncLastResult: null,
 
   theme: initialTheme,
   resolvedTheme: initialResolvedTheme,
@@ -1258,13 +1275,15 @@ export const orbitActions = {
 
     // 2. Non-blocking secondary metadata bootstrap (never blocks or aborts fleet hydration)
     void (async () => {
-      const [editors, sshList, version, fallbackCatalogs, slashCommands] = await Promise.all([
-        orbitIpc.listExternalEditors().catch(() => []),
-        orbitIpc.listSshHosts().catch(() => []),
-        orbitIpc.getAppVersion().catch(() => null),
-        orbitIpc.getFallbackProviderCatalogs().catch(() => []),
-        orbitIpc.getSlashCommands("desktop").catch(() => []),
-      ]);
+      const [editors, sshList, version, fallbackCatalogs, slashCommands, cloudSyncStatus] =
+        await Promise.all([
+          orbitIpc.listExternalEditors().catch(() => []),
+          orbitIpc.listSshHosts().catch(() => []),
+          orbitIpc.getAppVersion().catch(() => null),
+          orbitIpc.getFallbackProviderCatalogs().catch(() => []),
+          orbitIpc.getSlashCommands("desktop").catch(() => []),
+          orbitIpc.getCloudSyncStatus().catch(() => null),
+        ]);
       seedFallbackProviderCatalogs(fallbackCatalogs);
       setState((s) => ({
         ...s,
@@ -1272,7 +1291,11 @@ export const orbitActions = {
         sshHosts: sshList,
         appVersion: version,
         slashCommands,
+        cloudSyncStatus,
       }));
+      if (cloudSyncStatus?.state === "ready") {
+        void orbitActions.hydrateSyncedPreferencesFromCore();
+      }
       maybeAutoSyncOutdatedHosts();
 
       // Sanitize persisted draft models against Rust catalog & retired-slug table
@@ -5596,6 +5619,7 @@ export const orbitActions = {
     const resolved = resolveTheme(theme);
     applyDocumentTheme(resolved);
     setState((s) => ({ ...s, theme, resolvedTheme: resolved }), true);
+    void pushCloudPrefPatch({ theme });
   },
 
   cycleTheme(): void {
@@ -5606,6 +5630,7 @@ export const orbitActions = {
 
   setEnterToSend(enabled: boolean): void {
     setState((s) => ({ ...s, enterToSend: enabled }), true);
+    void pushCloudPrefPatch({ enterToSend: enabled });
   },
 
   setNotificationPrefs(patch: {
@@ -5620,6 +5645,7 @@ export const orbitActions = {
       }),
       true,
     );
+    void pushCloudPrefPatch(patch);
   },
 
   setWorktreePrefs(patch: {
@@ -5634,6 +5660,7 @@ export const orbitActions = {
       }),
       true,
     );
+    void pushCloudPrefPatch(patch);
   },
 
   setPreferredEditor(editor: ExternalEditorKind | null): void {
@@ -6054,10 +6081,327 @@ export const orbitActions = {
     notifyToast(msg);
   },
 
+  // --- Zero-Server E2EE Cloud Sync Actions ---
+
+  async refreshCloudSyncStatus(): Promise<CloudSyncStatusView | null> {
+    try {
+      const status = await orbitIpc.getCloudSyncStatus();
+      setState((s) => ({ ...s, cloudSyncStatus: status }));
+      return status;
+    } catch {
+      return null;
+    }
+  },
+
+  async hydrateSyncedPreferencesFromCore(): Promise<void> {
+    try {
+      const prefs = await orbitIpc.cloudSyncGetPreferences();
+      if (!prefs || Object.keys(prefs).length === 0) return;
+      let nextTheme: ThemeMode | null = null;
+      if (prefs.theme === "system" || prefs.theme === "light" || prefs.theme === "dark") {
+        nextTheme = prefs.theme;
+      }
+      if (nextTheme) {
+        applyDocumentTheme(resolveTheme(nextTheme));
+      }
+      setState(
+        (s) => ({
+          ...s,
+          theme: nextTheme ?? s.theme,
+          resolvedTheme: nextTheme ? resolveTheme(nextTheme) : s.resolvedTheme,
+          enterToSend: typeof prefs.enterToSend === "boolean" ? prefs.enterToSend : s.enterToSend,
+          notifyOnApproval:
+            typeof prefs.notifyOnApproval === "boolean"
+              ? prefs.notifyOnApproval
+              : s.notifyOnApproval,
+          notifyOnTurnComplete:
+            typeof prefs.notifyOnTurnComplete === "boolean"
+              ? prefs.notifyOnTurnComplete
+              : s.notifyOnTurnComplete,
+          coalesceExploration:
+            typeof prefs.coalesceExploration === "boolean"
+              ? prefs.coalesceExploration
+              : s.coalesceExploration,
+          worktreeBranchPrefix:
+            typeof prefs.worktreeBranchPrefix === "string"
+              ? prefs.worktreeBranchPrefix
+              : s.worktreeBranchPrefix,
+          draftUseWorktree:
+            typeof prefs.draftUseWorktree === "boolean"
+              ? prefs.draftUseWorktree
+              : s.draftUseWorktree,
+          draftMode:
+            prefs.draftMode === "default" ||
+            prefs.draftMode === "plan" ||
+            prefs.draftMode === "accept_edits" ||
+            prefs.draftMode === "full_access"
+              ? prefs.draftMode
+              : s.draftMode,
+        }),
+        true,
+      );
+    } catch {
+      // Ignore preference hydration errors
+    }
+  },
+
+  async startGithubCloudLogin(clientIdOverride?: string | null): Promise<void> {
+    cloudDeviceFlowPollToken += 1;
+    const pollToken = cloudDeviceFlowPollToken;
+    setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
+    try {
+      const started = await orbitIpc.cloudSyncStartGithubDeviceFlow(clientIdOverride ?? null);
+      if (pollToken !== cloudDeviceFlowPollToken) return;
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncDeviceFlow: started,
+        cloudSyncError: null,
+      }));
+
+      // Poll GitHub Device Flow until authorized, cancelled, or expired
+      let intervalMs = Math.max(2000, started.interval_secs * 1000);
+      const deadline = Date.now() + started.expires_in_secs * 1000;
+      while (pollToken === cloudDeviceFlowPollToken && Date.now() < deadline) {
+        await new Promise((r) => window.setTimeout(r, intervalMs));
+        if (pollToken !== cloudDeviceFlowPollToken) return;
+        try {
+          const polled = await orbitIpc.cloudSyncPollGithubDeviceFlow(
+            started.device_code,
+            clientIdOverride ?? null,
+          );
+          if (pollToken !== cloudDeviceFlowPollToken) return;
+          if (polled.status === "pending") {
+            continue;
+          }
+          if (polled.status === "slow_down") {
+            intervalMs = Math.max(intervalMs + 5000, (polled.interval_secs ?? 10) * 1000);
+            continue;
+          }
+          if (polled.status === "authorized") {
+            const status = polled.sync_status ?? (await orbitIpc.getCloudSyncStatus());
+            setState((s) => ({
+              ...s,
+              cloudSyncDeviceFlow: null,
+              cloudSyncStatus: status,
+              cloudSyncError: null,
+            }));
+            notifyToast(
+              status.account_login
+                ? `Signed in to GitHub as @${status.account_login}`
+                : "Signed in to GitHub",
+            );
+            return;
+          }
+          setState((s) => ({
+            ...s,
+            cloudSyncDeviceFlow: null,
+            cloudSyncError: polled.error ?? "GitHub authorization did not complete.",
+          }));
+          return;
+        } catch (err) {
+          if (pollToken !== cloudDeviceFlowPollToken) return;
+          setState((s) => ({
+            ...s,
+            cloudSyncDeviceFlow: null,
+            cloudSyncError: String(err),
+          }));
+          return;
+        }
+      }
+      if (pollToken === cloudDeviceFlowPollToken) {
+        setState((s) => ({
+          ...s,
+          cloudSyncDeviceFlow: null,
+          cloudSyncError: "GitHub verification code expired — please start again.",
+        }));
+      }
+    } catch (err) {
+      if (pollToken !== cloudDeviceFlowPollToken) return;
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncDeviceFlow: null,
+        cloudSyncError: String(err),
+      }));
+    }
+  },
+
+  cancelGithubCloudLogin(): void {
+    cloudDeviceFlowPollToken += 1;
+    setState((s) => ({
+      ...s,
+      cloudSyncBusy: false,
+      cloudSyncDeviceFlow: null,
+      cloudSyncError: null,
+    }));
+  },
+
+  async loginCloudSyncWithToken(token: string): Promise<boolean> {
+    setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
+    try {
+      const status = await orbitIpc.cloudSyncLoginWithToken(token.trim());
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncStatus: status,
+        cloudSyncError: null,
+        cloudSyncDeviceFlow: null,
+      }));
+      notifyToast(
+        status.account_login
+          ? `Signed in to GitHub as @${status.account_login}`
+          : "Signed in to GitHub",
+      );
+      return true;
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncError: String(err),
+      }));
+      return false;
+    }
+  },
+
+  async unlockCloudSyncWithPassphrase(passphrase: string): Promise<boolean> {
+    setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
+    try {
+      // Seed current local syncable prefs before first unlock so a brand-new vault captures them
+      await orbitIpc.cloudSyncUpdatePreferences({
+        theme: state.theme,
+        enterToSend: state.enterToSend,
+        notifyOnApproval: state.notifyOnApproval,
+        notifyOnTurnComplete: state.notifyOnTurnComplete,
+        coalesceExploration: state.coalesceExploration,
+        worktreeBranchPrefix: state.worktreeBranchPrefix,
+        draftUseWorktree: state.draftUseWorktree,
+        draftMode: state.draftMode,
+      });
+      const result = await orbitIpc.cloudSyncUnlockWithPassphrase(passphrase);
+      const status = await orbitIpc.getCloudSyncStatus();
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncStatus: status,
+        cloudSyncLastResult: result,
+        cloudSyncError: null,
+      }));
+      await orbitActions.reloadFleetAndHosts();
+      await orbitActions.hydrateSyncedPreferencesFromCore();
+      notifyToast(formatCloudSyncToast(result));
+      return true;
+    } catch (err) {
+      const status = await orbitIpc.getCloudSyncStatus().catch(() => state.cloudSyncStatus);
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncStatus: status,
+        cloudSyncError: String(err),
+      }));
+      return false;
+    }
+  },
+
+  async syncCloudNow(): Promise<boolean> {
+    setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
+    try {
+      const result = await orbitIpc.cloudSyncNow();
+      const status = await orbitIpc.getCloudSyncStatus();
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncStatus: status,
+        cloudSyncLastResult: result,
+        cloudSyncError: null,
+      }));
+      await orbitActions.reloadFleetAndHosts();
+      await orbitActions.hydrateSyncedPreferencesFromCore();
+      notifyToast(formatCloudSyncToast(result));
+      return true;
+    } catch (err) {
+      const status = await orbitIpc.getCloudSyncStatus().catch(() => state.cloudSyncStatus);
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncStatus: status,
+        cloudSyncError: String(err),
+      }));
+      return false;
+    }
+  },
+
+  async setCloudAutoSync(enabled: boolean): Promise<void> {
+    try {
+      const status = await orbitIpc.cloudSyncSetAutoSync(enabled);
+      setState((s) => ({ ...s, cloudSyncStatus: status }));
+    } catch (err) {
+      notifyToast(`Failed to update auto-sync: ${String(err)}`);
+    }
+  },
+
+  async setCloudGithubClientId(clientId: string | null): Promise<void> {
+    try {
+      const status = await orbitIpc.cloudSyncSetGithubClientId(clientId);
+      setState((s) => ({ ...s, cloudSyncStatus: status, cloudSyncError: null }));
+    } catch (err) {
+      setState((s) => ({ ...s, cloudSyncError: String(err) }));
+    }
+  },
+
+  async logoutCloudSync(clearLocalHosts = false): Promise<void> {
+    cloudDeviceFlowPollToken += 1;
+    setState((s) => ({ ...s, cloudSyncBusy: true, cloudSyncError: null }));
+    try {
+      const status = await orbitIpc.cloudSyncLogout(clearLocalHosts);
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncStatus: status,
+        cloudSyncDeviceFlow: null,
+        cloudSyncLastResult: null,
+        cloudSyncError: null,
+      }));
+      if (clearLocalHosts) {
+        await orbitActions.reloadFleetAndHosts();
+      }
+      notifyToast("Signed out of Cloud Sync");
+    } catch (err) {
+      setState((s) => ({
+        ...s,
+        cloudSyncBusy: false,
+        cloudSyncError: String(err),
+      }));
+    }
+  },
+
   getSnapshot(): OrbitUiState {
     return state;
   },
 };
+
+let cloudDeviceFlowPollToken = 0;
+
+function formatCloudSyncToast(res: CloudSyncResultView): string {
+  const parts: string[] = [];
+  if (res.hosts_added > 0) parts.push(`+${res.hosts_added} host${res.hosts_added === 1 ? "" : "s"}`);
+  if (res.hosts_updated > 0) parts.push(`${res.hosts_updated} updated`);
+  if (res.hosts_removed > 0) parts.push(`-${res.hosts_removed} removed`);
+  if (res.projects_added > 0)
+    parts.push(`+${res.projects_added} project${res.projects_added === 1 ? "" : "s"}`);
+  if (res.preferences_updated > 0) parts.push(`${res.preferences_updated} pref synced`);
+  if (parts.length === 0) {
+    return res.pushed_remote
+      ? `Cloud Sync uploaded (rev #${res.vault_revision})`
+      : `Cloud Sync up to date (rev #${res.vault_revision})`;
+  }
+  return `Cloud Synced: ${parts.join(", ")}`;
+}
+
+async function pushCloudPrefPatch(patch: Record<string, unknown>): Promise<void> {
+  if (state.cloudSyncStatus?.state !== "ready") return;
+  await orbitIpc.cloudSyncUpdatePreferences(patch);
+}
 
 let nextFileFocusNonce = 1;
 

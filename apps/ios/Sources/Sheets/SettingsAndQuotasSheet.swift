@@ -8,6 +8,13 @@ struct SettingsAndQuotasSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.orbitPalette) private var palette
 
+    @State private var cloudClientIdInput = ""
+    @State private var cloudTokenInput = ""
+    @State private var cloudUseTokenFallback = false
+    @State private var cloudPassphraseInput = ""
+    @State private var cloudConfirmPassphraseInput = ""
+    @State private var cloudGeneratedKey: String? = nil
+
     private var selectedAppearance: OrbitAppearanceMode {
         OrbitAppearanceMode.fromStorage(appearanceRaw)
     }
@@ -32,6 +39,7 @@ struct SettingsAndQuotasSheet: View {
                 VStack(alignment: .leading, spacing: OrbitSpacing.xl) {
                     appearanceSection
                     generalPreferencesSection
+                    cloudSyncSection
                     hostsSection
                     if store.activeHost != nil {
                         quotasSection
@@ -67,6 +75,7 @@ struct SettingsAndQuotasSheet: View {
             }
         }
         .onAppear {
+            store.refreshCloudSyncStatus()
             if store.activeHost != nil {
                 store.refreshQuotas()
             }
@@ -224,6 +233,332 @@ struct SettingsAndQuotasSheet: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    // MARK: - 1c. Zero-Server E2EE Cloud Sync (GitHub Secret Gist)
+
+    private var cloudSyncSection: some View {
+        let status = store.cloudSyncStatus
+        let state = status?.state ?? .signedOut
+        let oauthReady = status?.githubOauthConfigured ?? false
+
+        return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            HStack {
+                Text("Cloud Sync (GitHub E2EE)")
+                    .font(OrbitTypography.meta(.medium))
+                    .foregroundStyle(palette.fgMuted)
+                Spacer()
+                if state == .ready {
+                    Text("Synced")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.direct)
+                } else if state == .locked {
+                    Text("Locked")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.warning)
+                }
+            }
+            .padding(.horizontal, OrbitSpacing.xs)
+
+            VStack(alignment: .leading, spacing: OrbitSpacing.md) {
+                if state == .signedOut {
+                    if let flow = store.cloudSyncDeviceFlow {
+                        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+                            Text("Enter this code on GitHub")
+                                .font(OrbitTypography.subhead(.semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                            HStack {
+                                Text(flow.userCode)
+                                    .font(.system(.title3, design: .monospaced).weight(.bold))
+                                    .foregroundStyle(palette.fgPrimary)
+                                Spacer()
+                                Button("Copy") {
+                                    UIPasteboard.general.string = flow.userCode
+                                    store.showToast("Code copied")
+                                }
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(palette.accentSky)
+                            }
+                            .padding(OrbitSpacing.sm)
+                            .background(palette.subtleFill)
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                            HStack(spacing: OrbitSpacing.sm) {
+                                Button {
+                                    UIPasteboard.general.string = flow.userCode
+                                    if let url = URL(string: flow.verificationUri) {
+                                        UIApplication.shared.open(url)
+                                    }
+                                } label: {
+                                    Text("Copy & Open GitHub")
+                                        .font(OrbitTypography.subhead(.semibold))
+                                        .foregroundStyle(palette.onPrimary)
+                                        .frame(maxWidth: .infinity, minHeight: 38)
+                                        .background(palette.primary)
+                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                }
+                                .buttonStyle(.plain)
+
+                                Button("Cancel") {
+                                    store.cancelGithubCloudLogin()
+                                }
+                                .font(OrbitTypography.subhead(.medium))
+                                .foregroundStyle(palette.fgSecondary)
+                                .padding(.horizontal, OrbitSpacing.sm)
+                            }
+                        }
+                    } else {
+                        Text("Sync paired hosts & projects across devices via your own encrypted GitHub Secret Gist (`gist` scope only, zero Orbit servers).")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgSecondary)
+
+                        if !cloudUseTokenFallback {
+                            if !oauthReady {
+                                TextField("GitHub OAuth Client ID (Ov23li...)", text: $cloudClientIdInput)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .font(OrbitTypography.code(.regular))
+                                    .padding(10)
+                                    .background(palette.subtleFill)
+                                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            }
+                            Button {
+                                store.startGithubCloudLogin(
+                                    clientIdOverride: cloudClientIdInput.isEmpty ? nil : cloudClientIdInput
+                                )
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if store.cloudSyncBusy {
+                                        ProgressView().tint(palette.onPrimary)
+                                    } else {
+                                        Image(systemName: "icloud.and.arrow.down")
+                                    }
+                                    Text("Sign in with GitHub")
+                                        .font(OrbitTypography.subhead(.semibold))
+                                }
+                                .foregroundStyle(palette.onPrimary)
+                                .frame(maxWidth: .infinity, minHeight: 40)
+                                .background(palette.primary)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(store.cloudSyncBusy)
+                        } else {
+                            SecureField("GitHub Token (`gist` scope)", text: $cloudTokenInput)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .font(OrbitTypography.code(.regular))
+                                .padding(10)
+                                .background(palette.subtleFill)
+                                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+                            HStack(spacing: OrbitSpacing.sm) {
+                                Button {
+                                    store.loginCloudSyncWithToken(cloudTokenInput)
+                                    cloudTokenInput = ""
+                                } label: {
+                                    Text(store.cloudSyncBusy ? "Verifying…" : "Continue with Token")
+                                        .font(OrbitTypography.subhead(.semibold))
+                                        .foregroundStyle(palette.onPrimary)
+                                        .frame(maxWidth: .infinity, minHeight: 38)
+                                        .background(palette.primary)
+                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(store.cloudSyncBusy)
+
+                                Button("Create Token") {
+                                    if let url = URL(string: "https://github.com/settings/tokens/new?scopes=gist&description=Orbit%20Cloud%20Sync") {
+                                        UIApplication.shared.open(url)
+                                    }
+                                }
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(palette.accentSky)
+                            }
+                        }
+
+                        Button {
+                            cloudUseTokenFallback.toggle()
+                            store.cloudSyncError = nil
+                        } label: {
+                            Text(cloudUseTokenFallback ? "Use GitHub OAuth Device Login instead" : "Or sign in with a Personal Access Token (`gist`)")
+                                .font(OrbitTypography.meta(.medium))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else if state == .locked, let status {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("@\(status.accountLogin ?? "github")")
+                                .font(OrbitTypography.subhead(.semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                            Text(status.remoteVaultExists
+                                ? "Encrypted vault found — enter Sync Passphrase to unlock."
+                                : "Create a Sync Passphrase to encrypt your first vault.")
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgSecondary)
+                        }
+                        Spacer()
+                        Button("Sign Out") {
+                            store.logoutCloudSync(clearLocalHosts: false)
+                        }
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.danger)
+                    }
+
+                    if let gen = cloudGeneratedKey {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Generated Recovery Key (save it!)")
+                                    .font(OrbitTypography.meta(.semibold))
+                                    .foregroundStyle(palette.direct)
+                                Spacer()
+                                Button("Copy") {
+                                    UIPasteboard.general.string = gen
+                                    store.showToast("Recovery Key copied")
+                                }
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(palette.accentSky)
+                            }
+                            Text(gen)
+                                .font(OrbitTypography.code(.semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                                .textSelection(.enabled)
+                        }
+                        .padding(10)
+                        .background(palette.subtleFill)
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    }
+
+                    SecureField(
+                        status.remoteVaultExists ? "Sync Passphrase or Recovery Key" : "Create Sync Passphrase",
+                        text: $cloudPassphraseInput
+                    )
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .padding(10)
+                    .background(palette.subtleFill)
+                    .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+                    if !status.remoteVaultExists && cloudGeneratedKey == nil {
+                        SecureField("Confirm Sync Passphrase", text: $cloudConfirmPassphraseInput)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .padding(10)
+                            .background(palette.subtleFill)
+                            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    }
+
+                    HStack(spacing: OrbitSpacing.sm) {
+                        Button {
+                            if !status.remoteVaultExists && cloudGeneratedKey == nil && cloudPassphraseInput != cloudConfirmPassphraseInput {
+                                store.cloudSyncError = "Sync Passphrases do not match."
+                                return
+                            }
+                            let pass = cloudPassphraseInput
+                            store.unlockCloudSyncWithPassphrase(pass)
+                            cloudPassphraseInput = ""
+                            cloudConfirmPassphraseInput = ""
+                            cloudGeneratedKey = nil
+                        } label: {
+                            Text(store.cloudSyncBusy ? "Unlocking…" : (status.remoteVaultExists ? "Unlock & Sync" : "Encrypt & Sync"))
+                                .font(OrbitTypography.subhead(.semibold))
+                                .foregroundStyle(palette.onPrimary)
+                                .frame(maxWidth: .infinity, minHeight: 38)
+                                .background(palette.primary)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(store.cloudSyncBusy)
+
+                        if !status.remoteVaultExists {
+                            Button("Generate Key") {
+                                let rec = store.generateCloudSyncPassphrase()
+                                cloudGeneratedKey = rec
+                                cloudPassphraseInput = rec
+                                cloudConfirmPassphraseInput = rec
+                            }
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.accentSky)
+                        }
+                    }
+                } else if let status {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("@\(status.accountLogin ?? "github")")
+                                .font(OrbitTypography.subhead(.semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                            Text("\(status.syncedHostCount) hosts · \(status.syncedProjectCount) projects · rev #\(status.lastVaultRevision)")
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                        }
+                        Spacer()
+                        Button {
+                            store.syncCloudNow()
+                        } label: {
+                            HStack(spacing: 4) {
+                                if store.cloudSyncBusy {
+                                    ProgressView()
+                                } else {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                }
+                                Text("Sync")
+                            }
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.onPrimary)
+                            .padding(.horizontal, 12)
+                            .frame(minHeight: 32)
+                            .background(palette.primary)
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(store.cloudSyncBusy)
+                    }
+
+                    OrbitHairline()
+
+                    Toggle(isOn: Binding(
+                        get: { status.autoSyncEnabled },
+                        set: { store.setCloudAutoSync($0) }
+                    )) {
+                        Text("Auto-sync changes")
+                            .font(OrbitTypography.subhead(.regular))
+                            .foregroundStyle(palette.fgPrimary)
+                    }
+                    .tint(palette.direct)
+
+                    HStack {
+                        if let gistUrl = status.gistHtmlUrl, let url = URL(string: gistUrl), !gistUrl.isEmpty {
+                            Button("View Secret Gist") {
+                                UIApplication.shared.open(url)
+                            }
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(palette.accentSky)
+                        }
+                        Spacer()
+                        Button("Sign Out") {
+                            store.logoutCloudSync(clearLocalHosts: false)
+                        }
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.danger)
+                    }
+                }
+
+                if let err = store.cloudSyncError ?? status?.lastError, !err.isEmpty {
+                    Text(err)
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.danger)
+                }
+            }
+            .padding(OrbitSpacing.md)
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(palette.hairline, lineWidth: 0.5)
+            )
+        }
     }
 
     // MARK: - 2. Hosts Fleet (Progressive Disclosure Drill-Down)

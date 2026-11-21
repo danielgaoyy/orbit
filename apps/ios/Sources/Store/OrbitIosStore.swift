@@ -629,6 +629,13 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var lastError: String?
     @Published public var toastMessage: String?
 
+    // Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist)
+    @Published public private(set) var cloudSyncStatus: FfiCloudSyncStatus?
+    @Published public private(set) var cloudSyncBusy: Bool = false
+    @Published public var cloudSyncError: String?
+    @Published public private(set) var cloudSyncDeviceFlow: FfiGitHubDeviceFlowStart?
+    private var cloudDeviceFlowTask: Task<Void, Never>?
+
     private var core: OrbitMobileCore?
     private var listenerBridge: WeakMobileListenerBridge?
     private let pathMonitor = NWPathMonitor()
@@ -713,6 +720,7 @@ public final class OrbitIosStore: ObservableObject {
             instance.subscribeThrottled(listener: bridge, intervalMs: 24)
 
             self.localDaemonUri = instance.discoverLocalDaemonUri()
+            self.cloudSyncStatus = instance.cloudSyncStatus()
             self.refreshPasteboardAvailability()
 
             reloadFleet()
@@ -4070,5 +4078,223 @@ public final class OrbitIosStore: ObservableObject {
         core?.sendPrompt(hostId: hid, agentId: aid, prompt: prompt)
         hapticLight()
         showToast("Requested stop for \(task.title)")
+    }
+
+    // MARK: - Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist)
+
+    public func refreshCloudSyncStatus() {
+        cloudSyncStatus = core?.cloudSyncStatus()
+    }
+
+    public func generateCloudSyncPassphrase() -> String {
+        core?.cloudSyncGeneratePassphrase() ?? ""
+    }
+
+    public func startGithubCloudLogin(clientIdOverride: String? = nil) {
+        guard let core = self.core else { return }
+        cloudDeviceFlowTask?.cancel()
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        let cleanCid = clientIdOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveCid = (cleanCid?.isEmpty == false) ? cleanCid : nil
+
+        cloudDeviceFlowTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let started: FfiGitHubDeviceFlowStart = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncStartGithubDeviceFlow(clientIdOverride: effectiveCid)
+                }.value
+                guard !Task.isCancelled else { return }
+                self.cloudSyncBusy = false
+                self.cloudSyncDeviceFlow = started
+                self.cloudSyncError = nil
+
+                var intervalSecs = max(UInt64(2), started.intervalSecs)
+                let deadline = Date().addingTimeInterval(TimeInterval(started.expiresInSecs))
+
+                while !Task.isCancelled && Date() < deadline {
+                    try? await Task.sleep(nanoseconds: intervalSecs * 1_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    let polled: FfiCloudSyncDevicePoll = try await Task.detached(priority: .userInitiated) {
+                        try core.cloudSyncPollGithubDeviceFlow(
+                            deviceCode: started.deviceCode,
+                            clientIdOverride: effectiveCid
+                        )
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    switch polled.status {
+                    case .pending:
+                        continue
+                    case .slowDown:
+                        intervalSecs = max(intervalSecs + 5, polled.intervalSecs ?? 10)
+                    case .authorized:
+                        let nextStatus = polled.syncStatus ?? core.cloudSyncStatus()
+                        self.cloudSyncDeviceFlow = nil
+                        self.cloudSyncStatus = nextStatus
+                        self.cloudSyncError = nil
+                        self.hapticSuccess()
+                        if let login = nextStatus.accountLogin {
+                            self.showToast("Signed in to GitHub as @\(login)")
+                        } else {
+                            self.showToast("Signed in to GitHub")
+                        }
+                        return
+                    case .expired, .denied:
+                        self.cloudSyncDeviceFlow = nil
+                        self.cloudSyncError = polled.error ?? "GitHub authorization did not complete."
+                        return
+                    }
+                }
+                if !Task.isCancelled {
+                    self.cloudSyncDeviceFlow = nil
+                    self.cloudSyncError = "GitHub verification code expired — please try again."
+                }
+            } catch {
+                if !Task.isCancelled {
+                    self.cloudSyncBusy = false
+                    self.cloudSyncDeviceFlow = nil
+                    self.cloudSyncError = Self.describeCloudSyncError(error)
+                }
+            }
+        }
+    }
+
+    public func cancelGithubCloudLogin() {
+        cloudDeviceFlowTask?.cancel()
+        cloudDeviceFlowTask = nil
+        cloudSyncBusy = false
+        cloudSyncDeviceFlow = nil
+        cloudSyncError = nil
+    }
+
+    public func loginCloudSyncWithToken(_ token: String) {
+        guard let core = self.core else { return }
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            cloudSyncError = "GitHub token cannot be empty."
+            return
+        }
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let status: FfiCloudSyncStatus = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncLoginWithToken(token: trimmed)
+                }.value
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = status
+                self.cloudSyncError = nil
+                self.hapticSuccess()
+                if let login = status.accountLogin {
+                    self.showToast("Signed in to GitHub as @\(login)")
+                }
+            } catch {
+                self.cloudSyncBusy = false
+                self.cloudSyncError = Self.describeCloudSyncError(error)
+            }
+        }
+    }
+
+    public func unlockCloudSyncWithPassphrase(_ passphrase: String) {
+        guard let core = self.core else { return }
+        let trimmed = passphrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            cloudSyncError = "Sync Passphrase cannot be empty."
+            return
+        }
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result: FfiCloudSyncResult = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncUnlockWithPassphrase(passphrase: trimmed)
+                }.value
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = nil
+                self.reloadFleet()
+                self.refreshSidebar()
+                self.hapticSuccess()
+                self.showToast(Self.formatCloudSyncResult(result))
+            } catch {
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = Self.describeCloudSyncError(error)
+            }
+        }
+    }
+
+    public func syncCloudNow() {
+        guard let core = self.core else { return }
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result: FfiCloudSyncResult = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncNow()
+                }.value
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = nil
+                self.reloadFleet()
+                self.refreshSidebar()
+                self.hapticSuccess()
+                self.showToast(Self.formatCloudSyncResult(result))
+            } catch {
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = Self.describeCloudSyncError(error)
+            }
+        }
+    }
+
+    public func setCloudAutoSync(_ enabled: Bool) {
+        guard let core = self.core else { return }
+        do {
+            cloudSyncStatus = try core.cloudSyncSetAutoSync(enabled: enabled)
+        } catch {
+            cloudSyncError = Self.describeCloudSyncError(error)
+        }
+    }
+
+    public func logoutCloudSync(clearLocalHosts: Bool = false) {
+        guard let core = self.core else { return }
+        cloudDeviceFlowTask?.cancel()
+        cloudDeviceFlowTask = nil
+        do {
+            cloudSyncStatus = try core.cloudSyncLogout(clearLocalHosts: clearLocalHosts)
+            cloudSyncDeviceFlow = nil
+            cloudSyncError = nil
+            if clearLocalHosts {
+                reloadFleet()
+                refreshSidebar()
+            }
+            hapticLight()
+            showToast("Signed out of Cloud Sync")
+        } catch {
+            cloudSyncError = Self.describeCloudSyncError(error)
+        }
+    }
+
+    private static func describeCloudSyncError(_ error: Error) -> String {
+        if case let FfiOrbitError.Core(detail) = error {
+            return detail
+        }
+        return error.localizedDescription
+    }
+
+    private static func formatCloudSyncResult(_ res: FfiCloudSyncResult) -> String {
+        var parts: [String] = []
+        if res.hostsAdded > 0 { parts.append("+\(res.hostsAdded) host\(res.hostsAdded == 1 ? "" : "s")") }
+        if res.hostsUpdated > 0 { parts.append("\(res.hostsUpdated) updated") }
+        if res.hostsRemoved > 0 { parts.append("-\(res.hostsRemoved) removed") }
+        if res.projectsAdded > 0 { parts.append("+\(res.projectsAdded) project\(res.projectsAdded == 1 ? "" : "s")") }
+        if parts.isEmpty {
+            return res.pushedRemote ? "Cloud Sync uploaded (rev #\(res.vaultRevision))" : "Cloud Sync up to date"
+        }
+        return "Cloud Synced: \(parts.joined(separator: ", "))"
     }
 }

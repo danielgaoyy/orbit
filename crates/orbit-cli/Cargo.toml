@@ -20,6 +20,7 @@ orbit-daemon.workspace = true
 orbit-relay.workspace = true
 orbit-relay-transport.workspace = true
 orbit-client-core.workspace = true
+orbit-store.workspace = true
 clap.workspace = true
 chrono.workspace = true
 tokio.workspace = true

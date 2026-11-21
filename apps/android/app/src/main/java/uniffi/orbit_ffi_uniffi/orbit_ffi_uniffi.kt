@@ -763,6 +763,30 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_build_side_question_context(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_logout(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_now(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_poll_github_device_flow(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_auto_sync(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_status(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_unlock_with_passphrase(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_update_preferences_json(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_compose_prompt(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_connect_all_hosts(
@@ -1049,6 +1073,30 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_build_side_question_context(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`maxChars`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_generate_passphrase(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_login_with_token(`ptr`: Long,`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_logout(`ptr`: Long,`clearLocalHosts`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_now(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_poll_github_device_flow(`ptr`: Long,`deviceCode`: RustBuffer.ByValue,`clientIdOverride`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_auto_sync(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_github_client_id(`ptr`: Long,`clientId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_start_github_device_flow(`ptr`: Long,`clientIdOverride`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_unlock_with_passphrase(`ptr`: Long,`passphrase`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_update_preferences_json(`ptr`: Long,`patchJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_compose_prompt(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_connect_all_hosts(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1468,6 +1516,42 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_build_side_question_context() and 0xFFFF) != 42218) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase() and 0xFFFF) != 49340) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json() and 0xFFFF) != 11716) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token() and 0xFFFF) != 37302) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_logout() and 0xFFFF) != 45701) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_now() and 0xFFFF) != 58181) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_poll_github_device_flow() and 0xFFFF) != 17558) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_auto_sync() and 0xFFFF) != 54195) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id() and 0xFFFF) != 62078) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow() and 0xFFFF) != 41593) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_status() and 0xFFFF) != 50836) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_unlock_with_passphrase() and 0xFFFF) != 5433) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_update_preferences_json() and 0xFFFF) != 53863) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_compose_prompt() and 0xFFFF) != 1118) {
@@ -2714,6 +2798,30 @@ public interface OrbitMobileCoreInterface {
     
     fun `buildSideQuestionContext`(`hostId`: kotlin.String, `agentId`: kotlin.String, `maxChars`: kotlin.UInt?): kotlin.String
     
+    fun `cloudSyncGeneratePassphrase`(): kotlin.String
+    
+    fun `cloudSyncGetPreferencesJson`(): kotlin.String
+    
+    fun `cloudSyncLoginWithToken`(`token`: kotlin.String): FfiCloudSyncStatus
+    
+    fun `cloudSyncLogout`(`clearLocalHosts`: kotlin.Boolean): FfiCloudSyncStatus
+    
+    fun `cloudSyncNow`(): FfiCloudSyncResult
+    
+    fun `cloudSyncPollGithubDeviceFlow`(`deviceCode`: kotlin.String, `clientIdOverride`: kotlin.String?): FfiCloudSyncDevicePoll
+    
+    fun `cloudSyncSetAutoSync`(`enabled`: kotlin.Boolean): FfiCloudSyncStatus
+    
+    fun `cloudSyncSetGithubClientId`(`clientId`: kotlin.String?): FfiCloudSyncStatus
+    
+    fun `cloudSyncStartGithubDeviceFlow`(`clientIdOverride`: kotlin.String?): FfiGitHubDeviceFlowStart
+    
+    fun `cloudSyncStatus`(): FfiCloudSyncStatus
+    
+    fun `cloudSyncUnlockWithPassphrase`(`passphrase`: kotlin.String): FfiCloudSyncResult
+    
+    fun `cloudSyncUpdatePreferencesJson`(`patchJson`: kotlin.String)
+    
     fun `composePrompt`(`req`: FfiComposePromptRequest): FfiComposedPrompt
     
     fun `connectAllHosts`()
@@ -3226,6 +3334,179 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     )
     }
+    
+
+    override fun `cloudSyncGeneratePassphrase`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_generate_passphrase(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    override fun `cloudSyncGetPreferencesJson`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncLoginWithToken`(`token`: kotlin.String): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_login_with_token(
+        it,
+        
+        FfiConverterString.lower(`token`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncLogout`(`clearLocalHosts`: kotlin.Boolean): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_logout(
+        it,
+        
+        FfiConverterBoolean.lower(`clearLocalHosts`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncNow`(): FfiCloudSyncResult {
+            return FfiConverterTypeFfiCloudSyncResult.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_now(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncPollGithubDeviceFlow`(`deviceCode`: kotlin.String, `clientIdOverride`: kotlin.String?): FfiCloudSyncDevicePoll {
+            return FfiConverterTypeFfiCloudSyncDevicePoll.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_poll_github_device_flow(
+        it,
+        
+        FfiConverterString.lower(`deviceCode`),
+        FfiConverterOptionalString.lower(`clientIdOverride`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncSetAutoSync`(`enabled`: kotlin.Boolean): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_auto_sync(
+        it,
+        
+        FfiConverterBoolean.lower(`enabled`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncSetGithubClientId`(`clientId`: kotlin.String?): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_github_client_id(
+        it,
+        
+        FfiConverterOptionalString.lower(`clientId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncStartGithubDeviceFlow`(`clientIdOverride`: kotlin.String?): FfiGitHubDeviceFlowStart {
+            return FfiConverterTypeFfiGitHubDeviceFlowStart.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_start_github_device_flow(
+        it,
+        
+        FfiConverterOptionalString.lower(`clientIdOverride`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `cloudSyncStatus`(): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_status(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncUnlockWithPassphrase`(`passphrase`: kotlin.String): FfiCloudSyncResult {
+            return FfiConverterTypeFfiCloudSyncResult.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_unlock_with_passphrase(
+        it,
+        
+        FfiConverterString.lower(`passphrase`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncUpdatePreferencesJson`(`patchJson`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_update_preferences_json(
+        it,
+        
+        FfiConverterString.lower(`patchJson`),_status)
+}
+    }
+    
     
 
     override fun `composePrompt`(`req`: FfiComposePromptRequest): FfiComposedPrompt {
@@ -5846,6 +6127,245 @@ public object FfiConverterTypeFfiClientProject: FfiConverterRustBuffer<FfiClient
 
 
 
+data class FfiCloudSyncDevicePoll (
+    var `status`: FfiCloudSyncDevicePollStatus
+    , 
+    var `intervalSecs`: kotlin.ULong?
+    , 
+    var `error`: kotlin.String?
+    , 
+    var `syncStatus`: FfiCloudSyncStatus?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncDevicePoll: FfiConverterRustBuffer<FfiCloudSyncDevicePoll> {
+    override fun read(buf: ByteBuffer): FfiCloudSyncDevicePoll {
+        return FfiCloudSyncDevicePoll(
+            FfiConverterTypeFfiCloudSyncDevicePollStatus.read(buf),
+            FfiConverterOptionalULong.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeFfiCloudSyncStatus.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiCloudSyncDevicePoll) = (
+            FfiConverterTypeFfiCloudSyncDevicePollStatus.allocationSize(value.`status`) +
+            FfiConverterOptionalULong.allocationSize(value.`intervalSecs`) +
+            FfiConverterOptionalString.allocationSize(value.`error`) +
+            FfiConverterOptionalTypeFfiCloudSyncStatus.allocationSize(value.`syncStatus`)
+    )
+
+    override fun write(value: FfiCloudSyncDevicePoll, buf: ByteBuffer) {
+            FfiConverterTypeFfiCloudSyncDevicePollStatus.write(value.`status`, buf)
+            FfiConverterOptionalULong.write(value.`intervalSecs`, buf)
+            FfiConverterOptionalString.write(value.`error`, buf)
+            FfiConverterOptionalTypeFfiCloudSyncStatus.write(value.`syncStatus`, buf)
+    }
+}
+
+
+
+data class FfiCloudSyncResult (
+    var `hostsAdded`: kotlin.UInt
+    , 
+    var `hostsUpdated`: kotlin.UInt
+    , 
+    var `hostsRemoved`: kotlin.UInt
+    , 
+    var `projectsAdded`: kotlin.UInt
+    , 
+    var `projectsUpdated`: kotlin.UInt
+    , 
+    var `projectsRemoved`: kotlin.UInt
+    , 
+    var `preferencesUpdated`: kotlin.UInt
+    , 
+    var `pushedRemote`: kotlin.Boolean
+    , 
+    var `vaultRevision`: kotlin.ULong
+    , 
+    var `syncedAtMs`: kotlin.Long
+    , 
+    var `gistHtmlUrl`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncResult: FfiConverterRustBuffer<FfiCloudSyncResult> {
+    override fun read(buf: ByteBuffer): FfiCloudSyncResult {
+        return FfiCloudSyncResult(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiCloudSyncResult) = (
+            FfiConverterUInt.allocationSize(value.`hostsAdded`) +
+            FfiConverterUInt.allocationSize(value.`hostsUpdated`) +
+            FfiConverterUInt.allocationSize(value.`hostsRemoved`) +
+            FfiConverterUInt.allocationSize(value.`projectsAdded`) +
+            FfiConverterUInt.allocationSize(value.`projectsUpdated`) +
+            FfiConverterUInt.allocationSize(value.`projectsRemoved`) +
+            FfiConverterUInt.allocationSize(value.`preferencesUpdated`) +
+            FfiConverterBoolean.allocationSize(value.`pushedRemote`) +
+            FfiConverterULong.allocationSize(value.`vaultRevision`) +
+            FfiConverterLong.allocationSize(value.`syncedAtMs`) +
+            FfiConverterOptionalString.allocationSize(value.`gistHtmlUrl`)
+    )
+
+    override fun write(value: FfiCloudSyncResult, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`hostsAdded`, buf)
+            FfiConverterUInt.write(value.`hostsUpdated`, buf)
+            FfiConverterUInt.write(value.`hostsRemoved`, buf)
+            FfiConverterUInt.write(value.`projectsAdded`, buf)
+            FfiConverterUInt.write(value.`projectsUpdated`, buf)
+            FfiConverterUInt.write(value.`projectsRemoved`, buf)
+            FfiConverterUInt.write(value.`preferencesUpdated`, buf)
+            FfiConverterBoolean.write(value.`pushedRemote`, buf)
+            FfiConverterULong.write(value.`vaultRevision`, buf)
+            FfiConverterLong.write(value.`syncedAtMs`, buf)
+            FfiConverterOptionalString.write(value.`gistHtmlUrl`, buf)
+    }
+}
+
+
+
+data class FfiCloudSyncStatus (
+    var `state`: FfiCloudSyncState
+    , 
+    var `provider`: kotlin.String
+    , 
+    var `githubOauthConfigured`: kotlin.Boolean
+    , 
+    var `githubClientIdOverride`: kotlin.String?
+    , 
+    var `accountLogin`: kotlin.String?
+    , 
+    var `accountName`: kotlin.String?
+    , 
+    var `accountAvatarUrl`: kotlin.String?
+    , 
+    var `gistId`: kotlin.String?
+    , 
+    var `gistHtmlUrl`: kotlin.String?
+    , 
+    var `remoteVaultExists`: kotlin.Boolean
+    , 
+    var `autoSyncEnabled`: kotlin.Boolean
+    , 
+    var `lastSyncedAtMs`: kotlin.Long?
+    , 
+    var `lastVaultRevision`: kotlin.ULong
+    , 
+    var `syncedHostCount`: kotlin.UInt
+    , 
+    var `syncedProjectCount`: kotlin.UInt
+    , 
+    var `lastError`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer<FfiCloudSyncStatus> {
+    override fun read(buf: ByteBuffer): FfiCloudSyncStatus {
+        return FfiCloudSyncStatus(
+            FfiConverterTypeFfiCloudSyncState.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiCloudSyncStatus) = (
+            FfiConverterTypeFfiCloudSyncState.allocationSize(value.`state`) +
+            FfiConverterString.allocationSize(value.`provider`) +
+            FfiConverterBoolean.allocationSize(value.`githubOauthConfigured`) +
+            FfiConverterOptionalString.allocationSize(value.`githubClientIdOverride`) +
+            FfiConverterOptionalString.allocationSize(value.`accountLogin`) +
+            FfiConverterOptionalString.allocationSize(value.`accountName`) +
+            FfiConverterOptionalString.allocationSize(value.`accountAvatarUrl`) +
+            FfiConverterOptionalString.allocationSize(value.`gistId`) +
+            FfiConverterOptionalString.allocationSize(value.`gistHtmlUrl`) +
+            FfiConverterBoolean.allocationSize(value.`remoteVaultExists`) +
+            FfiConverterBoolean.allocationSize(value.`autoSyncEnabled`) +
+            FfiConverterOptionalLong.allocationSize(value.`lastSyncedAtMs`) +
+            FfiConverterULong.allocationSize(value.`lastVaultRevision`) +
+            FfiConverterUInt.allocationSize(value.`syncedHostCount`) +
+            FfiConverterUInt.allocationSize(value.`syncedProjectCount`) +
+            FfiConverterOptionalString.allocationSize(value.`lastError`)
+    )
+
+    override fun write(value: FfiCloudSyncStatus, buf: ByteBuffer) {
+            FfiConverterTypeFfiCloudSyncState.write(value.`state`, buf)
+            FfiConverterString.write(value.`provider`, buf)
+            FfiConverterBoolean.write(value.`githubOauthConfigured`, buf)
+            FfiConverterOptionalString.write(value.`githubClientIdOverride`, buf)
+            FfiConverterOptionalString.write(value.`accountLogin`, buf)
+            FfiConverterOptionalString.write(value.`accountName`, buf)
+            FfiConverterOptionalString.write(value.`accountAvatarUrl`, buf)
+            FfiConverterOptionalString.write(value.`gistId`, buf)
+            FfiConverterOptionalString.write(value.`gistHtmlUrl`, buf)
+            FfiConverterBoolean.write(value.`remoteVaultExists`, buf)
+            FfiConverterBoolean.write(value.`autoSyncEnabled`, buf)
+            FfiConverterOptionalLong.write(value.`lastSyncedAtMs`, buf)
+            FfiConverterULong.write(value.`lastVaultRevision`, buf)
+            FfiConverterUInt.write(value.`syncedHostCount`, buf)
+            FfiConverterUInt.write(value.`syncedProjectCount`, buf)
+            FfiConverterOptionalString.write(value.`lastError`, buf)
+    }
+}
+
+
+
 data class FfiComposePromptRequest (
     var `provider`: FfiProviderKind
     , 
@@ -6691,6 +7211,59 @@ public object FfiConverterTypeFfiGitFileEntry: FfiConverterRustBuffer<FfiGitFile
             FfiConverterString.write(value.`status`, buf)
             FfiConverterBoolean.write(value.`staged`, buf)
             FfiConverterBoolean.write(value.`untracked`, buf)
+    }
+}
+
+
+
+data class FfiGitHubDeviceFlowStart (
+    var `deviceCode`: kotlin.String
+    , 
+    var `userCode`: kotlin.String
+    , 
+    var `verificationUri`: kotlin.String
+    , 
+    var `expiresInSecs`: kotlin.ULong
+    , 
+    var `intervalSecs`: kotlin.ULong
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiGitHubDeviceFlowStart: FfiConverterRustBuffer<FfiGitHubDeviceFlowStart> {
+    override fun read(buf: ByteBuffer): FfiGitHubDeviceFlowStart {
+        return FfiGitHubDeviceFlowStart(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiGitHubDeviceFlowStart) = (
+            FfiConverterString.allocationSize(value.`deviceCode`) +
+            FfiConverterString.allocationSize(value.`userCode`) +
+            FfiConverterString.allocationSize(value.`verificationUri`) +
+            FfiConverterULong.allocationSize(value.`expiresInSecs`) +
+            FfiConverterULong.allocationSize(value.`intervalSecs`)
+    )
+
+    override fun write(value: FfiGitHubDeviceFlowStart, buf: ByteBuffer) {
+            FfiConverterString.write(value.`deviceCode`, buf)
+            FfiConverterString.write(value.`userCode`, buf)
+            FfiConverterString.write(value.`verificationUri`, buf)
+            FfiConverterULong.write(value.`expiresInSecs`, buf)
+            FfiConverterULong.write(value.`intervalSecs`, buf)
     }
 }
 
@@ -10728,6 +11301,80 @@ public object FfiConverterTypeFfiClientPlatform: FfiConverterRustBuffer<FfiClien
 
 
 
+
+enum class FfiCloudSyncDevicePollStatus {
+    
+    PENDING,
+    SLOW_DOWN,
+    AUTHORIZED,
+    EXPIRED,
+    DENIED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncDevicePollStatus: FfiConverterRustBuffer<FfiCloudSyncDevicePollStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiCloudSyncDevicePollStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiCloudSyncDevicePollStatus) = 4UL
+
+    override fun write(value: FfiCloudSyncDevicePollStatus, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiCloudSyncState {
+    
+    SIGNED_OUT,
+    LOCKED,
+    READY,
+    SYNCING,
+    ERROR;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncState: FfiConverterRustBuffer<FfiCloudSyncState> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiCloudSyncState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiCloudSyncState) = 4UL
+
+    override fun write(value: FfiCloudSyncState, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 sealed class FfiComposerContextInput {
     
     data class Image(
@@ -13521,6 +14168,38 @@ public object FfiConverterOptionalTypeFfiAgentCard: FfiConverterRustBuffer<FfiAg
         } else {
             buf.put(1)
             FfiConverterTypeFfiAgentCard.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiCloudSyncStatus: FfiConverterRustBuffer<FfiCloudSyncStatus?> {
+    override fun read(buf: ByteBuffer): FfiCloudSyncStatus? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiCloudSyncStatus.read(buf)
+    }
+
+    override fun allocationSize(value: FfiCloudSyncStatus?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiCloudSyncStatus.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiCloudSyncStatus?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiCloudSyncStatus.write(value, buf)
         }
     }
 }

@@ -30,6 +30,9 @@ use orbit_client_core::app_core::{
     SideQuestionStreamEvent, SubscribeOptions, WorkspaceFileView,
 };
 use orbit_client_core::catalog::ResolvedModelSelectionView;
+use orbit_client_core::cloud_sync::{
+    CloudSyncDevicePollView, CloudSyncResultView, CloudSyncStatusView, GitHubDeviceFlowStartView,
+};
 use orbit_client_core::composer::{
     ClientPlatform, ComposePromptRequest, ComposedPromptView, MentionCandidateView,
     SlashCommandView,
@@ -1835,6 +1838,139 @@ async fn upgrade_host_daemon_over_wire(
         .await
 }
 
+// --- Zero-Server E2EE Cloud Sync Commands ---
+
+#[tauri::command]
+fn get_cloud_sync_status(state: State<'_, DesktopAppState>) -> CloudSyncStatusView {
+    state.core.cloud_sync_status()
+}
+
+#[tauri::command]
+fn cloud_sync_generate_passphrase(state: State<'_, DesktopAppState>) -> String {
+    state.core.cloud_sync_generate_passphrase()
+}
+
+#[tauri::command]
+fn cloud_sync_set_github_client_id(
+    state: State<'_, DesktopAppState>,
+    client_id: Option<String>,
+) -> Result<CloudSyncStatusView, String> {
+    state
+        .core
+        .cloud_sync_set_github_client_id(client_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cloud_sync_set_auto_sync(
+    state: State<'_, DesktopAppState>,
+    enabled: bool,
+) -> Result<CloudSyncStatusView, String> {
+    state
+        .core
+        .cloud_sync_set_auto_sync(enabled)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cloud_sync_start_github_device_flow(
+    state: State<'_, DesktopAppState>,
+    client_id_override: Option<String>,
+) -> Result<GitHubDeviceFlowStartView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.cloud_sync_start_github_device_flow(client_id_override)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cloud sync start task error: {e}"))?
+}
+
+#[tauri::command]
+async fn cloud_sync_poll_github_device_flow(
+    state: State<'_, DesktopAppState>,
+    device_code: String,
+    client_id_override: Option<String>,
+) -> Result<CloudSyncDevicePollView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.cloud_sync_poll_github_device_flow(&device_code, client_id_override)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cloud sync poll task error: {e}"))?
+}
+
+#[tauri::command]
+async fn cloud_sync_login_with_token(
+    state: State<'_, DesktopAppState>,
+    token: String,
+) -> Result<CloudSyncStatusView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.cloud_sync_login_with_token(&token)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cloud sync token login task error: {e}"))?
+}
+
+#[tauri::command]
+async fn cloud_sync_unlock_with_passphrase(
+    state: State<'_, DesktopAppState>,
+    passphrase: String,
+) -> Result<CloudSyncResultView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || {
+        core.cloud_sync_unlock_with_passphrase(&passphrase)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cloud sync unlock task error: {e}"))?
+}
+
+#[tauri::command]
+async fn cloud_sync_now(state: State<'_, DesktopAppState>) -> Result<CloudSyncResultView, String> {
+    let core = Arc::clone(&state.core);
+    tauri::async_runtime::spawn_blocking(move || core.cloud_sync_now().map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| format!("cloud sync task error: {e}"))?
+}
+
+#[tauri::command]
+fn cloud_sync_trigger_background(state: State<'_, DesktopAppState>) {
+    state.core.schedule_cloud_auto_sync(false);
+}
+
+#[tauri::command]
+fn cloud_sync_logout(
+    state: State<'_, DesktopAppState>,
+    clear_local_hosts: bool,
+) -> Result<CloudSyncStatusView, String> {
+    state
+        .core
+        .cloud_sync_logout(clear_local_hosts)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn cloud_sync_get_preferences(
+    state: State<'_, DesktopAppState>,
+) -> HashMap<String, serde_json::Value> {
+    state.core.cloud_sync_get_preferences()
+}
+
+#[tauri::command]
+fn cloud_sync_update_preferences(
+    state: State<'_, DesktopAppState>,
+    patch: HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    state
+        .core
+        .cloud_sync_update_preferences(patch)
+        .map_err(|e| e.to_string())
+}
+
 fn init_desktop_file_logging() {
     let log_path = resolve_user_home()
         .map(|home| home.join(".orbit").join("logs").join("desktop.log"))
@@ -2028,6 +2164,19 @@ pub fn run() {
             perform_app_self_update,
             sync_local_daemon,
             upgrade_host_daemon_over_wire,
+            get_cloud_sync_status,
+            cloud_sync_generate_passphrase,
+            cloud_sync_set_github_client_id,
+            cloud_sync_set_auto_sync,
+            cloud_sync_start_github_device_flow,
+            cloud_sync_poll_github_device_flow,
+            cloud_sync_login_with_token,
+            cloud_sync_unlock_with_passphrase,
+            cloud_sync_now,
+            cloud_sync_trigger_background,
+            cloud_sync_logout,
+            cloud_sync_get_preferences,
+            cloud_sync_update_preferences,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Orbit Tauri desktop application");

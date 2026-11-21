@@ -15,22 +15,51 @@ export const TopBar = memo(function TopBar() {
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const hasActiveSession = workspacePanel === "conversation" && !isDraft && Boolean(selectedAgentId);
-  const hasRunningBackgroundTasks = useOrbitSelector((s) => {
+  // Primitive return keeps TopBar free from re-renders on unrelated store updates
+  const overviewBadgeTone = useOrbitSelector<
+    "none" | "approval" | "subagent_running" | "bg_running"
+  >((s) => {
     if (
       s.workspacePanel !== "conversation" ||
       s.isDraftNewSession ||
       !s.selectedHostId ||
       !s.selectedAgentId
     ) {
-      return false;
+      return "none";
     }
-    const ag = s.hostDetails[s.selectedHostId]?.agents.find(
-      (a) => a.agent_id === s.selectedAgentId,
+    const parentHostId = s.selectedHostId;
+    const parentAgentId = s.selectedAgentId;
+    const ag = s.hostDetails[parentHostId]?.agents.find((a) => a.agent_id === parentAgentId);
+    const stageInsights = s.stages[`${parentHostId}::${parentAgentId}`]?.insights;
+
+    let hasRunningSubagent = Boolean(
+      stageInsights?.subagents?.some((sa) => sa.status === "running"),
     );
-    if (isAgentBackgroundWaiting(ag)) return true;
-    const tasks =
-      s.stages[`${s.selectedHostId}::${s.selectedAgentId}`]?.insights?.background_tasks;
-    return Boolean(tasks && tasks.some((t) => t.status === "running"));
+
+    const providerSubs = s.hostDetails[parentHostId]?.provider_subagents?.[parentAgentId];
+    if (providerSubs?.some((ps) => ps.status === "running")) {
+      hasRunningSubagent = true;
+    }
+
+    for (const detail of Object.values(s.hostDetails)) {
+      for (const child of detail.agents) {
+        if (child.archived_at_rfc3339) continue;
+        if (
+          child.parent_agent_id === parentAgentId &&
+          (!child.parent_host_id || child.parent_host_id === parentHostId)
+        ) {
+          if (child.is_awaiting_permission) return "approval";
+          if (child.is_running || child.has_background_tasks) hasRunningSubagent = true;
+        }
+      }
+    }
+
+    if (hasRunningSubagent) return "subagent_running";
+
+    const hasRunningBgTask =
+      isAgentBackgroundWaiting(ag) ||
+      Boolean(stageInsights?.background_tasks?.some((t) => t.status === "running"));
+    return hasRunningBgTask ? "bg_running" : "none";
   });
 
   const {
@@ -125,9 +154,13 @@ export const TopBar = memo(function TopBar() {
             label={
               overviewVisible
                 ? "Hide overview"
-                : hasRunningBackgroundTasks
-                  ? "Show overview (background task running)"
-                  : "Show overview"
+                : overviewBadgeTone === "approval"
+                  ? "Show overview (subagent needs approval)"
+                  : overviewBadgeTone === "subagent_running"
+                    ? "Show overview (subagent running)"
+                    : overviewBadgeTone === "bg_running"
+                      ? "Show overview (background task running)"
+                      : "Show overview"
             }
             shortcut={`${mod}⌥O`}
           >
@@ -144,10 +177,13 @@ export const TopBar = memo(function TopBar() {
               )}
             >
               <FileText className="h-[15.5px] w-[15.5px] stroke-[1.75]" />
-              {!overviewVisible && hasRunningBackgroundTasks && (
+              {!overviewVisible && overviewBadgeTone !== "none" && (
                 <span
                   aria-hidden="true"
-                  className="ring-canvas absolute top-[5px] right-[5px] h-[5px] w-[5px] rounded-full bg-emerald-500/90 ring-[1.5px]"
+                  className={cn(
+                    "ring-canvas absolute top-[5px] right-[5px] h-[5px] w-[5px] rounded-full ring-[1.5px]",
+                    overviewBadgeTone === "approval" ? "bg-amber-500" : "bg-emerald-500/90",
+                  )}
                 />
               )}
             </button>

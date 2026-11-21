@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { PanelLeft, PanelRight } from "lucide-react";
 import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/command/command-palette";
@@ -201,15 +201,16 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
   workspacePanel: "conversation" | "automations";
 }) {
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
-  const sidebarWidth = useOrbitSelector((s) => s.sidebarWidth);
   const sidePanelOpen = useOrbitSelector((s) => s.sidePanelOpen);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  const sidebarElRef = useRef<HTMLDivElement | null>(null);
 
   const {
     isAnimating,
     hasSelectedHost,
-    leftLayoutReservePx,
-    rightLayoutReservePx,
+    leftWidthCss,
+    leftLayoutReserveCss,
+    rightLayoutReserveCss,
     shellReserveTransition,
     leftVisible,
     leftTransform,
@@ -222,17 +223,28 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
   const mod = modSymbol();
 
   const startSidebarResize = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if (e.detail >= 2) {
+      e.preventDefault();
+      return;
+    }
     e.preventDefault();
     const startX = e.clientX;
-    const startW = sidebarWidth;
+    const startW = Math.round(sidebarElRef.current?.getBoundingClientRect().width ?? 256);
     let latestW = startW;
+    let hasMoved = false;
     let rafId: number | null = null;
-    setIsResizingSidebar(true);
-    setIsResizingLeft(true);
-    document.body.style.cursor = "col-resize";
 
     const onMove = (ev: MouseEvent) => {
-      latestW = startW + (ev.clientX - startX);
+      const delta = ev.clientX - startX;
+      if (!hasMoved) {
+        if (Math.abs(delta) < 2) return;
+        hasMoved = true;
+        setIsResizingSidebar(true);
+        setIsResizingLeft(true);
+        document.body.style.cursor = "col-resize";
+      }
+      latestW = startW + delta;
       if (rafId === null) {
         rafId = window.requestAnimationFrame(() => {
           rafId = null;
@@ -245,10 +257,12 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
         window.cancelAnimationFrame(rafId);
         rafId = null;
       }
-      orbitActions.setSidebarWidth(latestW, true);
-      setIsResizingSidebar(false);
-      setIsResizingLeft(false);
-      document.body.style.cursor = "";
+      if (hasMoved) {
+        orbitActions.setSidebarWidth(latestW, true);
+        setIsResizingSidebar(false);
+        setIsResizingLeft(false);
+        document.body.style.cursor = "";
+      }
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", cleanup);
       window.removeEventListener("blur", cleanup);
@@ -256,6 +270,11 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", cleanup);
     window.addEventListener("blur", cleanup);
+  };
+
+  const resetSidebarWidth = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    orbitActions.resetSidebarWidth();
   };
 
   return (
@@ -319,19 +338,20 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
 
         {/* 1. Left Unified Fleet Sidebar (`⌘B`) — Pure GPU translate3d Layer */}
         <div
+          ref={sidebarElRef}
           inert={!sidebarOpen}
           data-open={sidebarOpen ? "true" : "false"}
           data-animating={isAnimating ? "true" : "false"}
           data-resizing={isResizingSidebar ? "true" : "false"}
           onTransitionEnd={onLeftTransitionEnd}
           style={{
-            width: `${sidebarWidth}px`,
+            width: leftWidthCss,
             transform: leftTransform,
             transition: leftTransition,
             visibility: leftVisible ? "visible" : "hidden",
           }}
           className={cn(
-            "orbit-panel-left bg-sidebar absolute inset-y-0 left-0 z-20 h-full shrink-0 overflow-hidden [backface-visibility:hidden]",
+            "orbit-panel-left bg-sidebar absolute inset-y-0 left-0 z-20 h-full shrink-0 overflow-hidden [contain:layout_style] [backface-visibility:hidden]",
             !sidebarOpen && "pointer-events-none",
           )}
         >
@@ -339,18 +359,24 @@ const WorkspaceShellLayout = memo(function WorkspaceShellLayout({
 
           {sidebarOpen && (
             <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize sidebar (double-click to reset)"
               onMouseDown={startSidebarResize}
-              className="hover:bg-primary/40 absolute top-0 right-0 z-20 h-full w-1 cursor-col-resize transition-colors"
-            />
+              onDoubleClick={resetSidebarWidth}
+              className="group/sash absolute top-0 right-0 z-20 flex h-full w-[6px] cursor-col-resize justify-end"
+            >
+              <div className="group-hover/sash:bg-primary/45 group-active/sash:bg-primary/65 h-full w-[2px] transition-colors duration-150" />
+            </div>
           )}
         </div>
 
-        {/* 2. Center Narrative Stage (pure GPU-slid when width is constant; fluid padding sync when width changes) */}
+        {/* 2. Center Narrative Stage (pure CSS variables when idle; coordinated motion on panel toggle) */}
         <div
-          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-clip"
+          className="flex min-h-0 min-w-0 flex-1 flex-col overflow-clip [contain:layout_style]"
           style={{
-            paddingLeft: `${leftLayoutReservePx}px`,
-            paddingRight: `${rightLayoutReservePx}px`,
+            paddingLeft: leftLayoutReserveCss,
+            paddingRight: rightLayoutReserveCss,
             transition: shellReserveTransition,
           }}
         >

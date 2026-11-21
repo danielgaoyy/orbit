@@ -12,6 +12,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import {
+  observeElementOffset,
   useVirtualizer,
   type Range,
   type ReactVirtualizer,
@@ -86,7 +87,7 @@ import { ChatOutlineRail } from "@/components/stage/stage-outline-rail";
 import {
   AgentMessageCard,
   ParentSubagentBanner,
-  SubagentsTrack,
+  SubagentApprovalBanner,
 } from "@/components/stage/subagents-track";
 import { StageOverviewPanel } from "@/components/stage/stage-overview-panel";
 import { Button } from "@/components/ui/button";
@@ -3240,6 +3241,25 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
     [readScrollVelocity],
   );
 
+  const initialRect = useMemo(() => {
+    const el = scrollRef.current;
+    const width =
+      el && el.clientWidth > 0
+        ? el.clientWidth
+        : typeof window !== "undefined"
+          ? Math.max(360, window.innerWidth)
+          : 1280;
+    const height =
+      el && el.clientHeight > 0
+        ? el.clientHeight
+        : typeof window !== "undefined"
+          ? Math.max(400, window.innerHeight - 160)
+          : 720;
+    return { width, height };
+    // Compute initial viewport estimate only when mounting a fresh session list
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedAgentId]);
+
   const initialBottomOffset = useMemo(() => {
     if (stageTurns.length === 0) return 0;
     let total = 0;
@@ -3248,17 +3268,36 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
       const cached = getCachedTurnHeight(`${selectedAgentId}::${turn.key}::${widthBucket}`);
       total += (cached ?? estimateTurnSizeFallback(turn)) + TURN_LIST_GAP_PX;
     }
-    return total;
+    return Math.max(0, total - initialRect.height);
     // Compute initial bottom anchor only when mounting a fresh session list
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedAgentId]);
+  }, [selectedAgentId, initialRect.height]);
+
+  const observeOffsetWithBottomSeed = useCallback(
+    (
+      instance: Virtualizer<HTMLDivElement, HTMLDivElement>,
+      cb: (offset: number, isScrolling: boolean) => void,
+    ) => {
+      const el = instance.scrollElement;
+      if (el && stickToBottomRef.current && initialBottomOffset > 0 && el.scrollTop === 0) {
+        const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        if (maxTop > 0) {
+          el.scrollTop = maxTop;
+        }
+      }
+      return observeElementOffset(instance, cb);
+    },
+    [initialBottomOffset, stickToBottomRef],
+  );
 
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
     count: stageTurns.length,
     getScrollElement: () => scrollRef.current,
     getItemKey,
     estimateSize,
+    initialRect,
     initialOffset: initialBottomOffset,
+    observeElementOffset: observeOffsetWithBottomSeed,
     rangeExtractor,
     onChange: handleVirtualizerChange,
     gap: TURN_LIST_GAP_PX,
@@ -4274,7 +4313,7 @@ export function StreamStage() {
           ref={contentRef}
           onTransitionEnd={onStageTransitionEnd}
           style={stagePushStyle}
-          className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,768px)]"
+          className="mx-auto w-full min-w-0 max-w-[var(--orbit-stage-max-w,768px)]"
         >
           {stageTurns.length === 0 &&
             wasSessionRewound &&
@@ -4335,7 +4374,7 @@ export function StreamStage() {
           }}
         >
           <div style={stagePushStyle}>
-            <SubagentsTrack hostId={selectedHostId} agentId={selectedAgentId} />
+            <SubagentApprovalBanner hostId={selectedHostId} agentId={selectedAgentId} />
             <StickyApprovalDock
               hostId={selectedHostId}
               agentId={selectedAgentId}

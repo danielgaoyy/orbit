@@ -3212,6 +3212,28 @@ mod tests {
             .expect("found q1");
         assert_eq!(taken.wire_prompt, "wire 1");
 
+        // Sync mutations (read cursor, pin, handle, unread, move) must NEVER drop queued prompts!
+        let after_read = store
+            .mark_agent_read_seq("ag_q", Some(1))
+            .expect("mark read")
+            .expect("some");
+        assert_eq!(after_read.queued_prompts.len(), 2);
+        let after_pin = store
+            .set_agent_pinned("ag_q", true, Some(100))
+            .expect("pin")
+            .expect("some");
+        assert_eq!(after_pin.queued_prompts.len(), 2);
+        let after_unread = store
+            .mark_agent_unread("ag_q")
+            .expect("unread")
+            .expect("some");
+        assert_eq!(after_unread.queued_prompts.len(), 2);
+        let after_handle = store
+            .set_agent_handle("ag_q", Some("lead"))
+            .expect("handle")
+            .expect("some");
+        assert_eq!(after_handle.queued_prompts.len(), 2);
+
         // FIFO pop now gets q3 (new head after reorder)
         let popped = store
             .pop_next_queued_prompt("ag_q")

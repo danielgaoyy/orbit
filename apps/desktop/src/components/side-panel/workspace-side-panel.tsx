@@ -85,7 +85,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
 }) {
   const {
     shouldRightOpen: shouldOpen,
-    panelWidthPx,
+    panelWidthCss,
     rightVisible: panelVisible,
     isRightSettledOpen: isSettledOpen,
     isAnimating,
@@ -96,7 +96,9 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     onRightTransitionEnd,
   } = useWorkspaceMotion();
 
+  const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
   const tabs = useOrbitSelector((s) => s.sidePanelTabs);
+  const panelElRef = useRef<HTMLElement | null>(null);
   const activeTabId = useOrbitSelector((s) => s.activeSidePanelTabId);
   const hasStreamingSideQuestion = useOrbitSelector((s) => {
     const scope = sideQuestionScopeKey(s);
@@ -123,17 +125,28 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   const isTerminalVisible = panelVisible && activeTab?.kind === "terminal";
 
   const startResize = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    if (e.detail >= 2) {
+      e.preventDefault();
+      return;
+    }
     e.preventDefault();
     resizeCleanupRef.current?.();
     const startX = e.clientX;
-    const startW = panelWidthPx;
+    const startW = Math.round(panelElRef.current?.getBoundingClientRect().width ?? 480);
     let latestW = startW;
+    let hasMoved = false;
     let rafId: number | null = null;
-    setIsResizingRight(true);
-    document.body.style.cursor = "col-resize";
 
     const onMove = (ev: MouseEvent) => {
-      latestW = startW + (startX - ev.clientX);
+      const delta = startX - ev.clientX;
+      if (!hasMoved) {
+        if (Math.abs(delta) < 2) return;
+        hasMoved = true;
+        setIsResizingRight(true);
+        document.body.style.cursor = "col-resize";
+      }
+      latestW = startW + delta;
       if (rafId === null) {
         rafId = window.requestAnimationFrame(() => {
           rafId = null;
@@ -146,9 +159,11 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         window.cancelAnimationFrame(rafId);
         rafId = null;
       }
-      orbitActions.setSidePanelWidth(latestW, true);
-      setIsResizingRight(false);
-      document.body.style.cursor = "";
+      if (hasMoved) {
+        orbitActions.setSidePanelWidth(latestW, true);
+        setIsResizingRight(false);
+        document.body.style.cursor = "";
+      }
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", cleanup);
       window.removeEventListener("blur", cleanup);
@@ -162,15 +177,23 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
     window.addEventListener("blur", cleanup);
   };
 
+  const handleEqualizeSidePanel = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const leftEl = sidebarOpen ? document.querySelector<HTMLElement>(".orbit-panel-left") : null;
+    const activeLeft = leftEl ? Math.round(leftEl.getBoundingClientRect().width) : 0;
+    orbitActions.equalizeSidePanel(window.innerWidth, activeLeft);
+  };
+
   return (
     <aside
+      ref={panelElRef}
       inert={!shouldOpen}
       data-open={shouldOpen ? "true" : "false"}
       data-animating={isAnimating ? "true" : "false"}
       data-resizing={isResizingRight ? "true" : "false"}
       onTransitionEnd={onRightTransitionEnd}
       style={{
-        width: `${panelWidthPx}px`,
+        width: panelWidthCss,
         transform: panelTransform,
         transition: panelTransition,
         visibility: panelVisible ? "visible" : "hidden",
@@ -180,12 +203,18 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
         !shouldOpen && "pointer-events-none",
       )}
     >
-      {/* Left Resize Drag Handle */}
+      {/* Left Resize Drag Handle (double-click to split 50/50 with main stage) */}
       {shouldOpen && (
         <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize side panel (double-click to split evenly)"
           onMouseDown={startResize}
-          className="hover:bg-primary/40 absolute top-0 left-0 z-20 h-full w-1 cursor-col-resize transition-colors duration-150"
-        />
+          onDoubleClick={handleEqualizeSidePanel}
+          className="group/sash absolute top-0 left-0 z-20 flex h-full w-[6px] cursor-col-resize justify-start"
+        >
+          <div className="group-hover/sash:bg-primary/45 group-active/sash:bg-primary/65 h-full w-[2px] transition-colors duration-150" />
+        </div>
       )}
 
       {/* Transparent Drag Shield so embedded iframes / WebGL canvases never swallow resize events */}

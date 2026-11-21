@@ -22,6 +22,13 @@ import {
   projectPathScopeKey,
 } from "@/lib/projects";
 import {
+  SIDE_PANEL_DEFAULT_WIDTH_PX,
+  SIDEBAR_DEFAULT_WIDTH_PX,
+  clampSidePanelPrefWidth,
+  clampSidebarPrefWidth,
+  computeEqualizedSidePanelWidth,
+} from "@/lib/workspace-layout";
+import {
   type AgentStageView,
   type ClientThreadPrefSeed,
   type ComposerContextInput,
@@ -552,7 +559,8 @@ let state: OrbitUiState = {
   rewoundSessions: {},
 
   sidePanelOpen: false,
-  sidePanelWidth: initialPrefs.sidePanelWidth ?? initialPrefs.inspectorWidth ?? 480,
+  sidePanelWidth:
+    initialPrefs.sidePanelWidth ?? initialPrefs.inspectorWidth ?? SIDE_PANEL_DEFAULT_WIDTH_PX,
   sidePanelTabs: [],
   activeSidePanelTabId: null,
   fileViewCache: {},
@@ -3459,7 +3467,11 @@ export const orbitActions = {
   },
 
   setSidebarWidth(w: number, persist = true): void {
-    setState((s) => ({ ...s, sidebarWidth: Math.min(400, Math.max(230, w)) }), persist);
+    setState((s) => ({ ...s, sidebarWidth: clampSidebarPrefWidth(w) }), persist);
+  },
+
+  resetSidebarWidth(): void {
+    setState((s) => ({ ...s, sidebarWidth: SIDEBAR_DEFAULT_WIDTH_PX }), true);
   },
 
   toggleHostCollapsed(hostId: string): void {
@@ -3747,7 +3759,12 @@ export const orbitActions = {
   },
 
   setSidePanelWidth(w: number, persist = true): void {
-    setState((s) => ({ ...s, sidePanelWidth: Math.min(780, Math.max(360, w)) }), persist);
+    setState((s) => ({ ...s, sidePanelWidth: clampSidePanelPrefWidth(w) }), persist);
+  },
+
+  equalizeSidePanel(viewportWidth: number, activeLeftWidthPx: number): void {
+    const width = computeEqualizedSidePanelWidth(viewportWidth, activeLeftWidthPx);
+    setState((s) => ({ ...s, sidePanelWidth: width }), true);
   },
 
   markOpenFilesStaleForWorkspace(hostId: string, cwd: string): void {
@@ -4539,20 +4556,27 @@ export const orbitActions = {
     role: string;
     promptPreview: string;
     childAgentId: string | null;
+    childHostId?: string | null;
     providerSubagentId?: string | null;
     parentAgentId?: string | null;
   }): void {
-    const hostId = state.selectedHostId;
+    const parentHostId = state.selectedHostId;
+    const targetHostId = params.childHostId ?? parentHostId;
     const parentAgentId = params.parentAgentId ?? state.selectedAgentId;
     const hasManagedChild = Boolean(
-      hostId &&
+      targetHostId &&
         params.childAgentId &&
-        state.hostDetails[hostId]?.agents.some((a) => a.agent_id === params.childAgentId),
+        state.hostDetails[targetHostId]?.agents.some((a) => a.agent_id === params.childAgentId),
     );
     const effectiveChildAgentId = hasManagedChild ? params.childAgentId : null;
     const effectiveProviderSubagentId =
       params.providerSubagentId ?? (!hasManagedChild ? params.childAgentId : null);
-    const tabId = `tab:subagent:${effectiveChildAgentId || effectiveProviderSubagentId || params.callId}`;
+    const tabHostId = hasManagedChild ? targetHostId : parentHostId;
+    const tabId = `tab:subagent:${
+      effectiveChildAgentId
+        ? `${tabHostId ?? ""}:${effectiveChildAgentId}`
+        : effectiveProviderSubagentId || params.callId
+    }`;
     setState((s) => {
       const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
       let nextTabs = s.sidePanelTabs;
@@ -4560,7 +4584,7 @@ export const orbitActions = {
         id: tabId,
         kind: "subagent",
         title: params.role || "Subagent",
-        hostId: hostId ?? undefined,
+        hostId: tabHostId ?? undefined,
         subagentCallId: params.callId,
         subagentRole: params.role,
         subagentPrompt: params.promptPreview,
@@ -4586,11 +4610,15 @@ export const orbitActions = {
       };
     });
 
-    if (hostId && effectiveChildAgentId) {
-      void orbitIpc.openAgentTimeline(hostId, effectiveChildAgentId);
-      void orbitActions.pullStageDelta(hostId, effectiveChildAgentId, false);
-    } else if (hostId && parentAgentId && effectiveProviderSubagentId) {
-      void orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, effectiveProviderSubagentId);
+    if (tabHostId && effectiveChildAgentId) {
+      void orbitIpc.openAgentTimeline(tabHostId, effectiveChildAgentId);
+      void orbitActions.pullStageDelta(tabHostId, effectiveChildAgentId, false);
+    } else if (parentHostId && parentAgentId && effectiveProviderSubagentId) {
+      void orbitIpc.openProviderSubagentTimeline(
+        parentHostId,
+        parentAgentId,
+        effectiveProviderSubagentId,
+      );
     }
   },
 

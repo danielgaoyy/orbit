@@ -608,10 +608,12 @@ async fn run_agy_actor(
     let mut consecutive_self_heals: u32 = 0;
     let mut last_ask_question_raw: Option<Vec<QuestionItem>> = None;
     let mut transcript_poll = tokio::time::interval(Duration::from_millis(200));
+    let mut idle_poll_tick: u8 = 0;
 
     loop {
         tokio::select! {
             maybe_cmd = cmd_rx.recv() => {
+                idle_poll_tick = 0;
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
                     DriverCommand::SendPrompt {
@@ -1107,6 +1109,24 @@ async fn run_agy_actor(
             }
 
             _ = transcript_poll.tick() => {
+                let has_running_subagent = subagent_monitors
+                    .values()
+                    .any(|(desc, _)| desc.status == ProviderSubagentStatus::Running);
+                let is_fully_idle = active_turn_id.is_none()
+                    && autonomous_turn_id.is_none()
+                    && bg_tracker.is_empty()
+                    && pending_self_heal.is_none()
+                    && !transcript_monitor.in_wakeup
+                    && !has_running_subagent;
+                if is_fully_idle {
+                    idle_poll_tick = idle_poll_tick.wrapping_add(1);
+                    if !idle_poll_tick.is_multiple_of(5) {
+                        continue;
+                    }
+                } else {
+                    idle_poll_tick = 0;
+                }
+
                 // Poll native Antigravity subagent transcripts for read-only Subagents Track timelines
                 for (sub_id, (desc, sub_mon)) in subagent_monitors.iter_mut() {
                     if desc.status != ProviderSubagentStatus::Running {
@@ -4605,6 +4625,8 @@ struct AgyTranscriptMonitor {
     in_progress_thinking_lens: HashMap<u64, usize>,
     last_in_progress_heartbeat: Option<Instant>,
     seen_undelivered_files: HashSet<PathBuf>,
+    last_checked_path: Option<PathBuf>,
+    last_checked_mtime: Option<std::time::SystemTime>,
 }
 
 impl AgyTranscriptMonitor {
@@ -4641,6 +4663,8 @@ impl AgyTranscriptMonitor {
             in_progress_thinking_lens: HashMap::new(),
             last_in_progress_heartbeat: None,
             seen_undelivered_files: HashSet::new(),
+            last_checked_path: None,
+            last_checked_mtime: None,
         }
     }
 
@@ -4790,13 +4814,28 @@ impl AgyTranscriptMonitor {
         let Some(path) = self.active_path().map(Path::to_path_buf) else {
             return Vec::new();
         };
+        let Ok(stat_meta) = std::fs::metadata(&path) else {
+            return Vec::new();
+        };
+        let stat_mtime = stat_meta.modified().ok();
+        // Fast path: when completely caught up at EOF and neither file length nor mtime changed,
+        // avoid `open`/`seek`/`read` syscalls altogether. Any deferred unfinished `PLANNER_RESPONSE`
+        // keeps `self.byte_offset < stat_meta.len()`, so in-place rewrites are never skipped.
+        if stat_meta.len() == self.byte_offset
+            && self.last_checked_path.as_deref() == Some(path.as_path())
+            && self.last_checked_mtime == stat_mtime
+        {
+            return Vec::new();
+        }
         let Ok(mut file) = std::fs::File::open(&path) else {
             return Vec::new();
         };
         let Ok(meta) = file.metadata() else {
             return Vec::new();
         };
-        if meta.len() < self.byte_offset {
+        let file_len = meta.len();
+        let file_mtime = meta.modified().ok();
+        if file_len < self.byte_offset {
             self.byte_offset = 0;
         }
         if self.byte_offset > 0 {
@@ -4815,6 +4854,10 @@ impl AgyTranscriptMonitor {
 
         let mut buf = String::new();
         if file.read_to_string(&mut buf).is_err() || buf.is_empty() {
+            if self.byte_offset == file_len {
+                self.last_checked_path = Some(path);
+                self.last_checked_mtime = file_mtime;
+            }
             return Vec::new();
         }
 
@@ -5302,6 +5345,12 @@ impl AgyTranscriptMonitor {
         }
 
         self.byte_offset += consumed_bytes;
+        if self.byte_offset == file_len {
+            self.last_checked_path = Some(path);
+            self.last_checked_mtime = file_mtime;
+        } else {
+            self.last_checked_mtime = None;
+        }
         out
     }
 }

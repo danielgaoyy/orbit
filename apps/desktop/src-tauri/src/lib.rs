@@ -83,7 +83,7 @@ fn default_desktop_db_path() -> PathBuf {
 fn subscribe_core_events(state: State<'_, DesktopAppState>, on_event: Channel<CoreNotification>) {
     state.core.replace_subscribers(
         SubscribeOptions {
-            min_interval_ms: 28,
+            min_interval_ms: 33,
             include_terminal_raw_bytes: true,
         },
         Arc::new(TauriChannelSubscriber { channel: on_event }),
@@ -1864,6 +1864,18 @@ fn init_desktop_file_logging() {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_desktop_file_logging();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 4))
+        .unwrap_or(4);
+    let _tauri_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(16)
+        .thread_name("orbit-tauri-rt")
+        .enable_all()
+        .build()
+        .expect("failed to initialize Orbit Desktop Tokio runtime");
+    tauri::async_runtime::set(_tauri_rt.handle().clone());
+
     let db_path = default_desktop_db_path();
     tracing::info!(
         version = CURRENT_APP_VERSION,

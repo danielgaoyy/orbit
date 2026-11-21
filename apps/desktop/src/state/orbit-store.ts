@@ -572,8 +572,15 @@ const initialPrefs = loadPrefs();
 const initialTheme: ThemeMode = initialPrefs.theme ?? "system";
 const initialResolvedTheme: ResolvedTheme = resolveTheme(initialTheme);
 applyDocumentTheme(initialResolvedTheme);
-if (typeof document !== "undefined" && isMacDesktop()) {
-  document.documentElement.classList.add("orbit-mac");
+if (typeof document !== "undefined") {
+  if (isMacDesktop()) {
+    document.documentElement.classList.add("orbit-mac");
+  } else if (
+    typeof navigator !== "undefined" &&
+    /Linux/i.test(navigator.platform || navigator.userAgent)
+  ) {
+    document.documentElement.classList.add("orbit-linux");
+  }
 }
 
 if (typeof window !== "undefined" && window.matchMedia) {
@@ -806,9 +813,27 @@ const hostSyncGates = new Map<string, SimpleSyncGate>();
 const fleetSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const sidebarSyncGate: SimpleSyncGate = { inFlight: false, queued: false, rafId: null };
 const lastReportedSeenSeq = new Map<string, number>();
+const pendingSeenTimers = new Map<
+  string,
+  { hostId: string; agentId: string; seq: number; timerId: number }
+>();
+const SEEN_REPORT_DEBOUNCE_MS = 1500;
 const submittingComposerScopes = new Set<string>();
 const cancelledSideQuestionIds = new Set<string>();
 let gitChangedDebounceTimer: number | null = null;
+
+function flushPendingSeenMarks(onlyKey?: string): void {
+  const keys = onlyKey ? [onlyKey] : Array.from(pendingSeenTimers.keys());
+  for (const key of keys) {
+    const entry = pendingSeenTimers.get(key);
+    if (!entry) continue;
+    pendingSeenTimers.delete(key);
+    if (typeof window !== "undefined") {
+      window.clearTimeout(entry.timerId);
+    }
+    void orbitIpc.markAgentSeen(entry.hostId, entry.agentId, entry.seq);
+  }
+}
 
 function markThreadSeenInCore(
   hostId: string,
@@ -819,8 +844,35 @@ function markThreadSeenInCore(
   const key = threadScopeKey(hostId, agentId);
   const prev = lastReportedSeenSeq.get(key) ?? -1;
   if (!force && seq <= prev) return;
-  lastReportedSeenSeq.set(key, Math.max(seq, prev));
-  void orbitIpc.markAgentSeen(hostId, agentId, seq);
+  const nextSeq = Math.max(seq, prev);
+  lastReportedSeenSeq.set(key, nextSeq);
+
+  if (force || typeof window === "undefined") {
+    const existing = pendingSeenTimers.get(key);
+    if (existing) {
+      pendingSeenTimers.delete(key);
+      if (typeof window !== "undefined") {
+        window.clearTimeout(existing.timerId);
+      }
+    }
+    void orbitIpc.markAgentSeen(hostId, agentId, nextSeq);
+    return;
+  }
+
+  // Throttle continuous seen-cursor ticks while streaming so rapid timeline deltas
+  // don't spam SQLite/WebSocket `MarkAgentRead` echo loops; flush promptly on force/switch/hide.
+  const existing = pendingSeenTimers.get(key);
+  if (existing) {
+    existing.seq = Math.max(existing.seq, nextSeq);
+    return;
+  }
+  const timerId = window.setTimeout(() => {
+    const current = pendingSeenTimers.get(key);
+    if (!current) return;
+    pendingSeenTimers.delete(key);
+    void orbitIpc.markAgentSeen(current.hostId, current.agentId, current.seq);
+  }, SEEN_REPORT_DEBOUNCE_MS);
+  pendingSeenTimers.set(key, { hostId, agentId, seq: nextSeq, timerId });
 }
 
 function scheduleCoalescedGate(gate: SimpleSyncGate, run: () => Promise<void>): void {
@@ -1958,7 +2010,19 @@ export const orbitActions = {
 
     const nextDetails: Record<string, HostDetailView> = {};
     for (const [hid, d] of detailEntries) {
-      if (d) nextDetails[hid] = d;
+      if (d) {
+        nextDetails[hid] = d;
+        // Fleet reload already fetched fresh host detail for `hid`; cancel redundant
+        // same-frame per-host sync scheduled by a paired `HostChanged` notification.
+        const hGate = hostSyncGates.get(hid);
+        if (hGate && !hGate.inFlight) {
+          if (hGate.rafId !== null && typeof window !== "undefined") {
+            window.cancelAnimationFrame(hGate.rafId);
+            hGate.rafId = null;
+          }
+          hGate.queued = false;
+        }
+      }
     }
 
     setState((s) => {
@@ -2352,7 +2416,12 @@ export const orbitActions = {
     }
   },
 
+  flushPendingSeenMarks(): void {
+    flushPendingSeenMarks();
+  },
+
   selectHost(hostId: string, opts?: { keepDraft?: boolean }): void {
+    flushPendingSeenMarks();
     pendingDraftCreate = null;
     const detail = state.hostDetails[hostId];
     const stayInDraft = Boolean(opts?.keepDraft);
@@ -2413,6 +2482,7 @@ export const orbitActions = {
   },
 
   selectAgent(hostId: string, agentId: string): void {
+    flushPendingSeenMarks();
     pendingDraftCreate = null;
     const detail = state.hostDetails[hostId];
     const ag = detail?.agents.find((a) => a.agent_id === agentId);

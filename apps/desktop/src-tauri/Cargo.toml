@@ -1,6 +1,6 @@
 [package]
 name = "orbit-desktop"
-version = "0.7.1"
+version = "0.7.2"
 description = "Orbit Multi-Host AI Coding Agent Desktop Control Plane (macOS & Linux)"
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -19,7 +19,7 @@ orbit-providers = { path = "../../../crates/orbit-providers" }
 tauri = { version = "2.12", features = [] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.44", features = ["fs", "io-util", "process", "time"] }
+tokio = { version = "1.44", features = ["fs", "io-util", "process", "rt-multi-thread", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures-util = "0.3"
 tracing = "0.1"

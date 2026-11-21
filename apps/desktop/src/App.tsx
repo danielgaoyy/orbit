@@ -54,22 +54,38 @@ export default function App() {
       }
     };
     const onFocus = () => void orbitIpc.onAppForeground();
+    const syncVisibilityClass = () => {
+      document.documentElement.classList.toggle(
+        "orbit-window-hidden",
+        document.visibilityState !== "visible",
+      );
+    };
     const onVisibility = () => {
+      syncVisibilityClass();
       if (document.visibilityState === "visible") {
         void orbitIpc.onAppForeground();
       } else {
+        orbitActions.flushPendingSeenMarks();
         void orbitIpc.onAppBackground();
       }
     };
+    const onPageHide = () => {
+      orbitActions.flushPendingSeenMarks();
+    };
     syncOnline();
+    syncVisibilityClass();
     window.addEventListener("offline", syncOnline);
     window.addEventListener("online", syncOnline);
     window.addEventListener("focus", onFocus);
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("beforeunload", onPageHide);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.removeEventListener("offline", syncOnline);
       window.removeEventListener("online", syncOnline);
       window.removeEventListener("focus", onFocus);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("beforeunload", onPageHide);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);

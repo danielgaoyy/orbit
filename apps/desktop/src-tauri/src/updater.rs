@@ -653,7 +653,7 @@ async fn update_linux_deb_and_relaunch(
             fi
           fi
           rm -rf {sq_stage} {sq_deb}
-          nohup \"$LAUNCH_TARGET\" >/dev/null 2>&1 &
+          MALLOC_ARENA_MAX=\"${{MALLOC_ARENA_MAX:-2}}\" nohup \"$LAUNCH_TARGET\" >/dev/null 2>&1 &
         ) >/dev/null 2>&1 &"
     );
 

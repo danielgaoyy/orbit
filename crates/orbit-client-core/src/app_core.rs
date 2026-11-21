@@ -536,6 +536,7 @@ struct HostMemoryState {
     agents: HashMap<String, AgentSummary>,
     timelines: HashMap<String, Vec<TimelineEvent>>,
     stage_cache: HashMap<String, CachedAgentStage>,
+    stage_access_order: VecDeque<String>,
     stage_dirty: HashMap<String, StageDirtyState>,
     markdown_cache: HashMap<(String, u64, usize), Vec<RichBlockView>>,
     streaming_markdown_cache: HashMap<(String, String), (usize, Vec<RichBlockView>)>,
@@ -610,6 +611,7 @@ impl HostMemoryState {
             agents: HashMap::new(),
             timelines: HashMap::new(),
             stage_cache: HashMap::new(),
+            stage_access_order: VecDeque::new(),
             stage_dirty: HashMap::new(),
             markdown_cache: HashMap::new(),
             streaming_markdown_cache: HashMap::new(),
@@ -665,6 +667,80 @@ impl HostMemoryState {
             .entry(agent_id.to_string())
             .or_default()
             .meta_dirty = true;
+    }
+
+    fn touch_stage_lru(&mut self, agent_id: &str) {
+        if let Some(pos) = self.stage_access_order.iter().position(|id| id == agent_id) {
+            self.stage_access_order.remove(pos);
+        }
+        self.stage_access_order.push_back(agent_id.to_string());
+    }
+
+    fn is_agent_active_for_cache(&self, agent_id: &str) -> bool {
+        self.agents.get(agent_id).is_some_and(|a| {
+            matches!(
+                a.status,
+                AgentStatus::Initializing
+                    | AgentStatus::Running { .. }
+                    | AgentStatus::AutonomousWakeup { .. }
+                    | AgentStatus::AwaitingPermission { .. }
+            )
+        })
+    }
+
+    fn enforce_memory_cache_bounds(&mut self, keep_agent_id: &str) {
+        const MAX_CACHED_STAGES_PER_HOST: usize = 8;
+        const MAX_CACHED_TIMELINES_PER_HOST: usize = 12;
+        const MAX_MARKDOWN_CACHE_ENTRIES: usize = 2048;
+        const MAX_STREAMING_MARKDOWN_CACHE_ENTRIES: usize = 256;
+
+        if self.stage_cache.len() > MAX_CACHED_STAGES_PER_HOST {
+            let mut idx = 0;
+            while self.stage_cache.len() > MAX_CACHED_STAGES_PER_HOST
+                && idx < self.stage_access_order.len()
+            {
+                let candidate = self.stage_access_order[idx].clone();
+                if candidate == keep_agent_id || self.is_agent_active_for_cache(&candidate) {
+                    idx += 1;
+                    continue;
+                }
+                self.stage_access_order.remove(idx);
+                self.stage_cache.remove(&candidate);
+                self.stage_dirty.remove(&candidate);
+            }
+        }
+
+        if self.timelines.len() > MAX_CACHED_TIMELINES_PER_HOST {
+            let evict_candidates: Vec<String> = self
+                .timelines
+                .keys()
+                .filter(|id| {
+                    id.as_str() != keep_agent_id
+                        && !id.starts_with("opt_")
+                        && !self.stage_cache.contains_key(id.as_str())
+                        && !self.is_agent_active_for_cache(id.as_str())
+                })
+                .cloned()
+                .collect();
+            let mut to_remove = self
+                .timelines
+                .len()
+                .saturating_sub(MAX_CACHED_TIMELINES_PER_HOST);
+            for id in evict_candidates {
+                if to_remove == 0 {
+                    break;
+                }
+                self.timelines.remove(&id);
+                to_remove -= 1;
+            }
+        }
+
+        if self.markdown_cache.len() > MAX_MARKDOWN_CACHE_ENTRIES {
+            self.markdown_cache.clear();
+        }
+        if self.streaming_markdown_cache.len() > MAX_STREAMING_MARKDOWN_CACHE_ENTRIES {
+            self.streaming_markdown_cache.clear();
+        }
     }
 
     fn emulator_slot_mut(&mut self, slot: u8) -> &mut TerminalGridEmulator {
@@ -1308,7 +1384,7 @@ impl OrbitAppCore {
                     cached.turn_item_starts.extend(sliced.turn_item_starts);
                 }
 
-                if dirty_state.aux_dirty || dirty_state.meta_dirty {
+                if dirty_state.aux_dirty {
                     let provider_subagents = host_state
                         .provider_subagents
                         .get(agent_id)
@@ -1327,6 +1403,23 @@ impl OrbitAppCore {
                     cached.session_turn_diffs = session_turn_diffs;
                     cached.insights = insights;
                     cached.aux_revision = cached.aux_revision.saturating_add(1);
+                } else if dirty_state.meta_dirty {
+                    let provider_subagents = host_state
+                        .provider_subagents
+                        .get(agent_id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let next_insights = stage::derive_session_insights(
+                        &cached.items,
+                        cwd,
+                        current_agent_card.as_ref(),
+                        &host_agent_cards,
+                        provider_subagents,
+                    );
+                    if next_insights != cached.insights {
+                        cached.insights = next_insights;
+                        cached.aux_revision = cached.aux_revision.saturating_add(1);
+                    }
                 }
                 cached.latest_seq = latest_seq;
                 cached.stage_revision = cached.stage_revision.saturating_add(1);
@@ -1341,6 +1434,8 @@ impl OrbitAppCore {
                     }
                 }
             }
+            host_state.touch_stage_lru(agent_id);
+            host_state.enforce_memory_cache_bounds(agent_id);
         }
 
         let cached_ref = host_state.stage_cache.get(agent_id);
@@ -2138,18 +2233,23 @@ impl OrbitAppCore {
         if agent_id.is_empty() || agent_id.starts_with("opt_") {
             return;
         }
-        let (host_latest, host_read_seq, host_attention) = self
+        let (host_latest, host_read_seq, host_attention, host_is_running) = self
             .hosts
             .read()
             .ok()
             .and_then(|g| {
                 g.get(host_id).and_then(|h| {
-                    h.agents
-                        .get(agent_id)
-                        .map(|a| (a.latest_seq, a.read_seq, a.attention))
+                    h.agents.get(agent_id).map(|a| {
+                        (
+                            a.latest_seq,
+                            a.read_seq,
+                            a.attention,
+                            agent_status_is_foreground_running(&a.status),
+                        )
+                    })
                 })
             })
-            .unwrap_or((0, 0, AttentionState::None));
+            .unwrap_or((0, 0, AttentionState::None, false));
         let effective_seq = if seq == 0 {
             host_latest
         } else {
@@ -2163,13 +2263,18 @@ impl OrbitAppCore {
             return;
         }
 
-        let mut changed = false;
+        let mut pref_changed = false;
+        let mut had_unread_badge = has_clearable_attention;
         let now_ms = unix_ms_now() as i64;
         if let Ok(mut prefs) = self.thread_prefs.write() {
             let key = (host_id.to_string(), agent_id.to_string());
             let prev = prefs.get(&key).map(|p| p.seen_seq).unwrap_or(0);
+            let prev_effective_seen = host_read_seq.max(prev);
+            if !host_is_running && host_latest > 0 && host_latest > prev_effective_seen {
+                had_unread_badge = true;
+            }
             if effective_seq > prev {
-                changed = true;
+                pref_changed = true;
                 let _ = self.store.set_client_thread_seen_seq(
                     host_id,
                     agent_id,
@@ -2189,18 +2294,18 @@ impl OrbitAppCore {
                 entry.updated_at_ms = entry.updated_at_ms.max(now_ms);
             }
         }
-        let needs_wire = effective_seq > host_read_seq || has_clearable_attention || changed;
+        let needs_wire = effective_seq > host_read_seq || has_clearable_attention;
+        let mut cleared_attention = false;
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
             && let Some(ag) = h.agents.get_mut(agent_id)
         {
             if effective_seq > ag.read_seq {
                 ag.read_seq = effective_seq;
-                changed = true;
             }
             if ag.attention != AttentionState::None && ag.attention != AttentionState::Permission {
                 ag.attention = AttentionState::None;
-                changed = true;
+                cleared_attention = true;
             }
         }
         if needs_wire {
@@ -2213,7 +2318,9 @@ impl OrbitAppCore {
                 },
             );
         }
-        if changed {
+        // Only broadcast FleetChanged/HostChanged when a visible unread/attention badge actually cleared.
+        // Quiet cursor advances while streaming an already-viewed active session don't need full sidebar/host reloads.
+        if cleared_attention || (had_unread_badge && (pref_changed || needs_wire)) {
             self.emit(|revision| CoreNotification::FleetChanged { revision });
             self.emit(|revision| CoreNotification::HostChanged {
                 revision,
@@ -3306,12 +3413,23 @@ impl OrbitAppCore {
                 }
                 WireMessage::AgentUpdated { agent } => {
                     let ag_id = agent.agent_id.clone();
-                    let prev_epoch = state.agents.get(&ag_id).map(|a| a.timeline_epoch);
-                    let prev_pinned = state.agents.get(&ag_id).map(|a| a.is_pinned);
-                    let prev_parent_id = state
-                        .agents
-                        .get(&ag_id)
-                        .and_then(|a| a.parent_agent_id.clone());
+                    let prev_summary = state.agents.get(&ag_id);
+                    let prev_epoch = prev_summary.map(|a| a.timeline_epoch);
+                    let prev_pinned = prev_summary.map(|a| a.is_pinned);
+                    let prev_parent_id = prev_summary.and_then(|a| a.parent_agent_id.clone());
+                    let stage_fields_unchanged =
+                        prev_summary.is_some_and(|prev| agent_stage_meta_unchanged(prev, &agent));
+                    let unread_badge_changed = prev_summary.is_none_or(|prev| {
+                        let prev_running = agent_status_is_foreground_running(&prev.status);
+                        let next_running = agent_status_is_foreground_running(&agent.status);
+                        let prev_unread = !prev_running
+                            && (prev.attention != AttentionState::None
+                                || (prev.latest_seq > 0 && prev.latest_seq > prev.read_seq));
+                        let next_unread = !next_running
+                            && (agent.attention != AttentionState::None
+                                || (agent.latest_seq > 0 && agent.latest_seq > agent.read_seq));
+                        prev_unread != next_unread || prev.attention != agent.attention
+                    });
                     let local_max_seq = state
                         .timelines
                         .get(&ag_id)
@@ -3325,18 +3443,20 @@ impl OrbitAppCore {
                         state.mark_stage_dirty(&ag_id, 0, true);
                         state.rewound_agents.insert(ag_id.clone());
                         stale_replica_agents.push((ag_id.clone(), had_mem));
-                    } else {
+                    } else if !stage_fields_unchanged {
                         state.mark_stage_meta_dirty(&ag_id);
                     }
-                    if let Some(ref parent_id) = agent.parent_agent_id {
-                        state.mark_stage_meta_dirty(parent_id);
-                        push_notify_timeline(parent_id.clone());
-                    }
-                    if let Some(prev_pid) = prev_parent_id
-                        && agent.parent_agent_id.as_deref() != Some(prev_pid.as_str())
-                    {
-                        state.mark_stage_meta_dirty(&prev_pid);
-                        push_notify_timeline(prev_pid);
+                    if !stage_fields_unchanged {
+                        if let Some(ref parent_id) = agent.parent_agent_id {
+                            state.mark_stage_meta_dirty(parent_id);
+                            push_notify_timeline(parent_id.clone());
+                        }
+                        if let Some(prev_pid) = prev_parent_id
+                            && agent.parent_agent_id.as_deref() != Some(prev_pid.as_str())
+                        {
+                            state.mark_stage_meta_dirty(&prev_pid);
+                            push_notify_timeline(prev_pid);
+                        }
                     }
                     let pin_sync = if state.host_sync_supported
                         || agent.is_pinned
@@ -3350,9 +3470,13 @@ impl OrbitAppCore {
                         server_pref_syncs.push((ag_id.clone(), agent.read_seq, pin_sync));
                     }
                     state.agents.insert(ag_id.clone(), agent);
-                    notify_fleet = true;
-                    notify_host = true;
-                    push_notify_timeline(ag_id);
+                    if !stage_fields_unchanged || unread_badge_changed {
+                        notify_fleet = true;
+                        notify_host = true;
+                    }
+                    if epoch_advanced || seq_regressed || !stage_fields_unchanged {
+                        push_notify_timeline(ag_id);
+                    }
                 }
                 WireMessage::AgentDeleted { agent_id } => {
                     let parent_id = state
@@ -7544,6 +7668,9 @@ impl<T> Default for CoalesceSlot<T> {
 }
 
 struct CoalescingState {
+    fleet: CoalesceSlot<CoreNotification>,
+    hosts: HashMap<String, CoalesceSlot<CoreNotification>>,
+    git: HashMap<(String, String), CoalesceSlot<CoreNotification>>,
     timelines: HashMap<(String, String), CoalesceSlot<CoreNotification>>,
     terminals: HashMap<(String, u8), CoalesceSlot<CoreNotification>>,
 }
@@ -7585,20 +7712,159 @@ impl CoalescingSubscriber {
             interval,
             include_terminal_raw_bytes,
             state: Arc::new(Mutex::new(CoalescingState {
+                fleet: CoalesceSlot::default(),
+                hosts: HashMap::new(),
+                git: HashMap::new(),
                 timelines: HashMap::new(),
                 terminals: HashMap::new(),
             })),
         }
+    }
+
+    fn meta_interval(&self) -> Duration {
+        self.interval.saturating_mul(2)
     }
 }
 
 impl CoreEventSubscriber for CoalescingSubscriber {
     fn on_notification(&self, event: CoreNotification) {
         match event {
-            CoreNotification::FleetChanged { .. }
-            | CoreNotification::HostChanged { .. }
-            | CoreNotification::GitChanged { .. } => {
-                self.downstream.on_notification(event);
+            CoreNotification::FleetChanged { .. } => {
+                let meta_interval = self.meta_interval();
+                let now = tokio::time::Instant::now();
+                let mut emit_now = false;
+                let mut schedule_after: Option<Duration> = None;
+
+                if let Ok(mut guard) = self.state.lock() {
+                    let slot = &mut guard.fleet;
+                    let elapsed = slot.last_emit.map(|t| now.saturating_duration_since(t));
+                    if !slot.timer_scheduled && elapsed.is_none_or(|d| d >= meta_interval) {
+                        slot.last_emit = Some(now);
+                        emit_now = true;
+                    } else {
+                        slot.pending = Some(event.clone());
+                        if !slot.timer_scheduled {
+                            slot.timer_scheduled = true;
+                            let wait = elapsed
+                                .map(|d| meta_interval.saturating_sub(d))
+                                .unwrap_or(meta_interval);
+                            schedule_after = Some(wait);
+                        }
+                    }
+                }
+
+                if emit_now {
+                    self.downstream.on_notification(event);
+                } else if let Some(wait) = schedule_after {
+                    let state = Arc::clone(&self.state);
+                    let downstream = Arc::clone(&self.downstream);
+                    self.runtime_handle.spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        let ready = state.lock().ok().and_then(|mut g| {
+                            g.fleet.timer_scheduled = false;
+                            let ev = g.fleet.pending.take()?;
+                            g.fleet.last_emit = Some(tokio::time::Instant::now());
+                            Some(ev)
+                        });
+                        if let Some(ev) = ready {
+                            downstream.on_notification(ev);
+                        }
+                    });
+                }
+            }
+            CoreNotification::HostChanged { ref host_id, .. } => {
+                let key = host_id.clone();
+                let meta_interval = self.meta_interval();
+                let now = tokio::time::Instant::now();
+                let mut emit_now = false;
+                let mut schedule_after: Option<Duration> = None;
+
+                if let Ok(mut guard) = self.state.lock() {
+                    let slot = guard.hosts.entry(key.clone()).or_default();
+                    let elapsed = slot.last_emit.map(|t| now.saturating_duration_since(t));
+                    if !slot.timer_scheduled && elapsed.is_none_or(|d| d >= meta_interval) {
+                        slot.last_emit = Some(now);
+                        emit_now = true;
+                    } else {
+                        slot.pending = Some(event.clone());
+                        if !slot.timer_scheduled {
+                            slot.timer_scheduled = true;
+                            let wait = elapsed
+                                .map(|d| meta_interval.saturating_sub(d))
+                                .unwrap_or(meta_interval);
+                            schedule_after = Some(wait);
+                        }
+                    }
+                }
+
+                if emit_now {
+                    self.downstream.on_notification(event);
+                } else if let Some(wait) = schedule_after {
+                    let state = Arc::clone(&self.state);
+                    let downstream = Arc::clone(&self.downstream);
+                    self.runtime_handle.spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        let ready = state.lock().ok().and_then(|mut g| {
+                            let slot = g.hosts.get_mut(&key)?;
+                            slot.timer_scheduled = false;
+                            let ev = slot.pending.take()?;
+                            slot.last_emit = Some(tokio::time::Instant::now());
+                            Some(ev)
+                        });
+                        if let Some(ev) = ready {
+                            downstream.on_notification(ev);
+                        }
+                    });
+                }
+            }
+            CoreNotification::GitChanged {
+                ref host_id,
+                ref cwd,
+                ..
+            } => {
+                let key = (host_id.clone(), cwd.clone());
+                let meta_interval = self.meta_interval();
+                let now = tokio::time::Instant::now();
+                let mut emit_now = false;
+                let mut schedule_after: Option<Duration> = None;
+
+                if let Ok(mut guard) = self.state.lock() {
+                    let slot = guard.git.entry(key.clone()).or_default();
+                    let elapsed = slot.last_emit.map(|t| now.saturating_duration_since(t));
+                    if !slot.timer_scheduled && elapsed.is_none_or(|d| d >= meta_interval) {
+                        slot.last_emit = Some(now);
+                        emit_now = true;
+                    } else {
+                        slot.pending = Some(event.clone());
+                        if !slot.timer_scheduled {
+                            slot.timer_scheduled = true;
+                            let wait = elapsed
+                                .map(|d| meta_interval.saturating_sub(d))
+                                .unwrap_or(meta_interval);
+                            schedule_after = Some(wait);
+                        }
+                    }
+                }
+
+                if emit_now {
+                    self.downstream.on_notification(event);
+                } else if let Some(wait) = schedule_after {
+                    let state = Arc::clone(&self.state);
+                    let downstream = Arc::clone(&self.downstream);
+                    self.runtime_handle.spawn(async move {
+                        tokio::time::sleep(wait).await;
+                        let ready = state.lock().ok().and_then(|mut g| {
+                            let slot = g.git.get_mut(&key)?;
+                            slot.timer_scheduled = false;
+                            let ev = slot.pending.take()?;
+                            slot.last_emit = Some(tokio::time::Instant::now());
+                            Some(ev)
+                        });
+                        if let Some(ev) = ready {
+                            downstream.on_notification(ev);
+                        }
+                    });
+                }
             }
             CoreNotification::TimelineChanged {
                 ref host_id,
@@ -8349,6 +8615,52 @@ fn format_autonomous_wakeup_notice(source: &str) -> String {
     }
 }
 
+fn agent_status_is_foreground_running(status: &AgentStatus) -> bool {
+    match status {
+        AgentStatus::Initializing | AgentStatus::Running { .. } => true,
+        AgentStatus::AutonomousWakeup { source, .. } => !source.trim().starts_with("waiting:"),
+        AgentStatus::Idle
+        | AgentStatus::AwaitingPermission { .. }
+        | AgentStatus::Error { .. }
+        | AgentStatus::Closed => false,
+    }
+}
+
+/// Returns true if all stage/card-relevant fields of `AgentSummary` are unchanged
+/// (ignoring `read_seq`, `updated_at`, and `last_activity_at`).
+fn agent_stage_meta_unchanged(prev: &AgentSummary, next: &AgentSummary) -> bool {
+    prev.workspace_id == next.workspace_id
+        && prev.cwd == next.cwd
+        && prev.title == next.title
+        && prev.provider == next.provider
+        && prev.model == next.model
+        && prev.effort == next.effort
+        && prev.mode == next.mode
+        && prev.status == next.status
+        && prev.parent_agent_id == next.parent_agent_id
+        && prev.parent_host_id == next.parent_host_id
+        && prev.latest_seq == next.latest_seq
+        && prev.timeline_epoch == next.timeline_epoch
+        && prev.archived_at == next.archived_at
+        && prev.background == next.background
+        && prev.auto_archive == next.auto_archive
+        && prev.profile_id == next.profile_id
+        && prev.labels == next.labels
+        && prev.attention == next.attention
+        && prev.is_pinned == next.is_pinned
+        && prev.pinned_order == next.pinned_order
+        && prev.handle == next.handle
+        && prev.task_summary == next.task_summary
+        && prev.queued_prompts.len() == next.queued_prompts.len()
+        && prev
+            .queued_prompts
+            .iter()
+            .zip(next.queued_prompts.iter())
+            .all(|(a, b)| a.queue_id == b.queue_id && a.display_text == b.display_text)
+        && serde_json::to_string(&prev.cluster_suggestion).ok()
+            == serde_json::to_string(&next.cluster_suggestion).ok()
+}
+
 fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> AgentCardView {
     let (status_label, is_running, has_background_tasks, is_awaiting_permission) = match &a.status {
         AgentStatus::Initializing => ("Starting".to_string(), true, false, false),
@@ -8880,7 +9192,7 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_coalesced_throttles_timeline_bursts_while_passing_fleet_immediately() {
+    fn subscribe_coalesced_throttles_timeline_and_fleet_bursts_with_leading_edge() {
         struct CountSub {
             fleet_count: AtomicU64,
             timeline_count: AtomicU64,
@@ -8906,10 +9218,10 @@ mod tests {
         });
         core.subscribe_coalesced(30, counter.clone());
 
-        // FleetChanged passes immediately without coalescing
+        // FleetChanged emits leading-edge immediately and coalesces rapid bursts into a trailing flush
         core.emit(|revision| CoreNotification::FleetChanged { revision });
         core.emit(|revision| CoreNotification::FleetChanged { revision });
-        assert_eq!(counter.fleet_count.load(Ordering::SeqCst), 2);
+        assert_eq!(counter.fleet_count.load(Ordering::SeqCst), 1);
 
         // Emit 10 rapid TimelineChanged events for the same agent -> 1 immediate + 1 trailing flush
         for _ in 0..10 {
@@ -8920,7 +9232,8 @@ mod tests {
             });
         }
         assert_eq!(counter.timeline_count.load(Ordering::SeqCst), 1);
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(85));
+        assert_eq!(counter.fleet_count.load(Ordering::SeqCst), 2);
         assert_eq!(counter.timeline_count.load(Ordering::SeqCst), 2);
     }
 
@@ -10294,5 +10607,326 @@ mod tests {
         assert!(waking.is_running);
         assert!(!waking.has_background_tasks);
         assert!(!waking.is_unread);
+    }
+
+    #[test]
+    fn coalescing_subscriber_collapses_fleet_and_host_bursts() {
+        let core = OrbitAppCore::open_in_memory().expect("open");
+        let received: Arc<Mutex<Vec<CoreNotification>>> = Arc::new(Mutex::new(Vec::new()));
+        struct VecSub(Arc<Mutex<Vec<CoreNotification>>>);
+        impl CoreEventSubscriber for VecSub {
+            fn on_notification(&self, event: CoreNotification) {
+                self.0.lock().expect("lock").push(event);
+            }
+        }
+        let sub = CoalescingSubscriber::new(
+            Arc::new(VecSub(Arc::clone(&received))),
+            core.runtime.handle().clone(),
+            Duration::from_millis(20),
+            false,
+        );
+
+        for rev in 1..=20 {
+            sub.on_notification(CoreNotification::FleetChanged { revision: rev });
+            sub.on_notification(CoreNotification::HostChanged {
+                revision: rev,
+                host_id: "h1".into(),
+            });
+        }
+
+        // Leading edge fires immediately once per channel
+        {
+            let got = received.lock().expect("lock");
+            assert_eq!(got.len(), 2);
+        }
+
+        // Wait for trailing flush (2 * 20ms = 40ms)
+        std::thread::sleep(Duration::from_millis(80));
+        let got = received.lock().expect("lock");
+        let fleet_revs: Vec<u64> = got
+            .iter()
+            .filter_map(|e| match e {
+                CoreNotification::FleetChanged { revision } => Some(*revision),
+                _ => None,
+            })
+            .collect();
+        let host_revs: Vec<u64> = got
+            .iter()
+            .filter_map(|e| match e {
+                CoreNotification::HostChanged { revision, host_id } if host_id == "h1" => {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fleet_revs, vec![1, 20]);
+        assert_eq!(host_revs, vec![1, 20]);
+    }
+
+    #[test]
+    fn mark_agent_seen_quiet_cursor_advance_does_not_spam_fleet_events() {
+        let core = OrbitAppCore::open_in_memory().expect("open");
+        let now = Utc::now();
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_seen".into(),
+                hostname: "local".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: String::new(),
+                direct_endpoints: Vec::new(),
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert(
+                "ag_run".into(),
+                AgentSummary {
+                    agent_id: "ag_run".into(),
+                    workspace_id: "ws_1".into(),
+                    cwd: "/repo".into(),
+                    title: "Streaming".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::FullAccess,
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 10,
+                    timeline_epoch: 1,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: None,
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 9,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    cluster_suggestion: None,
+                    task_summary: None,
+                },
+            );
+            hosts.insert("h_seen".into(), mem);
+        }
+
+        let received: Arc<Mutex<Vec<CoreNotification>>> = Arc::new(Mutex::new(Vec::new()));
+        struct VecSub(Arc<Mutex<Vec<CoreNotification>>>);
+        impl CoreEventSubscriber for VecSub {
+            fn on_notification(&self, event: CoreNotification) {
+                self.0.lock().expect("lock").push(event);
+            }
+        }
+        core.subscribe(Arc::new(VecSub(Arc::clone(&received))));
+
+        // Advancing seen cursor while actively running and AttentionState::None must NOT emit FleetChanged/HostChanged
+        core.mark_agent_seen("h_seen", "ag_run", 10);
+        assert!(received.lock().expect("lock").is_empty());
+
+        // Transition to Finished (unread badge) and mark seen -> MUST emit FleetChanged + HostChanged
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let ag = hosts
+                .get_mut("h_seen")
+                .expect("h")
+                .agents
+                .get_mut("ag_run")
+                .expect("ag");
+            ag.status = AgentStatus::Idle;
+            ag.attention = AttentionState::Finished;
+            ag.latest_seq = 11;
+        }
+        core.mark_agent_seen("h_seen", "ag_run", 11);
+        let notes = received.lock().expect("lock");
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, CoreNotification::FleetChanged { .. }))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| matches!(n, CoreNotification::HostChanged { .. }))
+        );
+    }
+
+    #[test]
+    fn agent_updated_read_seq_echo_does_not_bump_stage_aux_revision() {
+        let core = OrbitAppCore::open_in_memory().expect("open");
+        let now = Utc::now();
+        let make_ag = |read_seq: u64| AgentSummary {
+            agent_id: "ag_echo".into(),
+            workspace_id: "ws_1".into(),
+            cwd: "/repo".into(),
+            title: "Echo".into(),
+            provider: ProviderKind::Antigravity,
+            model: None,
+            effort: None,
+            mode: SessionMode::FullAccess,
+            status: AgentStatus::Running {
+                turn_id: "t1".into(),
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 10,
+            timeline_epoch: 1,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+        };
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_echo".into(),
+                hostname: "local".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: String::new(),
+                direct_endpoints: Vec::new(),
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.agents.insert("ag_echo".into(), make_ag(5));
+            hosts.insert("h_echo".into(), mem);
+        }
+
+        let initial = core.agent_stage_delta_with_aux("h_echo", "ag_echo", 0, None);
+        let received: Arc<Mutex<Vec<CoreNotification>>> = Arc::new(Mutex::new(Vec::new()));
+        struct VecSub(Arc<Mutex<Vec<CoreNotification>>>);
+        impl CoreEventSubscriber for VecSub {
+            fn on_notification(&self, event: CoreNotification) {
+                self.0.lock().expect("lock").push(event);
+            }
+        }
+        core.subscribe(Arc::new(VecSub(Arc::clone(&received))));
+
+        // Echoed AgentUpdated where only read_seq advanced during active streaming
+        core.handle_inbound_wire("h_echo", WireMessage::AgentUpdated { agent: make_ag(10) });
+        assert!(
+            received.lock().expect("lock").is_empty(),
+            "read_seq-only echo during active running must not spam notifications"
+        );
+        let after = core.agent_stage_delta_with_aux(
+            "h_echo",
+            "ag_echo",
+            initial.revision,
+            Some(initial.aux_revision),
+        );
+        assert_eq!(after.revision, initial.revision);
+        assert_eq!(after.aux_revision, initial.aux_revision);
+        assert!(after.aux_unchanged);
+    }
+
+    #[test]
+    fn stage_cache_lru_evicts_idle_agents_beyond_cap_while_keeping_running() {
+        let core = OrbitAppCore::open_in_memory().expect("open");
+        let now = Utc::now();
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_lru".into(),
+                hostname: "local".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 6868,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: String::new(),
+                direct_endpoints: Vec::new(),
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            for idx in 0..12 {
+                let id = format!("ag_{idx}");
+                mem.agents.insert(
+                    id.clone(),
+                    AgentSummary {
+                        agent_id: id,
+                        workspace_id: "ws_1".into(),
+                        cwd: "/repo".into(),
+                        title: format!("Agent {idx}"),
+                        provider: ProviderKind::Antigravity,
+                        model: None,
+                        effort: None,
+                        mode: SessionMode::FullAccess,
+                        status: if idx == 0 {
+                            AgentStatus::Running {
+                                turn_id: "t0".into(),
+                            }
+                        } else {
+                            AgentStatus::Idle
+                        },
+                        parent_agent_id: None,
+                        parent_host_id: None,
+                        latest_seq: 1,
+                        timeline_epoch: 1,
+                        created_at: now,
+                        updated_at: now,
+                        archived_at: None,
+                        background: false,
+                        auto_archive: false,
+                        profile_id: None,
+                        labels: HashMap::new(),
+                        attention: AttentionState::None,
+                        last_activity_at: Some(now),
+                        queued_prompts: Vec::new(),
+                        read_seq: 1,
+                        is_pinned: false,
+                        pinned_order: 0,
+                        handle: None,
+                        cluster_suggestion: None,
+                        task_summary: None,
+                    },
+                );
+            }
+            hosts.insert("h_lru".into(), mem);
+        }
+
+        for idx in 0..12 {
+            let _ = core.agent_stage("h_lru", &format!("ag_{idx}"));
+        }
+
+        let hosts = core.hosts.read().expect("hosts");
+        let mem = hosts.get("h_lru").expect("h_lru");
+        assert!(
+            mem.stage_cache.len() <= 8,
+            "stage cache should stay bounded (got {})",
+            mem.stage_cache.len()
+        );
+        assert!(
+            mem.stage_cache.contains_key("ag_0"),
+            "active running agent must never be evicted"
+        );
+        assert!(
+            mem.stage_cache.contains_key("ag_11"),
+            "most recently accessed agent must remain cached"
+        );
     }
 }

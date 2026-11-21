@@ -106,6 +106,19 @@ impl OrbitStore {
         agent_id: &str,
         seen_seq: Option<u64>,
     ) -> Result<Option<AgentSummary>, StoreError> {
+        Ok(self
+            .mark_agent_read_seq_with_changed(agent_id, seen_seq)?
+            .map(|(ag, _)| ag))
+    }
+
+    /// Advance an agent's monotonic `read_seq` cursor and report whether the stored row actually changed.
+    /// When neither `read_seq` nor `attention_state` changes, skips the SQLite `UPDATE` completely so
+    /// no WAL page is dirtied and callers can suppress redundant `AgentUpdated` broadcasts.
+    pub fn mark_agent_read_seq_with_changed(
+        &self,
+        agent_id: &str,
+        seen_seq: Option<u64>,
+    ) -> Result<Option<(AgentSummary, bool)>, StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
         let row_opt: Option<(i64, i64, String)> = tx
@@ -129,16 +142,21 @@ impl OrbitStore {
         } else {
             prev_attention.as_str()
         };
-        tx.execute(
-            "UPDATE agents SET read_seq = ?1, attention_state = ?2 WHERE agent_id = ?3",
-            params![target_seq, next_attention, agent_id],
-        )?;
+        let changed = target_seq != prev_read_i64 || next_attention != prev_attention;
+        if changed {
+            tx.execute(
+                "UPDATE agents SET read_seq = ?1, attention_state = ?2 WHERE agent_id = ?3",
+                params![target_seq, next_attention, agent_id],
+            )?;
+        }
         let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
         let updated = tx
             .query_row(&select_sql, params![agent_id], map_agent_row)
             .optional()?;
-        tx.commit()?;
-        Ok(updated)
+        if changed {
+            tx.commit()?;
+        }
+        Ok(updated.map(|ag| (ag, changed)))
     }
 
     /// Explicitly mark an agent unread across all devices (`AttentionState::ManualUnread`)
@@ -1053,12 +1071,21 @@ mod tests {
         assert_eq!(after_read.read_seq, 42);
         assert_eq!(after_read.attention, AttentionState::None);
 
-        // Stale lower read_seq must NEVER regress read_seq
-        let after_stale = store
-            .mark_agent_read_seq("ag_1", Some(10))
+        // Stale lower read_seq must NEVER regress read_seq and must report changed=false
+        let (after_stale, stale_changed) = store
+            .mark_agent_read_seq_with_changed("ag_1", Some(10))
             .expect("stale")
             .expect("agent");
         assert_eq!(after_stale.read_seq, 42);
+        assert!(!stale_changed);
+
+        // Idempotent same read_seq with AttentionState::None must also report changed=false
+        let (after_same, same_changed) = store
+            .mark_agent_read_seq_with_changed("ag_1", Some(42))
+            .expect("same")
+            .expect("agent");
+        assert_eq!(after_same.read_seq, 42);
+        assert!(!same_changed);
 
         // Manual unread preserves read_seq=42 and sets AttentionState::ManualUnread
         let after_unread = store

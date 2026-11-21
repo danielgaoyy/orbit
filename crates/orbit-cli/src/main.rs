@@ -413,9 +413,26 @@ fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
         .join(".orbit")
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let rt = match &cli.command {
+        Commands::Daemon { action: None, .. } | Commands::Relay { .. } => {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 4))
+                .unwrap_or(4);
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()?
+        }
+        _ => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?,
+    };
+    rt.block_on(run_cli(cli))
+}
+
+async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let home_dir = resolve_home(cli.home);
     let json_mode = cli.json;
     let via_relay = cli.via_relay;

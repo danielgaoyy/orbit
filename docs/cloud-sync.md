@@ -9,20 +9,19 @@ Orbit provides multi-device login and automatic configuration sync **without any
 
 ---
 
-## Enabling 1-Click "Sign in with GitHub" for Official Releases (30 Seconds, Free Forever)
+## Official & Custom GitHub OAuth App Configuration
+
+Official Orbit builds ship with Orbit's built-in public GitHub OAuth App Client ID (`Ov23lit3VKcNBq6uNUfp`, RFC 8628 Device Flow enabled, zero client secret), so **Sign in with GitHub** works out of the box on CLI, Desktop, iOS, Android, and HarmonyOS.
+
+If you fork or self-host a custom Orbit build and want your own OAuth App branding:
 
 1. Open [GitHub Developer Settings → OAuth Apps](https://github.com/settings/developers) and click **New OAuth App**.
-2. Fill in:
-   - **Application name**: `Orbit`
-   - **Homepage URL**: `https://github.com/danielgaoyy/orbit`
-   - **Authorization callback URL**: `https://github.com/danielgaoyy/orbit` (unused by Device Flow, only required by the form)
-3. Check **Enable Device Flow** and save.
-4. Copy the public **Client ID** (e.g., `Ov23li...` — no client secret is needed).
-5. Either:
-   - Set it as a GitHub Actions Repository Variable named `ORBIT_GITHUB_CLIENT_ID` (CI and Release workflows inject it automatically at build time), **or**
-   - Paste it into `DEFAULT_GITHUB_CLIENT_ID` in `crates/orbit-client-core/src/cloud_sync.rs`.
+2. Check **Enable Device Flow** and save.
+3. Copy the public **Client ID** (`Ov23li...`) and either:
+   - Set the GitHub Actions Repository Variable `ORBIT_GITHUB_CLIENT_ID` (picked up automatically by CI and Release workflows), **or**
+   - Pass `ORBIT_GITHUB_CLIENT_ID` at runtime / override it in `crates/orbit-client-core/src/cloud_sync.rs`.
 
-Users can also override it at runtime via `ORBIT_GITHUB_CLIENT_ID` or sign in immediately with a `gist`-scoped GitHub Personal Access Token.
+Users can also sign in at any time using a `gist`-scoped GitHub Personal Access Token.
 
 ---
 

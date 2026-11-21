@@ -30,12 +30,14 @@ pub const CLOUD_VAULT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_GITHUB_WEB_BASE: &str = "https://github.com";
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Public GitHub OAuth App Client ID (RFC 8628 Device Flow — intentionally public, no secret).
-/// Can be injected at compile time via `ORBIT_GITHUB_CLIENT_ID`, overridden at runtime via
-/// `ORBIT_GITHUB_CLIENT_ID`, or provided in UI/CLI settings.
+/// Built-in public GitHub OAuth App Client ID for Orbit (RFC 8628 Device Flow — intentionally public,
+/// no client secret). Can be overridden at compile time via `ORBIT_GITHUB_CLIENT_ID`, at runtime via
+/// `ORBIT_GITHUB_CLIENT_ID`, or per-device in Settings / CLI.
+pub const BUILTIN_GITHUB_CLIENT_ID: &str = "Ov23lit3VKcNBq6uNUfp";
+
 pub const DEFAULT_GITHUB_CLIENT_ID: &str = match option_env!("ORBIT_GITHUB_CLIENT_ID") {
-    Some(id) => id,
-    None => "",
+    Some(id) if !id.is_empty() => id,
+    _ => BUILTIN_GITHUB_CLIENT_ID,
 };
 
 pub const KV_CLOUD_SYNC_CONFIG: &str = "cloud_sync_config_v1";
@@ -452,6 +454,10 @@ pub fn resolve_github_client_id(explicit: Option<&str>, saved: Option<&str>) -> 
     let compiled = DEFAULT_GITHUB_CLIENT_ID.trim();
     if !compiled.is_empty() {
         return Some(compiled.to_string());
+    }
+    let builtin = BUILTIN_GITHUB_CLIENT_ID.trim();
+    if !builtin.is_empty() {
+        return Some(builtin.to_string());
     }
     None
 }
@@ -1612,6 +1618,19 @@ mod tests {
             os_arch: Some("linux/aarch64".into()),
             updated_at_ms,
         }
+    }
+
+    #[test]
+    fn resolves_builtin_github_client_id_when_unset() {
+        assert_eq!(DEFAULT_GITHUB_CLIENT_ID, BUILTIN_GITHUB_CLIENT_ID);
+        assert_eq!(
+            resolve_github_client_id(Some("Ov23liOverride"), None).as_deref(),
+            Some("Ov23liOverride")
+        );
+        assert_eq!(
+            resolve_github_client_id(None, None).as_deref(),
+            Some(BUILTIN_GITHUB_CLIENT_ID)
+        );
     }
 
     #[test]

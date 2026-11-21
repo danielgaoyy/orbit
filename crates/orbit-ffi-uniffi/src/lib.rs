@@ -19,6 +19,10 @@ use orbit_client_core::catalog::{
     format_effort_label as core_format_effort_label,
     resolve_supported_effort_for_model as core_resolve_supported_effort_for_model,
 };
+use orbit_client_core::cloud_sync::{
+    CloudSyncDevicePollStatus, CloudSyncDevicePollView, CloudSyncResultView, CloudSyncState,
+    CloudSyncStatusView, GitHubDeviceFlowStartView,
+};
 use orbit_client_core::composer::{
     ClientPlatform, ComposePromptRequest, ComposedPromptView, ComposerContextInput,
     ComposerPasteInput, ComposerQuoteInput, MentionCandidateView, SlashCommandView, SlashDirective,
@@ -4803,6 +4807,288 @@ impl OrbitMobileCore {
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    // --- Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist) ---
+
+    pub fn cloud_sync_status(&self) -> FfiCloudSyncStatus {
+        self.inner.cloud_sync_status().into()
+    }
+
+    pub fn cloud_sync_generate_passphrase(&self) -> String {
+        self.inner.cloud_sync_generate_passphrase()
+    }
+
+    pub fn cloud_sync_set_github_client_id(
+        &self,
+        client_id: Option<String>,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_set_github_client_id(client_id)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_set_auto_sync(
+        &self,
+        enabled: bool,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_set_auto_sync(enabled)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_start_github_device_flow(
+        &self,
+        client_id_override: Option<String>,
+    ) -> Result<FfiGitHubDeviceFlowStart, FfiOrbitError> {
+        self.inner
+            .cloud_sync_start_github_device_flow(client_id_override)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_poll_github_device_flow(
+        &self,
+        device_code: String,
+        client_id_override: Option<String>,
+    ) -> Result<FfiCloudSyncDevicePoll, FfiOrbitError> {
+        self.inner
+            .cloud_sync_poll_github_device_flow(&device_code, client_id_override)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_login_with_token(
+        &self,
+        token: String,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_login_with_token(&token)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_unlock_with_passphrase(
+        &self,
+        passphrase: String,
+    ) -> Result<FfiCloudSyncResult, FfiOrbitError> {
+        self.inner
+            .cloud_sync_unlock_with_passphrase(&passphrase)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_now(&self) -> Result<FfiCloudSyncResult, FfiOrbitError> {
+        self.inner
+            .cloud_sync_now()
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_logout(
+        &self,
+        clear_local_hosts: bool,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_logout(clear_local_hosts)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_get_preferences_json(&self) -> String {
+        let prefs = self.inner.cloud_sync_get_preferences();
+        serde_json::to_string(&prefs).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn cloud_sync_update_preferences_json(
+        &self,
+        patch_json: String,
+    ) -> Result<(), FfiOrbitError> {
+        let patch: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&patch_json).map_err(|e| FfiOrbitError::Core {
+                detail: format!("invalid preferences patch JSON: {e}"),
+            })?;
+        self.inner
+            .cloud_sync_update_preferences(patch)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCloudSyncState {
+    SignedOut,
+    Locked,
+    Ready,
+    Syncing,
+    Error,
+}
+
+impl From<CloudSyncState> for FfiCloudSyncState {
+    fn from(v: CloudSyncState) -> Self {
+        match v {
+            CloudSyncState::SignedOut => Self::SignedOut,
+            CloudSyncState::Locked => Self::Locked,
+            CloudSyncState::Ready => Self::Ready,
+            CloudSyncState::Syncing => Self::Syncing,
+            CloudSyncState::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCloudSyncDevicePollStatus {
+    Pending,
+    SlowDown,
+    Authorized,
+    Expired,
+    Denied,
+}
+
+impl From<CloudSyncDevicePollStatus> for FfiCloudSyncDevicePollStatus {
+    fn from(v: CloudSyncDevicePollStatus) -> Self {
+        match v {
+            CloudSyncDevicePollStatus::Pending => Self::Pending,
+            CloudSyncDevicePollStatus::SlowDown => Self::SlowDown,
+            CloudSyncDevicePollStatus::Authorized => Self::Authorized,
+            CloudSyncDevicePollStatus::Expired => Self::Expired,
+            CloudSyncDevicePollStatus::Denied => Self::Denied,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCloudSyncStatus {
+    pub state: FfiCloudSyncState,
+    pub provider: String,
+    pub github_oauth_configured: bool,
+    pub github_client_id_override: Option<String>,
+    pub account_login: Option<String>,
+    pub account_name: Option<String>,
+    pub account_avatar_url: Option<String>,
+    pub gist_id: Option<String>,
+    pub gist_html_url: Option<String>,
+    pub remote_vault_exists: bool,
+    pub auto_sync_enabled: bool,
+    pub last_synced_at_ms: Option<i64>,
+    pub last_vault_revision: u64,
+    pub synced_host_count: u32,
+    pub synced_project_count: u32,
+    pub last_error: Option<String>,
+}
+
+impl From<CloudSyncStatusView> for FfiCloudSyncStatus {
+    fn from(v: CloudSyncStatusView) -> Self {
+        Self {
+            state: v.state.into(),
+            provider: v.provider,
+            github_oauth_configured: v.github_oauth_configured,
+            github_client_id_override: v.github_client_id_override,
+            account_login: v.account_login,
+            account_name: v.account_name,
+            account_avatar_url: v.account_avatar_url,
+            gist_id: v.gist_id,
+            gist_html_url: v.gist_html_url,
+            remote_vault_exists: v.remote_vault_exists,
+            auto_sync_enabled: v.auto_sync_enabled,
+            last_synced_at_ms: v.last_synced_at_ms,
+            last_vault_revision: v.last_vault_revision,
+            synced_host_count: v.synced_host_count,
+            synced_project_count: v.synced_project_count,
+            last_error: v.last_error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiGitHubDeviceFlowStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in_secs: u64,
+    pub interval_secs: u64,
+}
+
+impl From<GitHubDeviceFlowStartView> for FfiGitHubDeviceFlowStart {
+    fn from(v: GitHubDeviceFlowStartView) -> Self {
+        Self {
+            device_code: v.device_code,
+            user_code: v.user_code,
+            verification_uri: v.verification_uri,
+            expires_in_secs: v.expires_in_secs,
+            interval_secs: v.interval_secs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCloudSyncDevicePoll {
+    pub status: FfiCloudSyncDevicePollStatus,
+    pub interval_secs: Option<u64>,
+    pub error: Option<String>,
+    pub sync_status: Option<FfiCloudSyncStatus>,
+}
+
+impl From<CloudSyncDevicePollView> for FfiCloudSyncDevicePoll {
+    fn from(v: CloudSyncDevicePollView) -> Self {
+        Self {
+            status: v.status.into(),
+            interval_secs: v.interval_secs,
+            error: v.error,
+            sync_status: v.sync_status.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCloudSyncResult {
+    pub hosts_added: u32,
+    pub hosts_updated: u32,
+    pub hosts_removed: u32,
+    pub projects_added: u32,
+    pub projects_updated: u32,
+    pub projects_removed: u32,
+    pub preferences_updated: u32,
+    pub pushed_remote: bool,
+    pub vault_revision: u64,
+    pub synced_at_ms: i64,
+    pub gist_html_url: Option<String>,
+}
+
+impl From<CloudSyncResultView> for FfiCloudSyncResult {
+    fn from(v: CloudSyncResultView) -> Self {
+        Self {
+            hosts_added: v.hosts_added,
+            hosts_updated: v.hosts_updated,
+            hosts_removed: v.hosts_removed,
+            projects_added: v.projects_added,
+            projects_updated: v.projects_updated,
+            projects_removed: v.projects_removed,
+            preferences_updated: v.preferences_updated,
+            pushed_remote: v.pushed_remote,
+            vault_revision: v.vault_revision,
+            synced_at_ms: v.synced_at_ms,
+            gist_html_url: v.gist_html_url,
+        }
     }
 }
 

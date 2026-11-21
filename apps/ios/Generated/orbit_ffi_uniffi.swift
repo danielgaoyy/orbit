@@ -913,6 +913,30 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func buildSideQuestionContext(hostId: String, agentId: String, maxChars: UInt32?)  -> String
     
+    func cloudSyncGeneratePassphrase()  -> String
+    
+    func cloudSyncGetPreferencesJson()  -> String
+    
+    func cloudSyncLoginWithToken(token: String) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncLogout(clearLocalHosts: Bool) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncNow() throws  -> FfiCloudSyncResult
+    
+    func cloudSyncPollGithubDeviceFlow(deviceCode: String, clientIdOverride: String?) throws  -> FfiCloudSyncDevicePoll
+    
+    func cloudSyncSetAutoSync(enabled: Bool) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncSetGithubClientId(clientId: String?) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncStartGithubDeviceFlow(clientIdOverride: String?) throws  -> FfiGitHubDeviceFlowStart
+    
+    func cloudSyncStatus()  -> FfiCloudSyncStatus
+    
+    func cloudSyncUnlockWithPassphrase(passphrase: String) throws  -> FfiCloudSyncResult
+    
+    func cloudSyncUpdatePreferencesJson(patchJson: String) throws 
+    
     func composePrompt(req: FfiComposePromptRequest)  -> FfiComposedPrompt
     
     func connectAllHosts() 
@@ -1349,6 +1373,122 @@ open func buildSideQuestionContext(hostId: String, agentId: String, maxChars: UI
         FfiConverterOptionUInt32.lower(maxChars),uniffiCallStatus
     )
 })
+}
+    
+open func cloudSyncGeneratePassphrase() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_generate_passphrase(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncGetPreferencesJson() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncLoginWithToken(token: String)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_login_with_token(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(token),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncLogout(clearLocalHosts: Bool)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_logout(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(clearLocalHosts),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncNow()throws  -> FfiCloudSyncResult  {
+    return try  FfiConverterTypeFfiCloudSyncResult_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_now(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncPollGithubDeviceFlow(deviceCode: String, clientIdOverride: String?)throws  -> FfiCloudSyncDevicePoll  {
+    return try  FfiConverterTypeFfiCloudSyncDevicePoll_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_poll_github_device_flow(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(deviceCode),
+        FfiConverterOptionString.lower(clientIdOverride),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncSetAutoSync(enabled: Bool)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_auto_sync(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncSetGithubClientId(clientId: String?)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_github_client_id(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionString.lower(clientId),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncStartGithubDeviceFlow(clientIdOverride: String?)throws  -> FfiGitHubDeviceFlowStart  {
+    return try  FfiConverterTypeFfiGitHubDeviceFlowStart_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_start_github_device_flow(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionString.lower(clientIdOverride),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncStatus() -> FfiCloudSyncStatus  {
+    return try!  FfiConverterTypeFfiCloudSyncStatus_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_status(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncUnlockWithPassphrase(passphrase: String)throws  -> FfiCloudSyncResult  {
+    return try  FfiConverterTypeFfiCloudSyncResult_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_unlock_with_passphrase(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(passphrase),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncUpdatePreferencesJson(patchJson: String)throws   {try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_update_preferences_json(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(patchJson),uniffiCallStatus
+    )
+}
 }
     
 open func composePrompt(req: FfiComposePromptRequest) -> FfiComposedPrompt  {
@@ -3474,6 +3614,268 @@ public func FfiConverterTypeFfiClientProject_lower(_ value: FfiClientProject) ->
 }
 
 
+public struct FfiCloudSyncDevicePoll: Equatable, Hashable {
+    public var status: FfiCloudSyncDevicePollStatus
+    public var intervalSecs: UInt64?
+    public var error: String?
+    public var syncStatus: FfiCloudSyncStatus?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: FfiCloudSyncDevicePollStatus, intervalSecs: UInt64?, error: String?, syncStatus: FfiCloudSyncStatus?) {
+        self.status = status
+        self.intervalSecs = intervalSecs
+        self.error = error
+        self.syncStatus = syncStatus
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncDevicePoll: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncDevicePoll: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncDevicePoll {
+        return
+            try FfiCloudSyncDevicePoll(
+                status: FfiConverterTypeFfiCloudSyncDevicePollStatus.read(from: &buf), 
+                intervalSecs: FfiConverterOptionUInt64.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf), 
+                syncStatus: FfiConverterOptionTypeFfiCloudSyncStatus.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCloudSyncDevicePoll, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiCloudSyncDevicePollStatus.write(value.status, into: &buf)
+        FfiConverterOptionUInt64.write(value.intervalSecs, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterOptionTypeFfiCloudSyncStatus.write(value.syncStatus, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncDevicePoll_lift(_ buf: RustBuffer) throws -> FfiCloudSyncDevicePoll {
+    return try FfiConverterTypeFfiCloudSyncDevicePoll.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncDevicePoll_lower(_ value: FfiCloudSyncDevicePoll) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncDevicePoll.lower(value)
+}
+
+
+public struct FfiCloudSyncResult: Equatable, Hashable {
+    public var hostsAdded: UInt32
+    public var hostsUpdated: UInt32
+    public var hostsRemoved: UInt32
+    public var projectsAdded: UInt32
+    public var projectsUpdated: UInt32
+    public var projectsRemoved: UInt32
+    public var preferencesUpdated: UInt32
+    public var pushedRemote: Bool
+    public var vaultRevision: UInt64
+    public var syncedAtMs: Int64
+    public var gistHtmlUrl: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hostsAdded: UInt32, hostsUpdated: UInt32, hostsRemoved: UInt32, projectsAdded: UInt32, projectsUpdated: UInt32, projectsRemoved: UInt32, preferencesUpdated: UInt32, pushedRemote: Bool, vaultRevision: UInt64, syncedAtMs: Int64, gistHtmlUrl: String?) {
+        self.hostsAdded = hostsAdded
+        self.hostsUpdated = hostsUpdated
+        self.hostsRemoved = hostsRemoved
+        self.projectsAdded = projectsAdded
+        self.projectsUpdated = projectsUpdated
+        self.projectsRemoved = projectsRemoved
+        self.preferencesUpdated = preferencesUpdated
+        self.pushedRemote = pushedRemote
+        self.vaultRevision = vaultRevision
+        self.syncedAtMs = syncedAtMs
+        self.gistHtmlUrl = gistHtmlUrl
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncResult {
+        return
+            try FfiCloudSyncResult(
+                hostsAdded: FfiConverterUInt32.read(from: &buf), 
+                hostsUpdated: FfiConverterUInt32.read(from: &buf), 
+                hostsRemoved: FfiConverterUInt32.read(from: &buf), 
+                projectsAdded: FfiConverterUInt32.read(from: &buf), 
+                projectsUpdated: FfiConverterUInt32.read(from: &buf), 
+                projectsRemoved: FfiConverterUInt32.read(from: &buf), 
+                preferencesUpdated: FfiConverterUInt32.read(from: &buf), 
+                pushedRemote: FfiConverterBool.read(from: &buf), 
+                vaultRevision: FfiConverterUInt64.read(from: &buf), 
+                syncedAtMs: FfiConverterInt64.read(from: &buf), 
+                gistHtmlUrl: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCloudSyncResult, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.hostsAdded, into: &buf)
+        FfiConverterUInt32.write(value.hostsUpdated, into: &buf)
+        FfiConverterUInt32.write(value.hostsRemoved, into: &buf)
+        FfiConverterUInt32.write(value.projectsAdded, into: &buf)
+        FfiConverterUInt32.write(value.projectsUpdated, into: &buf)
+        FfiConverterUInt32.write(value.projectsRemoved, into: &buf)
+        FfiConverterUInt32.write(value.preferencesUpdated, into: &buf)
+        FfiConverterBool.write(value.pushedRemote, into: &buf)
+        FfiConverterUInt64.write(value.vaultRevision, into: &buf)
+        FfiConverterInt64.write(value.syncedAtMs, into: &buf)
+        FfiConverterOptionString.write(value.gistHtmlUrl, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncResult_lift(_ buf: RustBuffer) throws -> FfiCloudSyncResult {
+    return try FfiConverterTypeFfiCloudSyncResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncResult_lower(_ value: FfiCloudSyncResult) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncResult.lower(value)
+}
+
+
+public struct FfiCloudSyncStatus: Equatable, Hashable {
+    public var state: FfiCloudSyncState
+    public var provider: String
+    public var githubOauthConfigured: Bool
+    public var githubClientIdOverride: String?
+    public var accountLogin: String?
+    public var accountName: String?
+    public var accountAvatarUrl: String?
+    public var gistId: String?
+    public var gistHtmlUrl: String?
+    public var remoteVaultExists: Bool
+    public var autoSyncEnabled: Bool
+    public var lastSyncedAtMs: Int64?
+    public var lastVaultRevision: UInt64
+    public var syncedHostCount: UInt32
+    public var syncedProjectCount: UInt32
+    public var lastError: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: FfiCloudSyncState, provider: String, githubOauthConfigured: Bool, githubClientIdOverride: String?, accountLogin: String?, accountName: String?, accountAvatarUrl: String?, gistId: String?, gistHtmlUrl: String?, remoteVaultExists: Bool, autoSyncEnabled: Bool, lastSyncedAtMs: Int64?, lastVaultRevision: UInt64, syncedHostCount: UInt32, syncedProjectCount: UInt32, lastError: String?) {
+        self.state = state
+        self.provider = provider
+        self.githubOauthConfigured = githubOauthConfigured
+        self.githubClientIdOverride = githubClientIdOverride
+        self.accountLogin = accountLogin
+        self.accountName = accountName
+        self.accountAvatarUrl = accountAvatarUrl
+        self.gistId = gistId
+        self.gistHtmlUrl = gistHtmlUrl
+        self.remoteVaultExists = remoteVaultExists
+        self.autoSyncEnabled = autoSyncEnabled
+        self.lastSyncedAtMs = lastSyncedAtMs
+        self.lastVaultRevision = lastVaultRevision
+        self.syncedHostCount = syncedHostCount
+        self.syncedProjectCount = syncedProjectCount
+        self.lastError = lastError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncStatus {
+        return
+            try FfiCloudSyncStatus(
+                state: FfiConverterTypeFfiCloudSyncState.read(from: &buf), 
+                provider: FfiConverterString.read(from: &buf), 
+                githubOauthConfigured: FfiConverterBool.read(from: &buf), 
+                githubClientIdOverride: FfiConverterOptionString.read(from: &buf), 
+                accountLogin: FfiConverterOptionString.read(from: &buf), 
+                accountName: FfiConverterOptionString.read(from: &buf), 
+                accountAvatarUrl: FfiConverterOptionString.read(from: &buf), 
+                gistId: FfiConverterOptionString.read(from: &buf), 
+                gistHtmlUrl: FfiConverterOptionString.read(from: &buf), 
+                remoteVaultExists: FfiConverterBool.read(from: &buf), 
+                autoSyncEnabled: FfiConverterBool.read(from: &buf), 
+                lastSyncedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastVaultRevision: FfiConverterUInt64.read(from: &buf), 
+                syncedHostCount: FfiConverterUInt32.read(from: &buf), 
+                syncedProjectCount: FfiConverterUInt32.read(from: &buf), 
+                lastError: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCloudSyncStatus, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiCloudSyncState.write(value.state, into: &buf)
+        FfiConverterString.write(value.provider, into: &buf)
+        FfiConverterBool.write(value.githubOauthConfigured, into: &buf)
+        FfiConverterOptionString.write(value.githubClientIdOverride, into: &buf)
+        FfiConverterOptionString.write(value.accountLogin, into: &buf)
+        FfiConverterOptionString.write(value.accountName, into: &buf)
+        FfiConverterOptionString.write(value.accountAvatarUrl, into: &buf)
+        FfiConverterOptionString.write(value.gistId, into: &buf)
+        FfiConverterOptionString.write(value.gistHtmlUrl, into: &buf)
+        FfiConverterBool.write(value.remoteVaultExists, into: &buf)
+        FfiConverterBool.write(value.autoSyncEnabled, into: &buf)
+        FfiConverterOptionInt64.write(value.lastSyncedAtMs, into: &buf)
+        FfiConverterUInt64.write(value.lastVaultRevision, into: &buf)
+        FfiConverterUInt32.write(value.syncedHostCount, into: &buf)
+        FfiConverterUInt32.write(value.syncedProjectCount, into: &buf)
+        FfiConverterOptionString.write(value.lastError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncStatus_lift(_ buf: RustBuffer) throws -> FfiCloudSyncStatus {
+    return try FfiConverterTypeFfiCloudSyncStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncStatus_lower(_ value: FfiCloudSyncStatus) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncStatus.lower(value)
+}
+
+
 public struct FfiComposePromptRequest: Equatable, Hashable {
     public var provider: FfiProviderKind
     public var rawText: String
@@ -4505,6 +4907,72 @@ public func FfiConverterTypeFfiGitFileEntry_lift(_ buf: RustBuffer) throws -> Ff
 #endif
 public func FfiConverterTypeFfiGitFileEntry_lower(_ value: FfiGitFileEntry) -> RustBuffer {
     return FfiConverterTypeFfiGitFileEntry.lower(value)
+}
+
+
+public struct FfiGitHubDeviceFlowStart: Equatable, Hashable {
+    public var deviceCode: String
+    public var userCode: String
+    public var verificationUri: String
+    public var expiresInSecs: UInt64
+    public var intervalSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceCode: String, userCode: String, verificationUri: String, expiresInSecs: UInt64, intervalSecs: UInt64) {
+        self.deviceCode = deviceCode
+        self.userCode = userCode
+        self.verificationUri = verificationUri
+        self.expiresInSecs = expiresInSecs
+        self.intervalSecs = intervalSecs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiGitHubDeviceFlowStart: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiGitHubDeviceFlowStart: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiGitHubDeviceFlowStart {
+        return
+            try FfiGitHubDeviceFlowStart(
+                deviceCode: FfiConverterString.read(from: &buf), 
+                userCode: FfiConverterString.read(from: &buf), 
+                verificationUri: FfiConverterString.read(from: &buf), 
+                expiresInSecs: FfiConverterUInt64.read(from: &buf), 
+                intervalSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiGitHubDeviceFlowStart, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.deviceCode, into: &buf)
+        FfiConverterString.write(value.userCode, into: &buf)
+        FfiConverterString.write(value.verificationUri, into: &buf)
+        FfiConverterUInt64.write(value.expiresInSecs, into: &buf)
+        FfiConverterUInt64.write(value.intervalSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGitHubDeviceFlowStart_lift(_ buf: RustBuffer) throws -> FfiGitHubDeviceFlowStart {
+    return try FfiConverterTypeFfiGitHubDeviceFlowStart.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGitHubDeviceFlowStart_lower(_ value: FfiGitHubDeviceFlowStart) -> RustBuffer {
+    return FfiConverterTypeFfiGitHubDeviceFlowStart.lower(value)
 }
 
 
@@ -9294,6 +9762,180 @@ public func FfiConverterTypeFfiClientPlatform_lower(_ value: FfiClientPlatform) 
 
 
 
+public enum FfiCloudSyncDevicePollStatus: Equatable, Hashable {
+    
+    case pending
+    case slowDown
+    case authorized
+    case expired
+    case denied
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncDevicePollStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncDevicePollStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCloudSyncDevicePollStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncDevicePollStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .pending
+        
+        case 2: return .slowDown
+        
+        case 3: return .authorized
+        
+        case 4: return .expired
+        
+        case 5: return .denied
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCloudSyncDevicePollStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .pending:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .slowDown:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .authorized:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .expired:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .denied:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncDevicePollStatus_lift(_ buf: RustBuffer) throws -> FfiCloudSyncDevicePollStatus {
+    return try FfiConverterTypeFfiCloudSyncDevicePollStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncDevicePollStatus_lower(_ value: FfiCloudSyncDevicePollStatus) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncDevicePollStatus.lower(value)
+}
+
+
+
+
+public enum FfiCloudSyncState: Equatable, Hashable {
+    
+    case signedOut
+    case locked
+    case ready
+    case syncing
+    case error
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncState: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCloudSyncState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .signedOut
+        
+        case 2: return .locked
+        
+        case 3: return .ready
+        
+        case 4: return .syncing
+        
+        case 5: return .error
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCloudSyncState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .signedOut:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .locked:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .ready:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .syncing:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .error:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncState_lift(_ buf: RustBuffer) throws -> FfiCloudSyncState {
+    return try FfiConverterTypeFfiCloudSyncState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncState_lower(_ value: FfiCloudSyncState) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncState.lower(value)
+}
+
+
+
+
 public enum FfiComposerContextInput: Equatable, Hashable {
     
     case image(path: String, filename: String
@@ -12273,6 +12915,30 @@ fileprivate struct FfiConverterOptionTypeFfiAgentCard: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiCloudSyncStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCloudSyncStatus?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiCloudSyncStatus.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiCloudSyncStatus.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiDirectoryListing: FfiConverterRustBuffer {
     typealias SwiftType = FfiDirectoryListing?
 
@@ -14357,6 +15023,42 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_build_side_question_context() != 42218) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase() != 49340) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json() != 11716) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token() != 37302) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_logout() != 45701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_now() != 58181) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_poll_github_device_flow() != 17558) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_auto_sync() != 54195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id() != 62078) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow() != 41593) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_status() != 50836) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_unlock_with_passphrase() != 5433) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_update_preferences_json() != 53863) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_compose_prompt() != 1118) {

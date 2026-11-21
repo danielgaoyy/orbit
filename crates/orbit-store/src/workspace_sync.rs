@@ -718,6 +718,12 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn delete_client_kv(&self, key: &str) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute("DELETE FROM client_kv WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     // --- Mission Workspace Shared Blackboard & Activity Events ---
 
     pub fn get_workspace_board(

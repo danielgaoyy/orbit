@@ -9,6 +9,7 @@
 
 pub mod app_core;
 pub mod catalog;
+pub mod cloud_sync;
 pub mod composer;
 pub mod contract;
 pub mod desktop_ops;
@@ -138,6 +139,8 @@ pub enum ClientCoreError {
     Protocol(#[from] orbit_protocol::ProtocolError),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("cloud sync error: {0}")]
+    CloudSync(#[from] crate::cloud_sync::CloudSyncError),
     #[error("websocket error: {0}")]
     Ws(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("relay transport error: {0}")]

@@ -24,6 +24,10 @@ struct QrPairSheet: View {
 
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: OrbitSpacing.lg) {
+                    if store.cloudSyncStatus?.state != .ready {
+                        cloudSyncQuickCard
+                    }
+
                     if let clipUri = detectedClipboardPairUri {
                         clipboardPairBannerCard(clipUri)
                     }
@@ -69,6 +73,50 @@ struct QrPairSheet: View {
         }
         .padding(.horizontal, OrbitSpacing.lg)
         .frame(height: 52)
+    }
+
+    // MARK: - 1-Tap GitHub E2EE Cloud Sync Banner
+
+    private var cloudSyncQuickCard: some View {
+        VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+            HStack(spacing: OrbitSpacing.sm) {
+                Image(systemName: "icloud.and.arrow.down")
+                    .font(OrbitTypography.icon)
+                    .foregroundStyle(palette.accentSky)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Sync Existing Hosts via GitHub")
+                        .font(OrbitTypography.body(.semibold))
+                        .foregroundStyle(palette.fgPrimary)
+                    Text("Zero-server E2EE sync — import all paired machines without scanning QR codes.")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgSecondary)
+                }
+            }
+
+            Button {
+                dismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    store.activeSheet = .settings
+                }
+            } label: {
+                Text("Open Cloud Sync in Settings")
+                    .font(OrbitTypography.subhead(.semibold))
+                    .foregroundStyle(palette.fgPrimary)
+                    .frame(maxWidth: .infinity, minHeight: OrbitSpacing.hitTarget)
+                    .background(palette.subtleFill)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(OrbitSpacing.md)
+        .background(palette.elevated)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(palette.hairline, lineWidth: 0.5)
+        )
     }
 
     // MARK: - 1-Tap Clipboard Pairing Banner

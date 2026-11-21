@@ -49,9 +49,13 @@ serde_json = "1.0"
 zstd = "0.13"
 base64 = "0.22"
 
-# Cryptography (Noise NK E2EE)
+# Cryptography (Noise NK E2EE & Zero-Knowledge Cloud Vault)
 snow = "0.9"
 sha2 = "0.10"
+aes-gcm = "0.10"
+argon2 = "0.6"
+rand = "0.9"
+zeroize = "1"
 
 # Storage (SQLite WAL)
 rusqlite = { version = "0.34", features = ["bundled"] }

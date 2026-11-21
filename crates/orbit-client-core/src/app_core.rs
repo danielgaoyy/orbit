@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,16 @@ use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostPro
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cloud_sync::{
+    CloudSyncDevicePollStatus, CloudSyncDevicePollView, CloudSyncError, CloudSyncResultView,
+    CloudSyncStatusView, DevicePollOutcome, GitHubCloudClient, GitHubDeviceFlowStartView,
+    LocalHostSyncRecord, PersistedCloudSyncConfig, SyncedPreferenceEntry,
+    decrypt_remote_with_cached_key, generate_sync_passphrase, load_sync_config_from_store,
+    load_sync_meta_from_store, load_sync_prefs_from_store, merge_cloud_vault, now_unix_ms,
+    push_vault_payload, resolve_github_client_id, save_sync_config_to_store,
+    save_sync_meta_to_store, save_sync_prefs_to_store, stored_host_from_synced,
+    unlock_remote_vault_with_passphrase,
+};
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
@@ -825,6 +835,10 @@ pub struct OrbitAppCore {
     pin_order_seq: Arc<AtomicU64>,
     subscribers: Arc<Mutex<Vec<Arc<dyn CoreEventSubscriber>>>>,
     revision: Arc<AtomicU64>,
+    cloud_sync_client: Arc<RwLock<GitHubCloudClient>>,
+    cloud_sync_in_flight: Arc<AtomicBool>,
+    cloud_sync_last_auto_ms: Arc<AtomicU64>,
+    cloud_sync_mutex: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl OrbitAppCore {
@@ -991,6 +1005,10 @@ impl OrbitAppCore {
             pin_order_seq: Arc::new(AtomicU64::new(max_pin_order.saturating_add(1))),
             subscribers: Arc::new(Mutex::new(Vec::new())),
             revision: Arc::new(AtomicU64::new(1)),
+            cloud_sync_client: Arc::new(RwLock::new(GitHubCloudClient::new())),
+            cloud_sync_in_flight: Arc::new(AtomicBool::new(false)),
+            cloud_sync_last_auto_ms: Arc::new(AtomicU64::new(0)),
+            cloud_sync_mutex: Arc::new(tokio::sync::Mutex::new(())),
         }))
     }
 
@@ -2552,6 +2570,7 @@ impl OrbitAppCore {
                 },
             },
         );
+        self.record_cloud_meta_mutation(|meta| meta.record_project_mutated(&view.project_id));
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         Ok(view)
     }
@@ -2563,6 +2582,8 @@ impl OrbitAppCore {
             .ok()
             .and_then(|g| g.get(project_id).map(|p| p.host_id.clone()));
         self.store.delete_client_project(project_id)?;
+        let now_ms = unix_ms_now() as i64;
+        self.record_cloud_meta_mutation(|meta| meta.record_project_deleted(project_id, now_ms));
         if let Ok(mut guard) = self.projects.write() {
             guard.remove(project_id);
         }
@@ -2575,6 +2596,7 @@ impl OrbitAppCore {
                 let _ = self
                     .store
                     .set_client_kv("project_order", &json, unix_ms_now() as i64);
+                self.record_cloud_meta_mutation(|meta| meta.record_project_order_mutated(now_ms));
             }
         }
         if let Some(hid) = removed_host_id {
@@ -2611,10 +2633,11 @@ impl OrbitAppCore {
                 deduped.push(clean);
             }
         }
+        let now_ms = unix_ms_now() as i64;
         if let Ok(json) = serde_json::to_string(&deduped) {
-            self.store
-                .set_client_kv("project_order", &json, unix_ms_now() as i64)?;
+            self.store.set_client_kv("project_order", &json, now_ms)?;
         }
+        self.record_cloud_meta_mutation(|meta| meta.record_project_order_mutated(now_ms));
         if let Ok(mut guard) = self.project_order.write() {
             *guard = deduped.clone();
         }
@@ -2744,13 +2767,18 @@ impl OrbitAppCore {
         };
 
         self.store.upsert_client_host(&stored)?;
+        let now_ms = now_unix_ms();
+        self.record_cloud_meta_mutation(|meta| meta.record_host_mutated(&offer.host_id, now_ms));
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.connect_host_async(offer.host_id);
+        self.schedule_cloud_auto_sync(false);
         Ok(card)
     }
 
     pub fn remove_host(&self, host_id: &str) -> Result<(), ClientCoreError> {
         let _ = self.store.delete_client_host(host_id);
+        let now_ms = now_unix_ms();
+        self.record_cloud_meta_mutation(|meta| meta.record_host_deleted(host_id, now_ms));
         {
             let mut guard = self
                 .hosts
@@ -2829,6 +2857,8 @@ impl OrbitAppCore {
         };
 
         self.store.upsert_client_host(&stored)?;
+        let now_ms = now_unix_ms();
+        self.record_cloud_meta_mutation(|meta| meta.record_host_mutated(host_id, now_ms));
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
@@ -2837,6 +2867,7 @@ impl OrbitAppCore {
         if reconnect {
             self.connect_host_async(host_id.to_string());
         }
+        self.schedule_cloud_auto_sync(false);
         Ok(card)
     }
 
@@ -2867,6 +2898,7 @@ impl OrbitAppCore {
         for id in ids {
             self.connect_host_async(id);
         }
+        self.schedule_cloud_auto_sync(true);
     }
 
     pub fn connect_host_async(self: &Arc<Self>, host_id: String) {
@@ -6704,6 +6736,7 @@ impl OrbitAppCore {
                 }
             });
         }
+        self.schedule_cloud_auto_sync(true);
     }
 
     /// Invoked when a mobile client enters background: performs a passive SQLite WAL checkpoint
@@ -7534,6 +7567,687 @@ impl OrbitAppCore {
         });
         Ok(request_id)
     }
+
+    // --- Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist) ---
+
+    fn cloud_client(&self) -> GitHubCloudClient {
+        self.cloud_sync_client
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cloud_sync_github_bases_for_test(
+        &self,
+        web_base: impl Into<String>,
+        api_base: impl Into<String>,
+    ) {
+        if let Ok(mut g) = self.cloud_sync_client.write() {
+            *g = GitHubCloudClient::with_bases(web_base, api_base);
+        }
+    }
+
+    fn record_cloud_meta_mutation(
+        &self,
+        f: impl FnOnce(&mut crate::cloud_sync::CloudSyncLocalMeta),
+    ) {
+        let mut meta = load_sync_meta_from_store(&self.store);
+        f(&mut meta);
+        let _ = save_sync_meta_to_store(&self.store, &meta);
+    }
+
+    /// Inspect current Cloud Sync state, GitHub account identity, and last sync summary.
+    pub fn cloud_sync_status(&self) -> CloudSyncStatusView {
+        let cfg = load_sync_config_from_store(&self.store);
+        cfg.to_status_view(self.cloud_sync_in_flight.load(Ordering::SeqCst))
+    }
+
+    /// Generate a high-entropy human-readable Recovery Key (`orbit-XXXX-XXXX-XXXX-XXXX-XXXX`).
+    pub fn cloud_sync_generate_passphrase(&self) -> String {
+        generate_sync_passphrase()
+    }
+
+    /// Persist (or clear) a custom GitHub OAuth App Client ID for Device Flow.
+    pub fn cloud_sync_set_github_client_id(
+        &self,
+        client_id: Option<String>,
+    ) -> Result<CloudSyncStatusView, ClientCoreError> {
+        let mut cfg = load_sync_config_from_store(&self.store);
+        cfg.github_client_id = client_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        save_sync_config_to_store(&self.store, &cfg)?;
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        Ok(cfg.to_status_view(self.cloud_sync_in_flight.load(Ordering::SeqCst)))
+    }
+
+    /// Toggle automatic background Cloud Sync when hosts/projects/preferences change.
+    pub fn cloud_sync_set_auto_sync(
+        &self,
+        enabled: bool,
+    ) -> Result<CloudSyncStatusView, ClientCoreError> {
+        let mut cfg = load_sync_config_from_store(&self.store);
+        cfg.auto_sync_enabled = enabled;
+        save_sync_config_to_store(&self.store, &cfg)?;
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        Ok(cfg.to_status_view(self.cloud_sync_in_flight.load(Ordering::SeqCst)))
+    }
+
+    /// Start GitHub OAuth 2.0 Device Authorization Flow (`scope=gist`, zero backend server).
+    pub fn cloud_sync_start_github_device_flow(
+        &self,
+        client_id_override: Option<String>,
+    ) -> Result<GitHubDeviceFlowStartView, ClientCoreError> {
+        let mut cfg = load_sync_config_from_store(&self.store);
+        if let Some(cid) = client_id_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.github_client_id = Some(cid.to_string());
+            save_sync_config_to_store(&self.store, &cfg)?;
+        }
+        let cid = resolve_github_client_id(
+            client_id_override.as_deref(),
+            cfg.github_client_id.as_deref(),
+        )
+        .ok_or(CloudSyncError::MissingClientId)?;
+        let client = self.cloud_client();
+        let started = self.runtime.block_on(client.start_device_flow(&cid))?;
+        Ok(started)
+    }
+
+    /// Poll GitHub's Device Flow endpoint once. When authorized, immediately verifies the user profile
+    /// and checks whether an existing Orbit Encrypted Vault Secret Gist already exists.
+    pub fn cloud_sync_poll_github_device_flow(
+        &self,
+        device_code: &str,
+        client_id_override: Option<String>,
+    ) -> Result<CloudSyncDevicePollView, ClientCoreError> {
+        let cfg = load_sync_config_from_store(&self.store);
+        let cid = resolve_github_client_id(
+            client_id_override.as_deref(),
+            cfg.github_client_id.as_deref(),
+        )
+        .ok_or(CloudSyncError::MissingClientId)?;
+        let client = self.cloud_client();
+        let outcome = self
+            .runtime
+            .block_on(client.poll_device_flow_once(&cid, device_code))?;
+
+        match outcome {
+            DevicePollOutcome::Pending => Ok(CloudSyncDevicePollView {
+                status: CloudSyncDevicePollStatus::Pending,
+                interval_secs: None,
+                error: None,
+                sync_status: None,
+            }),
+            DevicePollOutcome::SlowDown { interval_secs } => Ok(CloudSyncDevicePollView {
+                status: CloudSyncDevicePollStatus::SlowDown,
+                interval_secs: Some(interval_secs),
+                error: None,
+                sync_status: None,
+            }),
+            DevicePollOutcome::Expired => Ok(CloudSyncDevicePollView {
+                status: CloudSyncDevicePollStatus::Expired,
+                interval_secs: None,
+                error: Some("GitHub verification code expired — please start again.".into()),
+                sync_status: None,
+            }),
+            DevicePollOutcome::Denied => Ok(CloudSyncDevicePollView {
+                status: CloudSyncDevicePollStatus::Denied,
+                interval_secs: None,
+                error: Some("GitHub authorization was cancelled.".into()),
+                sync_status: None,
+            }),
+            DevicePollOutcome::Authorized { access_token } => {
+                let status = self.finalize_github_login_blocking(&access_token)?;
+                Ok(CloudSyncDevicePollView {
+                    status: CloudSyncDevicePollStatus::Authorized,
+                    interval_secs: None,
+                    error: None,
+                    sync_status: Some(status),
+                })
+            }
+        }
+    }
+
+    /// Sign in directly using a GitHub Personal Access Token (`gist` scope).
+    pub fn cloud_sync_login_with_token(
+        &self,
+        token: &str,
+    ) -> Result<CloudSyncStatusView, ClientCoreError> {
+        self.finalize_github_login_blocking(token)
+    }
+
+    fn finalize_github_login_blocking(
+        &self,
+        token: &str,
+    ) -> Result<CloudSyncStatusView, ClientCoreError> {
+        let client = self.cloud_client();
+        let existing_cfg = load_sync_config_from_store(&self.store);
+        let (user, remote_gist) = self.runtime.block_on(async {
+            let user = client.verify_token(token).await?;
+            let gist = client
+                .fetch_vault_gist(token, existing_cfg.gist_id.as_deref())
+                .await?;
+            Ok::<_, CloudSyncError>((user, gist))
+        })?;
+
+        let mut cfg = existing_cfg;
+        let account_changed = cfg.github_login.as_deref() != Some(user.login.as_str());
+        if account_changed {
+            cfg.clear_derived_key();
+            cfg.gist_id = None;
+            cfg.gist_html_url = None;
+            cfg.last_synced_at_ms = None;
+            cfg.last_vault_revision = 0;
+        }
+        cfg.github_access_token = Some(token.trim().to_string());
+        cfg.github_login = Some(user.login);
+        cfg.github_name = user.name;
+        cfg.github_avatar_url = user.avatar_url;
+        cfg.last_error = None;
+        if let Some(gist) = remote_gist {
+            // If cached key doesn't match remote envelope salt, require passphrase entry
+            if let Some(cached) = cfg.derived_key()
+                && !cached.matches_envelope(&gist.envelope)
+            {
+                cfg.clear_derived_key();
+            }
+            cfg.gist_id = Some(gist.gist_id);
+            cfg.gist_html_url = Some(gist.html_url);
+            cfg.remote_vault_exists = true;
+        } else {
+            cfg.remote_vault_exists = false;
+        }
+        save_sync_config_to_store(&self.store, &cfg)?;
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        Ok(cfg.to_status_view(false))
+    }
+
+    /// Unlock (or initialize) the E2EE Cloud Vault with the user's Sync Passphrase and perform an immediate sync.
+    pub fn cloud_sync_unlock_with_passphrase(
+        self: &Arc<Self>,
+        passphrase: &str,
+    ) -> Result<CloudSyncResultView, ClientCoreError> {
+        let core = Arc::clone(self);
+        let pass = passphrase.to_string();
+        self.runtime
+            .block_on(core.cloud_sync_unlock_async(&pass))
+            .map_err(Into::into)
+    }
+
+    /// Run a full bidirectional pull -> LWW merge -> push Cloud Sync cycle now.
+    pub fn cloud_sync_now(self: &Arc<Self>) -> Result<CloudSyncResultView, ClientCoreError> {
+        let core = Arc::clone(self);
+        self.runtime
+            .block_on(core.cloud_sync_now_async())
+            .map_err(Into::into)
+    }
+
+    /// Trigger a non-blocking background Cloud Sync (used after local mutations or foreground resume).
+    pub fn schedule_cloud_auto_sync(self: &Arc<Self>, throttled: bool) {
+        let cfg = load_sync_config_from_store(&self.store);
+        if !cfg.auto_sync_enabled || !cfg.is_signed_in() || cfg.derived_key().is_none() {
+            return;
+        }
+        let now = unix_ms_now();
+        if throttled {
+            let last = self.cloud_sync_last_auto_ms.load(Ordering::SeqCst);
+            if now.saturating_sub(last) < 30_000 {
+                return;
+            }
+        }
+        self.cloud_sync_last_auto_ms.store(now, Ordering::SeqCst);
+        let core = Arc::clone(self);
+        self.runtime.spawn(async move {
+            if !throttled {
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+            }
+            if let Err(err) = core.cloud_sync_now_async().await {
+                tracing::debug!(error = %err, "Background cloud auto-sync skipped/failed");
+            }
+        });
+    }
+
+    /// Sign out of Cloud Sync on this device (leaves remote GitHub Gist untouched).
+    pub fn cloud_sync_logout(
+        &self,
+        clear_local_hosts: bool,
+    ) -> Result<CloudSyncStatusView, ClientCoreError> {
+        let prev = load_sync_config_from_store(&self.store);
+        let cleared = PersistedCloudSyncConfig {
+            github_client_id: prev.github_client_id,
+            auto_sync_enabled: prev.auto_sync_enabled,
+            ..PersistedCloudSyncConfig::default()
+        };
+        save_sync_config_to_store(&self.store, &cleared)?;
+
+        if clear_local_hosts {
+            let host_ids: Vec<String> = self
+                .hosts
+                .read()
+                .map(|g| g.keys().cloned().collect())
+                .unwrap_or_default();
+            for hid in host_ids {
+                let _ = self.store.delete_client_host(&hid);
+            }
+            if let Ok(mut guard) = self.hosts.write() {
+                for (_, mut h) in guard.drain() {
+                    fail_pending_host_requests(&mut h, "Signed out of Cloud Sync");
+                }
+            }
+            if let Ok(mut projs) = self.projects.write() {
+                projs.clear();
+            }
+        }
+
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+        Ok(cleared.to_status_view(false))
+    }
+
+    /// Return the current merged cross-device user preferences (`key -> JSON value`).
+    pub fn cloud_sync_get_preferences(&self) -> HashMap<String, serde_json::Value> {
+        load_sync_prefs_from_store(&self.store)
+            .into_iter()
+            .map(|(k, entry)| (k, entry.value))
+            .collect()
+    }
+
+    /// Update one or more cross-device user preferences locally and schedule an auto-sync push.
+    pub fn cloud_sync_update_preferences(
+        self: &Arc<Self>,
+        patch: HashMap<String, serde_json::Value>,
+    ) -> Result<(), ClientCoreError> {
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let now_ms = now_unix_ms();
+        let mut prefs = load_sync_prefs_from_store(&self.store);
+        let mut changed = false;
+        for (k, v) in patch {
+            let unchanged = prefs.get(&k).is_some_and(|existing| existing.value == v);
+            if !unchanged {
+                prefs.insert(
+                    k,
+                    SyncedPreferenceEntry {
+                        value: v,
+                        updated_at_ms: now_ms,
+                    },
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            save_sync_prefs_to_store(&self.store, &prefs)?;
+            self.schedule_cloud_auto_sync(false);
+        }
+        Ok(())
+    }
+
+    async fn cloud_sync_unlock_async(
+        self: &Arc<Self>,
+        passphrase: &str,
+    ) -> Result<CloudSyncResultView, CloudSyncError> {
+        let _guard = self.cloud_sync_mutex.lock().await;
+        self.cloud_sync_in_flight.store(true, Ordering::SeqCst);
+        let res = self.cloud_sync_unlock_inner(passphrase).await;
+        self.cloud_sync_in_flight.store(false, Ordering::SeqCst);
+        if let Err(ref err) = res {
+            let mut cfg = load_sync_config_from_store(&self.store);
+            cfg.last_error = Some(err.to_string());
+            let _ = save_sync_config_to_store(&self.store, &cfg);
+        }
+        res
+    }
+
+    async fn cloud_sync_unlock_inner(
+        self: &Arc<Self>,
+        passphrase: &str,
+    ) -> Result<CloudSyncResultView, CloudSyncError> {
+        let mut cfg = load_sync_config_from_store(&self.store);
+        let token = cfg
+            .github_access_token
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or(CloudSyncError::NotSignedIn)?;
+
+        let client = self.cloud_client();
+        let (key, remote_gist, remote_payload) = unlock_remote_vault_with_passphrase(
+            &client,
+            &token,
+            cfg.gist_id.as_deref(),
+            passphrase,
+        )
+        .await?;
+
+        cfg.set_derived_key(&key);
+        if let Some(ref gist) = remote_gist {
+            cfg.gist_id = Some(gist.gist_id.clone());
+            cfg.gist_html_url = Some(gist.html_url.clone());
+            cfg.remote_vault_exists = true;
+        }
+        cfg.last_error = None;
+        save_sync_config_to_store(&self.store, &cfg)?;
+
+        self.merge_apply_and_push_locked(&client, &token, &key, &mut cfg, remote_payload.as_ref())
+            .await
+    }
+
+    async fn cloud_sync_now_async(self: &Arc<Self>) -> Result<CloudSyncResultView, CloudSyncError> {
+        let _guard = self.cloud_sync_mutex.lock().await;
+        self.cloud_sync_in_flight.store(true, Ordering::SeqCst);
+        let res = self.cloud_sync_now_inner().await;
+        self.cloud_sync_in_flight.store(false, Ordering::SeqCst);
+        if let Err(ref err) = res {
+            let mut cfg = load_sync_config_from_store(&self.store);
+            if matches!(err, CloudSyncError::PassphraseRotationRequired) {
+                cfg.clear_derived_key();
+            }
+            cfg.last_error = Some(err.to_string());
+            let _ = save_sync_config_to_store(&self.store, &cfg);
+            self.emit(|revision| CoreNotification::FleetChanged { revision });
+        }
+        res
+    }
+
+    async fn cloud_sync_now_inner(self: &Arc<Self>) -> Result<CloudSyncResultView, CloudSyncError> {
+        let mut cfg = load_sync_config_from_store(&self.store);
+        let token = cfg
+            .github_access_token
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or(CloudSyncError::NotSignedIn)?;
+        let key = cfg.derived_key().ok_or(CloudSyncError::VaultLocked)?;
+
+        let client = self.cloud_client();
+        let remote_gist = client
+            .fetch_vault_gist(&token, cfg.gist_id.as_deref())
+            .await?;
+
+        let remote_payload = if let Some(ref gist) = remote_gist {
+            cfg.gist_id = Some(gist.gist_id.clone());
+            cfg.gist_html_url = Some(gist.html_url.clone());
+            cfg.remote_vault_exists = true;
+            Some(decrypt_remote_with_cached_key(&key, gist)?)
+        } else {
+            cfg.remote_vault_exists = false;
+            None
+        };
+
+        self.merge_apply_and_push_locked(&client, &token, &key, &mut cfg, remote_payload.as_ref())
+            .await
+    }
+
+    async fn merge_apply_and_push_locked(
+        self: &Arc<Self>,
+        client: &GitHubCloudClient,
+        token: &str,
+        key: &orbit_crypto::DerivedVaultKey,
+        cfg: &mut PersistedCloudSyncConfig,
+        remote_payload: Option<&crate::cloud_sync::CloudVaultPayload>,
+    ) -> Result<CloudSyncResultView, CloudSyncError> {
+        let now_ms = now_unix_ms();
+        let mut local_meta = load_sync_meta_from_store(&self.store);
+        let mut local_prefs = load_sync_prefs_from_store(&self.store);
+
+        // Snapshot local hosts, projects, and project order without holding locks across `.await`
+        let fallback_host_ts = if remote_payload.is_none() { now_ms } else { 1 };
+        let local_hosts: Vec<LocalHostSyncRecord> = self
+            .hosts
+            .read()
+            .map(|guard| {
+                guard
+                    .values()
+                    .map(|h| {
+                        let ts = local_meta
+                            .host_updated_at_ms
+                            .get(&h.profile.host_id)
+                            .copied()
+                            .unwrap_or(fallback_host_ts);
+                        LocalHostSyncRecord {
+                            profile: h.to_stored_host(),
+                            os_arch: h.os_arch.clone(),
+                            updated_at_ms: ts,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let local_projects: Vec<StoredClientProject> = self
+            .projects
+            .read()
+            .map(|guard| {
+                guard
+                    .values()
+                    .map(|p| StoredClientProject {
+                        project_id: p.project_id.clone(),
+                        host_id: p.host_id.clone(),
+                        name: p.name.clone(),
+                        directories: p.directories.clone(),
+                        updated_at_ms: p.updated_at_ms,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let local_project_order = self.project_order();
+
+        let outcome = merge_cloud_vault(
+            remote_payload,
+            &local_hosts,
+            &local_projects,
+            &local_project_order,
+            &local_prefs,
+            &local_meta,
+            now_ms,
+        );
+
+        // Apply remote host changes locally
+        let local_daemon_id = read_local_host_identity_pair();
+        let mut hosts_to_connect: Vec<String> = Vec::new();
+        for synced in &outcome.hosts_to_upsert {
+            let mut stored = stored_host_from_synced(synced);
+            let is_this_machine = local_daemon_id.as_ref().is_some_and(|(lid, lpub)| {
+                *lid == stored.host_id && *lpub == stored.daemon_pubkey_b64
+            });
+            let remote_port = stored
+                .meta
+                .remote_daemon_port
+                .or_else(|| extract_ws_port(&stored.direct_endpoints))
+                .unwrap_or(6868);
+            if is_this_machine {
+                let loopback = format!("ws://127.0.0.1:{remote_port}/ws");
+                if !stored.direct_endpoints.contains(&loopback) {
+                    stored.direct_endpoints.insert(0, loopback);
+                }
+            }
+            let _ = self.store.upsert_client_host(&stored);
+            local_meta.record_host_mutated(&stored.host_id, synced.updated_at_ms);
+
+            if let Ok(mut guard) = self.hosts.write() {
+                let profile = SavedHostProfile {
+                    host_id: stored.host_id.clone(),
+                    hostname: stored.display_name.clone(),
+                    custom_name: stored.meta.custom_name.clone(),
+                    ssh_alias: stored.meta.ssh_alias.clone(),
+                    route_mode: HostRouteMode::from_opt_str(stored.meta.route_mode.as_deref()),
+                    remote_daemon_port: remote_port,
+                    custom_direct_endpoint: stored.meta.custom_direct_endpoint.clone(),
+                    daemon_pubkey_b64: stored.daemon_pubkey_b64.clone(),
+                    direct_endpoints: stored.direct_endpoints.clone(),
+                    relay_url: stored.relay_url.clone(),
+                    state: HostConnectionState::Disconnected,
+                };
+                if let Some(existing) = guard.get_mut(&stored.host_id) {
+                    let prev_state = existing.profile.state;
+                    existing.profile = profile;
+                    existing.profile.state = prev_state;
+                    if is_this_machine {
+                        existing.is_local = true;
+                    }
+                    if existing.session.is_none() {
+                        hosts_to_connect.push(stored.host_id.clone());
+                    }
+                } else {
+                    let mut mem = HostMemoryState::new(profile);
+                    mem.is_local = is_this_machine;
+                    if let Some(ref oa) = synced.os_arch {
+                        mem.os_arch = Some(oa.clone());
+                    }
+                    guard.insert(stored.host_id.clone(), mem);
+                    hosts_to_connect.push(stored.host_id.clone());
+                }
+            }
+        }
+
+        for removed_hid in &outcome.hosts_to_remove {
+            let _ = self.store.delete_client_host(removed_hid);
+            let del_ts = outcome
+                .merged
+                .hosts
+                .get(removed_hid)
+                .and_then(|h| h.deleted_at_ms)
+                .unwrap_or(now_ms);
+            local_meta.record_host_deleted(removed_hid, del_ts);
+            if let Ok(mut guard) = self.hosts.write()
+                && let Some(mut removed) = guard.remove(removed_hid)
+            {
+                fail_pending_host_requests(&mut removed, "Host removed via Cloud Sync");
+            }
+            if let Ok(mut projs) = self.projects.write() {
+                projs.retain(|_, p| p.host_id != *removed_hid);
+            }
+        }
+
+        // Apply remote project changes locally
+        for proj in &outcome.projects_to_upsert {
+            let stored = StoredClientProject {
+                project_id: proj.project_id.clone(),
+                host_id: proj.host_id.clone(),
+                name: proj.name.clone(),
+                directories: proj.directories.clone(),
+                updated_at_ms: proj.updated_at_ms,
+            };
+            let _ = self.store.upsert_client_project(&stored);
+            local_meta.record_project_mutated(&proj.project_id);
+            if let Ok(mut guard) = self.projects.write() {
+                guard.insert(
+                    proj.project_id.clone(),
+                    ClientProjectView {
+                        project_id: proj.project_id.clone(),
+                        host_id: proj.host_id.clone(),
+                        name: proj.name.clone(),
+                        directories: proj.directories.clone(),
+                        updated_at_ms: proj.updated_at_ms,
+                    },
+                );
+            }
+        }
+        for removed_pid in &outcome.projects_to_remove {
+            let _ = self.store.delete_client_project(removed_pid);
+            let del_ts = outcome
+                .merged
+                .projects
+                .get(removed_pid)
+                .and_then(|p| p.deleted_at_ms)
+                .unwrap_or(now_ms);
+            local_meta.record_project_deleted(removed_pid, del_ts);
+            if let Ok(mut guard) = self.projects.write() {
+                guard.remove(removed_pid);
+            }
+        }
+
+        // Apply merged project order if remote won
+        if let Some((ref new_order, order_ts)) = outcome.project_order_changed {
+            if let Ok(json) = serde_json::to_string(new_order) {
+                let _ = self.store.set_client_kv("project_order", &json, order_ts);
+            }
+            if let Ok(mut guard) = self.project_order.write() {
+                *guard = new_order.clone();
+            }
+            local_meta.record_project_order_mutated(order_ts);
+        }
+
+        // Apply merged preferences if remote won
+        if !outcome.preferences_to_apply.is_empty() {
+            for (k, entry) in &outcome.preferences_to_apply {
+                local_prefs.insert(k.clone(), entry.clone());
+            }
+            let _ = save_sync_prefs_to_store(&self.store, &local_prefs);
+        }
+
+        // Record authoritative merged host timestamps so local-only pre-sync hosts stay monotonic
+        for (hid, entry) in &outcome.merged.hosts {
+            if entry.deleted_at_ms.is_none() {
+                local_meta
+                    .host_updated_at_ms
+                    .entry(hid.clone())
+                    .or_insert(entry.updated_at_ms);
+            }
+        }
+        let _ = save_sync_meta_to_store(&self.store, &local_meta);
+
+        // Push encrypted vault to GitHub Secret Gist if local state contributed new changes
+        if outcome.needs_push {
+            let (gid, html_url) =
+                push_vault_payload(client, token, cfg.gist_id.as_deref(), key, &outcome.merged)
+                    .await?;
+            cfg.gist_id = Some(gid);
+            cfg.gist_html_url = Some(html_url);
+            cfg.remote_vault_exists = true;
+        }
+
+        let active_hosts = outcome
+            .merged
+            .hosts
+            .values()
+            .filter(|h| h.deleted_at_ms.is_none())
+            .count() as u32;
+        let active_projects = outcome
+            .merged
+            .projects
+            .values()
+            .filter(|p| p.deleted_at_ms.is_none())
+            .count() as u32;
+
+        cfg.last_synced_at_ms = Some(now_ms);
+        cfg.last_vault_revision = outcome.merged.revision;
+        cfg.synced_host_count = active_hosts;
+        cfg.synced_project_count = active_projects;
+        cfg.last_error = None;
+        save_sync_config_to_store(&self.store, cfg)?;
+
+        for hid in hosts_to_connect {
+            self.connect_host_async(hid);
+        }
+        self.emit(|revision| CoreNotification::FleetChanged { revision });
+
+        Ok(CloudSyncResultView {
+            hosts_added: outcome.hosts_added_count,
+            hosts_updated: outcome.hosts_updated_count,
+            hosts_removed: outcome.hosts_removed_count,
+            projects_added: outcome.projects_added_count,
+            projects_updated: outcome.projects_updated_count,
+            projects_removed: outcome.projects_removed_count,
+            preferences_updated: outcome.preferences_updated_count,
+            pushed_remote: outcome.needs_push,
+            vault_revision: outcome.merged.revision,
+            synced_at_ms: now_ms,
+            gist_html_url: cfg.gist_html_url.clone(),
+        })
+    }
+}
+
+fn read_local_host_identity_pair() -> Option<(String, String)> {
+    let home = crate::desktop_ops::resolve_user_home()?;
+    let raw = std::fs::read_to_string(home.join(".orbit").join("host-keypair.json")).ok()?;
+    let kp: orbit_crypto::HostIdentityKeypair = serde_json::from_str(&raw).ok()?;
+    let host_id = kp.host_id().ok()?;
+    Some((host_id, kp.public_key_b64))
 }
 
 fn build_workspace_file_view(
@@ -10928,5 +11642,315 @@ mod tests {
             mem.stage_cache.contains_key("ag_11"),
             "most recently accessed agent must remain cached"
         );
+    }
+
+    #[test]
+    fn e2e_github_device_flow_and_multi_device_encrypted_sync() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        #[derive(Default)]
+        struct MockGitHubState {
+            poll_count: AtomicUsize,
+            gist_content: Mutex<Option<String>>,
+        }
+
+        let state = Arc::new(MockGitHubState::default());
+        let rt = tokio::runtime::Runtime::new().expect("rt");
+        let base_url = rt.block_on({
+            let state = Arc::clone(&state);
+            async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    loop {
+                        let Ok((mut sock, _)) = listener.accept().await else {
+                            break;
+                        };
+                        let st = Arc::clone(&state);
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            let n = sock.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let first_line = req.lines().next().unwrap_or("");
+                            let parts: Vec<&str> = first_line.split_whitespace().collect();
+                            let method = parts.first().copied().unwrap_or("");
+                            let path = parts.get(1).copied().unwrap_or("");
+                            let body_str = req.split("\r\n\r\n").nth(1).unwrap_or("");
+
+                            let (status, headers, resp_body) = match (method, path) {
+                                ("POST", "/login/device/code") => (
+                                    "200 OK",
+                                    "",
+                                    serde_json::json!({
+                                        "device_code": "dev_code_123",
+                                        "user_code": "ORBT-9942",
+                                        "verification_uri": "https://github.com/login/device",
+                                        "expires_in": 900,
+                                        "interval": 5
+                                    })
+                                    .to_string(),
+                                ),
+                                ("POST", "/login/oauth/access_token") => {
+                                    let count = st.poll_count.fetch_add(1, Ordering::SeqCst);
+                                    if count == 0 {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({"error": "authorization_pending"})
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "access_token": "gho_test_token_xyz",
+                                                "token_type": "bearer",
+                                                "scope": "gist"
+                                            })
+                                            .to_string(),
+                                        )
+                                    }
+                                }
+                                ("GET", "/user") => (
+                                    "200 OK",
+                                    "X-OAuth-Scopes: gist\r\n",
+                                    serde_json::json!({
+                                        "login": "octocat",
+                                        "name": "The Octocat",
+                                        "avatar_url": "https://avatars.githubusercontent.com/u/583231"
+                                    })
+                                    .to_string(),
+                                ),
+                                ("GET", p) if p.starts_with("/gists?") => {
+                                    let existing = st.gist_content.lock().expect("lock").clone();
+                                    if existing.is_some() {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!([{
+                                                "id": "gist_orbit_001",
+                                                "html_url": "https://gist.github.com/octocat/gist_orbit_001",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {}
+                                                }
+                                            }])
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        ("200 OK", "", "[]".to_string())
+                                    }
+                                }
+                                ("GET", "/gists/gist_orbit_001") => {
+                                    let existing = st.gist_content.lock().expect("lock").clone();
+                                    if let Some(content) = existing {
+                                        (
+                                            "200 OK",
+                                            "",
+                                            serde_json::json!({
+                                                "id": "gist_orbit_001",
+                                                "html_url": "https://gist.github.com/octocat/gist_orbit_001",
+                                                "files": {
+                                                    crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME: {
+                                                        "content": content,
+                                                        "truncated": false
+                                                    }
+                                                }
+                                            })
+                                            .to_string(),
+                                        )
+                                    } else {
+                                        (
+                                            "404 Not Found",
+                                            "",
+                                            serde_json::json!({"message": "Not Found"}).to_string(),
+                                        )
+                                    }
+                                }
+                                ("POST", "/gists") | ("PATCH", "/gists/gist_orbit_001") => {
+                                    let parsed: serde_json::Value =
+                                        serde_json::from_str(body_str).unwrap_or_default();
+                                    let content = parsed["files"]
+                                        [crate::cloud_sync::CLOUD_VAULT_GIST_FILENAME]["content"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    *st.gist_content.lock().expect("lock") = Some(content);
+                                    (
+                                        "200 OK",
+                                        "",
+                                        serde_json::json!({
+                                            "id": "gist_orbit_001",
+                                            "html_url": "https://gist.github.com/octocat/gist_orbit_001"
+                                        })
+                                        .to_string(),
+                                    )
+                                }
+                                _ => (
+                                    "404 Not Found",
+                                    "",
+                                    serde_json::json!({"message": "unhandled"}).to_string(),
+                                ),
+                            };
+
+                            let raw = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                                resp_body.len()
+                            );
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        });
+                    }
+                });
+                format!("http://{addr}")
+            }
+        });
+
+        // --- Device A: Sign in via Device Flow, pair 2 hosts, pin project, set prefs, sync ---
+        let device_a = OrbitAppCore::open_in_memory().expect("device a");
+        device_a.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+
+        let started = device_a
+            .cloud_sync_start_github_device_flow(Some("Ov23liTestClient".into()))
+            .expect("start device flow");
+        assert_eq!(started.user_code, "ORBT-9942");
+
+        let poll1 = device_a
+            .cloud_sync_poll_github_device_flow(&started.device_code, None)
+            .expect("poll 1");
+        assert_eq!(poll1.status, CloudSyncDevicePollStatus::Pending);
+
+        let poll2 = device_a
+            .cloud_sync_poll_github_device_flow(&started.device_code, None)
+            .expect("poll 2");
+        assert_eq!(poll2.status, CloudSyncDevicePollStatus::Authorized);
+        let st_a = poll2.sync_status.expect("sync status");
+        assert_eq!(st_a.account_login.as_deref(), Some("octocat"));
+        assert_eq!(st_a.state, crate::cloud_sync::CloudSyncState::Locked);
+        assert!(!st_a.remote_vault_exists);
+
+        let kp1 = orbit_crypto::HostIdentityKeypair::generate().expect("kp1");
+        let kp2 = orbit_crypto::HostIdentityKeypair::generate().expect("kp2");
+        let h1_id = kp1.host_id().expect("h1");
+        let h2_id = kp2.host_id().expect("h2");
+        let offer1 = PairingOffer {
+            host_id: h1_id.clone(),
+            hostname: "secret-studio-mac".into(),
+            daemon_pubkey_b64: kp1.public_key_b64,
+            direct_endpoints: vec![
+                "ws://127.0.0.1:6868/ws".into(),
+                "ws://192.168.1.88:6868/ws".into(),
+            ],
+            relay_url: Some("wss://relay.private.local:7878".into()),
+            pairing_secret: "sec1".into(),
+        };
+        let offer2 = PairingOffer {
+            host_id: h2_id.clone(),
+            hostname: "gpu-cluster-box".into(),
+            daemon_pubkey_b64: kp2.public_key_b64,
+            direct_endpoints: vec!["ws://10.0.0.5:6868/ws".into()],
+            relay_url: None,
+            pairing_secret: "sec2".into(),
+        };
+        device_a
+            .pair_host(&offer1.to_qr_uri().expect("uri1"))
+            .expect("pair h1");
+        device_a
+            .pair_host(&offer2.to_qr_uri().expect("uri2"))
+            .expect("pair h2");
+        let proj = device_a
+            .upsert_project(None, &h1_id, "UltraSecretApp", vec!["/code/app".into()])
+            .expect("proj");
+        device_a
+            .reorder_projects(vec![proj.project_id.clone()])
+            .expect("order");
+        device_a
+            .cloud_sync_update_preferences(HashMap::from([
+                ("theme".to_string(), serde_json::json!("dark")),
+                ("enterToSend".to_string(), serde_json::json!(false)),
+            ]))
+            .expect("prefs");
+
+        let unlock_a = device_a
+            .cloud_sync_unlock_with_passphrase("super-strong-sync-passphrase")
+            .expect("unlock a");
+        assert!(unlock_a.pushed_remote);
+        assert_eq!(unlock_a.vault_revision, 1);
+
+        // Verify zero-knowledge property: raw Gist on GitHub must NOT contain plaintext hostnames/projects!
+        let raw_gist = state
+            .gist_content
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("gist written");
+        assert!(raw_gist.contains("orbit-cloud-vault/v1"));
+        assert!(!raw_gist.contains("secret-studio-mac"));
+        assert!(!raw_gist.contains("UltraSecretApp"));
+        assert!(!raw_gist.contains("relay.private.local"));
+
+        // --- Device B: Brand-new empty device signs in, fails wrong passphrase, unlocks with right one ---
+        let device_b = OrbitAppCore::open_in_memory().expect("device b");
+        device_b.set_cloud_sync_github_bases_for_test(&base_url, &base_url);
+
+        let st_b = device_b
+            .cloud_sync_login_with_token("gho_test_token_xyz")
+            .expect("token login");
+        assert_eq!(st_b.state, crate::cloud_sync::CloudSyncState::Locked);
+        assert!(st_b.remote_vault_exists);
+
+        // Wrong passphrase must be rejected cleanly
+        assert!(
+            device_b
+                .cloud_sync_unlock_with_passphrase("wrong-passphrase")
+                .is_err()
+        );
+
+        // Correct passphrase unlocks and syncs everything immediately
+        let unlock_b = device_b
+            .cloud_sync_unlock_with_passphrase("super-strong-sync-passphrase")
+            .expect("unlock b");
+        assert_eq!(unlock_b.hosts_added, 2);
+        assert_eq!(unlock_b.projects_added, 1);
+        assert_eq!(unlock_b.preferences_updated, 2);
+
+        let fleet_b = device_b.fleet_overview();
+        assert_eq!(fleet_b.hosts.len(), 2);
+        let synced_h1 = fleet_b
+            .hosts
+            .iter()
+            .find(|h| h.host_id == h1_id)
+            .expect("h1 on b");
+        // Loopback 127.0.0.1 must have been stripped before cloud upload!
+        assert_eq!(
+            synced_h1.direct_endpoints,
+            vec!["ws://192.168.1.88:6868/ws".to_string()]
+        );
+        assert_eq!(
+            synced_h1.relay_url.as_deref(),
+            Some("wss://relay.private.local:7878")
+        );
+        assert_eq!(fleet_b.projects.len(), 1);
+        assert_eq!(fleet_b.projects[0].name, "UltraSecretApp");
+        assert_eq!(fleet_b.project_order, vec![proj.project_id]);
+        let prefs_b = device_b.cloud_sync_get_preferences();
+        assert_eq!(prefs_b.get("theme"), Some(&serde_json::json!("dark")));
+        assert_eq!(prefs_b.get("enterToSend"), Some(&serde_json::json!(false)));
+
+        // --- Device B deletes h2, syncs -> Device A pulls and removes h2 via tombstone ---
+        std::thread::sleep(Duration::from_millis(5));
+        device_b.remove_host(&h2_id).expect("remove h2 on b");
+        let sync_b = device_b.cloud_sync_now().expect("sync b push delete");
+        assert!(sync_b.pushed_remote);
+
+        let sync_a = device_a.cloud_sync_now().expect("sync a pull delete");
+        assert_eq!(sync_a.hosts_removed, 1);
+        assert_eq!(device_a.fleet_overview().hosts.len(), 1);
+        assert_eq!(device_a.fleet_overview().hosts[0].host_id, h1_id);
     }
 }

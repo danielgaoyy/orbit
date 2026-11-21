@@ -976,6 +976,102 @@ impl OhosCoreFacade {
     pub fn dismiss_cluster_suggestion(&self, host_id: &str, agent_id: &str) {
         self.inner.dismiss_cluster_suggestion(host_id, agent_id);
     }
+
+    // --- Zero-Server E2EE Cloud Sync ---
+
+    pub fn cloud_sync_status_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.inner.cloud_sync_status()).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_generate_passphrase(&self) -> String {
+        self.inner.cloud_sync_generate_passphrase()
+    }
+
+    pub fn cloud_sync_set_github_client_id_json(
+        &self,
+        client_id: Option<String>,
+    ) -> Result<String, String> {
+        let status = self
+            .inner
+            .cloud_sync_set_github_client_id(client_id)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&status).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_set_auto_sync_json(&self, enabled: bool) -> Result<String, String> {
+        let status = self
+            .inner
+            .cloud_sync_set_auto_sync(enabled)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&status).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_start_github_device_flow_json(
+        &self,
+        client_id_override: Option<String>,
+    ) -> Result<String, String> {
+        let started = self
+            .inner
+            .cloud_sync_start_github_device_flow(client_id_override)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&started).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_poll_github_device_flow_json(
+        &self,
+        device_code: &str,
+        client_id_override: Option<String>,
+    ) -> Result<String, String> {
+        let polled = self
+            .inner
+            .cloud_sync_poll_github_device_flow(device_code, client_id_override)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&polled).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_login_with_token_json(&self, token: &str) -> Result<String, String> {
+        let status = self
+            .inner
+            .cloud_sync_login_with_token(token)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&status).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_unlock_with_passphrase_json(
+        &self,
+        passphrase: &str,
+    ) -> Result<String, String> {
+        let res = self
+            .inner
+            .cloud_sync_unlock_with_passphrase(passphrase)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_now_json(&self) -> Result<String, String> {
+        let res = self.inner.cloud_sync_now().map_err(|e| e.to_string())?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_logout_json(&self, clear_local_hosts: bool) -> Result<String, String> {
+        let status = self
+            .inner
+            .cloud_sync_logout(clear_local_hosts)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_string(&status).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_get_preferences_json(&self) -> Result<String, String> {
+        serde_json::to_string(&self.inner.cloud_sync_get_preferences()).map_err(|e| e.to_string())
+    }
+
+    pub fn cloud_sync_update_preferences_json(&self, patch_json: &str) -> Result<(), String> {
+        let patch: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(patch_json).map_err(|e| e.to_string())?;
+        self.inner
+            .cloud_sync_update_preferences(patch)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(target_env = "ohos")]
@@ -1855,6 +1951,98 @@ mod ohos_napi {
                 facade: self.facade.clone(),
                 req_json,
             })
+        }
+
+        #[napi]
+        pub fn cloud_sync_status_json(&self) -> Result<String> {
+            self.facade
+                .cloud_sync_status_json()
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_generate_passphrase(&self) -> String {
+            self.facade.cloud_sync_generate_passphrase()
+        }
+
+        #[napi]
+        pub fn cloud_sync_set_github_client_id_json(
+            &self,
+            client_id: Option<String>,
+        ) -> Result<String> {
+            self.facade
+                .cloud_sync_set_github_client_id_json(client_id)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_set_auto_sync_json(&self, enabled: bool) -> Result<String> {
+            self.facade
+                .cloud_sync_set_auto_sync_json(enabled)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_start_github_device_flow_json(
+            &self,
+            client_id_override: Option<String>,
+        ) -> Result<String> {
+            self.facade
+                .cloud_sync_start_github_device_flow_json(client_id_override)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_poll_github_device_flow_json(
+            &self,
+            device_code: String,
+            client_id_override: Option<String>,
+        ) -> Result<String> {
+            self.facade
+                .cloud_sync_poll_github_device_flow_json(&device_code, client_id_override)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_login_with_token_json(&self, token: String) -> Result<String> {
+            self.facade
+                .cloud_sync_login_with_token_json(&token)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_unlock_with_passphrase_json(&self, passphrase: String) -> Result<String> {
+            self.facade
+                .cloud_sync_unlock_with_passphrase_json(&passphrase)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_now_json(&self) -> Result<String> {
+            self.facade
+                .cloud_sync_now_json()
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_logout_json(&self, clear_local_hosts: bool) -> Result<String> {
+            self.facade
+                .cloud_sync_logout_json(clear_local_hosts)
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_get_preferences_json(&self) -> Result<String> {
+            self.facade
+                .cloud_sync_get_preferences_json()
+                .map_err(Error::from_reason)
+        }
+
+        #[napi]
+        pub fn cloud_sync_update_preferences_json(&self, patch_json: String) -> Result<()> {
+            self.facade
+                .cloud_sync_update_preferences_json(&patch_json)
+                .map_err(Error::from_reason)
         }
     }
 }

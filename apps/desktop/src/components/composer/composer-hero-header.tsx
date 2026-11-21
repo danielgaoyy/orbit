@@ -6,7 +6,6 @@ import {
   FolderGit2,
   FolderPlus,
   GitBranch,
-  Inbox,
   Laptop,
   Layers,
   Search,
@@ -518,45 +517,45 @@ export const ComposerHeroHeader = memo(function ComposerHeroHeader() {
           </PopoverContent>
         </Popover>
 
-        {/* Optional Curated Mission Workspace Selector (child of Project; defaults to 待归类) */}
+        {/* Optional Group Selector — quiet opt-in pill shown only when the project already has Groups */}
         {(curatedWorkspacesForProject.length > 0 || selectedDraftWs) && (
           <>
-            <span className="text-foreground/25 select-none text-[13px]">/</span>
+            <span className="text-foreground/20 select-none text-[13px]">/</span>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
                   title={
                     selectedDraftWs
-                      ? `Workspace: ${selectedDraftWs.title}`
-                      : "未指定 Workspace（发送后将放入「待归类」并自动识别）"
+                      ? `Group: ${selectedDraftWs.title}`
+                      : "Optional: add this conversation to a group"
                   }
-                  className="text-foreground/72 hover:text-foreground inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]"
-                >
-                  {selectedDraftWs ? (
-                    <Layers className="size-3.5 shrink-0 stroke-[1.75] text-sky-500" />
-                  ) : (
-                    <Inbox className="size-3.5 shrink-0 stroke-[1.75] opacity-70" />
+                  className={cn(
+                    "inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-full px-2.5 text-[13px] transition-colors hover:bg-black/[0.045] dark:hover:bg-white/[0.06]",
+                    selectedDraftWs
+                      ? "text-foreground/80 hover:text-foreground font-medium"
+                      : "text-foreground/50 hover:text-foreground/80",
                   )}
+                >
+                  <Layers className="size-3.5 shrink-0 stroke-[1.75] opacity-75" />
                   <span className="max-w-36 truncate">
-                    {selectedDraftWs ? selectedDraftWs.title : "待归类"}
+                    {selectedDraftWs ? selectedDraftWs.title : "Group"}
                   </span>
-                  <ChevronDown className="text-foreground/45 size-3.5 shrink-0 stroke-[1.75]" />
+                  <ChevronDown className="text-foreground/40 size-3.5 shrink-0 stroke-[1.75]" />
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="start"
                 side="bottom"
                 finalFocus={false}
-                className="w-60 p-1.5"
+                className="w-56 p-1.5"
               >
-                <DropdownMenuLabel>归属 Workspace</DropdownMenuLabel>
+                <DropdownMenuLabel>Group</DropdownMenuLabel>
                 <DropdownMenuItem
                   onSelect={() => orbitActions.setDraftConfig({ workspaceId: null })}
                 >
-                  <span className="flex min-w-0 items-center gap-2">
-                    <Inbox className="text-muted-foreground size-3.5 shrink-0" />
-                    <span className="truncate">待归类（自动识别）</span>
+                  <span className="text-muted-foreground flex min-w-0 items-center gap-2">
+                    <span className="truncate">None</span>
                   </span>
                   {!selectedDraftWs && <Check className="size-3.5 shrink-0" />}
                 </DropdownMenuItem>

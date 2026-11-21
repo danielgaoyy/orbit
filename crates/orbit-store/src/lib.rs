@@ -3251,11 +3251,10 @@ mod tests {
         assert_eq!(taken.wire_prompt, "wire 1");
 
         // Sync mutations (read cursor, pin, handle, unread, move) must NEVER drop queued prompts!
-        let (after_read, read_changed) = store
+        let after_read = store
             .mark_agent_read_seq("ag_q", Some(1))
             .expect("mark read")
             .expect("some");
-        assert!(read_changed);
         assert_eq!(after_read.queued_prompts.len(), 2);
         let after_pin = store
             .set_agent_pinned("ag_q", true, Some(100))

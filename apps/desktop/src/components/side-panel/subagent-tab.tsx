@@ -1,9 +1,4 @@
-<<<<<<< HEAD
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-=======
-import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { Archive, ArrowUpRight, Check, Layers, Loader2, AlertTriangle, X } from "lucide-react";
->>>>>>> origin/main
 import {
   AlertCircle,
   Archive,

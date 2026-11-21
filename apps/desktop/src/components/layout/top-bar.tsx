@@ -3,6 +3,7 @@ import { FileText } from "lucide-react";
 import { isAgentBackgroundWaiting, isMacDesktop } from "@/lib/orbit-ipc";
 import { modSymbol } from "@/lib/keybindings";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
+import { StandaloneGroupButton } from "@/components/stage/workspace-peer-strip";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -150,7 +151,9 @@ export const TopBar = memo(function TopBar() {
         className="flex shrink-0 items-center gap-1"
       >
         {hasActiveSession && (
-          <SimpleTooltip
+          <>
+            <StandaloneGroupButton />
+            <SimpleTooltip
             label={
               overviewVisible
                 ? "Hide overview"
@@ -188,6 +191,7 @@ export const TopBar = memo(function TopBar() {
               )}
             </button>
           </SimpleTooltip>
+          </>
         )}
       </div>
     </header>

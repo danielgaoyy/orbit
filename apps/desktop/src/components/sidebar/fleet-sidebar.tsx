@@ -6,21 +6,16 @@ import {
   ChevronDown,
   ChevronRight,
   Clock,
-  FileText,
   Folder,
   FolderOpen,
-  FolderPlus,
   GripVertical,
-  Inbox,
   Layers,
   ListFilter,
-  Loader2,
   MoreHorizontal,
   Plus,
   RefreshCw,
   RotateCcw,
   Settings,
-  Sparkles,
   Trash2,
 } from "lucide-react";
 import { modSymbol } from "@/lib/keybindings";
@@ -96,7 +91,6 @@ export const FleetSidebar = memo(function FleetSidebar() {
   const workspacePanel = useOrbitSelector((s) => s.workspacePanel);
   const collapsedProjectIds = useOrbitSelector((s) => s.collapsedProjectIds);
   const collapsedWorkspaceIds = useOrbitSelector((s) => s.collapsedWorkspaceIds);
-  const collapsedInboxProjectIds = useOrbitSelector((s) => s.collapsedInboxProjectIds);
   const threadCustomTitles = useOrbitSelector((s) => s.threadCustomTitles);
   const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
   const sidebarProjectSort = useOrbitSelector((s) => s.sidebarProjectSort);
@@ -932,23 +926,6 @@ export const FleetSidebar = memo(function FleetSidebar() {
                           <button
                             type="button"
                             data-proj-action="true"
-                            title={`新建 Workspace (${proj.name})`}
-                            onClick={() =>
-                              setCreateWsTarget({
-                                hostId: proj.host_id,
-                                projectRoot: proj.primary_cwd,
-                                projectName: proj.name,
-                                isGitRepo: Boolean(proj.is_git_repo),
-                              })
-                            }
-                            className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
-                          >
-                            <FolderPlus className="h-[13px] w-[13px] stroke-[1.8]" />
-                          </button>
-
-                          <button
-                            type="button"
-                            data-proj-action="true"
                             title={`New conversation in ${proj.name}`}
                             onClick={() =>
                               orbitActions.startNewThreadDraft(
@@ -964,15 +941,15 @@ export const FleetSidebar = memo(function FleetSidebar() {
                       </div>
                     </div>
 
-                    {/* Curated Mission Workspaces + Unclassified (`待归类`) Inbox */}
+                    {/* Optional Groups + Flat Project Threads */}
                     {hasProjectBody && (
                       <div
                         data-open={!collapsed ? "true" : "false"}
                         className="orbit-collapse-grid"
                       >
                         <div className="orbit-collapse-inner">
-                          <div className="space-y-1 pt-0.5">
-                            {/* 1. Curated Mission Workspaces (Always Manageable — 0, 1, or N peers!) */}
+                          <div className="space-y-0.5 pt-0.5">
+                            {/* 1. Optional Groups (borderless, lightweight collapsible sections — zero chrome when none exist) */}
                             {curatedWorkspaces.map((ws) => {
                               const wsCollapsed = Boolean(collapsedWorkspaceIds[ws.workspace_id]);
                               const wsHasRunning = ws.visiblePeers.some((c) =>
@@ -1024,10 +1001,9 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                     }
                                   }}
                                   className={cn(
-                                    "my-0.5 space-y-0.5 rounded-[9px] border p-1 transition-colors",
-                                    isDropHover
-                                      ? "border-sky-500/70 bg-sky-500/10 ring-1 ring-sky-500/35"
-                                      : "border-black/[0.06] bg-black/[0.02] dark:border-white/[0.07] dark:bg-white/[0.025]",
+                                    "space-y-0.5 rounded-[8px] transition-colors",
+                                    isDropHover &&
+                                      "bg-foreground/[0.04] ring-1 ring-foreground/20",
                                   )}
                                 >
                                   <div
@@ -1045,11 +1021,11 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                         },
                                       });
                                     }}
-                                    className="group/ws flex h-[26px] items-center justify-between gap-1 rounded-[6px] px-1.5 transition-colors hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
+                                    className="group/ws flex h-[28px] items-center justify-between gap-1 rounded-[8px] px-2 transition-colors hover:bg-black/[0.035] dark:hover:bg-white/[0.045]"
                                   >
                                     {isRenamingThisWs ? (
-                                      <div className="flex min-w-0 flex-1 items-center gap-1.5">
-                                        <Layers className="h-[12.5px] w-[12.5px] shrink-0 text-sky-500" />
+                                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                                        <Layers className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0" />
                                         <input
                                           autoFocus
                                           value={workspaceRenameDraft}
@@ -1067,7 +1043,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                               setRenamingWorkspaceId(null);
                                             }
                                           }}
-                                          className="bg-background text-foreground h-[20px] min-w-0 flex-1 rounded px-1.5 text-[12px] outline-none ring-1 ring-sky-500/50"
+                                          className="bg-background text-foreground ring-foreground/25 h-[20px] min-w-0 flex-1 rounded px-1.5 text-[12.5px] ring-1 outline-none"
                                         />
                                       </div>
                                     ) : (
@@ -1075,8 +1051,8 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                         type="button"
                                         title={
                                           ws.mission_goal
-                                            ? `${ws.title}\n${ws.mission_goal}\n双击重命名`
-                                            : `${ws.title} · 双击重命名`
+                                            ? `${ws.title}\n${ws.mission_goal}`
+                                            : `${ws.title} · Double-click to rename`
                                         }
                                         onClick={() =>
                                           orbitActions.toggleWorkspaceCollapsed(ws.workspace_id)
@@ -1086,13 +1062,20 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                           setWorkspaceRenameDraft(ws.title);
                                           setRenamingWorkspaceId(ws.workspace_id);
                                         }}
-                                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left"
+                                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left"
                                       >
-                                        <Layers className="h-[12.5px] w-[12.5px] shrink-0 stroke-[1.8] text-sky-500/85" />
-                                        <span className="text-foreground/88 truncate text-[12px] font-medium">
+                                        <span className="text-muted-foreground relative inline-flex h-[16px] w-[16px] shrink-0 items-center justify-center">
+                                          <Layers className="h-[13.5px] w-[13.5px] stroke-[1.7] transition-opacity group-hover/ws:opacity-0" />
+                                          {wsCollapsed ? (
+                                            <ChevronRight className="absolute h-[13px] w-[13px] opacity-0 transition-opacity group-hover/ws:opacity-85" />
+                                          ) : (
+                                            <ChevronDown className="absolute h-[13px] w-[13px] opacity-0 transition-opacity group-hover/ws:opacity-85" />
+                                          )}
+                                        </span>
+                                        <span className="text-foreground/82 truncate text-[12.5px] font-medium">
                                           {ws.title}
                                         </span>
-                                        <span className="bg-black/[0.06] text-muted-foreground shrink-0 rounded-full px-1.5 text-[10.5px] tabular-nums dark:bg-white/[0.08]">
+                                        <span className="text-muted-foreground/65 shrink-0 text-[11px] tabular-nums">
                                           {ws.visiblePeers.length}
                                         </span>
                                         {ws.has_conflict && (
@@ -1101,7 +1084,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                         {!ws.has_conflict && wsHasRunning && (
                                           <OrbitSpinner
                                             size={11}
-                                            className="shrink-0 text-sky-500"
+                                            className="text-foreground/65 shrink-0"
                                           />
                                         )}
                                         {!ws.has_conflict &&
@@ -1114,42 +1097,10 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                     )}
 
                                     {!isRenamingThisWs && (
-                                      <div className="flex shrink-0 items-center gap-0.5">
+                                      <div className="hidden shrink-0 items-center gap-0.5 group-hover/ws:flex">
                                         <button
                                           type="button"
-                                          title="在此 Workspace 新建会话"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            orbitActions.startNewThreadDraft(
-                                              proj.host_id,
-                                              ws.cwd || proj.primary_cwd,
-                                              undefined,
-                                              undefined,
-                                              ws.workspace_id,
-                                            );
-                                          }}
-                                          className="text-muted-foreground hover:text-foreground hidden h-[20px] w-[20px] cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] group-hover/ws:inline-flex dark:hover:bg-white/[0.09]"
-                                        >
-                                          <Plus className="h-[12px] w-[12px]" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          title="打开协作看板 (BOARD.md)"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            orbitActions.openWorkspaceBoardTab(
-                                              proj.host_id,
-                                              ws.workspace_id,
-                                              ws.title,
-                                            );
-                                          }}
-                                          className="text-muted-foreground hover:text-foreground inline-flex h-[20px] w-[20px] shrink-0 cursor-pointer items-center justify-center rounded opacity-65 hover:bg-black/[0.06] hover:opacity-100 dark:hover:bg-white/[0.09]"
-                                        >
-                                          <FileText className="h-[11.5px] w-[11.5px]" />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          aria-label={`Workspace options for ${ws.title}`}
+                                          aria-label={`Group options for ${ws.title}`}
                                           onClick={(e) => {
                                             e.stopPropagation();
                                             const r = e.currentTarget.getBoundingClientRect();
@@ -1165,19 +1116,36 @@ export const FleetSidebar = memo(function FleetSidebar() {
                                               },
                                             });
                                           }}
-                                          className="text-muted-foreground hover:text-foreground hidden h-[20px] w-[20px] cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] group-hover/ws:inline-flex dark:hover:bg-white/[0.09]"
+                                          className="text-muted-foreground hover:text-foreground inline-flex h-[20px] w-[20px] cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
                                         >
-                                          <MoreHorizontal className="h-[12px] w-[12px]" />
+                                          <MoreHorizontal className="h-[12.5px] w-[12.5px]" />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          title={`New thread in ${ws.title}`}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            orbitActions.startNewThreadDraft(
+                                              proj.host_id,
+                                              ws.cwd || proj.primary_cwd,
+                                              undefined,
+                                              undefined,
+                                              ws.workspace_id,
+                                            );
+                                          }}
+                                          className="text-muted-foreground hover:text-foreground inline-flex h-[20px] w-[20px] cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
+                                        >
+                                          <Plus className="h-[12.5px] w-[12.5px]" />
                                         </button>
                                       </div>
                                     )}
                                   </div>
 
                                   {!wsCollapsed && (
-                                    <div className="space-y-0.5">
+                                    <div className="ml-[15px] space-y-0.5 border-l border-black/[0.06] pl-1.5 dark:border-white/[0.08]">
                                       {ws.visiblePeers.length === 0 ? (
-                                        <div className="text-muted-foreground/65 px-2 py-1.5 text-[11.5px]">
-                                          空 Workspace · 点 + 新建或拖入会话
+                                        <div className="text-muted-foreground/55 px-2 py-1 text-[11.5px]">
+                                          Empty group
                                         </div>
                                       ) : (
                                         ws.visiblePeers.map((conv) => {
@@ -1222,231 +1190,121 @@ export const FleetSidebar = memo(function FleetSidebar() {
                               );
                             })}
 
-                            {/* 2. Collapsible Unclassified (`待归类`) Inbox Section — Calm at Rest, 1-Click Single & Batch AI Classify */}
-                            {totalUnclassified > 0 && (() => {
-                              const hasExplicitInboxPref =
-                                collapsedInboxProjectIds[proj.id] !== undefined;
-                              // When a project already has curated Workspaces, keep `待归类` collapsed by default unless
-                              // the user opened it or the active conversation lives inside `待归类` (prevents sprawl!).
-                              const inboxCollapsed = hasExplicitInboxPref
-                                ? Boolean(collapsedInboxProjectIds[proj.id])
-                                : curatedWorkspaces.length > 0 && selectedUnclassifiedIdx < 0;
-                              const inboxHasRunning = unclassifiedConversations.some((c) =>
-                                isAgentForegroundRunning(c.agent),
-                              );
-                              const inboxHasUnread = unclassifiedConversations.some((c) =>
-                                isConvUnread(c),
-                              );
+                            {/* 2. Flat Project Threads (No "Unclassified" box — drop here to ungroup) */}
+                            {isProjectOrganizing && organizeEvent?.message && (
+                              <div className="text-muted-foreground px-2 py-1 text-[11.5px]">
+                                {organizeEvent.message}
+                              </div>
+                            )}
 
-                              return (
-                                <div
-                                  onDragOver={(e) => {
-                                    if (e.dataTransfer.types.includes("application/x-orbit-agent")) {
-                                      e.preventDefault();
-                                      e.dataTransfer.dropEffect = "move";
-                                      setDragOverDropId(`inbox:${proj.id}`);
-                                    }
-                                  }}
-                                  onDragLeave={(e) => {
-                                    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
-                                      setDragOverDropId((cur) =>
-                                        cur === `inbox:${proj.id}` ? null : cur,
-                                      );
-                                    }
-                                  }}
-                                  onDrop={(e) => {
+                            {totalUnclassified > 0 && (
+                              <div
+                                onDragOver={(e) => {
+                                  if (e.dataTransfer.types.includes("application/x-orbit-agent")) {
                                     e.preventDefault();
-                                    setDragOverDropId(null);
-                                    const dragged = parseDraggedAgent(e);
-                                    if (dragged) {
-                                      void orbitActions.moveAgentToWorkspace(
-                                        dragged.hostId,
-                                        dragged.agentId,
-                                        null,
-                                        { makeUnclassified: true },
-                                      );
-                                    }
-                                  }}
-                                  className={cn(
-                                    "space-y-0.5 rounded-[8px] pt-0.5 transition-colors",
-                                    dragOverDropId === `inbox:${proj.id}` &&
-                                      "bg-sky-500/8 ring-1 ring-sky-500/40",
-                                  )}
-                                >
-                                  <div className="group/inbox flex h-[24px] items-center justify-between gap-1 rounded-[6px] px-1.5 transition-colors hover:bg-black/[0.035] dark:hover:bg-white/[0.045]">
+                                    e.dataTransfer.dropEffect = "move";
+                                    setDragOverDropId(`inbox:${proj.id}`);
+                                  }
+                                }}
+                                onDragLeave={(e) => {
+                                  if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                                    setDragOverDropId((cur) =>
+                                      cur === `inbox:${proj.id}` ? null : cur,
+                                    );
+                                  }
+                                }}
+                                onDrop={(e) => {
+                                  e.preventDefault();
+                                  setDragOverDropId(null);
+                                  const dragged = parseDraggedAgent(e);
+                                  if (dragged) {
+                                    void orbitActions.moveAgentToWorkspace(
+                                      dragged.hostId,
+                                      dragged.agentId,
+                                      null,
+                                      { makeUnclassified: true },
+                                    );
+                                  }
+                                }}
+                                className={cn(
+                                  "space-y-0.5 rounded-[8px] transition-colors",
+                                  curatedWorkspaces.length > 0 && "pt-0.5",
+                                  dragOverDropId === `inbox:${proj.id}` &&
+                                    "bg-foreground/[0.04] ring-1 ring-foreground/20",
+                                )}
+                              >
+                                {slicedUnclassified.map((conv) => {
+                                  const ag = conv.agent;
+                                  const tKey = threadScopeKey(proj.host_id, ag.agent_id);
+                                  const selected =
+                                    workspacePanel === "conversation" &&
+                                    !isDraftNewSession &&
+                                    selectedHostId === proj.host_id &&
+                                    selectedAgentId === ag.agent_id;
+                                  const unread = isConvUnread(conv);
+                                  const effectiveTitle = threadCustomTitles[tKey] || ag.title;
+
+                                  return (
+                                    <SidebarConversationRow
+                                      key={ag.agent_id}
+                                      threadKey={tKey}
+                                      host={host}
+                                      agent={ag}
+                                      projectName={proj.name}
+                                      effectiveTitle={effectiveTitle}
+                                      isWorktree={conv.is_worktree}
+                                      isPinned={false}
+                                      isUnread={unread}
+                                      selected={selected}
+                                      isChild={Boolean(ag.parent_agent_id)}
+                                      nowMs={nowMs}
+                                      menuOpen={convMenu?.threadKey === tKey}
+                                      isRenaming={renamingThreadKey === tKey}
+                                      onOpenMenu={handleOpenConvMenu}
+                                      onStartRename={handleStartRename}
+                                      onFinishRename={handleFinishRename}
+                                    />
+                                  );
+                                })}
+
+                                {hiddenCount > 0 &&
+                                  !expandedMoreProjects[proj.id] &&
+                                  !isExpandedAll && (
                                     <button
                                       type="button"
                                       onClick={() =>
-                                        orbitActions.toggleProjectInboxCollapsed(proj.id)
+                                        setExpandedMoreProjects((prev) => ({
+                                          ...prev,
+                                          [proj.id]: true,
+                                        }))
                                       }
-                                      className="text-muted-foreground/85 hover:text-foreground flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-left text-[11.5px] font-medium"
+                                      className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors"
                                     >
-                                      {inboxCollapsed ? (
-                                        <ChevronRight className="h-[11.5px] w-[11.5px] shrink-0 opacity-65" />
-                                      ) : (
-                                        <ChevronDown className="h-[11.5px] w-[11.5px] shrink-0 opacity-65" />
-                                      )}
-                                      <Inbox className="h-[11.5px] w-[11.5px] shrink-0 opacity-80" />
-                                      <span className="truncate">待归类</span>
-                                      <span className="bg-black/[0.05] text-muted-foreground shrink-0 rounded-full px-1.5 text-[10.5px] tabular-nums dark:bg-white/[0.07]">
-                                        {totalUnclassified}
-                                      </span>
-                                      {inboxCollapsed && inboxHasRunning && (
-                                        <OrbitSpinner size={10.5} className="shrink-0 text-sky-500" />
-                                      )}
-                                      {inboxCollapsed && !inboxHasRunning && inboxHasUnread && (
-                                        <span className="h-[5px] w-[5px] shrink-0 rounded-full bg-sky-500" />
-                                      )}
+                                      <span className="inline-flex h-[16px] w-[16px] shrink-0" />
+                                      <span>Show {hiddenCount} more…</span>
                                     </button>
+                                  )}
 
-                                    <div
-                                      className={cn(
-                                        "shrink-0 items-center gap-0.5",
-                                        isProjectOrganizing
-                                          ? "inline-flex"
-                                          : "hidden group-hover/inbox:inline-flex",
-                                      )}
+                                {hiddenCount > 0 &&
+                                  Boolean(expandedMoreProjects[proj.id]) &&
+                                  selectedUnclassifiedIdx <
+                                    MAX_VISIBLE_CONVERSATIONS_PER_PROJECT && (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setExpandedMoreProjects((prev) => ({
+                                          ...prev,
+                                          [proj.id]: false,
+                                        }))
+                                      }
+                                      className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors"
                                     >
-                                      <SimpleTooltip
-                                        label={
-                                          organizeEvent?.message ||
-                                          `AI 批量归类本项目的全部 ${totalUnclassified} 个待归类会话`
-                                        }
-                                      >
-                                        <button
-                                          type="button"
-                                          disabled={isProjectOrganizing}
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void orbitActions.organizeProjectWorkspaces(
-                                              proj.host_id,
-                                              proj.primary_cwd,
-                                              [],
-                                              true,
-                                            );
-                                          }}
-                                          className="text-muted-foreground hover:text-sky-600 dark:hover:text-sky-400 inline-flex h-[19px] cursor-pointer items-center gap-1 rounded px-1.5 text-[10.5px] font-medium transition-colors hover:bg-black/[0.06] disabled:opacity-60 dark:hover:bg-white/[0.09]"
-                                        >
-                                          {isProjectOrganizing ? (
-                                            <Loader2 className="h-[10.5px] w-[10.5px] animate-spin text-sky-500" />
-                                          ) : (
-                                            <Sparkles className="h-[10.5px] w-[10.5px]" />
-                                          )}
-                                          <span>AI 归类</span>
-                                        </button>
-                                      </SimpleTooltip>
-
-                                      <SimpleTooltip label="手动新建 Workspace">
-                                        <button
-                                          type="button"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            setCreateWsTarget({
-                                              hostId: proj.host_id,
-                                              projectRoot: proj.primary_cwd,
-                                              projectName: proj.name,
-                                              isGitRepo: Boolean(proj.is_git_repo),
-                                            });
-                                          }}
-                                          className="text-muted-foreground hover:text-foreground inline-flex h-[19px] w-[19px] cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
-                                        >
-                                          <Plus className="h-[11.5px] w-[11.5px]" />
-                                        </button>
-                                      </SimpleTooltip>
-                                    </div>
-                                  </div>
-
-                                  {isProjectOrganizing && organizeEvent?.message && (
-                                    <div className="px-2 py-0.5 text-[11px] text-sky-600 dark:text-sky-400">
-                                      {organizeEvent.message}
-                                    </div>
+                                      <span className="inline-flex h-[16px] w-[16px] shrink-0" />
+                                      <span>Show less</span>
+                                    </button>
                                   )}
-
-                                  {!inboxCollapsed && (
-                                    <div className="space-y-0.5">
-                                      {slicedUnclassified.map((conv) => {
-                                        const ag = conv.agent;
-                                        const tKey = threadScopeKey(proj.host_id, ag.agent_id);
-                                        const selected =
-                                          workspacePanel === "conversation" &&
-                                          !isDraftNewSession &&
-                                          selectedHostId === proj.host_id &&
-                                          selectedAgentId === ag.agent_id;
-                                        const unread = isConvUnread(conv);
-                                        const effectiveTitle = threadCustomTitles[tKey] || ag.title;
-
-                                        return (
-                                          <SidebarConversationRow
-                                            key={ag.agent_id}
-                                            threadKey={tKey}
-                                            host={host}
-                                            agent={ag}
-                                            projectName={proj.name}
-                                            effectiveTitle={effectiveTitle}
-                                            isWorktree={conv.is_worktree}
-                                            isPinned={false}
-                                            isUnread={unread}
-                                            selected={selected}
-                                            isChild={Boolean(ag.parent_agent_id)}
-                                            nowMs={nowMs}
-                                            menuOpen={convMenu?.threadKey === tKey}
-                                            isRenaming={renamingThreadKey === tKey}
-                                            onOpenMenu={handleOpenConvMenu}
-                                            onStartRename={handleStartRename}
-                                            onFinishRename={handleFinishRename}
-                                            onAiClassify={() =>
-                                              void orbitActions.organizeProjectWorkspaces(
-                                                proj.host_id,
-                                                proj.primary_cwd,
-                                                [ag.agent_id],
-                                                true,
-                                              )
-                                            }
-                                          />
-                                        );
-                                      })}
-
-                                      {hiddenCount > 0 &&
-                                        !expandedMoreProjects[proj.id] &&
-                                        !isExpandedAll && (
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              setExpandedMoreProjects((prev) => ({
-                                                ...prev,
-                                                [proj.id]: true,
-                                              }))
-                                            }
-                                            className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors"
-                                          >
-                                            <span className="inline-flex h-[16px] w-[16px] shrink-0" />
-                                            <span>Show {hiddenCount} more…</span>
-                                          </button>
-                                        )}
-
-                                      {hiddenCount > 0 &&
-                                        Boolean(expandedMoreProjects[proj.id]) &&
-                                        selectedUnclassifiedIdx <
-                                          MAX_VISIBLE_CONVERSATIONS_PER_PROJECT && (
-                                          <button
-                                            type="button"
-                                            onClick={() =>
-                                              setExpandedMoreProjects((prev) => ({
-                                                ...prev,
-                                                [proj.id]: false,
-                                              }))
-                                            }
-                                            className="text-muted-foreground/68 hover:text-foreground flex h-[26px] w-full cursor-pointer items-center gap-2.5 rounded-[7px] px-2 text-left text-[12px] transition-colors"
-                                          >
-                                            <span className="inline-flex h-[16px] w-[16px] shrink-0" />
-                                            <span>Show less</span>
-                                          </button>
-                                        )}
-                                    </div>
-                                  )}
-                                </div>
-                              );
-                            })()}
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -1479,7 +1337,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
             )}
             {!isFleetUpdating && hasFleetUpdatesAvailable && (
               <span
-                aria-label="有可用更新"
+                aria-label="Update available"
                 className="absolute -top-0.5 -right-0.5 h-[6px] w-[6px] rounded-full bg-sky-500"
               />
             )}
@@ -1487,7 +1345,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
           <span className="truncate">Settings</span>
           {!isFleetUpdating && hasFleetUpdatesAvailable && (
             <span className="ml-auto shrink-0 rounded-full bg-sky-500/12 px-1.5 py-0.5 text-[10px] font-medium text-sky-600 dark:text-sky-400">
-              可更新
+              Update
             </span>
           )}
         </button>

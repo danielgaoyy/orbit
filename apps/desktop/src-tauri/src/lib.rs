@@ -585,7 +585,9 @@ fn remove_queued_prompt(
     agent_id: String,
     queue_id: String,
 ) {
-    state.core.remove_queued_prompt(&host_id, &agent_id, &queue_id);
+    state
+        .core
+        .remove_queued_prompt(&host_id, &agent_id, &queue_id);
 }
 
 #[tauri::command]
@@ -781,6 +783,65 @@ fn move_agent_to_workspace(
 }
 
 #[tauri::command]
+fn move_agent_to_workspace_v2(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    target_workspace_id: Option<String>,
+    new_workspace_title: Option<String>,
+    make_unclassified: bool,
+) {
+    state.core.move_agent_to_workspace_v2(
+        &host_id,
+        &agent_id,
+        target_workspace_id,
+        new_workspace_title,
+        make_unclassified,
+    );
+}
+
+#[tauri::command]
+fn organize_project_workspaces(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    project_root: String,
+    agent_ids: Vec<String>,
+    auto_apply: bool,
+) {
+    state
+        .core
+        .organize_project_workspaces(&host_id, &project_root, agent_ids, auto_apply);
+}
+
+#[tauri::command]
+fn summarize_agent(state: State<'_, DesktopAppState>, host_id: String, agent_id: String) {
+    state.core.summarize_agent(&host_id, &agent_id);
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_agent_identity(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    handle: Option<String>,
+    title: Option<String>,
+    task_summary: Option<String>,
+    lock_handle: bool,
+    lock_title: bool,
+) {
+    state.core.update_agent_identity(
+        &host_id,
+        &agent_id,
+        handle,
+        title,
+        task_summary,
+        lock_handle,
+        lock_title,
+    );
+}
+
+#[tauri::command]
 fn merge_workspaces(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -835,6 +896,29 @@ fn create_workspace_v2(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn create_mission_workspace(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    source_cwd: String,
+    title: String,
+    mission_goal: Option<String>,
+    isolation: WorkspaceIsolation,
+    worktree_branch: Option<String>,
+    base_ref: Option<String>,
+) {
+    state.core.create_mission_workspace(
+        &host_id,
+        &source_cwd,
+        title,
+        mission_goal,
+        isolation,
+        worktree_branch,
+        base_ref,
+    );
+}
+
+#[tauri::command]
 fn rename_workspace(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -847,6 +931,18 @@ fn rename_workspace(
 #[tauri::command]
 fn archive_workspace(state: State<'_, DesktopAppState>, host_id: String, workspace_id: String) {
     state.core.archive_workspace(&host_id, &workspace_id);
+}
+
+#[tauri::command]
+fn archive_workspace_v2(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    workspace_id: String,
+    keep_agents_unclassified: bool,
+) {
+    state
+        .core
+        .archive_workspace_v2(&host_id, &workspace_id, keep_agents_unclassified);
 }
 
 #[tauri::command]
@@ -1868,12 +1964,18 @@ pub fn run() {
             get_workspace_events,
             update_workspace_goal,
             move_agent_to_workspace,
+            move_agent_to_workspace_v2,
+            organize_project_workspaces,
+            summarize_agent,
+            update_agent_identity,
             merge_workspaces,
             dismiss_cluster_suggestion,
             spawn_workspace_peer,
             create_workspace_v2,
+            create_mission_workspace,
             rename_workspace,
             archive_workspace,
+            archive_workspace_v2,
             unarchive_workspace,
             list_workspace_scripts,
             start_workspace_script,

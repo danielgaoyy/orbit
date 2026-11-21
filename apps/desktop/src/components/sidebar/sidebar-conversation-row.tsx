@@ -4,6 +4,7 @@ import {
   type AgentCardView,
   type HostCardView,
   isAgentForegroundRunning,
+  isGenericHarnessHandle,
 } from "@/lib/orbit-ipc";
 import { useImeCompositionGuard } from "@/lib/ime";
 import type { MenuAnchorBox } from "@/components/sidebar/sidebar-menus";
@@ -90,9 +91,26 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
     onFinishRename();
   };
 
+  const showSemanticBadge = Boolean(peerHandle && !isGenericHarnessHandle(peerHandle));
+  const hoverTooltip = [
+    isPinned ? `${effectiveTitle} · ${projectName}` : effectiveTitle,
+    agent.task_summary ? agent.task_summary : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
   return (
     <div
-      title={isPinned ? `${effectiveTitle} · ${projectName}` : effectiveTitle}
+      draggable={!isRenaming}
+      onDragStart={(e) => {
+        if (isRenaming) return;
+        e.dataTransfer.setData(
+          "application/x-orbit-agent",
+          JSON.stringify({ hostId: host.host_id, agentId: agent.agent_id }),
+        );
+        e.dataTransfer.effectAllowed = "move";
+      }}
+      title={hoverTooltip}
       onClick={() => {
         if (!isRenaming) {
           orbitActions.selectAgent(host.host_id, agent.agent_id);
@@ -167,9 +185,9 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
             }}
             className="flex min-w-0 items-center gap-1.5 truncate text-[13.5px]"
           >
-            {peerHandle && (
-              <span className="bg-black/[0.06] text-foreground/75 shrink-0 rounded px-1 py-[1px] font-mono text-[10.5px] font-medium dark:bg-white/[0.09]">
-                @{peerHandle}
+            {showSemanticBadge && (
+              <span className="bg-black/[0.06] text-foreground/75 max-w-20 shrink-0 truncate rounded px-1 py-[1px] text-[10.5px] font-medium dark:bg-white/[0.09]">
+                {peerHandle}
               </span>
             )}
             <span className="truncate">{effectiveTitle}</span>

@@ -3457,6 +3457,7 @@ mod tests {
             handle: None,
             cluster_suggestion: None,
             worktree_branch: None,
+            task_summary: None,
         };
         let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[], &[]);
         assert_eq!(
@@ -3623,6 +3624,7 @@ Log: file:///tmp/spoofed.log\n";
             handle: None,
             cluster_suggestion: None,
             worktree_branch: None,
+            task_summary: None,
         };
 
         let mut items: Vec<TimelineItemView> = Vec::new();
@@ -3862,6 +3864,7 @@ Log: file:///tmp/spoofed.log\n";
             handle: None,
             cluster_suggestion: None,
             worktree_branch: None,
+            task_summary: None,
         };
 
         let items = vec![
@@ -4040,6 +4043,7 @@ Log: file:///tmp/spoofed.log\n";
             handle: None,
             cluster_suggestion: None,
             worktree_branch: None,
+            task_summary: None,
         };
 
         let items = vec![TimelineItemView::ToolCall {

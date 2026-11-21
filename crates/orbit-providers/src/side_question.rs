@@ -157,6 +157,57 @@ pub async fn run_side_question(
         .map_err(|_| format!("Side question timed out after {SIDE_QUESTION_TIMEOUT_SECS}s"))?
 }
 
+/// Execute a non-persistent, read-only, zero-tool raw text prompt (for example, JSON-structured
+/// AI classification or conversation summarization) using an installed provider CLI without
+/// creating or polluting any conversation history.
+pub async fn run_ephemeral_text_prompt(
+    provider: ProviderKind,
+    cwd: PathBuf,
+    model: Option<String>,
+    prompt: String,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err("Ephemeral prompt cannot be empty".to_string());
+    }
+    let executable = find_provider_executable(provider).ok_or_else(|| {
+        format!(
+            "{} binary (`{}`) not found on host PATH",
+            provider.display_name(),
+            provider.default_binary()
+        )
+    })?;
+    let safe_cwd = if cwd.is_dir() {
+        cwd
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+    let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
+    // Drain deltas concurrently so the provider driver never considers the channel closed.
+    let drain_task = tokio::spawn(async move { while delta_rx.recv().await.is_some() {} });
+
+    let bounded_secs = timeout_secs.clamp(5, 180);
+    let fut = async {
+        match provider {
+            ProviderKind::ClaudeCode => {
+                run_claude_side_question(executable, safe_cwd, model, prompt, delta_tx).await
+            }
+            ProviderKind::Codex => {
+                run_codex_side_question(executable, safe_cwd, model, prompt, delta_tx).await
+            }
+            ProviderKind::Antigravity => {
+                run_agy_side_question(executable, safe_cwd, model, prompt, delta_tx).await
+            }
+        }
+    };
+
+    let result = tokio::time::timeout(Duration::from_secs(bounded_secs), fut)
+        .await
+        .map_err(|_| format!("Ephemeral prompt timed out after {bounded_secs}s"))?;
+    drain_task.abort();
+    result
+}
+
 async fn run_claude_side_question(
     executable: PathBuf,
     cwd: PathBuf,
@@ -404,8 +455,6 @@ async fn run_agy_side_question(
         "--output-format",
         "stream-json",
         "--disable-slash-commands",
-        "--mode",
-        "plan",
         "--print-timeout",
         "85s",
     ]);
@@ -604,6 +653,75 @@ fn parse_agy_side_line(line: &str) -> ParsedSideEvent {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return ParsedSideEvent::PlainFallback(format!("{line}\n"));
     };
+
+    // Current `agy --print --output-format stream-json` emits `{"event":"step_update"|"result"|...}`.
+    if let Some(event_kind) = v.get("event").and_then(Value::as_str) {
+        return match event_kind {
+            "step_update" => {
+                if let Some(step) = v.get("step_update") {
+                    let step_type = step.get("step_type").and_then(Value::as_str).unwrap_or("");
+                    if matches!(step_type, "agent_response" | "assistant_message" | "text")
+                        && let Some(delta) = step.get("text_delta").and_then(Value::as_str)
+                        && !delta.is_empty()
+                    {
+                        return ParsedSideEvent::Delta(delta.to_string());
+                    }
+                    if matches!(step_type, "agent_response" | "assistant_message" | "text")
+                        && let Some(full) = step
+                            .get("text")
+                            .or_else(|| step.get("response"))
+                            .and_then(Value::as_str)
+                        && !full.is_empty()
+                    {
+                        return ParsedSideEvent::Snapshot(full.to_string());
+                    }
+                }
+                ParsedSideEvent::Ignore
+            }
+            "result" => {
+                if let Some(res_obj) = v.get("result").and_then(Value::as_object) {
+                    let status = res_obj
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("SUCCESS");
+                    if status.eq_ignore_ascii_case("ERROR") || status.eq_ignore_ascii_case("FAILED")
+                    {
+                        let msg = res_obj
+                            .get("error")
+                            .or_else(|| res_obj.get("message"))
+                            .or_else(|| res_obj.get("response"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("Antigravity side question returned an error")
+                            .to_string();
+                        return ParsedSideEvent::Error(msg);
+                    }
+                    if let Some(resp) = res_obj
+                        .get("response")
+                        .or_else(|| res_obj.get("text"))
+                        .and_then(Value::as_str)
+                        && !resp.trim().is_empty()
+                    {
+                        return ParsedSideEvent::Snapshot(resp.trim().to_string());
+                    }
+                }
+                ParsedSideEvent::Ignore
+            }
+            "error" => {
+                let msg = v
+                    .get("error")
+                    .and_then(|e| {
+                        e.as_str()
+                            .or_else(|| e.get("message").and_then(Value::as_str))
+                    })
+                    .or_else(|| v.get("message").and_then(Value::as_str))
+                    .unwrap_or("Antigravity side question failed")
+                    .to_string();
+                ParsedSideEvent::Error(msg)
+            }
+            _ => ParsedSideEvent::Ignore,
+        };
+    }
+
     let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
     match kind {
         "stream_event" => parse_claude_side_line(line),
@@ -714,6 +832,28 @@ mod tests {
         assert_eq!(
             parse_codex_side_line(line),
             ParsedSideEvent::Snapshot("Because RwLock allows concurrent readers.".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_agy_stream_json_step_update_and_result() {
+        let delta_line = r#"{"event":"step_update","step_update":{"conversation_id":"c1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"{\"handle\":\"缓存设计\"}"}}"#;
+        assert_eq!(
+            parse_agy_side_line(delta_line),
+            ParsedSideEvent::Delta(r#"{"handle":"缓存设计"}"#.to_string())
+        );
+
+        let result_line = r#"{"event":"result","result":{"conversation_id":"c1","status":"SUCCESS","response":"{\"handle\":\"缓存设计\"}\n"}}"#;
+        assert_eq!(
+            parse_agy_side_line(result_line),
+            ParsedSideEvent::Snapshot(r#"{"handle":"缓存设计"}"#.to_string())
+        );
+
+        let error_line =
+            r#"{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}"#;
+        assert_eq!(
+            parse_agy_side_line(error_line),
+            ParsedSideEvent::Error("quota exceeded".to_string())
         );
     }
 

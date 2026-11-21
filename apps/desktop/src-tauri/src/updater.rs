@@ -723,7 +723,9 @@ fn orbit_cli_release_asset_name() -> Result<&'static str, String> {
         ("macos", "aarch64") => Ok("orbit-cli-macos-arm64"),
         ("linux", "x86_64") => Ok("orbit-cli-linux-x64"),
         ("linux", "aarch64") => Ok("orbit-cli-linux-arm64"),
-        (os, arch) => Err(format!("Unsupported platform for local daemon sync: {os}/{arch}")),
+        (os, arch) => Err(format!(
+            "Unsupported platform for local daemon sync: {os}/{arch}"
+        )),
     }
 }
 

@@ -7,7 +7,7 @@ import {
   Loader2,
   Square,
 } from "lucide-react";
-import { orbitIpc } from "@/lib/orbit-ipc";
+import { orbitIpc, semanticAgentTabLabel } from "@/lib/orbit-ipc";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -62,7 +62,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
     }
   };
 
-  const handleLabel = agent?.handle ? `@${agent.handle}` : tab.title;
+  const handleLabel = agent ? semanticAgentTabLabel(agent) : tab.title;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -90,7 +90,7 @@ export const PeerSplitTab = memo(function PeerSplitTab({ tab }: { tab: SidePanel
               )}
             </div>
             <div className="text-muted-foreground truncate text-[11px]">
-              {agent?.title || peerAgentId}
+              {agent?.task_summary || agent?.title || peerAgentId}
             </div>
           </div>
         </div>

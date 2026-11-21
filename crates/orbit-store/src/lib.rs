@@ -5,6 +5,7 @@
 pub mod orchestration;
 pub mod workspace_sync;
 pub use orchestration::*;
+pub use workspace_sync::AgentContextSnippet;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -22,14 +23,14 @@ use serde::{Deserialize, Serialize};
 pub(crate) const WORKSPACE_SELECT_COLS: &str =
     "workspace_id, title, cwd, git_branch, is_worktree, updated_at,
     source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status,
-    mission_goal, project_root, board_revision, title_locked, auto_clustered";
+    mission_goal, project_root, board_revision, title_locked, auto_clustered, is_curated";
 
 pub(crate) const AGENT_SELECT_COLS: &str =
     "agent_id, workspace_id, cwd, title, provider_json, model, mode_json,
     status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
     parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
     attention_state, last_activity_at, timeline_epoch, read_seq, is_pinned, pinned_order,
-    handle, cluster_suggestion_json";
+    handle, cluster_suggestion_json, task_summary";
 
 /// Extra host configuration metadata persisted alongside `StoredHostProfile`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -379,9 +380,9 @@ impl OrbitStore {
             INSERT INTO workspaces (
                 workspace_id, title, cwd, git_branch, is_worktree, updated_at,
                 source_cwd, base_ref, parent_workspace_id, archived_at, background, setup_status,
-                mission_goal, project_root, board_revision, title_locked, auto_clustered
+                mission_goal, project_root, board_revision, title_locked, auto_clustered, is_curated
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(workspace_id) DO UPDATE SET
                 title = excluded.title,
                 cwd = excluded.cwd,
@@ -398,7 +399,8 @@ impl OrbitStore {
                 project_root = COALESCE(excluded.project_root, workspaces.project_root),
                 board_revision = MAX(workspaces.board_revision, excluded.board_revision),
                 title_locked = excluded.title_locked,
-                auto_clustered = excluded.auto_clustered
+                auto_clustered = excluded.auto_clustered,
+                is_curated = excluded.is_curated
             ",
             params![
                 ws.workspace_id,
@@ -418,6 +420,7 @@ impl OrbitStore {
                 ws.board_revision as i64,
                 i32::from(ws.title_locked),
                 i32::from(ws.auto_clustered),
+                i32::from(ws.is_curated),
             ],
         )?;
         Ok(())
@@ -468,9 +471,9 @@ impl OrbitStore {
                 mode_json, status_json, parent_agent_id, parent_host_id, persistence_ref,
                 latest_seq, timeline_epoch, created_at, updated_at, archived_at, background, auto_archive,
                 profile_id, labels_json, attention_state, last_activity_at,
-                read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json
+                read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json, task_summary
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
             ON CONFLICT(agent_id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 title = excluded.title,
@@ -495,7 +498,8 @@ impl OrbitStore {
                 is_pinned = excluded.is_pinned,
                 pinned_order = excluded.pinned_order,
                 handle = COALESCE(excluded.handle, agents.handle),
-                cluster_suggestion_json = excluded.cluster_suggestion_json
+                cluster_suggestion_json = excluded.cluster_suggestion_json,
+                task_summary = COALESCE(excluded.task_summary, agents.task_summary)
             ",
             params![
                 agent.agent_id,
@@ -526,6 +530,7 @@ impl OrbitStore {
                 agent.pinned_order,
                 agent.handle,
                 cluster_suggestion_json,
+                agent.task_summary,
             ],
         )?;
         Ok(())
@@ -2179,6 +2184,7 @@ pub(crate) fn map_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wor
         board_revision: row.get::<_, i64>(14).unwrap_or(0).max(0) as u64,
         title_locked: row.get::<_, i32>(15).unwrap_or(0) != 0,
         auto_clustered: row.get::<_, i32>(16).unwrap_or(0) != 0,
+        is_curated: row.get::<_, i32>(17).unwrap_or(0) != 0,
     })
 }
 
@@ -2203,6 +2209,7 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
     let pinned_order: i64 = row.get::<_, i64>(24).unwrap_or(0);
     let handle: Option<String> = row.get(25).unwrap_or(None);
     let cluster_suggestion_opt: Option<String> = row.get(26).unwrap_or(None);
+    let task_summary: Option<String> = row.get(27).unwrap_or(None);
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
@@ -2246,6 +2253,7 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         pinned_order,
         handle,
         cluster_suggestion,
+        task_summary,
     })
 }
 
@@ -2353,6 +2361,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             })
             .expect("upsert ws");
 
@@ -2387,6 +2396,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                 },
                 Some("session_abc"),
             )
@@ -2459,6 +2469,7 @@ mod tests {
             board_revision: 0,
             title_locked: false,
             auto_clustered: false,
+            is_curated: false,
         };
         store.upsert_workspace(&ws).expect("upsert ws");
 
@@ -2493,6 +2504,7 @@ mod tests {
             pinned_order: 0,
             handle: None,
             cluster_suggestion: None,
+            task_summary: None,
         };
         store.upsert_agent(&parent, Some("ref_p")).expect("parent");
 
@@ -2664,6 +2676,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             })
             .expect("upsert ws");
 
@@ -2698,6 +2711,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                 },
                 Some("prov_sess_1"),
             )
@@ -2825,6 +2839,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             })
             .expect("ws");
         store
@@ -2858,6 +2873,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                 },
                 None,
             )
@@ -2917,6 +2933,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             })
             .expect("ws");
         store
@@ -2950,6 +2967,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                 },
                 None,
             )
@@ -3123,6 +3141,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             })
             .expect("ws");
         store
@@ -3158,6 +3177,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                 },
                 None,
             )
@@ -3270,6 +3290,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             })
             .expect("ws");
         store
@@ -3303,6 +3324,7 @@ mod tests {
                     pinned_order: 0,
                     handle: None,
                     cluster_suggestion: None,
+                    task_summary: None,
                 },
                 Some("sess_bg"),
             )

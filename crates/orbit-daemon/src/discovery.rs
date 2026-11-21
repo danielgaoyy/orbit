@@ -545,6 +545,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             })
             .expect("upsert");
 

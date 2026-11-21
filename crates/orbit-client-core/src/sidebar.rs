@@ -57,6 +57,8 @@ pub struct SidebarWorkspaceGroupView {
     pub running_count: u32,
     pub unread_count: u32,
     pub is_multi_agent: bool,
+    #[serde(default)]
+    pub is_curated: bool,
     pub conversations: Vec<SidebarConversationView>,
 }
 
@@ -80,6 +82,8 @@ pub struct SidebarProjectGroupView {
     pub conversations: Vec<SidebarConversationView>,
     #[serde(default)]
     pub workspaces: Vec<SidebarWorkspaceGroupView>,
+    #[serde(default)]
+    pub unclassified_conversations: Vec<SidebarConversationView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -462,6 +466,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 sort_order_key: proj.project_id.clone(),
                 conversations: Vec::new(),
                 workspaces: Vec::new(),
+                unclassified_conversations: Vec::new(),
             };
             group_idx_by_id.insert(group.id.clone(), host_groups.len());
             host_groups.push(group);
@@ -650,6 +655,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                             sort_order_key: id,
                             conversations: Vec::new(),
                             workspaces: Vec::new(),
+                            unclassified_conversations: Vec::new(),
                         });
                         matched_idx = Some(idx);
                     }
@@ -699,6 +705,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         sort_order_key: id,
                         conversations: Vec::new(),
                         workspaces: Vec::new(),
+                        unclassified_conversations: Vec::new(),
                     });
                     idx
                 }
@@ -710,6 +717,102 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 group.sort_weight_ms = ts_ms;
             }
             group.conversations.push(conv);
+        }
+
+        // 2.5 Ensure empty curated Mission Workspaces attach to or create their enclosing Project Group
+        let mut curated_ws_by_group_idx: HashMap<usize, Vec<&WorkspaceSummary>> = HashMap::new();
+        for ws in host.workspaces {
+            if !ws.is_curated || ws.archived_at.is_some() || ws.background {
+                continue;
+            }
+            let ws_root = ws
+                .project_root
+                .as_deref()
+                .or(ws.source_cwd.as_deref())
+                .unwrap_or(&ws.cwd);
+            let clean_root = normalize_project_path(ws_root);
+            let clean_ws_cwd = normalize_project_path(&ws.cwd);
+
+            let matched_idx = host_groups
+                .iter()
+                .position(|g| matches_project_directory(&g.directories, &clean_root))
+                .or_else(|| {
+                    host_groups
+                        .iter()
+                        .position(|g| matches_project_directory(&g.directories, &clean_ws_cwd))
+                })
+                .or_else(|| {
+                    host_groups
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, g)| {
+                            g.directories
+                                .iter()
+                                .filter(|d| path_is_inside_directory(d, &clean_root))
+                                .map(|d| (idx, d.len()))
+                                .max_by_key(|(_, len)| *len)
+                        })
+                        .max_by_key(|(_, len)| *len)
+                        .map(|(idx, _)| idx)
+                });
+
+            let target_idx = if let Some(idx) = matched_idx {
+                idx
+            } else {
+                let id = format!("{host_id}::{clean_root}");
+                if let Some(&existing_idx) = group_idx_by_id.get(&id) {
+                    existing_idx
+                } else {
+                    let branch = resolve_branch_for_path(
+                        host.workspaces,
+                        host.discovered_projects,
+                        params.active_cwd,
+                        host.active_git_branch.as_deref(),
+                        &clean_root,
+                    );
+                    let (is_git_repo, nested_git_repos) = resolve_git_capability_for_path(
+                        host.git_repos_by_cwd,
+                        host.discovered_projects,
+                        host.workspaces,
+                        &clean_root,
+                    );
+                    let is_home = is_bare_home_dir(&clean_root);
+                    let name = if is_home {
+                        "Workspace (~)".to_string()
+                    } else {
+                        basename_of_project_path(&clean_root)
+                    };
+                    let idx = host_groups.len();
+                    group_idx_by_id.insert(id.clone(), idx);
+                    host_groups.push(SidebarProjectGroupView {
+                        id: id.clone(),
+                        host_id: host_id.to_string(),
+                        name,
+                        is_home_workspace: is_home,
+                        primary_cwd: clean_root.clone(),
+                        directories: vec![clean_root],
+                        git_branch: branch,
+                        is_git_repo,
+                        nested_git_repos,
+                        pinned_project_id: None,
+                        sort_weight_ms: ws.updated_at.timestamp_millis(),
+                        sort_order_key: id,
+                        conversations: Vec::new(),
+                        workspaces: Vec::new(),
+                        unclassified_conversations: Vec::new(),
+                    });
+                    idx
+                }
+            };
+
+            let ws_ts = ws.updated_at.timestamp_millis();
+            if ws_ts > host_groups[target_idx].sort_weight_ms {
+                host_groups[target_idx].sort_weight_ms = ws_ts;
+            }
+            curated_ws_by_group_idx
+                .entry(target_idx)
+                .or_default()
+                .push(ws);
         }
 
         // 3. Fallback discovered repositories when host has neither pinned projects nor active sessions
@@ -748,13 +851,14 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                     sort_order_key: id,
                     conversations: Vec::new(),
                     workspaces: Vec::new(),
+                    unclassified_conversations: Vec::new(),
                 });
                 added += 1;
             }
         }
 
-        // Apply conversation filter + search query + Mission Workspace grouping to host groups
-        for mut group in host_groups {
+        // Apply conversation filter + search query + Curated Mission Workspace & Unclassified (`待归类`) grouping
+        for (group_idx, mut group) in host_groups.into_iter().enumerate() {
             group
                 .conversations
                 .retain(|c| matches_conversation_filter(c, params.filter));
@@ -765,6 +869,10 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                     .then_with(|| b.agent.latest_seq.cmp(&a.agent.latest_seq))
             });
 
+            let project_curated_ws = curated_ws_by_group_idx
+                .remove(&group_idx)
+                .unwrap_or_default();
+
             if !q_lower.is_empty() {
                 let proj_match = group.name.to_lowercase().contains(&q_lower)
                     || group.primary_cwd.to_lowercase().contains(&q_lower)
@@ -772,6 +880,12 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         .git_branch
                         .as_deref()
                         .is_some_and(|b| b.to_lowercase().contains(&q_lower));
+                let ws_title_match = project_curated_ws.iter().any(|w| {
+                    w.title.to_lowercase().contains(&q_lower)
+                        || w.mission_goal
+                            .as_deref()
+                            .is_some_and(|g| g.to_lowercase().contains(&q_lower))
+                });
                 let thread_matches: Vec<SidebarConversationView> = group
                     .conversations
                     .iter()
@@ -790,7 +904,7 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                     .collect();
                 if !thread_matches.is_empty() {
                     group.conversations = thread_matches;
-                } else if !proj_match {
+                } else if !proj_match && !ws_title_match {
                     continue;
                 }
             }
@@ -810,45 +924,95 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 group.sort_weight_ms = max_thread_ts;
             }
 
-            // Build Mission Workspace groups preserving recency order of conversations
-            let mut ws_order: Vec<String> = Vec::new();
-            let mut ws_buckets: HashMap<String, Vec<SidebarConversationView>> = HashMap::new();
+            // Partition conversations into Curated Mission Workspaces vs Unclassified (`待归类`)
+            let mut curated_ws_buckets: HashMap<String, Vec<SidebarConversationView>> =
+                HashMap::new();
+            let mut curated_ws_seen: HashSet<String> = HashSet::new();
+            let mut curated_ws_list: Vec<(i64, SidebarWorkspaceGroupView)> = Vec::new();
+            let mut unclassified: Vec<SidebarConversationView> = Vec::new();
+
             for conv in &group.conversations {
-                let ws_id = conv.agent.workspace_id.clone();
-                if !ws_buckets.contains_key(&ws_id) {
-                    ws_order.push(ws_id.clone());
+                let ws_id = conv.agent.workspace_id.as_str();
+                if ws_by_id.get(ws_id).is_some_and(|w| w.is_curated) {
+                    curated_ws_buckets
+                        .entry(ws_id.to_string())
+                        .or_default()
+                        .push(conv.clone());
+                } else {
+                    unclassified.push(conv.clone());
                 }
-                ws_buckets.entry(ws_id).or_default().push(conv.clone());
             }
-            group.workspaces = ws_order
-                .into_iter()
-                .filter_map(|ws_id| {
-                    let convs = ws_buckets.remove(&ws_id)?;
-                    let first = convs.first()?;
-                    let ws_meta = ws_by_id.get(ws_id.as_str()).copied();
-                    let peer_count = convs.len() as u32;
-                    let running_count = convs
-                        .iter()
-                        .filter(|c| c.agent.is_running || c.agent.is_awaiting_permission)
-                        .count() as u32;
-                    let unread_count = convs.iter().filter(|c| c.is_unread).count() as u32;
-                    let title = ws_meta
-                        .map(|w| w.title.clone())
-                        .filter(|t| !t.trim().is_empty())
-                        .unwrap_or_else(|| first.agent.title.clone());
-                    let git_branch = ws_meta
-                        .and_then(|w| w.git_branch.clone())
-                        .or_else(|| first.agent.worktree_branch.clone());
-                    let is_worktree = ws_meta.is_some_and(|w| w.is_worktree)
-                        || convs.iter().all(|c| c.is_worktree);
-                    let has_conflict = host.workspace_conflict_ids.contains(&ws_id);
-                    Some(SidebarWorkspaceGroupView {
+            group.unclassified_conversations = unclassified;
+
+            // Include ALL curated workspaces belonging to this project (0, 1, or N conversations!)
+            let mut all_curated_ids: Vec<String> = Vec::new();
+            for ws in &project_curated_ws {
+                if curated_ws_seen.insert(ws.workspace_id.clone()) {
+                    all_curated_ids.push(ws.workspace_id.clone());
+                }
+            }
+            for ws_id in curated_ws_buckets.keys() {
+                if curated_ws_seen.insert(ws_id.clone()) {
+                    all_curated_ids.push(ws_id.clone());
+                }
+            }
+
+            for ws_id in all_curated_ids {
+                let convs = curated_ws_buckets.remove(&ws_id).unwrap_or_default();
+                let ws_meta = ws_by_id.get(ws_id.as_str()).copied();
+                if params.filter == SidebarThreadFilter::ActiveUnread && convs.is_empty() {
+                    continue;
+                }
+                if !q_lower.is_empty() && convs.is_empty() {
+                    let ws_matches = ws_meta.is_some_and(|w| {
+                        w.title.to_lowercase().contains(&q_lower)
+                            || w.mission_goal
+                                .as_deref()
+                                .is_some_and(|g| g.to_lowercase().contains(&q_lower))
+                    });
+                    let proj_matches = group.name.to_lowercase().contains(&q_lower)
+                        || group.primary_cwd.to_lowercase().contains(&q_lower);
+                    if !ws_matches && !proj_matches {
+                        continue;
+                    }
+                }
+                let peer_count = convs.len() as u32;
+                let running_count = convs
+                    .iter()
+                    .filter(|c| c.agent.is_running || c.agent.is_awaiting_permission)
+                    .count() as u32;
+                let unread_count = convs.iter().filter(|c| c.is_unread).count() as u32;
+                let title = ws_meta
+                    .map(|w| w.title.clone())
+                    .filter(|t| !t.trim().is_empty())
+                    .or_else(|| convs.first().map(|c| c.agent.title.clone()))
+                    .unwrap_or_else(|| "Workspace".into());
+                let git_branch = ws_meta
+                    .and_then(|w| w.git_branch.clone())
+                    .or_else(|| convs.first().and_then(|c| c.agent.worktree_branch.clone()));
+                let is_worktree = ws_meta.is_some_and(|w| w.is_worktree)
+                    || (!convs.is_empty() && convs.iter().all(|c| c.is_worktree));
+                let has_conflict = host.workspace_conflict_ids.contains(&ws_id);
+                let sort_ts = convs
+                    .iter()
+                    .map(|c| parse_rfc3339_ms(&c.agent.updated_at_rfc3339))
+                    .max()
+                    .unwrap_or(0)
+                    .max(
+                        ws_meta
+                            .map(|w| w.updated_at.timestamp_millis())
+                            .unwrap_or(0),
+                    );
+                curated_ws_list.push((
+                    sort_ts,
+                    SidebarWorkspaceGroupView {
                         workspace_id: ws_id,
                         title,
                         mission_goal: ws_meta.and_then(|w| w.mission_goal.clone()),
                         cwd: ws_meta
                             .map(|w| w.cwd.clone())
-                            .unwrap_or_else(|| first.agent.cwd.clone()),
+                            .or_else(|| convs.first().map(|c| c.agent.cwd.clone()))
+                            .unwrap_or_else(|| group.primary_cwd.clone()),
                         git_branch,
                         is_worktree,
                         board_revision: ws_meta.map(|w| w.board_revision).unwrap_or(0),
@@ -857,10 +1021,16 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                         running_count,
                         unread_count,
                         is_multi_agent: peer_count > 1,
+                        is_curated: true,
                         conversations: convs,
-                    })
-                })
-                .collect();
+                    },
+                ));
+            }
+            curated_ws_list.sort_by(|(ta, wa), (tb, wb)| {
+                tb.cmp(ta)
+                    .then_with(|| wa.title.to_lowercase().cmp(&wb.title.to_lowercase()))
+            });
+            group.workspaces = curated_ws_list.into_iter().map(|(_, w)| w).collect();
 
             all_groups.push(group);
         }
@@ -990,7 +1160,10 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
             all_groups.sort_by(|a, b| {
                 a.is_home_workspace
                     .cmp(&b.is_home_workspace)
-                    .then_with(|| b.conversations.is_empty().cmp(&a.conversations.is_empty()))
+                    .then_with(|| {
+                        (b.conversations.is_empty() && b.workspaces.is_empty())
+                            .cmp(&(a.conversations.is_empty() && a.workspaces.is_empty()))
+                    })
                     .then_with(|| b.sort_weight_ms.cmp(&a.sort_weight_ms))
                     .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             });
@@ -1108,6 +1281,7 @@ mod tests {
             handle: None,
             cluster_suggestion: None,
             worktree_branch: None,
+            task_summary: None,
         }
     }
 
@@ -1139,6 +1313,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             },
             WorkspaceSummary {
                 workspace_id: "ws_wt".into(),
@@ -1158,6 +1333,7 @@ mod tests {
                 board_revision: 0,
                 title_locked: false,
                 auto_clustered: false,
+                is_curated: false,
             },
         ];
         let discovered = vec![
@@ -1307,6 +1483,7 @@ mod tests {
             board_revision: 0,
             title_locked: false,
             auto_clustered: false,
+            is_curated: true,
         }];
         let mut parent = sample_agent(
             "parent",
@@ -1421,6 +1598,7 @@ mod tests {
             board_revision: 2,
             title_locked: false,
             auto_clustered: false,
+            is_curated: true,
         }];
         let mut lead = sample_agent(
             "ag_lead",
@@ -1492,5 +1670,108 @@ mod tests {
         assert_eq!(ws.unread_count, 1);
         assert!(ws.has_conflict);
         assert_eq!(ws.board_revision, 2);
+        assert!(ws.is_curated);
+        assert!(view.projects[0].unclassified_conversations.is_empty());
+    }
+
+    #[test]
+    fn surfaces_empty_curated_workspaces_and_separates_unclassified_inbox() {
+        let now = chrono::Utc::now();
+        let pinned = vec![ClientProjectView {
+            project_id: "proj_main".into(),
+            host_id: "h1".into(),
+            name: "Orbit".into(),
+            directories: vec!["/work/orbit".into()],
+            updated_at_ms: 1_000,
+        }];
+        let workspaces = vec![
+            WorkspaceSummary {
+                workspace_id: "ws_empty_curated".into(),
+                title: "Release v0.7".into(),
+                mission_goal: Some("Ship Workspace Management".into()),
+                cwd: "/work/orbit".into(),
+                project_root: Some("/work/orbit".into()),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: true,
+                auto_clustered: false,
+                is_curated: true,
+            },
+            WorkspaceSummary {
+                workspace_id: "ws_unclassified".into(),
+                title: "Quick question".into(),
+                mission_goal: None,
+                cwd: "/work/orbit".into(),
+                project_root: Some("/work/orbit".into()),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            },
+        ];
+        let mut inbox_agent = sample_agent(
+            "ag_inbox",
+            "/work/orbit",
+            "2026-11-20T12:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        inbox_agent.workspace_id = "ws_unclassified".into();
+
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 5,
+            hosts: vec![SidebarHostInput {
+                host_id: "h1",
+                workspaces: &workspaces,
+                discovered_projects: &[],
+                agents: vec![(inbox_agent, 0)],
+                active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
+            }],
+            pinned_projects: &pinned,
+            project_order: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h1"),
+            active_agent_id: None,
+            active_cwd: None,
+        });
+
+        assert_eq!(view.projects.len(), 1);
+        let proj = &view.projects[0];
+        // Empty curated workspace MUST surface in project.workspaces with peer_count == 0
+        assert_eq!(proj.workspaces.len(), 1);
+        assert_eq!(proj.workspaces[0].workspace_id, "ws_empty_curated");
+        assert!(proj.workspaces[0].is_curated);
+        assert_eq!(proj.workspaces[0].peer_count, 0);
+        // Unclassified conversation MUST surface in unclassified_conversations, NOT in workspaces
+        assert_eq!(proj.unclassified_conversations.len(), 1);
+        assert_eq!(
+            proj.unclassified_conversations[0].agent.agent_id,
+            "ag_inbox"
+        );
     }
 }

@@ -513,3 +513,28 @@ pub struct WorkspaceEventRecord {
     pub file_path: Option<String>,
     pub created_at: DateTime<Utc>,
 }
+
+/// Phase of an AI-assisted project workspace organization / triage run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOrganizePhase {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Live progress & outcome notification for AI workspace organization / triage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceOrganizeEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<uuid::Uuid>,
+    pub project_root: String,
+    pub phase: WorkspaceOrganizePhase,
+    pub message: String,
+    #[serde(default)]
+    pub created_workspaces: u32,
+    #[serde(default)]
+    pub grouped_agents: u32,
+    #[serde(default)]
+    pub summarized_agents: u32,
+}

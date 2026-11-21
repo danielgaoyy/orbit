@@ -258,8 +258,8 @@ export function SharedConversationMenu({
           }}
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
-            <Sparkles className="h-[14px] w-[14px] shrink-0 stroke-[1.75] text-sky-500" />
-            <span>AI 生成标签与摘要</span>
+            <Sparkles className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+            <span>Generate label & summary</span>
           </span>
         </DropdownMenuItem>
 
@@ -275,8 +275,8 @@ export function SharedConversationMenu({
             }}
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <Layers className="h-[14px] w-[14px] shrink-0 stroke-[1.75] text-sky-500" />
-              <span>AI 归类此会话到 Workspace</span>
+              <Layers className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+              <span>Auto-group with AI</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -293,7 +293,7 @@ export function SharedConversationMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <FileText className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-              <span>Workspace Board</span>
+              <span>Group notes</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -308,7 +308,7 @@ export function SharedConversationMenu({
                 provider: altProvider,
                 mode: "plan",
                 handle: "reviewer",
-                initial_prompt: `Join this Mission Workspace alongside @${tabLabel}. Read BOARD.md and inspect recent changes to provide a concise code review.`,
+                initial_prompt: `Join this group alongside @${tabLabel}. Read BOARD.md and inspect recent changes to provide a concise code review.`,
               },
               { openInSplit: true },
             );
@@ -316,11 +316,11 @@ export function SharedConversationMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <UserPlus className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>Add Reviewer Peer</span>
+            <span>Add reviewer</span>
           </span>
         </DropdownMenuItem>
 
-        <DropdownMenuLabel className="text-[10.5px]">Workspace 归属</DropdownMenuLabel>
+        <DropdownMenuLabel className="text-[10.5px]">Group</DropdownMenuLabel>
         {otherWorkspaces.map((ws) => (
           <DropdownMenuItem
             key={ws.workspace_id}
@@ -334,7 +334,7 @@ export function SharedConversationMenu({
           >
             <span className="flex min-w-0 items-center gap-2">
               <FolderInput className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span className="truncate">移入「{ws.title}」</span>
+              <span className="truncate">Move to {ws.title}</span>
             </span>
           </DropdownMenuItem>
         ))}
@@ -354,7 +354,7 @@ export function SharedConversationMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <FolderPlus className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>新建 Workspace 并移入…</span>
+              <span>New group…</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -369,7 +369,7 @@ export function SharedConversationMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <Inbox className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>移回「待归类」</span>
+              <span>Remove from group</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -476,8 +476,8 @@ export function SharedProjectMenu({
             }}
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
-              <FolderPlus className="h-[14px] w-[14px] shrink-0 stroke-[1.75] text-sky-500" />
-              <span>新建 Workspace…</span>
+              <FolderPlus className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+              <span>New group…</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -488,8 +488,8 @@ export function SharedProjectMenu({
           }}
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
-            <Sparkles className="h-[14px] w-[14px] shrink-0 stroke-[1.75] text-sky-500" />
-            <span>AI 批量归类待整理会话</span>
+            <Sparkles className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
+            <span>Organize threads with AI</span>
           </span>
         </DropdownMenuItem>
 
@@ -738,7 +738,7 @@ export function SharedWorkspaceMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Plus className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>在此 Workspace 新建会话</span>
+            <span>New thread in group</span>
           </span>
         </DropdownMenuItem>
 
@@ -750,7 +750,7 @@ export function SharedWorkspaceMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Pencil className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>重命名 Workspace</span>
+            <span>Rename group</span>
           </span>
         </DropdownMenuItem>
 
@@ -762,14 +762,14 @@ export function SharedWorkspaceMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <FileText className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>打开协作看板 (BOARD.md)</span>
+            <span>Group notes</span>
           </span>
         </DropdownMenuItem>
 
         {siblingWorkspaces.length > 0 && (
           <>
             <DropdownMenuSeparator />
-            <DropdownMenuLabel className="text-[10.5px]">合并到其他 Workspace</DropdownMenuLabel>
+            <DropdownMenuLabel className="text-[10.5px]">Merge into</DropdownMenuLabel>
             {siblingWorkspaces.slice(0, 6).map((other) => (
               <DropdownMenuItem
                 key={other.workspace_id}
@@ -783,7 +783,7 @@ export function SharedWorkspaceMenu({
               >
                 <span className="flex min-w-0 items-center gap-2">
                   <GitMerge className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-                  <span className="truncate">合并到「{other.title}」</span>
+                  <span className="truncate">{other.title}</span>
                 </span>
               </DropdownMenuItem>
             ))}
@@ -799,7 +799,7 @@ export function SharedWorkspaceMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Inbox className="text-muted-foreground h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>解散（会话移回待归类）</span>
+            <span>Ungroup threads</span>
           </span>
         </DropdownMenuItem>
 
@@ -810,7 +810,7 @@ export function SharedWorkspaceMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap text-rose-600 dark:text-rose-400">
             <Archive className="h-[14px] w-[14px] shrink-0 stroke-[1.75]" />
-            <span>归档 Workspace 及会话</span>
+            <span>Archive group & threads</span>
           </span>
         </DropdownMenuItem>
       </DropdownMenuContent>
@@ -874,20 +874,18 @@ export function CreateWorkspaceDialog({
       <DialogContent className="max-w-md gap-4 p-5 select-none">
         <DialogHeader className="gap-1.5 pr-6">
           <DialogTitle className="flex items-center gap-2 text-[15.5px]">
-            <Layers className="h-[16px] w-[16px] text-sky-500" />
-            <span>
-              {target?.moveAgentId ? "新建 Workspace 并移入会话" : "新建 Mission Workspace"}
-            </span>
+            <Layers className="text-muted-foreground h-[16px] w-[16px]" />
+            <span>{target?.moveAgentId ? "New group" : "Create group"}</span>
           </DialogTitle>
           <DialogDescription className="text-muted-foreground text-[12.5px]">
-            项目：<span className="text-foreground font-medium">{target?.projectName}</span> ·
-            同一 Workspace 内的多个 Agent 会话自动互相感知、共享 BOARD.md 并支持随时协同。
+            Project: <span className="text-foreground font-medium">{target?.projectName}</span> ·
+            Threads in the same group share context and notes automatically.
           </DialogDescription>
         </DialogHeader>
 
         <div className="space-y-3">
           <div className="space-y-1">
-            <label className="text-foreground/85 text-[12px] font-medium">Workspace 名称</label>
+            <label className="text-foreground/85 text-[12px] font-medium">Name</label>
             <input
               autoFocus
               value={title}
@@ -898,15 +896,15 @@ export function CreateWorkspaceDialog({
                   void handleSubmit();
                 }
               }}
-              placeholder="例如：多端同步重构、支付网关修复、v0.7 发布"
-              className="border-border bg-canvas text-foreground w-full rounded-lg border px-3 py-2 text-[13px] outline-none focus:ring-1 focus:ring-sky-500/50"
+              placeholder="e.g. Payments refactor, Release v0.8"
+              className="border-border bg-canvas text-foreground focus:ring-foreground/25 w-full rounded-lg border px-3 py-2 text-[13px] outline-none focus:ring-1"
             />
           </div>
 
           {!target?.moveAgentId && (
             <div className="space-y-1">
               <label className="text-foreground/85 text-[12px] font-medium">
-                任务目标（可选）
+                Goal (optional)
               </label>
               <input
                 value={goal}
@@ -917,15 +915,15 @@ export function CreateWorkspaceDialog({
                     void handleSubmit();
                   }
                 }}
-                placeholder="一句话对齐所有协作成员的共同目标…"
-                className="border-border bg-canvas text-foreground w-full rounded-lg border px-3 py-2 text-[12.5px] outline-none focus:ring-1 focus:ring-sky-500/50"
+                placeholder="One-line goal shared across collaborating threads…"
+                className="border-border bg-canvas text-foreground focus:ring-foreground/25 w-full rounded-lg border px-3 py-2 text-[12.5px] outline-none focus:ring-1"
               />
             </div>
           )}
 
           {!target?.moveAgentId && target?.isGitRepo && (
             <div className="space-y-1">
-              <label className="text-foreground/85 text-[12px] font-medium">工作目录隔离</label>
+              <label className="text-foreground/85 text-[12px] font-medium">Directory</label>
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
@@ -937,7 +935,7 @@ export function CreateWorkspaceDialog({
                   }
                 >
                   <Laptop className="h-[14px] w-[14px] shrink-0" />
-                  <span>Local 目录</span>
+                  <span>Local</span>
                 </button>
                 <button
                   type="button"
@@ -964,7 +962,7 @@ export function CreateWorkspaceDialog({
             disabled={submitting}
             onClick={onClose}
           >
-            取消
+            Cancel
           </Button>
           <Button
             type="button"
@@ -975,10 +973,10 @@ export function CreateWorkspaceDialog({
             {submitting ? (
               <>
                 <Loader2 className="h-[13.5px] w-[13.5px] animate-spin" />
-                <span>创建中…</span>
+                <span>Creating…</span>
               </>
             ) : (
-              "创建 Workspace"
+              "Create"
             )}
           </Button>
         </div>

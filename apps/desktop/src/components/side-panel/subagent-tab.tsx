@@ -1,37 +1,119 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { Archive, ArrowUpRight, Check, Layers, Loader2, AlertTriangle, X } from "lucide-react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ConversationUserBubble,
-  ConversationViewport,
-} from "@/components/conversation/conversation-viewport";
+  AlertCircle,
+  Archive,
+  ArrowUpRight,
+  CircleCheck,
+  MoreHorizontal,
+  Unlink,
+} from "lucide-react";
+import { ConversationViewport } from "@/components/conversation/conversation-viewport";
 import { TurnStageSection } from "@/components/stage/stream-stage";
-import { type ProviderSubagentEvent, orbitIpc } from "@/lib/orbit-ipc";
+import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/overlays";
+import { type StageTurnView, orbitIpc } from "@/lib/orbit-ipc";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
-
-function formatProviderSubagentPayload(payload: unknown): string {
-  if (!payload || typeof payload !== "object") return String(payload ?? "");
-  const obj = payload as Record<string, unknown>;
-  if (typeof obj.text === "string" && obj.text.trim()) return obj.text.trim();
-  if (typeof obj.message === "string" && obj.message.trim()) return obj.message.trim();
-  if (obj.detail && typeof obj.detail === "object") {
-    const d = obj.detail as Record<string, unknown>;
-    if (typeof d.command === "string") return `$ ${d.command}`;
-    if (typeof d.path === "string") return `file: ${d.path}`;
-    if (typeof d.tool_name === "string") return `tool: ${d.tool_name}`;
-  }
-  return JSON.stringify(payload).slice(0, 400);
-}
 
 const NOOP_HOLD_VIEWPORT = (_el?: HTMLElement | null) => {};
 const NOOP_THINKING_DURATION = () => null;
 const NOOP_REWIND = () => {};
 const NOOP_PREVIEW_IMAGE = () => {};
 
+function buildFallbackPromptTurn(callId: string, text: string): StageTurnView {
+  return {
+    key: `subagent-fallback-${callId}`,
+    turn_index: 0,
+    anchor_seq: 0,
+    user_prompt: {
+      item_type: "user_prompt",
+      seq: 0,
+      message_id: `subagent-prompt-${callId}`,
+      text,
+      badges: [],
+      blocks: [
+        {
+          kind: "paragraph",
+          spans: [
+            {
+              text,
+              bold: false,
+              italic: false,
+              strikethrough: false,
+              inline_code: false,
+              link_url: null,
+            },
+          ],
+        },
+      ],
+      timestamp_ms: null,
+    },
+    agent_message: null,
+    is_compaction_command: false,
+    folded_steps: [],
+    work_counts: {
+      edited_file_count: 0,
+      created_file_count: 0,
+      command_count: 0,
+      read_file_count: 0,
+      search_count: 0,
+      subagent_count: 0,
+      mcp_server_count: 0,
+      other_tool_count: 0,
+      thought_count: 0,
+      narration_count: 0,
+      action_steps: 0,
+      total_steps: 0,
+      failed_count: 0,
+      denied_count: 0,
+      unrecovered_failure_count: 0,
+      additions: 0,
+      deletions: 0,
+    },
+    work_summary_label: "",
+    work_summary_live_label: "",
+    work_summary_live_detail: null,
+    work_summary_includes_failure: false,
+    thought_duration_ms: null,
+    work_duration_ms: null,
+    turn_duration_ms: null,
+    terminal_reply: null,
+    last_assistant_reply: null,
+    notices: [],
+    compactions: [],
+    live_segments: [],
+    turn_diffs: [],
+    has_error: false,
+    has_unrecovered_error: false,
+    has_active_item: false,
+    started_at_ms: null,
+    completed_at_ms: null,
+  };
+}
+
 export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTab }) {
+  const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const hostId = useOrbitSelector((s) => tab.hostId ?? s.selectedHostId);
+  const parentHostId = selectedHostId ?? hostId;
+  const coalesceExploration = useOrbitSelector((s) => s.coalesceExploration);
+  const remoteHostName = useOrbitSelector((s) => {
+    if (!tab.hostId || !s.selectedHostId || tab.hostId === s.selectedHostId) return null;
+    return (
+      s.fleet.hosts.find((h) => h.host_id === tab.hostId)?.display_name ??
+      s.hostDetails[tab.hostId]?.host.display_name ??
+      tab.hostId
+    );
+  });
   const cwd = useOrbitSelector((s) => tab.cwd ?? s.selectedWorkspaceCwd);
   const parentAgentId = useOrbitSelector((s) => tab.parentAgentId ?? s.selectedAgentId);
+  const parentHostRevision = useOrbitSelector((s) =>
+    parentHostId ? (s.hostDetails[parentHostId]?.revision ?? 0) : 0,
+  );
   const isNetworkOffline = useOrbitSelector((s) =>
     hostId
       ? s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state === "disconnected"
@@ -48,24 +130,27 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       : null,
   );
   const providerSubagent = useOrbitSelector((s) =>
-    hostId && parentAgentId && tab.providerSubagentId
-      ? (s.hostDetails[hostId]?.provider_subagents?.[parentAgentId]?.find(
+    parentHostId && parentAgentId && tab.providerSubagentId
+      ? (s.hostDetails[parentHostId]?.provider_subagents?.[parentAgentId]?.find(
           (ps) => ps.subagent_id === tab.providerSubagentId,
         ) ?? null)
       : null,
   );
   const parentSubagent = useOrbitSelector((s) => {
-    if (!hostId || !parentAgentId || !tab.subagentCallId) return null;
-    const parentStage = s.stages[`${hostId}::${parentAgentId}`];
+    if (!parentHostId || !parentAgentId || !tab.subagentCallId) return null;
+    const parentStage = s.stages[`${parentHostId}::${parentAgentId}`];
     return parentStage?.insights.subagents.find((sa) => sa.id === tab.subagentCallId) ?? null;
   });
 
+  const isManaged = Boolean(hostId && tab.childAgentId && childAgent);
   const status = childAgent
-    ? childAgent.is_running
-      ? "running"
-      : childAgent.status_label.toLowerCase().includes("error")
-        ? "failed"
-        : "completed"
+    ? childAgent.is_awaiting_permission
+      ? "awaiting_permission"
+      : childAgent.is_running
+        ? "running"
+        : childAgent.status_label.toLowerCase().includes("error")
+          ? "failed"
+          : "completed"
     : providerSubagent
       ? providerSubagent.status === "running"
         ? "running"
@@ -73,48 +158,60 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           ? "completed"
           : "failed"
       : (parentSubagent?.status ?? "completed");
-  const [providerEvents, setProviderEvents] = useState<ProviderSubagentEvent[]>([]);
+
+  const resolvedPrompt = tab.subagentPrompt || providerSubagent?.subtitle || "";
+  const [providerTurns, setProviderTurns] = useState<StageTurnView[]>([]);
   const lastFingerprintRef = useRef<string>("");
 
-  // Ensure daemon hydrates/subscribes the provider subagent timeline on open or reconnect
+  // Ensure daemon hydrates & subscribes the provider subagent timeline on open or reconnect
   useEffect(() => {
-    if (!hostId || !parentAgentId || !tab.providerSubagentId) return;
-    void orbitIpc.openProviderSubagentTimeline(hostId, parentAgentId, tab.providerSubagentId);
-  }, [hostId, parentAgentId, tab.providerSubagentId]);
+    if (!parentHostId || !parentAgentId || !tab.providerSubagentId) return;
+    void orbitIpc.openProviderSubagentTimeline(parentHostId, parentAgentId, tab.providerSubagentId);
+  }, [parentHostId, parentAgentId, tab.providerSubagentId]);
 
+  // Project provider subagent events through the exact same Rust stage pipeline reactively
+  // whenever `parentHostRevision` ticks (Catchup / Live events bump host revision immediately).
   useEffect(() => {
-    if (!hostId || !parentAgentId || !tab.providerSubagentId) {
-      setProviderEvents([]);
+    if (!parentHostId || !parentAgentId || !tab.providerSubagentId) {
+      setProviderTurns([]);
       lastFingerprintRef.current = "";
       return;
     }
     const subId = tab.providerSubagentId;
     let cancelled = false;
-    const poll = async () => {
+    const syncTurns = async () => {
       try {
-        const evs = await orbitIpc.getProviderSubagentTimeline(hostId, parentAgentId, subId);
+        const turns = await orbitIpc.getProviderSubagentTurns(
+          parentHostId,
+          parentAgentId,
+          subId,
+          resolvedPrompt,
+        );
         if (cancelled) return;
-        const fp = `${evs.length}:${evs[evs.length - 1]?.seq ?? 0}`;
-        if (fp !== lastFingerprintRef.current) {
+        const lastTurn = turns[turns.length - 1];
+        const fp = `${turns.length}:${lastTurn?.key ?? ""}:${lastTurn?.live_segments.length ?? 0}:${lastTurn?.folded_steps.length ?? 0}:${lastTurn?.work_counts.total_steps ?? 0}:${Boolean(lastTurn?.terminal_reply)}:${lastTurn?.completed_at_ms ?? 0}`;
+        if (fp !== lastFingerprintRef.current || turns.length !== providerTurns.length) {
           lastFingerprintRef.current = fp;
-          setProviderEvents(evs);
+          setProviderTurns(turns);
         }
       } catch {
-        // ignore transient polling error
+        // ignore transient IPC error
       }
     };
-    void poll();
-    if (status !== "running") {
-      return () => {
-        cancelled = true;
-      };
-    }
-    const timer = window.setInterval(() => void poll(), 1500);
+    void syncTurns();
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
     };
-  }, [hostId, parentAgentId, tab.providerSubagentId, status, providerSubagent?.updated_at]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    parentHostId,
+    parentAgentId,
+    tab.providerSubagentId,
+    parentHostRevision,
+    status,
+    providerSubagent?.updated_at,
+    resolvedPrompt,
+  ]);
 
   const handleOpenThread = useCallback(() => {
     if (hostId && tab.childAgentId) {
@@ -122,143 +219,196 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     }
   }, [hostId, tab.childAgentId]);
 
-  const resolvedTitle =
-    providerSubagent?.title || tab.subagentRole || childAgent?.title || "Subagent";
-  const resolvedPrompt = tab.subagentPrompt || providerSubagent?.subtitle || "";
-  const contentVersion = `${childStage?.revision ?? 0}:${providerEvents.length}:${providerEvents[providerEvents.length - 1]?.seq ?? 0}`;
-  const hasChildTurns = Boolean(childStage && childStage.turns.length > 0);
+  const displayTurns = useMemo<StageTurnView[]>(() => {
+    if (childStage && childStage.turns.length > 0) {
+      return childStage.turns;
+    }
+    if (providerTurns.length > 0) {
+      return providerTurns;
+    }
+    if (resolvedPrompt.trim()) {
+      return [buildFallbackPromptTurn(tab.subagentCallId || tab.id, resolvedPrompt.trim())];
+    }
+    return [];
+  }, [childStage, providerTurns, resolvedPrompt, tab.id, tab.subagentCallId]);
+
+  const contentVersion = `${childStage?.revision ?? 0}:${providerTurns.length}:${parentHostRevision}:${displayTurns[displayTurns.length - 1]?.live_segments.length ?? 0}`;
+  const effectiveAgentId = tab.childAgentId ?? tab.providerSubagentId ?? parentAgentId ?? "";
+  const effectiveHostId = isManaged ? (hostId ?? "") : (parentHostId ?? "");
+
+  const canArchiveNative = Boolean(!isManaged && parentHostId && parentAgentId);
+  const resolvedTitle = tab.subagentRole || tab.title || "Subagent";
+  const viewportResetKey = `${tab.id}:${tab.childAgentId ?? tab.providerSubagentId ?? tab.subagentCallId ?? ""}`;
+
+  // Keep the header minimal: tab title already names the subagent, so only render a restrained
+  // context strip when the user can manage the thread or when active/error status needs signaling.
+  const showContextBar = Boolean(
+    isManaged ||
+      canArchiveNative ||
+      status === "running" ||
+      status === "failed" ||
+      status === "denied" ||
+      remoteHostName,
+  );
 
   return (
-    <div className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden">
-      {/* Subagent Header Sub-Bar */}
-      <div className="border-border flex h-[36px] shrink-0 items-center justify-between gap-2 border-b px-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <Layers className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0" />
-          <span className="text-foreground truncate text-[12.5px] font-medium">
-            {resolvedTitle}
-          </span>
-          <span
-            className={cn(
-              "inline-flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10.5px] font-medium",
-              status === "running" && "bg-foreground/10 text-foreground",
-              status === "completed" && "bg-emerald-500/12 text-emerald-700 dark:text-emerald-400",
-              (status === "failed" || status === "denied") &&
-                "bg-rose-500/12 text-rose-700 dark:text-rose-400",
-            )}
-          >
-            {status === "running" ? (
-              <Loader2 className="h-[10px] w-[10px] animate-spin" />
-            ) : status === "completed" ? (
-              <Check className="h-[10px] w-[10px]" />
+    <div className="orbit-stage-enter bg-canvas flex min-h-0 flex-1 flex-col overflow-hidden">
+      {showContextBar && (
+        <div className="flex h-[32px] shrink-0 items-center justify-between gap-2 border-b border-black/[0.055] px-3.5 dark:border-white/[0.06]">
+          <div className="flex min-w-0 items-center gap-2 text-[12px]">
+            {status === "awaiting_permission" ? (
+              <span className="inline-flex items-center gap-1.5 font-medium text-amber-600/90 dark:text-amber-400/90">
+                <span className="size-[6px] rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
+                <span>Approval required</span>
+              </span>
+            ) : status === "running" ? (
+              <span className="text-muted-foreground inline-flex items-center gap-1.5">
+                <OrbitSpinner size={12.5} className="text-foreground/70" />
+                <span>Running</span>
+              </span>
+            ) : status === "failed" || status === "denied" ? (
+              <span className="inline-flex items-center gap-1.5 text-rose-600/90 dark:text-rose-400/90">
+                <AlertCircle className="size-[13px]" />
+                <span className="capitalize">{status}</span>
+              </span>
             ) : (
-              <AlertTriangle className="h-[10px] w-[10px]" />
+              <span className="text-muted-foreground inline-flex items-center gap-1.5">
+                <CircleCheck className="size-[13px] text-emerald-600/85 dark:text-emerald-400/85" />
+                <span>Completed</span>
+              </span>
             )}
-            <span className="capitalize">{status}</span>
-          </span>
-        </div>
 
-        <div className="flex shrink-0 items-center gap-1">
-          {hostId && tab.childAgentId && childAgent && (
-            <button
-              type="button"
-              onClick={handleOpenThread}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] transition-colors"
-            >
-              <span>Open thread</span>
-              <ArrowUpRight className="h-[12px] w-[12px]" />
-            </button>
-          )}
-          {hostId && parentAgentId && (
-            <button
-              type="button"
-              title="归档并隐藏此子代理"
-              onClick={() => {
-                orbitActions.archiveSubagent(hostId, parentAgentId, {
-                  id: tab.subagentCallId || tab.providerSubagentId || tab.childAgentId || tab.id,
-                  providerSubagentId: tab.providerSubagentId ?? null,
-                  childAgentId: tab.childAgentId ?? null,
-                  role: resolvedTitle,
-                });
-                orbitActions.closeSidePanelTab(tab.id);
-              }}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 text-[11.5px] transition-colors"
-            >
-              <Archive className="h-[12px] w-[12px]" />
-              <span>归档</span>
-            </button>
-          )}
-          <button
-            type="button"
-            aria-label="Close subagent panel"
-            title="关闭子代理视图"
-            onClick={() => orbitActions.closeSidePanelTab(tab.id)}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors"
-          >
-            <X className="h-[13px] w-[13px]" />
-          </button>
-        </div>
-      </div>
+            {remoteHostName && (
+              <span className="text-muted-foreground/65 truncate text-[11.5px]">
+                · {remoteHostName}
+              </span>
+            )}
+          </div>
 
-      {/* Full Main Conversation View (read-only, without Composer) */}
+          {(isManaged && hostId && tab.childAgentId) || canArchiveNative ? (
+            <div className="flex shrink-0 items-center gap-0.5">
+              {isManaged && hostId && tab.childAgentId && (
+                <button
+                  type="button"
+                  onClick={handleOpenThread}
+                  className={cn(
+                    "inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11.5px] font-medium transition-colors",
+                    status === "awaiting_permission"
+                      ? "text-amber-700 hover:bg-amber-500/12 dark:text-amber-300"
+                      : "text-muted-foreground hover:text-foreground hover:bg-accent",
+                  )}
+                >
+                  <span>{status === "awaiting_permission" ? "Review" : "Open thread"}</span>
+                  <ArrowUpRight className="size-[12px]" />
+                </button>
+              )}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Subagent actions"
+                    className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-[24px] shrink-0 cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                  >
+                    <MoreHorizontal className="size-[13.5px]" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" side="bottom" sideOffset={4} className="min-w-[164px]">
+                  {isManaged && hostId && tab.childAgentId && (
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        void orbitActions.detachAgent(hostId, tab.childAgentId!);
+                      }}
+                    >
+                      <span className="flex items-center gap-2">
+                        <Unlink className="text-muted-foreground size-[13.5px]" />
+                        <span>Detach to thread</span>
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      if (isManaged && hostId && tab.childAgentId) {
+                        orbitActions.archiveThread(hostId, tab.childAgentId);
+                      } else if (parentHostId && parentAgentId) {
+                        orbitActions.archiveSubagent(parentHostId, parentAgentId, {
+                          id:
+                            tab.subagentCallId ||
+                            tab.providerSubagentId ||
+                            tab.childAgentId ||
+                            tab.id,
+                          providerSubagentId: tab.providerSubagentId ?? null,
+                          childAgentId: tab.childAgentId ?? null,
+                          role: resolvedTitle,
+                        });
+                      }
+                      orbitActions.closeSidePanelTab(tab.id);
+                    }}
+                  >
+                    <span className="flex items-center gap-2">
+                      <Archive className="text-muted-foreground size-[13.5px]" />
+                      <span>Archive</span>
+                    </span>
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      {/* Main Conversation Stream Parity (identical TurnStageSection, spacing, and typography; no Composer) */}
       <ConversationViewport
-        hostId={hostId}
+        hostId={effectiveHostId}
         cwd={cwd}
-        resetKey={tab.id}
+        resetKey={viewportResetKey}
         contentVersion={contentVersion}
-        viewportClassName="space-y-6 px-5 py-5"
+        viewportClassName="px-6 pt-6 pb-11"
       >
-        {!hasChildTurns && resolvedPrompt && <ConversationUserBubble text={resolvedPrompt} />}
-
-        {hasChildTurns && childStage ? (
-          <div className="space-y-8">
-            {childStage.turns.map((turn, idx) => {
-              const isLastTurn = idx === childStage.turns.length - 1;
-              const isTurnActive =
-                isLastTurn && (Boolean(childAgent?.is_running) || turn.has_active_item);
-              return (
-                <TurnStageSection
-                  key={turn.key}
-                  turn={turn}
-                  isTurnActive={isTurnActive}
-                  agentStatusLabel={isLastTurn ? (childAgent?.status_label ?? null) : null}
-                  isNetworkOffline={isNetworkOffline}
-                  autoFoldCompleted
-                  hostId={hostId ?? ""}
-                  cwd={cwd}
-                  agentId={tab.childAgentId ?? ""}
-                  thinkingSignature=""
-                  getThinkingDurationMs={NOOP_THINKING_DURATION}
-                  holdViewport={NOOP_HOLD_VIEWPORT}
-                  onRequestRewind={NOOP_REWIND}
-                  onPreviewImage={NOOP_PREVIEW_IMAGE}
-                />
-              );
-            })}
-          </div>
-        ) : tab.providerSubagentId && providerEvents.length > 0 ? (
-          <div className="space-y-2.5">
-            <div className="text-muted-foreground text-[11px] font-medium tracking-wide uppercase">
-              Provider Activity ({providerEvents.length}{" "}
-              {providerEvents.length === 1 ? "event" : "events"})
+        <div className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[768px]">
+          {displayTurns.length > 0 ? (
+            <div className="space-y-[32px]">
+              {displayTurns.map((turn, idx) => {
+                const isLastTurn = idx === displayTurns.length - 1;
+                const isTurnActive =
+                  isLastTurn && (status === "running" || turn.has_active_item);
+                const liveLabel = isLastTurn
+                  ? isManaged
+                    ? (childAgent?.status_label ?? null)
+                    : status === "running"
+                      ? "Working..."
+                      : null
+                  : null;
+                return (
+                  <TurnStageSection
+                    key={turn.key}
+                    turn={turn}
+                    isTurnActive={isTurnActive}
+                    agentStatusLabel={liveLabel}
+                    isNetworkOffline={isNetworkOffline}
+                    autoFoldCompleted={coalesceExploration}
+                    hostId={effectiveHostId}
+                    cwd={cwd}
+                    agentId={effectiveAgentId}
+                    thinkingSignature=""
+                    getThinkingDurationMs={NOOP_THINKING_DURATION}
+                    holdViewport={NOOP_HOLD_VIEWPORT}
+                    onRequestRewind={NOOP_REWIND}
+                    onPreviewImage={NOOP_PREVIEW_IMAGE}
+                  />
+                );
+              })}
             </div>
-            <div className="border-border bg-elevated/50 divide-border/50 selectable-text divide-y rounded-xl border font-mono text-[12px]">
-              {providerEvents.map((ev) => (
-                <div key={ev.seq} className="px-3 py-2 break-words whitespace-pre-wrap">
-                  <span className="text-muted-foreground mr-2">#{ev.seq}</span>
-                  <span className="text-foreground/90">
-                    {formatProviderSubagentPayload(ev.payload)}
-                  </span>
-                </div>
-              ))}
+          ) : (
+            <div className="text-muted-foreground flex flex-col items-center justify-center gap-2.5 py-20 text-center text-[13px]">
+              {status === "running" && <OrbitSpinner size={16} className="text-foreground/65" />}
+              <span>
+                {status === "running"
+                  ? "Running in an isolated context…"
+                  : "Subagent outputs were folded into the main conversation."}
+              </span>
             </div>
-          </div>
-        ) : (
-          <div className="border-border text-muted-foreground rounded-xl border border-dashed px-4 py-6 text-center text-[12.5px]">
-            {status === "running"
-              ? "Subagent is running in an isolated context. Final results will return to the main thread."
-              : "Subagent execution completed. Summary and outputs are folded into the parent conversation."}
-          </div>
-        )}
+          )}
+        </div>
       </ConversationViewport>
     </div>
   );

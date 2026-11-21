@@ -2433,6 +2433,21 @@ export const orbitIpc = {
     });
   },
 
+  getProviderSubagentTurns: async (
+    hostId: string,
+    parentAgentId: string,
+    subagentId: string,
+    fallbackPrompt?: string | null,
+  ): Promise<StageTurnView[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<StageTurnView[]>("get_provider_subagent_turns", {
+      hostId,
+      parentAgentId,
+      subagentId,
+      fallbackPrompt: fallbackPrompt ?? null,
+    });
+  },
+
   refreshPendingPermissions: async (hostId: string): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("refresh_pending_permissions", { hostId });
@@ -2729,7 +2744,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.8.0";
+    if (!isTauriRuntime()) return "0.8.1";
     return invoke<string>("get_app_version");
   },
 

@@ -516,9 +516,13 @@ struct HostMemoryState {
     reconnect_attempt: u32,
     ssh_heal_attempted: bool,
     connecting_in_flight: bool,
+    reconnect_scheduled: bool,
+    session_gen: u64,
     available_providers: Vec<ProviderKind>,
     session: Option<HostSessionHandle>,
     pending_outbox: Vec<WireMessage>,
+    pending_queue_adds: HashMap<String, Vec<(Uuid, QueuedPromptView)>>,
+    pending_queue_removals: HashMap<String, Vec<(Uuid, String)>>,
     pending_attachment_acks:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AttachmentStageAck, String>>>,
     pending_file_reads:
@@ -592,6 +596,8 @@ impl HostMemoryState {
             reconnect_attempt: 0,
             ssh_heal_attempted: false,
             connecting_in_flight: false,
+            reconnect_scheduled: false,
+            session_gen: 0,
             available_providers: vec![
                 ProviderKind::Antigravity,
                 ProviderKind::Codex,
@@ -599,6 +605,8 @@ impl HostMemoryState {
             ],
             session: None,
             pending_outbox: Vec::new(),
+            pending_queue_adds: HashMap::new(),
+            pending_queue_removals: HashMap::new(),
             pending_attachment_acks: HashMap::new(),
             pending_file_reads: HashMap::new(),
             pending_side_questions: HashMap::new(),
@@ -2941,7 +2949,7 @@ impl OrbitAppCore {
             Ok(handle) => {
                 let mut rx = handle.subscribe();
                 let welcome_host = handle.welcome_host.clone();
-                let (queued_outbox, resub_timelines) = {
+                let (queued_outbox, resub_timelines, conn_gen) = {
                     let Ok(mut guard) = self.hosts.write() else {
                         return;
                     };
@@ -2949,11 +2957,14 @@ impl OrbitAppCore {
                         return;
                     };
                     h.connecting_in_flight = false;
+                    h.reconnect_scheduled = false;
                     h.reconnect_attempt = 0;
                     h.ssh_heal_attempted = false;
                     h.profile.state = handle.mode;
                     h.via_ssh_tunnel = handle.via_ssh_tunnel;
                     h.last_error = None;
+                    h.session_gen = h.session_gen.wrapping_add(1);
+                    let conn_gen = h.session_gen;
                     h.session = Some(handle.clone());
 
                     let outbox = std::mem::take(&mut h.pending_outbox);
@@ -2966,7 +2977,7 @@ impl OrbitAppCore {
                             (aid.clone(), max_seq)
                         })
                         .collect();
-                    (outbox, resubs)
+                    (outbox, resubs, conn_gen)
                 };
                 if let Some(host_info) = welcome_host {
                     self.handle_inbound_wire(host_id, WireMessage::Welcome { host: host_info });
@@ -3087,7 +3098,8 @@ impl OrbitAppCore {
                                 loop_core.handle_inbound_terminal(&owned_host_id, term);
                             }
                             ClientInboundEvent::Disconnected => {
-                                loop_core.handle_unexpected_disconnect(&owned_host_id);
+                                loop_core
+                                    .handle_unexpected_disconnect(&owned_host_id, Some(conn_gen));
                                 break;
                             }
                         }
@@ -3187,22 +3199,37 @@ impl OrbitAppCore {
         }
     }
 
-    fn handle_unexpected_disconnect(self: &Arc<Self>, host_id: &str) {
-        tracing::warn!(host_id = %host_id, "Host session disconnected unexpectedly; scheduling reconnect");
+    fn handle_unexpected_disconnect(self: &Arc<Self>, host_id: &str, expected_gen: Option<u64>) {
         let mut should_reconnect = false;
+        let mut did_disconnect = false;
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
+            if h.session.is_none() {
+                return;
+            }
+            if let Some(gen_id) = expected_gen
+                && h.session_gen != gen_id
+            {
+                return;
+            }
+            did_disconnect = true;
             // Non-destructive disconnect: keep ALL workspaces, agents & timelines intact!
             h.profile.state = HostConnectionState::Disconnected;
             h.via_ssh_tunnel = false;
             h.session = None;
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
+                h.pending_queue_adds.clear();
+                h.pending_queue_removals.clear();
             }
             fail_pending_host_requests(h, "Host disconnected before request completed");
             should_reconnect = true;
         }
+        if !did_disconnect {
+            return;
+        }
+        tracing::warn!(host_id = %host_id, "Host session disconnected unexpectedly; scheduling reconnect");
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
@@ -3214,18 +3241,28 @@ impl OrbitAppCore {
     }
 
     fn schedule_reconnect(self: &Arc<Self>, host_id: String, delay_ms: u64) {
+        if let Ok(mut guard) = self.hosts.write()
+            && let Some(h) = guard.get_mut(&host_id)
+        {
+            if h.reconnect_scheduled || h.connecting_in_flight {
+                return;
+            }
+            h.reconnect_scheduled = true;
+        }
         let core = Arc::clone(self);
         self.runtime.spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             let still_disconnected = core
                 .hosts
-                .read()
+                .write()
                 .ok()
-                .and_then(|g| {
-                    g.get(&host_id).map(|h| {
+                .and_then(|mut g| {
+                    let h = g.get_mut(&host_id)?;
+                    h.reconnect_scheduled = false;
+                    Some(
                         h.profile.state == HostConnectionState::Disconnected
-                            && !h.connecting_in_flight
-                    })
+                            && !h.connecting_in_flight,
+                    )
                 })
                 .unwrap_or(false);
             if still_disconnected {
@@ -3357,7 +3394,8 @@ impl OrbitAppCore {
                     let sync_pin_authoritative = state.host_sync_supported;
                     state.initial_agents_hydrated = true;
                     state.agents.retain(|k, _| k.starts_with("opt_"));
-                    for a in agents {
+                    for mut a in agents {
+                        reconcile_pending_queue_ops(state, &mut a);
                         let ag_id = a.agent_id.clone();
                         let prev = prev_agents.get(&ag_id).copied();
                         let local_max_seq = state
@@ -3443,7 +3481,8 @@ impl OrbitAppCore {
                     notify_host = true;
                     push_notify_timeline(ag_id);
                 }
-                WireMessage::AgentUpdated { agent } => {
+                WireMessage::AgentUpdated { mut agent } => {
+                    reconcile_pending_queue_ops(state, &mut agent);
                     let ag_id = agent.agent_id.clone();
                     let prev_summary = state.agents.get(&ag_id);
                     let prev_epoch = prev_summary.map(|a| a.timeline_epoch);
@@ -3994,6 +4033,7 @@ impl OrbitAppCore {
                 }
                 WireMessage::Ack { request_id } => {
                     state.agent_req_by_req_id.remove(&request_id);
+                    clear_pending_queue_op_by_req(state, request_id, false);
                     if let Some(tx) = state.pending_daemon_upgrades.remove(&request_id) {
                         let _ = tx.send(Ok(()));
                     }
@@ -4020,6 +4060,11 @@ impl OrbitAppCore {
                     code,
                     message,
                 } => {
+                    if let Some(req_id) = request_id
+                        && clear_pending_queue_op_by_req(state, req_id, true)
+                    {
+                        notify_host = true;
+                    }
                     let formatted_err = format!("[{code}] {message}");
                     if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_attachment_acks.remove(&req_id)
@@ -4991,14 +5036,22 @@ impl OrbitAppCore {
             && let Some(h) = guard.get_mut(host_id)
             && let Some(ag) = h.agents.get_mut(agent_id)
         {
+            let qv = QueuedPromptView {
+                queue_id: qid.clone(),
+                display_text: visible_text,
+                badges: badges.clone(),
+                created_at: now,
+            };
             if !ag.queued_prompts.iter().any(|q| q.queue_id == qid) {
-                ag.queued_prompts.push(QueuedPromptView {
-                    queue_id: qid.clone(),
-                    display_text: visible_text,
-                    badges: badges.clone(),
-                    created_at: now,
-                });
+                ag.queued_prompts.push(qv.clone());
             }
+            if let Some(rems) = h.pending_queue_removals.get_mut(agent_id) {
+                rems.retain(|(_, rem_id)| rem_id != &qid);
+            }
+            h.pending_queue_adds
+                .entry(agent_id.to_string())
+                .or_default()
+                .push((req_id, qv));
             h.mark_stage_meta_dirty(agent_id);
         }
 
@@ -5028,6 +5081,13 @@ impl OrbitAppCore {
             && let Some(ag) = h.agents.get_mut(agent_id)
         {
             ag.queued_prompts.retain(|q| q.queue_id != queue_id);
+            if let Some(adds) = h.pending_queue_adds.get_mut(agent_id) {
+                adds.retain(|(_, qv)| qv.queue_id != queue_id);
+            }
+            h.pending_queue_removals
+                .entry(agent_id.to_string())
+                .or_default()
+                .push((req_id, queue_id.to_string()));
             h.mark_stage_meta_dirty(agent_id);
         }
 
@@ -5058,6 +5118,13 @@ impl OrbitAppCore {
             && let Some(ag) = h.agents.get_mut(agent_id)
         {
             ag.queued_prompts.retain(|q| q.queue_id != queue_id);
+            if let Some(adds) = h.pending_queue_adds.get_mut(agent_id) {
+                adds.retain(|(_, qv)| qv.queue_id != queue_id);
+            }
+            h.pending_queue_removals
+                .entry(agent_id.to_string())
+                .or_default()
+                .push((req_id, queue_id.to_string()));
             h.mark_stage_meta_dirty(agent_id);
         }
 
@@ -6400,6 +6467,119 @@ impl OrbitAppCore {
             .unwrap_or_default()
     }
 
+    /// Projects a provider-native subagent's `TimelinePayload` stream through the exact same
+    /// markdown / thinking / tool-coalescing stage pipeline as primary conversations.
+    pub fn provider_subagent_turns(
+        &self,
+        host_id: &str,
+        parent_agent_id: &str,
+        subagent_id: &str,
+        fallback_prompt: Option<&str>,
+    ) -> Vec<StageTurnView> {
+        let Ok(mut hosts) = self.hosts.write() else {
+            return Vec::new();
+        };
+        let Some(host_state) = hosts.get_mut(host_id) else {
+            return Vec::new();
+        };
+
+        let cwd = host_state
+            .agents
+            .get(parent_agent_id)
+            .map(|a| a.cwd.clone());
+        let raw_events = host_state
+            .provider_subagent_timelines
+            .get(&(parent_agent_id.to_string(), subagent_id.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        let descriptor = host_state
+            .provider_subagents
+            .get(parent_agent_id)
+            .and_then(|list| list.iter().find(|ps| ps.subagent_id == subagent_id))
+            .cloned();
+
+        let starts_with_prompt = raw_events
+            .first()
+            .is_some_and(|ev| matches!(ev.payload, TimelinePayload::UserPrompt { .. }));
+
+        let resolved_prompt = fallback_prompt
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                descriptor.as_ref().and_then(|d| {
+                    let sub = d.subtitle.as_deref()?.trim();
+                    if sub.is_empty()
+                        || sub.eq_ignore_ascii_case("antigravity")
+                        || sub.eq_ignore_ascii_case("codex")
+                        || sub.eq_ignore_ascii_case("claude")
+                        || sub.eq_ignore_ascii_case("claude code")
+                    {
+                        None
+                    } else {
+                        Some(sub.to_string())
+                    }
+                })
+            });
+
+        let mut timeline_events: Vec<TimelineEvent> =
+            Vec::with_capacity(raw_events.len() + usize::from(!starts_with_prompt));
+
+        if !starts_with_prompt && let Some(prompt_text) = resolved_prompt {
+            let prompt_ts = raw_events
+                .first()
+                .map(|ev| ev.timestamp)
+                .or_else(|| descriptor.as_ref().map(|d| d.created_at))
+                .unwrap_or_else(Utc::now);
+            timeline_events.push(TimelineEvent {
+                seq: 0,
+                epoch: 1,
+                agent_id: subagent_id.to_string(),
+                turn_id: None,
+                timestamp: prompt_ts,
+                payload: TimelinePayload::UserPrompt {
+                    message_id: format!("sub_prompt_{subagent_id}"),
+                    text: prompt_text,
+                    badges: Vec::new(),
+                },
+            });
+        }
+
+        for ev in raw_events {
+            timeline_events.push(TimelineEvent {
+                seq: ev.seq,
+                epoch: 1,
+                agent_id: subagent_id.to_string(),
+                turn_id: None,
+                timestamp: ev.timestamp,
+                payload: ev.payload,
+            });
+        }
+
+        if timeline_events.is_empty() {
+            return Vec::new();
+        }
+
+        let (all_resolved_perms, all_resolved_questions) = collect_resolved_gates(&timeline_events);
+        let cache_scope_id = format!("subagent:{parent_agent_id}:{subagent_id}");
+        let mut items: Vec<TimelineItemView> = Vec::with_capacity(timeline_events.len());
+        for ev in &timeline_events {
+            if let Some(item) = render_timeline_event_view(
+                &cache_scope_id,
+                cwd.as_deref(),
+                ev,
+                &all_resolved_perms,
+                &all_resolved_questions,
+                &mut host_state.markdown_cache,
+                &mut host_state.streaming_markdown_cache,
+            ) {
+                items.push(item);
+            }
+        }
+
+        stage::process_timeline_turns_slice(&items, 0, 0, cwd.as_deref()).turns
+    }
+
     pub fn refresh_pending_permissions(self: &Arc<Self>, host_id: &str) {
         self.dispatch_wire_queued(
             host_id,
@@ -6701,7 +6881,7 @@ impl OrbitAppCore {
                     })
                     .await;
                 if ping_res.is_err() {
-                    core.handle_unexpected_disconnect(&host_id);
+                    core.handle_unexpected_disconnect(&host_id, None);
                     return;
                 }
                 let _ = handle
@@ -6781,7 +6961,7 @@ impl OrbitAppCore {
                     .await
                     .is_err()
                 {
-                    core.handle_unexpected_disconnect(&host_id);
+                    core.handle_unexpected_disconnect(&host_id, None);
                 }
             });
         }
@@ -8290,6 +8470,80 @@ struct AttachmentUploadTarget<'a> {
     session: HostSessionHandle,
     daemon_version: Option<&'a str>,
     daemon_protocol_version: Option<u32>,
+}
+
+fn reconcile_pending_queue_ops(state: &mut HostMemoryState, agent: &mut AgentSummary) {
+    let ag_id = agent.agent_id.as_str();
+    if let Some(adds) = state.pending_queue_adds.get_mut(ag_id) {
+        adds.retain(|(_, qv)| {
+            !agent
+                .queued_prompts
+                .iter()
+                .any(|q| q.queue_id == qv.queue_id)
+        });
+        for (_, qv) in adds.iter() {
+            agent.queued_prompts.push(qv.clone());
+        }
+        if adds.is_empty() {
+            state.pending_queue_adds.remove(ag_id);
+        }
+    }
+    if let Some(removals) = state.pending_queue_removals.get_mut(ag_id) {
+        removals.retain(|(_, qid)| agent.queued_prompts.iter().any(|q| q.queue_id == *qid));
+        for (_, qid) in removals.iter() {
+            agent.queued_prompts.retain(|q| q.queue_id != *qid);
+        }
+        if removals.is_empty() {
+            state.pending_queue_removals.remove(ag_id);
+        }
+    }
+}
+
+fn clear_pending_queue_op_by_req(
+    state: &mut HostMemoryState,
+    req_id: Uuid,
+    rollback_failed_add: bool,
+) -> bool {
+    let mut changed = false;
+    let mut empty_add_keys = Vec::new();
+    for (ag_id, list) in state.pending_queue_adds.iter_mut() {
+        let mut rolled_back_qids = Vec::new();
+        list.retain(|(rid, qv)| {
+            if *rid == req_id {
+                if rollback_failed_add {
+                    rolled_back_qids.push(qv.queue_id.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if !rolled_back_qids.is_empty()
+            && let Some(ag) = state.agents.get_mut(ag_id)
+        {
+            ag.queued_prompts
+                .retain(|q| !rolled_back_qids.iter().any(|id| id == &q.queue_id));
+            changed = true;
+        }
+        if list.is_empty() {
+            empty_add_keys.push(ag_id.clone());
+        }
+    }
+    for k in empty_add_keys {
+        state.pending_queue_adds.remove(&k);
+    }
+
+    let mut empty_rem_keys = Vec::new();
+    for (ag_id, list) in state.pending_queue_removals.iter_mut() {
+        list.retain(|(rid, _)| *rid != req_id);
+        if list.is_empty() {
+            empty_rem_keys.push(ag_id.clone());
+        }
+    }
+    for k in empty_rem_keys {
+        state.pending_queue_removals.remove(&k);
+    }
+    changed
 }
 
 fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
@@ -11321,6 +11575,86 @@ mod tests {
         assert!(waking.is_running);
         assert!(!waking.has_background_tasks);
         assert!(!waking.is_unread);
+    }
+
+    #[test]
+    fn provider_subagent_turns_projects_native_events_into_stage_turns() {
+        let now = Utc::now();
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_sub_turns".into(),
+                hostname: "sub-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.provider_subagent_timelines.insert(
+                ("ag_parent".into(), "ps_reviewer".into()),
+                vec![
+                    ProviderSubagentEvent {
+                        seq: 1,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: "ps_reviewer".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantThinking {
+                            item_id: "th_1".into(),
+                            text: "Checking diff for privacy issues.".into(),
+                        },
+                    },
+                    ProviderSubagentEvent {
+                        seq: 2,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: "ps_reviewer".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::ToolCall {
+                            call_id: "tc_1".into(),
+                            status: ToolCallStatus::Completed,
+                            detail: ToolCallDetail::FileRead {
+                                path: "/repo/src/main.rs".into(),
+                                start_line: Some(1),
+                                end_line: Some(40),
+                            },
+                            background_task: None,
+                        },
+                    },
+                    ProviderSubagentEvent {
+                        seq: 3,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: "ps_reviewer".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "msg_1".into(),
+                            text: "## Review Summary\n\nNo privacy leaks found.".into(),
+                            streaming: false,
+                        },
+                    },
+                ],
+            );
+            core.hosts
+                .write()
+                .expect("hosts write lock")
+                .insert("h_sub_turns".into(), mem);
+        }
+
+        let turns = core.provider_subagent_turns(
+            "h_sub_turns",
+            "ag_parent",
+            "ps_reviewer",
+            Some("Audit the recent diff for privacy issues."),
+        );
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].user_prompt.is_some());
+        assert_eq!(turns[0].work_counts.thought_count, 1);
+        assert_eq!(turns[0].work_counts.read_file_count, 1);
+        assert!(turns[0].terminal_reply.is_some());
+        assert!(!turns[0].live_segments.is_empty());
     }
 
     #[test]

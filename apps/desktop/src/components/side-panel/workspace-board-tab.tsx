@@ -67,13 +67,13 @@ function classifySectionHeading(heading: string): {
 } {
   const lower = heading.trim().toLowerCase();
   if (lower.includes("decision") || lower.includes("contract") || lower.includes("决策") || lower.includes("约定")) {
-    return { kind: "decisions", displayTitle: "决策与约定" };
+    return { kind: "decisions", displayTitle: "Decisions & Contracts" };
   }
   if (lower.includes("task") || lower.includes("todo") || lower.includes("任务") || lower.includes("分工")) {
-    return { kind: "tasks", displayTitle: "任务分工" };
+    return { kind: "tasks", displayTitle: "Tasks" };
   }
   if (lower.includes("finding") || lower.includes("result") || lower.includes("progress") || lower.includes("结论") || lower.includes("进展")) {
-    return { kind: "findings", displayTitle: "进展与结论" };
+    return { kind: "findings", displayTitle: "Findings & Progress" };
   }
   return { kind: "custom", displayTitle: heading.trim() };
 }
@@ -97,7 +97,7 @@ function parseBoardMarkdown(raw: string): ParsedBoardDoc {
     }
     if (!current) {
       if (trimmed) {
-        current = { heading: "协作备忘", lines: [line] };
+        current = { heading: "Notes", lines: [line] };
       }
     } else {
       current.lines.push(line);
@@ -173,11 +173,11 @@ function formatRelativeEventTime(iso: string): string {
     const ts = Date.parse(iso);
     if (!Number.isFinite(ts)) return "";
     const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-    if (diffSec < 60) return "刚刚";
+    if (diffSec < 60) return "just now";
     const mins = Math.floor(diffSec / 60);
-    if (mins < 60) return `${mins} 分钟前`;
+    if (mins < 60) return `${mins}m ago`;
     const hours = Math.floor(mins / 60);
-    if (hours < 24) return `${hours} 小时前`;
+    if (hours < 24) return `${hours}h ago`;
     return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   } catch {
     return "";
@@ -201,50 +201,48 @@ function buildHumanActivities(
   const out: HumanActivityItem[] = [];
 
   for (const ev of events) {
-    const actor = ev.agent_handle?.trim() || "系统";
+    const actor = ev.agent_handle?.trim() || "System";
     let description = "";
 
     switch (ev.kind) {
       case "conflict_warning": {
-        const f = ev.file_path ? shortFileLabel(ev.file_path, rootCwd) : "同一文件";
-        description = `检测到多人同时修改 ${f}`;
+        const f = ev.file_path ? shortFileLabel(ev.file_path, rootCwd) : "a shared file";
+        description = `concurrent edit detected on ${f}`;
         break;
       }
       case "board_updated": {
         const secMatch = /section `([^`]+)`/i.exec(ev.summary);
         description = secMatch
-          ? `更新了协作笔记「${classifySectionHeading(secMatch[1]).displayTitle}」`
-          : "更新了协作笔记";
+          ? `updated ${classifySectionHeading(secMatch[1]).displayTitle}`
+          : "updated notes";
         break;
       }
       case "file_edited": {
-        const f = ev.file_path ? shortFileLabel(ev.file_path, rootCwd) : "工作区文件";
-        description = `编辑了 ${f}`;
+        const f = ev.file_path ? shortFileLabel(ev.file_path, rootCwd) : "a file";
+        description = `edited ${f}`;
         break;
       }
       case "peer_message": {
         const cleaned = stripRawMarkdownNoise(ev.summary).slice(0, 72);
-        description = cleaned || "发送了协作消息";
+        description = cleaned || "sent a message";
         break;
       }
       case "peer_joined": {
-        description = ev.summary.includes("AI Triage")
-          ? "通过 AI 归类加入工作区"
-          : "加入当前工作区";
+        description = "joined the group";
         break;
       }
       case "peer_finished": {
         const rawRest = ev.summary.replace(/^@\S+\s+finished:\s*/i, "").trim();
         const cleaned = stripRawMarkdownNoise(rawRest);
         if (!cleaned || /^finished turn$/i.test(cleaned)) {
-          description = "完成了本轮任务";
+          description = "finished turn";
         } else {
-          description = `完成阶段进展：${cleaned.slice(0, 64)}${cleaned.length > 64 ? "…" : ""}`;
+          description = `${cleaned.slice(0, 64)}${cleaned.length > 64 ? "…" : ""}`;
         }
         break;
       }
       default: {
-        description = stripRawMarkdownNoise(ev.summary).slice(0, 72) || "状态更新";
+        description = stripRawMarkdownNoise(ev.summary).slice(0, 72) || "updated status";
       }
     }
 
@@ -359,7 +357,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
         byPath.set(ev.file_path, {
           path: ev.file_path,
           label: shortFileLabel(ev.file_path, rootCwd),
-          lastActor: ev.agent_handle?.trim() || "会话",
+          lastActor: ev.agent_handle?.trim() || "Thread",
           count: 1,
           lastAt: ev.created_at,
         });
@@ -474,28 +472,28 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           ) : (
             <button
               type="button"
-              title="点击重命名工作区"
+              title="Click to rename group"
               onClick={() => setEditingTitle(true)}
-              className="text-foreground hover:text-primary flex max-w-full cursor-pointer items-center gap-1.5 truncate text-left text-[14px] font-semibold transition-colors"
+              className="text-foreground hover:text-foreground/80 flex max-w-full cursor-pointer items-center gap-1.5 truncate text-left text-[14px] font-semibold transition-colors"
             >
-              <span className="truncate">{workspace?.title || "工作区概览"}</span>
+              <span className="truncate">{workspace?.title || "Group Overview"}</span>
               <Edit3 className="text-muted-foreground/65 h-[11.5px] w-[11.5px] shrink-0" />
             </button>
           )}
           <div className="text-muted-foreground mt-0.5 flex items-center gap-2 text-[11.5px]">
-            <span>{peers.length} 个会话</span>
+            <span>{peers.length === 1 ? "1 thread" : `${peers.length} threads`}</span>
             {runningPeersCount > 0 && (
               <>
                 <span>·</span>
-                <span className="text-sky-600 dark:text-sky-400">
-                  {runningPeersCount} 个运行中
-                </span>
+                <span className="text-foreground/80">{runningPeersCount} running</span>
               </>
             )}
             {touchedFiles.length > 0 && (
               <>
                 <span>·</span>
-                <span>{touchedFiles.length} 个改动文件</span>
+                <span>
+                  {touchedFiles.length === 1 ? "1 file" : `${touchedFiles.length} files`}
+                </span>
               </>
             )}
           </div>
@@ -504,7 +502,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
         <div className="flex shrink-0 items-center gap-1">
           <button
             type="button"
-            title="刷新概览"
+            title="Refresh"
             onClick={() => void orbitActions.fetchWorkspaceBoardAndEvents(hostId, workspaceId)}
             className="text-muted-foreground hover:text-foreground inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
           >
@@ -518,12 +516,12 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
             {editingBoard ? (
               <>
                 <Eye className="h-[12px] w-[12px]" />
-                <span>返回概览</span>
+                <span>Preview</span>
               </>
             ) : (
               <>
                 <Edit3 className="h-[12px] w-[12px]" />
-                <span>编辑笔记</span>
+                <span>Edit notes</span>
               </>
             )}
           </button>
@@ -531,12 +529,12 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
       </div>
 
       <ScrollArea className="min-h-0 flex-1" viewportClassName="p-4 space-y-4">
-        {/* 1. Mission Goal Card */}
+        {/* 1. Goal Card */}
         <section className="border-border/70 bg-elevated/45 space-y-1.5 rounded-xl border p-3.5">
           <div className="flex items-center justify-between">
             <span className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
-              <Target className="h-[13px] w-[13px] text-sky-500" />
-              <span>工作区目标</span>
+              <Target className="h-[13px] w-[13px] opacity-75" />
+              <span>Goal</span>
             </span>
             {!editingGoal && (
               <button
@@ -544,7 +542,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                 onClick={() => setEditingGoal(true)}
                 className="text-muted-foreground hover:text-foreground cursor-pointer text-[11.5px]"
               >
-                编辑
+                Edit
               </button>
             )}
           </div>
@@ -559,7 +557,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   if (e.key === "Enter") void handleSaveGoal();
                   if (e.key === "Escape") setEditingGoal(false);
                 }}
-                placeholder="用一句话描述本工作区的共同目标…"
+                placeholder="Describe the shared goal for this group…"
                 className="border-border bg-canvas text-foreground w-full rounded-md border px-2.5 py-1.5 text-[12.5px] outline-none"
               />
               <div className="flex justify-end gap-1.5">
@@ -568,7 +566,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   onClick={() => setEditingGoal(false)}
                   className="text-muted-foreground hover:text-foreground cursor-pointer px-2 py-0.5 text-[11.5px]"
                 >
-                  取消
+                  Cancel
                 </button>
                 <button
                   type="button"
@@ -576,23 +574,23 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1 rounded-md px-2.5 py-0.5 text-[11.5px] font-medium"
                 >
                   <Check className="h-[11px] w-[11px]" />
-                  <span>保存</span>
+                  <span>Save</span>
                 </button>
               </div>
             </div>
           ) : (
             <p className="text-foreground/90 text-[13px] leading-relaxed">
-              {effectiveGoal || "暂未设置目标，点击右上角「编辑」补充后，工作区内所有会话都会共享该目标。"}
+              {effectiveGoal || "No goal set yet. Click Edit to share a goal across threads."}
             </p>
           )}
         </section>
 
-        {/* 2. Conflict Alerts (only visible when real multi-session file conflicts exist) */}
+        {/* 2. Conflict Alerts */}
         {conflictEvents.length > 0 && (
-          <section className="space-y-1.5 rounded-xl border border-amber-500/35 bg-amber-500/[0.08] p-3">
+          <section className="space-y-1.5 rounded-xl border border-amber-500/30 bg-amber-500/[0.07] p-3">
             <div className="flex items-center gap-1.5 text-[12px] font-medium text-amber-700 dark:text-amber-300">
               <AlertTriangle className="h-[13.5px] w-[13.5px]" />
-              <span>协作冲突提醒 ({conflictEvents.length})</span>
+              <span>Conflicts ({conflictEvents.length})</span>
             </div>
             <div className="space-y-1">
               {conflictEvents.map((ev) => (
@@ -613,13 +611,13 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           </section>
         )}
 
-        {/* 3. Participating Sessions */}
+        {/* 3. Threads in Group */}
         {peers.length > 0 && (
           <section className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
                 <Users className="h-[12.5px] w-[12.5px]" />
-                <span>协作会话 ({peers.length})</span>
+                <span>Threads ({peers.length})</span>
               </span>
             </div>
             <div className="space-y-1.5">
@@ -627,10 +625,10 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                 const isFocused = peer.agent_id === selectedAgentId;
                 const handle = semanticAgentTabLabel(peer);
                 const statusText = peer.is_running
-                  ? "运行中"
+                  ? "Running"
                   : peer.is_awaiting_permission
-                    ? "待确认"
-                    : "空闲";
+                    ? "Approval"
+                    : "Idle";
                 return (
                   <div
                     key={peer.agent_id}
@@ -647,11 +645,11 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                       className="flex min-w-0 flex-1 cursor-pointer items-start gap-2.5 text-left"
                     >
                       {peer.is_running ? (
-                        <Loader2 className="mt-0.5 h-[13px] w-[13px] shrink-0 animate-spin text-sky-500" />
+                        <Loader2 className="text-foreground/70 mt-0.5 h-[13px] w-[13px] shrink-0 animate-spin" />
                       ) : (
                         <ProviderIcon
                           provider={peer.provider}
-                          className="mt-0.5 h-[13.5px] w-[13.5px] shrink-0 opacity-85"
+                          className="mt-0.5 h-[13.5px] w-[13.5px] shrink-0 opacity-80"
                         />
                       )}
                       <div className="min-w-0 flex-1 space-y-0.5">
@@ -661,7 +659,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                             className={cn(
                               "rounded-full px-1.5 py-[1px] text-[10px] font-medium",
                               peer.is_running
-                                ? "bg-sky-500/12 text-sky-600 dark:text-sky-400"
+                                ? "bg-foreground/[0.07] text-foreground/80"
                                 : peer.is_awaiting_permission
                                   ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
                                   : "bg-black/[0.05] text-muted-foreground dark:bg-white/[0.08]",
@@ -683,7 +681,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                     </button>
                     <button
                       type="button"
-                      title="分屏并排查看"
+                      title="Open side-by-side"
                       onClick={() => orbitActions.openPeerSplitTab(hostId, peer.agent_id, handle)}
                       className="text-muted-foreground hover:text-foreground mt-0.5 inline-flex h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
                     >
@@ -696,16 +694,16 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           </section>
         )}
 
-        {/* 4. Structured Workspace Notes (Clean Cards Instead of Raw Boilerplate Markdown Dump) */}
+        {/* 4. Shared Notes */}
         <section className="space-y-2">
           <div className="flex items-center justify-between">
             <span className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
               <FileText className="h-[12.5px] w-[12.5px]" />
-              <span>协作笔记与关键结论</span>
+              <span>Shared notes</span>
             </span>
             {board?.updated_by && !editingBoard && parsedDoc.sections.length > 0 && (
               <span className="text-muted-foreground/70 text-[11px]">
-                最近更新：{board.updated_by}
+                Updated by {board.updated_by}
               </span>
             )}
           </div>
@@ -716,7 +714,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                 rows={12}
                 value={boardDraft}
                 onChange={(e) => setBoardDraft(e.target.value)}
-                placeholder={"## 决策与约定\n- ...\n\n## 任务分工\n- ...\n\n## 进展与结论\n- ..."}
+                placeholder={"## Decisions & Contracts\n- ...\n\n## Tasks\n- ...\n\n## Findings\n- ..."}
                 className="border-border bg-canvas text-foreground w-full rounded-xl border p-3 font-mono text-[12px] leading-relaxed outline-none"
               />
               <div className="flex justify-end gap-2">
@@ -728,7 +726,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   }}
                   className="border-border hover:bg-accent cursor-pointer rounded-lg border px-2.5 py-1 text-[12px]"
                 >
-                  取消
+                  Cancel
                 </button>
                 <button
                   type="button"
@@ -741,7 +739,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   ) : (
                     <Save className="h-[12px] w-[12px]" />
                   )}
-                  <span>保存笔记</span>
+                  <span>Save</span>
                 </button>
               </div>
             </div>
@@ -773,17 +771,17 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
             </div>
           ) : (
             <div className="border-border/65 text-muted-foreground rounded-xl border border-dashed px-4 py-5 text-center text-[12px] leading-relaxed">
-              还没有记录协作笔记。点击右上角 <strong>编辑笔记</strong> 添加关键约定与任务分工，或让会话在推进过程中自动沉淀结论。
+              No shared notes yet. Click <strong>Edit notes</strong> to record decisions or tasks.
             </div>
           )}
         </section>
 
-        {/* 5. Touched Files Summary (Deduplicated & Clickable — Replaces Wall of Duplicate File Paths) */}
+        {/* 5. Touched Files */}
         {touchedFiles.length > 0 && (
           <section className="space-y-1.5">
             <div className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
               <FileCode2 className="h-[12.5px] w-[12.5px]" />
-              <span>近期改动文件 ({touchedFiles.length})</span>
+              <span>Touched files ({touchedFiles.length})</span>
             </div>
             <div className="border-border/60 bg-elevated/25 divide-border/50 divide-y rounded-xl border">
               {touchedFiles.map((file) => (
@@ -819,7 +817,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           </section>
         )}
 
-        {/* 6. Collapsible Clean Activity Feed (Collapsed by Default, Human-Readable Summaries) */}
+        {/* 6. Collapsible Activity Feed */}
         {humanActivities.length > 0 && (
           <section className="border-border/60 border-t pt-2.5">
             <button
@@ -829,7 +827,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
             >
               <span className="flex items-center gap-1.5">
                 <History className="h-[12.5px] w-[12.5px]" />
-                <span>近期动态 ({humanActivities.length})</span>
+                <span>Activity ({humanActivities.length})</span>
               </span>
               <ChevronRight
                 className={cn(
@@ -859,7 +857,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                       <span>{item.description}</span>
                       {item.count > 1 && (
                         <span className="text-muted-foreground ml-1 text-[10.5px] tabular-nums">
-                          ({item.count} 次)
+                          ×{item.count}
                         </span>
                       )}
                     </div>

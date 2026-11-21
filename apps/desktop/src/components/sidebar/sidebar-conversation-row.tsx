@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef, useState } from "react";
-import { Archive, MoreHorizontal, Sparkles } from "lucide-react";
+import { Archive, MoreHorizontal } from "lucide-react";
 import {
   type AgentCardView,
   type HostCardView,
@@ -41,7 +41,6 @@ export interface SidebarConversationRowProps {
   ) => void;
   onStartRename: (threadKey: string) => void;
   onFinishRename: () => void;
-  onAiClassify?: () => void;
 }
 
 export const SidebarConversationRow = memo(function SidebarConversationRow({
@@ -62,7 +61,6 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   onOpenMenu,
   onStartRename,
   onFinishRename,
-  onAiClassify,
 }: SidebarConversationRowProps) {
   const [renameDraft, setRenameDraft] = useState(effectiveTitle);
   const renameInputRef = useRef<HTMLInputElement | null>(null);
@@ -227,17 +225,6 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
             )}
             onClick={(e) => e.stopPropagation()}
           >
-            {onAiClassify && (
-              <button
-                type="button"
-                title="AI 归类此会话到 Workspace"
-                onClick={onAiClassify}
-                className="text-muted-foreground hover:text-sky-600 dark:hover:text-sky-400 inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-[5px] hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
-              >
-                <Sparkles className="h-[13px] w-[13px] stroke-[1.75]" />
-              </button>
-            )}
-
             <button
               type="button"
               title="Archive conversation"

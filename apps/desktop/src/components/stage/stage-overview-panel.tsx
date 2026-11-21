@@ -8,24 +8,30 @@ import {
   Clock,
   File,
   FileDiff,
-  Loader2,
-  Pencil,
-  Sparkles,
+  FileText,
+  MoreHorizontal,
   Square,
   SquareTerminal,
+  Unlink,
   type LucideIcon,
 } from "lucide-react";
-import { useImeCompositionGuard } from "@/lib/ime";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
+import { ProviderIcon } from "@/components/ui/provider-icons";
 import { useWorkspaceMotion } from "@/components/layout/workspace-motion";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/overlays";
 import { SimpleTooltip } from "@/components/ui/overlays";
 import { Separator } from "@/components/ui/separator";
 import {
@@ -36,6 +42,7 @@ import {
   isAgentForegroundRunning,
   orbitIpc,
 } from "@/lib/orbit-ipc";
+import { type ResolvedSubagentItem, resolveSessionSubagents } from "@/lib/subagents";
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
   type OverviewSectionId,
@@ -120,7 +127,9 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
   count,
   collapsed,
   isRunning = false,
+  hasAlert = false,
   runningTone = "spinner",
+  headerAction,
   children,
 }: {
   id: OverviewSectionId;
@@ -128,7 +137,9 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
   count: number;
   collapsed: boolean;
   isRunning?: boolean;
+  hasAlert?: boolean;
   runningTone?: "spinner" | "emerald";
+  headerAction?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
@@ -139,9 +150,9 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
         onOpenChange={() => orbitActions.toggleOverviewSection(id)}
         className="px-2.5 py-2"
       >
-        <CollapsibleTrigger className="group/trigger hover:bg-accent/65 focus-visible:ring-ring/50 flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 text-left transition-colors outline-none focus-visible:ring-2">
-          <span className="flex min-w-0 items-center gap-1.5">
-            <span className="text-muted-foreground group-hover/trigger:text-foreground truncate text-[12.5px] font-medium transition-colors">
+        <div className="group/sechead hover:bg-accent/65 flex h-[30px] w-full items-center rounded-[8px] pr-1.5 transition-colors">
+          <CollapsibleTrigger className="group/trigger focus-visible:ring-ring/50 flex h-full min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded-[8px] pr-1 pl-2 text-left outline-none focus-visible:ring-2">
+            <span className="text-muted-foreground group-hover/sechead:text-foreground truncate text-[12.5px] font-medium transition-colors">
               {label}
             </span>
             <Badge
@@ -150,18 +161,39 @@ const OverviewLayerSection = memo(function OverviewLayerSection({
             >
               {count}
             </Badge>
-          </span>
-          <span className="flex shrink-0 items-center gap-1.5">
-            {collapsed &&
-              isRunning &&
-              (runningTone === "emerald" ? (
-                <span className="size-[6px] shrink-0 rounded-full bg-emerald-500/85" />
-              ) : (
-                <OrbitSpinner size={13} className="text-foreground/65" />
-              ))}
-            <ChevronRight className="text-muted-foreground/70 size-3.5 shrink-0 transition-transform duration-[220ms] ease-[var(--ease-panel)] group-data-[panel-open]/trigger:rotate-90" />
-          </span>
-        </CollapsibleTrigger>
+          </CollapsibleTrigger>
+
+          <div className="flex shrink-0 items-center gap-1">
+            {headerAction && (
+              <div className="hidden items-center group-focus-within/sechead:flex group-hover/sechead:flex">
+                {headerAction}
+              </div>
+            )}
+            {collapsed && (hasAlert || isRunning) && (
+              <span
+                className={cn(
+                  "flex items-center",
+                  headerAction &&
+                    "group-focus-within/sechead:hidden group-hover/sechead:hidden",
+                )}
+              >
+                {hasAlert ? (
+                  <span className="size-[6px] shrink-0 rounded-full bg-amber-500" />
+                ) : runningTone === "emerald" ? (
+                  <span className="size-[6px] shrink-0 rounded-full bg-emerald-500/85" />
+                ) : (
+                  <OrbitSpinner size={13} className="text-foreground/65" />
+                )}
+              </span>
+            )}
+            <CollapsibleTrigger
+              aria-label={`Toggle ${label}`}
+              className="group/trigger text-muted-foreground/70 inline-flex size-[20px] cursor-pointer items-center justify-center rounded-[5px] outline-none"
+            >
+              <ChevronRight className="size-3.5 shrink-0 transition-transform duration-[220ms] ease-[var(--ease-panel)] group-data-[panel-open]/trigger:rotate-90" />
+            </CollapsibleTrigger>
+          </div>
+        </div>
 
         <CollapsibleContent>
           <div className="space-y-0.5 pt-1">{children}</div>
@@ -190,44 +222,30 @@ const StageOverviewBody = memo(function StageOverviewBody({
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
-  const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const hostDetail = hostDetails[hostId] ?? null;
   const gitReview = useOrbitSelector((s) =>
     cwd ? (s.gitReviews[`${hostId}::${cwd}`] ?? null) : null,
   );
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const [stoppingBg, setStoppingBg] = useState(false);
-  const [editingSummary, setEditingSummary] = useState(false);
-  const [summaryDraft, setSummaryDraft] = useState("");
-  const [summarizing, setSummarizing] = useState(false);
-  const ime = useImeCompositionGuard();
+  const [openSubagentMenuKey, setOpenSubagentMenuKey] = useState<string | null>(null);
 
-  const activeSummary = currentAgent?.task_summary?.trim() || "";
-
-  useEffect(() => {
-    setEditingSummary(false);
-  }, [agentId]);
-
-  const commitSummaryEdit = () => {
-    const clean = summaryDraft.trim();
-    setEditingSummary(false);
-    if (clean === activeSummary) return;
-    void orbitActions.updateAgentIdentity({
-      hostId,
-      agentId,
-      taskSummary: clean,
-    });
-  };
-
-  const triggerSummarize = async () => {
-    if (summarizing) return;
-    setSummarizing(true);
-    try {
-      await orbitActions.summarizeAgent(hostId, agentId);
-    } finally {
-      window.setTimeout(() => setSummarizing(false), 1200);
-    }
-  };
+  const currentWorkspace = useMemo(() => {
+    if (!hostDetail || !currentAgent) return null;
+    return hostDetail.workspaces.find((w) => w.workspace_id === currentAgent.workspace_id) ?? null;
+  }, [hostDetail, currentAgent]);
+  const currentBoardRev =
+    (currentAgent ? hostDetail?.workspace_boards?.[currentAgent.workspace_id]?.revision : 0) ??
+    currentWorkspace?.board_revision ??
+    0;
+  const showGroupNotesRow = Boolean(
+    currentAgent &&
+      !currentAgent.parent_agent_id &&
+      (currentWorkspace?.is_curated || currentBoardRev > 0),
+  );
 
   const insights = baseInsights;
   const backgroundTasks = insights.background_tasks;
@@ -312,32 +330,60 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const [showAllSubagents, setShowAllSubagents] = useState(false);
   const [showAllTasks, setShowAllTasks] = useState(false);
 
-  const visibleInsightsSubagents = useMemo(
+  const orderedSubagents = useMemo(
     () =>
-      insights.subagents.filter(
+      resolveSessionSubagents({
+        hostId,
+        agentId,
+        insightsSubagents: insights.subagents,
+        hostDetails,
+        fleetHosts,
+      }).filter(
         (sa) =>
           !isSubagentArchived(archivedSubagents, hostId, agentId, {
-            id: sa.id,
-            providerSubagentId: sa.provider_subagent_id,
-            childAgentId: sa.child_agent_id,
+            id: sa.callId,
+            providerSubagentId: sa.providerSubagentId,
+            childAgentId: sa.childAgentId,
           }),
       ),
-    [insights.subagents, archivedSubagents, hostId, agentId],
+    [hostId, agentId, insights.subagents, hostDetails, fleetHosts, archivedSubagents],
   );
 
-  const orderedSubagents = useMemo(() => {
-    const running = visibleInsightsSubagents.filter((s) => s.status === "running");
-    const rest = visibleInsightsSubagents.filter((s) => s.status !== "running");
-    return [...running, ...rest];
-  }, [visibleInsightsSubagents]);
-
+  const hasAwaitingSubagent = orderedSubagents.some((s) => s.status === "awaiting_permission");
+  const hasRunningSubagent = orderedSubagents.some((s) => s.status === "running");
+  const activeSubagentCount = orderedSubagents.filter(
+    (s) => s.status === "awaiting_permission" || s.status === "running",
+  ).length;
   const finishedSubagents = useMemo(
-    () => orderedSubagents.filter((s) => s.status !== "running"),
+    () =>
+      orderedSubagents.filter(
+        (s) => s.status !== "running" && s.status !== "awaiting_permission",
+      ),
     [orderedSubagents],
   );
 
-  const visibleSubagents = showAllSubagents ? orderedSubagents : orderedSubagents.slice(0, 1);
+  const defaultVisibleSubagentCount =
+    activeSubagentCount > 0 ? Math.min(activeSubagentCount, 4) : 1;
+  const visibleSubagents = showAllSubagents
+    ? orderedSubagents
+    : orderedSubagents.slice(0, defaultVisibleSubagentCount);
   const hiddenSubagentCount = Math.max(0, orderedSubagents.length - visibleSubagents.length);
+
+  const handleOpenSubagent = (sa: ResolvedSubagentItem) => {
+    if (sa.status === "awaiting_permission" && sa.isManaged && sa.childAgentId) {
+      orbitActions.selectAgent(sa.childHostId, sa.childAgentId);
+      return;
+    }
+    orbitActions.openSubagentTab({
+      callId: sa.callId,
+      role: sa.title,
+      promptPreview: sa.promptPreview,
+      childAgentId: sa.childAgentId,
+      childHostId: sa.childHostId,
+      providerSubagentId: sa.providerSubagentId,
+      parentAgentId: agentId,
+    });
+  };
 
   const orderedTasks = useMemo(() => {
     const running = backgroundTasks.filter((t) => t.status === "running");
@@ -350,75 +396,11 @@ const StageOverviewBody = memo(function StageOverviewBody({
 
   return (
     <div className="flex min-h-0 max-h-full flex-1 flex-col overflow-y-auto select-none">
-      {/* Layer 1: Primary Overview Shortcuts + Quiet Session Summary */}
+      {/* Layer 1: Primary Overview Shortcuts */}
       <div className="px-2.5 pt-2.5 pb-2">
-        <div className="flex h-[24px] items-center justify-between px-2 pb-0.5">
+        <div className="flex h-[24px] items-center px-2 pb-0.5">
           <span className="text-muted-foreground text-[12px] font-medium">Overview</span>
-          <SimpleTooltip label="AI 更新会话标签与摘要">
-            <button
-              type="button"
-              disabled={summarizing}
-              onClick={() => void triggerSummarize()}
-              className="text-muted-foreground/75 hover:text-foreground inline-flex h-[20px] w-[20px] cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-black/[0.05] disabled:opacity-45 dark:hover:bg-white/[0.07]"
-            >
-              {summarizing ? (
-                <Loader2 className="h-[11.5px] w-[11.5px] animate-spin text-sky-500" />
-              ) : (
-                <Sparkles className="h-[11.5px] w-[11.5px] stroke-[1.75]" />
-              )}
-            </button>
-          </SimpleTooltip>
         </div>
-
-        {(activeSummary || editingSummary) && (
-          <div className="group/ovsum mb-1.5 px-2 pt-0.5">
-            {editingSummary ? (
-              <input
-                autoFocus
-                value={summaryDraft}
-                onChange={(e) => setSummaryDraft(e.target.value)}
-                onBlur={commitSummaryEdit}
-                {...ime.compositionProps}
-                onKeyDown={(e) => {
-                  if (ime.shouldIgnoreKeyDown(e)) return;
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    commitSummaryEdit();
-                  } else if (e.key === "Escape") {
-                    e.preventDefault();
-                    setEditingSummary(false);
-                  }
-                }}
-                placeholder="一句话概括此会话…"
-                className="bg-background text-foreground w-full rounded-md px-2 py-1 text-[11.5px] leading-snug outline-none ring-1 ring-sky-500/45"
-              />
-            ) : (
-              <div
-                onDoubleClick={() => {
-                  setSummaryDraft(activeSummary);
-                  setEditingSummary(true);
-                }}
-                title={`${activeSummary}\n双击编辑摘要`}
-                className="flex items-start justify-between gap-1.5 rounded-md py-0.5"
-              >
-                <p className="text-muted-foreground/90 line-clamp-2 text-[11.5px] leading-[1.45]">
-                  {activeSummary}
-                </p>
-                <button
-                  type="button"
-                  title="编辑摘要"
-                  onClick={() => {
-                    setSummaryDraft(activeSummary);
-                    setEditingSummary(true);
-                  }}
-                  className="text-muted-foreground hover:text-foreground mt-0.5 hidden h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] group-hover/ovsum:inline-flex dark:hover:bg-white/[0.08]"
-                >
-                  <Pencil className="h-[10px] w-[10px]" />
-                </button>
-              </div>
-            )}
-          </div>
-        )}
 
         <div className="space-y-0.5">
           <OverviewActionRow
@@ -475,111 +457,259 @@ const StageOverviewBody = memo(function StageOverviewBody({
               ) : undefined
             }
           />
+
+          {showGroupNotesRow && currentAgent && (
+            <OverviewActionRow
+              icon={FileText}
+              label="Group notes"
+              onClick={() =>
+                orbitActions.openWorkspaceBoardTab(
+                  hostId,
+                  currentAgent.workspace_id,
+                  currentWorkspace?.title,
+                )
+              }
+              trailing={
+                currentBoardRev > 0 ? (
+                  <span className="text-muted-foreground/70 font-mono text-[11px]">
+                    v{currentBoardRev}
+                  </span>
+                ) : undefined
+              }
+            />
+          )}
         </div>
       </div>
 
-      {/* Layer 2: Subagents (progressive disclosure when present; both managed & native archivable!) */}
+      {/* Layer 2: Subagents (single unified list: resting minimalist, hover actions for managed & native) */}
       {orderedSubagents.length > 0 && (
         <OverviewLayerSection
           id="subagents"
           label="Subagents"
           count={orderedSubagents.length}
           collapsed={collapsedSections.subagents}
-          isRunning={orderedSubagents.some((s) => s.status === "running")}
-        >
-          {visibleSubagents.map((sa) => (
-            <div
-              key={sa.id}
-              className="group/sa hover:bg-accent/65 flex h-[32px] w-full items-center gap-1 rounded-[8px] pr-1 transition-colors"
-            >
-              <button
-                type="button"
-                title={sa.prompt_preview || sa.role}
-                onClick={() =>
-                  orbitActions.openSubagentTab({
-                    callId: sa.id,
-                    role: sa.role,
-                    promptPreview: sa.prompt_preview,
-                    childAgentId: sa.child_agent_id,
-                    providerSubagentId: sa.provider_subagent_id ?? null,
-                    parentAgentId: agentId,
-                  })
+          isRunning={hasRunningSubagent}
+          hasAlert={hasAwaitingSubagent}
+          headerAction={
+            finishedSubagents.length > 0 ? (
+              <SimpleTooltip
+                label={
+                  finishedSubagents.length > 1
+                    ? `Archive finished (${finishedSubagents.length})`
+                    : "Archive finished"
                 }
-                className="text-foreground/86 hover:text-foreground flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2.5 pl-2 text-left text-[13px] font-normal"
               >
-                <span className="flex size-[15px] shrink-0 items-center justify-center">
-                  {sa.status === "running" ? (
-                    <OrbitSpinner size={13.5} className="text-foreground/70" />
-                  ) : sa.status === "completed" ? (
-                    <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
-                  ) : (
-                    <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
-                  )}
-                </span>
-                <span
-                  className={cn(
-                    "truncate leading-[18px]",
-                    sa.status === "running" && "agent-text-shimmer",
-                  )}
-                >
-                  {sa.role}
-                </span>
-              </button>
-
-              <SimpleTooltip label="归档并隐藏此子代理">
                 <button
                   type="button"
-                  aria-label={`Archive subagent ${sa.role}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    orbitActions.archiveSubagent(hostId, agentId, {
-                      id: sa.id,
-                      providerSubagentId: sa.provider_subagent_id ?? null,
-                      childAgentId: sa.child_agent_id ?? null,
-                      role: sa.role,
-                    });
+                  aria-label="Archive finished subagents"
+                  onClick={() => {
+                    const managed = finishedSubagents.filter(
+                      (item) => item.isManaged && item.childAgentId,
+                    );
+                    for (const item of managed) {
+                      if (item.childAgentId) {
+                        orbitActions.archiveThread(item.childHostId, item.childAgentId);
+                      }
+                    }
+                    const nativeItems = finishedSubagents.filter(
+                      (item) => !(item.isManaged && item.childAgentId),
+                    );
+                    if (nativeItems.length > 0) {
+                      orbitActions.archiveFinishedSubagents(
+                        hostId,
+                        agentId,
+                        nativeItems.map((item) => ({
+                          id: item.callId,
+                          providerSubagentId: item.providerSubagentId,
+                          childAgentId: item.childAgentId,
+                        })),
+                      );
+                    }
                   }}
-                  className="text-muted-foreground hover:text-foreground hidden size-[22px] shrink-0 cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.06] group-hover/sa:inline-flex dark:hover:bg-white/[0.08]"
+                  className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
                 >
-                  <Archive className="size-[12.5px] stroke-[1.75]" />
+                  <Archive className="size-[13px] stroke-[1.75]" />
                 </button>
               </SimpleTooltip>
-            </div>
-          ))}
-          {(orderedSubagents.length > 1 || finishedSubagents.length > 0) && (
-            <div className="flex items-center justify-between gap-1 pt-0.5">
-              {orderedSubagents.length > 1 ? (
+            ) : undefined
+          }
+        >
+          {visibleSubagents.map((sa) => {
+            const isMenuOpen = openSubagentMenuKey === sa.key;
+            const showCrossProvider = Boolean(
+              sa.isManaged &&
+                sa.childProvider &&
+                currentAgent?.provider &&
+                sa.childProvider !== currentAgent.provider,
+            );
+            const hasRestingMeta = Boolean(
+              sa.status === "awaiting_permission" || sa.remoteHostName || showCrossProvider,
+            );
+            const canManage = Boolean(sa.isManaged && sa.childAgentId);
+
+            return (
+              <div
+                key={sa.key}
+                className={cn(
+                  "group/subrow flex h-[32px] min-w-0 w-full items-center rounded-[8px] transition-colors",
+                  isMenuOpen ? "bg-accent/65" : "hover:bg-accent/65",
+                )}
+              >
                 <button
                   type="button"
-                  onClick={() => setShowAllSubagents((v) => !v)}
-                  className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex h-[24px] flex-1 cursor-pointer items-center justify-center rounded-[7px] text-[11.5px] font-medium transition-colors"
+                  title={sa.promptPreview || sa.title}
+                  onClick={() => handleOpenSubagent(sa)}
+                  className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2.5 pr-1 pl-2 text-left"
                 >
-                  {showAllSubagents ? "Show less" : `Show ${hiddenSubagentCount} more`}
+                  <span className="flex size-[15px] shrink-0 items-center justify-center">
+                    {sa.status === "awaiting_permission" ? (
+                      <span className="size-[6.5px] rounded-full bg-amber-500 shadow-[0_0_0_2.5px_rgba(245,158,11,0.18)]" />
+                    ) : sa.status === "running" ? (
+                      <OrbitSpinner size={13.5} className="text-foreground/70" />
+                    ) : sa.status === "completed" ? (
+                      <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
+                    ) : (
+                      <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
+                    )}
+                  </span>
+                  <span
+                    className={cn(
+                      "text-foreground/86 group-hover/subrow:text-foreground min-w-0 flex-1 truncate text-[13px] leading-[18px] font-normal transition-colors",
+                      sa.status === "running" && "agent-text-shimmer",
+                    )}
+                  >
+                    {sa.title}
+                  </span>
                 </button>
-              ) : (
-                <span className="flex-1" />
-              )}
-              {finishedSubagents.length > 0 && (
-                <button
-                  type="button"
-                  title="归档全部已完成的子代理（含原生子代理）"
-                  onClick={() =>
-                    orbitActions.archiveFinishedSubagents(
-                      hostId,
-                      agentId,
-                      finishedSubagents.map((s) => ({
-                        id: s.id,
-                        providerSubagentId: s.provider_subagent_id ?? null,
-                        childAgentId: s.child_agent_id ?? null,
-                      })),
-                    )
-                  }
-                  className="text-muted-foreground/80 hover:text-foreground hover:bg-accent/55 inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-[7px] px-2 text-[11px] transition-colors"
-                >
-                  <Archive className="size-[11px]" />
-                  <span>归档已完成 ({finishedSubagents.length})</span>
-                </button>
-              )}
+
+                <div className="flex shrink-0 items-center pr-1.5">
+                  {/* Resting: at most one quiet trailing cue */}
+                  {hasRestingMeta && (
+                    <div
+                      className={cn(
+                        "flex items-center pr-0.5",
+                        isMenuOpen
+                          ? "hidden"
+                          : "group-hover/subrow:hidden group-focus-within/subrow:hidden",
+                      )}
+                    >
+                      {sa.status === "awaiting_permission" ? (
+                        <span className="text-[11px] font-medium text-amber-600/90 dark:text-amber-400/90">
+                          Approval
+                        </span>
+                      ) : sa.remoteHostName ? (
+                        <span className="text-muted-foreground/60 max-w-[76px] truncate text-[11px]">
+                          {sa.remoteHostName}
+                        </span>
+                      ) : showCrossProvider && sa.childProvider ? (
+                        <ProviderIcon
+                          provider={sa.childProvider}
+                          className="size-[12.5px] shrink-0 opacity-60"
+                        />
+                      ) : null}
+                    </div>
+                  )}
+
+                  {/* Hover: managed subagents expose Open thread + More menu; native read-only shows quiet chevron */}
+                  {canManage && sa.childAgentId ? (
+                    <div
+                      className={cn(
+                        "items-center gap-0.5",
+                        isMenuOpen
+                          ? "flex"
+                          : "hidden group-hover/subrow:flex group-focus-within/subrow:flex",
+                      )}
+                    >
+                      <SimpleTooltip label="Open thread">
+                        <button
+                          type="button"
+                          aria-label={`Open ${sa.title} thread`}
+                          onClick={() => orbitActions.selectAgent(sa.childHostId, sa.childAgentId!)}
+                          className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                        >
+                          <ArrowUpRight className="size-[13px] stroke-[1.8]" />
+                        </button>
+                      </SimpleTooltip>
+
+                      <DropdownMenu
+                        open={isMenuOpen}
+                        onOpenChange={(next) => setOpenSubagentMenuKey(next ? sa.key : null)}
+                      >
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            aria-label={`More actions for ${sa.title}`}
+                            className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                          >
+                            <MoreHorizontal className="size-[13.5px] stroke-[1.8]" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          align="end"
+                          side="bottom"
+                          sideOffset={4}
+                          className="min-w-[164px]"
+                        >
+                          <DropdownMenuItem
+                            onSelect={() => {
+                              setOpenSubagentMenuKey(null);
+                              void orbitActions.detachAgent(sa.childHostId, sa.childAgentId!);
+                            }}
+                          >
+                            <span className="flex items-center gap-2">
+                              <Unlink className="text-muted-foreground size-[13.5px]" />
+                              <span>Detach to thread</span>
+                            </span>
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onSelect={() => {
+                              setOpenSubagentMenuKey(null);
+                              orbitActions.archiveThread(sa.childHostId, sa.childAgentId!);
+                            }}
+                          >
+                            <span className="flex items-center gap-2">
+                              <Archive className="text-muted-foreground size-[13.5px]" />
+                              <span>Archive</span>
+                            </span>
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  ) : (
+                    <div className="hidden items-center gap-0.5 group-focus-within/subrow:flex group-hover/subrow:flex">
+                      <SimpleTooltip label="Archive">
+                        <button
+                          type="button"
+                          aria-label={`Archive ${sa.title}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            orbitActions.archiveSubagent(hostId, agentId, {
+                              id: sa.callId,
+                              providerSubagentId: sa.providerSubagentId,
+                              childAgentId: sa.childAgentId,
+                              role: sa.title,
+                            });
+                          }}
+                          className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                        >
+                          <Archive className="size-[12.5px] stroke-[1.75]" />
+                        </button>
+                      </SimpleTooltip>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+          {orderedSubagents.length > defaultVisibleSubagentCount && (
+            <div className="pt-0.5 pl-2">
+              <button
+                type="button"
+                onClick={() => setShowAllSubagents((v) => !v)}
+                className="text-muted-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center py-0.5 text-[11.5px] leading-[16px] font-medium transition-colors"
+              >
+                {showAllSubagents ? "Show less" : `Show ${hiddenSubagentCount} more`}
+              </button>
             </div>
           )}
         </OverviewLayerSection>
@@ -754,13 +884,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
             );
           })}
           {orderedTasks.length > 1 && (
-            <button
-              type="button"
-              onClick={() => setShowAllTasks((v) => !v)}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex h-[26px] w-full cursor-pointer items-center justify-center rounded-[8px] text-[11.5px] font-medium transition-colors"
-            >
-              {showAllTasks ? "Show less" : `Show ${hiddenTaskCount} more`}
-            </button>
+            <div className="pt-0.5 pl-2">
+              <button
+                type="button"
+                onClick={() => setShowAllTasks((v) => !v)}
+                className="text-muted-foreground/75 hover:text-foreground inline-flex cursor-pointer items-center py-0.5 text-[11.5px] leading-[16px] font-medium transition-colors"
+              >
+                {showAllTasks ? "Show less" : `Show ${hiddenTaskCount} more`}
+              </button>
+            </div>
           )}
         </OverviewLayerSection>
       )}
@@ -800,24 +932,31 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
   const {
     dockedOverviewMounted,
     dockedOverviewVisualOpen,
-    dockedOverviewOffsetPx,
+    dockedOverviewTransform,
     dockedOverviewTransition,
   } = useWorkspaceMotion();
 
   useLayoutEffect(() => {
     const el = stageContainerRef?.current;
     if (!el) return;
+    let rafId = 0;
     const syncTop = () => {
       const nextTop = Math.round(el.getBoundingClientRect().top) + 12;
       setDockedTopPx((prev) => (prev === nextTop ? prev : nextTop));
     };
+    const scheduleSyncTop = () => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        syncTop();
+      });
+    };
     syncTop();
-    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(syncTop) : null;
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleSyncTop) : null;
     ro?.observe(el);
-    window.addEventListener("resize", syncTop);
     return () => {
       ro?.disconnect();
-      window.removeEventListener("resize", syncTop);
+      if (rafId) window.cancelAnimationFrame(rafId);
     };
   }, [stageContainerRef, dockedOverviewMounted]);
 
@@ -889,9 +1028,7 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
           inert={!dockedOverviewVisualOpen}
           style={{
             top: `${dockedTopPx}px`,
-            transform: dockedOverviewVisualOpen
-              ? `translate3d(${dockedOverviewOffsetPx}px, 0, 0) scale(1)`
-              : `translate3d(${dockedOverviewOffsetPx}px, 0, 0) scale(0.985)`,
+            transform: dockedOverviewTransform,
             opacity: dockedOverviewVisualOpen ? 1 : 0,
             transition: dockedOverviewTransition,
           }}

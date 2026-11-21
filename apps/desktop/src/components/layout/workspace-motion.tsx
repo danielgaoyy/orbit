@@ -12,6 +12,7 @@ import {
 } from "react";
 
 import { isMacDesktop } from "@/lib/orbit-ipc";
+import { buildWorkspaceShellCssVars, resolveWorkspacePaneWidths } from "@/lib/workspace-layout";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
 export type ShellMotionPhase = "idle" | "prep" | "playing";
@@ -32,7 +33,7 @@ function stageCenterX(V: number, t: ShellGeometryTuple): number {
 }
 
 /**
- * Computes stage motion strategy & geometry:
+ * Computes stage motion strategy & geometry during panel open/close transitions:
  * - When content width stays unchanged (`wFrom === wTo`, e.g. wide viewports where prose remains 768px):
  *   stays 100% on the pure GPU `translate3d` path (zero per-frame layout work).
  * - When content width actually changes (`wFrom !== wTo`, e.g. opening/closing a side panel narrows
@@ -91,7 +92,15 @@ interface ShellMotionSnapshot {
   from: ShellGeometryTuple;
   to: ShellGeometryTuple;
   base: ShellGeometryTuple;
+  viewportWidth: number;
   durationMs: number;
+}
+
+interface CommittedToggleFlags {
+  sidebarOpen: boolean;
+  shouldRightOpen: boolean;
+  dockedOverview: boolean;
+  hasActiveSession: boolean;
 }
 
 export interface WorkspaceMotionContextValue {
@@ -100,9 +109,12 @@ export interface WorkspaceMotionContextValue {
   isResizing: boolean;
   hasSelectedHost: boolean;
   shouldRightOpen: boolean;
-  panelWidthPx: number;
-  leftLayoutReservePx: number;
-  rightLayoutReservePx: number;
+  /** CSS width expression for the left sidebar (`var(--orbit-left-w)` while idle, fixed px while animating) */
+  leftWidthCss: string;
+  /** CSS width expression for the right side panel (`var(--orbit-right-w)` while idle, fixed px while animating) */
+  panelWidthCss: string;
+  leftLayoutReserveCss: string;
+  rightLayoutReserveCss: string;
   shellReserveTransition: string;
   overviewReservePx: number;
   overviewReserveTransition: string;
@@ -130,7 +142,7 @@ export interface WorkspaceMotionContextValue {
   isStageWide: boolean;
   dockedOverviewMounted: boolean;
   dockedOverviewVisualOpen: boolean;
-  dockedOverviewOffsetPx: number;
+  dockedOverviewTransform: string;
   dockedOverviewTransition: string;
   setIsResizingLeft: (resizing: boolean) => void;
   setIsResizingRight: (resizing: boolean) => void;
@@ -140,6 +152,32 @@ export interface WorkspaceMotionContextValue {
 }
 
 const WorkspaceMotionContext = createContext<WorkspaceMotionContextValue | null>(null);
+
+function evalBreakpoints(params: {
+  viewportWidth: number;
+  sidebarOpen: boolean;
+  sidebarWidth: number;
+  shouldRightOpen: boolean;
+  sidePanelWidth: number;
+  hasActiveSession: boolean;
+  overviewDesktopOpenPref: boolean;
+  prevCanDock: boolean;
+  prevIsWide: boolean;
+}): { canDockOverview: boolean; isStageWide: boolean } {
+  const panes = resolveWorkspacePaneWidths({
+    viewportWidth: params.viewportWidth,
+    sidebarOpen: params.sidebarOpen,
+    sidebarPrefWidth: params.sidebarWidth,
+    sidePanelOpen: params.shouldRightOpen,
+    sidePanelPrefWidth: params.sidePanelWidth,
+  });
+  const centerW = panes.centerWidthPx;
+  const canDockOverview = params.prevCanDock ? centerW >= 1000 : centerW >= 1040;
+  const D = params.hasActiveSession && canDockOverview && params.overviewDesktopOpenPref ? 324 : 0;
+  const effectiveContentW = centerW - D;
+  const isStageWide = params.prevIsWide ? effectiveContentW >= 776 : effectiveContentW >= 800;
+  return { canDockOverview, isStageWide };
+}
 
 export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
   const sidebarOpen = useOrbitSelector((s) => s.sidebarOpen);
@@ -152,18 +190,59 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
   const isDraftNewSession = useOrbitSelector((s) => s.isDraftNewSession);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
 
-  const [viewportWidth, setViewportWidth] = useState<number>(() =>
+  const isMac = isMacDesktop();
+  const hasSelectedHost = Boolean(selectedHostId);
+  const hasActiveSession =
+    workspacePanel === "conversation" && !isDraftNewSession && Boolean(selectedAgentId);
+  const shouldRightOpen = sidePanelOpen && hasSelectedHost;
+
+  // Store live window width strictly in a ref so continuous window resizing triggers
+  // ZERO per-frame React re-renders; only discrete breakpoint crossings bump `breakpointTick`.
+  const viewportWidthRef = useRef<number>(
     typeof window !== "undefined" ? window.innerWidth : 1280,
   );
-  const viewportWidthRef = useRef(viewportWidth);
-  viewportWidthRef.current = viewportWidth;
-  const [isResizingLeft, setIsResizingLeftState] = useState(false);
-  const [isResizingRight, setIsResizingRightState] = useState(false);
+  const [, setBreakpointTick] = useState(0);
+  const canDockRef = useRef(false);
+  const isWideRef = useRef(false);
 
-  const isResizing = isResizingLeft || isResizingRight;
-  const isResizingRef = useRef(isResizing);
-  isResizingRef.current = isResizing;
+  // Compute `canDockOverview` & `isStageWide` SYNCHRONOUSLY during render so toggling the
+  // right side panel / left sidebar updates `W` and `D` in the exact same render frame
+  // (never split across two renders via useLayoutEffect!).
+  const liveViewportWidth =
+    typeof window !== "undefined" ? window.innerWidth : viewportWidthRef.current;
+  viewportWidthRef.current = liveViewportWidth;
+  const { canDockOverview, isStageWide } = evalBreakpoints({
+    viewportWidth: liveViewportWidth,
+    sidebarOpen,
+    sidebarWidth,
+    shouldRightOpen,
+    sidePanelWidth,
+    hasActiveSession,
+    overviewDesktopOpenPref,
+    prevCanDock: canDockRef.current,
+    prevIsWide: isWideRef.current,
+  });
+  canDockRef.current = canDockOverview;
+  isWideRef.current = isStageWide;
 
+  const latestPrefsRef = useRef({
+    sidebarOpen,
+    sidebarWidth,
+    shouldRightOpen,
+    sidePanelWidth,
+    hasActiveSession,
+    overviewDesktopOpenPref,
+  });
+  latestPrefsRef.current = {
+    sidebarOpen,
+    sidebarWidth,
+    shouldRightOpen,
+    sidePanelWidth,
+    hasActiveSession,
+    overviewDesktopOpenPref,
+  };
+
+  // Listen to window resize in rAF strictly to detect discrete breakpoint crossings (0 re-renders otherwise)
   useEffect(() => {
     if (typeof window === "undefined") return;
     let rafId = 0;
@@ -171,7 +250,23 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       if (rafId) return;
       rafId = window.requestAnimationFrame(() => {
         rafId = 0;
-        setViewportWidth(window.innerWidth);
+        const p = latestPrefsRef.current;
+        const vw = window.innerWidth;
+        viewportWidthRef.current = vw;
+        const next = evalBreakpoints({
+          viewportWidth: vw,
+          sidebarOpen: p.sidebarOpen,
+          sidebarWidth: p.sidebarWidth,
+          shouldRightOpen: p.shouldRightOpen,
+          sidePanelWidth: p.sidePanelWidth,
+          hasActiveSession: p.hasActiveSession,
+          overviewDesktopOpenPref: p.overviewDesktopOpenPref,
+          prevCanDock: canDockRef.current,
+          prevIsWide: isWideRef.current,
+        });
+        if (next.canDockOverview !== canDockRef.current || next.isStageWide !== isWideRef.current) {
+          setBreakpointTick((n) => n + 1);
+        }
       });
     };
     window.addEventListener("resize", onResize);
@@ -181,36 +276,18 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  const isMac = isMacDesktop();
-  const hasSelectedHost = Boolean(selectedHostId);
-  const hasActiveSession =
-    workspacePanel === "conversation" && !isDraftNewSession && Boolean(selectedAgentId);
-  const shouldRightOpen = sidePanelOpen && hasSelectedHost;
-  const panelWidthPx = Math.min(sidePanelWidth, Math.floor(viewportWidth * 0.58));
-
-  const canDockRef = useRef(false);
-  const isWideRef = useRef(false);
-
-  const L = sidebarOpen ? sidebarWidth : 0;
-  const W = shouldRightOpen ? panelWidthPx : 0;
-  const centerW = Math.max(0, viewportWidth - L - W);
-  const canDockOverview = canDockRef.current ? centerW >= 1000 : centerW >= 1040;
-  canDockRef.current = canDockOverview;
-
-  const D = hasActiveSession && canDockOverview && overviewDesktopOpenPref ? 324 : 0;
-  const effectiveContentW = centerW - D;
-  const isStageWide = isWideRef.current ? effectiveContentW >= 776 : effectiveContentW >= 800;
-  isWideRef.current = isStageWide;
-
   useLayoutEffect(() => {
     orbitActions.setStageCanDockOverview(canDockOverview);
   }, [canDockOverview]);
 
-  const target: ShellGeometryTuple = useMemo(() => ({ L, W, D }), [L, W, D]);
-  const targetRef = useRef(target);
-  targetRef.current = target;
+  const [isResizingLeft, setIsResizingLeftState] = useState(false);
+  const [isResizingRight, setIsResizingRightState] = useState(false);
+  const isResizing = isResizingLeft || isResizingRight;
+  const isResizingRef = useRef(isResizing);
+  isResizingRef.current = isResizing;
 
-  const toggleSig = `${sidebarOpen}:${shouldRightOpen}:${D > 0}`;
+  const dockedOverview = hasActiveSession && canDockOverview && overviewDesktopOpenPref;
+  const toggleSig = `${sidebarOpen}:${shouldRightOpen}:${dockedOverview}`;
   const toggleSigRef = useRef(toggleSig);
   toggleSigRef.current = toggleSig;
 
@@ -219,74 +296,122 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
   phaseRef.current = phase;
 
   const [committedSig, setCommittedSig] = useState(toggleSig);
-  const [committedTarget, setCommittedTarget] = useState<ShellGeometryTuple>(target);
+  const [committedFlags, setCommittedFlags] = useState<CommittedToggleFlags>({
+    sidebarOpen,
+    shouldRightOpen,
+    dockedOverview,
+    hasActiveSession,
+  });
 
-  const [motion, setMotion] = useState<ShellMotionSnapshot>(() => ({
-    from: target,
-    to: target,
-    base: target,
-    durationMs: 260,
-  }));
+  const snapshotTupleFor = (
+    vw: number,
+    flags: { sidebarOpen: boolean; shouldRightOpen: boolean; dockedOverview: boolean },
+  ): ShellGeometryTuple => {
+    const panes = resolveWorkspacePaneWidths({
+      viewportWidth: vw,
+      sidebarOpen: flags.sidebarOpen,
+      sidebarPrefWidth: sidebarWidth,
+      sidePanelOpen: flags.shouldRightOpen,
+      sidePanelPrefWidth: sidePanelWidth,
+    });
+    return {
+      L: flags.sidebarOpen ? panes.leftWidthPx : 0,
+      W: flags.shouldRightOpen ? panes.rightWidthPx : 0,
+      D: flags.dockedOverview ? 324 : 0,
+    };
+  };
+
+  const [motion, setMotion] = useState<ShellMotionSnapshot>(() => {
+    const vw = viewportWidthRef.current;
+    const init = snapshotTupleFor(vw, { sidebarOpen, shouldRightOpen, dockedOverview });
+    return {
+      from: init,
+      to: init,
+      base: init,
+      viewportWidth: vw,
+      durationMs: 260,
+    };
+  });
   const motionRef = useRef(motion);
   motionRef.current = motion;
 
-  // Synchronously adjust motion state during render so React never paints a stale `idle` frame before `prep`
+  // Synchronously adjust motion state during render on panel toggle so React never paints a stale frame
   if (toggleSig !== committedSig) {
+    const currentV = typeof window !== "undefined" ? window.innerWidth : viewportWidthRef.current;
+    viewportWidthRef.current = currentV;
+
+    const prevFlags = committedFlags;
+    const nextFlags: CommittedToggleFlags = {
+      sidebarOpen,
+      shouldRightOpen,
+      dockedOverview,
+      hasActiveSession,
+    };
     setCommittedSig(toggleSig);
+    setCommittedFlags(nextFlags);
 
     const prefersReducedMotion =
       typeof window !== "undefined" &&
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
-    if (prefersReducedMotion || isResizing) {
-      setCommittedTarget(target);
+    const nextTarget = snapshotTupleFor(currentV, nextFlags);
+    const prevFrom =
+      phase === "playing" ? motion.to : snapshotTupleFor(currentV, prevFlags);
+
+    // Switching between views (e.g. New Conversation <-> Session, or Automations <-> Session)
+    // mounts a different page rather than toggling Overview on the current conversation.
+    const onlyViewPresenceChanged =
+      hasActiveSession !== prevFlags.hasActiveSession &&
+      sidebarOpen === prevFlags.sidebarOpen &&
+      shouldRightOpen === prevFlags.shouldRightOpen;
+
+    if (prefersReducedMotion || isResizing || onlyViewPresenceChanged) {
       setPhase("idle");
     } else if (
       phase === "playing" &&
-      target.L === motion.from.L &&
-      target.W === motion.from.W &&
-      target.D === motion.from.D
+      nextTarget.L === motion.from.L &&
+      nextTarget.W === motion.from.W &&
+      nextTarget.D === motion.from.D
     ) {
       const openingAny =
-        target.L > motion.to.L || target.W > motion.to.W || target.D > motion.to.D;
-      const reversed: ShellMotionSnapshot = {
+        nextTarget.L > motion.to.L || nextTarget.W > motion.to.W || nextTarget.D > motion.to.D;
+      setMotion({
         from: motion.to,
-        to: target,
+        to: nextTarget,
         base: motion.base,
+        viewportWidth: currentV,
         durationMs: openingAny ? 260 : 225,
-      };
-      setMotion(reversed);
-      setCommittedTarget(target);
+      });
+    } else if (
+      prevFrom.L === nextTarget.L &&
+      prevFrom.W === nextTarget.W &&
+      prevFrom.D === nextTarget.D
+    ) {
+      setPhase("idle");
     } else {
-      const prevFrom = phase === "playing" ? motion.to : committedTarget;
-      if (prevFrom.L === target.L && prevFrom.W === target.W && prevFrom.D === target.D) {
-        setCommittedTarget(target);
-        setPhase("idle");
-      } else {
-        const base: ShellGeometryTuple = {
-          L: Math.min(prevFrom.L, target.L),
-          W: Math.min(prevFrom.W, target.W),
-          D: Math.min(prevFrom.D, target.D),
-        };
-        const openingAny =
-          target.L > prevFrom.L || target.W > prevFrom.W || target.D > prevFrom.D;
-        const durationMs = openingAny ? 260 : 225;
-        setMotion({
-          from: prevFrom,
-          to: target,
-          base,
-          durationMs,
-        });
-        setPhase("prep");
-      }
+      const base: ShellGeometryTuple = {
+        L: Math.min(prevFrom.L, nextTarget.L),
+        W: Math.min(prevFrom.W, nextTarget.W),
+        D: Math.min(prevFrom.D, nextTarget.D),
+      };
+      const openingAny =
+        nextTarget.L > prevFrom.L || nextTarget.W > prevFrom.W || nextTarget.D > prevFrom.D;
+      setMotion({
+        from: prevFrom,
+        to: nextTarget,
+        base,
+        viewportWidth: currentV,
+        durationMs: openingAny ? 260 : 225,
+      });
+      setPhase("prep");
     }
-  } else if (
-    phase === "idle" &&
-    (committedTarget.L !== target.L ||
-      committedTarget.W !== target.W ||
-      committedTarget.D !== target.D)
-  ) {
-    setCommittedTarget(target);
+  } else if (hasActiveSession !== committedFlags.hasActiveSession) {
+    setCommittedFlags({
+      sidebarOpen,
+      shouldRightOpen,
+      dockedOverview,
+      hasActiveSession,
+    });
   }
 
   const raf1Ref = useRef<number | null>(null);
@@ -315,7 +440,6 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     fallbackTimerRef.current = window.setTimeout(() => {
       fallbackTimerRef.current = null;
       if (phaseRef.current === "playing") {
-        setCommittedTarget(motionRef.current.to);
         setPhase("idle");
       }
     }, durationMs + 65);
@@ -328,7 +452,6 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       if (resizing && phaseRef.current !== "idle") {
         cancelPendingMotion();
         setCommittedSig(toggleSigRef.current);
-        setCommittedTarget(targetRef.current);
         setPhase("idle");
       }
     },
@@ -342,7 +465,6 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       if (resizing && phaseRef.current !== "idle") {
         cancelPendingMotion();
         setCommittedSig(toggleSigRef.current);
-        setCommittedTarget(targetRef.current);
         setPhase("idle");
       }
     },
@@ -358,7 +480,6 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
         raf1Ref.current = null;
         raf2Ref.current = window.requestAnimationFrame(() => {
           raf2Ref.current = null;
-          setCommittedTarget(motionRef.current.to);
           setPhase("playing");
         });
       });
@@ -385,7 +506,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       if (phaseRef.current !== "playing") return;
       const m = motionRef.current;
       const { isFluidWidthMotion, prepShiftPx, playingShiftPx } = computeStageMotionGeometry(
-        viewportWidthRef.current,
+        m.viewportWidth,
         m,
       );
       if (axis === "stage" && isFluidWidthMotion) {
@@ -394,8 +515,6 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
         return;
       }
       const stageMoved = !isFluidWidthMotion && Math.abs(playingShiftPx - prepShiftPx) > 0.5;
-      // In pure-GPU mode wait for stage transform; in fluid-width mode wait for the sliding panel
-      // (or viewport padding-right when only the Overview card toggled).
       const expectedAxis: "left" | "right" | "stage" = stageMoved
         ? "stage"
         : m.from.W !== m.to.W
@@ -409,7 +528,6 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
         window.clearTimeout(fallbackTimerRef.current);
         fallbackTimerRef.current = null;
       }
-      setCommittedTarget(m.to);
       setPhase("idle");
     },
     [],
@@ -428,10 +546,27 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     [handleAxisTransitionEnd],
   );
 
+  // Pure CSS custom properties on the shell wrapper drive 100% of window resize & sash drag
+  // geometry natively in WebKit C++ with ZERO child React re-renders!
+  const shellCssVars = useMemo(
+    () =>
+      buildWorkspaceShellCssVars({
+        sidebarOpen,
+        sidebarPrefWidth: sidebarWidth,
+        sidePanelOpen: shouldRightOpen,
+        sidePanelPrefWidth: sidePanelWidth,
+      }),
+    [sidebarOpen, sidebarWidth, shouldRightOpen, sidePanelWidth],
+  );
+
+  // Notice `sidebarWidth`, `sidePanelWidth`, and `viewportWidth` are intentionally NOT dependencies
+  // of this context value: while `phase === "idle"`, all width/reserve values are stable CSS
+  // custom-property expressions (`var(--orbit-left-w)`, `var(--orbit-right-w)`), so dragging
+  // sashes or resizing the window never invalidates this context or re-renders Stage / TopBar / SidePanel!
   const value = useMemo<WorkspaceMotionContextValue>(() => {
-    const V = viewportWidth;
     const isAnimating = phase !== "idle";
     const m = motion;
+    const V = m.viewportWidth;
 
     const xTitle = (l: number) => l + (l > 0 ? 16 : isMac ? 114 : 48);
     const xTopRight = (w: number) => V - w - (w > 0 ? 12 : hasSelectedHost ? 42 : 12);
@@ -439,25 +574,36 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     const stageGeom = phase === "idle" ? null : computeStageMotionGeometry(V, m);
     const isFluidWidthMotion = Boolean(stageGeom?.isFluidWidthMotion);
 
-    const leftLayoutReservePx =
+    const leftWidthCss =
       phase === "idle"
-        ? target.L
-        : isFluidWidthMotion
-          ? phase === "prep"
-            ? m.from.L
-            : m.to.L
-          : m.base.L;
-    const rightLayoutReservePx =
+        ? "var(--orbit-left-w)"
+        : `${Math.max(m.from.L, m.to.L)}px`;
+    const panelWidthCss =
       phase === "idle"
-        ? target.W
+        ? "var(--orbit-right-w)"
+        : `${Math.max(m.from.W, m.to.W)}px`;
+
+    const leftLayoutReserveCss =
+      phase === "idle"
+        ? sidebarOpen
+          ? "var(--orbit-left-w)"
+          : "0px"
         : isFluidWidthMotion
-          ? phase === "prep"
-            ? m.from.W
-            : m.to.W
-          : m.base.W;
+          ? `${phase === "prep" ? m.from.L : m.to.L}px`
+          : `${m.base.L}px`;
+    const rightLayoutReserveCss =
+      phase === "idle"
+        ? shouldRightOpen
+          ? "var(--orbit-right-w)"
+          : "0px"
+        : isFluidWidthMotion
+          ? `${phase === "prep" ? m.from.W : m.to.W}px`
+          : `${m.base.W}px`;
     const overviewReservePx =
       phase === "idle"
-        ? target.D
+        ? dockedOverview
+          ? 324
+          : 0
         : isFluidWidthMotion
           ? phase === "prep"
             ? m.from.D
@@ -470,73 +616,97 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
         ? `padding-left ${m.durationMs}ms ${PANEL_EASE}, padding-right ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
     const overviewReserveTransition =
-      !isResizing && phase === "playing" && isFluidWidthMotion && m.from.D !== m.to.D
+      !isResizing && phase === "playing" && isFluidWidthMotion
         ? `padding-right ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
-    const leftVisible = phase === "idle" ? target.L > 0 : m.from.L > 0 || m.to.L > 0;
-    const leftShown =
-      phase === "idle" ? target.L > 0 : phase === "prep" ? m.from.L > 0 : m.to.L > 0;
-    const leftTransform = leftShown ? "translate3d(0, 0, 0)" : "translate3d(-100%, 0, 0)";
+    const leftVisible =
+      phase === "idle" ? sidebarOpen : m.from.L > 0 || m.to.L > 0;
+    const leftIsIn =
+      phase === "idle" ? sidebarOpen : phase === "prep" ? m.from.L > 0 : m.to.L > 0;
+    const leftTransform = leftIsIn ? "translate3d(0, 0, 0)" : "translate3d(-100%, 0, 0)";
     const leftTransition =
       !isResizing && phase === "playing" && m.from.L !== m.to.L
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
-    const rightVisible = phase === "idle" ? target.W > 0 : m.from.W > 0 || m.to.W > 0;
-    const isRightSettledOpen = phase === "idle" && target.W > 0;
-    const rightShown =
-      phase === "idle" ? target.W > 0 : phase === "prep" ? m.from.W > 0 : m.to.W > 0;
-    const rightTransform = rightShown ? "translate3d(0, 0, 0)" : "translate3d(100%, 0, 0)";
+    const rightVisible =
+      phase === "idle" ? shouldRightOpen : m.from.W > 0 || m.to.W > 0;
+    const isRightSettledOpen = shouldRightOpen && phase === "idle";
+    const rightIsIn =
+      phase === "idle" ? shouldRightOpen : phase === "prep" ? m.from.W > 0 : m.to.W > 0;
+    const rightTransform = rightIsIn ? "translate3d(0, 0, 0)" : "translate3d(100%, 0, 0)";
     const rightTransition =
       !isResizing && phase === "playing" && m.from.W !== m.to.W
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
-    const topbarUseOpenLeftPad = leftLayoutReservePx > 0;
-    const topbarReserveRightToggle = hasSelectedHost && rightLayoutReservePx === 0;
+    const topbarUseOpenLeftPad =
+      phase === "idle"
+        ? sidebarOpen
+        : isFluidWidthMotion
+          ? phase === "prep"
+            ? m.from.L > 0
+            : m.to.L > 0
+          : m.base.L > 0;
+    const topbarReserveRightToggle =
+      hasSelectedHost &&
+      (phase === "idle"
+        ? !shouldRightOpen
+        : isFluidWidthMotion
+          ? phase === "prep"
+            ? m.from.W === 0
+            : m.to.W === 0
+          : m.base.W === 0);
     const topbarPaddingTransition =
       !isResizing && phase === "playing" && isFluidWidthMotion
         ? `padding-left ${m.durationMs}ms ${PANEL_EASE}, padding-right ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
+    const baseTitleX = xTitle(m.base.L);
     const topbarTitleOffsetPx =
       phase === "idle" || isFluidWidthMotion
         ? 0
-        : (phase === "prep" ? xTitle(m.from.L) : xTitle(m.to.L)) - xTitle(m.base.L);
+        : phase === "prep"
+          ? xTitle(m.from.L) - baseTitleX
+          : xTitle(m.to.L) - baseTitleX;
     const topbarTitleTransition =
-      !isResizing && !isFluidWidthMotion && phase === "playing" && m.from.L !== m.to.L
+      !isResizing && phase === "playing" && !isFluidWidthMotion && m.from.L !== m.to.L
+        ? `transform ${m.durationMs}ms ${PANEL_EASE}`
+        : "none";
+
+    const baseRightX = xTopRight(m.base.W);
+    const topbarRightOffsetPx =
+      phase === "idle" || isFluidWidthMotion
+        ? 0
+        : phase === "prep"
+          ? xTopRight(m.from.W) - baseRightX
+          : xTopRight(m.to.W) - baseRightX;
+    const topbarRightTransition =
+      !isResizing && phase === "playing" && !isFluidWidthMotion && m.from.W !== m.to.W
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
     const outlineOffsetPx =
       phase === "idle" || isFluidWidthMotion
         ? 0
-        : (phase === "prep" ? m.from.L : m.to.L) - m.base.L;
+        : phase === "prep"
+          ? m.from.L - m.base.L
+          : m.to.L - m.base.L;
     const outlineTransition =
-      !isResizing && !isFluidWidthMotion && phase === "playing" && m.from.L !== m.to.L
+      !isResizing && phase === "playing" && !isFluidWidthMotion && m.from.L !== m.to.L
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
         : "none";
 
-    const topbarRightOffsetPx =
+    const prepShiftPx = stageGeom?.prepShiftPx ?? 0;
+    const playingShiftPx = stageGeom?.playingShiftPx ?? 0;
+    const stageMoved = !isFluidWidthMotion && Math.abs(playingShiftPx - prepShiftPx) > 0.5;
+    const stageShiftPx =
       phase === "idle" || isFluidWidthMotion
         ? 0
-        : (phase === "prep" ? xTopRight(m.from.W) : xTopRight(m.to.W)) - xTopRight(m.base.W);
-    const topbarRightTransition =
-      !isResizing && !isFluidWidthMotion && phase === "playing" && m.from.W !== m.to.W
-        ? `transform ${m.durationMs}ms ${PANEL_EASE}`
-        : "none";
-
-    const stageShiftPx =
-      stageGeom === null || isFluidWidthMotion
-        ? 0
         : phase === "prep"
-          ? stageGeom.prepShiftPx
-          : stageGeom.playingShiftPx;
-    const stageMoved =
-      stageGeom !== null &&
-      !isFluidWidthMotion &&
-      Math.abs(stageGeom.playingShiftPx - stageGeom.prepShiftPx) > 0.5;
+          ? prepShiftPx
+          : playingShiftPx;
     const stageTransition =
       !isResizing && phase === "playing" && stageMoved
         ? `transform ${m.durationMs}ms ${PANEL_EASE}`
@@ -544,21 +714,28 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
     const stageMaxContentWidthPx = stageGeom?.stageMaxContentWidthPx ?? null;
 
     const dockedOverviewMounted =
-      phase === "idle" ? target.D > 0 : m.from.D > 0 || m.to.D > 0;
+      phase === "idle" ? dockedOverview : m.from.D > 0 || m.to.D > 0;
     const dockedOverviewVisualOpen =
-      phase === "idle" ? target.D > 0 : phase === "prep" ? m.from.D > 0 : m.to.D > 0;
+      phase === "idle" ? dockedOverview : phase === "prep" ? m.from.D > 0 : m.to.D > 0;
 
-    let dockedOverviewOffsetPx = -target.W;
-    if (phase === "prep") {
-      dockedOverviewOffsetPx =
-        m.from.D > 0 ? -m.from.W : -m.to.W + (m.to.W < m.from.W ? 16 : 12);
-    } else if (phase === "playing") {
-      dockedOverviewOffsetPx =
-        m.to.D > 0
-          ? -m.to.W
-          : m.to.W > m.from.W
-            ? -m.from.W - 40
-            : -m.from.W + 12;
+    let dockedOverviewTransform: string;
+    if (phase === "idle") {
+      dockedOverviewTransform = shouldRightOpen
+        ? "translate3d(calc(var(--orbit-right-w) * -1), 0, 0) scale(1)"
+        : "translate3d(0, 0, 0) scale(1)";
+    } else {
+      let offsetPx = -m.to.W;
+      if (phase === "prep") {
+        offsetPx = m.from.D > 0 ? -m.from.W : -m.to.W + (m.to.W < m.from.W ? 16 : 12);
+      } else {
+        offsetPx =
+          m.to.D > 0
+            ? -m.to.W
+            : m.to.W > m.from.W
+              ? -m.from.W - 40
+              : -m.from.W + 12;
+      }
+      dockedOverviewTransform = `translate3d(${offsetPx}px, 0, 0) scale(${dockedOverviewVisualOpen ? 1 : 0.985})`;
     }
 
     let dockedOverviewTransition = "none";
@@ -567,7 +744,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
         dockedOverviewTransition = `transform ${m.durationMs}ms ${PANEL_EASE}`;
       } else if (m.to.D > 0) {
         dockedOverviewTransition = `transform ${m.durationMs}ms ${PANEL_EASE}, ${OVERVIEW_OPACITY_IN}`;
-      } else {
+      } else if (m.from.D > 0) {
         dockedOverviewTransition = `transform ${m.durationMs}ms ${PANEL_EASE}, ${OVERVIEW_OPACITY_OUT}`;
       }
     }
@@ -578,9 +755,10 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       isResizing,
       hasSelectedHost,
       shouldRightOpen,
-      panelWidthPx,
-      leftLayoutReservePx,
-      rightLayoutReservePx,
+      leftWidthCss,
+      panelWidthCss,
+      leftLayoutReserveCss,
+      rightLayoutReserveCss,
       shellReserveTransition,
       overviewReservePx,
       overviewReserveTransition,
@@ -608,7 +786,7 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       isStageWide,
       dockedOverviewMounted,
       dockedOverviewVisualOpen,
-      dockedOverviewOffsetPx,
+      dockedOverviewTransform,
       dockedOverviewTransition,
       setIsResizingLeft,
       setIsResizingRight,
@@ -617,14 +795,13 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
       onStageTransitionEnd,
     };
   }, [
-    viewportWidth,
     phase,
     motion,
-    target,
+    sidebarOpen,
+    shouldRightOpen,
+    dockedOverview,
     isMac,
     hasSelectedHost,
-    shouldRightOpen,
-    panelWidthPx,
     isResizing,
     canDockOverview,
     isStageWide,
@@ -636,7 +813,11 @@ export function WorkspaceMotionProvider({ children }: { children: ReactNode }) {
   ]);
 
   return (
-    <WorkspaceMotionContext.Provider value={value}>{children}</WorkspaceMotionContext.Provider>
+    <WorkspaceMotionContext.Provider value={value}>
+      <div style={shellCssVars} className="relative h-screen w-screen overflow-clip">
+        {children}
+      </div>
+    </WorkspaceMotionContext.Provider>
   );
 }
 

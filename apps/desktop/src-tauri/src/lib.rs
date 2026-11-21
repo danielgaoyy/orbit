@@ -49,7 +49,7 @@ use orbit_client_core::desktop_ops::{
 };
 use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
 use orbit_client_core::sidebar::FleetSidebarView;
-use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView};
+use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentProfile, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
@@ -1168,6 +1168,22 @@ fn get_provider_subagent_timeline(
 }
 
 #[tauri::command]
+fn get_provider_subagent_turns(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    parent_agent_id: String,
+    subagent_id: String,
+    fallback_prompt: Option<String>,
+) -> Vec<StageTurnView> {
+    state.core.provider_subagent_turns(
+        &host_id,
+        &parent_agent_id,
+        &subagent_id,
+        fallback_prompt.as_deref(),
+    )
+}
+
+#[tauri::command]
 fn refresh_pending_permissions(state: State<'_, DesktopAppState>, host_id: String) {
     state.core.refresh_pending_permissions(&host_id);
 }
@@ -2131,6 +2147,7 @@ pub fn run() {
             list_provider_subagents,
             open_provider_subagent_timeline,
             get_provider_subagent_timeline,
+            get_provider_subagent_turns,
             refresh_pending_permissions,
             rewind_agent,
             resolve_permission,

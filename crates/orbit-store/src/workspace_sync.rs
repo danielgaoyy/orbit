@@ -10,9 +10,23 @@ use orbit_protocol::{
 use rusqlite::{OptionalExtension, params};
 
 use crate::{
-    AGENT_SELECT_COLS, OrbitStore, StoreError, WORKSPACE_SELECT_COLS, map_agent_row,
-    map_workspace_row, parse_ts,
+    AGENT_SELECT_COLS, OrbitStore, StoreError, WORKSPACE_SELECT_COLS,
+    load_queued_prompts_for_agent, map_agent_row, map_workspace_row, parse_ts,
 };
+
+fn query_agent_with_queue(
+    tx: &rusqlite::Transaction<'_>,
+    agent_id: &str,
+) -> Result<Option<AgentSummary>, StoreError> {
+    let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
+    let mut updated = tx
+        .query_row(&select_sql, params![agent_id], map_agent_row)
+        .optional()?;
+    if let Some(ref mut ag) = updated {
+        ag.queued_prompts = load_queued_prompts_for_agent(tx, &ag.agent_id)?;
+    }
+    Ok(updated)
+}
 
 /// Compact context extracted from an agent's timeline for AI semantic summarization and triage.
 #[derive(Debug, Clone, Default)]
@@ -149,10 +163,7 @@ impl OrbitStore {
                 params![target_seq, next_attention, agent_id],
             )?;
         }
-        let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
-        let updated = tx
-            .query_row(&select_sql, params![agent_id], map_agent_row)
-            .optional()?;
+        let updated = query_agent_with_queue(&tx, agent_id)?;
         if changed {
             tx.commit()?;
         }
@@ -176,10 +187,7 @@ impl OrbitStore {
         if rows == 0 {
             return Ok(None);
         }
-        let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
-        let updated = tx
-            .query_row(&select_sql, params![agent_id], map_agent_row)
-            .optional()?;
+        let updated = query_agent_with_queue(&tx, agent_id)?;
         tx.commit()?;
         Ok(updated)
     }
@@ -205,10 +213,7 @@ impl OrbitStore {
         if rows == 0 {
             return Ok(None);
         }
-        let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
-        let updated = tx
-            .query_row(&select_sql, params![agent_id], map_agent_row)
-            .optional()?;
+        let updated = query_agent_with_queue(&tx, agent_id)?;
         tx.commit()?;
         Ok(updated)
     }
@@ -232,10 +237,7 @@ impl OrbitStore {
         if rows == 0 {
             return Ok(None);
         }
-        let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
-        let updated = tx
-            .query_row(&select_sql, params![agent_id], map_agent_row)
-            .optional()?;
+        let updated = query_agent_with_queue(&tx, agent_id)?;
         tx.commit()?;
         Ok(updated)
     }
@@ -256,10 +258,7 @@ impl OrbitStore {
         if rows == 0 {
             return Ok(None);
         }
-        let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
-        let updated = tx
-            .query_row(&select_sql, params![agent_id], map_agent_row)
-            .optional()?;
+        let updated = query_agent_with_queue(&tx, agent_id)?;
         tx.commit()?;
         Ok(updated)
     }
@@ -296,10 +295,7 @@ impl OrbitStore {
             "UPDATE workspaces SET updated_at = ?1 WHERE workspace_id = ?2",
             params![now, target_workspace_id],
         )?;
-        let select_sql = format!("SELECT {AGENT_SELECT_COLS} FROM agents WHERE agent_id = ?1");
-        let updated = tx
-            .query_row(&select_sql, params![agent_id], map_agent_row)
-            .optional()?;
+        let updated = query_agent_with_queue(&tx, agent_id)?;
         tx.commit()?;
         Ok(updated)
     }

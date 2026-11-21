@@ -671,7 +671,7 @@ public final class OrbitIosStore: ObservableObject {
         do {
             let instance: OrbitMobileCore
             do {
-                instance = try OrbitMobileCore.openWithOptions(dbPath: dbPath, autoDiscoverLocal: true)
+                instance = try OrbitMobileCore.openWithOptions(dbPath: dbPath, autoDiscoverLocal: false)
             } catch let openError {
                 NSLog("[OrbitIosStore] Failed to open SQLite at %@: %@ — falling back to in-memory store", dbPath, openError.localizedDescription)
                 self.lastError = "Storage fallback active: \(openError.localizedDescription)"

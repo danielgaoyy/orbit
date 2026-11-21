@@ -359,6 +359,8 @@ fn matches_agent_query(agent: &AgentCardView, q_lower: &str) -> bool {
 pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
     let q_lower = params.query.trim().to_lowercase();
     let mut all_groups: Vec<SidebarProjectGroupView> = Vec::new();
+    let mut fallback_discovered_groups: Vec<SidebarProjectGroupView> = Vec::new();
+    let mut has_any_real_project = false;
     let mut launchpad_projects: Vec<LaunchpadProjectView> = Vec::new();
     let mut needs_attention: Vec<SidebarConversationView> = Vec::new();
     let mut pinned_with_order: Vec<(i64, SidebarConversationView)> = Vec::new();
@@ -814,8 +816,13 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 .push(ws);
         }
 
-        // 3. Fallback discovered repositories when host has neither pinned projects nor active sessions
-        if host_groups.is_empty() {
+        // 3. Collect fallback discovered repositories only for hosts with neither pinned projects
+        //    nor active sessions/curated workspaces. These are ONLY surfaced later when the ENTIRE
+        //    fleet has zero real projects (first-time onboarding), so adding a fresh unused host
+        //    never floods an already-populated multi-host sidebar with auto-scanned directories.
+        if !host_groups.is_empty() {
+            has_any_real_project = true;
+        } else {
             let mut added = 0usize;
             for dp in host.discovered_projects {
                 if added >= 4 {
@@ -834,8 +841,8 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 } else {
                     dp.name.clone()
                 };
-                group_idx_by_id.insert(id.clone(), host_groups.len());
-                host_groups.push(SidebarProjectGroupView {
+                group_idx_by_id.insert(id.clone(), fallback_discovered_groups.len());
+                fallback_discovered_groups.push(SidebarProjectGroupView {
                     id: id.clone(),
                     host_id: host_id.to_string(),
                     name,
@@ -1203,6 +1210,23 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 );
             }
             launchpad_projects.extend(host_lp);
+        }
+    }
+
+    if !has_any_real_project && params.filter == SidebarThreadFilter::All {
+        for group in fallback_discovered_groups {
+            if !q_lower.is_empty() {
+                let proj_match = group.name.to_lowercase().contains(&q_lower)
+                    || group.primary_cwd.to_lowercase().contains(&q_lower)
+                    || group
+                        .git_branch
+                        .as_deref()
+                        .is_some_and(|b| b.to_lowercase().contains(&q_lower));
+                if !proj_match {
+                    continue;
+                }
+            }
+            all_groups.push(group);
         }
     }
 
@@ -2072,5 +2096,99 @@ mod tests {
         // Inside Secondary, workspaces & conversations still sort by recency
         assert_eq!(view.projects[1].workspaces[0].workspace_id, "ws_sec_new");
         assert_eq!(view.projects[1].workspaces[1].workspace_id, "ws_sec_old");
+    }
+
+    #[test]
+    fn multi_host_unused_host_does_not_flood_sidebar_with_discovered_projects() {
+        let pinned = vec![ClientProjectView {
+            project_id: "h_devbox::/home/ec2-user/go/src/mono_repo".into(),
+            host_id: "h_devbox".into(),
+            name: "mono_repo".into(),
+            directories: vec!["/home/ec2-user/go/src/mono_repo".into()],
+            updated_at_ms: 1_000,
+        }];
+        let local_discovered = vec![
+            DiscoveredProject {
+                path: "/Users/dev/code/mono_repo".into(),
+                name: "mono_repo".into(),
+                git_branch: Some("main".into()),
+                is_git_repo: true,
+                nested_git_repos: Vec::new(),
+                last_modified_unix: 400,
+            },
+            DiscoveredProject {
+                path: "/Users/dev/code/deepseek-harness".into(),
+                name: "deepseek-harness".into(),
+                git_branch: Some("main".into()),
+                is_git_repo: true,
+                nested_git_repos: Vec::new(),
+                last_modified_unix: 300,
+            },
+        ];
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+
+        // When another host already has real projects, an unused host's auto-discovered repos
+        // must NOT be injected into the main sidebar Projects list (they stay available in Launchpad).
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 8,
+            hosts: vec![
+                SidebarHostInput {
+                    host_id: "h_devbox",
+                    workspaces: &[],
+                    discovered_projects: &[],
+                    agents: Vec::new(),
+                    active_git_branch: None,
+                    git_repos_by_cwd: &empty_git_repos,
+                    workspace_conflict_ids: &empty_conflicts,
+                },
+                SidebarHostInput {
+                    host_id: "h_local",
+                    workspaces: &[],
+                    discovered_projects: &local_discovered,
+                    agents: Vec::new(),
+                    active_git_branch: None,
+                    git_repos_by_cwd: &empty_git_repos,
+                    workspace_conflict_ids: &empty_conflicts,
+                },
+            ],
+            pinned_projects: &pinned,
+            project_order: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h_local"),
+            active_agent_id: None,
+            active_cwd: None,
+        });
+
+        assert_eq!(view.projects.len(), 1);
+        assert_eq!(view.projects[0].host_id, "h_devbox");
+        assert_eq!(view.projects[0].name, "mono_repo");
+        // Launchpad for the selected host still surfaces its discovered directories.
+        assert_eq!(view.launchpad_projects.len(), 2);
+
+        // When the entire fleet has zero real projects, onboarding fallback still surfaces up to 4.
+        let onboarding = build_fleet_sidebar(FleetSidebarParams {
+            revision: 9,
+            hosts: vec![SidebarHostInput {
+                host_id: "h_local",
+                workspaces: &[],
+                discovered_projects: &local_discovered,
+                agents: Vec::new(),
+                active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
+            }],
+            pinned_projects: &[],
+            project_order: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h_local"),
+            active_agent_id: None,
+            active_cwd: None,
+        });
+        assert_eq!(onboarding.projects.len(), 2);
     }
 }

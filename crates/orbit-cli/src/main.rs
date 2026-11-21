@@ -172,6 +172,9 @@ enum Commands {
         /// Force reinstall even if already on the latest version.
         #[arg(long)]
         force: bool,
+        /// Also upgrade all connected remote Orbit hosts in the fleet mesh before upgrading this machine.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Auto-discover `~/.ssh/config` or attach to an E2EE Relay, auto-deploy via SSH if given an SSH alias, and print Pairing Code.
@@ -515,8 +518,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Upgrade { force } => {
-            self_upgrade_cli(&home_dir, force).await?;
+        Commands::Upgrade { force, all } => {
+            self_upgrade_cli(&home_dir, force, all).await?;
         }
 
         Commands::Quotas => {

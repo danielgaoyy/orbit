@@ -1,16 +1,21 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   AlertCircle,
+  Archive,
   ArrowUpRight,
   ChevronRight,
   CircleCheck,
   Clock,
   File,
   FileDiff,
+  Loader2,
+  Pencil,
+  Sparkles,
   Square,
   SquareTerminal,
   type LucideIcon,
 } from "lucide-react";
+import { useImeCompositionGuard } from "@/lib/ime";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -34,6 +39,7 @@ import {
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
   type OverviewSectionId,
+  isSubagentArchived,
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
@@ -183,6 +189,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
   currentAgent,
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const hostDetail = useOrbitSelector((s) => s.hostDetails[hostId] ?? null);
   const gitReview = useOrbitSelector((s) =>
     cwd ? (s.gitReviews[`${hostId}::${cwd}`] ?? null) : null,
@@ -190,6 +197,37 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const [stoppingBg, setStoppingBg] = useState(false);
+  const [editingSummary, setEditingSummary] = useState(false);
+  const [summaryDraft, setSummaryDraft] = useState("");
+  const [summarizing, setSummarizing] = useState(false);
+  const ime = useImeCompositionGuard();
+
+  const activeSummary = currentAgent?.task_summary?.trim() || "";
+
+  useEffect(() => {
+    setEditingSummary(false);
+  }, [agentId]);
+
+  const commitSummaryEdit = () => {
+    const clean = summaryDraft.trim();
+    setEditingSummary(false);
+    if (clean === activeSummary) return;
+    void orbitActions.updateAgentIdentity({
+      hostId,
+      agentId,
+      taskSummary: clean,
+    });
+  };
+
+  const triggerSummarize = async () => {
+    if (summarizing) return;
+    setSummarizing(true);
+    try {
+      await orbitActions.summarizeAgent(hostId, agentId);
+    } finally {
+      window.setTimeout(() => setSummarizing(false), 1200);
+    }
+  };
 
   const insights = baseInsights;
   const backgroundTasks = insights.background_tasks;
@@ -274,11 +312,29 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const [showAllSubagents, setShowAllSubagents] = useState(false);
   const [showAllTasks, setShowAllTasks] = useState(false);
 
+  const visibleInsightsSubagents = useMemo(
+    () =>
+      insights.subagents.filter(
+        (sa) =>
+          !isSubagentArchived(archivedSubagents, hostId, agentId, {
+            id: sa.id,
+            providerSubagentId: sa.provider_subagent_id,
+            childAgentId: sa.child_agent_id,
+          }),
+      ),
+    [insights.subagents, archivedSubagents, hostId, agentId],
+  );
+
   const orderedSubagents = useMemo(() => {
-    const running = insights.subagents.filter((s) => s.status === "running");
-    const rest = insights.subagents.filter((s) => s.status !== "running");
+    const running = visibleInsightsSubagents.filter((s) => s.status === "running");
+    const rest = visibleInsightsSubagents.filter((s) => s.status !== "running");
     return [...running, ...rest];
-  }, [insights.subagents]);
+  }, [visibleInsightsSubagents]);
+
+  const finishedSubagents = useMemo(
+    () => orderedSubagents.filter((s) => s.status !== "running"),
+    [orderedSubagents],
+  );
 
   const visibleSubagents = showAllSubagents ? orderedSubagents : orderedSubagents.slice(0, 1);
   const hiddenSubagentCount = Math.max(0, orderedSubagents.length - visibleSubagents.length);
@@ -294,11 +350,75 @@ const StageOverviewBody = memo(function StageOverviewBody({
 
   return (
     <div className="flex min-h-0 max-h-full flex-1 flex-col overflow-y-auto select-none">
-      {/* Layer 1: Primary Overview Shortcuts */}
+      {/* Layer 1: Primary Overview Shortcuts + Quiet Session Summary */}
       <div className="px-2.5 pt-2.5 pb-2">
-        <div className="flex h-[24px] items-center px-2 pb-0.5">
+        <div className="flex h-[24px] items-center justify-between px-2 pb-0.5">
           <span className="text-muted-foreground text-[12px] font-medium">Overview</span>
+          <SimpleTooltip label="AI 更新会话标签与摘要">
+            <button
+              type="button"
+              disabled={summarizing}
+              onClick={() => void triggerSummarize()}
+              className="text-muted-foreground/75 hover:text-foreground inline-flex h-[20px] w-[20px] cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-black/[0.05] disabled:opacity-45 dark:hover:bg-white/[0.07]"
+            >
+              {summarizing ? (
+                <Loader2 className="h-[11.5px] w-[11.5px] animate-spin text-sky-500" />
+              ) : (
+                <Sparkles className="h-[11.5px] w-[11.5px] stroke-[1.75]" />
+              )}
+            </button>
+          </SimpleTooltip>
         </div>
+
+        {(activeSummary || editingSummary) && (
+          <div className="group/ovsum mb-1.5 px-2 pt-0.5">
+            {editingSummary ? (
+              <input
+                autoFocus
+                value={summaryDraft}
+                onChange={(e) => setSummaryDraft(e.target.value)}
+                onBlur={commitSummaryEdit}
+                {...ime.compositionProps}
+                onKeyDown={(e) => {
+                  if (ime.shouldIgnoreKeyDown(e)) return;
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    commitSummaryEdit();
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    setEditingSummary(false);
+                  }
+                }}
+                placeholder="一句话概括此会话…"
+                className="bg-background text-foreground w-full rounded-md px-2 py-1 text-[11.5px] leading-snug outline-none ring-1 ring-sky-500/45"
+              />
+            ) : (
+              <div
+                onDoubleClick={() => {
+                  setSummaryDraft(activeSummary);
+                  setEditingSummary(true);
+                }}
+                title={`${activeSummary}\n双击编辑摘要`}
+                className="flex items-start justify-between gap-1.5 rounded-md py-0.5"
+              >
+                <p className="text-muted-foreground/90 line-clamp-2 text-[11.5px] leading-[1.45]">
+                  {activeSummary}
+                </p>
+                <button
+                  type="button"
+                  title="编辑摘要"
+                  onClick={() => {
+                    setSummaryDraft(activeSummary);
+                    setEditingSummary(true);
+                  }}
+                  className="text-muted-foreground hover:text-foreground mt-0.5 hidden h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] group-hover/ovsum:inline-flex dark:hover:bg-white/[0.08]"
+                >
+                  <Pencil className="h-[10px] w-[10px]" />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="space-y-0.5">
           <OverviewActionRow
@@ -358,61 +478,109 @@ const StageOverviewBody = memo(function StageOverviewBody({
         </div>
       </div>
 
-      {/* Layer 2: Subagents (progressive disclosure when present) */}
-      {insights.subagents.length > 0 && (
+      {/* Layer 2: Subagents (progressive disclosure when present; both managed & native archivable!) */}
+      {orderedSubagents.length > 0 && (
         <OverviewLayerSection
           id="subagents"
           label="Subagents"
-          count={insights.subagents.length}
+          count={orderedSubagents.length}
           collapsed={collapsedSections.subagents}
-          isRunning={insights.subagents.some((s) => s.status === "running")}
+          isRunning={orderedSubagents.some((s) => s.status === "running")}
         >
           {visibleSubagents.map((sa) => (
-            <Button
+            <div
               key={sa.id}
-              type="button"
-              variant="ghost"
-              size="sm"
-              title={sa.prompt_preview || sa.role}
-              onClick={() =>
-                orbitActions.openSubagentTab({
-                  callId: sa.id,
-                  role: sa.role,
-                  promptPreview: sa.prompt_preview,
-                  childAgentId: sa.child_agent_id,
-                  providerSubagentId: sa.provider_subagent_id ?? null,
-                  parentAgentId: agentId,
-                })
-              }
-              className="text-foreground/86 hover:bg-accent/65 hover:text-foreground h-[32px] w-full justify-start gap-2.5 rounded-[8px] px-2 text-[13px] font-normal shadow-none transition-colors"
+              className="group/sa hover:bg-accent/65 flex h-[32px] w-full items-center gap-1 rounded-[8px] pr-1 transition-colors"
             >
-              <span className="flex size-[15px] shrink-0 items-center justify-center">
-                {sa.status === "running" ? (
-                  <OrbitSpinner size={13.5} className="text-foreground/70" />
-                ) : sa.status === "completed" ? (
-                  <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
-                ) : (
-                  <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
-                )}
-              </span>
-              <span
-                className={cn(
-                  "truncate leading-[18px]",
-                  sa.status === "running" && "agent-text-shimmer",
-                )}
+              <button
+                type="button"
+                title={sa.prompt_preview || sa.role}
+                onClick={() =>
+                  orbitActions.openSubagentTab({
+                    callId: sa.id,
+                    role: sa.role,
+                    promptPreview: sa.prompt_preview,
+                    childAgentId: sa.child_agent_id,
+                    providerSubagentId: sa.provider_subagent_id ?? null,
+                    parentAgentId: agentId,
+                  })
+                }
+                className="text-foreground/86 hover:text-foreground flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2.5 pl-2 text-left text-[13px] font-normal"
               >
-                {sa.role}
-              </span>
-            </Button>
+                <span className="flex size-[15px] shrink-0 items-center justify-center">
+                  {sa.status === "running" ? (
+                    <OrbitSpinner size={13.5} className="text-foreground/70" />
+                  ) : sa.status === "completed" ? (
+                    <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
+                  ) : (
+                    <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
+                  )}
+                </span>
+                <span
+                  className={cn(
+                    "truncate leading-[18px]",
+                    sa.status === "running" && "agent-text-shimmer",
+                  )}
+                >
+                  {sa.role}
+                </span>
+              </button>
+
+              <SimpleTooltip label="归档并隐藏此子代理">
+                <button
+                  type="button"
+                  aria-label={`Archive subagent ${sa.role}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    orbitActions.archiveSubagent(hostId, agentId, {
+                      id: sa.id,
+                      providerSubagentId: sa.provider_subagent_id ?? null,
+                      childAgentId: sa.child_agent_id ?? null,
+                      role: sa.role,
+                    });
+                  }}
+                  className="text-muted-foreground hover:text-foreground hidden size-[22px] shrink-0 cursor-pointer items-center justify-center rounded-[6px] transition-colors hover:bg-black/[0.06] group-hover/sa:inline-flex dark:hover:bg-white/[0.08]"
+                >
+                  <Archive className="size-[12.5px] stroke-[1.75]" />
+                </button>
+              </SimpleTooltip>
+            </div>
           ))}
-          {orderedSubagents.length > 1 && (
-            <button
-              type="button"
-              onClick={() => setShowAllSubagents((v) => !v)}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex h-[26px] w-full cursor-pointer items-center justify-center rounded-[8px] text-[11.5px] font-medium transition-colors"
-            >
-              {showAllSubagents ? "Show less" : `Show ${hiddenSubagentCount} more`}
-            </button>
+          {(orderedSubagents.length > 1 || finishedSubagents.length > 0) && (
+            <div className="flex items-center justify-between gap-1 pt-0.5">
+              {orderedSubagents.length > 1 ? (
+                <button
+                  type="button"
+                  onClick={() => setShowAllSubagents((v) => !v)}
+                  className="text-muted-foreground hover:text-foreground hover:bg-accent/55 flex h-[24px] flex-1 cursor-pointer items-center justify-center rounded-[7px] text-[11.5px] font-medium transition-colors"
+                >
+                  {showAllSubagents ? "Show less" : `Show ${hiddenSubagentCount} more`}
+                </button>
+              ) : (
+                <span className="flex-1" />
+              )}
+              {finishedSubagents.length > 0 && (
+                <button
+                  type="button"
+                  title="归档全部已完成的子代理（含原生子代理）"
+                  onClick={() =>
+                    orbitActions.archiveFinishedSubagents(
+                      hostId,
+                      agentId,
+                      finishedSubagents.map((s) => ({
+                        id: s.id,
+                        providerSubagentId: s.provider_subagent_id ?? null,
+                        childAgentId: s.child_agent_id ?? null,
+                      })),
+                    )
+                  }
+                  className="text-muted-foreground/80 hover:text-foreground hover:bg-accent/55 inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-[7px] px-2 text-[11px] transition-colors"
+                >
+                  <Archive className="size-[11px]" />
+                  <span>归档已完成 ({finishedSubagents.length})</span>
+                </button>
+              )}
+            </div>
           )}
         </OverviewLayerSection>
       )}

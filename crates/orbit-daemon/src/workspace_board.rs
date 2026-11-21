@@ -136,7 +136,7 @@ pub fn build_workspace_roster_context(
 
     let active_peers: Vec<&AgentSummary> = peers
         .iter()
-        .filter(|a| a.archived_at.is_none() && !a.background)
+        .filter(|a| a.archived_at.is_none() && !a.background && a.parent_agent_id.is_none())
         .collect();
     let has_other_peers = active_peers.iter().any(|a| a.agent_id != current_agent_id);
     let has_board = board.is_some_and(|b| !b.content.trim().is_empty());

@@ -1,6 +1,8 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  Archive,
+  ArrowLeft,
   Check,
   ChevronDown,
   Columns2,
@@ -13,7 +15,6 @@ import {
   Pencil,
   Plus,
   Sparkles,
-  Undo2,
   Users,
   X,
 } from "lucide-react";
@@ -69,8 +70,6 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
   const [newWsTitle, setNewWsTitle] = useState("");
   const [editingPeerId, setEditingPeerId] = useState<string | null>(null);
   const [peerHandleDraft, setPeerHandleDraft] = useState("");
-  const [editingSummary, setEditingSummary] = useState(false);
-  const [summaryDraft, setSummaryDraft] = useState("");
   const [summarizing, setSummarizing] = useState(false);
 
   const [spawnOpen, setSpawnOpen] = useState(false);
@@ -98,6 +97,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
 
   const peers = useMemo(() => {
     if (!hostDetail || !activeAgent) return [];
+    if (activeAgent.parent_agent_id) {
+      return [];
+    }
     if (!isCuratedWorkspace) {
       return [activeAgent];
     }
@@ -106,7 +108,8 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
         (a) =>
           a.workspace_id === activeAgent.workspace_id &&
           !a.archived_at_rfc3339 &&
-          !a.background,
+          !a.background &&
+          !a.parent_agent_id,
       )
       .sort((a, b) => a.updated_at_rfc3339.localeCompare(b.updated_at_rfc3339));
   }, [hostDetail, activeAgent, isCuratedWorkspace]);
@@ -114,6 +117,22 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
   const rootCwd =
     workspace?.project_root || workspace?.source_cwd || workspace?.cwd || activeAgent?.cwd || "";
   const normRootCwd = normalizeProjectPath(rootCwd);
+
+  const projectUnclassifiedCount = useMemo(() => {
+    if (!hostDetail || !activeAgent) return 0;
+    const wsCuratedById = new Map(hostDetail.workspaces.map((w) => [w.workspace_id, w]));
+    return hostDetail.agents.filter((a) => {
+      if (a.archived_at_rfc3339 || a.background || a.parent_agent_id) return false;
+      const w = wsCuratedById.get(a.workspace_id);
+      if (w?.is_curated) return false;
+      const wRoot = normalizeProjectPath(w?.project_root || w?.source_cwd || w?.cwd || a.cwd);
+      return (
+        wRoot === normRootCwd ||
+        wRoot.startsWith(`${normRootCwd}/`) ||
+        normRootCwd.startsWith(`${wRoot}/`)
+      );
+    }).length;
+  }, [hostDetail, activeAgent, normRootCwd]);
 
   const projectCuratedWorkspaces = useMemo(() => {
     if (!hostDetail || !activeAgent) return [];
@@ -165,7 +184,6 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
 
   useEffect(() => {
     setEditingPeerId(null);
-    setEditingSummary(false);
   }, [selectedAgentId]);
 
   if (
@@ -177,6 +195,52 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
     !hostDetail
   ) {
     return null;
+  }
+
+  // Subagent threads NEVER pollute Workspace Peer Tabs — show a clean dismissible subagent bar instead.
+  if (activeAgent.parent_agent_id) {
+    const parentHostId = activeAgent.parent_host_id ?? selectedHostId;
+    const parentAgent =
+      hostDetail.agents.find((a) => a.agent_id === activeAgent.parent_agent_id) ?? null;
+    return (
+      <div className="border-border/70 bg-canvas/95 z-10 flex h-[36px] shrink-0 items-center justify-between gap-2 border-b px-3 select-none">
+        <div className="flex min-w-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              if (activeAgent.parent_agent_id) {
+                orbitActions.selectAgent(parentHostId, activeAgent.parent_agent_id);
+              }
+            }}
+            className="text-foreground/85 hover:text-foreground inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] bg-black/[0.04] px-2 text-[12px] font-medium transition-colors hover:bg-black/[0.07] dark:bg-white/[0.06] dark:hover:bg-white/[0.10]"
+          >
+            <ArrowLeft className="h-[12.5px] w-[12.5px]" />
+            <span className="max-w-44 truncate">
+              返回主会话{parentAgent ? ` · ${semanticAgentTabLabel(parentAgent)}` : ""}
+            </span>
+          </button>
+          <span className="text-muted-foreground/80 truncate text-[12px]">
+            子代理：{semanticAgentTabLabel(activeAgent)}
+          </span>
+        </div>
+
+        <button
+          type="button"
+          title="归档此子代理并返回主会话"
+          onClick={() => {
+            const pid = activeAgent.parent_agent_id;
+            orbitActions.archiveThread(selectedHostId, activeAgent.agent_id);
+            if (pid) {
+              orbitActions.selectAgent(parentHostId, pid);
+            }
+          }}
+          className="text-muted-foreground hover:text-foreground inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-[7px] px-2 text-[12px] transition-colors hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
+        >
+          <Archive className="h-[12px] w-[12px]" />
+          <span>归档并关闭</span>
+        </button>
+      </div>
+    );
   }
 
   const suggestion = activeAgent.cluster_suggestion ?? null;
@@ -214,16 +278,6 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
       agentId: peerId,
       handle: clean,
       lockHandle: true,
-    });
-  };
-
-  const commitSummaryEdit = () => {
-    const clean = summaryDraft.trim();
-    setEditingSummary(false);
-    void orbitActions.updateAgentIdentity({
-      hostId: selectedHostId,
-      agentId: activeAgent.agent_id,
-      taskSummary: clean,
     });
   };
 
@@ -340,11 +394,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
     }
   };
 
-  const activeSummary = activeAgent.task_summary?.trim() || "";
-
   return (
-    <div className="border-border/80 bg-canvas/95 z-10 flex shrink-0 flex-col border-b select-none">
-      {/* Row 1: Always-on Workspace Switcher + Semantic Editable Agent Tabs + Actions */}
+    <div className="border-border/70 bg-canvas/95 z-10 flex shrink-0 flex-col border-b select-none">
+      {/* Single-Row Slim Header: Workspace Switcher + Optional Auto-Triage Pill + Semantic Peer Tabs + Actions */}
       <div className="flex h-[36px] items-center justify-between gap-2 px-3">
         {/* Left: Workspace Switcher & Manager Popover + Semantic Peer Tabs */}
         <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
@@ -383,6 +435,61 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
               finalFocus={false}
               className="w-[300px] space-y-2.5 p-3 select-none"
             >
+              {/* Manual AI Classify (Single & Batch) when Unclassified — clean inside popover, never flat on bar */}
+              {!isCuratedWorkspace && (
+                <div className="border-border/70 space-y-1 border-b pb-2.5">
+                  <button
+                    type="button"
+                    disabled={isOrganizing}
+                    onClick={() => {
+                      void orbitActions.organizeProjectWorkspaces(
+                        selectedHostId,
+                        rootCwd,
+                        [activeAgent.agent_id],
+                        true,
+                      );
+                      setWsSwitcherOpen(false);
+                    }}
+                    className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg bg-sky-500/[0.09] px-2.5 py-1.5 text-left text-[12px] font-medium text-sky-600 transition-colors hover:bg-sky-500/[0.15] disabled:opacity-55 dark:text-sky-400"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      {isOrganizing ? (
+                        <Loader2 className="h-[12.5px] w-[12.5px] animate-spin" />
+                      ) : (
+                        <Sparkles className="h-[12.5px] w-[12.5px]" />
+                      )}
+                      <span>AI 归类此会话</span>
+                    </span>
+                    <span className="text-[10.5px] font-normal opacity-75">单个</span>
+                  </button>
+
+                  {projectUnclassifiedCount > 1 && (
+                    <button
+                      type="button"
+                      disabled={isOrganizing}
+                      onClick={() => {
+                        void orbitActions.organizeProjectWorkspaces(
+                          selectedHostId,
+                          rootCwd,
+                          [],
+                          true,
+                        );
+                        setWsSwitcherOpen(false);
+                      }}
+                      className="text-muted-foreground hover:text-foreground hover:bg-accent flex w-full cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-1 text-left text-[11.5px] transition-colors disabled:opacity-55"
+                    >
+                      <span className="flex items-center gap-1.5">
+                        <Layers className="h-[12px] w-[12px]" />
+                        <span>AI 批量归类本项目全部待归类</span>
+                      </span>
+                      <span className="tabular-nums text-[11px] opacity-75">
+                        {projectUnclassifiedCount}
+                      </span>
+                    </button>
+                  )}
+                </div>
+              )}
+
               {/* Rename Current Curated Workspace */}
               {isCuratedWorkspace && workspace && (
                 <div className="border-border/70 space-y-1.5 border-b pb-2.5">
@@ -519,9 +626,33 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                 </div>
               </div>
 
-              {/* Return To Unclassified */}
-              {isCuratedWorkspace && (
-                <div className="border-border/70 border-t pt-2">
+              {/* Secondary Actions: Refresh AI Summary + Return To Unclassified */}
+              <div className="border-border/70 space-y-0.5 border-t pt-2">
+                {suggestion?.auto_applied && suggestion.reason && (
+                  <div className="text-muted-foreground/85 bg-muted/45 mb-1.5 rounded-md px-2 py-1.5 text-[11px] leading-snug">
+                    <span className="text-foreground/80 font-medium">AI 自动归类依据：</span>
+                    {suggestion.reason}
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  disabled={summarizing}
+                  onClick={() => {
+                    void triggerSummarize();
+                    setWsSwitcherOpen(false);
+                  }}
+                  className="text-muted-foreground hover:text-foreground hover:bg-accent flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors disabled:opacity-50"
+                >
+                  {summarizing ? (
+                    <Loader2 className="h-[12.5px] w-[12.5px] animate-spin text-sky-500" />
+                  ) : (
+                    <Sparkles className="h-[12.5px] w-[12.5px] text-sky-500" />
+                  )}
+                  <span>AI 更新会话标签与摘要</span>
+                </button>
+
+                {isCuratedWorkspace && (
                   <button
                     type="button"
                     onClick={() => {
@@ -531,6 +662,12 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                         null,
                         { makeUnclassified: true },
                       );
+                      if (suggestion) {
+                        void orbitActions.dismissClusterSuggestion(
+                          selectedHostId,
+                          activeAgent.agent_id,
+                        );
+                      }
                       setWsSwitcherOpen(false);
                     }}
                     className="text-muted-foreground hover:text-foreground hover:bg-accent flex w-full cursor-pointer items-center gap-1.5 rounded-md px-2 py-1 text-left text-[12px] transition-colors"
@@ -538,35 +675,57 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                     <Inbox className="h-[12.5px] w-[12.5px]" />
                     <span>移回「待归类」</span>
                   </button>
-                </div>
-              )}
+                )}
+              </div>
             </PopoverContent>
           </Popover>
 
-          {/* 1-Click AI Triage Pill when conversation is Unclassified (`待归类`) */}
-          {!isCuratedWorkspace && (
-            <SimpleTooltip label="让 AI 理解此会话上下文并自动归类到合适的 Workspace">
+          {/* Compact Inline Auto-Triage Pill when AI auto-classified (zero extra rows!) */}
+          {suggestion?.auto_applied && (
+            <div className="inline-flex h-[22px] shrink-0 items-center gap-1 rounded-full border border-sky-500/20 bg-sky-500/[0.07] pr-1 pl-2 text-[11px] text-sky-600 dark:border-sky-400/20 dark:bg-sky-400/[0.09] dark:text-sky-400">
+              <SimpleTooltip
+                label={`已自动归类到「${suggestion.target_workspace_title}」· ${suggestion.reason}`}
+              >
+                <span className="inline-flex cursor-default items-center gap-1">
+                  <Sparkles className="h-[10.5px] w-[10.5px] shrink-0" />
+                  <span>自动归类</span>
+                </span>
+              </SimpleTooltip>
+              <span className="h-2.5 w-[1px] bg-sky-500/25" />
               <button
                 type="button"
-                disabled={isOrganizing}
-                onClick={() =>
-                  void orbitActions.organizeProjectWorkspaces(
+                title="撤销自动归类并移回「待归类」"
+                onClick={() => {
+                  void orbitActions.moveAgentToWorkspace(
                     selectedHostId,
-                    rootCwd,
-                    [activeAgent.agent_id],
-                    true,
+                    activeAgent.agent_id,
+                    null,
+                    { makeUnclassified: true },
+                  );
+                  void orbitActions.dismissClusterSuggestion(
+                    selectedHostId,
+                    activeAgent.agent_id,
+                  );
+                }}
+                className="cursor-pointer rounded px-1 py-0.5 text-[11px] font-medium transition-colors hover:bg-sky-500/15"
+              >
+                撤销
+              </button>
+              <button
+                type="button"
+                aria-label="收起自动归类提示"
+                title="确认归类并收起提示"
+                onClick={() =>
+                  void orbitActions.dismissClusterSuggestion(
+                    selectedHostId,
+                    activeAgent.agent_id,
                   )
                 }
-                className="inline-flex h-[23px] shrink-0 cursor-pointer items-center gap-1 rounded-full border border-sky-500/30 bg-sky-500/10 px-2 text-[11.5px] font-medium text-sky-600 transition-colors hover:bg-sky-500/18 disabled:opacity-60 dark:text-sky-400"
+                className="inline-flex h-[16px] w-[16px] cursor-pointer items-center justify-center rounded-full opacity-70 transition-colors hover:bg-sky-500/15 hover:opacity-100"
               >
-                {isOrganizing ? (
-                  <Loader2 className="h-[11px] w-[11px] animate-spin" />
-                ) : (
-                  <Sparkles className="h-[11px] w-[11px]" />
-                )}
-                <span>AI 归类</span>
+                <X className="h-[10px] w-[10px]" />
               </button>
-            </SimpleTooltip>
+            </div>
           )}
 
           <span className="bg-border/80 h-3.5 w-[1px] shrink-0" />
@@ -696,7 +855,7 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
           </div>
         </div>
 
-        {/* Right: Conflict Radar + AI Summarize + Shared Board + Spawn Peer */}
+        {/* Right: Conflict Radar + Shared Board + Spawn Peer */}
         <div className="flex shrink-0 items-center gap-1">
           {recentConflicts.length > 0 && (
             <SimpleTooltip label={recentConflicts[recentConflicts.length - 1].summary}>
@@ -721,22 +880,6 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
               </button>
             </SimpleTooltip>
           )}
-
-          <SimpleTooltip label="AI 自动理解上下文并更新会话标签与一句话摘要">
-            <button
-              type="button"
-              disabled={summarizing}
-              onClick={() => void triggerSummarize()}
-              className="text-muted-foreground hover:text-foreground inline-flex h-[24px] cursor-pointer items-center gap-1 rounded-[7px] px-1.5 text-[11.5px] transition-colors hover:bg-black/[0.045] disabled:opacity-50 dark:hover:bg-white/[0.06]"
-            >
-              {summarizing ? (
-                <Loader2 className="h-[12px] w-[12px] animate-spin text-sky-500" />
-              ) : (
-                <Sparkles className="h-[12px] w-[12px] stroke-[1.75]" />
-              )}
-              <span className="hidden md:inline">总结</span>
-            </button>
-          </SimpleTooltip>
 
           {(isCuratedWorkspace || boardRev > 0) && (
             <button
@@ -902,128 +1045,44 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
         </div>
       </div>
 
-      {/* Row 2: Live AI Task Summary Bar (editable inline) */}
-      {(activeSummary || editingSummary) && (
-        <div className="border-border/50 bg-muted/25 group/sum flex min-h-[25px] items-center justify-between gap-2 border-t px-3 py-0.5 text-[11.5px]">
-          {editingSummary ? (
-            <div className="flex min-w-0 flex-1 items-center gap-1.5">
-              <Sparkles className="h-[11px] w-[11px] shrink-0 text-sky-500" />
-              <input
-                autoFocus
-                value={summaryDraft}
-                onChange={(e) => setSummaryDraft(e.target.value)}
-                onBlur={commitSummaryEdit}
-                {...ime.compositionProps}
-                onKeyDown={(e) => {
-                  if (ime.shouldIgnoreKeyDown(e)) return;
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    commitSummaryEdit();
-                  } else if (e.key === "Escape") {
-                    e.preventDefault();
-                    setEditingSummary(false);
-                  }
-                }}
-                placeholder="一句话概括这个会话正在做什么…"
-                className="bg-background text-foreground h-[20px] min-w-0 flex-1 rounded px-1.5 text-[11.5px] outline-none ring-1 ring-sky-500/40"
-              />
-            </div>
-          ) : (
-            <>
-              <div
-                onDoubleClick={() => {
-                  setSummaryDraft(activeSummary);
-                  setEditingSummary(true);
-                }}
-                title={`${activeSummary}\n双击修改摘要`}
-                className="text-muted-foreground flex min-w-0 flex-1 items-center gap-1.5 truncate"
-              >
-                <Sparkles className="h-[11px] w-[11px] shrink-0 text-sky-500/80" />
-                <span className="truncate">{activeSummary}</span>
-              </div>
-              <button
-                type="button"
-                title="编辑一句话摘要"
-                onClick={() => {
-                  setSummaryDraft(activeSummary);
-                  setEditingSummary(true);
-                }}
-                className="text-muted-foreground hover:text-foreground hidden h-[18px] w-[18px] shrink-0 cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] group-hover/sum:inline-flex dark:hover:bg-white/[0.08]"
-              >
-                <Pencil className="h-[10px] w-[10px]" />
-              </button>
-            </>
-          )}
-        </div>
-      )}
-
-      {/* Row 3: Reversible Auto-Cluster / AI Triage Banner */}
-      {suggestion && (
-        <div className="border-border/60 bg-muted/40 flex flex-wrap items-center justify-between gap-2 border-t px-3 py-1.5 text-[12px]">
-          <div className="flex min-w-0 items-center gap-2">
-            <Sparkles className="h-[13px] w-[13px] shrink-0 text-sky-500" />
+      {/* Optional Strictly Single-Line Banner ONLY for Pending (Unapplied) AI Suggestions */}
+      {suggestion && !suggestion.auto_applied && (
+        <div className="border-border/50 bg-muted/30 flex h-[30px] items-center justify-between gap-2 border-t px-3 text-[11.5px]">
+          <div
+            title={`建议归类到「${suggestion.target_workspace_title}」· ${suggestion.reason}`}
+            className="flex min-w-0 flex-1 items-center gap-1.5"
+          >
+            <Sparkles className="h-[12px] w-[12px] shrink-0 text-sky-500" />
             <span className="text-foreground/85 truncate">
-              {suggestion.auto_applied ? (
-                <>
-                  已自动归类到{" "}
-                  <strong className="text-foreground font-medium">
-                    {suggestion.target_workspace_title}
-                  </strong>{" "}
-                  <span className="text-muted-foreground">· {suggestion.reason}</span>
-                </>
-              ) : (
-                <>
-                  建议归类到{" "}
-                  <strong className="text-foreground font-medium">
-                    {suggestion.target_workspace_title}
-                  </strong>{" "}
-                  <span className="text-muted-foreground">· {suggestion.reason}</span>
-                </>
-              )}
+              建议归类到{" "}
+              <strong className="text-foreground font-medium">
+                {suggestion.target_workspace_title}
+              </strong>
+              {suggestion.reason ? (
+                <span className="text-muted-foreground"> · {suggestion.reason}</span>
+              ) : null}
             </span>
           </div>
 
-          <div className="flex shrink-0 items-center gap-1.5">
-            {suggestion.auto_applied ? (
-              <button
-                type="button"
-                onClick={() => {
-                  void orbitActions.moveAgentToWorkspace(
-                    selectedHostId,
-                    activeAgent.agent_id,
-                    null,
-                    { makeUnclassified: true },
-                  );
-                  void orbitActions.dismissClusterSuggestion(
-                    selectedHostId,
-                    activeAgent.agent_id,
-                  );
-                }}
-                className="border-border bg-canvas hover:bg-accent inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md border px-2 text-[11.5px] font-medium"
-              >
-                <Undo2 className="h-[11px] w-[11px]" />
-                <span>撤销移回待归类</span>
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => {
-                  void orbitActions.moveAgentToWorkspace(
-                    selectedHostId,
-                    activeAgent.agent_id,
-                    suggestion.target_workspace_id,
-                  );
-                  void orbitActions.dismissClusterSuggestion(
-                    selectedHostId,
-                    activeAgent.agent_id,
-                  );
-                }}
-                className="bg-foreground text-background inline-flex h-[22px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] font-medium hover:opacity-90"
-              >
-                <Check className="h-[11px] w-[11px]" />
-                <span>移入该 Workspace</span>
-              </button>
-            )}
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              onClick={() => {
+                void orbitActions.moveAgentToWorkspace(
+                  selectedHostId,
+                  activeAgent.agent_id,
+                  suggestion.target_workspace_id,
+                );
+                void orbitActions.dismissClusterSuggestion(
+                  selectedHostId,
+                  activeAgent.agent_id,
+                );
+              }}
+              className="bg-foreground text-background inline-flex h-[21px] cursor-pointer items-center gap-1 rounded-md px-2 text-[11px] font-medium hover:opacity-90"
+            >
+              <Check className="h-[10.5px] w-[10.5px]" />
+              <span>移入</span>
+            </button>
 
             <button
               type="button"
@@ -1034,9 +1093,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
                   activeAgent.agent_id,
                 )
               }
-              className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
+              className="text-muted-foreground hover:text-foreground inline-flex h-[21px] w-[21px] cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.08]"
             >
-              <X className="h-[12px] w-[12px]" />
+              <X className="h-[11.5px] w-[11.5px]" />
             </button>
           </div>
         </div>

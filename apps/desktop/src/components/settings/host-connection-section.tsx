@@ -27,12 +27,18 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import {
+  orbitActions,
+  resolveFleetTargetVersion,
+  useOrbitSelector,
+} from "@/state/orbit-store";
 
 export function HostConnectionSection({ hostId }: { hostId: string }) {
   const fleet = useOrbitSelector((s) => s.fleet);
   const sshHosts = useOrbitSelector((s) => s.sshHosts);
   const appVersion = useOrbitSelector((s) => s.appVersion);
+  const releaseUpdateInfo = useOrbitSelector((s) => s.releaseUpdateInfo);
+  const fleetUpdate = useOrbitSelector((s) => s.fleetUpdate);
   const upgradeState = useOrbitSelector((s) => s.hostUpgradeStates[hostId] ?? null);
   const host = fleet.hosts.find((h) => h.host_id === hostId) ?? null;
 
@@ -87,14 +93,21 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
   };
 
   const upgrading = upgradeState?.status === "upgrading";
-  const normApp = normalizeSemver(appVersion);
+  const isFleetBusy =
+    fleetUpdate.phase === "checking" ||
+    fleetUpdate.phase === "upgrading_hosts" ||
+    fleetUpdate.phase === "upgrading_desktop";
+  const targetVersion = resolveFleetTargetVersion(appVersion, releaseUpdateInfo);
   const normDaemon = normalizeSemver(host.daemon_version);
   const isDaemonOutdated = Boolean(
-    normApp && normDaemon && compareSemver(normDaemon, normApp) < 0,
+    targetVersion && normDaemon && compareSemver(normDaemon, targetVersion) < 0,
   );
 
   const handleUpgradeDaemon = async () => {
-    await orbitActions.upgradeHostDaemon(host.host_id, { force: true });
+    await orbitActions.upgradeHostDaemon(host.host_id, {
+      force: true,
+      targetVersion,
+    });
   };
 
   const handleRemoveHost = async () => {
@@ -168,37 +181,54 @@ export function HostConnectionSection({ hostId }: { hostId: string }) {
             title={isLocal ? "Local service" : "Host service"}
             description={
               normDaemon
-                ? isDaemonOutdated && normApp
-                  ? `Running v${normDaemon} · v${normApp} available (active sessions stay running).`
+                ? isDaemonOutdated && targetVersion
+                  ? `Running v${normDaemon} · v${targetVersion} available (active sessions stay running).`
                   : `Running v${normDaemon} · Up to date.`
                 : isLocal
                   ? "Keep the local Orbit background service synced with Desktop."
                   : "Orbit background service on this host."
             }
           >
-            <button
-              type="button"
-              disabled={upgrading}
-              onClick={() => void handleUpgradeDaemon()}
-              className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
-            >
-              {upgrading ? (
-                <Loader2 className="h-[13px] w-[13px] animate-spin" />
-              ) : isDaemonOutdated ? (
-                <ArrowUpCircle className="h-[13.5px] w-[13.5px]" />
-              ) : (
-                <RefreshCw className="h-[13px] w-[13px]" />
+            <div className="flex items-center gap-1.5">
+              {fleet.hosts.length > 1 && (
+                <button
+                  type="button"
+                  disabled={isFleetBusy}
+                  onClick={() => void orbitActions.upgradeAllConnectedHosts()}
+                  className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
+                >
+                  {isFleetBusy ? (
+                    <Loader2 className="h-[13px] w-[13px] animate-spin" />
+                  ) : (
+                    <ArrowUpCircle className="h-[13.5px] w-[13.5px]" />
+                  )}
+                  <span>{isFleetBusy ? "更新全部中…" : "更新全部机器"}</span>
+                </button>
               )}
-              <span>
-                {upgrading
-                  ? "Updating…"
-                  : isDaemonOutdated
-                    ? "Update"
-                    : isLocal
-                      ? "Restart"
-                      : "Update"}
-              </span>
-            </button>
+              <button
+                type="button"
+                disabled={upgrading || isFleetBusy}
+                onClick={() => void handleUpgradeDaemon()}
+                className="border-border hover:bg-accent inline-flex h-[30px] cursor-pointer items-center gap-1.5 rounded-lg border px-2.5 text-[12px] font-medium transition-colors disabled:opacity-50"
+              >
+                {upgrading ? (
+                  <Loader2 className="h-[13px] w-[13px] animate-spin" />
+                ) : isDaemonOutdated ? (
+                  <ArrowUpCircle className="h-[13.5px] w-[13.5px]" />
+                ) : (
+                  <RefreshCw className="h-[13px] w-[13px]" />
+                )}
+                <span>
+                  {upgrading
+                    ? "Updating…"
+                    : isDaemonOutdated
+                      ? "Update"
+                      : isLocal
+                        ? "Restart"
+                        : "Update"}
+                </span>
+              </button>
+            </div>
           </SettingRow>
         </SettingCard>
       </div>

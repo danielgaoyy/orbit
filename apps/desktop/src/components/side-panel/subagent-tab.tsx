@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUpRight, Check, Layers, Loader2, AlertTriangle } from "lucide-react";
+import { Archive, ArrowUpRight, Check, Layers, Loader2, AlertTriangle, X } from "lucide-react";
 import {
   ConversationUserBubble,
   ConversationViewport,
@@ -157,16 +157,46 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           </span>
         </div>
 
-        {hostId && tab.childAgentId && childAgent && (
+        <div className="flex shrink-0 items-center gap-1">
+          {hostId && tab.childAgentId && childAgent && (
+            <button
+              type="button"
+              onClick={handleOpenThread}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] transition-colors"
+            >
+              <span>Open thread</span>
+              <ArrowUpRight className="h-[12px] w-[12px]" />
+            </button>
+          )}
+          {hostId && parentAgentId && (
+            <button
+              type="button"
+              title="归档并隐藏此子代理"
+              onClick={() => {
+                orbitActions.archiveSubagent(hostId, parentAgentId, {
+                  id: tab.subagentCallId || tab.providerSubagentId || tab.childAgentId || tab.id,
+                  providerSubagentId: tab.providerSubagentId ?? null,
+                  childAgentId: tab.childAgentId ?? null,
+                  role: resolvedTitle,
+                });
+                orbitActions.closeSidePanelTab(tab.id);
+              }}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 text-[11.5px] transition-colors"
+            >
+              <Archive className="h-[12px] w-[12px]" />
+              <span>归档</span>
+            </button>
+          )}
           <button
             type="button"
-            onClick={handleOpenThread}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-md px-2 text-[11.5px] transition-colors"
+            aria-label="Close subagent panel"
+            title="关闭子代理视图"
+            onClick={() => orbitActions.closeSidePanelTab(tab.id)}
+            className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex h-[24px] w-[24px] shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors"
           >
-            <span>Open thread</span>
-            <ArrowUpRight className="h-[12px] w-[12px]" />
+            <X className="h-[13px] w-[13px]" />
           </button>
-        )}
+        </div>
       </div>
 
       {/* Full Main Conversation View (read-only, without Composer) */}

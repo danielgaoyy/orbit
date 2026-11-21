@@ -2,11 +2,19 @@ import { memo, useEffect, useState } from "react";
 import { AlertTriangle, RefreshCw, WifiOff, X } from "lucide-react";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { compareSemver, normalizeSemver } from "@/lib/orbit-ipc";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import {
+  orbitActions,
+  resolveFleetTargetVersion,
+  useOrbitSelector,
+} from "@/state/orbit-store";
 
 export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
   const isBrowserOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const appVersion = useOrbitSelector((s) => s.appVersion);
+  const releaseUpdateInfo = useOrbitSelector((s) => s.releaseUpdateInfo);
+  const fleet = useOrbitSelector((s) => s.fleet);
+  const fleetUpdate = useOrbitSelector((s) => s.fleetUpdate);
+  const hostUpgradeStates = useOrbitSelector((s) => s.hostUpgradeStates);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedHost = useOrbitSelector((s) =>
     s.selectedHostId
@@ -46,6 +54,40 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
             Network offline — upstream model requests may fail or stall until connection recovers.
           </span>
         </div>
+      </div>
+    );
+  }
+
+  // 1.5 Active fleet-wide update progress (persists even after closing Settings)
+  if (
+    fleetUpdate.phase === "upgrading_hosts" ||
+    fleetUpdate.phase === "upgrading_desktop"
+  ) {
+    const upgradingCount = Object.values(hostUpgradeStates).filter(
+      (st) => st.status === "upgrading",
+    ).length;
+    const label =
+      fleetUpdate.phase === "upgrading_desktop"
+        ? (fleetUpdate.desktopStatus ?? "正在更新本机桌面端并重启…")
+        : upgradingCount > 0
+          ? `正在并行更新 ${upgradingCount} 台已联通主机${fleetUpdate.targetVersion ? `至 v${fleetUpdate.targetVersion}` : ""}… 运行中的会话不受影响`
+          : (fleetUpdate.summaryMessage ?? "正在更新全部已联通机器…");
+    return (
+      <div
+        role="status"
+        className="orbit-stage-enter border-border/80 bg-muted/40 text-muted-foreground flex shrink-0 items-center justify-between gap-3 border-b px-4 py-1.5 text-[12px]"
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <OrbitSpinner size={12} className="shrink-0 text-sky-500" />
+          <span className="truncate">{label}</span>
+        </div>
+        <button
+          type="button"
+          onClick={() => orbitActions.openSettings("general")}
+          className="text-foreground/80 hover:text-foreground hover:bg-accent shrink-0 cursor-pointer rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors"
+        >
+          查看进度
+        </button>
       </div>
     );
   }
@@ -130,6 +172,7 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
 
   // 4. Protocol-lagging daemon fallback (ONLY when protocol is behind AND automatic upgrade hasn't completed)
   // Always offers a direct 1-click Update button — never asks the user to copy/paste shell commands.
+  const targetVersion = resolveFleetTargetVersion(appVersion, releaseUpdateInfo);
   const normApp = normalizeSemver(appVersion);
   const normDaemon = normalizeSemver(selectedHost?.daemon_version);
   const isOnline =
@@ -139,7 +182,20 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
   const clientPv = selectedHost?.client_protocol_version ?? null;
   const isProtocolBehind =
     daemonPv !== null && clientPv !== null && clientPv > 0 && daemonPv < clientPv;
-  const isDaemonOlder = Boolean(normApp && normDaemon && compareSemver(normDaemon, normApp) < 0);
+  const isDaemonOlder = Boolean(
+    (targetVersion ?? normApp) &&
+      normDaemon &&
+      compareSemver(normDaemon, (targetVersion ?? normApp) as string) < 0,
+  );
+  const outdatedFleetHostsCount = targetVersion
+    ? fleet.hosts.filter((h) => {
+        const online =
+          h.connection_state === "online_direct" || h.connection_state === "online_relay";
+        if (!online && !h.ssh_alias) return false;
+        const v = normalizeSemver(h.daemon_version);
+        return Boolean(v && compareSemver(v, targetVersion) < 0);
+      }).length
+    : 0;
 
   if (
     selectedHost &&
@@ -163,10 +219,22 @@ export const ConnectionStatusBanner = memo(function ConnectionStatusBanner() {
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-1">
+          {outdatedFleetHostsCount > 1 && (
+            <button
+              type="button"
+              onClick={() => void orbitActions.upgradeAllConnectedHosts()}
+              className="text-sky-600 hover:bg-sky-500/12 dark:text-sky-400 inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors"
+            >
+              <span>更新全部 ({outdatedFleetHostsCount} 台)</span>
+            </button>
+          )}
           <button
             type="button"
             onClick={() =>
-              void orbitActions.upgradeHostDaemon(selectedHost.host_id, { force: true })
+              void orbitActions.upgradeHostDaemon(selectedHost.host_id, {
+                force: true,
+                targetVersion,
+              })
             }
             className="text-foreground/85 hover:text-foreground hover:bg-accent inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium transition-colors"
           >

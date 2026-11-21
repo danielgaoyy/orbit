@@ -196,12 +196,10 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
           <>
             {/* Flush 40px Two-State Side Panel Header Bar (No-Tab vs With-Tab) */}
       <div
-        data-tauri-drag-region
         className="flex h-[40px] shrink-0 items-center justify-between gap-1.5 pl-2 pr-[44px] shadow-[inset_0_-1px_0_0_rgba(0,0,0,0.055)] dark:shadow-[inset_0_-1px_0_0_rgba(255,255,255,0.06)]"
       >
         {tabs.length > 0 ? (
           <div
-            data-tauri-drag-region
             className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             {tabs.map((tab) => {
@@ -224,7 +222,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                     }
                   }}
                   className={cn(
-                    "group/stab relative inline-flex h-[28px] max-w-[148px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[12px] transition-colors",
+                    "group/stab relative inline-flex h-[28px] max-w-[160px] shrink-0 cursor-pointer items-center gap-1.5 rounded-[7px] px-2 text-[12px] transition-colors",
                     isActive
                       ? "bg-black/[0.055] text-foreground font-medium dark:bg-white/[0.08]"
                       : "text-muted-foreground hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
@@ -245,14 +243,15 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                   <button
                     type="button"
                     aria-label={`Close ${tab.title}`}
+                    onMouseDown={(e) => e.stopPropagation()}
                     onClick={(e) => {
                       e.stopPropagation();
                       orbitActions.closeSidePanelTab(tab.id);
                     }}
                     className={cn(
                       "ml-0.5 inline-flex h-[16px] w-[16px] shrink-0 cursor-pointer items-center justify-center rounded transition-opacity hover:bg-black/[0.08] dark:hover:bg-white/[0.12]",
-                      isActive
-                        ? "opacity-55 hover:opacity-100"
+                      isActive || tab.kind === "subagent"
+                        ? "opacity-65 hover:opacity-100"
                         : "opacity-0 group-hover/stab:opacity-65 hover:!opacity-100",
                     )}
                   >
@@ -277,6 +276,8 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
                 <Plus className="h-[15px] w-[15px] stroke-[1.8]" />
               </button>
             </SimpleTooltip>
+
+            <div data-tauri-drag-region className="h-full min-w-4 flex-1" />
           </div>
         ) : (
           <div data-tauri-drag-region className="h-full min-w-0 flex-1" />

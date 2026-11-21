@@ -17,6 +17,7 @@ import {
   seedFallbackProviderCatalogs,
 } from "@/lib/model-catalog";
 import {
+  isBareHomeDir,
   isLocalHostCard,
   matchesProjectDirectory,
   projectPathScopeKey,
@@ -36,6 +37,7 @@ import {
   type PromptBadge,
   type ProviderKind,
   type ReasoningEffort,
+  type ReleaseUpdateInfo,
   type RichBlockView,
   type SessionMode,
   type SidebarProjectGroupView,
@@ -53,10 +55,51 @@ import {
 } from "@/lib/orbit-ipc";
 
 export interface HostDaemonUpgradeState {
-  status: "upgrading" | "failed";
+  status: "upgrading" | "done" | "failed" | "skipped";
   mode: "local" | "ssh" | "wire";
+  fromVersion?: string | null;
+  toVersion?: string | null;
   error?: string;
   startedAt: number;
+  finishedAt?: number;
+}
+
+export type FleetUpdatePhase =
+  | "idle"
+  | "checking"
+  | "upgrading_hosts"
+  | "paused_with_failures"
+  | "upgrading_desktop"
+  | "completed";
+
+export interface FleetUpdateState {
+  phase: FleetUpdatePhase;
+  targetVersion: string | null;
+  desktopStatus: string | null;
+  desktopProgress: number | null;
+  desktopError: string | null;
+  startedAt: number | null;
+  summaryMessage: string | null;
+  pendingDesktopUpdate: boolean;
+}
+
+export interface HostUpgradeOutcome {
+  ok: boolean;
+  skipped?: boolean;
+  error?: string;
+  version?: string | null;
+}
+
+export function resolveFleetTargetVersion(
+  appVersion: string | null | undefined,
+  releaseInfo: ReleaseUpdateInfo | null | undefined,
+): string | null {
+  const normApp = normalizeSemver(appVersion);
+  const normLatest = normalizeSemver(releaseInfo?.latest_version);
+  if (normApp && normLatest) {
+    return compareSemver(normLatest, normApp) >= 0 ? normLatest : normApp;
+  }
+  return normLatest ?? normApp ?? null;
 }
 
 export type { SlashDirective };
@@ -219,6 +262,42 @@ export function threadScopeKey(hostId: string, agentId: string): string {
   return `${hostId}::${agentId}`;
 }
 
+export function subagentArchiveKey(
+  hostId: string,
+  parentAgentId: string,
+  subagentId: string,
+): string {
+  return `${hostId}::${parentAgentId}::${subagentId}`;
+}
+
+export function isSubagentArchived(
+  archivedSubagents: Record<string, true>,
+  hostId: string,
+  parentAgentId: string,
+  target: {
+    id?: string | null;
+    providerSubagentId?: string | null;
+    childAgentId?: string | null;
+  },
+): boolean {
+  if (target.id && archivedSubagents[subagentArchiveKey(hostId, parentAgentId, target.id)]) {
+    return true;
+  }
+  if (
+    target.providerSubagentId &&
+    archivedSubagents[subagentArchiveKey(hostId, parentAgentId, target.providerSubagentId)]
+  ) {
+    return true;
+  }
+  if (
+    target.childAgentId &&
+    archivedSubagents[subagentArchiveKey(hostId, parentAgentId, target.childAgentId)]
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function fileCacheKey(hostId: string, cwd: string, path: string): string {
   return `${hostId}::${cwd}::${path}`;
 }
@@ -304,9 +383,11 @@ export interface OrbitUiState {
   collapsedHostIds: Record<string, boolean>;
   collapsedProjectIds: Record<string, boolean>;
   collapsedWorkspaceIds: Record<string, boolean>;
+  collapsedInboxProjectIds: Record<string, boolean>;
   hiddenProjectKeys: Record<string, boolean>;
   threadCustomTitles: Record<string, string>;
   archivedThreads: Record<string, ArchivedThreadEntry>;
+  archivedSubagents: Record<string, true>;
   sidebarProjectSort: SidebarProjectSort;
   sidebarThreadFilter: SidebarThreadFilter;
 
@@ -331,6 +412,10 @@ export interface OrbitUiState {
   isBrowserOffline: boolean;
   dismissedVersionMismatchHosts: Record<string, string>;
   hostUpgradeStates: Record<string, HostDaemonUpgradeState>;
+  releaseUpdateInfo: ReleaseUpdateInfo | null;
+  checkingReleaseUpdate: boolean;
+  releaseCheckError: string | null;
+  fleetUpdate: FleetUpdateState;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -365,6 +450,8 @@ interface PersistedPrefs {
   pinnedThreadKeys?: string[];
   threadCustomTitles?: Record<string, string>;
   archivedThreads?: Record<string, ArchivedThreadEntry>;
+  archivedSubagents?: Record<string, true>;
+  collapsedInboxProjectIds?: Record<string, boolean>;
   seenAgentSeqs?: Record<string, number>;
   sidebarProjectSort?: SidebarProjectSort;
   sidebarThreadFilter?: SidebarThreadFilter;
@@ -419,6 +506,8 @@ function writePrefsNow(snap: OrbitUiState): void {
       hiddenProjectKeys: snap.hiddenProjectKeys,
       threadCustomTitles: snap.threadCustomTitles,
       archivedThreads: snap.archivedThreads,
+      archivedSubagents: snap.archivedSubagents,
+      collapsedInboxProjectIds: snap.collapsedInboxProjectIds,
       sidebarProjectSort: snap.sidebarProjectSort,
       sidebarThreadFilter: snap.sidebarThreadFilter,
       sidePanelWidth: snap.sidePanelWidth,
@@ -596,9 +685,11 @@ let state: OrbitUiState = {
   collapsedHostIds: {},
   collapsedProjectIds: {},
   collapsedWorkspaceIds: {},
+  collapsedInboxProjectIds: initialPrefs.collapsedInboxProjectIds ?? {},
   hiddenProjectKeys: initialPrefs.hiddenProjectKeys ?? {},
   threadCustomTitles: initialPrefs.threadCustomTitles ?? {},
   archivedThreads: initialPrefs.archivedThreads ?? {},
+  archivedSubagents: initialPrefs.archivedSubagents ?? {},
   sidebarProjectSort: initialPrefs.sidebarProjectSort ?? "recent",
   sidebarThreadFilter: initialPrefs.sidebarThreadFilter ?? "all",
 
@@ -621,6 +712,19 @@ let state: OrbitUiState = {
   isBrowserOffline: typeof navigator !== "undefined" ? !navigator.onLine : false,
   dismissedVersionMismatchHosts: {},
   hostUpgradeStates: {},
+  releaseUpdateInfo: null,
+  checkingReleaseUpdate: false,
+  releaseCheckError: null,
+  fleetUpdate: {
+    phase: "idle",
+    targetVersion: null,
+    desktopStatus: null,
+    desktopProgress: null,
+    desktopError: null,
+    startedAt: null,
+    summaryMessage: null,
+    pendingDesktopUpdate: false,
+  },
 
   theme: initialTheme,
   resolvedTheme: initialResolvedTheme,
@@ -678,7 +782,10 @@ function maybeAutoSyncOutdatedHosts(): void {
     const supportsNativeWireUpgrade = (host.daemon_protocol_version ?? 0) >= 4;
     if (isLocal || host.ssh_alias || supportsNativeWireUpgrade) {
       autoUpgradeAttempted.set(host.host_id, attemptKey);
-      void orbitActions.upgradeHostDaemon(host.host_id, { silent: true });
+      void orbitActions.upgradeHostDaemon(host.host_id, {
+        silent: true,
+        targetVersion: normApp,
+      });
     }
   }
 }
@@ -1279,17 +1386,174 @@ export const orbitActions = {
     }
   },
 
+  async checkFleetUpdates(opts?: { silent?: boolean }): Promise<ReleaseUpdateInfo | null> {
+    if (state.checkingReleaseUpdate) {
+      return state.releaseUpdateInfo;
+    }
+    setState((s) => ({
+      ...s,
+      checkingReleaseUpdate: true,
+      releaseCheckError: null,
+    }));
+    try {
+      const [info] = await Promise.all([
+        orbitIpc.checkAppUpdate(),
+        orbitActions.reloadFleetAndHosts(false).catch(() => {}),
+      ]);
+      setState((s) => ({
+        ...s,
+        releaseUpdateInfo: info,
+        checkingReleaseUpdate: false,
+        releaseCheckError: null,
+      }));
+      return info;
+    } catch (err) {
+      const detail =
+        err instanceof Error ? err.message : typeof err === "string" ? err.trim() : "";
+      const errMsg = detail
+        ? `检查更新失败: ${detail}`
+        : "暂时无法检查更新，请稍后重试。";
+      setState((s) => ({
+        ...s,
+        checkingReleaseUpdate: false,
+        releaseCheckError: errMsg,
+      }));
+      if (!opts?.silent) {
+        notifyToast(errMsg);
+      }
+      return null;
+    }
+  },
+
+  async installDesktopAppUpdate(
+    explicitRelease?: ReleaseUpdateInfo | null,
+  ): Promise<boolean> {
+    const release = explicitRelease ?? state.releaseUpdateInfo;
+    if (!release) return false;
+    setState((s) => ({
+      ...s,
+      fleetUpdate: {
+        ...s.fleetUpdate,
+        phase: "upgrading_desktop",
+        targetVersion: normalizeSemver(release.latest_version) ?? s.fleetUpdate.targetVersion,
+        desktopStatus: `正在下载 Orbit v${release.latest_version} 安装包…`,
+        desktopProgress: 0.02,
+        desktopError: null,
+        pendingDesktopUpdate: false,
+        startedAt: s.fleetUpdate.startedAt ?? Date.now(),
+      },
+    }));
+    try {
+      await orbitIpc.performAppSelfUpdate(release, (ev) => {
+        const rawProgress = Number.isFinite(ev.progress) ? ev.progress : 0;
+        const normalized = rawProgress > 1 ? Math.min(1, rawProgress / 100) : Math.max(0, rawProgress);
+        const pct = Math.round(normalized * 100);
+        const label = ev.status
+          ? pct > 0 && pct < 100
+            ? `${ev.status} (${pct}%)`
+            : ev.status
+          : `正在更新桌面端 (${pct}%)…`;
+        setState((s) => ({
+          ...s,
+          fleetUpdate: {
+            ...s.fleetUpdate,
+            phase: "upgrading_desktop",
+            desktopStatus: label,
+            desktopProgress: normalized,
+            desktopError: null,
+          },
+        }));
+      });
+      return true;
+    } catch (err) {
+      const detail =
+        err instanceof Error ? err.message : typeof err === "string" ? err.trim() : "";
+      const errMsg = detail
+        ? `桌面端更新失败: ${detail}`
+        : "桌面端更新失败，请稍后重试或手动下载。";
+      setState((s) => ({
+        ...s,
+        fleetUpdate: {
+          ...s.fleetUpdate,
+          phase: "completed",
+          desktopStatus: null,
+          desktopProgress: null,
+          desktopError: errMsg,
+          summaryMessage: errMsg,
+        },
+      }));
+      notifyToast(errMsg);
+      return false;
+    }
+  },
+
   async upgradeHostDaemon(
     hostId: string,
-    opts?: { force?: boolean; silent?: boolean },
-  ): Promise<void> {
+    opts?: {
+      force?: boolean;
+      silent?: boolean;
+      targetVersion?: string | null;
+      skipReload?: boolean;
+    },
+  ): Promise<HostUpgradeOutcome> {
     const host = state.fleet.hosts.find((h) => h.host_id === hostId);
-    if (!host) return;
-    if (state.hostUpgradeStates[hostId]?.status === "upgrading") return;
+    if (!host) return { ok: false, error: "Host not found" };
+    if (state.hostUpgradeStates[hostId]?.status === "upgrading") {
+      return { ok: true, skipped: true };
+    }
 
     const isLocal = isLocalHostCard(host);
-    const mode: "local" | "ssh" | "wire" = isLocal ? "local" : host.ssh_alias ? "ssh" : "wire";
+    const isOnline =
+      host.connection_state === "online_direct" || host.connection_state === "online_relay";
+    const supportsWire = (host.daemon_protocol_version ?? 0) >= 4;
+    const normApp = normalizeSemver(state.appVersion);
+    const fromVersion = normalizeSemver(host.daemon_version);
+    const explicitTarget = normalizeSemver(opts?.targetVersion);
+    const targetVersion =
+      explicitTarget ?? resolveFleetTargetVersion(state.appVersion, state.releaseUpdateInfo);
 
+    // Unreachable remote host without SSH fallback cannot be upgraded while offline.
+    if (!isLocal && !isOnline && !host.ssh_alias) {
+      const reason = "主机离线，已跳过";
+      setState((s) => ({
+        ...s,
+        hostUpgradeStates: {
+          ...s.hostUpgradeStates,
+          [hostId]: {
+            status: "skipped",
+            mode: "wire",
+            fromVersion,
+            toVersion: fromVersion,
+            error: reason,
+            startedAt: Date.now(),
+            finishedAt: Date.now(),
+          },
+        },
+      }));
+      return { ok: false, skipped: true, error: reason, version: fromVersion };
+    }
+
+    // Decide primary transport:
+    // - Local host: use wire upgrade if online v4+ AND targeting a release newer than bundled Desktop;
+    //   otherwise use 0ms bundled sidecar sync (`syncLocalDaemon`).
+    // - Remote host: prefer wire on online v4+ (fast, works over Direct/Relay/ssh+relay with exact targetVersion),
+    //   with automatic SSH fallback if `ssh_alias` is configured; use SSH directly when offline.
+    const localNeedsRemoteDownload =
+      isLocal &&
+      isOnline &&
+      supportsWire &&
+      Boolean(targetVersion && normApp && compareSemver(targetVersion, normApp) > 0);
+    const mode: "local" | "ssh" | "wire" = isLocal
+      ? localNeedsRemoteDownload
+        ? "wire"
+        : "local"
+      : isOnline && supportsWire
+        ? "wire"
+        : host.ssh_alias
+          ? "ssh"
+          : "wire";
+
+    const startedAt = Date.now();
     setState((s) => ({
       ...s,
       hostUpgradeStates: {
@@ -1297,59 +1561,134 @@ export const orbitActions = {
         [hostId]: {
           status: "upgrading",
           mode,
-          startedAt: Date.now(),
+          fromVersion,
+          toVersion: targetVersion,
+          startedAt,
         },
       },
     }));
 
+    const waitForReconnectedVersion = async (): Promise<string | null> => {
+      try {
+        await orbitIpc.connectHost(host.host_id);
+        await orbitIpc.refreshHost(host.host_id);
+      } catch {
+        // best-effort reconnect trigger
+      }
+      let latestVer = fromVersion;
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        try {
+          const snap = await orbitIpc.getFleetOverview();
+          const refreshed = snap.hosts.find((h) => h.host_id === host.host_id);
+          const refreshedVer = normalizeSemver(refreshed?.daemon_version);
+          if (refreshedVer) {
+            latestVer = refreshedVer;
+          }
+          const onlineNow =
+            refreshed?.connection_state === "online_direct" ||
+            refreshed?.connection_state === "online_relay";
+          if (
+            onlineNow &&
+            refreshedVer &&
+            (!targetVersion || compareSemver(refreshedVer, targetVersion) >= 0)
+          ) {
+            break;
+          }
+        } catch {
+          // ignore transient poll failure while daemon restarts
+        }
+        await new Promise((r) => window.setTimeout(r, 750));
+      }
+      return latestVer;
+    };
+
     try {
+      let resolvedVer: string | null = targetVersion ?? fromVersion;
+
       if (mode === "local") {
         const res = await orbitIpc.syncLocalDaemon(hostId, Boolean(opts?.force));
-        setState((s) => {
-          const next = { ...s.hostUpgradeStates };
-          delete next[hostId];
-          return { ...s, hostUpgradeStates: next };
-        });
         if (res.status === "skipped_dev") {
-          return;
+          setState((s) => {
+            const next = { ...s.hostUpgradeStates };
+            delete next[hostId];
+            return { ...s, hostUpgradeStates: next };
+          });
+          return { ok: true, skipped: true, version: fromVersion };
         }
-        await orbitActions.reloadFleetAndHosts(false);
+        resolvedVer = normalizeSemver(res.daemon_version) ?? (await waitForReconnectedVersion());
+        if (!opts?.skipReload) {
+          await orbitActions.reloadFleetAndHosts(false);
+        }
+        setState((s) => ({
+          ...s,
+          hostUpgradeStates: {
+            ...s.hostUpgradeStates,
+            [hostId]: {
+              status: "done",
+              mode,
+              fromVersion,
+              toVersion: resolvedVer,
+              startedAt,
+              finishedAt: Date.now(),
+            },
+          },
+        }));
         if (!opts?.silent) {
           notifyToast(
             res.status === "updated"
-              ? `Updated local Orbit service${res.daemon_version ? ` to v${res.daemon_version}` : ""}`
-              : "Restarted local Orbit service",
+              ? `已更新本机服务${resolvedVer ? `至 v${resolvedVer}` : ""}`
+              : "已重启本机 Orbit 服务",
           );
         }
-      } else if (mode === "ssh" && host.ssh_alias) {
+        return { ok: true, version: resolvedVer };
+      }
+
+      if (mode === "wire") {
+        try {
+          await orbitIpc.upgradeHostDaemonOverWire(host.host_id, targetVersion ?? null);
+        } catch (wireErr) {
+          if (!isLocal && host.ssh_alias) {
+            await orbitIpc.upgradeRemoteDaemon(
+              host.host_id,
+              host.ssh_alias,
+              host.remote_daemon_port || undefined,
+            );
+          } else {
+            throw wireErr;
+          }
+        }
+      } else if (host.ssh_alias) {
         await orbitIpc.upgradeRemoteDaemon(
           host.host_id,
           host.ssh_alias,
           host.remote_daemon_port || undefined,
         );
-        setState((s) => {
-          const next = { ...s.hostUpgradeStates };
-          delete next[hostId];
-          return { ...s, hostUpgradeStates: next };
-        });
-        await orbitIpc.connectHost(host.host_id);
-        await orbitActions.reloadFleetAndHosts(false);
-        if (!opts?.silent) {
-          notifyToast(`Updated ${host.display_name}`);
-        }
-      } else {
-        await orbitIpc.upgradeHostDaemonOverWire(host.host_id, normalizeSemver(state.appVersion));
-        setState((s) => {
-          const next = { ...s.hostUpgradeStates };
-          delete next[hostId];
-          return { ...s, hostUpgradeStates: next };
-        });
-        await orbitIpc.connectHost(host.host_id);
-        await orbitActions.reloadFleetAndHosts(false);
-        if (!opts?.silent) {
-          notifyToast(`Updated ${host.display_name}`);
-        }
       }
+
+      resolvedVer = await waitForReconnectedVersion();
+      if (!opts?.skipReload) {
+        await orbitActions.reloadFleetAndHosts(false);
+      }
+      setState((s) => ({
+        ...s,
+        hostUpgradeStates: {
+          ...s.hostUpgradeStates,
+          [hostId]: {
+            status: "done",
+            mode,
+            fromVersion,
+            toVersion: resolvedVer,
+            startedAt,
+            finishedAt: Date.now(),
+          },
+        },
+      }));
+      if (!opts?.silent) {
+        notifyToast(
+          `已更新 ${host.display_name}${resolvedVer ? ` 至 v${resolvedVer}` : ""}`,
+        );
+      }
+      return { ok: true, version: resolvedVer };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setState((s) => ({
@@ -1359,15 +1698,252 @@ export const orbitActions = {
           [hostId]: {
             status: "failed",
             mode,
+            fromVersion,
+            toVersion: targetVersion,
             error: msg,
-            startedAt: Date.now(),
+            startedAt,
+            finishedAt: Date.now(),
           },
         },
       }));
       if (!opts?.silent) {
-        notifyToast(`Upgrade failed: ${msg}`);
+        notifyToast(`${host.display_name} 更新失败: ${msg}`);
+      }
+      return { ok: false, error: msg, version: fromVersion };
+    }
+  },
+
+  async upgradeAllConnectedHosts(opts?: {
+    force?: boolean;
+    includeDesktopApp?: boolean;
+    onlyHostIds?: string[];
+  }): Promise<void> {
+    if (
+      state.fleetUpdate.phase === "checking" ||
+      state.fleetUpdate.phase === "upgrading_hosts" ||
+      state.fleetUpdate.phase === "upgrading_desktop"
+    ) {
+      return;
+    }
+
+    const force = Boolean(opts?.force);
+    const includeDesktopApp = opts?.includeDesktopApp ?? true;
+    const onlyIdSet = opts?.onlyHostIds ? new Set(opts.onlyHostIds) : null;
+
+    setState((s) => ({
+      ...s,
+      fleetUpdate: {
+        phase: "checking",
+        targetVersion: resolveFleetTargetVersion(s.appVersion, s.releaseUpdateInfo),
+        desktopStatus: null,
+        desktopProgress: null,
+        desktopError: null,
+        startedAt: Date.now(),
+        summaryMessage: "正在检查最新版本并同步全部主机状态…",
+        pendingDesktopUpdate: false,
+      },
+    }));
+
+    // Always resolve latest release before kicking off a fleet update so remote hosts
+    // upgrade to the true latest GitHub Release (not stale local appVersion).
+    let releaseInfo = state.releaseUpdateInfo;
+    if (!releaseInfo || force) {
+      const fresh = await orbitActions.checkFleetUpdates({ silent: true });
+      if (fresh) {
+        releaseInfo = fresh;
+      }
+    } else {
+      await orbitActions.reloadFleetAndHosts(false).catch(() => {});
+    }
+
+    const targetVersion = resolveFleetTargetVersion(state.appVersion, releaseInfo);
+    const desktopNeedsUpdate = Boolean(
+      includeDesktopApp && releaseInfo?.has_newer_version,
+    );
+
+    const allHosts = state.fleet.hosts;
+    const candidateHosts = onlyIdSet
+      ? allHosts.filter((h) => onlyIdSet.has(h.host_id))
+      : allHosts;
+
+    const hostsToUpgrade: typeof candidateHosts = [];
+    let skippedOffline = 0;
+    let alreadyUpToDate = 0;
+
+    for (const host of candidateHosts) {
+      const isLocal = isLocalHostCard(host);
+      const isOnline =
+        host.connection_state === "online_direct" ||
+        host.connection_state === "online_relay";
+      const normDaemon = normalizeSemver(host.daemon_version);
+
+      // When Desktop itself will run `performAppSelfUpdate`, its updater script copies
+      // the newly bundled `orbit` sidecar and hot-restarts the local daemon atomically,
+      // so skip double-restarting the local daemon here unless explicitly retrying only local.
+      if (isLocal && desktopNeedsUpdate && !onlyIdSet) {
+        continue;
+      }
+
+      if (!isLocal && !isOnline && !host.ssh_alias) {
+        skippedOffline += 1;
+        setState((s) => ({
+          ...s,
+          hostUpgradeStates: {
+            ...s.hostUpgradeStates,
+            [host.host_id]: {
+              status: "skipped",
+              mode: "wire",
+              fromVersion: normDaemon,
+              toVersion: normDaemon,
+              error: "主机离线，已跳过",
+              startedAt: Date.now(),
+              finishedAt: Date.now(),
+            },
+          },
+        }));
+        continue;
+      }
+
+      const needsUpgrade =
+        force ||
+        !normDaemon ||
+        (targetVersion !== null && compareSemver(normDaemon, targetVersion) < 0);
+
+      if (needsUpgrade) {
+        hostsToUpgrade.push(host);
+      } else {
+        alreadyUpToDate += 1;
+        setState((s) => ({
+          ...s,
+          hostUpgradeStates: {
+            ...s.hostUpgradeStates,
+            [host.host_id]: {
+              status: "done",
+              mode: isLocal ? "local" : host.ssh_alias ? "ssh" : "wire",
+              fromVersion: normDaemon,
+              toVersion: normDaemon,
+              startedAt: Date.now(),
+              finishedAt: Date.now(),
+            },
+          },
+        }));
       }
     }
+
+    // Nothing to update anywhere
+    if (hostsToUpgrade.length === 0 && !desktopNeedsUpdate) {
+      const msg =
+        skippedOffline > 0
+          ? `在线主机均已是最新${targetVersion ? ` v${targetVersion}` : ""}，${skippedOffline} 台离线主机已跳过。`
+          : `本机与全部已联通机器均已是最新版本${targetVersion ? ` (v${targetVersion})` : ""}。`;
+      setState((s) => ({
+        ...s,
+        fleetUpdate: {
+          ...s.fleetUpdate,
+          phase: "completed",
+          targetVersion,
+          summaryMessage: msg,
+          pendingDesktopUpdate: false,
+        },
+      }));
+      notifyToast(msg);
+      return;
+    }
+
+    let succeeded = 0;
+    let failed = 0;
+
+    if (hostsToUpgrade.length > 0) {
+      setState((s) => ({
+        ...s,
+        fleetUpdate: {
+          ...s.fleetUpdate,
+          phase: "upgrading_hosts",
+          targetVersion,
+          summaryMessage: `正在并行更新 ${hostsToUpgrade.length} 台主机${targetVersion ? `至 v${targetVersion}` : ""}（运行中的会话不受影响）…`,
+          pendingDesktopUpdate: desktopNeedsUpdate,
+        },
+      }));
+
+      const results = await Promise.allSettled(
+        hostsToUpgrade.map((host) =>
+          orbitActions.upgradeHostDaemon(host.host_id, {
+            force: true,
+            silent: true,
+            targetVersion,
+            skipReload: true,
+          }),
+        ),
+      );
+
+      for (const r of results) {
+        if (r.status === "fulfilled" && r.value.ok) {
+          succeeded += 1;
+        } else if (r.status === "fulfilled" && r.value.skipped) {
+          skippedOffline += 1;
+        } else {
+          failed += 1;
+        }
+      }
+
+      await orbitActions.reloadFleetAndHosts(false).catch(() => {});
+    }
+
+    // Phase 2: Desktop self-update (exits & relaunches Desktop + syncs bundled local daemon)
+    if (desktopNeedsUpdate && releaseInfo) {
+      if (failed > 0) {
+        const pausedMsg = `已完成 ${succeeded} 台主机更新，${failed} 台失败${skippedOffline > 0 ? `，${skippedOffline} 台离线跳过` : ""}。可先重试失败主机，或直接继续更新本机桌面端。`;
+        setState((s) => ({
+          ...s,
+          fleetUpdate: {
+            ...s.fleetUpdate,
+            phase: "paused_with_failures",
+            targetVersion,
+            summaryMessage: pausedMsg,
+            pendingDesktopUpdate: true,
+          },
+        }));
+        notifyToast(`有 ${failed} 台主机更新失败，已暂停桌面端重启`);
+        return;
+      }
+
+      await orbitActions.installDesktopAppUpdate(releaseInfo);
+      return;
+    }
+
+    const parts: string[] = [];
+    if (succeeded > 0) parts.push(`成功更新 ${succeeded} 台`);
+    if (alreadyUpToDate > 0) parts.push(`${alreadyUpToDate} 台已是最新`);
+    if (skippedOffline > 0) parts.push(`${skippedOffline} 台离线跳过`);
+    if (failed > 0) parts.push(`${failed} 台失败`);
+    const summary =
+      parts.length > 0
+        ? `全集群更新完成：${parts.join("，")}${targetVersion ? `（目标 v${targetVersion}）` : ""}。`
+        : "全集群更新完成。";
+
+    setState((s) => ({
+      ...s,
+      fleetUpdate: {
+        ...s.fleetUpdate,
+        phase: "completed",
+        targetVersion,
+        summaryMessage: summary,
+        pendingDesktopUpdate: false,
+      },
+    }));
+    notifyToast(summary);
+  },
+
+  async retryFailedFleetHosts(): Promise<void> {
+    const failedIds = Object.entries(state.hostUpgradeStates)
+      .filter(([, st]) => st.status === "failed")
+      .map(([hostId]) => hostId);
+    if (failedIds.length === 0) return;
+    await orbitActions.upgradeAllConnectedHosts({
+      force: true,
+      includeDesktopApp: state.fleetUpdate.pendingDesktopUpdate,
+      onlyHostIds: failedIds,
+    });
   },
 
   async reloadFleetAndHosts(initialBootstrap = false): Promise<void> {
@@ -1776,16 +2352,30 @@ export const orbitActions = {
     }
   },
 
-  selectHost(hostId: string): void {
+  selectHost(hostId: string, opts?: { keepDraft?: boolean }): void {
     pendingDraftCreate = null;
     const detail = state.hostDetails[hostId];
-    const firstAgent =
-      detail?.agents.find(
-        (a) => !state.archivedThreads[threadScopeKey(hostId, a.agent_id)],
-      ) ?? null;
+    const stayInDraft = Boolean(opts?.keepDraft);
+    const firstAgent = stayInDraft
+      ? null
+      : (detail?.agents.find(
+          (a) => !state.archivedThreads[threadScopeKey(hostId, a.agent_id)],
+        ) ?? null);
+    const sidebarHostProj = state.sidebarView?.projects.find(
+      (p) => p.host_id === hostId && !p.is_home_workspace,
+    );
+    const firstValidWorkspace = detail?.workspaces.find(
+      (w) => !w.archived_at && !w.background && !w.is_worktree && !isBareHomeDir(w.cwd),
+    );
+    const firstDiscovered = detail?.discovered_projects.find(
+      (p) => !isBareHomeDir(p.path) && !p.path.includes("/worktrees/"),
+    );
     const nextCwd =
       firstAgent?.cwd ??
-      detail?.workspaces[0]?.cwd ??
+      sidebarHostProj?.primary_cwd ??
+      firstValidWorkspace?.project_root ??
+      firstValidWorkspace?.cwd ??
+      firstDiscovered?.path ??
       detail?.discovered_projects[0]?.path ??
       "~";
     const avail = detail?.host.available_providers ?? [];
@@ -1797,10 +2387,12 @@ export const orbitActions = {
         workspacePanel: "conversation",
         selectedHostId: hostId,
         selectedAgentId: firstAgent?.agent_id ?? null,
-        isDraftNewSession: firstAgent === null,
+        isDraftNewSession: stayInDraft || firstAgent === null,
         sessionScrollNonce: s.sessionScrollNonce + 1,
         selectedWorkspaceCwd: nextCwd,
         selectedDiffPath: null,
+        draftWorktreeRepoPath: null,
+        draftWorkspaceId: null,
         draftProvider:
           avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
       }),
@@ -1816,6 +2408,7 @@ export const orbitActions = {
     }
     if (nextCwd && nextCwd !== "~") {
       void orbitActions.refreshGit(hostId, nextCwd, null, state.diffStaged);
+      void orbitActions.inspectGitRepos(hostId, nextCwd);
     }
   },
 
@@ -1834,6 +2427,17 @@ export const orbitActions = {
           nextArchived = { ...nextArchived };
           delete nextArchived[tKey];
         }
+        // Automatically dismiss stale subagent inspector tabs belonging to a different parent thread
+        const remainingSideTabs = s.sidePanelTabs.filter(
+          (t) => t.kind !== "subagent" || t.parentAgentId === agentId,
+        );
+        const tabsChanged = remainingSideTabs.length !== s.sidePanelTabs.length;
+        const nextActiveSideTab = tabsChanged
+          ? remainingSideTabs.some((t) => t.id === s.activeSidePanelTabId)
+            ? s.activeSidePanelTabId
+            : (remainingSideTabs[remainingSideTabs.length - 1]?.id ?? null)
+          : s.activeSidePanelTabId;
+        const shouldCloseSidePanel = tabsChanged && remainingSideTabs.length === 0;
         return {
           ...s,
           activeView: "workspace",
@@ -1845,6 +2449,13 @@ export const orbitActions = {
           selectedWorkspaceCwd: nextCwd,
           selectedDiffPath: null,
           archivedThreads: nextArchived,
+          ...(tabsChanged
+            ? {
+                sidePanelTabs: remainingSideTabs,
+                activeSidePanelTabId: nextActiveSideTab,
+                sidePanelOpen: shouldCloseSidePanel ? false : s.sidePanelOpen,
+              }
+            : {}),
         };
       },
       true,
@@ -1982,6 +2593,7 @@ export const orbitActions = {
       draftProvider:
         avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
     }));
+    orbitActions.refreshSidebarView();
     void orbitActions.ensureWorkspaceFiles(hostId, cwd);
     if (cwd && cwd !== "~") {
       void orbitActions.refreshGit(hostId, cwd, null, state.diffStaged);
@@ -4563,9 +5175,12 @@ export const orbitActions = {
     const effectiveChildAgentId = hasManagedChild ? params.childAgentId : null;
     const effectiveProviderSubagentId =
       params.providerSubagentId ?? (!hasManagedChild ? params.childAgentId : null);
-    const tabId = `tab:subagent:${effectiveChildAgentId || effectiveProviderSubagentId || params.callId}`;
+    // Reuse a single dedicated subagent inspector tab so clicking subagents never spams the tab bar
+    const tabId = "tab:subagent:inspector";
     setState((s) => {
-      const existingIdx = s.sidePanelTabs.findIndex((t) => t.id === tabId);
+      const existingIdx = s.sidePanelTabs.findIndex(
+        (t) => t.id === tabId || t.kind === "subagent",
+      );
       let nextTabs = s.sidePanelTabs;
       const tabObj: SidePanelTab = {
         id: tabId,
@@ -4580,8 +5195,13 @@ export const orbitActions = {
         parentAgentId: parentAgentId ?? null,
       };
       if (existingIdx >= 0) {
-        nextTabs = [...s.sidePanelTabs];
-        nextTabs[existingIdx] = tabObj;
+        nextTabs = s.sidePanelTabs.filter((t, i) => i === existingIdx || t.kind !== "subagent");
+        const targetIdx = nextTabs.findIndex((t) => t.kind === "subagent");
+        if (targetIdx >= 0) {
+          nextTabs[targetIdx] = tabObj;
+        } else {
+          nextTabs.push(tabObj);
+        }
       } else {
         nextTabs = [...s.sidePanelTabs, tabObj];
       }
@@ -5000,7 +5620,6 @@ export const orbitActions = {
   },
 
   async reorderProjects(orderedKeys: string[]): Promise<void> {
-    setState((s) => ({ ...s, sidebarProjectSort: "manual" }), true);
     try {
       await orbitIpc.reorderProjects(orderedKeys);
       await orbitActions.reloadFleetOnly();
@@ -5018,6 +5637,124 @@ export const orbitActions = {
         [workspaceId]: !s.collapsedWorkspaceIds[workspaceId],
       },
     }));
+  },
+
+  toggleProjectInboxCollapsed(projectId: string): void {
+    setState(
+      (s) => ({
+        ...s,
+        collapsedInboxProjectIds: {
+          ...s.collapsedInboxProjectIds,
+          [projectId]: !s.collapsedInboxProjectIds[projectId],
+        },
+      }),
+      true,
+    );
+  },
+
+  archiveSubagent(
+    hostId: string,
+    parentAgentId: string,
+    target: {
+      id: string;
+      providerSubagentId?: string | null;
+      childAgentId?: string | null;
+      role?: string;
+    },
+  ): void {
+    const keys: string[] = [];
+    if (target.id) keys.push(subagentArchiveKey(hostId, parentAgentId, target.id));
+    if (target.providerSubagentId) {
+      keys.push(subagentArchiveKey(hostId, parentAgentId, target.providerSubagentId));
+    }
+    if (target.childAgentId) {
+      keys.push(subagentArchiveKey(hostId, parentAgentId, target.childAgentId));
+    }
+    if (target.childAgentId) {
+      const hasManaged = state.hostDetails[hostId]?.agents.some(
+        (a) => a.agent_id === target.childAgentId,
+      );
+      if (hasManaged) {
+        orbitActions.archiveThread(hostId, target.childAgentId);
+      }
+    }
+    setState(
+      (s) => {
+        const nextArchived = { ...s.archivedSubagents };
+        for (const k of keys) {
+          nextArchived[k] = true;
+        }
+        const remainingTabs = s.sidePanelTabs.filter((t) => {
+          if (t.kind !== "subagent") return true;
+          const matchesId =
+            (target.id && t.subagentCallId === target.id) ||
+            (target.providerSubagentId && t.providerSubagentId === target.providerSubagentId) ||
+            (target.childAgentId && t.childAgentId === target.childAgentId);
+          return !matchesId;
+        });
+        const removedActive =
+          remainingTabs.length !== s.sidePanelTabs.length &&
+          !remainingTabs.some((t) => t.id === s.activeSidePanelTabId);
+        const shouldClosePanel =
+          remainingTabs.length !== s.sidePanelTabs.length && remainingTabs.length === 0;
+        return {
+          ...s,
+          archivedSubagents: nextArchived,
+          sidePanelTabs: remainingTabs,
+          activeSidePanelTabId: removedActive
+            ? (remainingTabs[remainingTabs.length - 1]?.id ?? null)
+            : s.activeSidePanelTabId,
+          sidePanelOpen: shouldClosePanel ? false : s.sidePanelOpen,
+        };
+      },
+      true,
+    );
+    if (!target.childAgentId) {
+      notifyToast(`已归档子代理${target.role ? `「${target.role}」` : ""}`);
+    }
+  },
+
+  archiveFinishedSubagents(
+    hostId: string,
+    parentAgentId: string,
+    targets: Array<{
+      id: string;
+      providerSubagentId?: string | null;
+      childAgentId?: string | null;
+    }>,
+  ): void {
+    if (targets.length === 0) return;
+    const managedIds = new Set<string>();
+    const keys: string[] = [];
+    for (const target of targets) {
+      if (target.id) keys.push(subagentArchiveKey(hostId, parentAgentId, target.id));
+      if (target.providerSubagentId) {
+        keys.push(subagentArchiveKey(hostId, parentAgentId, target.providerSubagentId));
+      }
+      if (target.childAgentId) {
+        keys.push(subagentArchiveKey(hostId, parentAgentId, target.childAgentId));
+        if (state.hostDetails[hostId]?.agents.some((a) => a.agent_id === target.childAgentId)) {
+          managedIds.add(target.childAgentId);
+        }
+      }
+    }
+    for (const cid of managedIds) {
+      orbitActions.archiveThread(hostId, cid);
+    }
+    setState(
+      (s) => {
+        const nextArchived = { ...s.archivedSubagents };
+        for (const k of keys) {
+          nextArchived[k] = true;
+        }
+        return {
+          ...s,
+          archivedSubagents: nextArchived,
+        };
+      },
+      true,
+    );
+    notifyToast(`已归档 ${targets.length} 个已完成子代理`);
   },
 
   openWorkspaceBoardTab(hostId: string, workspaceId: string, title?: string): void {

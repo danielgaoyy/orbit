@@ -3343,8 +3343,8 @@ impl AgentOrchestrator {
             let finished_idle = should_check_auto_archive && matches!(ag.status, AgentStatus::Idle);
             let ag_handle = ag.handle.clone();
             let ag_bg = ag.background;
-            let ag_needs_summary = ag.task_summary.is_none();
-            let ag_cwd = ag.cwd.clone();
+            let ag_is_subagent = ag.parent_agent_id.is_some();
+            let ag_needs_summary = ag.task_summary.is_none() && !ag_is_subagent;
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
             if finished_idle && !ag_bg {
@@ -3353,9 +3353,13 @@ impl AgentOrchestrator {
                 let peer_count = self
                     .store
                     .list_agents_filtered(Some(&ws_id), false, false, None)
-                    .map(|p| p.len())
+                    .map(|p| {
+                        p.into_iter()
+                            .filter(|a| a.parent_agent_id.is_none())
+                            .count()
+                    })
                     .unwrap_or(0);
-                if is_curated_ws && peer_count >= 2 {
+                if is_curated_ws && !ag_is_subagent && peer_count >= 2 {
                     let who = ag_handle.as_deref().unwrap_or("peer");
                     let snippet = self
                         .store
@@ -3382,28 +3386,13 @@ impl AgentOrchestrator {
                     }
                 }
 
-                // Non-blocking Turn-1 AI semantic summary + background auto-triage for unclassified sessions
+                // Non-blocking Turn-1 AI semantic summary (title/handle/1-line summary only).
+                // Workspace classification is strictly user-triggered (`待归类` until user clicks AI 归类 or assigns manually).
                 if ag_needs_summary && drained_prompt.is_none() && !auto_arch {
                     let mgr_bg = Arc::clone(self);
                     let aid_bg = agent_id.to_string();
-                    let project_root_bg = ws_opt
-                        .as_ref()
-                        .and_then(|w| w.project_root.clone().or_else(|| w.source_cwd.clone()))
-                        .unwrap_or(ag_cwd);
                     tokio::spawn(async move {
-                        let auto_cluster = mgr_bg.orch_config.read().await.auto_cluster_enabled;
-                        if !is_curated_ws && auto_cluster {
-                            let _ = mgr_bg
-                                .organize_project_workspaces(
-                                    None,
-                                    &project_root_bg,
-                                    vec![aid_bg],
-                                    false,
-                                )
-                                .await;
-                        } else {
-                            let _ = mgr_bg.summarize_agent(&aid_bg).await;
-                        }
+                        let _ = mgr_bg.summarize_agent(&aid_bg).await;
                     });
                 }
             }

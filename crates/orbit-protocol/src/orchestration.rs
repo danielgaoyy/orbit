@@ -204,8 +204,8 @@ pub struct OrchestrationConfig {
     /// IDs of bundled orchestration skills synced to local agent skill directories.
     #[serde(default)]
     pub installed_skills: Vec<String>,
-    /// Automatically cluster closely related new conversations into existing Mission Workspaces (default: `true`).
-    #[serde(default = "default_true")]
+    /// Automatically cluster closely related new conversations into existing Mission Workspaces (default: `false`; manual AI triage on demand).
+    #[serde(default)]
     pub auto_cluster_enabled: bool,
 }
 
@@ -218,7 +218,7 @@ impl Default for OrchestrationConfig {
             resume_on_startup: false,
             resume_prompt: default_resume_prompt(),
             installed_skills: Vec::new(),
-            auto_cluster_enabled: true,
+            auto_cluster_enabled: false,
         }
     }
 }

@@ -28,7 +28,7 @@ import { MarkdownBlocksView } from "@/components/markdown-blocks";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/overlays";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { isSubagentArchived, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 /**
@@ -106,6 +106,7 @@ export const SubagentsTrack = memo(function SubagentsTrack({
 }) {
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const [open, setOpen] = useState(false);
   const [inspectedProviderSub, setInspectedProviderSub] =
     useState<ProviderSubagentDescriptor | null>(null);
@@ -133,8 +134,14 @@ export const SubagentsTrack = memo(function SubagentsTrack({
 
   const providerSubagents: ProviderSubagentDescriptor[] = useMemo(() => {
     if (!hostId || !agentId) return [];
-    return hostDetails[hostId]?.provider_subagents?.[agentId] ?? [];
-  }, [hostId, agentId, hostDetails]);
+    return (hostDetails[hostId]?.provider_subagents?.[agentId] ?? []).filter(
+      (ps) =>
+        !isSubagentArchived(archivedSubagents, hostId, agentId, {
+          id: ps.subagent_id,
+          providerSubagentId: ps.subagent_id,
+        }),
+    );
+  }, [hostId, agentId, hostDetails, archivedSubagents]);
 
   useEffect(() => {
     if (!hostId || !agentId || !inspectedProviderSub) {
@@ -171,6 +178,8 @@ export const SubagentsTrack = memo(function SubagentsTrack({
   const finishedManaged = managedSubagents.filter(
     (m) => !m.agent.is_running && !m.agent.is_awaiting_permission,
   );
+  const finishedNative = providerSubagents.filter((p) => p.status !== "running");
+  const totalFinishedCount = finishedManaged.length + finishedNative.length;
 
   return (
     <div className="mx-auto mb-1.5 flex w-full max-w-[780px] justify-end px-4">
@@ -210,17 +219,27 @@ export const SubagentsTrack = memo(function SubagentsTrack({
               <Layers className="text-muted-foreground h-[14px] w-[14px]" />
               <span>Subagents ({totalCount})</span>
             </div>
-            {finishedManaged.length > 0 && (
+            {totalFinishedCount > 0 && (
               <button
                 type="button"
                 onClick={() => {
                   for (const item of finishedManaged) {
                     orbitActions.archiveThread(item.hostId, item.agent.agent_id);
                   }
+                  if (finishedNative.length > 0) {
+                    orbitActions.archiveFinishedSubagents(
+                      hostId,
+                      agentId,
+                      finishedNative.map((p) => ({
+                        id: p.subagent_id,
+                        providerSubagentId: p.subagent_id,
+                      })),
+                    );
+                  }
                 }}
                 className="text-muted-foreground hover:text-foreground hover:bg-accent cursor-pointer rounded-md px-2 py-0.5 text-[11.5px] transition-colors"
               >
-                Archive finished ({finishedManaged.length})
+                Archive finished ({totalFinishedCount})
               </button>
             )}
           </div>
@@ -341,24 +360,43 @@ export const SubagentsTrack = memo(function SubagentsTrack({
                             )}
                           />
                         </button>
-                        <button
-                          type="button"
-                          title="Inspect in Side Panel"
-                          onClick={() => {
-                            setOpen(false);
-                            orbitActions.openSubagentTab({
-                              callId: `provider:${sub.subagent_id}`,
-                              role: sub.title || "Subagent",
-                              promptPreview: sub.subtitle || "",
-                              childAgentId: null,
-                              providerSubagentId: sub.subagent_id,
-                              parentAgentId: agentId,
-                            });
-                          }}
-                          className="text-muted-foreground hover:text-foreground hover:bg-muted shrink-0 cursor-pointer rounded p-1"
-                        >
-                          <ArrowUpRight className="h-[13px] w-[13px]" />
-                        </button>
+                        <div className="flex shrink-0 items-center gap-0.5">
+                          <button
+                            type="button"
+                            title="Inspect in Side Panel"
+                            onClick={() => {
+                              setOpen(false);
+                              orbitActions.openSubagentTab({
+                                callId: `provider:${sub.subagent_id}`,
+                                role: sub.title || "Subagent",
+                                promptPreview: sub.subtitle || "",
+                                childAgentId: null,
+                                providerSubagentId: sub.subagent_id,
+                                parentAgentId: agentId,
+                              });
+                            }}
+                            className="text-muted-foreground hover:text-foreground hover:bg-muted shrink-0 cursor-pointer rounded p-1"
+                          >
+                            <ArrowUpRight className="h-[13px] w-[13px]" />
+                          </button>
+                          <button
+                            type="button"
+                            title="归档并隐藏此原生子代理"
+                            onClick={() => {
+                              if (inspectedProviderSub?.subagent_id === sub.subagent_id) {
+                                setInspectedProviderSub(null);
+                              }
+                              orbitActions.archiveSubagent(hostId, agentId, {
+                                id: sub.subagent_id,
+                                providerSubagentId: sub.subagent_id,
+                                role: sub.title || "Subagent",
+                              });
+                            }}
+                            className="text-muted-foreground hover:text-foreground hover:bg-muted shrink-0 cursor-pointer rounded p-1"
+                          >
+                            <Archive className="h-[13px] w-[13px]" />
+                          </button>
+                        </div>
                       </div>
 
                       {isSelected && (

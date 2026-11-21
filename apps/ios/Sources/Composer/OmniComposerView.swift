@@ -294,6 +294,18 @@ struct OmniComposerView: View {
             store.applySessionMode(.fullAccess)
         case "diff":
             store.openGitDiff()
+        case "files":
+            store.openWorkspaceFiles()
+        case "btw":
+            let remaining = collapsed.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !remaining.isEmpty {
+                store.composerText = ""
+                cursorOffset = 0
+                store.openSideQuestion(prefillAndSubmit: remaining)
+            } else {
+                store.openSideQuestion()
+            }
+            return
         case "terminal":
             store.openTerminal()
         case "new":
@@ -336,6 +348,9 @@ struct OmniComposerView: View {
             store.setGitStagedFilter(true)
             let token = candidate.tokenLabel.isEmpty ? "@staged-diff" : candidate.tokenLabel
             store.registerInlineMention(token: token, item: .gitDiff(staged: true, label: candidate.title))
+            insertInlineToken(token)
+        case "peer", "all":
+            let token = candidate.tokenLabel.isEmpty ? "@\(candidate.title)" : candidate.tokenLabel
             insertInlineToken(token)
         case "terminal":
             if let snap = store.captureTerminalSnapshotText() {

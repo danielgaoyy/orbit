@@ -89,6 +89,8 @@ public struct OrbitPalette: Equatable, Sendable {
     public let warning: Color
     public let danger: Color
     public let removed: Color
+    public let accentSky: Color
+    public let accentViolet: Color
 
     public static let light = OrbitPalette(
         isDark: false,
@@ -109,7 +111,9 @@ public struct OrbitPalette: Equatable, Sendable {
         relay: Color(hex: "#7C3AED"),
         warning: Color(hex: "#D97706"),
         danger: Color(hex: "#EF4444"),
-        removed: Color(hex: "#E11D48")
+        removed: Color(hex: "#E11D48"),
+        accentSky: Color(hex: "#0EA5E9"),
+        accentViolet: Color(hex: "#7C3AED")
     )
 
     public static let graphiteDark = OrbitPalette(
@@ -131,7 +135,9 @@ public struct OrbitPalette: Equatable, Sendable {
         relay: Color(hex: "#A78BFA"),
         warning: Color(hex: "#FBBF24"),
         danger: Color(hex: "#F87171"),
-        removed: Color(hex: "#FB7185")
+        removed: Color(hex: "#FB7185"),
+        accentSky: Color(hex: "#38BDF8"),
+        accentViolet: Color(hex: "#A78BFA")
     )
 
     public static let oledPure = OrbitPalette(
@@ -153,7 +159,9 @@ public struct OrbitPalette: Equatable, Sendable {
         relay: Color(hex: "#A78BFA"),
         warning: Color(hex: "#FBBF24"),
         danger: Color(hex: "#F87171"),
-        removed: Color(hex: "#FB7185")
+        removed: Color(hex: "#FB7185"),
+        accentSky: Color(hex: "#38BDF8"),
+        accentViolet: Color(hex: "#A78BFA")
     )
 
     public func connectionColor(_ state: FfiConnectionState) -> Color {
@@ -791,6 +799,104 @@ public enum OrbitFormatters {
         default:
             return codeExtensions.contains(ext) ? "chevron.left.forwardslash.chevron.right" : "doc"
         }
+    }
+
+    public static func isHostOnline(_ state: FfiConnectionState) -> Bool {
+        switch state {
+        case .onlineDirect, .onlineRelay:
+            return true
+        case .connectingDirect, .connectingRelay, .disconnected:
+            return false
+        }
+    }
+
+    private static let genericHandlePrefixes: [String] = [
+        "claude", "codex", "antigravity", "agy", "agent", "peer", "session", "worker"
+    ]
+
+    public static func isGenericHarnessHandle(_ raw: String?) -> Bool {
+        guard let raw else { return true }
+        let clean = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+            .lowercased()
+        if clean.isEmpty { return true }
+        for prefix in genericHandlePrefixes {
+            if clean == prefix { return true }
+            if clean.hasPrefix("\(prefix)-") || clean.hasPrefix("\(prefix)_") {
+                let suffix = String(clean.dropFirst(prefix.count + 1))
+                if suffix.allSatisfy({ $0.isNumber }) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    public static func semanticAgentTabLabel(
+        handle: String?,
+        title: String,
+        taskSummary: String?,
+        agentId: String
+    ) -> String {
+        if let rawHandle = handle?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@")),
+           !rawHandle.isEmpty,
+           !isGenericHarnessHandle(rawHandle) {
+            return rawHandle
+        }
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanTitle.isEmpty, cleanTitle.lowercased() != "new conversation" {
+            return cleanTitle.count > 26 ? String(cleanTitle.prefix(25)) + "…" : cleanTitle
+        }
+        if let summary = taskSummary?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty {
+            return summary.count > 26 ? String(summary.prefix(25)) + "…" : summary
+        }
+        if let rawHandle = handle?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@")),
+           !rawHandle.isEmpty {
+            return rawHandle
+        }
+        return String(agentId.prefix(10))
+    }
+
+    public static func normalizeSemver(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = trimmed.hasPrefix("v") || trimmed.hasPrefix("V")
+            ? String(trimmed.dropFirst())
+            : trimmed
+        let corePart = stripped.split(separator: "-").first.map(String.init) ?? stripped
+        let parts = corePart.split(separator: ".")
+        guard parts.count >= 2, parts.allSatisfy({ Int($0) != nil }) else { return nil }
+        return corePart
+    }
+
+    public static func compareSemver(_ lhs: String, _ rhs: String) -> Int {
+        let a = lhs.split(separator: ".").compactMap { Int($0) }
+        let b = rhs.split(separator: ".").compactMap { Int($0) }
+        let maxCount = max(a.count, b.count)
+        for idx in 0..<maxCount {
+            let av = idx < a.count ? a[idx] : 0
+            let bv = idx < b.count ? b[idx] : 0
+            if av < bv { return -1 }
+            if av > bv { return 1 }
+        }
+        return 0
+    }
+
+    public static func shortFileLabel(_ path: String, rootCwd: String) -> String {
+        stripWorkspacePrefix(path, cwd: rootCwd)
+    }
+
+    public static func relativeTimeFromRfc3339(_ rfc3339: String?) -> String {
+        guard let raw = rfc3339?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return ""
+        }
+        let parsed = isoFormatterWithFractional.date(from: raw) ?? isoFormatterPlain.date(from: raw)
+        guard let date = parsed else { return "" }
+        let ms = Int64(date.timeIntervalSince1970 * 1000.0)
+        return relativeTimeLabel(timestampMs: ms)
     }
 }
 

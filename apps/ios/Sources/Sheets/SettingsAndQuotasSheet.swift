@@ -31,6 +31,7 @@ struct SettingsAndQuotasSheet: View {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: OrbitSpacing.xl) {
                     appearanceSection
+                    generalPreferencesSection
                     hostsSection
                     if store.activeHost != nil {
                         quotasSection
@@ -121,14 +122,136 @@ struct SettingsAndQuotasSheet: View {
         }
     }
 
-    // MARK: - 2. Hosts Fleet (Progressive Disclosure Drill-Down)
+    // MARK: - 1b. General Preferences (Aligned with Desktop Settings)
 
-    private var hostsSection: some View {
-        VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
-            Text("Hosts")
+    private var generalPreferencesSection: some View {
+        let defaultPerm = OrbitIosStore.sessionModeFromRaw(store.defaultPermissionModeRaw)
+        return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            Text("General")
                 .font(OrbitTypography.meta(.medium))
                 .foregroundStyle(palette.fgMuted)
                 .padding(.horizontal, OrbitSpacing.xs)
+
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+                    Text("Default Access Permissions")
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.fgSecondary)
+
+                    HStack(spacing: 3) {
+                        permissionPrefChip(.default, title: "Always Ask", selected: defaultPerm == .default)
+                        permissionPrefChip(.acceptEdits, title: "Accept Edits", selected: defaultPerm == .acceptEdits)
+                        permissionPrefChip(.fullAccess, title: "Full Access", selected: defaultPerm == .fullAccess)
+                    }
+                    .padding(3)
+                    .background(palette.subtleFill)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, OrbitSpacing.md)
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Default Execution Mode")
+                            .font(OrbitTypography.subhead(.regular))
+                            .foregroundStyle(palette.fgPrimary)
+                        Text(store.draftUseWorktree ? "Isolated Git Worktree" : "Direct Local Folder")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                    Spacer()
+                    Picker("", selection: Binding(
+                        get: { store.draftUseWorktree },
+                        set: { store.setDraftUseWorktree($0) }
+                    )) {
+                        Text("Local").tag(false)
+                        Text("Worktree").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 150)
+                }
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, 10)
+
+                OrbitHairline()
+                    .padding(.leading, OrbitSpacing.md)
+
+                Toggle(isOn: Binding(
+                    get: { store.coalesceExploration },
+                    set: { store.setCoalesceExploration($0) }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Collapse Thinking & Tool Steps")
+                            .font(OrbitTypography.subhead(.regular))
+                            .foregroundStyle(palette.fgPrimary)
+                        Text("Keep completed exploration folded behind compact summaries")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                }
+                .tint(palette.primary)
+                .padding(.horizontal, OrbitSpacing.md)
+                .padding(.vertical, 10)
+            }
+            .background(palette.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(palette.hairline, lineWidth: 0.5)
+            )
+        }
+    }
+
+    private func permissionPrefChip(_ mode: FfiSessionMode, title: String, selected: Bool) -> some View {
+        Button {
+            store.setDefaultPermissionMode(mode)
+        } label: {
+            Text(title)
+                .font(OrbitTypography.meta(selected ? .semibold : .medium))
+                .foregroundStyle(selected ? palette.fgPrimary : palette.fgSecondary)
+                .frame(maxWidth: .infinity, minHeight: 30)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(selected ? palette.elevated : Color.clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(selected ? palette.hairline : Color.clear, lineWidth: 0.5)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 2. Hosts Fleet (Progressive Disclosure Drill-Down)
+
+    private var hostsSection: some View {
+        let outdatedHosts = store.outdatedOnlineHosts
+        return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
+            HStack {
+                Text("Hosts")
+                    .font(OrbitTypography.meta(.medium))
+                    .foregroundStyle(palette.fgMuted)
+                Spacer()
+                if !outdatedHosts.isEmpty {
+                    Button {
+                        store.upgradeAllOutdatedHosts()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 11.5))
+                            Text(outdatedHosts.count > 1 ? "Update All (\(outdatedHosts.count))" : "Update Host")
+                                .font(OrbitTypography.meta(.semibold))
+                        }
+                        .foregroundStyle(palette.accentSky)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, OrbitSpacing.xs)
 
             VStack(spacing: 0) {
                 if store.hosts.isEmpty {
@@ -226,6 +349,17 @@ struct SettingsAndQuotasSheet: View {
                             .padding(.horizontal, 6)
                             .padding(.vertical, 1.5)
                             .background(palette.subtleFill, in: Capsule())
+                    }
+
+                    if store.hostUpgradeStates[host.hostId]?.isUpgrading == true {
+                        OrbitSpinnerRingView(color: palette.accentSky, size: 11)
+                    } else if store.isHostDaemonOutdated(host) || store.isHostProtocolBehind(host) {
+                        Text("Update")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.accentSky)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(palette.accentSky.opacity(0.14), in: Capsule())
                     }
                 }
 
@@ -586,6 +720,57 @@ private struct HostDetailSettingsView: View {
                     .padding(.leading, OrbitSpacing.md)
 
                 metricRow(label: "Daemon", value: daemonSummary)
+
+                if OrbitFormatters.isHostOnline(host.connectionState) {
+                    let upState = store.hostUpgradeStates[host.hostId]
+                    let isOutdated = store.isHostDaemonOutdated(host) || store.isHostProtocolBehind(host)
+
+                    OrbitHairline()
+                        .padding(.leading, OrbitSpacing.md)
+
+                    HStack(spacing: OrbitSpacing.sm) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Daemon Update")
+                                .font(OrbitTypography.subhead(.regular))
+                                .foregroundStyle(palette.fgPrimary)
+                            if let err = upState?.error, !err.isEmpty {
+                                Text(err)
+                                    .font(OrbitTypography.meta(.regular))
+                                    .foregroundStyle(palette.danger)
+                                    .lineLimit(2)
+                            } else if let msg = upState?.statusMessage, !msg.isEmpty {
+                                Text(msg)
+                                    .font(OrbitTypography.meta(.regular))
+                                    .foregroundStyle(palette.accentSky)
+                                    .lineLimit(1)
+                            } else {
+                                Text(isOutdated ? "Update to v\(store.appShortVersion) available" : "Up to date (v\(store.appShortVersion))")
+                                    .font(OrbitTypography.meta(.regular))
+                                    .foregroundStyle(isOutdated ? palette.accentSky : palette.fgMuted)
+                            }
+                        }
+
+                        Spacer(minLength: OrbitSpacing.xs)
+
+                        if upState?.isUpgrading == true {
+                            OrbitSpinnerRingView(color: palette.accentSky, size: 14)
+                        } else {
+                            Button {
+                                store.upgradeHostDaemon(host.hostId)
+                            } label: {
+                                Text(isOutdated ? "Update Now" : "Re-sync")
+                                    .font(OrbitTypography.meta(.semibold))
+                                    .foregroundStyle(isOutdated ? palette.onPrimary : palette.fgPrimary)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 28)
+                                    .background(isOutdated ? palette.accentSky : palette.subtleFill, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, OrbitSpacing.md)
+                    .padding(.vertical, 8)
+                }
 
                 OrbitHairline()
                     .padding(.leading, OrbitSpacing.md)

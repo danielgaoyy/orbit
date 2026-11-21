@@ -17,8 +17,10 @@ struct StreamStageView: View {
     @State private var isReanchoringForViewportShrink: Bool = false
     @State private var stageViewportHeight: CGFloat = 0
     @State private var isProjectPickerPresented: Bool = false
+    @State private var isWorkspacePickerPresented: Bool = false
     @State private var isHostPickerPresented: Bool = false
     @State private var isEnvironmentPickerPresented: Bool = false
+    @State private var projectSearchQuery: String = ""
 
     private let bottomAnchorId = "bottom_anchor"
 
@@ -52,14 +54,22 @@ struct StreamStageView: View {
     }
 
     var body: some View {
-        Group {
-            if store.hosts.isEmpty {
-                unpairedZeroState
-            } else if turns.isEmpty {
-                newSessionZeroState
-            } else {
-                turnStreamScrollView
+        VStack(spacing: 0) {
+            if !store.hosts.isEmpty {
+                ConnectionStatusBannerView(store: store)
+                WorkspacePeerStripView(store: store)
             }
+
+            Group {
+                if store.hosts.isEmpty {
+                    unpairedZeroState
+                } else if turns.isEmpty {
+                    newSessionZeroState
+                } else {
+                    turnStreamScrollView
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .contentShape(Rectangle())
@@ -72,6 +82,7 @@ struct StreamStageView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if !store.hosts.isEmpty || store.hasDemoStageOverlay {
                 VStack(spacing: 0) {
+                    SubagentsTrackPill(store: store)
                     StickyDecisionDock(store: store)
                     OmniComposerView(store: store)
                 }
@@ -389,6 +400,45 @@ struct StreamStageView: View {
         }
     }
 
+    private var activeLaunchpadProject: FfiLaunchpadProject? {
+        store.launchpadProjects.first(where: {
+            OrbitFormatters.arePathsEquivalent($0.path, store.activeCwd)
+        })
+    }
+
+    private var activeGitInspection: FfiGitReposInspection? {
+        store.gitReposInspection(for: store.activeCwd)
+    }
+
+    private var isActiveFolderGitRepo: Bool {
+        if let insp = activeGitInspection { return insp.isGitRepo }
+        if let proj = activeLaunchpadProject { return proj.isGitRepo }
+        return store.activeGitBranch != nil
+    }
+
+    private var activeNestedGitRepos: [FfiNestedGitRepo] {
+        if let insp = activeGitInspection, !insp.nestedGitRepos.isEmpty {
+            return insp.nestedGitRepos
+        }
+        return activeLaunchpadProject?.nestedGitRepos ?? []
+    }
+
+    private var activeWorktreeLabel: String {
+        guard store.draftUseWorktree else { return "Local" }
+        if let nestedPath = store.draftWorktreeRepoPath, !nestedPath.isEmpty {
+            return "Worktree · \(OrbitFormatters.shortPath(nestedPath))"
+        }
+        return "Worktree"
+    }
+
+    private var draftSelectedWorkspaceTitle: String {
+        if let wsId = store.draftWorkspaceId,
+           let ws = store.activeProjectCuratedWorkspaces.first(where: { $0.workspaceId == wsId }) {
+            return ws.title
+        }
+        return "待归类"
+    }
+
     private var newSessionZeroState: some View {
         GeometryReader { geo in
             ScrollView(.vertical, showsIndicators: false) {
@@ -403,101 +453,135 @@ struct StreamStageView: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.84)
 
-                    // Compact Contextual Readiness Pills: [Project ▾] [Host ▾] [Local / Worktree ▾]
-                    HStack(spacing: OrbitSpacing.sm) {
-                        Button {
-                            store.hapticLight()
-                            isProjectPickerPresented.toggle()
-                        } label: {
-                            launchpadPillLabel {
-                                Image(systemName: "folder")
-                                    .font(.system(size: 12, weight: .medium))
-                                    .foregroundStyle(palette.fgSecondary)
-                                Text(activeProjectLabel)
-                                    .font(OrbitTypography.subhead(.medium))
-                                    .foregroundStyle(palette.fgPrimary)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 8.5, weight: .semibold))
-                                    .foregroundStyle(palette.fgMuted)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Project: \(activeProjectLabel)")
-                        .orbitCompactPopover(
-                            isPresented: $isProjectPickerPresented,
-                            arrowEdge: .top,
-                            palette: palette
-                        ) {
-                            projectPickerPopover
-                        }
-
-                        if store.hosts.count > 1, let activeHost = store.activeHost {
+                    // Compact Contextual Readiness Pills: [Project ▾] [Workspace ▾] [Host ▾] [Local / Worktree ▾]
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: OrbitSpacing.sm) {
                             Button {
                                 store.hapticLight()
-                                isHostPickerPresented.toggle()
+                                projectSearchQuery = ""
+                                isProjectPickerPresented.toggle()
                             } label: {
                                 launchpadPillLabel {
-                                    Circle()
-                                        .fill(palette.connectionColor(activeHost.connectionState))
-                                        .frame(width: 6, height: 6)
-                                    Text(activeHost.displayName)
-                                        .font(OrbitTypography.subhead(.medium))
-                                        .foregroundStyle(palette.fgPrimary)
-                                        .lineLimit(1)
-                                    Image(systemName: "chevron.down")
-                                        .font(.system(size: 8.5, weight: .semibold))
-                                        .foregroundStyle(palette.fgMuted)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Host: \(activeHost.displayName)")
-                            .orbitCompactPopover(
-                                isPresented: $isHostPickerPresented,
-                                arrowEdge: .top,
-                                palette: palette
-                            ) {
-                                OrbitHostPickerPopover(
-                                    store: store,
-                                    showPairingActions: false,
-                                    onSelectHost: { hostId in
-                                        store.hapticLight()
-                                        store.selectHost(hostId)
-                                        isHostPickerPresented = false
-                                    }
-                                )
-                            }
-                        }
-
-                        if store.isDraftNewSession {
-                            Button {
-                                store.hapticLight()
-                                isEnvironmentPickerPresented.toggle()
-                            } label: {
-                                launchpadPillLabel {
-                                    Image(systemName: store.draftUseWorktree ? "arrow.triangle.branch" : "laptopcomputer")
+                                    Image(systemName: "folder")
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundStyle(palette.fgSecondary)
-                                    Text(store.draftUseWorktree ? "Worktree" : "Local")
+                                    Text(activeProjectLabel)
                                         .font(OrbitTypography.subhead(.medium))
                                         .foregroundStyle(palette.fgPrimary)
                                         .lineLimit(1)
+                                        .truncationMode(.middle)
                                     Image(systemName: "chevron.down")
                                         .font(.system(size: 8.5, weight: .semibold))
                                         .foregroundStyle(palette.fgMuted)
                                 }
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("Execution environment: \(store.draftUseWorktree ? "Worktree" : "Local")")
+                            .accessibilityLabel("Project: \(activeProjectLabel)")
                             .orbitCompactPopover(
-                                isPresented: $isEnvironmentPickerPresented,
+                                isPresented: $isProjectPickerPresented,
                                 arrowEdge: .top,
                                 palette: palette
                             ) {
-                                environmentPickerPopover
+                                projectPickerPopover
+                            }
+
+                            if store.isDraftNewSession && !store.activeProjectCuratedWorkspaces.isEmpty {
+                                Button {
+                                    store.hapticLight()
+                                    isWorkspacePickerPresented.toggle()
+                                } label: {
+                                    launchpadPillLabel {
+                                        Image(systemName: store.draftWorkspaceId != nil ? "square.stack.3d.up" : "tray")
+                                            .font(.system(size: 11.5, weight: .medium))
+                                            .foregroundStyle(store.draftWorkspaceId != nil ? palette.accentViolet : palette.fgSecondary)
+                                        Text(draftSelectedWorkspaceTitle)
+                                            .font(OrbitTypography.subhead(.medium))
+                                            .foregroundStyle(palette.fgPrimary)
+                                            .lineLimit(1)
+                                        Image(systemName: "chevron.down")
+                                            .font(.system(size: 8.5, weight: .semibold))
+                                            .foregroundStyle(palette.fgMuted)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Workspace: \(draftSelectedWorkspaceTitle)")
+                                .orbitCompactPopover(
+                                    isPresented: $isWorkspacePickerPresented,
+                                    arrowEdge: .top,
+                                    palette: palette
+                                ) {
+                                    draftWorkspacePickerPopover
+                                }
+                            }
+
+                            if store.hosts.count > 1, let activeHost = store.activeHost {
+                                Button {
+                                    store.hapticLight()
+                                    isHostPickerPresented.toggle()
+                                } label: {
+                                    launchpadPillLabel {
+                                        Circle()
+                                            .fill(palette.connectionColor(activeHost.connectionState))
+                                            .frame(width: 6, height: 6)
+                                        Text(activeHost.displayName)
+                                            .font(OrbitTypography.subhead(.medium))
+                                            .foregroundStyle(palette.fgPrimary)
+                                            .lineLimit(1)
+                                        Image(systemName: "chevron.down")
+                                            .font(.system(size: 8.5, weight: .semibold))
+                                            .foregroundStyle(palette.fgMuted)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Host: \(activeHost.displayName)")
+                                .orbitCompactPopover(
+                                    isPresented: $isHostPickerPresented,
+                                    arrowEdge: .top,
+                                    palette: palette
+                                ) {
+                                    OrbitHostPickerPopover(
+                                        store: store,
+                                        showPairingActions: false,
+                                        onSelectHost: { hostId in
+                                            store.hapticLight()
+                                            store.selectHost(hostId)
+                                            isHostPickerPresented = false
+                                        }
+                                    )
+                                }
+                            }
+
+                            if store.isDraftNewSession {
+                                Button {
+                                    store.hapticLight()
+                                    store.requestGitReposInspection(for: store.activeCwd)
+                                    isEnvironmentPickerPresented.toggle()
+                                } label: {
+                                    launchpadPillLabel {
+                                        Image(systemName: store.draftUseWorktree ? "arrow.triangle.branch" : "laptopcomputer")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(palette.fgSecondary)
+                                        Text(activeWorktreeLabel)
+                                            .font(OrbitTypography.subhead(.medium))
+                                            .foregroundStyle(palette.fgPrimary)
+                                            .lineLimit(1)
+                                        Image(systemName: "chevron.down")
+                                            .font(.system(size: 8.5, weight: .semibold))
+                                            .foregroundStyle(palette.fgMuted)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Execution environment: \(activeWorktreeLabel)")
+                                .orbitCompactPopover(
+                                    isPresented: $isEnvironmentPickerPresented,
+                                    arrowEdge: .top,
+                                    palette: palette
+                                ) {
+                                    environmentPickerPopover
+                                }
                             }
                         }
+                        .padding(.horizontal, 4)
                     }
                     .padding(.top, 14)
 
@@ -525,6 +609,11 @@ struct StreamStageView: View {
                                 .truncationMode(.middle)
                         }
                         .padding(.top, 10)
+                    } else if !isActiveFolderGitRepo {
+                        Text(activeNestedGitRepos.isEmpty ? "Local folder (not a Git repo)" : "Multi-repo folder · \(activeNestedGitRepos.count) nested Git repos")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                            .padding(.top, 10)
                     }
 
                     Spacer(minLength: OrbitSpacing.xl)
@@ -541,40 +630,80 @@ struct StreamStageView: View {
         }
     }
 
+    private var filteredLaunchpadProjects: [FfiLaunchpadProject] {
+        let q = projectSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return store.launchpadProjects }
+        return store.launchpadProjects.filter { proj in
+            proj.name.lowercased().contains(q)
+                || proj.path.lowercased().contains(q)
+                || (proj.branch?.lowercased().contains(q) ?? false)
+        }
+    }
+
     private var projectPickerPopover: some View {
         VStack(alignment: .leading, spacing: 6) {
             OrbitPopoverSectionHeader(title: "Projects")
                 .padding(.horizontal, 10)
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 12))
+                    .foregroundStyle(palette.fgMuted)
+                TextField("Filter projects…", text: $projectSearchQuery)
+                    .font(OrbitTypography.meta(.regular))
+                    .foregroundStyle(palette.fgPrimary)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 30)
+            .background(palette.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .padding(.horizontal, 10)
 
             ViewThatFits(in: .vertical) {
                 projectRowsStack
                 ScrollView(.vertical, showsIndicators: true) {
                     projectRowsStack
                 }
-                .frame(height: 240)
+                .frame(height: 220)
             }
-            .frame(maxHeight: 240)
+            .frame(maxHeight: 220)
+
+            OrbitHairline()
+                .padding(.horizontal, 20)
+                .padding(.vertical, 2)
+
+            OrbitPopoverActionRow(
+                title: "Add new project…",
+                systemImage: "folder.badge.plus"
+            ) {
+                isProjectPickerPresented = false
+                store.openDirectoryBrowser()
+            }
+            .padding(.horizontal, 10)
         }
         .padding(.vertical, 10)
-        .frame(width: 252)
+        .frame(width: 268)
     }
 
     private var projectRowsStack: some View {
         VStack(alignment: .leading, spacing: 2) {
-            if store.launchpadProjects.isEmpty {
-                Text("No projects")
+            if filteredLaunchpadProjects.isEmpty {
+                Text(projectSearchQuery.isEmpty ? "No projects" : "No matching projects")
                     .font(.system(size: 12.5, weight: .regular))
                     .foregroundStyle(palette.fgMuted)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 12)
             } else {
-                ForEach(store.launchpadProjects) { proj in
+                ForEach(filteredLaunchpadProjects) { proj in
                     let isSelected = OrbitFormatters.arePathsEquivalent(proj.path, store.activeCwd)
                     OrbitPopoverOptionRow(
                         title: proj.name,
+                        subtitle: proj.branch,
                         systemImage: "folder",
                         isSelected: isSelected
                     ) {
+                        store.draftWorkspaceId = nil
                         store.selectWorkspaceDirectory(proj.path)
                         isProjectPickerPresented = false
                     }
@@ -584,8 +713,45 @@ struct StreamStageView: View {
         .padding(.horizontal, 10)
     }
 
-    private var environmentPickerPopover: some View {
+    private var draftWorkspacePickerPopover: some View {
         VStack(alignment: .leading, spacing: 6) {
+            OrbitPopoverSectionHeader(title: "Target Workspace")
+                .padding(.horizontal, 10)
+
+            VStack(alignment: .leading, spacing: 2) {
+                OrbitPopoverOptionRow(
+                    title: "待归类",
+                    subtitle: "Start standalone in project inbox",
+                    systemImage: "tray",
+                    isSelected: store.draftWorkspaceId == nil
+                ) {
+                    store.draftWorkspaceId = nil
+                    isWorkspacePickerPresented = false
+                }
+
+                ForEach(store.activeProjectCuratedWorkspaces, id: \.workspaceId) { ws in
+                    OrbitPopoverOptionRow(
+                        title: ws.title,
+                        subtitle: ws.missionGoal,
+                        systemImage: "square.stack.3d.up",
+                        isSelected: store.draftWorkspaceId == ws.workspaceId
+                    ) {
+                        store.draftWorkspaceId = ws.workspaceId
+                        isWorkspacePickerPresented = false
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+        }
+        .padding(.vertical, 10)
+        .frame(width: 268)
+    }
+
+    private var environmentPickerPopover: some View {
+        let canWorktreeRoot = isActiveFolderGitRepo
+        let nestedRepos = activeNestedGitRepos
+
+        return VStack(alignment: .leading, spacing: 6) {
             OrbitPopoverSectionHeader(
                 title: "Execution",
                 trailing: store.activeGitBranch
@@ -598,24 +764,67 @@ struct StreamStageView: View {
                     systemImage: "laptopcomputer",
                     isSelected: !store.draftUseWorktree
                 ) {
+                    store.draftWorktreeRepoPath = nil
                     store.setDraftUseWorktree(false)
                     isEnvironmentPickerPresented = false
                 }
 
-                OrbitPopoverOptionRow(
-                    title: "Worktree",
-                    subtitle: "Isolated Git worktree for parallel tasks",
-                    systemImage: "arrow.triangle.branch",
-                    isSelected: store.draftUseWorktree
-                ) {
-                    store.setDraftUseWorktree(true)
-                    isEnvironmentPickerPresented = false
+                if canWorktreeRoot {
+                    OrbitPopoverOptionRow(
+                        title: "Worktree",
+                        subtitle: "Isolated Git worktree for parallel tasks",
+                        systemImage: "arrow.triangle.branch",
+                        isSelected: store.draftUseWorktree && store.draftWorktreeRepoPath == nil
+                    ) {
+                        store.draftWorktreeRepoPath = nil
+                        store.setDraftUseWorktree(true)
+                        isEnvironmentPickerPresented = false
+                    }
+                } else if !nestedRepos.isEmpty {
+                    OrbitHairline()
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 2)
+
+                    OrbitPopoverSectionHeader(title: "Worktree in Nested Repo")
+
+                    ForEach(nestedRepos) { repo in
+                        let isSelected = store.draftUseWorktree
+                            && OrbitFormatters.arePathsEquivalent(store.draftWorktreeRepoPath ?? "", repo.path)
+                        OrbitPopoverOptionRow(
+                            title: repo.name,
+                            subtitle: repo.gitBranch ?? repo.relativePath,
+                            systemImage: "arrow.triangle.branch",
+                            isSelected: isSelected
+                        ) {
+                            store.draftWorktreeRepoPath = repo.path
+                            store.setDraftUseWorktree(true)
+                            isEnvironmentPickerPresented = false
+                        }
+                    }
+                } else {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundStyle(palette.fgMuted.opacity(0.6))
+                            .frame(width: 16)
+                            .padding(.top, 2)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Worktree unavailable")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(palette.fgMuted)
+                            Text("Selected folder is not a Git repository")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(palette.fgMuted.opacity(0.8))
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
                 }
             }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 10)
-        .frame(width: 288)
+        .frame(width: 292)
     }
 
     private func launchpadPillLabel<Content: View>(

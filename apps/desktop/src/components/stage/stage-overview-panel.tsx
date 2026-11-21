@@ -8,6 +8,7 @@ import {
   Clock,
   File,
   FileDiff,
+  FileText,
   MoreHorizontal,
   Square,
   SquareTerminal,
@@ -45,6 +46,7 @@ import { type ResolvedSubagentItem, resolveSessionSubagents } from "@/lib/subage
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
   type OverviewSectionId,
+  isSubagentArchived,
   orbitActions,
   useOrbitSelector,
 } from "@/state/orbit-store";
@@ -219,6 +221,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
   currentAgent,
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
+  const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
   const hostDetail = hostDetails[hostId] ?? null;
@@ -229,6 +232,20 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const [stoppingBg, setStoppingBg] = useState(false);
   const [openSubagentMenuKey, setOpenSubagentMenuKey] = useState<string | null>(null);
+
+  const currentWorkspace = useMemo(() => {
+    if (!hostDetail || !currentAgent) return null;
+    return hostDetail.workspaces.find((w) => w.workspace_id === currentAgent.workspace_id) ?? null;
+  }, [hostDetail, currentAgent]);
+  const currentBoardRev =
+    (currentAgent ? hostDetail?.workspace_boards?.[currentAgent.workspace_id]?.revision : 0) ??
+    currentWorkspace?.board_revision ??
+    0;
+  const showGroupNotesRow = Boolean(
+    currentAgent &&
+      !currentAgent.parent_agent_id &&
+      (currentWorkspace?.is_curated || currentBoardRev > 0),
+  );
 
   const insights = baseInsights;
   const backgroundTasks = insights.background_tasks;
@@ -321,8 +338,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
         insightsSubagents: insights.subagents,
         hostDetails,
         fleetHosts,
-      }),
-    [hostId, agentId, insights.subagents, hostDetails, fleetHosts],
+      }).filter(
+        (sa) =>
+          !isSubagentArchived(archivedSubagents, hostId, agentId, {
+            id: sa.callId,
+            providerSubagentId: sa.providerSubagentId,
+            childAgentId: sa.childAgentId,
+          }),
+      ),
+    [hostId, agentId, insights.subagents, hostDetails, fleetHosts, archivedSubagents],
   );
 
   const hasAwaitingSubagent = orderedSubagents.some((s) => s.status === "awaiting_permission");
@@ -330,14 +354,10 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const activeSubagentCount = orderedSubagents.filter(
     (s) => s.status === "awaiting_permission" || s.status === "running",
   ).length;
-  const finishedManagedSubagents = useMemo(
+  const finishedSubagents = useMemo(
     () =>
       orderedSubagents.filter(
-        (s) =>
-          s.isManaged &&
-          Boolean(s.childAgentId) &&
-          s.status !== "running" &&
-          s.status !== "awaiting_permission",
+        (s) => s.status !== "running" && s.status !== "awaiting_permission",
       ),
     [orderedSubagents],
   );
@@ -437,10 +457,31 @@ const StageOverviewBody = memo(function StageOverviewBody({
               ) : undefined
             }
           />
+
+          {showGroupNotesRow && currentAgent && (
+            <OverviewActionRow
+              icon={FileText}
+              label="Group notes"
+              onClick={() =>
+                orbitActions.openWorkspaceBoardTab(
+                  hostId,
+                  currentAgent.workspace_id,
+                  currentWorkspace?.title,
+                )
+              }
+              trailing={
+                currentBoardRev > 0 ? (
+                  <span className="text-muted-foreground/70 font-mono text-[11px]">
+                    v{currentBoardRev}
+                  </span>
+                ) : undefined
+              }
+            />
+          )}
         </div>
       </div>
 
-      {/* Layer 2: Subagents (single unified list: resting minimalist, hover actions for managed) */}
+      {/* Layer 2: Subagents (single unified list: resting minimalist, hover actions for managed & native) */}
       {orderedSubagents.length > 0 && (
         <OverviewLayerSection
           id="subagents"
@@ -450,11 +491,11 @@ const StageOverviewBody = memo(function StageOverviewBody({
           isRunning={hasRunningSubagent}
           hasAlert={hasAwaitingSubagent}
           headerAction={
-            finishedManagedSubagents.length > 0 ? (
+            finishedSubagents.length > 0 ? (
               <SimpleTooltip
                 label={
-                  finishedManagedSubagents.length > 1
-                    ? `Archive finished (${finishedManagedSubagents.length})`
+                  finishedSubagents.length > 1
+                    ? `Archive finished (${finishedSubagents.length})`
                     : "Archive finished"
                 }
               >
@@ -462,10 +503,27 @@ const StageOverviewBody = memo(function StageOverviewBody({
                   type="button"
                   aria-label="Archive finished subagents"
                   onClick={() => {
-                    for (const item of finishedManagedSubagents) {
+                    const managed = finishedSubagents.filter(
+                      (item) => item.isManaged && item.childAgentId,
+                    );
+                    for (const item of managed) {
                       if (item.childAgentId) {
                         orbitActions.archiveThread(item.childHostId, item.childAgentId);
                       }
+                    }
+                    const nativeItems = finishedSubagents.filter(
+                      (item) => !(item.isManaged && item.childAgentId),
+                    );
+                    if (nativeItems.length > 0) {
+                      orbitActions.archiveFinishedSubagents(
+                        hostId,
+                        agentId,
+                        nativeItems.map((item) => ({
+                          id: item.callId,
+                          providerSubagentId: item.providerSubagentId,
+                          childAgentId: item.childAgentId,
+                        })),
+                      );
                     }
                   }}
                   className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
@@ -618,7 +676,26 @@ const StageOverviewBody = memo(function StageOverviewBody({
                       </DropdownMenu>
                     </div>
                   ) : (
-                    <ChevronRight className="text-muted-foreground/45 hidden size-[13px] shrink-0 group-focus-within/subrow:block group-hover/subrow:block" />
+                    <div className="hidden items-center gap-0.5 group-focus-within/subrow:flex group-hover/subrow:flex">
+                      <SimpleTooltip label="Archive">
+                        <button
+                          type="button"
+                          aria-label={`Archive ${sa.title}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            orbitActions.archiveSubagent(hostId, agentId, {
+                              id: sa.callId,
+                              providerSubagentId: sa.providerSubagentId,
+                              childAgentId: sa.childAgentId,
+                              role: sa.title,
+                            });
+                          }}
+                          className="text-muted-foreground hover:text-foreground hover:bg-black/[0.06] dark:hover:bg-white/[0.08] inline-flex size-[22px] cursor-pointer items-center justify-center rounded-[6px] transition-colors"
+                        >
+                          <Archive className="size-[12.5px] stroke-[1.75]" />
+                        </button>
+                      </SimpleTooltip>
+                    </div>
                   )}
                 </div>
               </div>

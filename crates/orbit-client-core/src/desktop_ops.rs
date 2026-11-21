@@ -556,6 +556,7 @@ pub fn upgrade_remote_daemon_over_ssh(
          export PATH=\"$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; \
          curl -fsSL https://raw.githubusercontent.com/danielgaoyy/orbit/main/deploy/install.sh | sh >/dev/null 2>&1; \
          orbit daemon up{port_flag} >/dev/null 2>&1; \
+         if [ -f \"$HOME/.orbit/relay.json\" ] && orbit relay status 2>/dev/null | grep -q 'RUNNING'; then orbit relay up >/dev/null 2>&1 || true; fi; \
          orbit --version; \
          orbit pair"
     );

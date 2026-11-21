@@ -19,14 +19,19 @@ use orbit_client_core::catalog::{
     format_effort_label as core_format_effort_label,
     resolve_supported_effort_for_model as core_resolve_supported_effort_for_model,
 };
+use orbit_client_core::cloud_sync::{
+    CloudSyncDevicePollStatus, CloudSyncDevicePollView, CloudSyncResultView, CloudSyncState,
+    CloudSyncStatusView, GitHubDeviceFlowStartView,
+};
 use orbit_client_core::composer::{
     ClientPlatform, ComposePromptRequest, ComposedPromptView, ComposerContextInput,
     ComposerPasteInput, ComposerQuoteInput, MentionCandidateView, SlashCommandView, SlashDirective,
 };
 use orbit_client_core::contract::{
     AgentStageDeltaRequest, BridgeInfoView, CreateSessionRequest, FleetSidebarRequest,
-    MentionRankRequest, ModelSelectionRequest, ReadWorkspaceFileRequest, RenderDiagramRequest,
-    RenderDiagramView, RewindAgentRequest, SendPromptRequest, UpdateHostConfigRequest,
+    GitReposInspectionView, MentionRankRequest, ModelSelectionRequest, ReadWorkspaceFileRequest,
+    RenderDiagramRequest, RenderDiagramView, RewindAgentRequest, SendPromptRequest,
+    SpawnWorkspacePeerRequest, UpdateHostConfigRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
@@ -35,10 +40,11 @@ use orbit_client_core::render::{
     DiffFileView, DiffLineKind, DiffLineView, HighlightedLineView, HighlightedTokenView,
     InlineSpanView, RichBlockView, TableAlignmentView, TableCellView, TableRowView,
     TerminalRowView, TerminalScreenView, TerminalSpanView,
+    parse_markdown_blocks as core_parse_markdown_blocks,
 };
 use orbit_client_core::sidebar::{
     FleetSidebarView, LaunchpadProjectView, SidebarConversationView, SidebarProjectGroupView,
-    SidebarProjectSort, SidebarThreadFilter,
+    SidebarProjectSort, SidebarThreadFilter, SidebarWorkspaceGroupView,
 };
 use orbit_client_core::stage::{
     AgentStageDeltaView, AgentStageView, SessionBackgroundTaskKind, SessionBackgroundTaskStatus,
@@ -49,10 +55,15 @@ use orbit_client_core::stage::{
 };
 use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
-    DirectoryEntry, DiscoveredProject, PromptBadge, ProviderKind, ProviderModelCatalog,
-    ProviderModelSpec, ProviderQuotaSnapshot, QuestionItem, QuotaWindow, ReasoningEffort,
-    SessionMode, TerminalSummary, ThinkingOptionSpec, ToolCallDetail, ToolCallStatus,
-    WorkspaceSummary,
+    AgentMessageKind, AttentionState, DirectoryEntry, DiscoveredProject, NestedGitRepo,
+    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    ProviderSubagentStatus, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
+    ScheduleNewAgentConfig, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
+    ScheduleTarget, SessionMode, TerminalSummary, ThinkingOptionSpec, TimelinePayload,
+    ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
+    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
+    WorkspaceOrganizePhase, WorkspaceSummary,
 };
 
 uniffi::setup_scaffolding!();
@@ -374,6 +385,7 @@ pub struct FfiFleetOverview {
     pub total_pending_approvals: u32,
     pub hosts: Vec<FfiHostCard>,
     pub projects: Vec<FfiClientProject>,
+    pub project_order: Vec<String>,
 }
 
 impl From<FleetOverviewView> for FfiFleetOverview {
@@ -383,6 +395,45 @@ impl From<FleetOverviewView> for FfiFleetOverview {
             total_pending_approvals: v.total_pending_approvals,
             hosts: v.hosts.into_iter().map(Into::into).collect(),
             projects: v.projects.into_iter().map(Into::into).collect(),
+            project_order: v.project_order,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiNestedGitRepo {
+    pub path: String,
+    pub relative_path: String,
+    pub name: String,
+    pub git_branch: Option<String>,
+}
+
+impl From<NestedGitRepo> for FfiNestedGitRepo {
+    fn from(v: NestedGitRepo) -> Self {
+        Self {
+            path: v.path,
+            relative_path: v.relative_path,
+            name: v.name,
+            git_branch: v.git_branch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiGitReposInspection {
+    pub path: String,
+    pub is_git_repo: bool,
+    pub git_branch: Option<String>,
+    pub nested_git_repos: Vec<FfiNestedGitRepo>,
+}
+
+impl From<GitReposInspectionView> for FfiGitReposInspection {
+    fn from(v: GitReposInspectionView) -> Self {
+        Self {
+            path: v.path,
+            is_git_repo: v.is_git_repo,
+            git_branch: v.git_branch,
+            nested_git_repos: v.nested_git_repos.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -568,6 +619,12 @@ pub struct FfiWorkspaceSummary {
     pub cwd: String,
     pub git_branch: Option<String>,
     pub is_worktree: bool,
+    pub mission_goal: Option<String>,
+    pub project_root: Option<String>,
+    pub source_cwd: Option<String>,
+    pub board_revision: u64,
+    pub is_curated: bool,
+    pub updated_at_rfc3339: String,
 }
 
 impl From<WorkspaceSummary> for FfiWorkspaceSummary {
@@ -578,6 +635,391 @@ impl From<WorkspaceSummary> for FfiWorkspaceSummary {
             cwd: v.cwd,
             git_branch: v.git_branch,
             is_worktree: v.is_worktree,
+            mission_goal: v.mission_goal,
+            project_root: v.project_root,
+            source_cwd: v.source_cwd,
+            board_revision: v.board_revision,
+            is_curated: v.is_curated,
+            updated_at_rfc3339: v.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceClusterSuggestion {
+    pub target_workspace_id: String,
+    pub target_workspace_title: String,
+    pub confidence: f32,
+    pub reason: String,
+    pub auto_applied: bool,
+    pub previous_workspace_id: Option<String>,
+}
+
+impl From<WorkspaceClusterSuggestion> for FfiWorkspaceClusterSuggestion {
+    fn from(v: WorkspaceClusterSuggestion) -> Self {
+        Self {
+            target_workspace_id: v.target_workspace_id,
+            target_workspace_title: v.target_workspace_title,
+            confidence: v.confidence,
+            reason: v.reason,
+            auto_applied: v.auto_applied,
+            previous_workspace_id: v.previous_workspace_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceBoardSnapshot {
+    pub workspace_id: String,
+    pub content: String,
+    pub revision: u64,
+    pub updated_by: Option<String>,
+    pub updated_at_rfc3339: String,
+    pub board_path: Option<String>,
+}
+
+impl From<WorkspaceBoardSnapshot> for FfiWorkspaceBoardSnapshot {
+    fn from(v: WorkspaceBoardSnapshot) -> Self {
+        Self {
+            workspace_id: v.workspace_id,
+            content: v.content,
+            revision: v.revision,
+            updated_by: v.updated_by,
+            updated_at_rfc3339: v.updated_at.to_rfc3339(),
+            board_path: v.board_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorkspaceEventKind {
+    PeerJoined,
+    PeerFinished,
+    BoardUpdated,
+    PeerMessage,
+    FileEdited,
+    ConflictWarning,
+    WorkspaceMerged,
+}
+
+impl From<WorkspaceEventKind> for FfiWorkspaceEventKind {
+    fn from(v: WorkspaceEventKind) -> Self {
+        match v {
+            WorkspaceEventKind::PeerJoined => Self::PeerJoined,
+            WorkspaceEventKind::PeerFinished => Self::PeerFinished,
+            WorkspaceEventKind::BoardUpdated => Self::BoardUpdated,
+            WorkspaceEventKind::PeerMessage => Self::PeerMessage,
+            WorkspaceEventKind::FileEdited => Self::FileEdited,
+            WorkspaceEventKind::ConflictWarning => Self::ConflictWarning,
+            WorkspaceEventKind::WorkspaceMerged => Self::WorkspaceMerged,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceEvent {
+    pub seq: u64,
+    pub workspace_id: String,
+    pub agent_id: Option<String>,
+    pub agent_handle: Option<String>,
+    pub kind: FfiWorkspaceEventKind,
+    pub summary: String,
+    pub file_path: Option<String>,
+    pub created_at_rfc3339: String,
+}
+
+impl From<WorkspaceEventRecord> for FfiWorkspaceEvent {
+    fn from(v: WorkspaceEventRecord) -> Self {
+        Self {
+            seq: v.seq,
+            workspace_id: v.workspace_id,
+            agent_id: v.agent_id,
+            agent_handle: v.agent_handle,
+            kind: v.kind.into(),
+            summary: v.summary,
+            file_path: v.file_path,
+            created_at_rfc3339: v.created_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiWorkspaceOrganizePhase {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl From<WorkspaceOrganizePhase> for FfiWorkspaceOrganizePhase {
+    fn from(v: WorkspaceOrganizePhase) -> Self {
+        match v {
+            WorkspaceOrganizePhase::Running => Self::Running,
+            WorkspaceOrganizePhase::Completed => Self::Completed,
+            WorkspaceOrganizePhase::Failed => Self::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiWorkspaceOrganizeStatus {
+    pub project_root: String,
+    pub phase: FfiWorkspaceOrganizePhase,
+    pub message: String,
+    pub created_workspaces: u32,
+    pub grouped_agents: u32,
+    pub summarized_agents: u32,
+}
+
+impl From<WorkspaceOrganizeEvent> for FfiWorkspaceOrganizeStatus {
+    fn from(v: WorkspaceOrganizeEvent) -> Self {
+        Self {
+            project_root: v.project_root,
+            phase: v.phase.into(),
+            message: v.message,
+            created_workspaces: v.created_workspaces,
+            grouped_agents: v.grouped_agents,
+            summarized_agents: v.summarized_agents,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiProviderSubagentStatus {
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+
+impl From<ProviderSubagentStatus> for FfiProviderSubagentStatus {
+    fn from(v: ProviderSubagentStatus) -> Self {
+        match v {
+            ProviderSubagentStatus::Running => Self::Running,
+            ProviderSubagentStatus::Completed => Self::Completed,
+            ProviderSubagentStatus::Failed => Self::Failed,
+            ProviderSubagentStatus::Canceled => Self::Canceled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiProviderSubagentDescriptor {
+    pub subagent_id: String,
+    pub parent_agent_id: String,
+    pub parent_subagent_id: Option<String>,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub status: FfiProviderSubagentStatus,
+    pub created_at_rfc3339: String,
+    pub updated_at_rfc3339: String,
+}
+
+impl From<ProviderSubagentDescriptor> for FfiProviderSubagentDescriptor {
+    fn from(v: ProviderSubagentDescriptor) -> Self {
+        Self {
+            subagent_id: v.subagent_id,
+            parent_agent_id: v.parent_agent_id,
+            parent_subagent_id: v.parent_subagent_id,
+            title: v.title,
+            subtitle: v.subtitle,
+            status: v.status.into(),
+            created_at_rfc3339: v.created_at.to_rfc3339(),
+            updated_at_rfc3339: v.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+fn summarize_provider_subagent_payload(payload: &TimelinePayload) -> String {
+    match payload {
+        TimelinePayload::UserPrompt { text, .. } => text.trim().chars().take(280).collect(),
+        TimelinePayload::AssistantThinking { text, .. } => {
+            format!(
+                "Thinking: {}",
+                text.trim().chars().take(240).collect::<String>()
+            )
+        }
+        TimelinePayload::AssistantMessage { text, .. } => text.trim().chars().take(280).collect(),
+        TimelinePayload::ToolCall { detail, .. } => match detail {
+            ToolCallDetail::Shell { command, .. } => format!("$ {command}"),
+            ToolCallDetail::FileRead { path, .. } => format!("Read {path}"),
+            ToolCallDetail::FileEdit { path, .. } => format!("Edit {path}"),
+            ToolCallDetail::Search { query, .. } => format!("Search {query}"),
+            ToolCallDetail::Subagent { role, .. } => format!("Subagent {role}"),
+            ToolCallDetail::Generic { tool_name, .. } => format!("Tool {tool_name}"),
+        },
+        TimelinePayload::PermissionRequest { title, .. } => format!("Permission: {title}"),
+        TimelinePayload::PermissionResolved { decision, .. } => format!("Decision: {decision}"),
+        TimelinePayload::QuestionRequest { questions, .. } => questions
+            .first()
+            .map(|q| q.question.clone())
+            .unwrap_or_else(|| "Question requested".into()),
+        TimelinePayload::QuestionResolved { .. } => "Answered question".into(),
+        TimelinePayload::Notice { message, .. } => message.trim().chars().take(240).collect(),
+        TimelinePayload::AgentMessage { text, .. } => text.trim().chars().take(280).collect(),
+        TimelinePayload::StatusChanged { status } => format!("Status: {status:?}"),
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiProviderSubagentEvent {
+    pub seq: u64,
+    pub parent_agent_id: String,
+    pub subagent_id: String,
+    pub timestamp_rfc3339: String,
+    pub summary_text: String,
+}
+
+impl From<ProviderSubagentEvent> for FfiProviderSubagentEvent {
+    fn from(v: ProviderSubagentEvent) -> Self {
+        let summary_text = summarize_provider_subagent_payload(&v.payload);
+        Self {
+            seq: v.seq,
+            parent_agent_id: v.parent_agent_id,
+            subagent_id: v.subagent_id,
+            timestamp_rfc3339: v.timestamp.to_rfc3339(),
+            summary_text,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiScheduleKind {
+    Schedule,
+    Heartbeat,
+}
+
+impl From<ScheduleKind> for FfiScheduleKind {
+    fn from(v: ScheduleKind) -> Self {
+        match v {
+            ScheduleKind::Schedule => Self::Schedule,
+            ScheduleKind::Heartbeat => Self::Heartbeat,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiScheduleStatus {
+    Active,
+    Paused,
+    Completed,
+}
+
+impl From<ScheduleStatus> for FfiScheduleStatus {
+    fn from(v: ScheduleStatus) -> Self {
+        match v {
+            ScheduleStatus::Active => Self::Active,
+            ScheduleStatus::Paused => Self::Paused,
+            ScheduleStatus::Completed => Self::Completed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiScheduleRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+impl From<ScheduleRunStatus> for FfiScheduleRunStatus {
+    fn from(v: ScheduleRunStatus) -> Self {
+        match v {
+            ScheduleRunStatus::Running => Self::Running,
+            ScheduleRunStatus::Succeeded => Self::Succeeded,
+            ScheduleRunStatus::Failed => Self::Failed,
+            ScheduleRunStatus::Skipped => Self::Skipped,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiScheduleSpec {
+    pub schedule_id: String,
+    pub kind: FfiScheduleKind,
+    pub name: String,
+    pub cron_expr: String,
+    pub timezone: Option<String>,
+    pub prompt: String,
+    pub status: FfiScheduleStatus,
+    pub cwd: Option<String>,
+    pub workspace_id: Option<String>,
+    pub provider: Option<FfiProviderKind>,
+    pub mode: Option<FfiSessionMode>,
+    pub worktree: bool,
+    pub archive_on_finish: bool,
+    pub target_agent_id: Option<String>,
+    pub max_runs: Option<u32>,
+    pub run_count: u32,
+    pub last_run_at_rfc3339: Option<String>,
+    pub next_run_at_rfc3339: Option<String>,
+}
+
+impl From<ScheduleSpec> for FfiScheduleSpec {
+    fn from(v: ScheduleSpec) -> Self {
+        let (cwd, workspace_id, provider, mode, worktree, archive_on_finish, target_agent_id) =
+            match v.target {
+                ScheduleTarget::NewAgent(cfg) => (
+                    Some(cfg.cwd),
+                    cfg.workspace_id,
+                    Some(cfg.provider.into()),
+                    Some(cfg.mode.into()),
+                    cfg.worktree,
+                    cfg.archive_on_finish,
+                    None,
+                ),
+                ScheduleTarget::ExistingAgent { agent_id } => {
+                    (None, None, None, None, false, false, Some(agent_id))
+                }
+            };
+        Self {
+            schedule_id: v.schedule_id,
+            kind: v.kind.into(),
+            name: v.name,
+            cron_expr: v.cron_expr,
+            timezone: v.timezone,
+            prompt: v.prompt,
+            status: v.status.into(),
+            cwd,
+            workspace_id,
+            provider,
+            mode,
+            worktree,
+            archive_on_finish,
+            target_agent_id,
+            max_runs: v.max_runs,
+            run_count: v.run_count,
+            last_run_at_rfc3339: v.last_run_at.map(|d| d.to_rfc3339()),
+            next_run_at_rfc3339: v.next_run_at.map(|d| d.to_rfc3339()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiScheduleRunRecord {
+    pub run_id: String,
+    pub schedule_id: String,
+    pub agent_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub status: FfiScheduleRunStatus,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub started_at_rfc3339: String,
+    pub finished_at_rfc3339: Option<String>,
+}
+
+impl From<ScheduleRunRecord> for FfiScheduleRunRecord {
+    fn from(v: ScheduleRunRecord) -> Self {
+        Self {
+            run_id: v.run_id,
+            schedule_id: v.schedule_id,
+            agent_id: v.agent_id,
+            workspace_id: v.workspace_id,
+            status: v.status.into(),
+            summary: v.summary,
+            error: v.error,
+            started_at_rfc3339: v.started_at.to_rfc3339(),
+            finished_at_rfc3339: v.finished_at.map(|d| d.to_rfc3339()),
         }
     }
 }
@@ -617,6 +1059,13 @@ pub struct FfiAgentCard {
     pub has_background_tasks: bool,
     pub is_awaiting_permission: bool,
     pub parent_agent_id: Option<String>,
+    pub parent_host_id: Option<String>,
+    pub archived_at_rfc3339: Option<String>,
+    pub handle: Option<String>,
+    pub cluster_suggestion: Option<FfiWorkspaceClusterSuggestion>,
+    pub worktree_branch: Option<String>,
+    pub task_summary: Option<String>,
+    pub attention_label: Option<String>,
     pub latest_seq: u64,
     pub updated_at_rfc3339: String,
     pub is_pinned: bool,
@@ -627,6 +1076,13 @@ pub struct FfiAgentCard {
 
 impl From<AgentCardView> for FfiAgentCard {
     fn from(v: AgentCardView) -> Self {
+        let attention_label = match v.attention {
+            AttentionState::None => None,
+            AttentionState::Finished => Some("finished".into()),
+            AttentionState::Error => Some("error".into()),
+            AttentionState::Permission => Some("permission".into()),
+            AttentionState::ManualUnread => Some("manual_unread".into()),
+        };
         Self {
             agent_id: v.agent_id,
             workspace_id: v.workspace_id,
@@ -642,6 +1098,13 @@ impl From<AgentCardView> for FfiAgentCard {
             has_background_tasks: v.has_background_tasks,
             is_awaiting_permission: v.is_awaiting_permission,
             parent_agent_id: v.parent_agent_id,
+            parent_host_id: v.parent_host_id,
+            archived_at_rfc3339: v.archived_at_rfc3339,
+            handle: v.handle,
+            cluster_suggestion: v.cluster_suggestion.map(Into::into),
+            worktree_branch: v.worktree_branch,
+            task_summary: v.task_summary,
+            attention_label,
             latest_seq: v.latest_seq,
             updated_at_rfc3339: v.updated_at_rfc3339,
             is_pinned: v.is_pinned,
@@ -702,16 +1165,35 @@ pub struct FfiHostDetail {
     pub provider_catalogs: Vec<FfiProviderModelCatalog>,
     pub workspaces: Vec<FfiWorkspaceSummary>,
     pub agents: Vec<FfiAgentCard>,
+    pub archived_agents: Vec<FfiAgentCard>,
     pub last_created_agent_id: Option<String>,
     pub replaced_optimistic_agents: HashMap<String, String>,
     pub quotas: Vec<FfiProviderQuota>,
     pub terminals: Vec<FfiTerminalSummary>,
     pub active_terminal_id: Option<String>,
     pub active_terminal_slot: u8,
+    pub schedules: Vec<FfiScheduleSpec>,
+    pub provider_subagents: HashMap<String, Vec<FfiProviderSubagentDescriptor>>,
+    pub git_repos_by_cwd: HashMap<String, FfiGitReposInspection>,
+    pub workspace_boards: HashMap<String, FfiWorkspaceBoardSnapshot>,
+    pub workspace_events: HashMap<String, Vec<FfiWorkspaceEvent>>,
+    pub workspace_organize_status: HashMap<String, FfiWorkspaceOrganizeStatus>,
 }
 
 impl From<HostDetailView> for FfiHostDetail {
     fn from(v: HostDetailView) -> Self {
+        let mut active_agents = Vec::new();
+        let mut archived_agents = Vec::new();
+        for a in v.agents {
+            if a.background {
+                continue;
+            }
+            if a.archived_at_rfc3339.is_some() {
+                archived_agents.push(a.into());
+            } else {
+                active_agents.push(a.into());
+            }
+        }
         Self {
             revision: v.revision,
             host: v.host.into(),
@@ -724,18 +1206,40 @@ impl From<HostDetailView> for FfiHostDetail {
                 .filter(|w| w.archived_at.is_none() && !w.background)
                 .map(Into::into)
                 .collect(),
-            agents: v
-                .agents
-                .into_iter()
-                .filter(|a| a.archived_at_rfc3339.is_none() && !a.background)
-                .map(Into::into)
-                .collect(),
+            agents: active_agents,
+            archived_agents,
             last_created_agent_id: v.last_created_agent_id,
             replaced_optimistic_agents: v.replaced_optimistic_agents,
             quotas: v.quotas.into_iter().map(Into::into).collect(),
             terminals: v.terminals.into_iter().map(Into::into).collect(),
             active_terminal_id: v.active_terminal_id,
             active_terminal_slot: v.active_terminal_slot,
+            schedules: v.schedules.into_iter().map(Into::into).collect(),
+            provider_subagents: v
+                .provider_subagents
+                .into_iter()
+                .map(|(k, list)| (k, list.into_iter().map(Into::into).collect()))
+                .collect(),
+            git_repos_by_cwd: v
+                .git_repos_by_cwd
+                .into_iter()
+                .map(|(k, val)| (k, val.into()))
+                .collect(),
+            workspace_boards: v
+                .workspace_boards
+                .into_iter()
+                .map(|(k, val)| (k, val.into()))
+                .collect(),
+            workspace_events: v
+                .workspace_events
+                .into_iter()
+                .map(|(k, list)| (k, list.into_iter().map(Into::into).collect()))
+                .collect(),
+            workspace_organize_status: v
+                .workspace_organize_status
+                .into_iter()
+                .map(|(k, val)| (k, val.into()))
+                .collect(),
         }
     }
 }
@@ -1281,6 +1785,44 @@ impl From<QuestionItem> for FfiQuestionItem {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiAgentMessageKind {
+    DirectMessage,
+    FinishNotification,
+    Heartbeat,
+}
+
+impl From<AgentMessageKind> for FfiAgentMessageKind {
+    fn from(v: AgentMessageKind) -> Self {
+        match v {
+            AgentMessageKind::DirectMessage => Self::DirectMessage,
+            AgentMessageKind::FinishNotification => Self::FinishNotification,
+            AgentMessageKind::Heartbeat => Self::Heartbeat,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPermissionCheckpointRef {
+    pub child_agent_id: String,
+    pub child_host_id: Option<String>,
+    pub permission_request_id: String,
+    pub title: String,
+    pub allowed_decisions: Vec<String>,
+}
+
+impl From<PermissionCheckpointRef> for FfiPermissionCheckpointRef {
+    fn from(v: PermissionCheckpointRef) -> Self {
+        Self {
+            child_agent_id: v.agent_id,
+            child_host_id: v.host_id,
+            permission_request_id: v.request_id,
+            title: v.title,
+            allowed_decisions: v.allowed_decisions,
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum FfiTimelineItem {
     UserPrompt {
@@ -1338,6 +1880,19 @@ pub enum FfiTimelineItem {
         seq: u64,
         level: String,
         message: String,
+        timestamp_ms: Option<i64>,
+    },
+    AgentMessage {
+        seq: u64,
+        message_id: String,
+        kind: FfiAgentMessageKind,
+        source_agent_id: Option<String>,
+        source_host_id: Option<String>,
+        source_title: Option<String>,
+        event: Option<String>,
+        text: String,
+        permission_context: Option<FfiPermissionCheckpointRef>,
+        blocks: Vec<FfiRichBlock>,
         timestamp_ms: Option<i64>,
     },
 }
@@ -1501,23 +2056,29 @@ impl From<TimelineItemView> for FfiTimelineItem {
             },
             TimelineItemView::AgentMessage {
                 seq,
+                message_id,
+                kind,
+                source_agent_id,
+                source_host_id,
                 source_title,
+                event,
                 text,
+                permission_context,
+                blocks,
                 timestamp_ms,
-                ..
-            } => {
-                let prefix = source_title
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .map(|t| format!("[{t}] "))
-                    .unwrap_or_default();
-                Self::Notice {
-                    seq,
-                    level: "info".to_string(),
-                    message: format!("{prefix}{text}"),
-                    timestamp_ms,
-                }
-            }
+            } => Self::AgentMessage {
+                seq,
+                message_id,
+                kind: kind.into(),
+                source_agent_id,
+                source_host_id,
+                source_title,
+                event,
+                text,
+                permission_context: permission_context.map(Into::into),
+                blocks: blocks.into_iter().map(Into::into).collect(),
+                timestamp_ms,
+            },
         }
     }
 }
@@ -1883,6 +2444,7 @@ pub struct FfiSessionBackgroundTask {
     pub started_at_ms: Option<i64>,
     pub command: Option<String>,
     pub output_preview: Option<String>,
+    pub log_path: Option<String>,
 }
 
 impl From<SessionBackgroundTaskView> for FfiSessionBackgroundTask {
@@ -1896,6 +2458,7 @@ impl From<SessionBackgroundTaskView> for FfiSessionBackgroundTask {
             started_at_ms: v.started_at_ms,
             command: v.command,
             output_preview: v.output_preview,
+            log_path: v.log_path,
         }
     }
 }
@@ -1907,6 +2470,7 @@ pub struct FfiSessionSubagentEntry {
     pub prompt_preview: String,
     pub status: FfiToolStatus,
     pub child_agent_id: Option<String>,
+    pub provider_subagent_id: Option<String>,
     pub last_seq: u64,
 }
 
@@ -1918,6 +2482,7 @@ impl From<SessionSubagentEntryView> for FfiSessionSubagentEntry {
             prompt_preview: v.prompt_preview,
             status: v.status.into(),
             child_agent_id: v.child_agent_id,
+            provider_subagent_id: v.provider_subagent_id,
             last_seq: v.last_seq,
         }
     }
@@ -2064,6 +2629,45 @@ impl From<SidebarConversationView> for FfiSidebarConversation {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSidebarWorkspaceGroup {
+    pub workspace_id: String,
+    pub title: String,
+    pub mission_goal: Option<String>,
+    pub cwd: String,
+    pub git_branch: Option<String>,
+    pub is_worktree: bool,
+    pub board_revision: u64,
+    pub has_conflict: bool,
+    pub peer_count: u32,
+    pub running_count: u32,
+    pub unread_count: u32,
+    pub is_multi_agent: bool,
+    pub is_curated: bool,
+    pub conversations: Vec<FfiSidebarConversation>,
+}
+
+impl From<SidebarWorkspaceGroupView> for FfiSidebarWorkspaceGroup {
+    fn from(v: SidebarWorkspaceGroupView) -> Self {
+        Self {
+            workspace_id: v.workspace_id,
+            title: v.title,
+            mission_goal: v.mission_goal,
+            cwd: v.cwd,
+            git_branch: v.git_branch,
+            is_worktree: v.is_worktree,
+            board_revision: v.board_revision,
+            has_conflict: v.has_conflict,
+            peer_count: v.peer_count,
+            running_count: v.running_count,
+            unread_count: v.unread_count,
+            is_multi_agent: v.is_multi_agent,
+            is_curated: v.is_curated,
+            conversations: v.conversations.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiSidebarProjectGroup {
     pub id: String,
     pub host_id: String,
@@ -2071,10 +2675,15 @@ pub struct FfiSidebarProjectGroup {
     pub primary_cwd: String,
     pub directories: Vec<String>,
     pub git_branch: Option<String>,
+    pub is_git_repo: bool,
+    pub nested_git_repos: Vec<FfiNestedGitRepo>,
     pub pinned_project_id: Option<String>,
     pub is_home_workspace: bool,
     pub sort_weight_ms: i64,
+    pub sort_order_key: String,
     pub conversations: Vec<FfiSidebarConversation>,
+    pub workspaces: Vec<FfiSidebarWorkspaceGroup>,
+    pub unclassified_conversations: Vec<FfiSidebarConversation>,
 }
 
 impl From<SidebarProjectGroupView> for FfiSidebarProjectGroup {
@@ -2086,10 +2695,19 @@ impl From<SidebarProjectGroupView> for FfiSidebarProjectGroup {
             primary_cwd: v.primary_cwd,
             directories: v.directories,
             git_branch: v.git_branch,
+            is_git_repo: v.is_git_repo,
+            nested_git_repos: v.nested_git_repos.into_iter().map(Into::into).collect(),
             pinned_project_id: v.pinned_project_id,
             is_home_workspace: v.is_home_workspace,
             sort_weight_ms: v.sort_weight_ms,
+            sort_order_key: v.sort_order_key,
             conversations: v.conversations.into_iter().map(Into::into).collect(),
+            workspaces: v.workspaces.into_iter().map(Into::into).collect(),
+            unclassified_conversations: v
+                .unclassified_conversations
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         }
     }
 }
@@ -2101,6 +2719,8 @@ pub struct FfiLaunchpadProject {
     pub name: String,
     pub path: String,
     pub branch: Option<String>,
+    pub is_git_repo: bool,
+    pub nested_git_repos: Vec<FfiNestedGitRepo>,
 }
 
 impl From<LaunchpadProjectView> for FfiLaunchpadProject {
@@ -2111,6 +2731,8 @@ impl From<LaunchpadProjectView> for FfiLaunchpadProject {
             name: v.name,
             path: v.path,
             branch: v.branch,
+            is_git_repo: v.is_git_repo,
+            nested_git_repos: v.nested_git_repos.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -2863,6 +3485,59 @@ impl From<FfiReadWorkspaceFileRequest> for ReadWorkspaceFileRequest {
     }
 }
 
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSpawnWorkspacePeerRequest {
+    pub host_id: String,
+    pub workspace_id: String,
+    pub cwd: String,
+    pub extra_dirs: Vec<String>,
+    pub provider: FfiProviderKind,
+    pub model: Option<String>,
+    pub effort: Option<FfiReasoningEffort>,
+    pub mode: FfiSessionMode,
+    pub initial_prompt: String,
+    pub worktree_branch: Option<String>,
+    pub handle: Option<String>,
+    pub profile_id: Option<String>,
+}
+
+impl From<FfiSpawnWorkspacePeerRequest> for SpawnWorkspacePeerRequest {
+    fn from(v: FfiSpawnWorkspacePeerRequest) -> Self {
+        Self {
+            host_id: v.host_id,
+            workspace_id: v.workspace_id,
+            cwd: v.cwd,
+            extra_dirs: v.extra_dirs,
+            provider: v.provider.into(),
+            model: v.model,
+            effort: v.effort.map(Into::into),
+            mode: v.mode.into(),
+            initial_prompt: v.initial_prompt,
+            worktree_branch: v.worktree_branch,
+            handle: v.handle,
+            profile_id: v.profile_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCreateScheduleRequest {
+    pub host_id: String,
+    pub name: String,
+    pub cron_expr: String,
+    pub timezone: Option<String>,
+    pub prompt: String,
+    pub cwd: String,
+    pub workspace_id: Option<String>,
+    pub provider: FfiProviderKind,
+    pub model: Option<String>,
+    pub effort: Option<FfiReasoningEffort>,
+    pub mode: FfiSessionMode,
+    pub worktree: bool,
+    pub archive_on_finish: bool,
+    pub max_runs: Option<u32>,
+}
+
 // --- Git Review & Terminal Grid ---
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -3051,6 +3726,14 @@ pub fn resolve_supported_effort_for_model(
         catalog_default.map(Into::into),
     )
     .map(Into::into)
+}
+
+#[uniffi::export]
+pub fn parse_markdown_preview(markdown: String, streaming: bool) -> Vec<FfiRichBlock> {
+    core_parse_markdown_blocks(&markdown, streaming)
+        .into_iter()
+        .map(Into::into)
+        .collect()
 }
 
 #[derive(uniffi::Object)]
@@ -3821,6 +4504,592 @@ impl OrbitMobileCore {
     pub fn dismiss_cluster_suggestion(&self, host_id: String, agent_id: String) {
         self.inner.dismiss_cluster_suggestion(&host_id, &agent_id);
     }
+
+    pub fn create_session_in_workspace(
+        &self,
+        req: FfiCreateSessionRequest,
+        workspace_id: Option<String>,
+        handle: Option<String>,
+        auto_cluster: Option<bool>,
+    ) -> String {
+        let mut core_req: CreateSessionRequest = req.into();
+        core_req.workspace_id = workspace_id;
+        core_req.handle = handle;
+        core_req.auto_cluster = auto_cluster;
+        self.inner.create_session(core_req)
+    }
+
+    pub fn rank_mention_candidates_with_workspace(
+        &self,
+        host_id: String,
+        cwd: String,
+        query: String,
+        limit: u32,
+        workspace_id: Option<String>,
+        active_agent_id: Option<String>,
+    ) -> Vec<FfiMentionCandidate> {
+        let core_req = MentionRankRequest {
+            host_id,
+            cwd,
+            query,
+            limit: limit as usize,
+            workspace_id,
+            active_agent_id,
+        };
+        self.inner
+            .rank_mention_candidates(&core_req)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn unarchive_agent(&self, host_id: String, agent_id: String) {
+        self.inner.unarchive_agent(&host_id, &agent_id);
+    }
+
+    pub fn delete_agent(&self, host_id: String, agent_id: String) {
+        self.inner.delete_agent(&host_id, &agent_id);
+    }
+
+    pub fn detach_agent(&self, host_id: String, agent_id: String) {
+        self.inner.detach_agent(&host_id, &agent_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent_identity(
+        &self,
+        host_id: String,
+        agent_id: String,
+        handle: Option<String>,
+        title: Option<String>,
+        task_summary: Option<String>,
+        lock_handle: bool,
+        lock_title: bool,
+    ) {
+        self.inner.update_agent_identity(
+            &host_id,
+            &agent_id,
+            handle,
+            title,
+            task_summary,
+            lock_handle,
+            lock_title,
+        );
+    }
+
+    pub fn summarize_agent(&self, host_id: String, agent_id: String) {
+        self.inner.summarize_agent(&host_id, &agent_id);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_mission_workspace(
+        &self,
+        host_id: String,
+        source_cwd: String,
+        title: String,
+        mission_goal: Option<String>,
+        use_worktree: bool,
+        worktree_branch: Option<String>,
+        base_ref: Option<String>,
+    ) {
+        let isolation = if use_worktree {
+            WorkspaceIsolation::Worktree
+        } else {
+            WorkspaceIsolation::Local
+        };
+        self.inner.create_mission_workspace(
+            &host_id,
+            &source_cwd,
+            title,
+            mission_goal,
+            isolation,
+            worktree_branch,
+            base_ref,
+        );
+    }
+
+    pub fn rename_workspace(&self, host_id: String, workspace_id: String, title: String) {
+        self.inner.rename_workspace(&host_id, &workspace_id, &title);
+    }
+
+    pub fn update_workspace_goal(&self, host_id: String, workspace_id: String, goal: String) {
+        self.inner
+            .update_workspace_goal(&host_id, &workspace_id, goal);
+    }
+
+    pub fn archive_workspace(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        keep_agents_unclassified: bool,
+    ) {
+        self.inner
+            .archive_workspace_v2(&host_id, &workspace_id, keep_agents_unclassified);
+    }
+
+    pub fn move_agent_to_workspace_v2(
+        &self,
+        host_id: String,
+        agent_id: String,
+        target_workspace_id: Option<String>,
+        new_workspace_title: Option<String>,
+        make_unclassified: bool,
+    ) {
+        self.inner.move_agent_to_workspace_v2(
+            &host_id,
+            &agent_id,
+            target_workspace_id,
+            new_workspace_title,
+            make_unclassified,
+        );
+    }
+
+    pub fn organize_project_workspaces(
+        &self,
+        host_id: String,
+        project_root: String,
+        agent_ids: Vec<String>,
+        auto_apply: bool,
+    ) {
+        self.inner
+            .organize_project_workspaces(&host_id, &project_root, agent_ids, auto_apply);
+    }
+
+    pub fn spawn_workspace_peer(&self, req: FfiSpawnWorkspacePeerRequest) -> String {
+        self.inner.spawn_workspace_peer(req.into())
+    }
+
+    pub fn fetch_workspace_board(&self, host_id: String, workspace_id: String) {
+        self.inner.fetch_workspace_board(&host_id, &workspace_id);
+    }
+
+    pub fn workspace_board(
+        &self,
+        host_id: String,
+        workspace_id: String,
+    ) -> Option<FfiWorkspaceBoardSnapshot> {
+        self.inner
+            .workspace_board(&host_id, &workspace_id)
+            .map(Into::into)
+    }
+
+    pub fn update_workspace_board(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        content: String,
+        section: Option<String>,
+        updated_by: Option<String>,
+    ) {
+        self.inner
+            .update_workspace_board(&host_id, &workspace_id, content, section, updated_by);
+    }
+
+    pub fn fetch_workspace_events(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        limit: Option<u32>,
+    ) {
+        self.inner
+            .fetch_workspace_events(&host_id, &workspace_id, limit);
+    }
+
+    pub fn workspace_events(
+        &self,
+        host_id: String,
+        workspace_id: String,
+    ) -> Vec<FfiWorkspaceEvent> {
+        self.inner
+            .workspace_events(&host_id, &workspace_id)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn request_git_repos_inspection(
+        &self,
+        host_id: String,
+        path: String,
+        extra_dirs: Vec<String>,
+    ) {
+        self.inner
+            .request_git_repos_inspection(&host_id, &path, extra_dirs);
+    }
+
+    pub fn git_repos_inspection(
+        &self,
+        host_id: String,
+        path: String,
+    ) -> Option<FfiGitReposInspection> {
+        self.inner
+            .git_repos_inspection(&host_id, &path)
+            .map(Into::into)
+    }
+
+    pub fn list_provider_subagents(&self, host_id: String, parent_agent_id: String) {
+        self.inner
+            .list_provider_subagents(&host_id, &parent_agent_id);
+    }
+
+    pub fn open_provider_subagent_timeline(
+        &self,
+        host_id: String,
+        parent_agent_id: String,
+        subagent_id: String,
+    ) {
+        self.inner
+            .open_provider_subagent_timeline(&host_id, &parent_agent_id, &subagent_id);
+    }
+
+    pub fn provider_subagent_timeline(
+        &self,
+        host_id: String,
+        parent_agent_id: String,
+        subagent_id: String,
+    ) -> Vec<FfiProviderSubagentEvent> {
+        self.inner
+            .provider_subagent_timeline(&host_id, &parent_agent_id, &subagent_id)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn create_schedule(&self, req: FfiCreateScheduleRequest) {
+        let target = ScheduleTarget::NewAgent(ScheduleNewAgentConfig {
+            cwd: req.cwd,
+            workspace_id: req.workspace_id,
+            provider: req.provider.into(),
+            model: req.model,
+            effort: req.effort.map(Into::into),
+            mode: req.mode.into(),
+            profile_id: None,
+            worktree: req.worktree,
+            base_ref: None,
+            archive_on_finish: req.archive_on_finish,
+            background: false,
+        });
+        self.inner.create_schedule(
+            &req.host_id,
+            req.name,
+            req.cron_expr,
+            req.timezone,
+            req.prompt,
+            target,
+            req.max_runs,
+        );
+    }
+
+    pub fn pause_schedule(&self, host_id: String, schedule_id: String) {
+        self.inner.pause_schedule(&host_id, &schedule_id);
+    }
+
+    pub fn resume_schedule(&self, host_id: String, schedule_id: String) {
+        self.inner.resume_schedule(&host_id, &schedule_id);
+    }
+
+    pub fn run_schedule_once(&self, host_id: String, schedule_id: String) {
+        self.inner.run_schedule_once(&host_id, &schedule_id);
+    }
+
+    pub fn delete_schedule(&self, host_id: String, schedule_id: String) {
+        self.inner.delete_schedule(&host_id, &schedule_id);
+    }
+
+    pub fn fetch_schedule_runs(&self, host_id: String, schedule_id: String, limit: Option<u32>) {
+        self.inner
+            .fetch_schedule_runs(&host_id, &schedule_id, limit);
+    }
+
+    pub fn schedule_runs(&self, host_id: String, schedule_id: String) -> Vec<FfiScheduleRunRecord> {
+        self.inner
+            .schedule_runs(&host_id, &schedule_id)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    // --- Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist) ---
+
+    pub fn cloud_sync_status(&self) -> FfiCloudSyncStatus {
+        self.inner.cloud_sync_status().into()
+    }
+
+    pub fn cloud_sync_generate_passphrase(&self) -> String {
+        self.inner.cloud_sync_generate_passphrase()
+    }
+
+    pub fn cloud_sync_set_github_client_id(
+        &self,
+        client_id: Option<String>,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_set_github_client_id(client_id)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_set_auto_sync(
+        &self,
+        enabled: bool,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_set_auto_sync(enabled)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_start_github_device_flow(
+        &self,
+        client_id_override: Option<String>,
+    ) -> Result<FfiGitHubDeviceFlowStart, FfiOrbitError> {
+        self.inner
+            .cloud_sync_start_github_device_flow(client_id_override)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_poll_github_device_flow(
+        &self,
+        device_code: String,
+        client_id_override: Option<String>,
+    ) -> Result<FfiCloudSyncDevicePoll, FfiOrbitError> {
+        self.inner
+            .cloud_sync_poll_github_device_flow(&device_code, client_id_override)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_login_with_token(
+        &self,
+        token: String,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_login_with_token(&token)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_unlock_with_passphrase(
+        &self,
+        passphrase: String,
+    ) -> Result<FfiCloudSyncResult, FfiOrbitError> {
+        self.inner
+            .cloud_sync_unlock_with_passphrase(&passphrase)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_now(&self) -> Result<FfiCloudSyncResult, FfiOrbitError> {
+        self.inner
+            .cloud_sync_now()
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_logout(
+        &self,
+        clear_local_hosts: bool,
+    ) -> Result<FfiCloudSyncStatus, FfiOrbitError> {
+        self.inner
+            .cloud_sync_logout(clear_local_hosts)
+            .map(Into::into)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+
+    pub fn cloud_sync_get_preferences_json(&self) -> String {
+        let prefs = self.inner.cloud_sync_get_preferences();
+        serde_json::to_string(&prefs).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    pub fn cloud_sync_update_preferences_json(
+        &self,
+        patch_json: String,
+    ) -> Result<(), FfiOrbitError> {
+        let patch: HashMap<String, serde_json::Value> =
+            serde_json::from_str(&patch_json).map_err(|e| FfiOrbitError::Core {
+                detail: format!("invalid preferences patch JSON: {e}"),
+            })?;
+        self.inner
+            .cloud_sync_update_preferences(patch)
+            .map_err(|e| FfiOrbitError::Core {
+                detail: e.to_string(),
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCloudSyncState {
+    SignedOut,
+    Locked,
+    Ready,
+    Syncing,
+    Error,
+}
+
+impl From<CloudSyncState> for FfiCloudSyncState {
+    fn from(v: CloudSyncState) -> Self {
+        match v {
+            CloudSyncState::SignedOut => Self::SignedOut,
+            CloudSyncState::Locked => Self::Locked,
+            CloudSyncState::Ready => Self::Ready,
+            CloudSyncState::Syncing => Self::Syncing,
+            CloudSyncState::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCloudSyncDevicePollStatus {
+    Pending,
+    SlowDown,
+    Authorized,
+    Expired,
+    Denied,
+}
+
+impl From<CloudSyncDevicePollStatus> for FfiCloudSyncDevicePollStatus {
+    fn from(v: CloudSyncDevicePollStatus) -> Self {
+        match v {
+            CloudSyncDevicePollStatus::Pending => Self::Pending,
+            CloudSyncDevicePollStatus::SlowDown => Self::SlowDown,
+            CloudSyncDevicePollStatus::Authorized => Self::Authorized,
+            CloudSyncDevicePollStatus::Expired => Self::Expired,
+            CloudSyncDevicePollStatus::Denied => Self::Denied,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCloudSyncStatus {
+    pub state: FfiCloudSyncState,
+    pub provider: String,
+    pub github_oauth_configured: bool,
+    pub github_client_id_override: Option<String>,
+    pub account_login: Option<String>,
+    pub account_name: Option<String>,
+    pub account_avatar_url: Option<String>,
+    pub gist_id: Option<String>,
+    pub gist_html_url: Option<String>,
+    pub remote_vault_exists: bool,
+    pub auto_sync_enabled: bool,
+    pub last_synced_at_ms: Option<i64>,
+    pub last_vault_revision: u64,
+    pub synced_host_count: u32,
+    pub synced_project_count: u32,
+    pub last_error: Option<String>,
+}
+
+impl From<CloudSyncStatusView> for FfiCloudSyncStatus {
+    fn from(v: CloudSyncStatusView) -> Self {
+        Self {
+            state: v.state.into(),
+            provider: v.provider,
+            github_oauth_configured: v.github_oauth_configured,
+            github_client_id_override: v.github_client_id_override,
+            account_login: v.account_login,
+            account_name: v.account_name,
+            account_avatar_url: v.account_avatar_url,
+            gist_id: v.gist_id,
+            gist_html_url: v.gist_html_url,
+            remote_vault_exists: v.remote_vault_exists,
+            auto_sync_enabled: v.auto_sync_enabled,
+            last_synced_at_ms: v.last_synced_at_ms,
+            last_vault_revision: v.last_vault_revision,
+            synced_host_count: v.synced_host_count,
+            synced_project_count: v.synced_project_count,
+            last_error: v.last_error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiGitHubDeviceFlowStart {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in_secs: u64,
+    pub interval_secs: u64,
+}
+
+impl From<GitHubDeviceFlowStartView> for FfiGitHubDeviceFlowStart {
+    fn from(v: GitHubDeviceFlowStartView) -> Self {
+        Self {
+            device_code: v.device_code,
+            user_code: v.user_code,
+            verification_uri: v.verification_uri,
+            expires_in_secs: v.expires_in_secs,
+            interval_secs: v.interval_secs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCloudSyncDevicePoll {
+    pub status: FfiCloudSyncDevicePollStatus,
+    pub interval_secs: Option<u64>,
+    pub error: Option<String>,
+    pub sync_status: Option<FfiCloudSyncStatus>,
+}
+
+impl From<CloudSyncDevicePollView> for FfiCloudSyncDevicePoll {
+    fn from(v: CloudSyncDevicePollView) -> Self {
+        Self {
+            status: v.status.into(),
+            interval_secs: v.interval_secs,
+            error: v.error,
+            sync_status: v.sync_status.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiCloudSyncResult {
+    pub hosts_added: u32,
+    pub hosts_updated: u32,
+    pub hosts_removed: u32,
+    pub projects_added: u32,
+    pub projects_updated: u32,
+    pub projects_removed: u32,
+    pub preferences_updated: u32,
+    pub pushed_remote: bool,
+    pub vault_revision: u64,
+    pub synced_at_ms: i64,
+    pub gist_html_url: Option<String>,
+}
+
+impl From<CloudSyncResultView> for FfiCloudSyncResult {
+    fn from(v: CloudSyncResultView) -> Self {
+        Self {
+            hosts_added: v.hosts_added,
+            hosts_updated: v.hosts_updated,
+            hosts_removed: v.hosts_removed,
+            projects_added: v.projects_added,
+            projects_updated: v.projects_updated,
+            projects_removed: v.projects_removed,
+            preferences_updated: v.preferences_updated,
+            pushed_remote: v.pushed_remote,
+            vault_revision: v.vault_revision,
+            synced_at_ms: v.synced_at_ms,
+            gist_html_url: v.gist_html_url,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3918,7 +5187,26 @@ mod tests {
 
         let cmds = core.slash_commands(FfiClientPlatform::Ios, None);
         assert!(cmds.iter().any(|c| c.id == "btw"));
-        assert!(!cmds.iter().any(|c| c.id == "files"));
+        assert!(cmds.iter().any(|c| c.id == "files"));
+
+        let blocks = parse_markdown_preview("# Board\n\n- Task **one**".into(), false);
+        assert_eq!(blocks.len(), 2);
+
+        let reordered = core
+            .reorder_projects(vec!["host_1::/Users/jess/Code/orbit".into()])
+            .expect("reorder projects");
+        assert_eq!(reordered, vec!["host_1::/Users/jess/Code/orbit"]);
+        assert_eq!(core.project_order(), reordered);
+
+        let mentions_ws = core.rank_mention_candidates_with_workspace(
+            "host_1".into(),
+            "/Users/jess/Code/orbit".into(),
+            "diff".into(),
+            10,
+            None,
+            None,
+        );
+        assert!(mentions_ws.iter().any(|m| m.token_label == "@working-diff"));
 
         let composed = core.compose_prompt(FfiComposePromptRequest {
             provider: FfiProviderKind::Codex,

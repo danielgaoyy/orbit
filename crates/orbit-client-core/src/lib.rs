@@ -9,6 +9,7 @@
 
 pub mod app_core;
 pub mod catalog;
+pub mod cloud_sync;
 pub mod composer;
 pub mod contract;
 pub mod desktop_ops;
@@ -138,6 +139,8 @@ pub enum ClientCoreError {
     Protocol(#[from] orbit_protocol::ProtocolError),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("cloud sync error: {0}")]
+    CloudSync(#[from] crate::cloud_sync::CloudSyncError),
     #[error("websocket error: {0}")]
     Ws(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("relay transport error: {0}")]
@@ -818,19 +821,24 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
         WireMessage::WorkspaceCreated { workspace, .. }
         | WireMessage::WorkspaceUpdated { workspace } => {
             let _ = store.upsert_workspace(workspace);
+            if !host_id.is_empty() {
+                let _ = store.upsert_single_replica_workspace(host_id, workspace);
+            }
         }
         WireMessage::AgentsSnapshot { agents, .. } => {
-            for ag in agents {
-                let _ = store.upsert_agent(ag, None);
-            }
             if !host_id.is_empty() {
                 let _ = store.upsert_replica_agents(host_id, agents);
+            } else {
+                for ag in agents {
+                    let _ = store.upsert_agent(ag, None);
+                }
             }
         }
         WireMessage::AgentCreated { agent, .. } | WireMessage::AgentUpdated { agent } => {
-            let _ = store.upsert_agent(agent, None);
             if !host_id.is_empty() {
                 let _ = store.upsert_single_replica_agent(host_id, agent);
+            } else {
+                let _ = store.upsert_agent(agent, None);
             }
         }
         WireMessage::AgentDeleted { agent_id } => {

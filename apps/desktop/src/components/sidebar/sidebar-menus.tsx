@@ -276,7 +276,7 @@ export function SharedConversationMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <Layers className="h-[14px] w-[14px] shrink-0 stroke-[1.75] text-sky-500" />
-              <span>AI 自动归类到 Workspace</span>
+              <span>AI 归类此会话到 Workspace</span>
             </span>
           </DropdownMenuItem>
         )}
@@ -489,7 +489,7 @@ export function SharedProjectMenu({
         >
           <span className="flex items-center gap-2 whitespace-nowrap">
             <Sparkles className="h-[14px] w-[14px] shrink-0 stroke-[1.75] text-sky-500" />
-            <span>AI 自动归类会话</span>
+            <span>AI 批量归类待整理会话</span>
           </span>
         </DropdownMenuItem>
 

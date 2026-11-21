@@ -18,6 +18,7 @@ path = "src/bin/uniffi-bindgen.rs"
 [dependencies]
 orbit-client-core.workspace = true
 orbit-protocol.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 uniffi = { workspace = true, features = ["cli"] }
 

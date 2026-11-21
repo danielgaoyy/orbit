@@ -134,6 +134,8 @@ impl OrbitStore {
             PRAGMA busy_timeout = 5000;
             PRAGMA wal_autocheckpoint = 1000;
             PRAGMA journal_size_limit = 16777216;
+            PRAGMA cache_size = -16000;
+            PRAGMA temp_store = MEMORY;
 
             CREATE TABLE IF NOT EXISTS workspaces (
                 workspace_id TEXT PRIMARY KEY,
@@ -1249,6 +1251,22 @@ impl OrbitStore {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_single_replica_workspace(
+        &self,
+        host_id: &str,
+        ws: &WorkspaceSummary,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let json = serde_json::to_string(ws)?;
+        conn.execute(
+            "INSERT INTO client_replica_workspaces (host_id, workspace_id, payload_json)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(host_id, workspace_id) DO UPDATE SET payload_json = excluded.payload_json",
+            params![host_id, ws.workspace_id, json],
+        )?;
         Ok(())
     }
 
@@ -3233,10 +3251,11 @@ mod tests {
         assert_eq!(taken.wire_prompt, "wire 1");
 
         // Sync mutations (read cursor, pin, handle, unread, move) must NEVER drop queued prompts!
-        let after_read = store
+        let (after_read, read_changed) = store
             .mark_agent_read_seq("ag_q", Some(1))
             .expect("mark read")
             .expect("some");
+        assert!(read_changed);
         assert_eq!(after_read.queued_prompts.len(), 2);
         let after_pin = store
             .set_agent_pinned("ag_q", true, Some(100))

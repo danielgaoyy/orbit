@@ -2071,7 +2071,11 @@ impl AgentOrchestrator {
         agent_id: &str,
         seen_seq: Option<u64>,
     ) -> anyhow::Result<()> {
-        if let Some(updated) = self.store.mark_agent_read_seq(agent_id, seen_seq)? {
+        if let Some((updated, changed)) = self
+            .store
+            .mark_agent_read_seq_with_changed(agent_id, seen_seq)?
+            && changed
+        {
             let _ = self
                 .broadcast_tx
                 .send(DaemonBroadcast::AgentUpdated(updated));
@@ -3038,11 +3042,65 @@ impl AgentOrchestrator {
         let mut evt_rx = handle.evt_rx;
 
         let ingest_task = tokio::spawn(async move {
-            while let Some(evt) = evt_rx.recv().await {
-                if mgr.current_generation(&ag_id).await != expected_gen {
-                    continue;
+            const STREAM_COALESCE_WINDOW: std::time::Duration =
+                std::time::Duration::from_millis(65);
+            let mut stream_buf = StreamingEventBuffer::default();
+            let sleep = tokio::time::sleep(STREAM_COALESCE_WINDOW);
+            tokio::pin!(sleep);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    maybe_evt = evt_rx.recv() => {
+                        match maybe_evt {
+                            Some(evt) => {
+                                if mgr.current_generation(&ag_id).await != expected_gen {
+                                    stream_buf.clear();
+                                    continue;
+                                }
+                                let was_empty = stream_buf.is_empty();
+                                match stream_buf.push(evt) {
+                                    StreamPushOutcome::Buffered => {
+                                        if was_empty {
+                                            sleep.as_mut().reset(
+                                                tokio::time::Instant::now() + STREAM_COALESCE_WINDOW,
+                                            );
+                                        }
+                                    }
+                                    StreamPushOutcome::FlushAndIngest { flushed, current } => {
+                                        if !stream_buf.is_empty() {
+                                            sleep.as_mut().reset(
+                                                tokio::time::Instant::now()
+                                                    + STREAM_COALESCE_WINDOW,
+                                            );
+                                        }
+                                        if let Some(prev) = flushed {
+                                            mgr.ingest_driver_event(&ag_id, expected_gen, *prev)
+                                                .await;
+                                        }
+                                        mgr.ingest_driver_event(&ag_id, expected_gen, *current)
+                                            .await;
+                                    }
+                                }
+                            }
+                            None => {
+                                if let Some(pending) = stream_buf.take()
+                                    && mgr.current_generation(&ag_id).await == expected_gen
+                                {
+                                    mgr.ingest_driver_event(&ag_id, expected_gen, pending).await;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    _ = &mut sleep, if !stream_buf.is_empty() => {
+                        if let Some(pending) = stream_buf.take()
+                            && mgr.current_generation(&ag_id).await == expected_gen
+                        {
+                            mgr.ingest_driver_event(&ag_id, expected_gen, pending).await;
+                        }
+                    }
                 }
-                mgr.ingest_driver_event(&ag_id, expected_gen, evt).await;
             }
             let mut live_guard = mgr.live_agents.write().await;
             if live_guard
@@ -3343,8 +3401,8 @@ impl AgentOrchestrator {
             let finished_idle = should_check_auto_archive && matches!(ag.status, AgentStatus::Idle);
             let ag_handle = ag.handle.clone();
             let ag_bg = ag.background;
-            let ag_needs_summary = ag.task_summary.is_none();
-            let ag_cwd = ag.cwd.clone();
+            let ag_is_subagent = ag.parent_agent_id.is_some();
+            let ag_needs_summary = ag.task_summary.is_none() && !ag_is_subagent;
             let _ = self.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
 
             if finished_idle && !ag_bg {
@@ -3353,9 +3411,13 @@ impl AgentOrchestrator {
                 let peer_count = self
                     .store
                     .list_agents_filtered(Some(&ws_id), false, false, None)
-                    .map(|p| p.len())
+                    .map(|p| {
+                        p.into_iter()
+                            .filter(|a| a.parent_agent_id.is_none())
+                            .count()
+                    })
                     .unwrap_or(0);
-                if is_curated_ws && peer_count >= 2 {
+                if is_curated_ws && !ag_is_subagent && peer_count >= 2 {
                     let who = ag_handle.as_deref().unwrap_or("peer");
                     let snippet = self
                         .store
@@ -3382,28 +3444,13 @@ impl AgentOrchestrator {
                     }
                 }
 
-                // Non-blocking Turn-1 AI semantic summary + background auto-triage for unclassified sessions
+                // Non-blocking Turn-1 AI semantic summary (title/handle/1-line summary only).
+                // Workspace classification is strictly user-triggered (`待归类` until user clicks AI 归类 or assigns manually).
                 if ag_needs_summary && drained_prompt.is_none() && !auto_arch {
                     let mgr_bg = Arc::clone(self);
                     let aid_bg = agent_id.to_string();
-                    let project_root_bg = ws_opt
-                        .as_ref()
-                        .and_then(|w| w.project_root.clone().or_else(|| w.source_cwd.clone()))
-                        .unwrap_or(ag_cwd);
                     tokio::spawn(async move {
-                        let auto_cluster = mgr_bg.orch_config.read().await.auto_cluster_enabled;
-                        if !is_curated_ws && auto_cluster {
-                            let _ = mgr_bg
-                                .organize_project_workspaces(
-                                    None,
-                                    &project_root_bg,
-                                    vec![aid_bg],
-                                    false,
-                                )
-                                .await;
-                        } else {
-                            let _ = mgr_bg.summarize_agent(&aid_bg).await;
-                        }
+                        let _ = mgr_bg.summarize_agent(&aid_bg).await;
                     });
                 }
             }
@@ -3826,5 +3873,209 @@ fn auto_worktree_branch(prompt: &str) -> String {
         format!("orbit/task-{short_id}")
     } else {
         format!("orbit/{clean}-{short_id}")
+    }
+}
+
+enum StreamPushOutcome {
+    Buffered,
+    FlushAndIngest {
+        flushed: Option<Box<DriverEvent>>,
+        current: Box<DriverEvent>,
+    },
+}
+
+#[derive(Default)]
+struct StreamingEventBuffer {
+    pending: Option<DriverEvent>,
+}
+
+impl StreamingEventBuffer {
+    fn is_empty(&self) -> bool {
+        self.pending.is_none()
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+    }
+
+    fn take(&mut self) -> Option<DriverEvent> {
+        self.pending.take()
+    }
+
+    fn push(&mut self, evt: DriverEvent) -> StreamPushOutcome {
+        match evt {
+            DriverEvent::AssistantText {
+                ref item_id,
+                streaming: true,
+                ..
+            } => {
+                let same_pending = matches!(
+                    self.pending.as_ref(),
+                    Some(DriverEvent::AssistantText {
+                        item_id: prev_id,
+                        streaming: true,
+                        ..
+                    }) if prev_id == item_id
+                );
+                if same_pending || self.pending.is_none() {
+                    self.pending = Some(evt);
+                    StreamPushOutcome::Buffered
+                } else {
+                    let flushed = self.pending.replace(evt);
+                    StreamPushOutcome::FlushAndIngest {
+                        flushed: None,
+                        current: Box::new(flushed.unwrap_or_else(|| unreachable!())),
+                    }
+                }
+            }
+            DriverEvent::ThinkingText { ref item_id, .. } => {
+                let same_pending = matches!(
+                    self.pending.as_ref(),
+                    Some(DriverEvent::ThinkingText {
+                        item_id: prev_id,
+                        ..
+                    }) if prev_id == item_id
+                );
+                if same_pending || self.pending.is_none() {
+                    self.pending = Some(evt);
+                    StreamPushOutcome::Buffered
+                } else {
+                    let flushed = self.pending.replace(evt);
+                    StreamPushOutcome::FlushAndIngest {
+                        flushed: None,
+                        current: Box::new(flushed.unwrap_or_else(|| unreachable!())),
+                    }
+                }
+            }
+            DriverEvent::AssistantText {
+                ref item_id,
+                streaming: false,
+                ..
+            } => {
+                let supersedes_pending = matches!(
+                    self.pending.as_ref(),
+                    Some(DriverEvent::AssistantText {
+                        item_id: prev_id,
+                        streaming: true,
+                        ..
+                    }) if prev_id == item_id
+                );
+                let flushed = if supersedes_pending {
+                    self.pending = None;
+                    None
+                } else {
+                    self.pending.take().map(Box::new)
+                };
+                StreamPushOutcome::FlushAndIngest {
+                    flushed,
+                    current: Box::new(evt),
+                }
+            }
+            other => {
+                let flushed = self.pending.take().map(Box::new);
+                StreamPushOutcome::FlushAndIngest {
+                    flushed,
+                    current: Box::new(other),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod streaming_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn coalesces_same_item_streaming_assistant_and_drops_superseded_on_final() {
+        let mut buf = StreamingEventBuffer::default();
+        assert!(matches!(
+            buf.push(DriverEvent::AssistantText {
+                item_id: "m1".into(),
+                text: "Hel".into(),
+                streaming: true,
+            }),
+            StreamPushOutcome::Buffered
+        ));
+        assert!(matches!(
+            buf.push(DriverEvent::AssistantText {
+                item_id: "m1".into(),
+                text: "Hello world".into(),
+                streaming: true,
+            }),
+            StreamPushOutcome::Buffered
+        ));
+        match buf.push(DriverEvent::AssistantText {
+            item_id: "m1".into(),
+            text: "Hello world!".into(),
+            streaming: false,
+        }) {
+            StreamPushOutcome::FlushAndIngest { flushed, current } => {
+                assert!(flushed.is_none(), "final message supersedes buffered chunk");
+                assert!(matches!(
+                    *current,
+                    DriverEvent::AssistantText {
+                        ref item_id,
+                        ref text,
+                        streaming: false
+                    } if item_id == "m1" && text == "Hello world!"
+                ));
+            }
+            StreamPushOutcome::Buffered => panic!("final text must flush immediately"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn flushes_pending_streaming_chunk_before_tool_call_or_different_item() {
+        let mut buf = StreamingEventBuffer::default();
+        assert!(matches!(
+            buf.push(DriverEvent::ThinkingText {
+                item_id: "t1".into(),
+                text: "step 1".into(),
+            }),
+            StreamPushOutcome::Buffered
+        ));
+        assert!(matches!(
+            buf.push(DriverEvent::ThinkingText {
+                item_id: "t1".into(),
+                text: "step 1 + 2".into(),
+            }),
+            StreamPushOutcome::Buffered
+        ));
+        match buf.push(DriverEvent::AssistantText {
+            item_id: "m1".into(),
+            text: "ans".into(),
+            streaming: true,
+        }) {
+            StreamPushOutcome::FlushAndIngest { flushed, current } => {
+                assert!(flushed.is_none());
+                assert!(matches!(
+                    *current,
+                    DriverEvent::ThinkingText { ref item_id, ref text }
+                        if item_id == "t1" && text == "step 1 + 2"
+                ));
+            }
+            StreamPushOutcome::Buffered => panic!("switching item kind must flush previous"),
+        }
+        assert!(!buf.is_empty());
+        match buf.push(DriverEvent::Notice {
+            level: "info".into(),
+            message: "done".into(),
+        }) {
+            StreamPushOutcome::FlushAndIngest { flushed, current } => {
+                assert!(matches!(
+                    flushed.as_deref(),
+                    Some(DriverEvent::AssistantText {
+                        item_id,
+                        text,
+                        streaming: true,
+                    }) if item_id == "m1" && text == "ans"
+                ));
+                assert!(matches!(*current, DriverEvent::Notice { .. }));
+            }
+            StreamPushOutcome::Buffered => panic!("non-streaming event must flush immediately"),
+        }
+        assert!(buf.is_empty());
     }
 }

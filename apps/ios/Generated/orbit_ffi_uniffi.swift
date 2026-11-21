@@ -903,6 +903,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func archiveAgent(hostId: String, agentId: String) 
     
+    func archiveWorkspace(hostId: String, workspaceId: String, keepAgentsUnclassified: Bool) 
+    
     func askSideQuestion(req: FfiAskSideQuestionRequest, listener: SideQuestionListener) throws  -> String
     
     func attachTerminal(hostId: String, terminalId: String, slot: UInt8) 
@@ -910,6 +912,30 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func bridgeInfo()  -> FfiBridgeInfo
     
     func buildSideQuestionContext(hostId: String, agentId: String, maxChars: UInt32?)  -> String
+    
+    func cloudSyncGeneratePassphrase()  -> String
+    
+    func cloudSyncGetPreferencesJson()  -> String
+    
+    func cloudSyncLoginWithToken(token: String) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncLogout(clearLocalHosts: Bool) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncNow() throws  -> FfiCloudSyncResult
+    
+    func cloudSyncPollGithubDeviceFlow(deviceCode: String, clientIdOverride: String?) throws  -> FfiCloudSyncDevicePoll
+    
+    func cloudSyncSetAutoSync(enabled: Bool) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncSetGithubClientId(clientId: String?) throws  -> FfiCloudSyncStatus
+    
+    func cloudSyncStartGithubDeviceFlow(clientIdOverride: String?) throws  -> FfiGitHubDeviceFlowStart
+    
+    func cloudSyncStatus()  -> FfiCloudSyncStatus
+    
+    func cloudSyncUnlockWithPassphrase(passphrase: String) throws  -> FfiCloudSyncResult
+    
+    func cloudSyncUpdatePreferencesJson(patchJson: String) throws 
     
     func composePrompt(req: FfiComposePromptRequest)  -> FfiComposedPrompt
     
@@ -921,9 +947,21 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func createAgentFull(hostId: String, cwd: String, extraDirs: [String], provider: FfiProviderKind, model: String?, effort: FfiReasoningEffort?, mode: FfiSessionMode, initialPrompt: String, initialDisplayPrompt: String?, initialBadges: [FfiPromptBadge], worktreeBranch: String?)  -> String
     
+    func createMissionWorkspace(hostId: String, sourceCwd: String, title: String, missionGoal: String?, useWorktree: Bool, worktreeBranch: String?, baseRef: String?) 
+    
+    func createSchedule(req: FfiCreateScheduleRequest) 
+    
     func createSession(req: FfiCreateSessionRequest)  -> String
     
+    func createSessionInWorkspace(req: FfiCreateSessionRequest, workspaceId: String?, handle: String?, autoCluster: Bool?)  -> String
+    
+    func deleteAgent(hostId: String, agentId: String) 
+    
+    func deleteSchedule(hostId: String, scheduleId: String) 
+    
     func describeToolItem(item: FfiTimelineItem, cwd: String?)  -> FfiToolStepDescriptor?
+    
+    func detachAgent(hostId: String, agentId: String) 
     
     func discoverLocalDaemonUri()  -> String?
     
@@ -937,6 +975,12 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func fetchGitStatus(hostId: String, cwd: String) 
     
+    func fetchScheduleRuns(hostId: String, scheduleId: String, limit: UInt32?) 
+    
+    func fetchWorkspaceBoard(hostId: String, workspaceId: String) 
+    
+    func fetchWorkspaceEvents(hostId: String, workspaceId: String, limit: UInt32?) 
+    
     func fetchWorkspaceFiles(hostId: String, cwd: String) 
     
     func fleetOverview()  -> FfiFleetOverview
@@ -946,6 +990,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func fleetSidebarRequest(req: FfiFleetSidebarRequest)  -> FfiFleetSidebar
     
     func flushQueuedPromptNow(hostId: String, agentId: String, queueId: String) 
+    
+    func gitReposInspection(hostId: String, path: String)  -> FfiGitReposInspection?
     
     func gitReview(hostId: String, cwd: String, path: String?)  -> FfiGitReview
     
@@ -957,6 +1003,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func listDirectory(hostId: String, path: String?) 
     
+    func listProviderSubagents(hostId: String, parentAgentId: String) 
+    
     func markAgentSeen(hostId: String, agentId: String, seq: UInt64) 
     
     func markAgentUnread(hostId: String, agentId: String) 
@@ -964,6 +1012,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func mergeWorkspaces(hostId: String, sourceWorkspaceId: String, targetWorkspaceId: String) 
     
     func moveAgentToWorkspace(hostId: String, agentId: String, targetWorkspaceId: String?) 
+    
+    func moveAgentToWorkspaceV2(hostId: String, agentId: String, targetWorkspaceId: String?, newWorkspaceTitle: String?, makeUnclassified: Bool) 
     
     func onAppBackground() 
     
@@ -973,11 +1023,21 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func openAgentTimeline(hostId: String, agentId: String) 
     
+    func openProviderSubagentTimeline(hostId: String, parentAgentId: String, subagentId: String) 
+    
+    func organizeProjectWorkspaces(hostId: String, projectRoot: String, agentIds: [String], autoApply: Bool) 
+    
     func pairHost(pairingUri: String) throws  -> FfiHostCard
+    
+    func pauseSchedule(hostId: String, scheduleId: String) 
     
     func projectOrder()  -> [String]
     
+    func providerSubagentTimeline(hostId: String, parentAgentId: String, subagentId: String)  -> [FfiProviderSubagentEvent]
+    
     func rankMentionCandidates(req: FfiMentionRankRequest)  -> [FfiMentionCandidate]
+    
+    func rankMentionCandidatesWithWorkspace(hostId: String, cwd: String, query: String, limit: UInt32, workspaceId: String?, activeAgentId: String?)  -> [FfiMentionCandidate]
     
     func readWorkspaceFile(hostId: String, cwd: String, path: String) throws  -> FfiWorkspaceFile
     
@@ -995,11 +1055,15 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func removeQueuedPrompt(hostId: String, agentId: String, queueId: String) 
     
+    func renameWorkspace(hostId: String, workspaceId: String, title: String) 
+    
     func renderDiagram(req: FfiRenderDiagramRequest)  -> FfiRenderDiagramView
     
     func reorderProjects(orderedKeys: [String]) throws  -> [String]
     
     func reorderQueuedPrompts(hostId: String, agentId: String, queueIds: [String]) 
+    
+    func requestGitReposInspection(hostId: String, path: String, extraDirs: [String]) 
     
     func resizeTerminal(hostId: String, cols: UInt16, rows: UInt16) 
     
@@ -1009,9 +1073,15 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func resolvePermission(hostId: String, agentId: String, permissionRequestId: String, decision: String) 
     
+    func resumeSchedule(hostId: String, scheduleId: String) 
+    
     func rewindAgent(hostId: String, agentId: String, toBeforeSeq: UInt64, restoreFiles: Bool) throws  -> FfiRewindAgentResult
     
     func rewindAgentRequest(req: FfiRewindAgentRequest) throws  -> FfiRewindAgentResult
+    
+    func runScheduleOnce(hostId: String, scheduleId: String) 
+    
+    func scheduleRuns(hostId: String, scheduleId: String)  -> [FfiScheduleRunRecord]
     
     func seedThreadPrefs(seeds: [FfiThreadPrefSeed]) 
     
@@ -1035,6 +1105,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func slashCommands(platform: FfiClientPlatform, query: String?)  -> [FfiSlashCommand]
     
+    func spawnWorkspacePeer(req: FfiSpawnWorkspacePeerRequest)  -> String
+    
     func stageAttachment(hostId: String, filename: String, mimeType: String?, bytes: Data) throws  -> FfiStagedAttachment
     
     func startTerminal(hostId: String, cwd: String, cols: UInt16, rows: UInt16) 
@@ -1042,6 +1114,8 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     func subscribe(listener: MobileCoreListener) 
     
     func subscribeThrottled(listener: MobileCoreListener, intervalMs: UInt32) 
+    
+    func summarizeAgent(hostId: String, agentId: String) 
     
     func switchAgentProvider(hostId: String, agentId: String, provider: FfiProviderKind, model: String?, effort: FfiReasoningEffort?) 
     
@@ -1051,15 +1125,27 @@ public protocol OrbitMobileCoreProtocol: AnyObject, Sendable {
     
     func togglePinAgent(hostId: String, agentId: String)  -> Bool
     
+    func unarchiveAgent(hostId: String, agentId: String) 
+    
+    func updateAgentIdentity(hostId: String, agentId: String, handle: String?, title: String?, taskSummary: String?, lockHandle: Bool, lockTitle: Bool) 
+    
     func updateHostConfig(hostId: String, customName: String?, routeMode: FfiHostRouteMode?, sshAlias: String?, remoteDaemonPort: UInt16?, customDirectEndpoint: String?, relayUrl: String?, reconnect: Bool) throws  -> FfiHostCard
     
     func updateHostConfigRequest(req: FfiUpdateHostConfigRequest) throws  -> FfiHostCard
     
     func updateHostRelay(hostId: String, relayUrl: String?) throws 
     
+    func updateWorkspaceBoard(hostId: String, workspaceId: String, content: String, section: String?, updatedBy: String?) 
+    
+    func updateWorkspaceGoal(hostId: String, workspaceId: String, goal: String) 
+    
     func upgradeHostDaemonOverWire(hostId: String, targetVersion: String?) throws  -> String
     
     func upsertProject(projectId: String?, hostId: String, name: String, directories: [String]) throws  -> FfiClientProject
+    
+    func workspaceBoard(hostId: String, workspaceId: String)  -> FfiWorkspaceBoardSnapshot?
+    
+    func workspaceEvents(hostId: String, workspaceId: String)  -> [FfiWorkspaceEvent]
     
     func workspaceFiles(hostId: String, cwd: String)  -> [String]
     
@@ -1235,6 +1321,17 @@ open func archiveAgent(hostId: String, agentId: String)  {try! rustCall() {
 }
 }
     
+open func archiveWorkspace(hostId: String, workspaceId: String, keepAgentsUnclassified: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_archive_workspace(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(workspaceId),
+        FfiConverterBool.lower(keepAgentsUnclassified),uniffiCallStatus
+    )
+}
+}
+    
 open func askSideQuestion(req: FfiAskSideQuestionRequest, listener: SideQuestionListener)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
         uniffiCallStatus in
@@ -1276,6 +1373,122 @@ open func buildSideQuestionContext(hostId: String, agentId: String, maxChars: UI
         FfiConverterOptionUInt32.lower(maxChars),uniffiCallStatus
     )
 })
+}
+    
+open func cloudSyncGeneratePassphrase() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_generate_passphrase(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncGetPreferencesJson() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncLoginWithToken(token: String)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_login_with_token(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(token),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncLogout(clearLocalHosts: Bool)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_logout(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(clearLocalHosts),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncNow()throws  -> FfiCloudSyncResult  {
+    return try  FfiConverterTypeFfiCloudSyncResult_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_now(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncPollGithubDeviceFlow(deviceCode: String, clientIdOverride: String?)throws  -> FfiCloudSyncDevicePoll  {
+    return try  FfiConverterTypeFfiCloudSyncDevicePoll_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_poll_github_device_flow(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(deviceCode),
+        FfiConverterOptionString.lower(clientIdOverride),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncSetAutoSync(enabled: Bool)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_auto_sync(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncSetGithubClientId(clientId: String?)throws  -> FfiCloudSyncStatus  {
+    return try  FfiConverterTypeFfiCloudSyncStatus_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_github_client_id(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionString.lower(clientId),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncStartGithubDeviceFlow(clientIdOverride: String?)throws  -> FfiGitHubDeviceFlowStart  {
+    return try  FfiConverterTypeFfiGitHubDeviceFlowStart_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_start_github_device_flow(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionString.lower(clientIdOverride),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncStatus() -> FfiCloudSyncStatus  {
+    return try!  FfiConverterTypeFfiCloudSyncStatus_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_status(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncUnlockWithPassphrase(passphrase: String)throws  -> FfiCloudSyncResult  {
+    return try  FfiConverterTypeFfiCloudSyncResult_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_unlock_with_passphrase(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(passphrase),uniffiCallStatus
+    )
+})
+}
+    
+open func cloudSyncUpdatePreferencesJson(patchJson: String)throws   {try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_update_preferences_json(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(patchJson),uniffiCallStatus
+    )
+}
 }
     
 open func composePrompt(req: FfiComposePromptRequest) -> FfiComposedPrompt  {
@@ -1339,6 +1552,30 @@ open func createAgentFull(hostId: String, cwd: String, extraDirs: [String], prov
 })
 }
     
+open func createMissionWorkspace(hostId: String, sourceCwd: String, title: String, missionGoal: String?, useWorktree: Bool, worktreeBranch: String?, baseRef: String?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_mission_workspace(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(sourceCwd),
+        FfiConverterString.lower(title),
+        FfiConverterOptionString.lower(missionGoal),
+        FfiConverterBool.lower(useWorktree),
+        FfiConverterOptionString.lower(worktreeBranch),
+        FfiConverterOptionString.lower(baseRef),uniffiCallStatus
+    )
+}
+}
+    
+open func createSchedule(req: FfiCreateScheduleRequest)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_schedule(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiCreateScheduleRequest_lower(req),uniffiCallStatus
+    )
+}
+}
+    
 open func createSession(req: FfiCreateSessionRequest) -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
         uniffiCallStatus in
@@ -1347,6 +1584,39 @@ open func createSession(req: FfiCreateSessionRequest) -> String  {
         FfiConverterTypeFfiCreateSessionRequest_lower(req),uniffiCallStatus
     )
 })
+}
+    
+open func createSessionInWorkspace(req: FfiCreateSessionRequest, workspaceId: String?, handle: String?, autoCluster: Bool?) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_session_in_workspace(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiCreateSessionRequest_lower(req),
+        FfiConverterOptionString.lower(workspaceId),
+        FfiConverterOptionString.lower(handle),
+        FfiConverterOptionBool.lower(autoCluster),uniffiCallStatus
+    )
+})
+}
+    
+open func deleteAgent(hostId: String, agentId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_delete_agent(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),uniffiCallStatus
+    )
+}
+}
+    
+open func deleteSchedule(hostId: String, scheduleId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_delete_schedule(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(scheduleId),uniffiCallStatus
+    )
+}
 }
     
 open func describeToolItem(item: FfiTimelineItem, cwd: String?) -> FfiToolStepDescriptor?  {
@@ -1358,6 +1628,16 @@ open func describeToolItem(item: FfiTimelineItem, cwd: String?) -> FfiToolStepDe
         FfiConverterOptionString.lower(cwd),uniffiCallStatus
     )
 })
+}
+    
+open func detachAgent(hostId: String, agentId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_detach_agent(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),uniffiCallStatus
+    )
+}
 }
     
 open func discoverLocalDaemonUri() -> String?  {
@@ -1425,6 +1705,38 @@ open func fetchGitStatus(hostId: String, cwd: String)  {try! rustCall() {
 }
 }
     
+open func fetchScheduleRuns(hostId: String, scheduleId: String, limit: UInt32?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_schedule_runs(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(scheduleId),
+        FfiConverterOptionUInt32.lower(limit),uniffiCallStatus
+    )
+}
+}
+    
+open func fetchWorkspaceBoard(hostId: String, workspaceId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_workspace_board(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(workspaceId),uniffiCallStatus
+    )
+}
+}
+    
+open func fetchWorkspaceEvents(hostId: String, workspaceId: String, limit: UInt32?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_workspace_events(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(workspaceId),
+        FfiConverterOptionUInt32.lower(limit),uniffiCallStatus
+    )
+}
+}
+    
 open func fetchWorkspaceFiles(hostId: String, cwd: String)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_workspace_files(
@@ -1480,6 +1792,17 @@ open func flushQueuedPromptNow(hostId: String, agentId: String, queueId: String)
 }
 }
     
+open func gitReposInspection(hostId: String, path: String) -> FfiGitReposInspection?  {
+    return try!  FfiConverterOptionTypeFfiGitReposInspection.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_git_repos_inspection(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(path),uniffiCallStatus
+    )
+})
+}
+    
 open func gitReview(hostId: String, cwd: String, path: String?) -> FfiGitReview  {
     return try!  FfiConverterTypeFfiGitReview_lift(try! rustCall() {
         uniffiCallStatus in
@@ -1532,6 +1855,16 @@ open func listDirectory(hostId: String, path: String?)  {try! rustCall() {
 }
 }
     
+open func listProviderSubagents(hostId: String, parentAgentId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_list_provider_subagents(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(parentAgentId),uniffiCallStatus
+    )
+}
+}
+    
 open func markAgentSeen(hostId: String, agentId: String, seq: UInt64)  {try! rustCall() {
         uniffiCallStatus in
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_mark_agent_seen(
@@ -1575,6 +1908,19 @@ open func moveAgentToWorkspace(hostId: String, agentId: String, targetWorkspaceI
 }
 }
     
+open func moveAgentToWorkspaceV2(hostId: String, agentId: String, targetWorkspaceId: String?, newWorkspaceTitle: String?, makeUnclassified: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_move_agent_to_workspace_v2(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterOptionString.lower(targetWorkspaceId),
+        FfiConverterOptionString.lower(newWorkspaceTitle),
+        FfiConverterBool.lower(makeUnclassified),uniffiCallStatus
+    )
+}
+}
+    
 open func onAppBackground()  {try! rustCall() {
         uniffiCallStatus in
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_on_app_background(
@@ -1609,6 +1955,29 @@ open func openAgentTimeline(hostId: String, agentId: String)  {try! rustCall() {
 }
 }
     
+open func openProviderSubagentTimeline(hostId: String, parentAgentId: String, subagentId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_open_provider_subagent_timeline(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(parentAgentId),
+        FfiConverterString.lower(subagentId),uniffiCallStatus
+    )
+}
+}
+    
+open func organizeProjectWorkspaces(hostId: String, projectRoot: String, agentIds: [String], autoApply: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_organize_project_workspaces(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(projectRoot),
+        FfiConverterSequenceString.lower(agentIds),
+        FfiConverterBool.lower(autoApply),uniffiCallStatus
+    )
+}
+}
+    
 open func pairHost(pairingUri: String)throws  -> FfiHostCard  {
     return try  FfiConverterTypeFfiHostCard_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
         uniffiCallStatus in
@@ -1617,6 +1986,16 @@ open func pairHost(pairingUri: String)throws  -> FfiHostCard  {
         FfiConverterString.lower(pairingUri),uniffiCallStatus
     )
 })
+}
+    
+open func pauseSchedule(hostId: String, scheduleId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_pause_schedule(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(scheduleId),uniffiCallStatus
+    )
+}
 }
     
 open func projectOrder() -> [String]  {
@@ -1628,12 +2007,39 @@ open func projectOrder() -> [String]  {
 })
 }
     
+open func providerSubagentTimeline(hostId: String, parentAgentId: String, subagentId: String) -> [FfiProviderSubagentEvent]  {
+    return try!  FfiConverterSequenceTypeFfiProviderSubagentEvent.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_provider_subagent_timeline(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(parentAgentId),
+        FfiConverterString.lower(subagentId),uniffiCallStatus
+    )
+})
+}
+    
 open func rankMentionCandidates(req: FfiMentionRankRequest) -> [FfiMentionCandidate]  {
     return try!  FfiConverterSequenceTypeFfiMentionCandidate.lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rank_mention_candidates(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiMentionRankRequest_lower(req),uniffiCallStatus
+    )
+})
+}
+    
+open func rankMentionCandidatesWithWorkspace(hostId: String, cwd: String, query: String, limit: UInt32, workspaceId: String?, activeAgentId: String?) -> [FfiMentionCandidate]  {
+    return try!  FfiConverterSequenceTypeFfiMentionCandidate.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rank_mention_candidates_with_workspace(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(cwd),
+        FfiConverterString.lower(query),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterOptionString.lower(workspaceId),
+        FfiConverterOptionString.lower(activeAgentId),uniffiCallStatus
     )
 })
 }
@@ -1717,6 +2123,17 @@ open func removeQueuedPrompt(hostId: String, agentId: String, queueId: String)  
 }
 }
     
+open func renameWorkspace(hostId: String, workspaceId: String, title: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rename_workspace(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(workspaceId),
+        FfiConverterString.lower(title),uniffiCallStatus
+    )
+}
+}
+    
 open func renderDiagram(req: FfiRenderDiagramRequest) -> FfiRenderDiagramView  {
     return try!  FfiConverterTypeFfiRenderDiagramView_lift(try! rustCall() {
         uniffiCallStatus in
@@ -1744,6 +2161,17 @@ open func reorderQueuedPrompts(hostId: String, agentId: String, queueIds: [Strin
         FfiConverterString.lower(hostId),
         FfiConverterString.lower(agentId),
         FfiConverterSequenceString.lower(queueIds),uniffiCallStatus
+    )
+}
+}
+    
+open func requestGitReposInspection(hostId: String, path: String, extraDirs: [String])  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_request_git_repos_inspection(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(path),
+        FfiConverterSequenceString.lower(extraDirs),uniffiCallStatus
     )
 }
 }
@@ -1793,6 +2221,16 @@ open func resolvePermission(hostId: String, agentId: String, permissionRequestId
 }
 }
     
+open func resumeSchedule(hostId: String, scheduleId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_resume_schedule(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(scheduleId),uniffiCallStatus
+    )
+}
+}
+    
 open func rewindAgent(hostId: String, agentId: String, toBeforeSeq: UInt64, restoreFiles: Bool)throws  -> FfiRewindAgentResult  {
     return try  FfiConverterTypeFfiRewindAgentResult_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
         uniffiCallStatus in
@@ -1812,6 +2250,27 @@ open func rewindAgentRequest(req: FfiRewindAgentRequest)throws  -> FfiRewindAgen
     uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rewind_agent_request(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiRewindAgentRequest_lower(req),uniffiCallStatus
+    )
+})
+}
+    
+open func runScheduleOnce(hostId: String, scheduleId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_run_schedule_once(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(scheduleId),uniffiCallStatus
+    )
+}
+}
+    
+open func scheduleRuns(hostId: String, scheduleId: String) -> [FfiScheduleRunRecord]  {
+    return try!  FfiConverterSequenceTypeFfiScheduleRunRecord.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_schedule_runs(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(scheduleId),uniffiCallStatus
     )
 })
 }
@@ -1935,6 +2394,16 @@ open func slashCommands(platform: FfiClientPlatform, query: String?) -> [FfiSlas
 })
 }
     
+open func spawnWorkspacePeer(req: FfiSpawnWorkspacePeerRequest) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_spawn_workspace_peer(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeFfiSpawnWorkspacePeerRequest_lower(req),uniffiCallStatus
+    )
+})
+}
+    
 open func stageAttachment(hostId: String, filename: String, mimeType: String?, bytes: Data)throws  -> FfiStagedAttachment  {
     return try  FfiConverterTypeFfiStagedAttachment_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
         uniffiCallStatus in
@@ -1975,6 +2444,16 @@ open func subscribeThrottled(listener: MobileCoreListener, intervalMs: UInt32)  
             self.uniffiCloneHandle(),
         FfiConverterTypeMobileCoreListener_lower(listener),
         FfiConverterUInt32.lower(intervalMs),uniffiCallStatus
+    )
+}
+}
+    
+open func summarizeAgent(hostId: String, agentId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_summarize_agent(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),uniffiCallStatus
     )
 }
 }
@@ -2024,6 +2503,31 @@ open func togglePinAgent(hostId: String, agentId: String) -> Bool  {
 })
 }
     
+open func unarchiveAgent(hostId: String, agentId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_unarchive_agent(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),uniffiCallStatus
+    )
+}
+}
+    
+open func updateAgentIdentity(hostId: String, agentId: String, handle: String?, title: String?, taskSummary: String?, lockHandle: Bool, lockTitle: Bool)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_agent_identity(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(agentId),
+        FfiConverterOptionString.lower(handle),
+        FfiConverterOptionString.lower(title),
+        FfiConverterOptionString.lower(taskSummary),
+        FfiConverterBool.lower(lockHandle),
+        FfiConverterBool.lower(lockTitle),uniffiCallStatus
+    )
+}
+}
+    
 open func updateHostConfig(hostId: String, customName: String?, routeMode: FfiHostRouteMode?, sshAlias: String?, remoteDaemonPort: UInt16?, customDirectEndpoint: String?, relayUrl: String?, reconnect: Bool)throws  -> FfiHostCard  {
     return try  FfiConverterTypeFfiHostCard_lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
         uniffiCallStatus in
@@ -2061,6 +2565,30 @@ open func updateHostRelay(hostId: String, relayUrl: String?)throws   {try rustCa
 }
 }
     
+open func updateWorkspaceBoard(hostId: String, workspaceId: String, content: String, section: String?, updatedBy: String?)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_workspace_board(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(workspaceId),
+        FfiConverterString.lower(content),
+        FfiConverterOptionString.lower(section),
+        FfiConverterOptionString.lower(updatedBy),uniffiCallStatus
+    )
+}
+}
+    
+open func updateWorkspaceGoal(hostId: String, workspaceId: String, goal: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_workspace_goal(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(workspaceId),
+        FfiConverterString.lower(goal),uniffiCallStatus
+    )
+}
+}
+    
 open func upgradeHostDaemonOverWire(hostId: String, targetVersion: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiOrbitError_lift) {
         uniffiCallStatus in
@@ -2081,6 +2609,28 @@ open func upsertProject(projectId: String?, hostId: String, name: String, direct
         FfiConverterString.lower(hostId),
         FfiConverterString.lower(name),
         FfiConverterSequenceString.lower(directories),uniffiCallStatus
+    )
+})
+}
+    
+open func workspaceBoard(hostId: String, workspaceId: String) -> FfiWorkspaceBoardSnapshot?  {
+    return try!  FfiConverterOptionTypeFfiWorkspaceBoardSnapshot.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_workspace_board(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(workspaceId),uniffiCallStatus
+    )
+})
+}
+    
+open func workspaceEvents(hostId: String, workspaceId: String) -> [FfiWorkspaceEvent]  {
+    return try!  FfiConverterSequenceTypeFfiWorkspaceEvent.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_workspace_events(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(hostId),
+        FfiConverterString.lower(workspaceId),uniffiCallStatus
     )
 })
 }
@@ -2357,6 +2907,13 @@ public struct FfiAgentCard: Equatable, Hashable {
     public var hasBackgroundTasks: Bool
     public var isAwaitingPermission: Bool
     public var parentAgentId: String?
+    public var parentHostId: String?
+    public var archivedAtRfc3339: String?
+    public var handle: String?
+    public var clusterSuggestion: FfiWorkspaceClusterSuggestion?
+    public var worktreeBranch: String?
+    public var taskSummary: String?
+    public var attentionLabel: String?
     public var latestSeq: UInt64
     public var updatedAtRfc3339: String
     public var isPinned: Bool
@@ -2366,7 +2923,7 @@ public struct FfiAgentCard: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, isAwaitingPermission: Bool, parentAgentId: String?, latestSeq: UInt64, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt]) {
+    public init(agentId: String, workspaceId: String, cwd: String, title: String, provider: FfiProviderKind, providerLabel: String, model: String?, effort: FfiReasoningEffort?, mode: FfiSessionMode, statusLabel: String, isRunning: Bool, hasBackgroundTasks: Bool, isAwaitingPermission: Bool, parentAgentId: String?, parentHostId: String?, archivedAtRfc3339: String?, handle: String?, clusterSuggestion: FfiWorkspaceClusterSuggestion?, worktreeBranch: String?, taskSummary: String?, attentionLabel: String?, latestSeq: UInt64, updatedAtRfc3339: String, isPinned: Bool, seenSeq: UInt64, isUnread: Bool, queuedPrompts: [FfiQueuedPrompt]) {
         self.agentId = agentId
         self.workspaceId = workspaceId
         self.cwd = cwd
@@ -2381,6 +2938,13 @@ public struct FfiAgentCard: Equatable, Hashable {
         self.hasBackgroundTasks = hasBackgroundTasks
         self.isAwaitingPermission = isAwaitingPermission
         self.parentAgentId = parentAgentId
+        self.parentHostId = parentHostId
+        self.archivedAtRfc3339 = archivedAtRfc3339
+        self.handle = handle
+        self.clusterSuggestion = clusterSuggestion
+        self.worktreeBranch = worktreeBranch
+        self.taskSummary = taskSummary
+        self.attentionLabel = attentionLabel
         self.latestSeq = latestSeq
         self.updatedAtRfc3339 = updatedAtRfc3339
         self.isPinned = isPinned
@@ -2419,6 +2983,13 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
                 hasBackgroundTasks: FfiConverterBool.read(from: &buf), 
                 isAwaitingPermission: FfiConverterBool.read(from: &buf), 
                 parentAgentId: FfiConverterOptionString.read(from: &buf), 
+                parentHostId: FfiConverterOptionString.read(from: &buf), 
+                archivedAtRfc3339: FfiConverterOptionString.read(from: &buf), 
+                handle: FfiConverterOptionString.read(from: &buf), 
+                clusterSuggestion: FfiConverterOptionTypeFfiWorkspaceClusterSuggestion.read(from: &buf), 
+                worktreeBranch: FfiConverterOptionString.read(from: &buf), 
+                taskSummary: FfiConverterOptionString.read(from: &buf), 
+                attentionLabel: FfiConverterOptionString.read(from: &buf), 
                 latestSeq: FfiConverterUInt64.read(from: &buf), 
                 updatedAtRfc3339: FfiConverterString.read(from: &buf), 
                 isPinned: FfiConverterBool.read(from: &buf), 
@@ -2443,6 +3014,13 @@ public struct FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer {
         FfiConverterBool.write(value.hasBackgroundTasks, into: &buf)
         FfiConverterBool.write(value.isAwaitingPermission, into: &buf)
         FfiConverterOptionString.write(value.parentAgentId, into: &buf)
+        FfiConverterOptionString.write(value.parentHostId, into: &buf)
+        FfiConverterOptionString.write(value.archivedAtRfc3339, into: &buf)
+        FfiConverterOptionString.write(value.handle, into: &buf)
+        FfiConverterOptionTypeFfiWorkspaceClusterSuggestion.write(value.clusterSuggestion, into: &buf)
+        FfiConverterOptionString.write(value.worktreeBranch, into: &buf)
+        FfiConverterOptionString.write(value.taskSummary, into: &buf)
+        FfiConverterOptionString.write(value.attentionLabel, into: &buf)
         FfiConverterUInt64.write(value.latestSeq, into: &buf)
         FfiConverterString.write(value.updatedAtRfc3339, into: &buf)
         FfiConverterBool.write(value.isPinned, into: &buf)
@@ -3036,6 +3614,268 @@ public func FfiConverterTypeFfiClientProject_lower(_ value: FfiClientProject) ->
 }
 
 
+public struct FfiCloudSyncDevicePoll: Equatable, Hashable {
+    public var status: FfiCloudSyncDevicePollStatus
+    public var intervalSecs: UInt64?
+    public var error: String?
+    public var syncStatus: FfiCloudSyncStatus?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: FfiCloudSyncDevicePollStatus, intervalSecs: UInt64?, error: String?, syncStatus: FfiCloudSyncStatus?) {
+        self.status = status
+        self.intervalSecs = intervalSecs
+        self.error = error
+        self.syncStatus = syncStatus
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncDevicePoll: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncDevicePoll: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncDevicePoll {
+        return
+            try FfiCloudSyncDevicePoll(
+                status: FfiConverterTypeFfiCloudSyncDevicePollStatus.read(from: &buf), 
+                intervalSecs: FfiConverterOptionUInt64.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf), 
+                syncStatus: FfiConverterOptionTypeFfiCloudSyncStatus.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCloudSyncDevicePoll, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiCloudSyncDevicePollStatus.write(value.status, into: &buf)
+        FfiConverterOptionUInt64.write(value.intervalSecs, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterOptionTypeFfiCloudSyncStatus.write(value.syncStatus, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncDevicePoll_lift(_ buf: RustBuffer) throws -> FfiCloudSyncDevicePoll {
+    return try FfiConverterTypeFfiCloudSyncDevicePoll.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncDevicePoll_lower(_ value: FfiCloudSyncDevicePoll) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncDevicePoll.lower(value)
+}
+
+
+public struct FfiCloudSyncResult: Equatable, Hashable {
+    public var hostsAdded: UInt32
+    public var hostsUpdated: UInt32
+    public var hostsRemoved: UInt32
+    public var projectsAdded: UInt32
+    public var projectsUpdated: UInt32
+    public var projectsRemoved: UInt32
+    public var preferencesUpdated: UInt32
+    public var pushedRemote: Bool
+    public var vaultRevision: UInt64
+    public var syncedAtMs: Int64
+    public var gistHtmlUrl: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hostsAdded: UInt32, hostsUpdated: UInt32, hostsRemoved: UInt32, projectsAdded: UInt32, projectsUpdated: UInt32, projectsRemoved: UInt32, preferencesUpdated: UInt32, pushedRemote: Bool, vaultRevision: UInt64, syncedAtMs: Int64, gistHtmlUrl: String?) {
+        self.hostsAdded = hostsAdded
+        self.hostsUpdated = hostsUpdated
+        self.hostsRemoved = hostsRemoved
+        self.projectsAdded = projectsAdded
+        self.projectsUpdated = projectsUpdated
+        self.projectsRemoved = projectsRemoved
+        self.preferencesUpdated = preferencesUpdated
+        self.pushedRemote = pushedRemote
+        self.vaultRevision = vaultRevision
+        self.syncedAtMs = syncedAtMs
+        self.gistHtmlUrl = gistHtmlUrl
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncResult {
+        return
+            try FfiCloudSyncResult(
+                hostsAdded: FfiConverterUInt32.read(from: &buf), 
+                hostsUpdated: FfiConverterUInt32.read(from: &buf), 
+                hostsRemoved: FfiConverterUInt32.read(from: &buf), 
+                projectsAdded: FfiConverterUInt32.read(from: &buf), 
+                projectsUpdated: FfiConverterUInt32.read(from: &buf), 
+                projectsRemoved: FfiConverterUInt32.read(from: &buf), 
+                preferencesUpdated: FfiConverterUInt32.read(from: &buf), 
+                pushedRemote: FfiConverterBool.read(from: &buf), 
+                vaultRevision: FfiConverterUInt64.read(from: &buf), 
+                syncedAtMs: FfiConverterInt64.read(from: &buf), 
+                gistHtmlUrl: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCloudSyncResult, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.hostsAdded, into: &buf)
+        FfiConverterUInt32.write(value.hostsUpdated, into: &buf)
+        FfiConverterUInt32.write(value.hostsRemoved, into: &buf)
+        FfiConverterUInt32.write(value.projectsAdded, into: &buf)
+        FfiConverterUInt32.write(value.projectsUpdated, into: &buf)
+        FfiConverterUInt32.write(value.projectsRemoved, into: &buf)
+        FfiConverterUInt32.write(value.preferencesUpdated, into: &buf)
+        FfiConverterBool.write(value.pushedRemote, into: &buf)
+        FfiConverterUInt64.write(value.vaultRevision, into: &buf)
+        FfiConverterInt64.write(value.syncedAtMs, into: &buf)
+        FfiConverterOptionString.write(value.gistHtmlUrl, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncResult_lift(_ buf: RustBuffer) throws -> FfiCloudSyncResult {
+    return try FfiConverterTypeFfiCloudSyncResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncResult_lower(_ value: FfiCloudSyncResult) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncResult.lower(value)
+}
+
+
+public struct FfiCloudSyncStatus: Equatable, Hashable {
+    public var state: FfiCloudSyncState
+    public var provider: String
+    public var githubOauthConfigured: Bool
+    public var githubClientIdOverride: String?
+    public var accountLogin: String?
+    public var accountName: String?
+    public var accountAvatarUrl: String?
+    public var gistId: String?
+    public var gistHtmlUrl: String?
+    public var remoteVaultExists: Bool
+    public var autoSyncEnabled: Bool
+    public var lastSyncedAtMs: Int64?
+    public var lastVaultRevision: UInt64
+    public var syncedHostCount: UInt32
+    public var syncedProjectCount: UInt32
+    public var lastError: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: FfiCloudSyncState, provider: String, githubOauthConfigured: Bool, githubClientIdOverride: String?, accountLogin: String?, accountName: String?, accountAvatarUrl: String?, gistId: String?, gistHtmlUrl: String?, remoteVaultExists: Bool, autoSyncEnabled: Bool, lastSyncedAtMs: Int64?, lastVaultRevision: UInt64, syncedHostCount: UInt32, syncedProjectCount: UInt32, lastError: String?) {
+        self.state = state
+        self.provider = provider
+        self.githubOauthConfigured = githubOauthConfigured
+        self.githubClientIdOverride = githubClientIdOverride
+        self.accountLogin = accountLogin
+        self.accountName = accountName
+        self.accountAvatarUrl = accountAvatarUrl
+        self.gistId = gistId
+        self.gistHtmlUrl = gistHtmlUrl
+        self.remoteVaultExists = remoteVaultExists
+        self.autoSyncEnabled = autoSyncEnabled
+        self.lastSyncedAtMs = lastSyncedAtMs
+        self.lastVaultRevision = lastVaultRevision
+        self.syncedHostCount = syncedHostCount
+        self.syncedProjectCount = syncedProjectCount
+        self.lastError = lastError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncStatus {
+        return
+            try FfiCloudSyncStatus(
+                state: FfiConverterTypeFfiCloudSyncState.read(from: &buf), 
+                provider: FfiConverterString.read(from: &buf), 
+                githubOauthConfigured: FfiConverterBool.read(from: &buf), 
+                githubClientIdOverride: FfiConverterOptionString.read(from: &buf), 
+                accountLogin: FfiConverterOptionString.read(from: &buf), 
+                accountName: FfiConverterOptionString.read(from: &buf), 
+                accountAvatarUrl: FfiConverterOptionString.read(from: &buf), 
+                gistId: FfiConverterOptionString.read(from: &buf), 
+                gistHtmlUrl: FfiConverterOptionString.read(from: &buf), 
+                remoteVaultExists: FfiConverterBool.read(from: &buf), 
+                autoSyncEnabled: FfiConverterBool.read(from: &buf), 
+                lastSyncedAtMs: FfiConverterOptionInt64.read(from: &buf), 
+                lastVaultRevision: FfiConverterUInt64.read(from: &buf), 
+                syncedHostCount: FfiConverterUInt32.read(from: &buf), 
+                syncedProjectCount: FfiConverterUInt32.read(from: &buf), 
+                lastError: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCloudSyncStatus, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiCloudSyncState.write(value.state, into: &buf)
+        FfiConverterString.write(value.provider, into: &buf)
+        FfiConverterBool.write(value.githubOauthConfigured, into: &buf)
+        FfiConverterOptionString.write(value.githubClientIdOverride, into: &buf)
+        FfiConverterOptionString.write(value.accountLogin, into: &buf)
+        FfiConverterOptionString.write(value.accountName, into: &buf)
+        FfiConverterOptionString.write(value.accountAvatarUrl, into: &buf)
+        FfiConverterOptionString.write(value.gistId, into: &buf)
+        FfiConverterOptionString.write(value.gistHtmlUrl, into: &buf)
+        FfiConverterBool.write(value.remoteVaultExists, into: &buf)
+        FfiConverterBool.write(value.autoSyncEnabled, into: &buf)
+        FfiConverterOptionInt64.write(value.lastSyncedAtMs, into: &buf)
+        FfiConverterUInt64.write(value.lastVaultRevision, into: &buf)
+        FfiConverterUInt32.write(value.syncedHostCount, into: &buf)
+        FfiConverterUInt32.write(value.syncedProjectCount, into: &buf)
+        FfiConverterOptionString.write(value.lastError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncStatus_lift(_ buf: RustBuffer) throws -> FfiCloudSyncStatus {
+    return try FfiConverterTypeFfiCloudSyncStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncStatus_lower(_ value: FfiCloudSyncStatus) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncStatus.lower(value)
+}
+
+
 public struct FfiComposePromptRequest: Equatable, Hashable {
     public var provider: FfiProviderKind
     public var rawText: String
@@ -3305,6 +4145,108 @@ public func FfiConverterTypeFfiComposerQuoteInput_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeFfiComposerQuoteInput_lower(_ value: FfiComposerQuoteInput) -> RustBuffer {
     return FfiConverterTypeFfiComposerQuoteInput.lower(value)
+}
+
+
+public struct FfiCreateScheduleRequest: Equatable, Hashable {
+    public var hostId: String
+    public var name: String
+    public var cronExpr: String
+    public var timezone: String?
+    public var prompt: String
+    public var cwd: String
+    public var workspaceId: String?
+    public var provider: FfiProviderKind
+    public var model: String?
+    public var effort: FfiReasoningEffort?
+    public var mode: FfiSessionMode
+    public var worktree: Bool
+    public var archiveOnFinish: Bool
+    public var maxRuns: UInt32?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hostId: String, name: String, cronExpr: String, timezone: String?, prompt: String, cwd: String, workspaceId: String?, provider: FfiProviderKind, model: String?, effort: FfiReasoningEffort?, mode: FfiSessionMode, worktree: Bool, archiveOnFinish: Bool, maxRuns: UInt32?) {
+        self.hostId = hostId
+        self.name = name
+        self.cronExpr = cronExpr
+        self.timezone = timezone
+        self.prompt = prompt
+        self.cwd = cwd
+        self.workspaceId = workspaceId
+        self.provider = provider
+        self.model = model
+        self.effort = effort
+        self.mode = mode
+        self.worktree = worktree
+        self.archiveOnFinish = archiveOnFinish
+        self.maxRuns = maxRuns
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiCreateScheduleRequest: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCreateScheduleRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCreateScheduleRequest {
+        return
+            try FfiCreateScheduleRequest(
+                hostId: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                cronExpr: FfiConverterString.read(from: &buf), 
+                timezone: FfiConverterOptionString.read(from: &buf), 
+                prompt: FfiConverterString.read(from: &buf), 
+                cwd: FfiConverterString.read(from: &buf), 
+                workspaceId: FfiConverterOptionString.read(from: &buf), 
+                provider: FfiConverterTypeFfiProviderKind.read(from: &buf), 
+                model: FfiConverterOptionString.read(from: &buf), 
+                effort: FfiConverterOptionTypeFfiReasoningEffort.read(from: &buf), 
+                mode: FfiConverterTypeFfiSessionMode.read(from: &buf), 
+                worktree: FfiConverterBool.read(from: &buf), 
+                archiveOnFinish: FfiConverterBool.read(from: &buf), 
+                maxRuns: FfiConverterOptionUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCreateScheduleRequest, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.hostId, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.cronExpr, into: &buf)
+        FfiConverterOptionString.write(value.timezone, into: &buf)
+        FfiConverterString.write(value.prompt, into: &buf)
+        FfiConverterString.write(value.cwd, into: &buf)
+        FfiConverterOptionString.write(value.workspaceId, into: &buf)
+        FfiConverterTypeFfiProviderKind.write(value.provider, into: &buf)
+        FfiConverterOptionString.write(value.model, into: &buf)
+        FfiConverterOptionTypeFfiReasoningEffort.write(value.effort, into: &buf)
+        FfiConverterTypeFfiSessionMode.write(value.mode, into: &buf)
+        FfiConverterBool.write(value.worktree, into: &buf)
+        FfiConverterBool.write(value.archiveOnFinish, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxRuns, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCreateScheduleRequest_lift(_ buf: RustBuffer) throws -> FfiCreateScheduleRequest {
+    return try FfiConverterTypeFfiCreateScheduleRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCreateScheduleRequest_lower(_ value: FfiCreateScheduleRequest) -> RustBuffer {
+    return FfiConverterTypeFfiCreateScheduleRequest.lower(value)
 }
 
 
@@ -3709,14 +4651,16 @@ public struct FfiFleetOverview: Equatable, Hashable {
     public var totalPendingApprovals: UInt32
     public var hosts: [FfiHostCard]
     public var projects: [FfiClientProject]
+    public var projectOrder: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(revision: UInt64, totalPendingApprovals: UInt32, hosts: [FfiHostCard], projects: [FfiClientProject]) {
+    public init(revision: UInt64, totalPendingApprovals: UInt32, hosts: [FfiHostCard], projects: [FfiClientProject], projectOrder: [String]) {
         self.revision = revision
         self.totalPendingApprovals = totalPendingApprovals
         self.hosts = hosts
         self.projects = projects
+        self.projectOrder = projectOrder
     }
 
     
@@ -3738,7 +4682,8 @@ public struct FfiConverterTypeFfiFleetOverview: FfiConverterRustBuffer {
                 revision: FfiConverterUInt64.read(from: &buf), 
                 totalPendingApprovals: FfiConverterUInt32.read(from: &buf), 
                 hosts: FfiConverterSequenceTypeFfiHostCard.read(from: &buf), 
-                projects: FfiConverterSequenceTypeFfiClientProject.read(from: &buf)
+                projects: FfiConverterSequenceTypeFfiClientProject.read(from: &buf), 
+                projectOrder: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
@@ -3747,6 +4692,7 @@ public struct FfiConverterTypeFfiFleetOverview: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.totalPendingApprovals, into: &buf)
         FfiConverterSequenceTypeFfiHostCard.write(value.hosts, into: &buf)
         FfiConverterSequenceTypeFfiClientProject.write(value.projects, into: &buf)
+        FfiConverterSequenceString.write(value.projectOrder, into: &buf)
     }
 }
 
@@ -3961,6 +4907,134 @@ public func FfiConverterTypeFfiGitFileEntry_lift(_ buf: RustBuffer) throws -> Ff
 #endif
 public func FfiConverterTypeFfiGitFileEntry_lower(_ value: FfiGitFileEntry) -> RustBuffer {
     return FfiConverterTypeFfiGitFileEntry.lower(value)
+}
+
+
+public struct FfiGitHubDeviceFlowStart: Equatable, Hashable {
+    public var deviceCode: String
+    public var userCode: String
+    public var verificationUri: String
+    public var expiresInSecs: UInt64
+    public var intervalSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceCode: String, userCode: String, verificationUri: String, expiresInSecs: UInt64, intervalSecs: UInt64) {
+        self.deviceCode = deviceCode
+        self.userCode = userCode
+        self.verificationUri = verificationUri
+        self.expiresInSecs = expiresInSecs
+        self.intervalSecs = intervalSecs
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiGitHubDeviceFlowStart: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiGitHubDeviceFlowStart: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiGitHubDeviceFlowStart {
+        return
+            try FfiGitHubDeviceFlowStart(
+                deviceCode: FfiConverterString.read(from: &buf), 
+                userCode: FfiConverterString.read(from: &buf), 
+                verificationUri: FfiConverterString.read(from: &buf), 
+                expiresInSecs: FfiConverterUInt64.read(from: &buf), 
+                intervalSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiGitHubDeviceFlowStart, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.deviceCode, into: &buf)
+        FfiConverterString.write(value.userCode, into: &buf)
+        FfiConverterString.write(value.verificationUri, into: &buf)
+        FfiConverterUInt64.write(value.expiresInSecs, into: &buf)
+        FfiConverterUInt64.write(value.intervalSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGitHubDeviceFlowStart_lift(_ buf: RustBuffer) throws -> FfiGitHubDeviceFlowStart {
+    return try FfiConverterTypeFfiGitHubDeviceFlowStart.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGitHubDeviceFlowStart_lower(_ value: FfiGitHubDeviceFlowStart) -> RustBuffer {
+    return FfiConverterTypeFfiGitHubDeviceFlowStart.lower(value)
+}
+
+
+public struct FfiGitReposInspection: Equatable, Hashable {
+    public var path: String
+    public var isGitRepo: Bool
+    public var gitBranch: String?
+    public var nestedGitRepos: [FfiNestedGitRepo]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(path: String, isGitRepo: Bool, gitBranch: String?, nestedGitRepos: [FfiNestedGitRepo]) {
+        self.path = path
+        self.isGitRepo = isGitRepo
+        self.gitBranch = gitBranch
+        self.nestedGitRepos = nestedGitRepos
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiGitReposInspection: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiGitReposInspection: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiGitReposInspection {
+        return
+            try FfiGitReposInspection(
+                path: FfiConverterString.read(from: &buf), 
+                isGitRepo: FfiConverterBool.read(from: &buf), 
+                gitBranch: FfiConverterOptionString.read(from: &buf), 
+                nestedGitRepos: FfiConverterSequenceTypeFfiNestedGitRepo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiGitReposInspection, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterBool.write(value.isGitRepo, into: &buf)
+        FfiConverterOptionString.write(value.gitBranch, into: &buf)
+        FfiConverterSequenceTypeFfiNestedGitRepo.write(value.nestedGitRepos, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGitReposInspection_lift(_ buf: RustBuffer) throws -> FfiGitReposInspection {
+    return try FfiConverterTypeFfiGitReposInspection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGitReposInspection_lower(_ value: FfiGitReposInspection) -> RustBuffer {
+    return FfiConverterTypeFfiGitReposInspection.lower(value)
 }
 
 
@@ -4324,16 +5398,23 @@ public struct FfiHostDetail: Equatable, Hashable {
     public var providerCatalogs: [FfiProviderModelCatalog]
     public var workspaces: [FfiWorkspaceSummary]
     public var agents: [FfiAgentCard]
+    public var archivedAgents: [FfiAgentCard]
     public var lastCreatedAgentId: String?
     public var replacedOptimisticAgents: [String: String]
     public var quotas: [FfiProviderQuota]
     public var terminals: [FfiTerminalSummary]
     public var activeTerminalId: String?
     public var activeTerminalSlot: UInt8
+    public var schedules: [FfiScheduleSpec]
+    public var providerSubagents: [String: [FfiProviderSubagentDescriptor]]
+    public var gitReposByCwd: [String: FfiGitReposInspection]
+    public var workspaceBoards: [String: FfiWorkspaceBoardSnapshot]
+    public var workspaceEvents: [String: [FfiWorkspaceEvent]]
+    public var workspaceOrganizeStatus: [String: FfiWorkspaceOrganizeStatus]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(revision: UInt64, host: FfiHostCard, discoveredProjects: [FfiDiscoveredProject], directoryListing: FfiDirectoryListing?, providerCatalogs: [FfiProviderModelCatalog], workspaces: [FfiWorkspaceSummary], agents: [FfiAgentCard], lastCreatedAgentId: String?, replacedOptimisticAgents: [String: String], quotas: [FfiProviderQuota], terminals: [FfiTerminalSummary], activeTerminalId: String?, activeTerminalSlot: UInt8) {
+    public init(revision: UInt64, host: FfiHostCard, discoveredProjects: [FfiDiscoveredProject], directoryListing: FfiDirectoryListing?, providerCatalogs: [FfiProviderModelCatalog], workspaces: [FfiWorkspaceSummary], agents: [FfiAgentCard], archivedAgents: [FfiAgentCard], lastCreatedAgentId: String?, replacedOptimisticAgents: [String: String], quotas: [FfiProviderQuota], terminals: [FfiTerminalSummary], activeTerminalId: String?, activeTerminalSlot: UInt8, schedules: [FfiScheduleSpec], providerSubagents: [String: [FfiProviderSubagentDescriptor]], gitReposByCwd: [String: FfiGitReposInspection], workspaceBoards: [String: FfiWorkspaceBoardSnapshot], workspaceEvents: [String: [FfiWorkspaceEvent]], workspaceOrganizeStatus: [String: FfiWorkspaceOrganizeStatus]) {
         self.revision = revision
         self.host = host
         self.discoveredProjects = discoveredProjects
@@ -4341,12 +5422,19 @@ public struct FfiHostDetail: Equatable, Hashable {
         self.providerCatalogs = providerCatalogs
         self.workspaces = workspaces
         self.agents = agents
+        self.archivedAgents = archivedAgents
         self.lastCreatedAgentId = lastCreatedAgentId
         self.replacedOptimisticAgents = replacedOptimisticAgents
         self.quotas = quotas
         self.terminals = terminals
         self.activeTerminalId = activeTerminalId
         self.activeTerminalSlot = activeTerminalSlot
+        self.schedules = schedules
+        self.providerSubagents = providerSubagents
+        self.gitReposByCwd = gitReposByCwd
+        self.workspaceBoards = workspaceBoards
+        self.workspaceEvents = workspaceEvents
+        self.workspaceOrganizeStatus = workspaceOrganizeStatus
     }
 
     
@@ -4372,12 +5460,19 @@ public struct FfiConverterTypeFfiHostDetail: FfiConverterRustBuffer {
                 providerCatalogs: FfiConverterSequenceTypeFfiProviderModelCatalog.read(from: &buf), 
                 workspaces: FfiConverterSequenceTypeFfiWorkspaceSummary.read(from: &buf), 
                 agents: FfiConverterSequenceTypeFfiAgentCard.read(from: &buf), 
+                archivedAgents: FfiConverterSequenceTypeFfiAgentCard.read(from: &buf), 
                 lastCreatedAgentId: FfiConverterOptionString.read(from: &buf), 
                 replacedOptimisticAgents: FfiConverterDictionaryStringString.read(from: &buf), 
                 quotas: FfiConverterSequenceTypeFfiProviderQuota.read(from: &buf), 
                 terminals: FfiConverterSequenceTypeFfiTerminalSummary.read(from: &buf), 
                 activeTerminalId: FfiConverterOptionString.read(from: &buf), 
-                activeTerminalSlot: FfiConverterUInt8.read(from: &buf)
+                activeTerminalSlot: FfiConverterUInt8.read(from: &buf), 
+                schedules: FfiConverterSequenceTypeFfiScheduleSpec.read(from: &buf), 
+                providerSubagents: FfiConverterDictionaryStringSequenceTypeFfiProviderSubagentDescriptor.read(from: &buf), 
+                gitReposByCwd: FfiConverterDictionaryStringTypeFfiGitReposInspection.read(from: &buf), 
+                workspaceBoards: FfiConverterDictionaryStringTypeFfiWorkspaceBoardSnapshot.read(from: &buf), 
+                workspaceEvents: FfiConverterDictionaryStringSequenceTypeFfiWorkspaceEvent.read(from: &buf), 
+                workspaceOrganizeStatus: FfiConverterDictionaryStringTypeFfiWorkspaceOrganizeStatus.read(from: &buf)
         )
     }
 
@@ -4389,12 +5484,19 @@ public struct FfiConverterTypeFfiHostDetail: FfiConverterRustBuffer {
         FfiConverterSequenceTypeFfiProviderModelCatalog.write(value.providerCatalogs, into: &buf)
         FfiConverterSequenceTypeFfiWorkspaceSummary.write(value.workspaces, into: &buf)
         FfiConverterSequenceTypeFfiAgentCard.write(value.agents, into: &buf)
+        FfiConverterSequenceTypeFfiAgentCard.write(value.archivedAgents, into: &buf)
         FfiConverterOptionString.write(value.lastCreatedAgentId, into: &buf)
         FfiConverterDictionaryStringString.write(value.replacedOptimisticAgents, into: &buf)
         FfiConverterSequenceTypeFfiProviderQuota.write(value.quotas, into: &buf)
         FfiConverterSequenceTypeFfiTerminalSummary.write(value.terminals, into: &buf)
         FfiConverterOptionString.write(value.activeTerminalId, into: &buf)
         FfiConverterUInt8.write(value.activeTerminalSlot, into: &buf)
+        FfiConverterSequenceTypeFfiScheduleSpec.write(value.schedules, into: &buf)
+        FfiConverterDictionaryStringSequenceTypeFfiProviderSubagentDescriptor.write(value.providerSubagents, into: &buf)
+        FfiConverterDictionaryStringTypeFfiGitReposInspection.write(value.gitReposByCwd, into: &buf)
+        FfiConverterDictionaryStringTypeFfiWorkspaceBoardSnapshot.write(value.workspaceBoards, into: &buf)
+        FfiConverterDictionaryStringSequenceTypeFfiWorkspaceEvent.write(value.workspaceEvents, into: &buf)
+        FfiConverterDictionaryStringTypeFfiWorkspaceOrganizeStatus.write(value.workspaceOrganizeStatus, into: &buf)
     }
 }
 
@@ -4490,15 +5592,19 @@ public struct FfiLaunchpadProject: Equatable, Hashable {
     public var name: String
     public var path: String
     public var branch: String?
+    public var isGitRepo: Bool
+    public var nestedGitRepos: [FfiNestedGitRepo]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, hostId: String, name: String, path: String, branch: String?) {
+    public init(id: String, hostId: String, name: String, path: String, branch: String?, isGitRepo: Bool, nestedGitRepos: [FfiNestedGitRepo]) {
         self.id = id
         self.hostId = hostId
         self.name = name
         self.path = path
         self.branch = branch
+        self.isGitRepo = isGitRepo
+        self.nestedGitRepos = nestedGitRepos
     }
 
     
@@ -4521,7 +5627,9 @@ public struct FfiConverterTypeFfiLaunchpadProject: FfiConverterRustBuffer {
                 hostId: FfiConverterString.read(from: &buf), 
                 name: FfiConverterString.read(from: &buf), 
                 path: FfiConverterString.read(from: &buf), 
-                branch: FfiConverterOptionString.read(from: &buf)
+                branch: FfiConverterOptionString.read(from: &buf), 
+                isGitRepo: FfiConverterBool.read(from: &buf), 
+                nestedGitRepos: FfiConverterSequenceTypeFfiNestedGitRepo.read(from: &buf)
         )
     }
 
@@ -4531,6 +5639,8 @@ public struct FfiConverterTypeFfiLaunchpadProject: FfiConverterRustBuffer {
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterString.write(value.path, into: &buf)
         FfiConverterOptionString.write(value.branch, into: &buf)
+        FfiConverterBool.write(value.isGitRepo, into: &buf)
+        FfiConverterSequenceTypeFfiNestedGitRepo.write(value.nestedGitRepos, into: &buf)
     }
 }
 
@@ -4749,6 +5859,134 @@ public func FfiConverterTypeFfiModelSelectionRequest_lift(_ buf: RustBuffer) thr
 #endif
 public func FfiConverterTypeFfiModelSelectionRequest_lower(_ value: FfiModelSelectionRequest) -> RustBuffer {
     return FfiConverterTypeFfiModelSelectionRequest.lower(value)
+}
+
+
+public struct FfiNestedGitRepo: Equatable, Hashable {
+    public var path: String
+    public var relativePath: String
+    public var name: String
+    public var gitBranch: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(path: String, relativePath: String, name: String, gitBranch: String?) {
+        self.path = path
+        self.relativePath = relativePath
+        self.name = name
+        self.gitBranch = gitBranch
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiNestedGitRepo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiNestedGitRepo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiNestedGitRepo {
+        return
+            try FfiNestedGitRepo(
+                path: FfiConverterString.read(from: &buf), 
+                relativePath: FfiConverterString.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                gitBranch: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiNestedGitRepo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterString.write(value.relativePath, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionString.write(value.gitBranch, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNestedGitRepo_lift(_ buf: RustBuffer) throws -> FfiNestedGitRepo {
+    return try FfiConverterTypeFfiNestedGitRepo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiNestedGitRepo_lower(_ value: FfiNestedGitRepo) -> RustBuffer {
+    return FfiConverterTypeFfiNestedGitRepo.lower(value)
+}
+
+
+public struct FfiPermissionCheckpointRef: Equatable, Hashable {
+    public var childAgentId: String
+    public var childHostId: String?
+    public var permissionRequestId: String
+    public var title: String
+    public var allowedDecisions: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(childAgentId: String, childHostId: String?, permissionRequestId: String, title: String, allowedDecisions: [String]) {
+        self.childAgentId = childAgentId
+        self.childHostId = childHostId
+        self.permissionRequestId = permissionRequestId
+        self.title = title
+        self.allowedDecisions = allowedDecisions
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiPermissionCheckpointRef: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiPermissionCheckpointRef: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiPermissionCheckpointRef {
+        return
+            try FfiPermissionCheckpointRef(
+                childAgentId: FfiConverterString.read(from: &buf), 
+                childHostId: FfiConverterOptionString.read(from: &buf), 
+                permissionRequestId: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                allowedDecisions: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiPermissionCheckpointRef, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.childAgentId, into: &buf)
+        FfiConverterOptionString.write(value.childHostId, into: &buf)
+        FfiConverterString.write(value.permissionRequestId, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterSequenceString.write(value.allowedDecisions, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPermissionCheckpointRef_lift(_ buf: RustBuffer) throws -> FfiPermissionCheckpointRef {
+    return try FfiConverterTypeFfiPermissionCheckpointRef.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiPermissionCheckpointRef_lower(_ value: FfiPermissionCheckpointRef) -> RustBuffer {
+    return FfiConverterTypeFfiPermissionCheckpointRef.lower(value)
 }
 
 
@@ -5009,6 +6247,150 @@ public func FfiConverterTypeFfiProviderQuota_lift(_ buf: RustBuffer) throws -> F
 #endif
 public func FfiConverterTypeFfiProviderQuota_lower(_ value: FfiProviderQuota) -> RustBuffer {
     return FfiConverterTypeFfiProviderQuota.lower(value)
+}
+
+
+public struct FfiProviderSubagentDescriptor: Equatable, Hashable {
+    public var subagentId: String
+    public var parentAgentId: String
+    public var parentSubagentId: String?
+    public var title: String
+    public var subtitle: String?
+    public var status: FfiProviderSubagentStatus
+    public var createdAtRfc3339: String
+    public var updatedAtRfc3339: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(subagentId: String, parentAgentId: String, parentSubagentId: String?, title: String, subtitle: String?, status: FfiProviderSubagentStatus, createdAtRfc3339: String, updatedAtRfc3339: String) {
+        self.subagentId = subagentId
+        self.parentAgentId = parentAgentId
+        self.parentSubagentId = parentSubagentId
+        self.title = title
+        self.subtitle = subtitle
+        self.status = status
+        self.createdAtRfc3339 = createdAtRfc3339
+        self.updatedAtRfc3339 = updatedAtRfc3339
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiProviderSubagentDescriptor: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiProviderSubagentDescriptor: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiProviderSubagentDescriptor {
+        return
+            try FfiProviderSubagentDescriptor(
+                subagentId: FfiConverterString.read(from: &buf), 
+                parentAgentId: FfiConverterString.read(from: &buf), 
+                parentSubagentId: FfiConverterOptionString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                subtitle: FfiConverterOptionString.read(from: &buf), 
+                status: FfiConverterTypeFfiProviderSubagentStatus.read(from: &buf), 
+                createdAtRfc3339: FfiConverterString.read(from: &buf), 
+                updatedAtRfc3339: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiProviderSubagentDescriptor, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.subagentId, into: &buf)
+        FfiConverterString.write(value.parentAgentId, into: &buf)
+        FfiConverterOptionString.write(value.parentSubagentId, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.subtitle, into: &buf)
+        FfiConverterTypeFfiProviderSubagentStatus.write(value.status, into: &buf)
+        FfiConverterString.write(value.createdAtRfc3339, into: &buf)
+        FfiConverterString.write(value.updatedAtRfc3339, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProviderSubagentDescriptor_lift(_ buf: RustBuffer) throws -> FfiProviderSubagentDescriptor {
+    return try FfiConverterTypeFfiProviderSubagentDescriptor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProviderSubagentDescriptor_lower(_ value: FfiProviderSubagentDescriptor) -> RustBuffer {
+    return FfiConverterTypeFfiProviderSubagentDescriptor.lower(value)
+}
+
+
+public struct FfiProviderSubagentEvent: Equatable, Hashable {
+    public var seq: UInt64
+    public var parentAgentId: String
+    public var subagentId: String
+    public var timestampRfc3339: String
+    public var summaryText: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(seq: UInt64, parentAgentId: String, subagentId: String, timestampRfc3339: String, summaryText: String) {
+        self.seq = seq
+        self.parentAgentId = parentAgentId
+        self.subagentId = subagentId
+        self.timestampRfc3339 = timestampRfc3339
+        self.summaryText = summaryText
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiProviderSubagentEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiProviderSubagentEvent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiProviderSubagentEvent {
+        return
+            try FfiProviderSubagentEvent(
+                seq: FfiConverterUInt64.read(from: &buf), 
+                parentAgentId: FfiConverterString.read(from: &buf), 
+                subagentId: FfiConverterString.read(from: &buf), 
+                timestampRfc3339: FfiConverterString.read(from: &buf), 
+                summaryText: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiProviderSubagentEvent, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.seq, into: &buf)
+        FfiConverterString.write(value.parentAgentId, into: &buf)
+        FfiConverterString.write(value.subagentId, into: &buf)
+        FfiConverterString.write(value.timestampRfc3339, into: &buf)
+        FfiConverterString.write(value.summaryText, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProviderSubagentEvent_lift(_ buf: RustBuffer) throws -> FfiProviderSubagentEvent {
+    return try FfiConverterTypeFfiProviderSubagentEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProviderSubagentEvent_lower(_ value: FfiProviderSubagentEvent) -> RustBuffer {
+    return FfiConverterTypeFfiProviderSubagentEvent.lower(value)
 }
 
 
@@ -5586,6 +6968,206 @@ public func FfiConverterTypeFfiRewindAgentResult_lower(_ value: FfiRewindAgentRe
 }
 
 
+public struct FfiScheduleRunRecord: Equatable, Hashable {
+    public var runId: String
+    public var scheduleId: String
+    public var agentId: String?
+    public var workspaceId: String?
+    public var status: FfiScheduleRunStatus
+    public var summary: String?
+    public var error: String?
+    public var startedAtRfc3339: String
+    public var finishedAtRfc3339: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(runId: String, scheduleId: String, agentId: String?, workspaceId: String?, status: FfiScheduleRunStatus, summary: String?, error: String?, startedAtRfc3339: String, finishedAtRfc3339: String?) {
+        self.runId = runId
+        self.scheduleId = scheduleId
+        self.agentId = agentId
+        self.workspaceId = workspaceId
+        self.status = status
+        self.summary = summary
+        self.error = error
+        self.startedAtRfc3339 = startedAtRfc3339
+        self.finishedAtRfc3339 = finishedAtRfc3339
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiScheduleRunRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScheduleRunRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScheduleRunRecord {
+        return
+            try FfiScheduleRunRecord(
+                runId: FfiConverterString.read(from: &buf), 
+                scheduleId: FfiConverterString.read(from: &buf), 
+                agentId: FfiConverterOptionString.read(from: &buf), 
+                workspaceId: FfiConverterOptionString.read(from: &buf), 
+                status: FfiConverterTypeFfiScheduleRunStatus.read(from: &buf), 
+                summary: FfiConverterOptionString.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf), 
+                startedAtRfc3339: FfiConverterString.read(from: &buf), 
+                finishedAtRfc3339: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiScheduleRunRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.runId, into: &buf)
+        FfiConverterString.write(value.scheduleId, into: &buf)
+        FfiConverterOptionString.write(value.agentId, into: &buf)
+        FfiConverterOptionString.write(value.workspaceId, into: &buf)
+        FfiConverterTypeFfiScheduleRunStatus.write(value.status, into: &buf)
+        FfiConverterOptionString.write(value.summary, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterString.write(value.startedAtRfc3339, into: &buf)
+        FfiConverterOptionString.write(value.finishedAtRfc3339, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleRunRecord_lift(_ buf: RustBuffer) throws -> FfiScheduleRunRecord {
+    return try FfiConverterTypeFfiScheduleRunRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleRunRecord_lower(_ value: FfiScheduleRunRecord) -> RustBuffer {
+    return FfiConverterTypeFfiScheduleRunRecord.lower(value)
+}
+
+
+public struct FfiScheduleSpec: Equatable, Hashable {
+    public var scheduleId: String
+    public var kind: FfiScheduleKind
+    public var name: String
+    public var cronExpr: String
+    public var timezone: String?
+    public var prompt: String
+    public var status: FfiScheduleStatus
+    public var cwd: String?
+    public var workspaceId: String?
+    public var provider: FfiProviderKind?
+    public var mode: FfiSessionMode?
+    public var worktree: Bool
+    public var archiveOnFinish: Bool
+    public var targetAgentId: String?
+    public var maxRuns: UInt32?
+    public var runCount: UInt32
+    public var lastRunAtRfc3339: String?
+    public var nextRunAtRfc3339: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(scheduleId: String, kind: FfiScheduleKind, name: String, cronExpr: String, timezone: String?, prompt: String, status: FfiScheduleStatus, cwd: String?, workspaceId: String?, provider: FfiProviderKind?, mode: FfiSessionMode?, worktree: Bool, archiveOnFinish: Bool, targetAgentId: String?, maxRuns: UInt32?, runCount: UInt32, lastRunAtRfc3339: String?, nextRunAtRfc3339: String?) {
+        self.scheduleId = scheduleId
+        self.kind = kind
+        self.name = name
+        self.cronExpr = cronExpr
+        self.timezone = timezone
+        self.prompt = prompt
+        self.status = status
+        self.cwd = cwd
+        self.workspaceId = workspaceId
+        self.provider = provider
+        self.mode = mode
+        self.worktree = worktree
+        self.archiveOnFinish = archiveOnFinish
+        self.targetAgentId = targetAgentId
+        self.maxRuns = maxRuns
+        self.runCount = runCount
+        self.lastRunAtRfc3339 = lastRunAtRfc3339
+        self.nextRunAtRfc3339 = nextRunAtRfc3339
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiScheduleSpec: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScheduleSpec: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScheduleSpec {
+        return
+            try FfiScheduleSpec(
+                scheduleId: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeFfiScheduleKind.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf), 
+                cronExpr: FfiConverterString.read(from: &buf), 
+                timezone: FfiConverterOptionString.read(from: &buf), 
+                prompt: FfiConverterString.read(from: &buf), 
+                status: FfiConverterTypeFfiScheduleStatus.read(from: &buf), 
+                cwd: FfiConverterOptionString.read(from: &buf), 
+                workspaceId: FfiConverterOptionString.read(from: &buf), 
+                provider: FfiConverterOptionTypeFfiProviderKind.read(from: &buf), 
+                mode: FfiConverterOptionTypeFfiSessionMode.read(from: &buf), 
+                worktree: FfiConverterBool.read(from: &buf), 
+                archiveOnFinish: FfiConverterBool.read(from: &buf), 
+                targetAgentId: FfiConverterOptionString.read(from: &buf), 
+                maxRuns: FfiConverterOptionUInt32.read(from: &buf), 
+                runCount: FfiConverterUInt32.read(from: &buf), 
+                lastRunAtRfc3339: FfiConverterOptionString.read(from: &buf), 
+                nextRunAtRfc3339: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiScheduleSpec, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.scheduleId, into: &buf)
+        FfiConverterTypeFfiScheduleKind.write(value.kind, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.cronExpr, into: &buf)
+        FfiConverterOptionString.write(value.timezone, into: &buf)
+        FfiConverterString.write(value.prompt, into: &buf)
+        FfiConverterTypeFfiScheduleStatus.write(value.status, into: &buf)
+        FfiConverterOptionString.write(value.cwd, into: &buf)
+        FfiConverterOptionString.write(value.workspaceId, into: &buf)
+        FfiConverterOptionTypeFfiProviderKind.write(value.provider, into: &buf)
+        FfiConverterOptionTypeFfiSessionMode.write(value.mode, into: &buf)
+        FfiConverterBool.write(value.worktree, into: &buf)
+        FfiConverterBool.write(value.archiveOnFinish, into: &buf)
+        FfiConverterOptionString.write(value.targetAgentId, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxRuns, into: &buf)
+        FfiConverterUInt32.write(value.runCount, into: &buf)
+        FfiConverterOptionString.write(value.lastRunAtRfc3339, into: &buf)
+        FfiConverterOptionString.write(value.nextRunAtRfc3339, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleSpec_lift(_ buf: RustBuffer) throws -> FfiScheduleSpec {
+    return try FfiConverterTypeFfiScheduleSpec.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleSpec_lower(_ value: FfiScheduleSpec) -> RustBuffer {
+    return FfiConverterTypeFfiScheduleSpec.lower(value)
+}
+
+
 public struct FfiSendPromptRequest: Equatable, Hashable {
     public var hostId: String
     public var agentId: String
@@ -5661,10 +7243,11 @@ public struct FfiSessionBackgroundTask: Equatable, Hashable {
     public var startedAtMs: Int64?
     public var command: String?
     public var outputPreview: String?
+    public var logPath: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, kind: FfiSessionBackgroundTaskKind, title: String, subtitle: String, status: FfiSessionBackgroundTaskStatus, startedAtMs: Int64?, command: String?, outputPreview: String?) {
+    public init(id: String, kind: FfiSessionBackgroundTaskKind, title: String, subtitle: String, status: FfiSessionBackgroundTaskStatus, startedAtMs: Int64?, command: String?, outputPreview: String?, logPath: String?) {
         self.id = id
         self.kind = kind
         self.title = title
@@ -5673,6 +7256,7 @@ public struct FfiSessionBackgroundTask: Equatable, Hashable {
         self.startedAtMs = startedAtMs
         self.command = command
         self.outputPreview = outputPreview
+        self.logPath = logPath
     }
 
     
@@ -5698,7 +7282,8 @@ public struct FfiConverterTypeFfiSessionBackgroundTask: FfiConverterRustBuffer {
                 status: FfiConverterTypeFfiSessionBackgroundTaskStatus.read(from: &buf), 
                 startedAtMs: FfiConverterOptionInt64.read(from: &buf), 
                 command: FfiConverterOptionString.read(from: &buf), 
-                outputPreview: FfiConverterOptionString.read(from: &buf)
+                outputPreview: FfiConverterOptionString.read(from: &buf), 
+                logPath: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -5711,6 +7296,7 @@ public struct FfiConverterTypeFfiSessionBackgroundTask: FfiConverterRustBuffer {
         FfiConverterOptionInt64.write(value.startedAtMs, into: &buf)
         FfiConverterOptionString.write(value.command, into: &buf)
         FfiConverterOptionString.write(value.outputPreview, into: &buf)
+        FfiConverterOptionString.write(value.logPath, into: &buf)
     }
 }
 
@@ -5798,16 +7384,18 @@ public struct FfiSessionSubagentEntry: Equatable, Hashable {
     public var promptPreview: String
     public var status: FfiToolStatus
     public var childAgentId: String?
+    public var providerSubagentId: String?
     public var lastSeq: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, role: String, promptPreview: String, status: FfiToolStatus, childAgentId: String?, lastSeq: UInt64) {
+    public init(id: String, role: String, promptPreview: String, status: FfiToolStatus, childAgentId: String?, providerSubagentId: String?, lastSeq: UInt64) {
         self.id = id
         self.role = role
         self.promptPreview = promptPreview
         self.status = status
         self.childAgentId = childAgentId
+        self.providerSubagentId = providerSubagentId
         self.lastSeq = lastSeq
     }
 
@@ -5832,6 +7420,7 @@ public struct FfiConverterTypeFfiSessionSubagentEntry: FfiConverterRustBuffer {
                 promptPreview: FfiConverterString.read(from: &buf), 
                 status: FfiConverterTypeFfiToolStatus.read(from: &buf), 
                 childAgentId: FfiConverterOptionString.read(from: &buf), 
+                providerSubagentId: FfiConverterOptionString.read(from: &buf), 
                 lastSeq: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -5842,6 +7431,7 @@ public struct FfiConverterTypeFfiSessionSubagentEntry: FfiConverterRustBuffer {
         FfiConverterString.write(value.promptPreview, into: &buf)
         FfiConverterTypeFfiToolStatus.write(value.status, into: &buf)
         FfiConverterOptionString.write(value.childAgentId, into: &buf)
+        FfiConverterOptionString.write(value.providerSubagentId, into: &buf)
         FfiConverterUInt64.write(value.lastSeq, into: &buf)
     }
 }
@@ -6009,24 +7599,34 @@ public struct FfiSidebarProjectGroup: Equatable, Hashable {
     public var primaryCwd: String
     public var directories: [String]
     public var gitBranch: String?
+    public var isGitRepo: Bool
+    public var nestedGitRepos: [FfiNestedGitRepo]
     public var pinnedProjectId: String?
     public var isHomeWorkspace: Bool
     public var sortWeightMs: Int64
+    public var sortOrderKey: String
     public var conversations: [FfiSidebarConversation]
+    public var workspaces: [FfiSidebarWorkspaceGroup]
+    public var unclassifiedConversations: [FfiSidebarConversation]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: String, hostId: String, name: String, primaryCwd: String, directories: [String], gitBranch: String?, pinnedProjectId: String?, isHomeWorkspace: Bool, sortWeightMs: Int64, conversations: [FfiSidebarConversation]) {
+    public init(id: String, hostId: String, name: String, primaryCwd: String, directories: [String], gitBranch: String?, isGitRepo: Bool, nestedGitRepos: [FfiNestedGitRepo], pinnedProjectId: String?, isHomeWorkspace: Bool, sortWeightMs: Int64, sortOrderKey: String, conversations: [FfiSidebarConversation], workspaces: [FfiSidebarWorkspaceGroup], unclassifiedConversations: [FfiSidebarConversation]) {
         self.id = id
         self.hostId = hostId
         self.name = name
         self.primaryCwd = primaryCwd
         self.directories = directories
         self.gitBranch = gitBranch
+        self.isGitRepo = isGitRepo
+        self.nestedGitRepos = nestedGitRepos
         self.pinnedProjectId = pinnedProjectId
         self.isHomeWorkspace = isHomeWorkspace
         self.sortWeightMs = sortWeightMs
+        self.sortOrderKey = sortOrderKey
         self.conversations = conversations
+        self.workspaces = workspaces
+        self.unclassifiedConversations = unclassifiedConversations
     }
 
     
@@ -6051,10 +7651,15 @@ public struct FfiConverterTypeFfiSidebarProjectGroup: FfiConverterRustBuffer {
                 primaryCwd: FfiConverterString.read(from: &buf), 
                 directories: FfiConverterSequenceString.read(from: &buf), 
                 gitBranch: FfiConverterOptionString.read(from: &buf), 
+                isGitRepo: FfiConverterBool.read(from: &buf), 
+                nestedGitRepos: FfiConverterSequenceTypeFfiNestedGitRepo.read(from: &buf), 
                 pinnedProjectId: FfiConverterOptionString.read(from: &buf), 
                 isHomeWorkspace: FfiConverterBool.read(from: &buf), 
                 sortWeightMs: FfiConverterInt64.read(from: &buf), 
-                conversations: FfiConverterSequenceTypeFfiSidebarConversation.read(from: &buf)
+                sortOrderKey: FfiConverterString.read(from: &buf), 
+                conversations: FfiConverterSequenceTypeFfiSidebarConversation.read(from: &buf), 
+                workspaces: FfiConverterSequenceTypeFfiSidebarWorkspaceGroup.read(from: &buf), 
+                unclassifiedConversations: FfiConverterSequenceTypeFfiSidebarConversation.read(from: &buf)
         )
     }
 
@@ -6065,10 +7670,15 @@ public struct FfiConverterTypeFfiSidebarProjectGroup: FfiConverterRustBuffer {
         FfiConverterString.write(value.primaryCwd, into: &buf)
         FfiConverterSequenceString.write(value.directories, into: &buf)
         FfiConverterOptionString.write(value.gitBranch, into: &buf)
+        FfiConverterBool.write(value.isGitRepo, into: &buf)
+        FfiConverterSequenceTypeFfiNestedGitRepo.write(value.nestedGitRepos, into: &buf)
         FfiConverterOptionString.write(value.pinnedProjectId, into: &buf)
         FfiConverterBool.write(value.isHomeWorkspace, into: &buf)
         FfiConverterInt64.write(value.sortWeightMs, into: &buf)
+        FfiConverterString.write(value.sortOrderKey, into: &buf)
         FfiConverterSequenceTypeFfiSidebarConversation.write(value.conversations, into: &buf)
+        FfiConverterSequenceTypeFfiSidebarWorkspaceGroup.write(value.workspaces, into: &buf)
+        FfiConverterSequenceTypeFfiSidebarConversation.write(value.unclassifiedConversations, into: &buf)
     }
 }
 
@@ -6085,6 +7695,108 @@ public func FfiConverterTypeFfiSidebarProjectGroup_lift(_ buf: RustBuffer) throw
 #endif
 public func FfiConverterTypeFfiSidebarProjectGroup_lower(_ value: FfiSidebarProjectGroup) -> RustBuffer {
     return FfiConverterTypeFfiSidebarProjectGroup.lower(value)
+}
+
+
+public struct FfiSidebarWorkspaceGroup: Equatable, Hashable {
+    public var workspaceId: String
+    public var title: String
+    public var missionGoal: String?
+    public var cwd: String
+    public var gitBranch: String?
+    public var isWorktree: Bool
+    public var boardRevision: UInt64
+    public var hasConflict: Bool
+    public var peerCount: UInt32
+    public var runningCount: UInt32
+    public var unreadCount: UInt32
+    public var isMultiAgent: Bool
+    public var isCurated: Bool
+    public var conversations: [FfiSidebarConversation]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(workspaceId: String, title: String, missionGoal: String?, cwd: String, gitBranch: String?, isWorktree: Bool, boardRevision: UInt64, hasConflict: Bool, peerCount: UInt32, runningCount: UInt32, unreadCount: UInt32, isMultiAgent: Bool, isCurated: Bool, conversations: [FfiSidebarConversation]) {
+        self.workspaceId = workspaceId
+        self.title = title
+        self.missionGoal = missionGoal
+        self.cwd = cwd
+        self.gitBranch = gitBranch
+        self.isWorktree = isWorktree
+        self.boardRevision = boardRevision
+        self.hasConflict = hasConflict
+        self.peerCount = peerCount
+        self.runningCount = runningCount
+        self.unreadCount = unreadCount
+        self.isMultiAgent = isMultiAgent
+        self.isCurated = isCurated
+        self.conversations = conversations
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiSidebarWorkspaceGroup: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSidebarWorkspaceGroup: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSidebarWorkspaceGroup {
+        return
+            try FfiSidebarWorkspaceGroup(
+                workspaceId: FfiConverterString.read(from: &buf), 
+                title: FfiConverterString.read(from: &buf), 
+                missionGoal: FfiConverterOptionString.read(from: &buf), 
+                cwd: FfiConverterString.read(from: &buf), 
+                gitBranch: FfiConverterOptionString.read(from: &buf), 
+                isWorktree: FfiConverterBool.read(from: &buf), 
+                boardRevision: FfiConverterUInt64.read(from: &buf), 
+                hasConflict: FfiConverterBool.read(from: &buf), 
+                peerCount: FfiConverterUInt32.read(from: &buf), 
+                runningCount: FfiConverterUInt32.read(from: &buf), 
+                unreadCount: FfiConverterUInt32.read(from: &buf), 
+                isMultiAgent: FfiConverterBool.read(from: &buf), 
+                isCurated: FfiConverterBool.read(from: &buf), 
+                conversations: FfiConverterSequenceTypeFfiSidebarConversation.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiSidebarWorkspaceGroup, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.workspaceId, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.missionGoal, into: &buf)
+        FfiConverterString.write(value.cwd, into: &buf)
+        FfiConverterOptionString.write(value.gitBranch, into: &buf)
+        FfiConverterBool.write(value.isWorktree, into: &buf)
+        FfiConverterUInt64.write(value.boardRevision, into: &buf)
+        FfiConverterBool.write(value.hasConflict, into: &buf)
+        FfiConverterUInt32.write(value.peerCount, into: &buf)
+        FfiConverterUInt32.write(value.runningCount, into: &buf)
+        FfiConverterUInt32.write(value.unreadCount, into: &buf)
+        FfiConverterBool.write(value.isMultiAgent, into: &buf)
+        FfiConverterBool.write(value.isCurated, into: &buf)
+        FfiConverterSequenceTypeFfiSidebarConversation.write(value.conversations, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSidebarWorkspaceGroup_lift(_ buf: RustBuffer) throws -> FfiSidebarWorkspaceGroup {
+    return try FfiConverterTypeFfiSidebarWorkspaceGroup.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSidebarWorkspaceGroup_lower(_ value: FfiSidebarWorkspaceGroup) -> RustBuffer {
+    return FfiConverterTypeFfiSidebarWorkspaceGroup.lower(value)
 }
 
 
@@ -6163,6 +7875,100 @@ public func FfiConverterTypeFfiSlashCommand_lift(_ buf: RustBuffer) throws -> Ff
 #endif
 public func FfiConverterTypeFfiSlashCommand_lower(_ value: FfiSlashCommand) -> RustBuffer {
     return FfiConverterTypeFfiSlashCommand.lower(value)
+}
+
+
+public struct FfiSpawnWorkspacePeerRequest: Equatable, Hashable {
+    public var hostId: String
+    public var workspaceId: String
+    public var cwd: String
+    public var extraDirs: [String]
+    public var provider: FfiProviderKind
+    public var model: String?
+    public var effort: FfiReasoningEffort?
+    public var mode: FfiSessionMode
+    public var initialPrompt: String
+    public var worktreeBranch: String?
+    public var handle: String?
+    public var profileId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(hostId: String, workspaceId: String, cwd: String, extraDirs: [String], provider: FfiProviderKind, model: String?, effort: FfiReasoningEffort?, mode: FfiSessionMode, initialPrompt: String, worktreeBranch: String?, handle: String?, profileId: String?) {
+        self.hostId = hostId
+        self.workspaceId = workspaceId
+        self.cwd = cwd
+        self.extraDirs = extraDirs
+        self.provider = provider
+        self.model = model
+        self.effort = effort
+        self.mode = mode
+        self.initialPrompt = initialPrompt
+        self.worktreeBranch = worktreeBranch
+        self.handle = handle
+        self.profileId = profileId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiSpawnWorkspacePeerRequest: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSpawnWorkspacePeerRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSpawnWorkspacePeerRequest {
+        return
+            try FfiSpawnWorkspacePeerRequest(
+                hostId: FfiConverterString.read(from: &buf), 
+                workspaceId: FfiConverterString.read(from: &buf), 
+                cwd: FfiConverterString.read(from: &buf), 
+                extraDirs: FfiConverterSequenceString.read(from: &buf), 
+                provider: FfiConverterTypeFfiProviderKind.read(from: &buf), 
+                model: FfiConverterOptionString.read(from: &buf), 
+                effort: FfiConverterOptionTypeFfiReasoningEffort.read(from: &buf), 
+                mode: FfiConverterTypeFfiSessionMode.read(from: &buf), 
+                initialPrompt: FfiConverterString.read(from: &buf), 
+                worktreeBranch: FfiConverterOptionString.read(from: &buf), 
+                handle: FfiConverterOptionString.read(from: &buf), 
+                profileId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiSpawnWorkspacePeerRequest, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.hostId, into: &buf)
+        FfiConverterString.write(value.workspaceId, into: &buf)
+        FfiConverterString.write(value.cwd, into: &buf)
+        FfiConverterSequenceString.write(value.extraDirs, into: &buf)
+        FfiConverterTypeFfiProviderKind.write(value.provider, into: &buf)
+        FfiConverterOptionString.write(value.model, into: &buf)
+        FfiConverterOptionTypeFfiReasoningEffort.write(value.effort, into: &buf)
+        FfiConverterTypeFfiSessionMode.write(value.mode, into: &buf)
+        FfiConverterString.write(value.initialPrompt, into: &buf)
+        FfiConverterOptionString.write(value.worktreeBranch, into: &buf)
+        FfiConverterOptionString.write(value.handle, into: &buf)
+        FfiConverterOptionString.write(value.profileId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSpawnWorkspacePeerRequest_lift(_ buf: RustBuffer) throws -> FfiSpawnWorkspacePeerRequest {
+    return try FfiConverterTypeFfiSpawnWorkspacePeerRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSpawnWorkspacePeerRequest_lower(_ value: FfiSpawnWorkspacePeerRequest) -> RustBuffer {
+    return FfiConverterTypeFfiSpawnWorkspacePeerRequest.lower(value)
 }
 
 
@@ -7330,6 +9136,224 @@ public func FfiConverterTypeFfiWorkSummaryResult_lower(_ value: FfiWorkSummaryRe
 }
 
 
+public struct FfiWorkspaceBoardSnapshot: Equatable, Hashable {
+    public var workspaceId: String
+    public var content: String
+    public var revision: UInt64
+    public var updatedBy: String?
+    public var updatedAtRfc3339: String
+    public var boardPath: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(workspaceId: String, content: String, revision: UInt64, updatedBy: String?, updatedAtRfc3339: String, boardPath: String?) {
+        self.workspaceId = workspaceId
+        self.content = content
+        self.revision = revision
+        self.updatedBy = updatedBy
+        self.updatedAtRfc3339 = updatedAtRfc3339
+        self.boardPath = boardPath
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiWorkspaceBoardSnapshot: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWorkspaceBoardSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWorkspaceBoardSnapshot {
+        return
+            try FfiWorkspaceBoardSnapshot(
+                workspaceId: FfiConverterString.read(from: &buf), 
+                content: FfiConverterString.read(from: &buf), 
+                revision: FfiConverterUInt64.read(from: &buf), 
+                updatedBy: FfiConverterOptionString.read(from: &buf), 
+                updatedAtRfc3339: FfiConverterString.read(from: &buf), 
+                boardPath: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiWorkspaceBoardSnapshot, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.workspaceId, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+        FfiConverterUInt64.write(value.revision, into: &buf)
+        FfiConverterOptionString.write(value.updatedBy, into: &buf)
+        FfiConverterString.write(value.updatedAtRfc3339, into: &buf)
+        FfiConverterOptionString.write(value.boardPath, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceBoardSnapshot_lift(_ buf: RustBuffer) throws -> FfiWorkspaceBoardSnapshot {
+    return try FfiConverterTypeFfiWorkspaceBoardSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceBoardSnapshot_lower(_ value: FfiWorkspaceBoardSnapshot) -> RustBuffer {
+    return FfiConverterTypeFfiWorkspaceBoardSnapshot.lower(value)
+}
+
+
+public struct FfiWorkspaceClusterSuggestion: Equatable, Hashable {
+    public var targetWorkspaceId: String
+    public var targetWorkspaceTitle: String
+    public var confidence: Float
+    public var reason: String
+    public var autoApplied: Bool
+    public var previousWorkspaceId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(targetWorkspaceId: String, targetWorkspaceTitle: String, confidence: Float, reason: String, autoApplied: Bool, previousWorkspaceId: String?) {
+        self.targetWorkspaceId = targetWorkspaceId
+        self.targetWorkspaceTitle = targetWorkspaceTitle
+        self.confidence = confidence
+        self.reason = reason
+        self.autoApplied = autoApplied
+        self.previousWorkspaceId = previousWorkspaceId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiWorkspaceClusterSuggestion: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWorkspaceClusterSuggestion: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWorkspaceClusterSuggestion {
+        return
+            try FfiWorkspaceClusterSuggestion(
+                targetWorkspaceId: FfiConverterString.read(from: &buf), 
+                targetWorkspaceTitle: FfiConverterString.read(from: &buf), 
+                confidence: FfiConverterFloat.read(from: &buf), 
+                reason: FfiConverterString.read(from: &buf), 
+                autoApplied: FfiConverterBool.read(from: &buf), 
+                previousWorkspaceId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiWorkspaceClusterSuggestion, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.targetWorkspaceId, into: &buf)
+        FfiConverterString.write(value.targetWorkspaceTitle, into: &buf)
+        FfiConverterFloat.write(value.confidence, into: &buf)
+        FfiConverterString.write(value.reason, into: &buf)
+        FfiConverterBool.write(value.autoApplied, into: &buf)
+        FfiConverterOptionString.write(value.previousWorkspaceId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceClusterSuggestion_lift(_ buf: RustBuffer) throws -> FfiWorkspaceClusterSuggestion {
+    return try FfiConverterTypeFfiWorkspaceClusterSuggestion.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceClusterSuggestion_lower(_ value: FfiWorkspaceClusterSuggestion) -> RustBuffer {
+    return FfiConverterTypeFfiWorkspaceClusterSuggestion.lower(value)
+}
+
+
+public struct FfiWorkspaceEvent: Equatable, Hashable {
+    public var seq: UInt64
+    public var workspaceId: String
+    public var agentId: String?
+    public var agentHandle: String?
+    public var kind: FfiWorkspaceEventKind
+    public var summary: String
+    public var filePath: String?
+    public var createdAtRfc3339: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(seq: UInt64, workspaceId: String, agentId: String?, agentHandle: String?, kind: FfiWorkspaceEventKind, summary: String, filePath: String?, createdAtRfc3339: String) {
+        self.seq = seq
+        self.workspaceId = workspaceId
+        self.agentId = agentId
+        self.agentHandle = agentHandle
+        self.kind = kind
+        self.summary = summary
+        self.filePath = filePath
+        self.createdAtRfc3339 = createdAtRfc3339
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiWorkspaceEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWorkspaceEvent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWorkspaceEvent {
+        return
+            try FfiWorkspaceEvent(
+                seq: FfiConverterUInt64.read(from: &buf), 
+                workspaceId: FfiConverterString.read(from: &buf), 
+                agentId: FfiConverterOptionString.read(from: &buf), 
+                agentHandle: FfiConverterOptionString.read(from: &buf), 
+                kind: FfiConverterTypeFfiWorkspaceEventKind.read(from: &buf), 
+                summary: FfiConverterString.read(from: &buf), 
+                filePath: FfiConverterOptionString.read(from: &buf), 
+                createdAtRfc3339: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiWorkspaceEvent, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.seq, into: &buf)
+        FfiConverterString.write(value.workspaceId, into: &buf)
+        FfiConverterOptionString.write(value.agentId, into: &buf)
+        FfiConverterOptionString.write(value.agentHandle, into: &buf)
+        FfiConverterTypeFfiWorkspaceEventKind.write(value.kind, into: &buf)
+        FfiConverterString.write(value.summary, into: &buf)
+        FfiConverterOptionString.write(value.filePath, into: &buf)
+        FfiConverterString.write(value.createdAtRfc3339, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceEvent_lift(_ buf: RustBuffer) throws -> FfiWorkspaceEvent {
+    return try FfiConverterTypeFfiWorkspaceEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceEvent_lower(_ value: FfiWorkspaceEvent) -> RustBuffer {
+    return FfiConverterTypeFfiWorkspaceEvent.lower(value)
+}
+
+
 public struct FfiWorkspaceFile: Equatable, Hashable {
     public var hostId: String
     public var cwd: String
@@ -7424,21 +9448,103 @@ public func FfiConverterTypeFfiWorkspaceFile_lower(_ value: FfiWorkspaceFile) ->
 }
 
 
+public struct FfiWorkspaceOrganizeStatus: Equatable, Hashable {
+    public var projectRoot: String
+    public var phase: FfiWorkspaceOrganizePhase
+    public var message: String
+    public var createdWorkspaces: UInt32
+    public var groupedAgents: UInt32
+    public var summarizedAgents: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(projectRoot: String, phase: FfiWorkspaceOrganizePhase, message: String, createdWorkspaces: UInt32, groupedAgents: UInt32, summarizedAgents: UInt32) {
+        self.projectRoot = projectRoot
+        self.phase = phase
+        self.message = message
+        self.createdWorkspaces = createdWorkspaces
+        self.groupedAgents = groupedAgents
+        self.summarizedAgents = summarizedAgents
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FfiWorkspaceOrganizeStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWorkspaceOrganizeStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWorkspaceOrganizeStatus {
+        return
+            try FfiWorkspaceOrganizeStatus(
+                projectRoot: FfiConverterString.read(from: &buf), 
+                phase: FfiConverterTypeFfiWorkspaceOrganizePhase.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf), 
+                createdWorkspaces: FfiConverterUInt32.read(from: &buf), 
+                groupedAgents: FfiConverterUInt32.read(from: &buf), 
+                summarizedAgents: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiWorkspaceOrganizeStatus, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.projectRoot, into: &buf)
+        FfiConverterTypeFfiWorkspaceOrganizePhase.write(value.phase, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+        FfiConverterUInt32.write(value.createdWorkspaces, into: &buf)
+        FfiConverterUInt32.write(value.groupedAgents, into: &buf)
+        FfiConverterUInt32.write(value.summarizedAgents, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceOrganizeStatus_lift(_ buf: RustBuffer) throws -> FfiWorkspaceOrganizeStatus {
+    return try FfiConverterTypeFfiWorkspaceOrganizeStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceOrganizeStatus_lower(_ value: FfiWorkspaceOrganizeStatus) -> RustBuffer {
+    return FfiConverterTypeFfiWorkspaceOrganizeStatus.lower(value)
+}
+
+
 public struct FfiWorkspaceSummary: Equatable, Hashable {
     public var workspaceId: String
     public var title: String
     public var cwd: String
     public var gitBranch: String?
     public var isWorktree: Bool
+    public var missionGoal: String?
+    public var projectRoot: String?
+    public var sourceCwd: String?
+    public var boardRevision: UInt64
+    public var isCurated: Bool
+    public var updatedAtRfc3339: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(workspaceId: String, title: String, cwd: String, gitBranch: String?, isWorktree: Bool) {
+    public init(workspaceId: String, title: String, cwd: String, gitBranch: String?, isWorktree: Bool, missionGoal: String?, projectRoot: String?, sourceCwd: String?, boardRevision: UInt64, isCurated: Bool, updatedAtRfc3339: String) {
         self.workspaceId = workspaceId
         self.title = title
         self.cwd = cwd
         self.gitBranch = gitBranch
         self.isWorktree = isWorktree
+        self.missionGoal = missionGoal
+        self.projectRoot = projectRoot
+        self.sourceCwd = sourceCwd
+        self.boardRevision = boardRevision
+        self.isCurated = isCurated
+        self.updatedAtRfc3339 = updatedAtRfc3339
     }
 
     
@@ -7461,7 +9567,13 @@ public struct FfiConverterTypeFfiWorkspaceSummary: FfiConverterRustBuffer {
                 title: FfiConverterString.read(from: &buf), 
                 cwd: FfiConverterString.read(from: &buf), 
                 gitBranch: FfiConverterOptionString.read(from: &buf), 
-                isWorktree: FfiConverterBool.read(from: &buf)
+                isWorktree: FfiConverterBool.read(from: &buf), 
+                missionGoal: FfiConverterOptionString.read(from: &buf), 
+                projectRoot: FfiConverterOptionString.read(from: &buf), 
+                sourceCwd: FfiConverterOptionString.read(from: &buf), 
+                boardRevision: FfiConverterUInt64.read(from: &buf), 
+                isCurated: FfiConverterBool.read(from: &buf), 
+                updatedAtRfc3339: FfiConverterString.read(from: &buf)
         )
     }
 
@@ -7471,6 +9583,12 @@ public struct FfiConverterTypeFfiWorkspaceSummary: FfiConverterRustBuffer {
         FfiConverterString.write(value.cwd, into: &buf)
         FfiConverterOptionString.write(value.gitBranch, into: &buf)
         FfiConverterBool.write(value.isWorktree, into: &buf)
+        FfiConverterOptionString.write(value.missionGoal, into: &buf)
+        FfiConverterOptionString.write(value.projectRoot, into: &buf)
+        FfiConverterOptionString.write(value.sourceCwd, into: &buf)
+        FfiConverterUInt64.write(value.boardRevision, into: &buf)
+        FfiConverterBool.write(value.isCurated, into: &buf)
+        FfiConverterString.write(value.updatedAtRfc3339, into: &buf)
     }
 }
 
@@ -7488,6 +9606,79 @@ public func FfiConverterTypeFfiWorkspaceSummary_lift(_ buf: RustBuffer) throws -
 public func FfiConverterTypeFfiWorkspaceSummary_lower(_ value: FfiWorkspaceSummary) -> RustBuffer {
     return FfiConverterTypeFfiWorkspaceSummary.lower(value)
 }
+
+
+
+public enum FfiAgentMessageKind: Equatable, Hashable {
+    
+    case directMessage
+    case finishNotification
+    case heartbeat
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiAgentMessageKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiAgentMessageKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiAgentMessageKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAgentMessageKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .directMessage
+        
+        case 2: return .finishNotification
+        
+        case 3: return .heartbeat
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiAgentMessageKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .directMessage:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .finishNotification:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .heartbeat:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAgentMessageKind_lift(_ buf: RustBuffer) throws -> FfiAgentMessageKind {
+    return try FfiConverterTypeFfiAgentMessageKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiAgentMessageKind_lower(_ value: FfiAgentMessageKind) -> RustBuffer {
+    return FfiConverterTypeFfiAgentMessageKind.lower(value)
+}
+
 
 
 
@@ -7566,6 +9757,180 @@ public func FfiConverterTypeFfiClientPlatform_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeFfiClientPlatform_lower(_ value: FfiClientPlatform) -> RustBuffer {
     return FfiConverterTypeFfiClientPlatform.lower(value)
+}
+
+
+
+
+public enum FfiCloudSyncDevicePollStatus: Equatable, Hashable {
+    
+    case pending
+    case slowDown
+    case authorized
+    case expired
+    case denied
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncDevicePollStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncDevicePollStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCloudSyncDevicePollStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncDevicePollStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .pending
+        
+        case 2: return .slowDown
+        
+        case 3: return .authorized
+        
+        case 4: return .expired
+        
+        case 5: return .denied
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCloudSyncDevicePollStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .pending:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .slowDown:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .authorized:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .expired:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .denied:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncDevicePollStatus_lift(_ buf: RustBuffer) throws -> FfiCloudSyncDevicePollStatus {
+    return try FfiConverterTypeFfiCloudSyncDevicePollStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncDevicePollStatus_lower(_ value: FfiCloudSyncDevicePollStatus) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncDevicePollStatus.lower(value)
+}
+
+
+
+
+public enum FfiCloudSyncState: Equatable, Hashable {
+    
+    case signedOut
+    case locked
+    case ready
+    case syncing
+    case error
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiCloudSyncState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCloudSyncState: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCloudSyncState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCloudSyncState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .signedOut
+        
+        case 2: return .locked
+        
+        case 3: return .ready
+        
+        case 4: return .syncing
+        
+        case 5: return .error
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCloudSyncState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .signedOut:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .locked:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .ready:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .syncing:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .error:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncState_lift(_ buf: RustBuffer) throws -> FfiCloudSyncState {
+    return try FfiConverterTypeFfiCloudSyncState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCloudSyncState_lower(_ value: FfiCloudSyncState) -> RustBuffer {
+    return FfiConverterTypeFfiCloudSyncState.lower(value)
 }
 
 
@@ -8339,6 +10704,86 @@ public func FfiConverterTypeFfiProviderKind_lower(_ value: FfiProviderKind) -> R
 
 
 
+public enum FfiProviderSubagentStatus: Equatable, Hashable {
+    
+    case running
+    case completed
+    case failed
+    case canceled
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiProviderSubagentStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiProviderSubagentStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiProviderSubagentStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiProviderSubagentStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .running
+        
+        case 2: return .completed
+        
+        case 3: return .failed
+        
+        case 4: return .canceled
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiProviderSubagentStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .running:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .completed:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .canceled:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProviderSubagentStatus_lift(_ buf: RustBuffer) throws -> FfiProviderSubagentStatus {
+    return try FfiConverterTypeFfiProviderSubagentStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiProviderSubagentStatus_lower(_ value: FfiProviderSubagentStatus) -> RustBuffer {
+    return FfiConverterTypeFfiProviderSubagentStatus.lower(value)
+}
+
+
+
+
 public enum FfiReasoningEffort: Equatable, Hashable {
     
     case off
@@ -8562,6 +11007,225 @@ public func FfiConverterTypeFfiRichBlock_lift(_ buf: RustBuffer) throws -> FfiRi
 #endif
 public func FfiConverterTypeFfiRichBlock_lower(_ value: FfiRichBlock) -> RustBuffer {
     return FfiConverterTypeFfiRichBlock.lower(value)
+}
+
+
+
+
+public enum FfiScheduleKind: Equatable, Hashable {
+    
+    case schedule
+    case heartbeat
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiScheduleKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScheduleKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiScheduleKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScheduleKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .schedule
+        
+        case 2: return .heartbeat
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiScheduleKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .schedule:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .heartbeat:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleKind_lift(_ buf: RustBuffer) throws -> FfiScheduleKind {
+    return try FfiConverterTypeFfiScheduleKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleKind_lower(_ value: FfiScheduleKind) -> RustBuffer {
+    return FfiConverterTypeFfiScheduleKind.lower(value)
+}
+
+
+
+
+public enum FfiScheduleRunStatus: Equatable, Hashable {
+    
+    case running
+    case succeeded
+    case failed
+    case skipped
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiScheduleRunStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScheduleRunStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiScheduleRunStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScheduleRunStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .running
+        
+        case 2: return .succeeded
+        
+        case 3: return .failed
+        
+        case 4: return .skipped
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiScheduleRunStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .running:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .succeeded:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .skipped:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleRunStatus_lift(_ buf: RustBuffer) throws -> FfiScheduleRunStatus {
+    return try FfiConverterTypeFfiScheduleRunStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleRunStatus_lower(_ value: FfiScheduleRunStatus) -> RustBuffer {
+    return FfiConverterTypeFfiScheduleRunStatus.lower(value)
+}
+
+
+
+
+public enum FfiScheduleStatus: Equatable, Hashable {
+    
+    case active
+    case paused
+    case completed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiScheduleStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiScheduleStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiScheduleStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiScheduleStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .active
+        
+        case 2: return .paused
+        
+        case 3: return .completed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiScheduleStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .active:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .paused:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .completed:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleStatus_lift(_ buf: RustBuffer) throws -> FfiScheduleStatus {
+    return try FfiConverterTypeFfiScheduleStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiScheduleStatus_lower(_ value: FfiScheduleStatus) -> RustBuffer {
+    return FfiConverterTypeFfiScheduleStatus.lower(value)
 }
 
 
@@ -9280,6 +11944,8 @@ public enum FfiTimelineItem: Equatable, Hashable {
     )
     case notice(seq: UInt64, level: String, message: String, timestampMs: Int64?
     )
+    case agentMessage(seq: UInt64, messageId: String, kind: FfiAgentMessageKind, sourceAgentId: String?, sourceHostId: String?, sourceTitle: String?, event: String?, text: String, permissionContext: FfiPermissionCheckpointRef?, blocks: [FfiRichBlock], timestampMs: Int64?
+    )
 
 
 
@@ -9320,6 +11986,9 @@ public struct FfiConverterTypeFfiTimelineItem: FfiConverterRustBuffer {
         )
         
         case 7: return .notice(seq: try FfiConverterUInt64.read(from: &buf), level: try FfiConverterString.read(from: &buf), message: try FfiConverterString.read(from: &buf), timestampMs: try FfiConverterOptionInt64.read(from: &buf)
+        )
+        
+        case 8: return .agentMessage(seq: try FfiConverterUInt64.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), kind: try FfiConverterTypeFfiAgentMessageKind.read(from: &buf), sourceAgentId: try FfiConverterOptionString.read(from: &buf), sourceHostId: try FfiConverterOptionString.read(from: &buf), sourceTitle: try FfiConverterOptionString.read(from: &buf), event: try FfiConverterOptionString.read(from: &buf), text: try FfiConverterString.read(from: &buf), permissionContext: try FfiConverterOptionTypeFfiPermissionCheckpointRef.read(from: &buf), blocks: try FfiConverterSequenceTypeFfiRichBlock.read(from: &buf), timestampMs: try FfiConverterOptionInt64.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -9398,6 +12067,21 @@ public struct FfiConverterTypeFfiTimelineItem: FfiConverterRustBuffer {
             FfiConverterUInt64.write(seq, into: &buf)
             FfiConverterString.write(level, into: &buf)
             FfiConverterString.write(message, into: &buf)
+            FfiConverterOptionInt64.write(timestampMs, into: &buf)
+            
+        
+        case let .agentMessage(seq,messageId,kind,sourceAgentId,sourceHostId,sourceTitle,event,text,permissionContext,blocks,timestampMs):
+            writeInt(&buf, Int32(8))
+            FfiConverterUInt64.write(seq, into: &buf)
+            FfiConverterString.write(messageId, into: &buf)
+            FfiConverterTypeFfiAgentMessageKind.write(kind, into: &buf)
+            FfiConverterOptionString.write(sourceAgentId, into: &buf)
+            FfiConverterOptionString.write(sourceHostId, into: &buf)
+            FfiConverterOptionString.write(sourceTitle, into: &buf)
+            FfiConverterOptionString.write(event, into: &buf)
+            FfiConverterString.write(text, into: &buf)
+            FfiConverterOptionTypeFfiPermissionCheckpointRef.write(permissionContext, into: &buf)
+            FfiConverterSequenceTypeFfiRichBlock.write(blocks, into: &buf)
             FfiConverterOptionInt64.write(timestampMs, into: &buf)
             
         }
@@ -9838,6 +12522,180 @@ public func FfiConverterTypeFfiTurnLiveSegment_lower(_ value: FfiTurnLiveSegment
 }
 
 
+
+
+public enum FfiWorkspaceEventKind: Equatable, Hashable {
+    
+    case peerJoined
+    case peerFinished
+    case boardUpdated
+    case peerMessage
+    case fileEdited
+    case conflictWarning
+    case workspaceMerged
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiWorkspaceEventKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWorkspaceEventKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiWorkspaceEventKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWorkspaceEventKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .peerJoined
+        
+        case 2: return .peerFinished
+        
+        case 3: return .boardUpdated
+        
+        case 4: return .peerMessage
+        
+        case 5: return .fileEdited
+        
+        case 6: return .conflictWarning
+        
+        case 7: return .workspaceMerged
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiWorkspaceEventKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .peerJoined:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .peerFinished:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .boardUpdated:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .peerMessage:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .fileEdited:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .conflictWarning:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .workspaceMerged:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceEventKind_lift(_ buf: RustBuffer) throws -> FfiWorkspaceEventKind {
+    return try FfiConverterTypeFfiWorkspaceEventKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceEventKind_lower(_ value: FfiWorkspaceEventKind) -> RustBuffer {
+    return FfiConverterTypeFfiWorkspaceEventKind.lower(value)
+}
+
+
+
+
+public enum FfiWorkspaceOrganizePhase: Equatable, Hashable {
+    
+    case running
+    case completed
+    case failed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FfiWorkspaceOrganizePhase: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiWorkspaceOrganizePhase: FfiConverterRustBuffer {
+    typealias SwiftType = FfiWorkspaceOrganizePhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiWorkspaceOrganizePhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .running
+        
+        case 2: return .completed
+        
+        case 3: return .failed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiWorkspaceOrganizePhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .running:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .completed:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceOrganizePhase_lift(_ buf: RustBuffer) throws -> FfiWorkspaceOrganizePhase {
+    return try FfiConverterTypeFfiWorkspaceOrganizePhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiWorkspaceOrganizePhase_lower(_ value: FfiWorkspaceOrganizePhase) -> RustBuffer {
+    return FfiConverterTypeFfiWorkspaceOrganizePhase.lower(value)
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -10057,6 +12915,30 @@ fileprivate struct FfiConverterOptionTypeFfiAgentCard: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiCloudSyncStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCloudSyncStatus?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiCloudSyncStatus.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiCloudSyncStatus.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiDirectoryListing: FfiConverterRustBuffer {
     typealias SwiftType = FfiDirectoryListing?
 
@@ -10081,6 +12963,30 @@ fileprivate struct FfiConverterOptionTypeFfiDirectoryListing: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiGitReposInspection: FfiConverterRustBuffer {
+    typealias SwiftType = FfiGitReposInspection?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiGitReposInspection.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiGitReposInspection.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiHostDetail: FfiConverterRustBuffer {
     typealias SwiftType = FfiHostDetail?
 
@@ -10097,6 +13003,30 @@ fileprivate struct FfiConverterOptionTypeFfiHostDetail: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiHostDetail.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiPermissionCheckpointRef: FfiConverterRustBuffer {
+    typealias SwiftType = FfiPermissionCheckpointRef?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiPermissionCheckpointRef.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiPermissionCheckpointRef.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -10177,6 +13107,54 @@ fileprivate struct FfiConverterOptionTypeFfiToolStepDescriptor: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiWorkspaceBoardSnapshot: FfiConverterRustBuffer {
+    typealias SwiftType = FfiWorkspaceBoardSnapshot?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiWorkspaceBoardSnapshot.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiWorkspaceBoardSnapshot.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiWorkspaceClusterSuggestion: FfiConverterRustBuffer {
+    typealias SwiftType = FfiWorkspaceClusterSuggestion?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiWorkspaceClusterSuggestion.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiWorkspaceClusterSuggestion.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiDiagramKind: FfiConverterRustBuffer {
     typealias SwiftType = FfiDiagramKind?
 
@@ -10225,6 +13203,30 @@ fileprivate struct FfiConverterOptionTypeFfiHostRouteMode: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiProviderKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiProviderKind?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiProviderKind.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiProviderKind.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiReasoningEffort: FfiConverterRustBuffer {
     typealias SwiftType = FfiReasoningEffort?
 
@@ -10241,6 +13243,30 @@ fileprivate struct FfiConverterOptionTypeFfiReasoningEffort: FfiConverterRustBuf
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiReasoningEffort.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiSessionMode: FfiConverterRustBuffer {
+    typealias SwiftType = FfiSessionMode?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiSessionMode.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiSessionMode.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -10721,6 +13747,31 @@ fileprivate struct FfiConverterSequenceTypeFfiMentionCandidate: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiNestedGitRepo: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiNestedGitRepo]
+
+    public static func write(_ value: [FfiNestedGitRepo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiNestedGitRepo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiNestedGitRepo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiNestedGitRepo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiNestedGitRepo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiPromptBadge: FfiConverterRustBuffer {
     typealias SwiftType = [FfiPromptBadge]
 
@@ -10821,6 +13872,56 @@ fileprivate struct FfiConverterSequenceTypeFfiProviderQuota: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiProviderSubagentDescriptor: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiProviderSubagentDescriptor]
+
+    public static func write(_ value: [FfiProviderSubagentDescriptor], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiProviderSubagentDescriptor.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiProviderSubagentDescriptor] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiProviderSubagentDescriptor]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiProviderSubagentDescriptor.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiProviderSubagentEvent: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiProviderSubagentEvent]
+
+    public static func write(_ value: [FfiProviderSubagentEvent], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiProviderSubagentEvent.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiProviderSubagentEvent] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiProviderSubagentEvent]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiProviderSubagentEvent.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiQuestionItem: FfiConverterRustBuffer {
     typealias SwiftType = [FfiQuestionItem]
 
@@ -10888,6 +13989,56 @@ fileprivate struct FfiConverterSequenceTypeFfiQuotaWindow: FfiConverterRustBuffe
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiQuotaWindow.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiScheduleRunRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiScheduleRunRecord]
+
+    public static func write(_ value: [FfiScheduleRunRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiScheduleRunRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiScheduleRunRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiScheduleRunRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiScheduleRunRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiScheduleSpec: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiScheduleSpec]
+
+    public static func write(_ value: [FfiScheduleSpec], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiScheduleSpec.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiScheduleSpec] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiScheduleSpec]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiScheduleSpec.read(from: &buf))
         }
         return seq
     }
@@ -11013,6 +14164,31 @@ fileprivate struct FfiConverterSequenceTypeFfiSidebarProjectGroup: FfiConverterR
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiSidebarProjectGroup.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiSidebarWorkspaceGroup: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiSidebarWorkspaceGroup]
+
+    public static func write(_ value: [FfiSidebarWorkspaceGroup], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiSidebarWorkspaceGroup.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiSidebarWorkspaceGroup] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiSidebarWorkspaceGroup]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiSidebarWorkspaceGroup.read(from: &buf))
         }
         return seq
     }
@@ -11296,6 +14472,31 @@ fileprivate struct FfiConverterSequenceTypeFfiTurnFileDiffSummary: FfiConverterR
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiWorkspaceEvent: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiWorkspaceEvent]
+
+    public static func write(_ value: [FfiWorkspaceEvent], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiWorkspaceEvent.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiWorkspaceEvent] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiWorkspaceEvent]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiWorkspaceEvent.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiWorkspaceSummary: FfiConverterRustBuffer {
     typealias SwiftType = [FfiWorkspaceSummary]
 
@@ -11522,6 +14723,136 @@ fileprivate struct FfiConverterDictionaryStringString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterDictionaryStringTypeFfiGitReposInspection: FfiConverterRustBuffer {
+    public static func write(_ value: [String: FfiGitReposInspection], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterTypeFfiGitReposInspection.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: FfiGitReposInspection] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [String: FfiGitReposInspection]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterTypeFfiGitReposInspection.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryStringTypeFfiWorkspaceBoardSnapshot: FfiConverterRustBuffer {
+    public static func write(_ value: [String: FfiWorkspaceBoardSnapshot], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterTypeFfiWorkspaceBoardSnapshot.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: FfiWorkspaceBoardSnapshot] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [String: FfiWorkspaceBoardSnapshot]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterTypeFfiWorkspaceBoardSnapshot.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryStringTypeFfiWorkspaceOrganizeStatus: FfiConverterRustBuffer {
+    public static func write(_ value: [String: FfiWorkspaceOrganizeStatus], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterTypeFfiWorkspaceOrganizeStatus.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: FfiWorkspaceOrganizeStatus] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [String: FfiWorkspaceOrganizeStatus]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterTypeFfiWorkspaceOrganizeStatus.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryStringSequenceTypeFfiProviderSubagentDescriptor: FfiConverterRustBuffer {
+    public static func write(_ value: [String: [FfiProviderSubagentDescriptor]], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterSequenceTypeFfiProviderSubagentDescriptor.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: [FfiProviderSubagentDescriptor]] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [String: [FfiProviderSubagentDescriptor]]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterSequenceTypeFfiProviderSubagentDescriptor.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDictionaryStringSequenceTypeFfiWorkspaceEvent: FfiConverterRustBuffer {
+    public static func write(_ value: [String: [FfiWorkspaceEvent]], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for (key, value) in value {
+            FfiConverterString.write(key, into: &buf)
+            FfiConverterSequenceTypeFfiWorkspaceEvent.write(value, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String: [FfiWorkspaceEvent]] {
+        let len: Int32 = try readInt(&buf)
+        var dict = [String: [FfiWorkspaceEvent]]()
+        dict.reserveCapacity(Int(len))
+        for _ in 0..<len {
+            let key = try FfiConverterString.read(from: &buf)
+            let value = try FfiConverterSequenceTypeFfiWorkspaceEvent.read(from: &buf)
+            dict[key] = value
+        }
+        return dict
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDictionaryStringSequenceSequenceString: FfiConverterRustBuffer {
     public static func write(_ value: [String: [[String]]], into buf: inout [UInt8]) {
         let len = Int32(value.count)
@@ -11593,6 +14924,15 @@ public func formatEffortLabel(effort: FfiReasoningEffort) -> String  {
     )
 })
 }
+public func parseMarkdownPreview(markdown: String, streaming: Bool) -> [FfiRichBlock]  {
+    return try!  FfiConverterSequenceTypeFfiRichBlock.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_orbit_ffi_uniffi_fn_func_parse_markdown_preview(
+        FfiConverterString.lower(markdown),
+        FfiConverterBool.lower(streaming),uniffiCallStatus
+    )
+})
+}
 public func resolveSupportedEffortForModel(spec: FfiProviderModelSpec?, desired: FfiReasoningEffort?, catalogDefault: FfiReasoningEffort?) -> FfiReasoningEffort?  {
     return try!  FfiConverterOptionTypeFfiReasoningEffort.lift(try! rustCall() {
         uniffiCallStatus in
@@ -11637,6 +14977,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_func_format_effort_label() != 50207) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_func_parse_markdown_preview() != 53723) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_func_resolve_supported_effort_for_model() != 151) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11667,6 +15010,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_agent() != 61104) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_workspace() != 63031) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_ask_side_question() != 21247) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11677,6 +15023,42 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_build_side_question_context() != 42218) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase() != 49340) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json() != 11716) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token() != 37302) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_logout() != 45701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_now() != 58181) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_poll_github_device_flow() != 17558) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_auto_sync() != 54195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id() != 62078) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow() != 41593) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_status() != 50836) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_unlock_with_passphrase() != 5433) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_update_preferences_json() != 53863) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_compose_prompt() != 1118) {
@@ -11694,10 +15076,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_agent_full() != 7969) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_mission_workspace() != 39628) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_schedule() != 47954) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_session() != 9298) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_session_in_workspace() != 17668) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_delete_agent() != 48304) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_delete_schedule() != 33714) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_describe_tool_item() != 24848) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_detach_agent() != 46604) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_discover_local_daemon_uri() != 31969) {
@@ -11718,6 +15118,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_git_status() != 971) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_schedule_runs() != 17888) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_board() != 35325) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_events() != 62231) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_files() != 16269) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11731,6 +15140,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_flush_queued_prompt_now() != 60554) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_repos_inspection() != 62271) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_review() != 29779) {
@@ -11748,6 +15160,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_directory() != 10329) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_provider_subagents() != 17893) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_seen() != 61018) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11758,6 +15173,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace() != 27017) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace_v2() != 49470) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_on_app_background() != 56418) {
@@ -11772,13 +15190,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_open_agent_timeline() != 25448) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_open_provider_subagent_timeline() != 9720) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_organize_project_workspaces() != 36087) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pair_host() != 37596) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pause_schedule() != 4747) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_project_order() != 21866) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_provider_subagent_timeline() != 12093) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates() != 3280) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates_with_workspace() != 32809) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_read_workspace_file() != 18181) {
@@ -11805,6 +15238,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_queued_prompt() != 22264) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rename_workspace() != 22896) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram() != 2210) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11812,6 +15248,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_queued_prompts() != 39769) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_request_git_repos_inspection() != 52199) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal() != 57060) {
@@ -11826,10 +15265,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resolve_permission() != 17662) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resume_schedule() != 32926) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rewind_agent() != 10423) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rewind_agent_request() != 56124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_run_schedule_once() != 9369) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_schedule_runs() != 45863) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_seed_thread_prefs() != 47307) {
@@ -11865,6 +15313,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_slash_commands() != 61779) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_spawn_workspace_peer() != 27113) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_stage_attachment() != 5186) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11875,6 +15326,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_subscribe_throttled() != 42324) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_summarize_agent() != 50285) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_switch_agent_provider() != 4646) {
@@ -11889,6 +15343,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_toggle_pin_agent() != 15456) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_unarchive_agent() != 593) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_agent_identity() != 9558) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config() != 12313) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11898,10 +15358,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_relay() != 50634) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_workspace_board() != 35418) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_workspace_goal() != 58556) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upgrade_host_daemon_over_wire() != 62597) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upsert_project() != 43684) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_board() != 1727) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_events() != 58261) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_files() != 42522) {

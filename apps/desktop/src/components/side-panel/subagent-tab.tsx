@@ -1,4 +1,9 @@
+<<<<<<< HEAD
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+=======
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { Archive, ArrowUpRight, Check, Layers, Loader2, AlertTriangle, X } from "lucide-react";
+>>>>>>> origin/main
 import {
   AlertCircle,
   Archive,
@@ -236,10 +241,19 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const effectiveAgentId = tab.childAgentId ?? tab.providerSubagentId ?? parentAgentId ?? "";
   const effectiveHostId = isManaged ? (hostId ?? "") : (parentHostId ?? "");
 
+  const canArchiveNative = Boolean(!isManaged && parentHostId && parentAgentId);
+  const resolvedTitle = tab.subagentRole || tab.title || "Subagent";
+  const viewportResetKey = `${tab.id}:${tab.childAgentId ?? tab.providerSubagentId ?? tab.subagentCallId ?? ""}`;
+
   // Keep the header minimal: tab title already names the subagent, so only render a restrained
   // context strip when the user can manage the thread or when active/error status needs signaling.
   const showContextBar = Boolean(
-    isManaged || status === "running" || status === "failed" || status === "denied" || remoteHostName,
+    isManaged ||
+      canArchiveNative ||
+      status === "running" ||
+      status === "failed" ||
+      status === "denied" ||
+      remoteHostName,
   );
 
   return (
@@ -276,21 +290,23 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
             )}
           </div>
 
-          {isManaged && hostId && tab.childAgentId && (
+          {(isManaged && hostId && tab.childAgentId) || canArchiveNative ? (
             <div className="flex shrink-0 items-center gap-0.5">
-              <button
-                type="button"
-                onClick={handleOpenThread}
-                className={cn(
-                  "inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11.5px] font-medium transition-colors",
-                  status === "awaiting_permission"
-                    ? "text-amber-700 hover:bg-amber-500/12 dark:text-amber-300"
-                    : "text-muted-foreground hover:text-foreground hover:bg-accent",
-                )}
-              >
-                <span>{status === "awaiting_permission" ? "Review" : "Open thread"}</span>
-                <ArrowUpRight className="size-[12px]" />
-              </button>
+              {isManaged && hostId && tab.childAgentId && (
+                <button
+                  type="button"
+                  onClick={handleOpenThread}
+                  className={cn(
+                    "inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11.5px] font-medium transition-colors",
+                    status === "awaiting_permission"
+                      ? "text-amber-700 hover:bg-amber-500/12 dark:text-amber-300"
+                      : "text-muted-foreground hover:text-foreground hover:bg-accent",
+                  )}
+                >
+                  <span>{status === "awaiting_permission" ? "Review" : "Open thread"}</span>
+                  <ArrowUpRight className="size-[12px]" />
+                </button>
+              )}
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button
@@ -302,19 +318,34 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" side="bottom" sideOffset={4} className="min-w-[164px]">
+                  {isManaged && hostId && tab.childAgentId && (
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        void orbitActions.detachAgent(hostId, tab.childAgentId!);
+                      }}
+                    >
+                      <span className="flex items-center gap-2">
+                        <Unlink className="text-muted-foreground size-[13.5px]" />
+                        <span>Detach to thread</span>
+                      </span>
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuItem
                     onSelect={() => {
-                      void orbitActions.detachAgent(hostId, tab.childAgentId!);
-                    }}
-                  >
-                    <span className="flex items-center gap-2">
-                      <Unlink className="text-muted-foreground size-[13.5px]" />
-                      <span>Detach to thread</span>
-                    </span>
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      orbitActions.archiveThread(hostId, tab.childAgentId!);
+                      if (isManaged && hostId && tab.childAgentId) {
+                        orbitActions.archiveThread(hostId, tab.childAgentId);
+                      } else if (parentHostId && parentAgentId) {
+                        orbitActions.archiveSubagent(parentHostId, parentAgentId, {
+                          id:
+                            tab.subagentCallId ||
+                            tab.providerSubagentId ||
+                            tab.childAgentId ||
+                            tab.id,
+                          providerSubagentId: tab.providerSubagentId ?? null,
+                          childAgentId: tab.childAgentId ?? null,
+                          role: resolvedTitle,
+                        });
+                      }
                       orbitActions.closeSidePanelTab(tab.id);
                     }}
                   >
@@ -326,7 +357,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
-          )}
+          ) : null}
         </div>
       )}
 
@@ -334,7 +365,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       <ConversationViewport
         hostId={effectiveHostId}
         cwd={cwd}
-        resetKey={tab.id}
+        resetKey={viewportResetKey}
         contentVersion={contentVersion}
         viewportClassName="px-6 pt-6 pb-11"
       >

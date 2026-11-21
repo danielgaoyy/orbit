@@ -615,6 +615,20 @@ html:not(.orbit-mac).dark .orbit-native-scroll {
   transform: scale(0.975);
 }
 
+/* Pause infinite ambient animations when the desktop window is hidden/minimized to save CPU/GPU. */
+html.orbit-window-hidden .agent-text-shimmer,
+html.orbit-window-hidden .animate-spin,
+html.orbit-window-hidden [class*="animate-[spin"] {
+  animation-play-state: paused !important;
+}
+
+/* Under Linux software-rendered WebKitGTK (e.g. NVIDIA with DMABUF disabled), stepped spinners
+ * cut full-viewport 60fps software rasterization load while preserving clear motion feedback. */
+html.orbit-linux [class*="animate-[spin"],
+html.orbit-linux .animate-spin {
+  animation-timing-function: steps(12, end);
+}
+
 /* System Accessibility Guard (`prefers-reduced-motion`) */
 @media (prefers-reduced-motion: reduce) {
   *,

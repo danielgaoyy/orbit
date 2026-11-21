@@ -769,3 +769,192 @@ async fn connect_relay_peer(
 
     Ok((host_info, out_tx, in_rx))
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemotePeerUpgradeOutcome {
+    Upgraded {
+        from_version: String,
+        target_version: String,
+    },
+    AlreadyUpToDate {
+        version: String,
+    },
+    SkippedDisabled,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct RemotePeerUpgradeReport {
+    pub label: String,
+    pub host_id: Option<String>,
+    pub outcome: RemotePeerUpgradeOutcome,
+}
+
+fn compare_semver_triplet(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parse_parts(v: &str) -> [u32; 3] {
+        let clean = v
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .split(['+', '-'])
+            .next()
+            .unwrap_or("0.0.0");
+        let mut it = clean.split('.');
+        [
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+            it.next().and_then(|s| s.parse().ok()).unwrap_or(0),
+        ]
+    }
+    parse_parts(a).cmp(&parse_parts(b))
+}
+
+/// Connect to every enabled daemon-to-daemon Connected Host in `store` concurrently and trigger
+/// `WireMessage::UpgradeDaemon` on each reachable peer (direct WS, Noise NK Relay, or `ssh+relay://`).
+pub async fn upgrade_all_saved_connected_hosts(
+    store: &OrbitStore,
+    self_host_id: &str,
+    target_version: &str,
+    force: bool,
+) -> anyhow::Result<Vec<RemotePeerUpgradeReport>> {
+    let saved = store.list_connected_hosts()?;
+    let target = target_version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .to_string();
+
+    let mut handles = Vec::with_capacity(saved.len());
+    for row in saved {
+        let self_id = self_host_id.to_string();
+        let target_ver = target.clone();
+        handles.push(tokio::spawn(async move {
+            let label = row.label.clone();
+            let host_id = row.host_id.clone();
+            if !row.enabled {
+                return RemotePeerUpgradeReport {
+                    label,
+                    host_id,
+                    outcome: RemotePeerUpgradeOutcome::SkippedDisabled,
+                };
+            }
+            let outcome = upgrade_single_saved_peer(&row, &self_id, &target_ver, force).await;
+            RemotePeerUpgradeReport {
+                label,
+                host_id,
+                outcome,
+            }
+        }));
+    }
+
+    let mut reports = Vec::with_capacity(handles.len());
+    for h in handles {
+        match h.await {
+            Ok(rep) => reports.push(rep),
+            Err(e) => reports.push(RemotePeerUpgradeReport {
+                label: "unknown".to_string(),
+                host_id: None,
+                outcome: RemotePeerUpgradeOutcome::Failed(format!("upgrade task aborted: {e}")),
+            }),
+        }
+    }
+    Ok(reports)
+}
+
+async fn upgrade_single_saved_peer(
+    row: &StoredConnectedHost,
+    self_host_id: &str,
+    target_version: &str,
+    force: bool,
+) -> RemotePeerUpgradeOutcome {
+    let (host_info, tx, mut rx) = match connect_to_peer_daemon(row, self_host_id).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            return RemotePeerUpgradeOutcome::Failed(format!("unreachable ({e})"));
+        }
+    };
+
+    if let Some(ref pinned) = row.host_id
+        && pinned != &host_info.host_id
+    {
+        return RemotePeerUpgradeOutcome::Failed(format!(
+            "pinned host identity mismatch: expected `{pinned}`, got `{}`",
+            host_info.host_id
+        ));
+    }
+
+    let current_ver = host_info
+        .daemon_version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .to_string();
+
+    if !force
+        && !target_version.is_empty()
+        && compare_semver_triplet(&current_ver, target_version) != std::cmp::Ordering::Less
+    {
+        return RemotePeerUpgradeOutcome::AlreadyUpToDate {
+            version: current_ver,
+        };
+    }
+
+    let req_id = Uuid::new_v4();
+    let msg = WireMessage::UpgradeDaemon {
+        request_id: req_id,
+        target_version: if target_version.is_empty() {
+            None
+        } else {
+            Some(target_version.to_string())
+        },
+    };
+    if let Err(e) = tx.send(msg).await {
+        return RemotePeerUpgradeOutcome::Failed(format!("failed to send UpgradeDaemon: {e}"));
+    }
+
+    let wait_res = tokio::time::timeout(Duration::from_secs(95), async {
+        while let Some(incoming) = rx.recv().await {
+            match incoming {
+                WireMessage::Ack { request_id } if request_id == req_id => return Ok(()),
+                WireMessage::RpcError {
+                    request_id: Some(r),
+                    message,
+                    ..
+                } if r == req_id => return Err(message),
+                _ => {}
+            }
+        }
+        // Connection drop right after daemon spawns hot-restart is expected & healthy.
+        Ok(())
+    })
+    .await;
+
+    match wait_res {
+        Ok(Ok(())) => RemotePeerUpgradeOutcome::Upgraded {
+            from_version: current_ver,
+            target_version: target_version.to_string(),
+        },
+        Ok(Err(rpc_err)) => RemotePeerUpgradeOutcome::Failed(rpc_err),
+        Err(_) => RemotePeerUpgradeOutcome::Failed(
+            "timed out waiting for remote daemon self-upgrade".to_string(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compare_semver_triplet_orders_correctly() {
+        assert_eq!(
+            compare_semver_triplet("0.7.0", "0.7.1"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_semver_triplet("v0.7.1", "0.7.1"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_semver_triplet("0.8.0-rc.1", "0.7.9"),
+            std::cmp::Ordering::Greater
+        );
+    }
+}

@@ -2118,7 +2118,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "orbit-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-client-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2157,6 +2157,7 @@ dependencies = [
  "orbit-relay-transport",
  "orbit-store",
  "pulldown-cmark",
+ "reqwest",
  "serde",
  "serde_json",
  "similar",
@@ -2171,19 +2172,24 @@ dependencies = [
 
 [[package]]
 name = "orbit-crypto"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
+ "aes-gcm 0.10.3",
+ "argon2",
  "base64 0.22.1",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "snow",
  "thiserror 2.0.21",
+ "zeroize",
+ "zstd",
 ]
 
 [[package]]
 name = "orbit-daemon"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2209,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-ffi-ohos"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "napi-build-ohos",
  "napi-derive-ohos",
@@ -2223,18 +2229,19 @@ dependencies = [
 
 [[package]]
 name = "orbit-ffi-uniffi"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "orbit-client-core",
  "orbit-crypto",
  "orbit-protocol",
+ "serde_json",
  "thiserror 2.0.21",
  "uniffi",
 ]
 
 [[package]]
 name = "orbit-protocol"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "serde",
@@ -2246,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-providers"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2264,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-relay"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2278,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-relay-transport"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -2291,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-shim"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "portable-pty",
@@ -2303,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-store"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "chrono",
  "orbit-protocol",
@@ -2403,6 +2410,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
+ "getrandom 0.4.3",
  "phc",
 ]
 
@@ -2439,6 +2447,7 @@ checksum = "44dc769b75f93afdddd8c7fa12d685292ddeff1e66f7f0f3a234cf1818afe892"
 dependencies = [
  "base64ct",
  "ctutils",
+ "getrandom 0.4.3",
 ]
 
 [[package]]

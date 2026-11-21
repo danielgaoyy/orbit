@@ -2939,21 +2939,17 @@ impl DaemonRuntime {
             .unwrap_or_else(|_| self.home_dir.clone())
             == std::fs::canonicalize(&default_home).unwrap_or(default_home);
 
-        let sq_bin = shell_single_quote(&install_path.to_string_lossy());
-        let home_flag = if is_default_home {
-            String::new()
-        } else {
-            format!(
-                " --home {}",
-                shell_single_quote(&self.home_dir.to_string_lossy())
-            )
-        };
-        let port_flag = if port > 0 {
-            format!(" --port {port}")
-        } else {
-            String::new()
-        };
-        let restart_script = format!("sleep 0.35 && {sq_bin}{home_flag} daemon up{port_flag}");
+        let restart_relay = detect_running_local_relay(&self.home_dir).await;
+        let restart_script = build_self_upgrade_restart_script(
+            &install_path,
+            if is_default_home {
+                None
+            } else {
+                Some(&self.home_dir)
+            },
+            port,
+            restart_relay,
+        );
 
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", &restart_script])
@@ -2971,10 +2967,60 @@ impl DaemonRuntime {
         tracing::info!(
             install_path = %install_path.display(),
             port,
+            restart_relay,
             "Scheduled self-upgrade hot-restart via `orbit daemon up`"
         );
         Ok(())
     }
+}
+
+fn parse_relay_port_from_json(raw: &str) -> Option<u16> {
+    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let addr_str = val.get("listen_addr")?.as_str()?;
+    addr_str.parse::<SocketAddr>().ok().map(|a| a.port())
+}
+
+async fn detect_running_local_relay(home_dir: &Path) -> bool {
+    let relay_cfg_path = home_dir.join("relay.json");
+    let Ok(raw) = std::fs::read_to_string(&relay_cfg_path) else {
+        return false;
+    };
+    let port = parse_relay_port_from_json(&raw).unwrap_or(7878);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+fn build_self_upgrade_restart_script(
+    install_path: &Path,
+    custom_home_dir: Option<&Path>,
+    port: u16,
+    restart_relay: bool,
+) -> String {
+    let sq_bin = shell_single_quote(&install_path.to_string_lossy());
+    let home_flag = custom_home_dir
+        .map(|h| format!(" --home {}", shell_single_quote(&h.to_string_lossy())))
+        .unwrap_or_default();
+    let port_flag = if port > 0 {
+        format!(" --port {port}")
+    } else {
+        String::new()
+    };
+    let relay_suffix = if restart_relay {
+        format!(" && ({sq_bin}{home_flag} relay up >/dev/null 2>&1 || true)")
+    } else {
+        String::new()
+    };
+    format!("sleep 0.35 && {sq_bin}{home_flag} daemon up{port_flag}{relay_suffix}")
 }
 
 /// Strictly validate a release semver tag (`X.Y.Z` with optional `-prerelease`) before
@@ -3010,4 +3056,36 @@ fn is_valid_release_semver(ver: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == b'.' || ch == b'-');
     }
     true
+}
+
+#[cfg(test)]
+mod self_upgrade_tests {
+    use super::*;
+
+    #[test]
+    fn parse_relay_port_from_json_reads_listen_addr() {
+        assert_eq!(
+            parse_relay_port_from_json(r#"{"listen_addr":"0.0.0.0:7878","allowed_pubkeys":[]}"#),
+            Some(7878)
+        );
+        assert_eq!(
+            parse_relay_port_from_json(r#"{"listen_addr":"127.0.0.1:9001"}"#),
+            Some(9001)
+        );
+        assert_eq!(parse_relay_port_from_json("not json"), None);
+    }
+
+    #[test]
+    fn build_self_upgrade_restart_script_includes_relay_only_when_running() {
+        let bin = Path::new("/home/u/.local/bin/orbit");
+        let without_relay = build_self_upgrade_restart_script(bin, None, 7474, false);
+        assert_eq!(
+            without_relay,
+            "sleep 0.35 && '/home/u/.local/bin/orbit' daemon up --port 7474"
+        );
+        let with_relay =
+            build_self_upgrade_restart_script(bin, Some(Path::new("/tmp/o home")), 7474, true);
+        assert!(with_relay.contains("--home '/tmp/o home' daemon up --port 7474"));
+        assert!(with_relay.contains("relay up >/dev/null 2>&1 || true"));
+    }
 }

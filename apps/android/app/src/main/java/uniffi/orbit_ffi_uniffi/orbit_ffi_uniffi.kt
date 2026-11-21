@@ -731,6 +731,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_func_format_effort_label(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_func_parse_markdown_preview(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_func_resolve_supported_effort_for_model(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_mobilecorelistener_on_core_event(
@@ -751,6 +753,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_agent(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_workspace(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_ask_side_question(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_attach_terminal(
@@ -758,6 +762,30 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_bridge_info(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_build_side_question_context(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_logout(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_now(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_poll_github_device_flow(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_auto_sync(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_status(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_unlock_with_passphrase(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_update_preferences_json(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_compose_prompt(
     ): Int
@@ -769,9 +797,21 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_agent_full(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_mission_workspace(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_schedule(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_session(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_session_in_workspace(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_delete_agent(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_delete_schedule(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_describe_tool_item(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_detach_agent(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_discover_local_daemon_uri(
     ): Int
@@ -785,6 +825,12 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_git_status(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_schedule_runs(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_board(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_events(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_files(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fleet_overview(
@@ -794,6 +840,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fleet_sidebar_request(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_flush_queued_prompt_now(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_repos_inspection(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_review(
     ): Int
@@ -805,6 +853,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_directory(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_provider_subagents(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_seen(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_unread(
@@ -812,6 +862,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_merge_workspaces(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace_v2(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_on_app_background(
     ): Int
@@ -821,11 +873,21 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_open_agent_timeline(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_open_provider_subagent_timeline(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_organize_project_workspaces(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pair_host(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pause_schedule(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_project_order(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_provider_subagent_timeline(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates_with_workspace(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_read_workspace_file(
     ): Int
@@ -843,11 +905,15 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_queued_prompt(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rename_workspace(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_projects(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_queued_prompts(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_request_git_repos_inspection(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal(
     ): Int
@@ -857,9 +923,15 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resolve_permission(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resume_schedule(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rewind_agent(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rewind_agent_request(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_run_schedule_once(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_schedule_runs(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_seed_thread_prefs(
     ): Int
@@ -883,6 +955,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_slash_commands(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_spawn_workspace_peer(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_stage_attachment(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_start_terminal(
@@ -890,6 +964,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_subscribe(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_subscribe_throttled(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_summarize_agent(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_switch_agent_provider(
     ): Int
@@ -899,15 +975,27 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_toggle_pin_agent(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_unarchive_agent(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_agent_identity(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config_request(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_relay(
     ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_workspace_board(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_workspace_goal(
+    ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upgrade_host_daemon_over_wire(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upsert_project(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_board(
+    ): Int
+    external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_events(
     ): Int
     external fun uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_files(
     ): Int
@@ -975,6 +1063,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_archive_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_archive_workspace(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,`keepAgentsUnclassified`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_ask_side_question(`ptr`: Long,`req`: RustBuffer.ByValue,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_attach_terminal(`ptr`: Long,`hostId`: RustBuffer.ByValue,`terminalId`: RustBuffer.ByValue,`slot`: Byte,uniffi_out_err: UniffiRustCallStatus, 
@@ -983,6 +1073,30 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_build_side_question_context(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`maxChars`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_generate_passphrase(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_login_with_token(`ptr`: Long,`token`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_logout(`ptr`: Long,`clearLocalHosts`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_now(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_poll_github_device_flow(`ptr`: Long,`deviceCode`: RustBuffer.ByValue,`clientIdOverride`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_auto_sync(`ptr`: Long,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_github_client_id(`ptr`: Long,`clientId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_start_github_device_flow(`ptr`: Long,`clientIdOverride`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_status(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_unlock_with_passphrase(`ptr`: Long,`passphrase`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_update_preferences_json(`ptr`: Long,`patchJson`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_compose_prompt(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_connect_all_hosts(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -993,10 +1107,22 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_agent_full(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`extraDirs`: RustBuffer.ByValue,`provider`: RustBuffer.ByValue,`model`: RustBuffer.ByValue,`effort`: RustBuffer.ByValue,`mode`: RustBuffer.ByValue,`initialPrompt`: RustBuffer.ByValue,`initialDisplayPrompt`: RustBuffer.ByValue,`initialBadges`: RustBuffer.ByValue,`worktreeBranch`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_mission_workspace(`ptr`: Long,`hostId`: RustBuffer.ByValue,`sourceCwd`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`missionGoal`: RustBuffer.ByValue,`useWorktree`: Byte,`worktreeBranch`: RustBuffer.ByValue,`baseRef`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_schedule(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_session(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_session_in_workspace(`ptr`: Long,`req`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,`handle`: RustBuffer.ByValue,`autoCluster`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_delete_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_delete_schedule(`ptr`: Long,`hostId`: RustBuffer.ByValue,`scheduleId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_describe_tool_item(`ptr`: Long,`item`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_detach_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_discover_local_daemon_uri(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_dismiss_cluster_suggestion(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1009,6 +1135,12 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_git_status(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_schedule_runs(`ptr`: Long,`hostId`: RustBuffer.ByValue,`scheduleId`: RustBuffer.ByValue,`limit`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_workspace_board(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_workspace_events(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,`limit`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_workspace_files(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fleet_overview(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1019,6 +1151,8 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_flush_queued_prompt_now(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`queueId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_git_repos_inspection(`ptr`: Long,`hostId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_git_review(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_host_detail(`ptr`: Long,`hostId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1029,6 +1163,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_list_directory(`ptr`: Long,`hostId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_list_provider_subagents(`ptr`: Long,`hostId`: RustBuffer.ByValue,`parentAgentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_mark_agent_seen(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`seq`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_mark_agent_unread(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1036,6 +1172,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_merge_workspaces(`ptr`: Long,`hostId`: RustBuffer.ByValue,`sourceWorkspaceId`: RustBuffer.ByValue,`targetWorkspaceId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_move_agent_to_workspace(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`targetWorkspaceId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_move_agent_to_workspace_v2(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`targetWorkspaceId`: RustBuffer.ByValue,`newWorkspaceTitle`: RustBuffer.ByValue,`makeUnclassified`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_on_app_background(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1045,11 +1183,21 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_open_agent_timeline(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_open_provider_subagent_timeline(`ptr`: Long,`hostId`: RustBuffer.ByValue,`parentAgentId`: RustBuffer.ByValue,`subagentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_organize_project_workspaces(`ptr`: Long,`hostId`: RustBuffer.ByValue,`projectRoot`: RustBuffer.ByValue,`agentIds`: RustBuffer.ByValue,`autoApply`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_pair_host(`ptr`: Long,`pairingUri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_pause_schedule(`ptr`: Long,`hostId`: RustBuffer.ByValue,`scheduleId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_project_order(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_provider_subagent_timeline(`ptr`: Long,`hostId`: RustBuffer.ByValue,`parentAgentId`: RustBuffer.ByValue,`subagentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rank_mention_candidates(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rank_mention_candidates_with_workspace(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`query`: RustBuffer.ByValue,`limit`: Int,`workspaceId`: RustBuffer.ByValue,`activeAgentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_read_workspace_file(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1067,11 +1215,15 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_remove_queued_prompt(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`queueId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rename_workspace(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_render_diagram(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_projects(`ptr`: Long,`orderedKeys`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_reorder_queued_prompts(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`queueIds`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_request_git_repos_inspection(`ptr`: Long,`hostId`: RustBuffer.ByValue,`path`: RustBuffer.ByValue,`extraDirs`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_resize_terminal(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cols`: Short,`rows`: Short,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1081,9 +1233,15 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_resolve_permission(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`permissionRequestId`: RustBuffer.ByValue,`decision`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_resume_schedule(`ptr`: Long,`hostId`: RustBuffer.ByValue,`scheduleId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rewind_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`toBeforeSeq`: Long,`restoreFiles`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rewind_agent_request(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_run_schedule_once(`ptr`: Long,`hostId`: RustBuffer.ByValue,`scheduleId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_schedule_runs(`ptr`: Long,`hostId`: RustBuffer.ByValue,`scheduleId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_seed_thread_prefs(`ptr`: Long,`seeds`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1107,6 +1265,8 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_slash_commands(`ptr`: Long,`platform`: RustBuffer.ByValue,`query`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_spawn_workspace_peer(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_stage_attachment(`ptr`: Long,`hostId`: RustBuffer.ByValue,`filename`: RustBuffer.ByValue,`mimeType`: RustBuffer.ByValue,`bytes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_start_terminal(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,`cols`: Short,`rows`: Short,uniffi_out_err: UniffiRustCallStatus, 
@@ -1114,6 +1274,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_subscribe(`ptr`: Long,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_subscribe_throttled(`ptr`: Long,`listener`: Long,`intervalMs`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_summarize_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_switch_agent_provider(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`provider`: RustBuffer.ByValue,`model`: RustBuffer.ByValue,`effort`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -1123,15 +1285,27 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_toggle_pin_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_unarchive_agent(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_agent_identity(`ptr`: Long,`hostId`: RustBuffer.ByValue,`agentId`: RustBuffer.ByValue,`handle`: RustBuffer.ByValue,`title`: RustBuffer.ByValue,`taskSummary`: RustBuffer.ByValue,`lockHandle`: Byte,`lockTitle`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_host_config(`ptr`: Long,`hostId`: RustBuffer.ByValue,`customName`: RustBuffer.ByValue,`routeMode`: RustBuffer.ByValue,`sshAlias`: RustBuffer.ByValue,`remoteDaemonPort`: RustBuffer.ByValue,`customDirectEndpoint`: RustBuffer.ByValue,`relayUrl`: RustBuffer.ByValue,`reconnect`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_host_config_request(`ptr`: Long,`req`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_host_relay(`ptr`: Long,`hostId`: RustBuffer.ByValue,`relayUrl`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_workspace_board(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,`content`: RustBuffer.ByValue,`section`: RustBuffer.ByValue,`updatedBy`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_workspace_goal(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,`goal`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_upgrade_host_daemon_over_wire(`ptr`: Long,`hostId`: RustBuffer.ByValue,`targetVersion`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_upsert_project(`ptr`: Long,`projectId`: RustBuffer.ByValue,`hostId`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,`directories`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_workspace_board(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_workspace_events(`ptr`: Long,`hostId`: RustBuffer.ByValue,`workspaceId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_workspace_files(`ptr`: Long,`hostId`: RustBuffer.ByValue,`cwd`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1154,6 +1328,8 @@ internal object UniffiLib {
     external fun uniffi_orbit_ffi_uniffi_fn_func_format_catalog_model_label(`catalog`: RustBuffer.ByValue,`rawModelId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_func_format_effort_label(`effort`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_orbit_ffi_uniffi_fn_func_parse_markdown_preview(`markdown`: RustBuffer.ByValue,`streaming`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_orbit_ffi_uniffi_fn_func_resolve_supported_effort_for_model(`spec`: RustBuffer.ByValue,`desired`: RustBuffer.ByValue,`catalogDefault`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -1294,6 +1470,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_func_format_effort_label() and 0xFFFF) != 50207) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_func_parse_markdown_preview() and 0xFFFF) != 53723) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_func_resolve_supported_effort_for_model() and 0xFFFF) != 151) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1324,6 +1503,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_agent() and 0xFFFF) != 61104) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_archive_workspace() and 0xFFFF) != 63031) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_ask_side_question() and 0xFFFF) != 21247) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1334,6 +1516,42 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_build_side_question_context() and 0xFFFF) != 42218) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_generate_passphrase() and 0xFFFF) != 49340) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_get_preferences_json() and 0xFFFF) != 11716) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_login_with_token() and 0xFFFF) != 37302) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_logout() and 0xFFFF) != 45701) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_now() and 0xFFFF) != 58181) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_poll_github_device_flow() and 0xFFFF) != 17558) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_auto_sync() and 0xFFFF) != 54195) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_set_github_client_id() and 0xFFFF) != 62078) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_start_github_device_flow() and 0xFFFF) != 41593) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_status() and 0xFFFF) != 50836) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_unlock_with_passphrase() and 0xFFFF) != 5433) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_cloud_sync_update_preferences_json() and 0xFFFF) != 53863) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_compose_prompt() and 0xFFFF) != 1118) {
@@ -1351,10 +1569,28 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_agent_full() and 0xFFFF) != 7969) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_mission_workspace() and 0xFFFF) != 39628) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_schedule() and 0xFFFF) != 47954) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_session() and 0xFFFF) != 9298) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_create_session_in_workspace() and 0xFFFF) != 17668) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_delete_agent() and 0xFFFF) != 48304) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_delete_schedule() and 0xFFFF) != 33714) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_describe_tool_item() and 0xFFFF) != 24848) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_detach_agent() and 0xFFFF) != 46604) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_discover_local_daemon_uri() and 0xFFFF) != 31969) {
@@ -1375,6 +1611,15 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_git_status() and 0xFFFF) != 971) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_schedule_runs() and 0xFFFF) != 17888) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_board() and 0xFFFF) != 35325) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_events() and 0xFFFF) != 62231) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_fetch_workspace_files() and 0xFFFF) != 16269) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1388,6 +1633,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_flush_queued_prompt_now() and 0xFFFF) != 60554) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_repos_inspection() and 0xFFFF) != 62271) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_git_review() and 0xFFFF) != 29779) {
@@ -1405,6 +1653,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_directory() and 0xFFFF) != 10329) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_list_provider_subagents() and 0xFFFF) != 17893) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_mark_agent_seen() and 0xFFFF) != 61018) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1415,6 +1666,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace() and 0xFFFF) != 27017) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_move_agent_to_workspace_v2() and 0xFFFF) != 49470) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_on_app_background() and 0xFFFF) != 56418) {
@@ -1429,13 +1683,28 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_open_agent_timeline() and 0xFFFF) != 25448) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_open_provider_subagent_timeline() and 0xFFFF) != 9720) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_organize_project_workspaces() and 0xFFFF) != 36087) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pair_host() and 0xFFFF) != 37596) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_pause_schedule() and 0xFFFF) != 4747) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_project_order() and 0xFFFF) != 21866) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_provider_subagent_timeline() and 0xFFFF) != 12093) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates() and 0xFFFF) != 3280) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rank_mention_candidates_with_workspace() and 0xFFFF) != 32809) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_read_workspace_file() and 0xFFFF) != 18181) {
@@ -1462,6 +1731,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_remove_queued_prompt() and 0xFFFF) != 22264) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rename_workspace() and 0xFFFF) != 22896) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_render_diagram() and 0xFFFF) != 2210) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1469,6 +1741,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_reorder_queued_prompts() and 0xFFFF) != 39769) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_request_git_repos_inspection() and 0xFFFF) != 52199) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resize_terminal() and 0xFFFF) != 57060) {
@@ -1483,10 +1758,19 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resolve_permission() and 0xFFFF) != 17662) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_resume_schedule() and 0xFFFF) != 32926) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rewind_agent() and 0xFFFF) != 10423) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_rewind_agent_request() and 0xFFFF) != 56124) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_run_schedule_once() and 0xFFFF) != 9369) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_schedule_runs() and 0xFFFF) != 45863) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_seed_thread_prefs() and 0xFFFF) != 47307) {
@@ -1522,6 +1806,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_slash_commands() and 0xFFFF) != 61779) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_spawn_workspace_peer() and 0xFFFF) != 27113) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_stage_attachment() and 0xFFFF) != 5186) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1532,6 +1819,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_subscribe_throttled() and 0xFFFF) != 42324) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_summarize_agent() and 0xFFFF) != 50285) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_switch_agent_provider() and 0xFFFF) != 4646) {
@@ -1546,6 +1836,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_toggle_pin_agent() and 0xFFFF) != 15456) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_unarchive_agent() and 0xFFFF) != 593) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_agent_identity() and 0xFFFF) != 9558) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_config() and 0xFFFF) != 12313) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1555,10 +1851,22 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_host_relay() and 0xFFFF) != 50634) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_workspace_board() and 0xFFFF) != 35418) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_update_workspace_goal() and 0xFFFF) != 58556) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upgrade_host_daemon_over_wire() and 0xFFFF) != 62597) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_upsert_project() and 0xFFFF) != 43684) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_board() and 0xFFFF) != 1727) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_events() and 0xFFFF) != 58261) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_orbit_ffi_uniffi_checksum_method_orbitmobilecore_workspace_files() and 0xFFFF) != 42522) {
@@ -2480,6 +2788,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `archiveAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
+    fun `archiveWorkspace`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `keepAgentsUnclassified`: kotlin.Boolean)
+    
     fun `askSideQuestion`(`req`: FfiAskSideQuestionRequest, `listener`: SideQuestionListener): kotlin.String
     
     fun `attachTerminal`(`hostId`: kotlin.String, `terminalId`: kotlin.String, `slot`: kotlin.UByte)
@@ -2487,6 +2797,30 @@ public interface OrbitMobileCoreInterface {
     fun `bridgeInfo`(): FfiBridgeInfo
     
     fun `buildSideQuestionContext`(`hostId`: kotlin.String, `agentId`: kotlin.String, `maxChars`: kotlin.UInt?): kotlin.String
+    
+    fun `cloudSyncGeneratePassphrase`(): kotlin.String
+    
+    fun `cloudSyncGetPreferencesJson`(): kotlin.String
+    
+    fun `cloudSyncLoginWithToken`(`token`: kotlin.String): FfiCloudSyncStatus
+    
+    fun `cloudSyncLogout`(`clearLocalHosts`: kotlin.Boolean): FfiCloudSyncStatus
+    
+    fun `cloudSyncNow`(): FfiCloudSyncResult
+    
+    fun `cloudSyncPollGithubDeviceFlow`(`deviceCode`: kotlin.String, `clientIdOverride`: kotlin.String?): FfiCloudSyncDevicePoll
+    
+    fun `cloudSyncSetAutoSync`(`enabled`: kotlin.Boolean): FfiCloudSyncStatus
+    
+    fun `cloudSyncSetGithubClientId`(`clientId`: kotlin.String?): FfiCloudSyncStatus
+    
+    fun `cloudSyncStartGithubDeviceFlow`(`clientIdOverride`: kotlin.String?): FfiGitHubDeviceFlowStart
+    
+    fun `cloudSyncStatus`(): FfiCloudSyncStatus
+    
+    fun `cloudSyncUnlockWithPassphrase`(`passphrase`: kotlin.String): FfiCloudSyncResult
+    
+    fun `cloudSyncUpdatePreferencesJson`(`patchJson`: kotlin.String)
     
     fun `composePrompt`(`req`: FfiComposePromptRequest): FfiComposedPrompt
     
@@ -2498,9 +2832,21 @@ public interface OrbitMobileCoreInterface {
     
     fun `createAgentFull`(`hostId`: kotlin.String, `cwd`: kotlin.String, `extraDirs`: List<kotlin.String>, `provider`: FfiProviderKind, `model`: kotlin.String?, `effort`: FfiReasoningEffort?, `mode`: FfiSessionMode, `initialPrompt`: kotlin.String, `initialDisplayPrompt`: kotlin.String?, `initialBadges`: List<FfiPromptBadge>, `worktreeBranch`: kotlin.String?): kotlin.String
     
+    fun `createMissionWorkspace`(`hostId`: kotlin.String, `sourceCwd`: kotlin.String, `title`: kotlin.String, `missionGoal`: kotlin.String?, `useWorktree`: kotlin.Boolean, `worktreeBranch`: kotlin.String?, `baseRef`: kotlin.String?)
+    
+    fun `createSchedule`(`req`: FfiCreateScheduleRequest)
+    
     fun `createSession`(`req`: FfiCreateSessionRequest): kotlin.String
     
+    fun `createSessionInWorkspace`(`req`: FfiCreateSessionRequest, `workspaceId`: kotlin.String?, `handle`: kotlin.String?, `autoCluster`: kotlin.Boolean?): kotlin.String
+    
+    fun `deleteAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+    
+    fun `deleteSchedule`(`hostId`: kotlin.String, `scheduleId`: kotlin.String)
+    
     fun `describeToolItem`(`item`: FfiTimelineItem, `cwd`: kotlin.String?): FfiToolStepDescriptor?
+    
+    fun `detachAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
     fun `discoverLocalDaemonUri`(): kotlin.String?
     
@@ -2514,6 +2860,12 @@ public interface OrbitMobileCoreInterface {
     
     fun `fetchGitStatus`(`hostId`: kotlin.String, `cwd`: kotlin.String)
     
+    fun `fetchScheduleRuns`(`hostId`: kotlin.String, `scheduleId`: kotlin.String, `limit`: kotlin.UInt?)
+    
+    fun `fetchWorkspaceBoard`(`hostId`: kotlin.String, `workspaceId`: kotlin.String)
+    
+    fun `fetchWorkspaceEvents`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `limit`: kotlin.UInt?)
+    
     fun `fetchWorkspaceFiles`(`hostId`: kotlin.String, `cwd`: kotlin.String)
     
     fun `fleetOverview`(): FfiFleetOverview
@@ -2523,6 +2875,8 @@ public interface OrbitMobileCoreInterface {
     fun `fleetSidebarRequest`(`req`: FfiFleetSidebarRequest): FfiFleetSidebar
     
     fun `flushQueuedPromptNow`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueId`: kotlin.String)
+    
+    fun `gitReposInspection`(`hostId`: kotlin.String, `path`: kotlin.String): FfiGitReposInspection?
     
     fun `gitReview`(`hostId`: kotlin.String, `cwd`: kotlin.String, `path`: kotlin.String?): FfiGitReview
     
@@ -2534,6 +2888,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `listDirectory`(`hostId`: kotlin.String, `path`: kotlin.String?)
     
+    fun `listProviderSubagents`(`hostId`: kotlin.String, `parentAgentId`: kotlin.String)
+    
     fun `markAgentSeen`(`hostId`: kotlin.String, `agentId`: kotlin.String, `seq`: kotlin.ULong)
     
     fun `markAgentUnread`(`hostId`: kotlin.String, `agentId`: kotlin.String)
@@ -2541,6 +2897,8 @@ public interface OrbitMobileCoreInterface {
     fun `mergeWorkspaces`(`hostId`: kotlin.String, `sourceWorkspaceId`: kotlin.String, `targetWorkspaceId`: kotlin.String)
     
     fun `moveAgentToWorkspace`(`hostId`: kotlin.String, `agentId`: kotlin.String, `targetWorkspaceId`: kotlin.String?)
+    
+    fun `moveAgentToWorkspaceV2`(`hostId`: kotlin.String, `agentId`: kotlin.String, `targetWorkspaceId`: kotlin.String?, `newWorkspaceTitle`: kotlin.String?, `makeUnclassified`: kotlin.Boolean)
     
     fun `onAppBackground`()
     
@@ -2550,11 +2908,21 @@ public interface OrbitMobileCoreInterface {
     
     fun `openAgentTimeline`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
+    fun `openProviderSubagentTimeline`(`hostId`: kotlin.String, `parentAgentId`: kotlin.String, `subagentId`: kotlin.String)
+    
+    fun `organizeProjectWorkspaces`(`hostId`: kotlin.String, `projectRoot`: kotlin.String, `agentIds`: List<kotlin.String>, `autoApply`: kotlin.Boolean)
+    
     fun `pairHost`(`pairingUri`: kotlin.String): FfiHostCard
+    
+    fun `pauseSchedule`(`hostId`: kotlin.String, `scheduleId`: kotlin.String)
     
     fun `projectOrder`(): List<kotlin.String>
     
+    fun `providerSubagentTimeline`(`hostId`: kotlin.String, `parentAgentId`: kotlin.String, `subagentId`: kotlin.String): List<FfiProviderSubagentEvent>
+    
     fun `rankMentionCandidates`(`req`: FfiMentionRankRequest): List<FfiMentionCandidate>
+    
+    fun `rankMentionCandidatesWithWorkspace`(`hostId`: kotlin.String, `cwd`: kotlin.String, `query`: kotlin.String, `limit`: kotlin.UInt, `workspaceId`: kotlin.String?, `activeAgentId`: kotlin.String?): List<FfiMentionCandidate>
     
     fun `readWorkspaceFile`(`hostId`: kotlin.String, `cwd`: kotlin.String, `path`: kotlin.String): FfiWorkspaceFile
     
@@ -2572,11 +2940,15 @@ public interface OrbitMobileCoreInterface {
     
     fun `removeQueuedPrompt`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueId`: kotlin.String)
     
+    fun `renameWorkspace`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `title`: kotlin.String)
+    
     fun `renderDiagram`(`req`: FfiRenderDiagramRequest): FfiRenderDiagramView
     
     fun `reorderProjects`(`orderedKeys`: List<kotlin.String>): List<kotlin.String>
     
     fun `reorderQueuedPrompts`(`hostId`: kotlin.String, `agentId`: kotlin.String, `queueIds`: List<kotlin.String>)
+    
+    fun `requestGitReposInspection`(`hostId`: kotlin.String, `path`: kotlin.String, `extraDirs`: List<kotlin.String>)
     
     fun `resizeTerminal`(`hostId`: kotlin.String, `cols`: kotlin.UShort, `rows`: kotlin.UShort)
     
@@ -2586,9 +2958,15 @@ public interface OrbitMobileCoreInterface {
     
     fun `resolvePermission`(`hostId`: kotlin.String, `agentId`: kotlin.String, `permissionRequestId`: kotlin.String, `decision`: kotlin.String)
     
+    fun `resumeSchedule`(`hostId`: kotlin.String, `scheduleId`: kotlin.String)
+    
     fun `rewindAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String, `toBeforeSeq`: kotlin.ULong, `restoreFiles`: kotlin.Boolean): FfiRewindAgentResult
     
     fun `rewindAgentRequest`(`req`: FfiRewindAgentRequest): FfiRewindAgentResult
+    
+    fun `runScheduleOnce`(`hostId`: kotlin.String, `scheduleId`: kotlin.String)
+    
+    fun `scheduleRuns`(`hostId`: kotlin.String, `scheduleId`: kotlin.String): List<FfiScheduleRunRecord>
     
     fun `seedThreadPrefs`(`seeds`: List<FfiThreadPrefSeed>)
     
@@ -2612,6 +2990,8 @@ public interface OrbitMobileCoreInterface {
     
     fun `slashCommands`(`platform`: FfiClientPlatform, `query`: kotlin.String?): List<FfiSlashCommand>
     
+    fun `spawnWorkspacePeer`(`req`: FfiSpawnWorkspacePeerRequest): kotlin.String
+    
     fun `stageAttachment`(`hostId`: kotlin.String, `filename`: kotlin.String, `mimeType`: kotlin.String?, `bytes`: kotlin.ByteArray): FfiStagedAttachment
     
     fun `startTerminal`(`hostId`: kotlin.String, `cwd`: kotlin.String, `cols`: kotlin.UShort, `rows`: kotlin.UShort)
@@ -2619,6 +2999,8 @@ public interface OrbitMobileCoreInterface {
     fun `subscribe`(`listener`: MobileCoreListener)
     
     fun `subscribeThrottled`(`listener`: MobileCoreListener, `intervalMs`: kotlin.UInt)
+    
+    fun `summarizeAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
     
     fun `switchAgentProvider`(`hostId`: kotlin.String, `agentId`: kotlin.String, `provider`: FfiProviderKind, `model`: kotlin.String?, `effort`: FfiReasoningEffort?)
     
@@ -2628,15 +3010,27 @@ public interface OrbitMobileCoreInterface {
     
     fun `togglePinAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String): kotlin.Boolean
     
+    fun `unarchiveAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+    
+    fun `updateAgentIdentity`(`hostId`: kotlin.String, `agentId`: kotlin.String, `handle`: kotlin.String?, `title`: kotlin.String?, `taskSummary`: kotlin.String?, `lockHandle`: kotlin.Boolean, `lockTitle`: kotlin.Boolean)
+    
     fun `updateHostConfig`(`hostId`: kotlin.String, `customName`: kotlin.String?, `routeMode`: FfiHostRouteMode?, `sshAlias`: kotlin.String?, `remoteDaemonPort`: kotlin.UShort?, `customDirectEndpoint`: kotlin.String?, `relayUrl`: kotlin.String?, `reconnect`: kotlin.Boolean): FfiHostCard
     
     fun `updateHostConfigRequest`(`req`: FfiUpdateHostConfigRequest): FfiHostCard
     
     fun `updateHostRelay`(`hostId`: kotlin.String, `relayUrl`: kotlin.String?)
     
+    fun `updateWorkspaceBoard`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `content`: kotlin.String, `section`: kotlin.String?, `updatedBy`: kotlin.String?)
+    
+    fun `updateWorkspaceGoal`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `goal`: kotlin.String)
+    
     fun `upgradeHostDaemonOverWire`(`hostId`: kotlin.String, `targetVersion`: kotlin.String?): kotlin.String
     
     fun `upsertProject`(`projectId`: kotlin.String?, `hostId`: kotlin.String, `name`: kotlin.String, `directories`: List<kotlin.String>): FfiClientProject
+    
+    fun `workspaceBoard`(`hostId`: kotlin.String, `workspaceId`: kotlin.String): FfiWorkspaceBoardSnapshot?
+    
+    fun `workspaceEvents`(`hostId`: kotlin.String, `workspaceId`: kotlin.String): List<FfiWorkspaceEvent>
     
     fun `workspaceFiles`(`hostId`: kotlin.String, `cwd`: kotlin.String): List<kotlin.String>
     
@@ -2867,6 +3261,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `archiveWorkspace`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `keepAgentsUnclassified`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_archive_workspace(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`workspaceId`),
+        FfiConverterBoolean.lower(`keepAgentsUnclassified`),_status)
+}
+    }
+    
+    
+
     
     @Throws(FfiOrbitException::class)override fun `askSideQuestion`(`req`: FfiAskSideQuestionRequest, `listener`: SideQuestionListener): kotlin.String {
             return FfiConverterString.lift(
@@ -2925,6 +3334,179 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     )
     }
+    
+
+    override fun `cloudSyncGeneratePassphrase`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_generate_passphrase(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    override fun `cloudSyncGetPreferencesJson`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_get_preferences_json(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncLoginWithToken`(`token`: kotlin.String): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_login_with_token(
+        it,
+        
+        FfiConverterString.lower(`token`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncLogout`(`clearLocalHosts`: kotlin.Boolean): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_logout(
+        it,
+        
+        FfiConverterBoolean.lower(`clearLocalHosts`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncNow`(): FfiCloudSyncResult {
+            return FfiConverterTypeFfiCloudSyncResult.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_now(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncPollGithubDeviceFlow`(`deviceCode`: kotlin.String, `clientIdOverride`: kotlin.String?): FfiCloudSyncDevicePoll {
+            return FfiConverterTypeFfiCloudSyncDevicePoll.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_poll_github_device_flow(
+        it,
+        
+        FfiConverterString.lower(`deviceCode`),
+        FfiConverterOptionalString.lower(`clientIdOverride`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncSetAutoSync`(`enabled`: kotlin.Boolean): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_auto_sync(
+        it,
+        
+        FfiConverterBoolean.lower(`enabled`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncSetGithubClientId`(`clientId`: kotlin.String?): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_set_github_client_id(
+        it,
+        
+        FfiConverterOptionalString.lower(`clientId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncStartGithubDeviceFlow`(`clientIdOverride`: kotlin.String?): FfiGitHubDeviceFlowStart {
+            return FfiConverterTypeFfiGitHubDeviceFlowStart.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_start_github_device_flow(
+        it,
+        
+        FfiConverterOptionalString.lower(`clientIdOverride`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `cloudSyncStatus`(): FfiCloudSyncStatus {
+            return FfiConverterTypeFfiCloudSyncStatus.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_status(
+        it,
+        _status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncUnlockWithPassphrase`(`passphrase`: kotlin.String): FfiCloudSyncResult {
+            return FfiConverterTypeFfiCloudSyncResult.lift(
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_unlock_with_passphrase(
+        it,
+        
+        FfiConverterString.lower(`passphrase`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    @Throws(FfiOrbitException::class)override fun `cloudSyncUpdatePreferencesJson`(`patchJson`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(FfiOrbitException) { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_cloud_sync_update_preferences_json(
+        it,
+        
+        FfiConverterString.lower(`patchJson`),_status)
+}
+    }
+    
     
 
     override fun `composePrompt`(`req`: FfiComposePromptRequest): FfiComposedPrompt {
@@ -3008,6 +3590,38 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     
 
+    override fun `createMissionWorkspace`(`hostId`: kotlin.String, `sourceCwd`: kotlin.String, `title`: kotlin.String, `missionGoal`: kotlin.String?, `useWorktree`: kotlin.Boolean, `worktreeBranch`: kotlin.String?, `baseRef`: kotlin.String?)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_mission_workspace(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`sourceCwd`),
+        FfiConverterString.lower(`title`),
+        FfiConverterOptionalString.lower(`missionGoal`),
+        FfiConverterBoolean.lower(`useWorktree`),
+        FfiConverterOptionalString.lower(`worktreeBranch`),
+        FfiConverterOptionalString.lower(`baseRef`),_status)
+}
+    }
+    
+    
+
+    override fun `createSchedule`(`req`: FfiCreateScheduleRequest)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_schedule(
+        it,
+        
+        FfiConverterTypeFfiCreateScheduleRequest.lower(`req`),_status)
+}
+    }
+    
+    
+
     override fun `createSession`(`req`: FfiCreateSessionRequest): kotlin.String {
             return FfiConverterString.lift(
     callWithHandle {
@@ -3020,6 +3634,51 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     )
     }
+    
+
+    override fun `createSessionInWorkspace`(`req`: FfiCreateSessionRequest, `workspaceId`: kotlin.String?, `handle`: kotlin.String?, `autoCluster`: kotlin.Boolean?): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_create_session_in_workspace(
+        it,
+        
+        FfiConverterTypeFfiCreateSessionRequest.lower(`req`),
+        FfiConverterOptionalString.lower(`workspaceId`),
+        FfiConverterOptionalString.lower(`handle`),
+        FfiConverterOptionalBoolean.lower(`autoCluster`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `deleteAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_delete_agent(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),_status)
+}
+    }
+    
+    
+
+    override fun `deleteSchedule`(`hostId`: kotlin.String, `scheduleId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_delete_schedule(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`scheduleId`),_status)
+}
+    }
+    
     
 
     override fun `describeToolItem`(`item`: FfiTimelineItem, `cwd`: kotlin.String?): FfiToolStepDescriptor? {
@@ -3035,6 +3694,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     )
     }
+    
+
+    override fun `detachAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_detach_agent(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),_status)
+}
+    }
+    
     
 
     override fun `discoverLocalDaemonUri`(): kotlin.String? {
@@ -3126,6 +3799,50 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `fetchScheduleRuns`(`hostId`: kotlin.String, `scheduleId`: kotlin.String, `limit`: kotlin.UInt?)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_schedule_runs(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`scheduleId`),
+        FfiConverterOptionalUInt.lower(`limit`),_status)
+}
+    }
+    
+    
+
+    override fun `fetchWorkspaceBoard`(`hostId`: kotlin.String, `workspaceId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_workspace_board(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`workspaceId`),_status)
+}
+    }
+    
+    
+
+    override fun `fetchWorkspaceEvents`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `limit`: kotlin.UInt?)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_fetch_workspace_events(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`workspaceId`),
+        FfiConverterOptionalUInt.lower(`limit`),_status)
+}
+    }
+    
+    
+
     override fun `fetchWorkspaceFiles`(`hostId`: kotlin.String, `cwd`: kotlin.String)
         = 
     callWithHandle {
@@ -3201,6 +3918,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `gitReposInspection`(`hostId`: kotlin.String, `path`: kotlin.String): FfiGitReposInspection? {
+            return FfiConverterOptionalTypeFfiGitReposInspection.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_git_repos_inspection(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`path`),_status)
+}
+    }
+    )
+    }
+    
+
     override fun `gitReview`(`hostId`: kotlin.String, `cwd`: kotlin.String, `path`: kotlin.String?): FfiGitReview {
             return FfiConverterTypeFfiGitReview.lift(
     callWithHandle {
@@ -3273,6 +4005,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `listProviderSubagents`(`hostId`: kotlin.String, `parentAgentId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_list_provider_subagents(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`parentAgentId`),_status)
+}
+    }
+    
+    
+
     override fun `markAgentSeen`(`hostId`: kotlin.String, `agentId`: kotlin.String, `seq`: kotlin.ULong)
         = 
     callWithHandle {
@@ -3332,6 +4078,23 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `moveAgentToWorkspaceV2`(`hostId`: kotlin.String, `agentId`: kotlin.String, `targetWorkspaceId`: kotlin.String?, `newWorkspaceTitle`: kotlin.String?, `makeUnclassified`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_move_agent_to_workspace_v2(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterOptionalString.lower(`targetWorkspaceId`),
+        FfiConverterOptionalString.lower(`newWorkspaceTitle`),
+        FfiConverterBoolean.lower(`makeUnclassified`),_status)
+}
+    }
+    
+    
+
     override fun `onAppBackground`()
         = 
     callWithHandle {
@@ -3382,6 +4145,37 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `openProviderSubagentTimeline`(`hostId`: kotlin.String, `parentAgentId`: kotlin.String, `subagentId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_open_provider_subagent_timeline(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`parentAgentId`),
+        FfiConverterString.lower(`subagentId`),_status)
+}
+    }
+    
+    
+
+    override fun `organizeProjectWorkspaces`(`hostId`: kotlin.String, `projectRoot`: kotlin.String, `agentIds`: List<kotlin.String>, `autoApply`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_organize_project_workspaces(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`projectRoot`),
+        FfiConverterSequenceString.lower(`agentIds`),
+        FfiConverterBoolean.lower(`autoApply`),_status)
+}
+    }
+    
+    
+
     
     @Throws(FfiOrbitException::class)override fun `pairHost`(`pairingUri`: kotlin.String): FfiHostCard {
             return FfiConverterTypeFfiHostCard.lift(
@@ -3397,6 +4191,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     
 
+    override fun `pauseSchedule`(`hostId`: kotlin.String, `scheduleId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_pause_schedule(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`scheduleId`),_status)
+}
+    }
+    
+    
+
     override fun `projectOrder`(): List<kotlin.String> {
             return FfiConverterSequenceString.lift(
     callWithHandle {
@@ -3404,6 +4212,22 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_project_order(
         it,
         _status)
+}
+    }
+    )
+    }
+    
+
+    override fun `providerSubagentTimeline`(`hostId`: kotlin.String, `parentAgentId`: kotlin.String, `subagentId`: kotlin.String): List<FfiProviderSubagentEvent> {
+            return FfiConverterSequenceTypeFfiProviderSubagentEvent.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_provider_subagent_timeline(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`parentAgentId`),
+        FfiConverterString.lower(`subagentId`),_status)
 }
     }
     )
@@ -3418,6 +4242,25 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         it,
         
         FfiConverterTypeFfiMentionRankRequest.lower(`req`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `rankMentionCandidatesWithWorkspace`(`hostId`: kotlin.String, `cwd`: kotlin.String, `query`: kotlin.String, `limit`: kotlin.UInt, `workspaceId`: kotlin.String?, `activeAgentId`: kotlin.String?): List<FfiMentionCandidate> {
+            return FfiConverterSequenceTypeFfiMentionCandidate.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rank_mention_candidates_with_workspace(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`cwd`),
+        FfiConverterString.lower(`query`),
+        FfiConverterUInt.lower(`limit`),
+        FfiConverterOptionalString.lower(`workspaceId`),
+        FfiConverterOptionalString.lower(`activeAgentId`),_status)
 }
     }
     )
@@ -3539,6 +4382,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `renameWorkspace`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `title`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_rename_workspace(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`workspaceId`),
+        FfiConverterString.lower(`title`),_status)
+}
+    }
+    
+    
+
     override fun `renderDiagram`(`req`: FfiRenderDiagramRequest): FfiRenderDiagramView {
             return FfiConverterTypeFfiRenderDiagramView.lift(
     callWithHandle {
@@ -3578,6 +4436,21 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         FfiConverterString.lower(`hostId`),
         FfiConverterString.lower(`agentId`),
         FfiConverterSequenceString.lower(`queueIds`),_status)
+}
+    }
+    
+    
+
+    override fun `requestGitReposInspection`(`hostId`: kotlin.String, `path`: kotlin.String, `extraDirs`: List<kotlin.String>)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_request_git_repos_inspection(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`path`),
+        FfiConverterSequenceString.lower(`extraDirs`),_status)
 }
     }
     
@@ -3644,6 +4517,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `resumeSchedule`(`hostId`: kotlin.String, `scheduleId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_resume_schedule(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`scheduleId`),_status)
+}
+    }
+    
+    
+
     
     @Throws(FfiOrbitException::class)override fun `rewindAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String, `toBeforeSeq`: kotlin.ULong, `restoreFiles`: kotlin.Boolean): FfiRewindAgentResult {
             return FfiConverterTypeFfiRewindAgentResult.lift(
@@ -3671,6 +4558,35 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         it,
         
         FfiConverterTypeFfiRewindAgentRequest.lower(`req`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `runScheduleOnce`(`hostId`: kotlin.String, `scheduleId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_run_schedule_once(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`scheduleId`),_status)
+}
+    }
+    
+    
+
+    override fun `scheduleRuns`(`hostId`: kotlin.String, `scheduleId`: kotlin.String): List<FfiScheduleRunRecord> {
+            return FfiConverterSequenceTypeFfiScheduleRunRecord.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_schedule_runs(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`scheduleId`),_status)
 }
     }
     )
@@ -3840,6 +4756,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     
 
+    override fun `spawnWorkspacePeer`(`req`: FfiSpawnWorkspacePeerRequest): kotlin.String {
+            return FfiConverterString.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_spawn_workspace_peer(
+        it,
+        
+        FfiConverterTypeFfiSpawnWorkspacePeerRequest.lower(`req`),_status)
+}
+    }
+    )
+    }
+    
+
     
     @Throws(FfiOrbitException::class)override fun `stageAttachment`(`hostId`: kotlin.String, `filename`: kotlin.String, `mimeType`: kotlin.String?, `bytes`: kotlin.ByteArray): FfiStagedAttachment {
             return FfiConverterTypeFfiStagedAttachment.lift(
@@ -3896,6 +4826,20 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         
         FfiConverterTypeMobileCoreListener.lower(`listener`),
         FfiConverterUInt.lower(`intervalMs`),_status)
+}
+    }
+    
+    
+
+    override fun `summarizeAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_summarize_agent(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),_status)
 }
     }
     
@@ -3962,6 +4906,39 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     }
     
 
+    override fun `unarchiveAgent`(`hostId`: kotlin.String, `agentId`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_unarchive_agent(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),_status)
+}
+    }
+    
+    
+
+    override fun `updateAgentIdentity`(`hostId`: kotlin.String, `agentId`: kotlin.String, `handle`: kotlin.String?, `title`: kotlin.String?, `taskSummary`: kotlin.String?, `lockHandle`: kotlin.Boolean, `lockTitle`: kotlin.Boolean)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_agent_identity(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`agentId`),
+        FfiConverterOptionalString.lower(`handle`),
+        FfiConverterOptionalString.lower(`title`),
+        FfiConverterOptionalString.lower(`taskSummary`),
+        FfiConverterBoolean.lower(`lockHandle`),
+        FfiConverterBoolean.lower(`lockTitle`),_status)
+}
+    }
+    
+    
+
     
     @Throws(FfiOrbitException::class)override fun `updateHostConfig`(`hostId`: kotlin.String, `customName`: kotlin.String?, `routeMode`: FfiHostRouteMode?, `sshAlias`: kotlin.String?, `remoteDaemonPort`: kotlin.UShort?, `customDirectEndpoint`: kotlin.String?, `relayUrl`: kotlin.String?, `reconnect`: kotlin.Boolean): FfiHostCard {
             return FfiConverterTypeFfiHostCard.lift(
@@ -4014,6 +4991,38 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
     
     
 
+    override fun `updateWorkspaceBoard`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `content`: kotlin.String, `section`: kotlin.String?, `updatedBy`: kotlin.String?)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_workspace_board(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`workspaceId`),
+        FfiConverterString.lower(`content`),
+        FfiConverterOptionalString.lower(`section`),
+        FfiConverterOptionalString.lower(`updatedBy`),_status)
+}
+    }
+    
+    
+
+    override fun `updateWorkspaceGoal`(`hostId`: kotlin.String, `workspaceId`: kotlin.String, `goal`: kotlin.String)
+        = 
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_update_workspace_goal(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`workspaceId`),
+        FfiConverterString.lower(`goal`),_status)
+}
+    }
+    
+    
+
     
     @Throws(FfiOrbitException::class)override fun `upgradeHostDaemonOverWire`(`hostId`: kotlin.String, `targetVersion`: kotlin.String?): kotlin.String {
             return FfiConverterString.lift(
@@ -4042,6 +5051,36 @@ open class OrbitMobileCore: Disposable, AutoCloseable, OrbitMobileCoreInterface
         FfiConverterString.lower(`hostId`),
         FfiConverterString.lower(`name`),
         FfiConverterSequenceString.lower(`directories`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `workspaceBoard`(`hostId`: kotlin.String, `workspaceId`: kotlin.String): FfiWorkspaceBoardSnapshot? {
+            return FfiConverterOptionalTypeFfiWorkspaceBoardSnapshot.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_workspace_board(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`workspaceId`),_status)
+}
+    }
+    )
+    }
+    
+
+    override fun `workspaceEvents`(`hostId`: kotlin.String, `workspaceId`: kotlin.String): List<FfiWorkspaceEvent> {
+            return FfiConverterSequenceTypeFfiWorkspaceEvent.lift(
+    callWithHandle {
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_method_orbitmobilecore_workspace_events(
+        it,
+        
+        FfiConverterString.lower(`hostId`),
+        FfiConverterString.lower(`workspaceId`),_status)
 }
     }
     )
@@ -4480,6 +5519,20 @@ data class FfiAgentCard (
     , 
     var `parentAgentId`: kotlin.String?
     , 
+    var `parentHostId`: kotlin.String?
+    , 
+    var `archivedAtRfc3339`: kotlin.String?
+    , 
+    var `handle`: kotlin.String?
+    , 
+    var `clusterSuggestion`: FfiWorkspaceClusterSuggestion?
+    , 
+    var `worktreeBranch`: kotlin.String?
+    , 
+    var `taskSummary`: kotlin.String?
+    , 
+    var `attentionLabel`: kotlin.String?
+    , 
     var `latestSeq`: kotlin.ULong
     , 
     var `updatedAtRfc3339`: kotlin.String
@@ -4521,6 +5574,13 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeFfiWorkspaceClusterSuggestion.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterULong.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
@@ -4545,6 +5605,13 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterBoolean.allocationSize(value.`hasBackgroundTasks`) +
             FfiConverterBoolean.allocationSize(value.`isAwaitingPermission`) +
             FfiConverterOptionalString.allocationSize(value.`parentAgentId`) +
+            FfiConverterOptionalString.allocationSize(value.`parentHostId`) +
+            FfiConverterOptionalString.allocationSize(value.`archivedAtRfc3339`) +
+            FfiConverterOptionalString.allocationSize(value.`handle`) +
+            FfiConverterOptionalTypeFfiWorkspaceClusterSuggestion.allocationSize(value.`clusterSuggestion`) +
+            FfiConverterOptionalString.allocationSize(value.`worktreeBranch`) +
+            FfiConverterOptionalString.allocationSize(value.`taskSummary`) +
+            FfiConverterOptionalString.allocationSize(value.`attentionLabel`) +
             FfiConverterULong.allocationSize(value.`latestSeq`) +
             FfiConverterString.allocationSize(value.`updatedAtRfc3339`) +
             FfiConverterBoolean.allocationSize(value.`isPinned`) +
@@ -4568,6 +5635,13 @@ public object FfiConverterTypeFfiAgentCard: FfiConverterRustBuffer<FfiAgentCard>
             FfiConverterBoolean.write(value.`hasBackgroundTasks`, buf)
             FfiConverterBoolean.write(value.`isAwaitingPermission`, buf)
             FfiConverterOptionalString.write(value.`parentAgentId`, buf)
+            FfiConverterOptionalString.write(value.`parentHostId`, buf)
+            FfiConverterOptionalString.write(value.`archivedAtRfc3339`, buf)
+            FfiConverterOptionalString.write(value.`handle`, buf)
+            FfiConverterOptionalTypeFfiWorkspaceClusterSuggestion.write(value.`clusterSuggestion`, buf)
+            FfiConverterOptionalString.write(value.`worktreeBranch`, buf)
+            FfiConverterOptionalString.write(value.`taskSummary`, buf)
+            FfiConverterOptionalString.write(value.`attentionLabel`, buf)
             FfiConverterULong.write(value.`latestSeq`, buf)
             FfiConverterString.write(value.`updatedAtRfc3339`, buf)
             FfiConverterBoolean.write(value.`isPinned`, buf)
@@ -5053,6 +6127,245 @@ public object FfiConverterTypeFfiClientProject: FfiConverterRustBuffer<FfiClient
 
 
 
+data class FfiCloudSyncDevicePoll (
+    var `status`: FfiCloudSyncDevicePollStatus
+    , 
+    var `intervalSecs`: kotlin.ULong?
+    , 
+    var `error`: kotlin.String?
+    , 
+    var `syncStatus`: FfiCloudSyncStatus?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncDevicePoll: FfiConverterRustBuffer<FfiCloudSyncDevicePoll> {
+    override fun read(buf: ByteBuffer): FfiCloudSyncDevicePoll {
+        return FfiCloudSyncDevicePoll(
+            FfiConverterTypeFfiCloudSyncDevicePollStatus.read(buf),
+            FfiConverterOptionalULong.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeFfiCloudSyncStatus.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiCloudSyncDevicePoll) = (
+            FfiConverterTypeFfiCloudSyncDevicePollStatus.allocationSize(value.`status`) +
+            FfiConverterOptionalULong.allocationSize(value.`intervalSecs`) +
+            FfiConverterOptionalString.allocationSize(value.`error`) +
+            FfiConverterOptionalTypeFfiCloudSyncStatus.allocationSize(value.`syncStatus`)
+    )
+
+    override fun write(value: FfiCloudSyncDevicePoll, buf: ByteBuffer) {
+            FfiConverterTypeFfiCloudSyncDevicePollStatus.write(value.`status`, buf)
+            FfiConverterOptionalULong.write(value.`intervalSecs`, buf)
+            FfiConverterOptionalString.write(value.`error`, buf)
+            FfiConverterOptionalTypeFfiCloudSyncStatus.write(value.`syncStatus`, buf)
+    }
+}
+
+
+
+data class FfiCloudSyncResult (
+    var `hostsAdded`: kotlin.UInt
+    , 
+    var `hostsUpdated`: kotlin.UInt
+    , 
+    var `hostsRemoved`: kotlin.UInt
+    , 
+    var `projectsAdded`: kotlin.UInt
+    , 
+    var `projectsUpdated`: kotlin.UInt
+    , 
+    var `projectsRemoved`: kotlin.UInt
+    , 
+    var `preferencesUpdated`: kotlin.UInt
+    , 
+    var `pushedRemote`: kotlin.Boolean
+    , 
+    var `vaultRevision`: kotlin.ULong
+    , 
+    var `syncedAtMs`: kotlin.Long
+    , 
+    var `gistHtmlUrl`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncResult: FfiConverterRustBuffer<FfiCloudSyncResult> {
+    override fun read(buf: ByteBuffer): FfiCloudSyncResult {
+        return FfiCloudSyncResult(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterLong.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiCloudSyncResult) = (
+            FfiConverterUInt.allocationSize(value.`hostsAdded`) +
+            FfiConverterUInt.allocationSize(value.`hostsUpdated`) +
+            FfiConverterUInt.allocationSize(value.`hostsRemoved`) +
+            FfiConverterUInt.allocationSize(value.`projectsAdded`) +
+            FfiConverterUInt.allocationSize(value.`projectsUpdated`) +
+            FfiConverterUInt.allocationSize(value.`projectsRemoved`) +
+            FfiConverterUInt.allocationSize(value.`preferencesUpdated`) +
+            FfiConverterBoolean.allocationSize(value.`pushedRemote`) +
+            FfiConverterULong.allocationSize(value.`vaultRevision`) +
+            FfiConverterLong.allocationSize(value.`syncedAtMs`) +
+            FfiConverterOptionalString.allocationSize(value.`gistHtmlUrl`)
+    )
+
+    override fun write(value: FfiCloudSyncResult, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`hostsAdded`, buf)
+            FfiConverterUInt.write(value.`hostsUpdated`, buf)
+            FfiConverterUInt.write(value.`hostsRemoved`, buf)
+            FfiConverterUInt.write(value.`projectsAdded`, buf)
+            FfiConverterUInt.write(value.`projectsUpdated`, buf)
+            FfiConverterUInt.write(value.`projectsRemoved`, buf)
+            FfiConverterUInt.write(value.`preferencesUpdated`, buf)
+            FfiConverterBoolean.write(value.`pushedRemote`, buf)
+            FfiConverterULong.write(value.`vaultRevision`, buf)
+            FfiConverterLong.write(value.`syncedAtMs`, buf)
+            FfiConverterOptionalString.write(value.`gistHtmlUrl`, buf)
+    }
+}
+
+
+
+data class FfiCloudSyncStatus (
+    var `state`: FfiCloudSyncState
+    , 
+    var `provider`: kotlin.String
+    , 
+    var `githubOauthConfigured`: kotlin.Boolean
+    , 
+    var `githubClientIdOverride`: kotlin.String?
+    , 
+    var `accountLogin`: kotlin.String?
+    , 
+    var `accountName`: kotlin.String?
+    , 
+    var `accountAvatarUrl`: kotlin.String?
+    , 
+    var `gistId`: kotlin.String?
+    , 
+    var `gistHtmlUrl`: kotlin.String?
+    , 
+    var `remoteVaultExists`: kotlin.Boolean
+    , 
+    var `autoSyncEnabled`: kotlin.Boolean
+    , 
+    var `lastSyncedAtMs`: kotlin.Long?
+    , 
+    var `lastVaultRevision`: kotlin.ULong
+    , 
+    var `syncedHostCount`: kotlin.UInt
+    , 
+    var `syncedProjectCount`: kotlin.UInt
+    , 
+    var `lastError`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncStatus: FfiConverterRustBuffer<FfiCloudSyncStatus> {
+    override fun read(buf: ByteBuffer): FfiCloudSyncStatus {
+        return FfiCloudSyncStatus(
+            FfiConverterTypeFfiCloudSyncState.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalLong.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiCloudSyncStatus) = (
+            FfiConverterTypeFfiCloudSyncState.allocationSize(value.`state`) +
+            FfiConverterString.allocationSize(value.`provider`) +
+            FfiConverterBoolean.allocationSize(value.`githubOauthConfigured`) +
+            FfiConverterOptionalString.allocationSize(value.`githubClientIdOverride`) +
+            FfiConverterOptionalString.allocationSize(value.`accountLogin`) +
+            FfiConverterOptionalString.allocationSize(value.`accountName`) +
+            FfiConverterOptionalString.allocationSize(value.`accountAvatarUrl`) +
+            FfiConverterOptionalString.allocationSize(value.`gistId`) +
+            FfiConverterOptionalString.allocationSize(value.`gistHtmlUrl`) +
+            FfiConverterBoolean.allocationSize(value.`remoteVaultExists`) +
+            FfiConverterBoolean.allocationSize(value.`autoSyncEnabled`) +
+            FfiConverterOptionalLong.allocationSize(value.`lastSyncedAtMs`) +
+            FfiConverterULong.allocationSize(value.`lastVaultRevision`) +
+            FfiConverterUInt.allocationSize(value.`syncedHostCount`) +
+            FfiConverterUInt.allocationSize(value.`syncedProjectCount`) +
+            FfiConverterOptionalString.allocationSize(value.`lastError`)
+    )
+
+    override fun write(value: FfiCloudSyncStatus, buf: ByteBuffer) {
+            FfiConverterTypeFfiCloudSyncState.write(value.`state`, buf)
+            FfiConverterString.write(value.`provider`, buf)
+            FfiConverterBoolean.write(value.`githubOauthConfigured`, buf)
+            FfiConverterOptionalString.write(value.`githubClientIdOverride`, buf)
+            FfiConverterOptionalString.write(value.`accountLogin`, buf)
+            FfiConverterOptionalString.write(value.`accountName`, buf)
+            FfiConverterOptionalString.write(value.`accountAvatarUrl`, buf)
+            FfiConverterOptionalString.write(value.`gistId`, buf)
+            FfiConverterOptionalString.write(value.`gistHtmlUrl`, buf)
+            FfiConverterBoolean.write(value.`remoteVaultExists`, buf)
+            FfiConverterBoolean.write(value.`autoSyncEnabled`, buf)
+            FfiConverterOptionalLong.write(value.`lastSyncedAtMs`, buf)
+            FfiConverterULong.write(value.`lastVaultRevision`, buf)
+            FfiConverterUInt.write(value.`syncedHostCount`, buf)
+            FfiConverterUInt.write(value.`syncedProjectCount`, buf)
+            FfiConverterOptionalString.write(value.`lastError`, buf)
+    }
+}
+
+
+
 data class FfiComposePromptRequest (
     var `provider`: FfiProviderKind
     , 
@@ -5270,6 +6583,104 @@ public object FfiConverterTypeFfiComposerQuoteInput: FfiConverterRustBuffer<FfiC
             FfiConverterString.write(value.`path`, buf)
             FfiConverterOptionalUInt.write(value.`lineNumber`, buf)
             FfiConverterString.write(value.`code`, buf)
+    }
+}
+
+
+
+data class FfiCreateScheduleRequest (
+    var `hostId`: kotlin.String
+    , 
+    var `name`: kotlin.String
+    , 
+    var `cronExpr`: kotlin.String
+    , 
+    var `timezone`: kotlin.String?
+    , 
+    var `prompt`: kotlin.String
+    , 
+    var `cwd`: kotlin.String
+    , 
+    var `workspaceId`: kotlin.String?
+    , 
+    var `provider`: FfiProviderKind
+    , 
+    var `model`: kotlin.String?
+    , 
+    var `effort`: FfiReasoningEffort?
+    , 
+    var `mode`: FfiSessionMode
+    , 
+    var `worktree`: kotlin.Boolean
+    , 
+    var `archiveOnFinish`: kotlin.Boolean
+    , 
+    var `maxRuns`: kotlin.UInt?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCreateScheduleRequest: FfiConverterRustBuffer<FfiCreateScheduleRequest> {
+    override fun read(buf: ByteBuffer): FfiCreateScheduleRequest {
+        return FfiCreateScheduleRequest(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterTypeFfiProviderKind.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeFfiReasoningEffort.read(buf),
+            FfiConverterTypeFfiSessionMode.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiCreateScheduleRequest) = (
+            FfiConverterString.allocationSize(value.`hostId`) +
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterString.allocationSize(value.`cronExpr`) +
+            FfiConverterOptionalString.allocationSize(value.`timezone`) +
+            FfiConverterString.allocationSize(value.`prompt`) +
+            FfiConverterString.allocationSize(value.`cwd`) +
+            FfiConverterOptionalString.allocationSize(value.`workspaceId`) +
+            FfiConverterTypeFfiProviderKind.allocationSize(value.`provider`) +
+            FfiConverterOptionalString.allocationSize(value.`model`) +
+            FfiConverterOptionalTypeFfiReasoningEffort.allocationSize(value.`effort`) +
+            FfiConverterTypeFfiSessionMode.allocationSize(value.`mode`) +
+            FfiConverterBoolean.allocationSize(value.`worktree`) +
+            FfiConverterBoolean.allocationSize(value.`archiveOnFinish`) +
+            FfiConverterOptionalUInt.allocationSize(value.`maxRuns`)
+    )
+
+    override fun write(value: FfiCreateScheduleRequest, buf: ByteBuffer) {
+            FfiConverterString.write(value.`hostId`, buf)
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterString.write(value.`cronExpr`, buf)
+            FfiConverterOptionalString.write(value.`timezone`, buf)
+            FfiConverterString.write(value.`prompt`, buf)
+            FfiConverterString.write(value.`cwd`, buf)
+            FfiConverterOptionalString.write(value.`workspaceId`, buf)
+            FfiConverterTypeFfiProviderKind.write(value.`provider`, buf)
+            FfiConverterOptionalString.write(value.`model`, buf)
+            FfiConverterOptionalTypeFfiReasoningEffort.write(value.`effort`, buf)
+            FfiConverterTypeFfiSessionMode.write(value.`mode`, buf)
+            FfiConverterBoolean.write(value.`worktree`, buf)
+            FfiConverterBoolean.write(value.`archiveOnFinish`, buf)
+            FfiConverterOptionalUInt.write(value.`maxRuns`, buf)
     }
 }
 
@@ -5601,6 +7012,8 @@ data class FfiFleetOverview (
     var `hosts`: List<FfiHostCard>
     , 
     var `projects`: List<FfiClientProject>
+    , 
+    var `projectOrder`: List<kotlin.String>
     
 ){
     
@@ -5621,6 +7034,7 @@ public object FfiConverterTypeFfiFleetOverview: FfiConverterRustBuffer<FfiFleetO
             FfiConverterUInt.read(buf),
             FfiConverterSequenceTypeFfiHostCard.read(buf),
             FfiConverterSequenceTypeFfiClientProject.read(buf),
+            FfiConverterSequenceString.read(buf),
         )
     }
 
@@ -5628,7 +7042,8 @@ public object FfiConverterTypeFfiFleetOverview: FfiConverterRustBuffer<FfiFleetO
             FfiConverterULong.allocationSize(value.`revision`) +
             FfiConverterUInt.allocationSize(value.`totalPendingApprovals`) +
             FfiConverterSequenceTypeFfiHostCard.allocationSize(value.`hosts`) +
-            FfiConverterSequenceTypeFfiClientProject.allocationSize(value.`projects`)
+            FfiConverterSequenceTypeFfiClientProject.allocationSize(value.`projects`) +
+            FfiConverterSequenceString.allocationSize(value.`projectOrder`)
     )
 
     override fun write(value: FfiFleetOverview, buf: ByteBuffer) {
@@ -5636,6 +7051,7 @@ public object FfiConverterTypeFfiFleetOverview: FfiConverterRustBuffer<FfiFleetO
             FfiConverterUInt.write(value.`totalPendingApprovals`, buf)
             FfiConverterSequenceTypeFfiHostCard.write(value.`hosts`, buf)
             FfiConverterSequenceTypeFfiClientProject.write(value.`projects`, buf)
+            FfiConverterSequenceString.write(value.`projectOrder`, buf)
     }
 }
 
@@ -5795,6 +7211,107 @@ public object FfiConverterTypeFfiGitFileEntry: FfiConverterRustBuffer<FfiGitFile
             FfiConverterString.write(value.`status`, buf)
             FfiConverterBoolean.write(value.`staged`, buf)
             FfiConverterBoolean.write(value.`untracked`, buf)
+    }
+}
+
+
+
+data class FfiGitHubDeviceFlowStart (
+    var `deviceCode`: kotlin.String
+    , 
+    var `userCode`: kotlin.String
+    , 
+    var `verificationUri`: kotlin.String
+    , 
+    var `expiresInSecs`: kotlin.ULong
+    , 
+    var `intervalSecs`: kotlin.ULong
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiGitHubDeviceFlowStart: FfiConverterRustBuffer<FfiGitHubDeviceFlowStart> {
+    override fun read(buf: ByteBuffer): FfiGitHubDeviceFlowStart {
+        return FfiGitHubDeviceFlowStart(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiGitHubDeviceFlowStart) = (
+            FfiConverterString.allocationSize(value.`deviceCode`) +
+            FfiConverterString.allocationSize(value.`userCode`) +
+            FfiConverterString.allocationSize(value.`verificationUri`) +
+            FfiConverterULong.allocationSize(value.`expiresInSecs`) +
+            FfiConverterULong.allocationSize(value.`intervalSecs`)
+    )
+
+    override fun write(value: FfiGitHubDeviceFlowStart, buf: ByteBuffer) {
+            FfiConverterString.write(value.`deviceCode`, buf)
+            FfiConverterString.write(value.`userCode`, buf)
+            FfiConverterString.write(value.`verificationUri`, buf)
+            FfiConverterULong.write(value.`expiresInSecs`, buf)
+            FfiConverterULong.write(value.`intervalSecs`, buf)
+    }
+}
+
+
+
+data class FfiGitReposInspection (
+    var `path`: kotlin.String
+    , 
+    var `isGitRepo`: kotlin.Boolean
+    , 
+    var `gitBranch`: kotlin.String?
+    , 
+    var `nestedGitRepos`: List<FfiNestedGitRepo>
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiGitReposInspection: FfiConverterRustBuffer<FfiGitReposInspection> {
+    override fun read(buf: ByteBuffer): FfiGitReposInspection {
+        return FfiGitReposInspection(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterSequenceTypeFfiNestedGitRepo.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiGitReposInspection) = (
+            FfiConverterString.allocationSize(value.`path`) +
+            FfiConverterBoolean.allocationSize(value.`isGitRepo`) +
+            FfiConverterOptionalString.allocationSize(value.`gitBranch`) +
+            FfiConverterSequenceTypeFfiNestedGitRepo.allocationSize(value.`nestedGitRepos`)
+    )
+
+    override fun write(value: FfiGitReposInspection, buf: ByteBuffer) {
+            FfiConverterString.write(value.`path`, buf)
+            FfiConverterBoolean.write(value.`isGitRepo`, buf)
+            FfiConverterOptionalString.write(value.`gitBranch`, buf)
+            FfiConverterSequenceTypeFfiNestedGitRepo.write(value.`nestedGitRepos`, buf)
     }
 }
 
@@ -6137,6 +7654,8 @@ data class FfiHostDetail (
     , 
     var `agents`: List<FfiAgentCard>
     , 
+    var `archivedAgents`: List<FfiAgentCard>
+    , 
     var `lastCreatedAgentId`: kotlin.String?
     , 
     var `replacedOptimisticAgents`: Map<kotlin.String, kotlin.String>
@@ -6148,6 +7667,18 @@ data class FfiHostDetail (
     var `activeTerminalId`: kotlin.String?
     , 
     var `activeTerminalSlot`: kotlin.UByte
+    , 
+    var `schedules`: List<FfiScheduleSpec>
+    , 
+    var `providerSubagents`: Map<kotlin.String, List<FfiProviderSubagentDescriptor>>
+    , 
+    var `gitReposByCwd`: Map<kotlin.String, FfiGitReposInspection>
+    , 
+    var `workspaceBoards`: Map<kotlin.String, FfiWorkspaceBoardSnapshot>
+    , 
+    var `workspaceEvents`: Map<kotlin.String, List<FfiWorkspaceEvent>>
+    , 
+    var `workspaceOrganizeStatus`: Map<kotlin.String, FfiWorkspaceOrganizeStatus>
     
 ){
     
@@ -6171,12 +7702,19 @@ public object FfiConverterTypeFfiHostDetail: FfiConverterRustBuffer<FfiHostDetai
             FfiConverterSequenceTypeFfiProviderModelCatalog.read(buf),
             FfiConverterSequenceTypeFfiWorkspaceSummary.read(buf),
             FfiConverterSequenceTypeFfiAgentCard.read(buf),
+            FfiConverterSequenceTypeFfiAgentCard.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterMapStringString.read(buf),
             FfiConverterSequenceTypeFfiProviderQuota.read(buf),
             FfiConverterSequenceTypeFfiTerminalSummary.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterUByte.read(buf),
+            FfiConverterSequenceTypeFfiScheduleSpec.read(buf),
+            FfiConverterMapStringSequenceTypeFfiProviderSubagentDescriptor.read(buf),
+            FfiConverterMapStringTypeFfiGitReposInspection.read(buf),
+            FfiConverterMapStringTypeFfiWorkspaceBoardSnapshot.read(buf),
+            FfiConverterMapStringSequenceTypeFfiWorkspaceEvent.read(buf),
+            FfiConverterMapStringTypeFfiWorkspaceOrganizeStatus.read(buf),
         )
     }
 
@@ -6188,12 +7726,19 @@ public object FfiConverterTypeFfiHostDetail: FfiConverterRustBuffer<FfiHostDetai
             FfiConverterSequenceTypeFfiProviderModelCatalog.allocationSize(value.`providerCatalogs`) +
             FfiConverterSequenceTypeFfiWorkspaceSummary.allocationSize(value.`workspaces`) +
             FfiConverterSequenceTypeFfiAgentCard.allocationSize(value.`agents`) +
+            FfiConverterSequenceTypeFfiAgentCard.allocationSize(value.`archivedAgents`) +
             FfiConverterOptionalString.allocationSize(value.`lastCreatedAgentId`) +
             FfiConverterMapStringString.allocationSize(value.`replacedOptimisticAgents`) +
             FfiConverterSequenceTypeFfiProviderQuota.allocationSize(value.`quotas`) +
             FfiConverterSequenceTypeFfiTerminalSummary.allocationSize(value.`terminals`) +
             FfiConverterOptionalString.allocationSize(value.`activeTerminalId`) +
-            FfiConverterUByte.allocationSize(value.`activeTerminalSlot`)
+            FfiConverterUByte.allocationSize(value.`activeTerminalSlot`) +
+            FfiConverterSequenceTypeFfiScheduleSpec.allocationSize(value.`schedules`) +
+            FfiConverterMapStringSequenceTypeFfiProviderSubagentDescriptor.allocationSize(value.`providerSubagents`) +
+            FfiConverterMapStringTypeFfiGitReposInspection.allocationSize(value.`gitReposByCwd`) +
+            FfiConverterMapStringTypeFfiWorkspaceBoardSnapshot.allocationSize(value.`workspaceBoards`) +
+            FfiConverterMapStringSequenceTypeFfiWorkspaceEvent.allocationSize(value.`workspaceEvents`) +
+            FfiConverterMapStringTypeFfiWorkspaceOrganizeStatus.allocationSize(value.`workspaceOrganizeStatus`)
     )
 
     override fun write(value: FfiHostDetail, buf: ByteBuffer) {
@@ -6204,12 +7749,19 @@ public object FfiConverterTypeFfiHostDetail: FfiConverterRustBuffer<FfiHostDetai
             FfiConverterSequenceTypeFfiProviderModelCatalog.write(value.`providerCatalogs`, buf)
             FfiConverterSequenceTypeFfiWorkspaceSummary.write(value.`workspaces`, buf)
             FfiConverterSequenceTypeFfiAgentCard.write(value.`agents`, buf)
+            FfiConverterSequenceTypeFfiAgentCard.write(value.`archivedAgents`, buf)
             FfiConverterOptionalString.write(value.`lastCreatedAgentId`, buf)
             FfiConverterMapStringString.write(value.`replacedOptimisticAgents`, buf)
             FfiConverterSequenceTypeFfiProviderQuota.write(value.`quotas`, buf)
             FfiConverterSequenceTypeFfiTerminalSummary.write(value.`terminals`, buf)
             FfiConverterOptionalString.write(value.`activeTerminalId`, buf)
             FfiConverterUByte.write(value.`activeTerminalSlot`, buf)
+            FfiConverterSequenceTypeFfiScheduleSpec.write(value.`schedules`, buf)
+            FfiConverterMapStringSequenceTypeFfiProviderSubagentDescriptor.write(value.`providerSubagents`, buf)
+            FfiConverterMapStringTypeFfiGitReposInspection.write(value.`gitReposByCwd`, buf)
+            FfiConverterMapStringTypeFfiWorkspaceBoardSnapshot.write(value.`workspaceBoards`, buf)
+            FfiConverterMapStringSequenceTypeFfiWorkspaceEvent.write(value.`workspaceEvents`, buf)
+            FfiConverterMapStringTypeFfiWorkspaceOrganizeStatus.write(value.`workspaceOrganizeStatus`, buf)
     }
 }
 
@@ -6283,6 +7835,10 @@ data class FfiLaunchpadProject (
     var `path`: kotlin.String
     , 
     var `branch`: kotlin.String?
+    , 
+    var `isGitRepo`: kotlin.Boolean
+    , 
+    var `nestedGitRepos`: List<FfiNestedGitRepo>
     
 ){
     
@@ -6304,6 +7860,8 @@ public object FfiConverterTypeFfiLaunchpadProject: FfiConverterRustBuffer<FfiLau
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceTypeFfiNestedGitRepo.read(buf),
         )
     }
 
@@ -6312,7 +7870,9 @@ public object FfiConverterTypeFfiLaunchpadProject: FfiConverterRustBuffer<FfiLau
             FfiConverterString.allocationSize(value.`hostId`) +
             FfiConverterString.allocationSize(value.`name`) +
             FfiConverterString.allocationSize(value.`path`) +
-            FfiConverterOptionalString.allocationSize(value.`branch`)
+            FfiConverterOptionalString.allocationSize(value.`branch`) +
+            FfiConverterBoolean.allocationSize(value.`isGitRepo`) +
+            FfiConverterSequenceTypeFfiNestedGitRepo.allocationSize(value.`nestedGitRepos`)
     )
 
     override fun write(value: FfiLaunchpadProject, buf: ByteBuffer) {
@@ -6321,6 +7881,8 @@ public object FfiConverterTypeFfiLaunchpadProject: FfiConverterRustBuffer<FfiLau
             FfiConverterString.write(value.`name`, buf)
             FfiConverterString.write(value.`path`, buf)
             FfiConverterOptionalString.write(value.`branch`, buf)
+            FfiConverterBoolean.write(value.`isGitRepo`, buf)
+            FfiConverterSequenceTypeFfiNestedGitRepo.write(value.`nestedGitRepos`, buf)
     }
 }
 
@@ -6485,6 +8047,107 @@ public object FfiConverterTypeFfiModelSelectionRequest: FfiConverterRustBuffer<F
             FfiConverterTypeFfiProviderKind.write(value.`provider`, buf)
             FfiConverterOptionalString.write(value.`desiredModel`, buf)
             FfiConverterOptionalTypeFfiReasoningEffort.write(value.`desiredEffort`, buf)
+    }
+}
+
+
+
+data class FfiNestedGitRepo (
+    var `path`: kotlin.String
+    , 
+    var `relativePath`: kotlin.String
+    , 
+    var `name`: kotlin.String
+    , 
+    var `gitBranch`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiNestedGitRepo: FfiConverterRustBuffer<FfiNestedGitRepo> {
+    override fun read(buf: ByteBuffer): FfiNestedGitRepo {
+        return FfiNestedGitRepo(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiNestedGitRepo) = (
+            FfiConverterString.allocationSize(value.`path`) +
+            FfiConverterString.allocationSize(value.`relativePath`) +
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterOptionalString.allocationSize(value.`gitBranch`)
+    )
+
+    override fun write(value: FfiNestedGitRepo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`path`, buf)
+            FfiConverterString.write(value.`relativePath`, buf)
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterOptionalString.write(value.`gitBranch`, buf)
+    }
+}
+
+
+
+data class FfiPermissionCheckpointRef (
+    var `childAgentId`: kotlin.String
+    , 
+    var `childHostId`: kotlin.String?
+    , 
+    var `permissionRequestId`: kotlin.String
+    , 
+    var `title`: kotlin.String
+    , 
+    var `allowedDecisions`: List<kotlin.String>
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiPermissionCheckpointRef: FfiConverterRustBuffer<FfiPermissionCheckpointRef> {
+    override fun read(buf: ByteBuffer): FfiPermissionCheckpointRef {
+        return FfiPermissionCheckpointRef(
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiPermissionCheckpointRef) = (
+            FfiConverterString.allocationSize(value.`childAgentId`) +
+            FfiConverterOptionalString.allocationSize(value.`childHostId`) +
+            FfiConverterString.allocationSize(value.`permissionRequestId`) +
+            FfiConverterString.allocationSize(value.`title`) +
+            FfiConverterSequenceString.allocationSize(value.`allowedDecisions`)
+    )
+
+    override fun write(value: FfiPermissionCheckpointRef, buf: ByteBuffer) {
+            FfiConverterString.write(value.`childAgentId`, buf)
+            FfiConverterOptionalString.write(value.`childHostId`, buf)
+            FfiConverterString.write(value.`permissionRequestId`, buf)
+            FfiConverterString.write(value.`title`, buf)
+            FfiConverterSequenceString.write(value.`allowedDecisions`, buf)
     }
 }
 
@@ -6692,6 +8355,127 @@ public object FfiConverterTypeFfiProviderQuota: FfiConverterRustBuffer<FfiProvid
             FfiConverterSequenceTypeFfiQuotaWindow.write(value.`windows`, buf)
             FfiConverterOptionalDouble.write(value.`creditsRemaining`, buf)
             FfiConverterOptionalString.write(value.`error`, buf)
+    }
+}
+
+
+
+data class FfiProviderSubagentDescriptor (
+    var `subagentId`: kotlin.String
+    , 
+    var `parentAgentId`: kotlin.String
+    , 
+    var `parentSubagentId`: kotlin.String?
+    , 
+    var `title`: kotlin.String
+    , 
+    var `subtitle`: kotlin.String?
+    , 
+    var `status`: FfiProviderSubagentStatus
+    , 
+    var `createdAtRfc3339`: kotlin.String
+    , 
+    var `updatedAtRfc3339`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiProviderSubagentDescriptor: FfiConverterRustBuffer<FfiProviderSubagentDescriptor> {
+    override fun read(buf: ByteBuffer): FfiProviderSubagentDescriptor {
+        return FfiProviderSubagentDescriptor(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterTypeFfiProviderSubagentStatus.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiProviderSubagentDescriptor) = (
+            FfiConverterString.allocationSize(value.`subagentId`) +
+            FfiConverterString.allocationSize(value.`parentAgentId`) +
+            FfiConverterOptionalString.allocationSize(value.`parentSubagentId`) +
+            FfiConverterString.allocationSize(value.`title`) +
+            FfiConverterOptionalString.allocationSize(value.`subtitle`) +
+            FfiConverterTypeFfiProviderSubagentStatus.allocationSize(value.`status`) +
+            FfiConverterString.allocationSize(value.`createdAtRfc3339`) +
+            FfiConverterString.allocationSize(value.`updatedAtRfc3339`)
+    )
+
+    override fun write(value: FfiProviderSubagentDescriptor, buf: ByteBuffer) {
+            FfiConverterString.write(value.`subagentId`, buf)
+            FfiConverterString.write(value.`parentAgentId`, buf)
+            FfiConverterOptionalString.write(value.`parentSubagentId`, buf)
+            FfiConverterString.write(value.`title`, buf)
+            FfiConverterOptionalString.write(value.`subtitle`, buf)
+            FfiConverterTypeFfiProviderSubagentStatus.write(value.`status`, buf)
+            FfiConverterString.write(value.`createdAtRfc3339`, buf)
+            FfiConverterString.write(value.`updatedAtRfc3339`, buf)
+    }
+}
+
+
+
+data class FfiProviderSubagentEvent (
+    var `seq`: kotlin.ULong
+    , 
+    var `parentAgentId`: kotlin.String
+    , 
+    var `subagentId`: kotlin.String
+    , 
+    var `timestampRfc3339`: kotlin.String
+    , 
+    var `summaryText`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiProviderSubagentEvent: FfiConverterRustBuffer<FfiProviderSubagentEvent> {
+    override fun read(buf: ByteBuffer): FfiProviderSubagentEvent {
+        return FfiProviderSubagentEvent(
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiProviderSubagentEvent) = (
+            FfiConverterULong.allocationSize(value.`seq`) +
+            FfiConverterString.allocationSize(value.`parentAgentId`) +
+            FfiConverterString.allocationSize(value.`subagentId`) +
+            FfiConverterString.allocationSize(value.`timestampRfc3339`) +
+            FfiConverterString.allocationSize(value.`summaryText`)
+    )
+
+    override fun write(value: FfiProviderSubagentEvent, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`seq`, buf)
+            FfiConverterString.write(value.`parentAgentId`, buf)
+            FfiConverterString.write(value.`subagentId`, buf)
+            FfiConverterString.write(value.`timestampRfc3339`, buf)
+            FfiConverterString.write(value.`summaryText`, buf)
     }
 }
 
@@ -7149,6 +8933,197 @@ public object FfiConverterTypeFfiRewindAgentResult: FfiConverterRustBuffer<FfiRe
 
 
 
+data class FfiScheduleRunRecord (
+    var `runId`: kotlin.String
+    , 
+    var `scheduleId`: kotlin.String
+    , 
+    var `agentId`: kotlin.String?
+    , 
+    var `workspaceId`: kotlin.String?
+    , 
+    var `status`: FfiScheduleRunStatus
+    , 
+    var `summary`: kotlin.String?
+    , 
+    var `error`: kotlin.String?
+    , 
+    var `startedAtRfc3339`: kotlin.String
+    , 
+    var `finishedAtRfc3339`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiScheduleRunRecord: FfiConverterRustBuffer<FfiScheduleRunRecord> {
+    override fun read(buf: ByteBuffer): FfiScheduleRunRecord {
+        return FfiScheduleRunRecord(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterTypeFfiScheduleRunStatus.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiScheduleRunRecord) = (
+            FfiConverterString.allocationSize(value.`runId`) +
+            FfiConverterString.allocationSize(value.`scheduleId`) +
+            FfiConverterOptionalString.allocationSize(value.`agentId`) +
+            FfiConverterOptionalString.allocationSize(value.`workspaceId`) +
+            FfiConverterTypeFfiScheduleRunStatus.allocationSize(value.`status`) +
+            FfiConverterOptionalString.allocationSize(value.`summary`) +
+            FfiConverterOptionalString.allocationSize(value.`error`) +
+            FfiConverterString.allocationSize(value.`startedAtRfc3339`) +
+            FfiConverterOptionalString.allocationSize(value.`finishedAtRfc3339`)
+    )
+
+    override fun write(value: FfiScheduleRunRecord, buf: ByteBuffer) {
+            FfiConverterString.write(value.`runId`, buf)
+            FfiConverterString.write(value.`scheduleId`, buf)
+            FfiConverterOptionalString.write(value.`agentId`, buf)
+            FfiConverterOptionalString.write(value.`workspaceId`, buf)
+            FfiConverterTypeFfiScheduleRunStatus.write(value.`status`, buf)
+            FfiConverterOptionalString.write(value.`summary`, buf)
+            FfiConverterOptionalString.write(value.`error`, buf)
+            FfiConverterString.write(value.`startedAtRfc3339`, buf)
+            FfiConverterOptionalString.write(value.`finishedAtRfc3339`, buf)
+    }
+}
+
+
+
+data class FfiScheduleSpec (
+    var `scheduleId`: kotlin.String
+    , 
+    var `kind`: FfiScheduleKind
+    , 
+    var `name`: kotlin.String
+    , 
+    var `cronExpr`: kotlin.String
+    , 
+    var `timezone`: kotlin.String?
+    , 
+    var `prompt`: kotlin.String
+    , 
+    var `status`: FfiScheduleStatus
+    , 
+    var `cwd`: kotlin.String?
+    , 
+    var `workspaceId`: kotlin.String?
+    , 
+    var `provider`: FfiProviderKind?
+    , 
+    var `mode`: FfiSessionMode?
+    , 
+    var `worktree`: kotlin.Boolean
+    , 
+    var `archiveOnFinish`: kotlin.Boolean
+    , 
+    var `targetAgentId`: kotlin.String?
+    , 
+    var `maxRuns`: kotlin.UInt?
+    , 
+    var `runCount`: kotlin.UInt
+    , 
+    var `lastRunAtRfc3339`: kotlin.String?
+    , 
+    var `nextRunAtRfc3339`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiScheduleSpec: FfiConverterRustBuffer<FfiScheduleSpec> {
+    override fun read(buf: ByteBuffer): FfiScheduleSpec {
+        return FfiScheduleSpec(
+            FfiConverterString.read(buf),
+            FfiConverterTypeFfiScheduleKind.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterTypeFfiScheduleStatus.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeFfiProviderKind.read(buf),
+            FfiConverterOptionalTypeFfiSessionMode.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiScheduleSpec) = (
+            FfiConverterString.allocationSize(value.`scheduleId`) +
+            FfiConverterTypeFfiScheduleKind.allocationSize(value.`kind`) +
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterString.allocationSize(value.`cronExpr`) +
+            FfiConverterOptionalString.allocationSize(value.`timezone`) +
+            FfiConverterString.allocationSize(value.`prompt`) +
+            FfiConverterTypeFfiScheduleStatus.allocationSize(value.`status`) +
+            FfiConverterOptionalString.allocationSize(value.`cwd`) +
+            FfiConverterOptionalString.allocationSize(value.`workspaceId`) +
+            FfiConverterOptionalTypeFfiProviderKind.allocationSize(value.`provider`) +
+            FfiConverterOptionalTypeFfiSessionMode.allocationSize(value.`mode`) +
+            FfiConverterBoolean.allocationSize(value.`worktree`) +
+            FfiConverterBoolean.allocationSize(value.`archiveOnFinish`) +
+            FfiConverterOptionalString.allocationSize(value.`targetAgentId`) +
+            FfiConverterOptionalUInt.allocationSize(value.`maxRuns`) +
+            FfiConverterUInt.allocationSize(value.`runCount`) +
+            FfiConverterOptionalString.allocationSize(value.`lastRunAtRfc3339`) +
+            FfiConverterOptionalString.allocationSize(value.`nextRunAtRfc3339`)
+    )
+
+    override fun write(value: FfiScheduleSpec, buf: ByteBuffer) {
+            FfiConverterString.write(value.`scheduleId`, buf)
+            FfiConverterTypeFfiScheduleKind.write(value.`kind`, buf)
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterString.write(value.`cronExpr`, buf)
+            FfiConverterOptionalString.write(value.`timezone`, buf)
+            FfiConverterString.write(value.`prompt`, buf)
+            FfiConverterTypeFfiScheduleStatus.write(value.`status`, buf)
+            FfiConverterOptionalString.write(value.`cwd`, buf)
+            FfiConverterOptionalString.write(value.`workspaceId`, buf)
+            FfiConverterOptionalTypeFfiProviderKind.write(value.`provider`, buf)
+            FfiConverterOptionalTypeFfiSessionMode.write(value.`mode`, buf)
+            FfiConverterBoolean.write(value.`worktree`, buf)
+            FfiConverterBoolean.write(value.`archiveOnFinish`, buf)
+            FfiConverterOptionalString.write(value.`targetAgentId`, buf)
+            FfiConverterOptionalUInt.write(value.`maxRuns`, buf)
+            FfiConverterUInt.write(value.`runCount`, buf)
+            FfiConverterOptionalString.write(value.`lastRunAtRfc3339`, buf)
+            FfiConverterOptionalString.write(value.`nextRunAtRfc3339`, buf)
+    }
+}
+
+
+
 data class FfiSendPromptRequest (
     var `hostId`: kotlin.String
     , 
@@ -7218,6 +9193,8 @@ data class FfiSessionBackgroundTask (
     var `command`: kotlin.String?
     , 
     var `outputPreview`: kotlin.String?
+    , 
+    var `logPath`: kotlin.String?
     
 ){
     
@@ -7242,6 +9219,7 @@ public object FfiConverterTypeFfiSessionBackgroundTask: FfiConverterRustBuffer<F
             FfiConverterOptionalLong.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -7253,7 +9231,8 @@ public object FfiConverterTypeFfiSessionBackgroundTask: FfiConverterRustBuffer<F
             FfiConverterTypeFfiSessionBackgroundTaskStatus.allocationSize(value.`status`) +
             FfiConverterOptionalLong.allocationSize(value.`startedAtMs`) +
             FfiConverterOptionalString.allocationSize(value.`command`) +
-            FfiConverterOptionalString.allocationSize(value.`outputPreview`)
+            FfiConverterOptionalString.allocationSize(value.`outputPreview`) +
+            FfiConverterOptionalString.allocationSize(value.`logPath`)
     )
 
     override fun write(value: FfiSessionBackgroundTask, buf: ByteBuffer) {
@@ -7265,6 +9244,7 @@ public object FfiConverterTypeFfiSessionBackgroundTask: FfiConverterRustBuffer<F
             FfiConverterOptionalLong.write(value.`startedAtMs`, buf)
             FfiConverterOptionalString.write(value.`command`, buf)
             FfiConverterOptionalString.write(value.`outputPreview`, buf)
+            FfiConverterOptionalString.write(value.`logPath`, buf)
     }
 }
 
@@ -7329,6 +9309,8 @@ data class FfiSessionSubagentEntry (
     , 
     var `childAgentId`: kotlin.String?
     , 
+    var `providerSubagentId`: kotlin.String?
+    , 
     var `lastSeq`: kotlin.ULong
     
 ){
@@ -7351,6 +9333,7 @@ public object FfiConverterTypeFfiSessionSubagentEntry: FfiConverterRustBuffer<Ff
             FfiConverterString.read(buf),
             FfiConverterTypeFfiToolStatus.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
             FfiConverterULong.read(buf),
         )
     }
@@ -7361,6 +9344,7 @@ public object FfiConverterTypeFfiSessionSubagentEntry: FfiConverterRustBuffer<Ff
             FfiConverterString.allocationSize(value.`promptPreview`) +
             FfiConverterTypeFfiToolStatus.allocationSize(value.`status`) +
             FfiConverterOptionalString.allocationSize(value.`childAgentId`) +
+            FfiConverterOptionalString.allocationSize(value.`providerSubagentId`) +
             FfiConverterULong.allocationSize(value.`lastSeq`)
     )
 
@@ -7370,6 +9354,7 @@ public object FfiConverterTypeFfiSessionSubagentEntry: FfiConverterRustBuffer<Ff
             FfiConverterString.write(value.`promptPreview`, buf)
             FfiConverterTypeFfiToolStatus.write(value.`status`, buf)
             FfiConverterOptionalString.write(value.`childAgentId`, buf)
+            FfiConverterOptionalString.write(value.`providerSubagentId`, buf)
             FfiConverterULong.write(value.`lastSeq`, buf)
     }
 }
@@ -7505,13 +9490,23 @@ data class FfiSidebarProjectGroup (
     , 
     var `gitBranch`: kotlin.String?
     , 
+    var `isGitRepo`: kotlin.Boolean
+    , 
+    var `nestedGitRepos`: List<FfiNestedGitRepo>
+    , 
     var `pinnedProjectId`: kotlin.String?
     , 
     var `isHomeWorkspace`: kotlin.Boolean
     , 
     var `sortWeightMs`: kotlin.Long
     , 
+    var `sortOrderKey`: kotlin.String
+    , 
     var `conversations`: List<FfiSidebarConversation>
+    , 
+    var `workspaces`: List<FfiSidebarWorkspaceGroup>
+    , 
+    var `unclassifiedConversations`: List<FfiSidebarConversation>
     
 ){
     
@@ -7534,9 +9529,14 @@ public object FfiConverterTypeFfiSidebarProjectGroup: FfiConverterRustBuffer<Ffi
             FfiConverterString.read(buf),
             FfiConverterSequenceString.read(buf),
             FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceTypeFfiNestedGitRepo.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterLong.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterSequenceTypeFfiSidebarConversation.read(buf),
+            FfiConverterSequenceTypeFfiSidebarWorkspaceGroup.read(buf),
             FfiConverterSequenceTypeFfiSidebarConversation.read(buf),
         )
     }
@@ -7548,10 +9548,15 @@ public object FfiConverterTypeFfiSidebarProjectGroup: FfiConverterRustBuffer<Ffi
             FfiConverterString.allocationSize(value.`primaryCwd`) +
             FfiConverterSequenceString.allocationSize(value.`directories`) +
             FfiConverterOptionalString.allocationSize(value.`gitBranch`) +
+            FfiConverterBoolean.allocationSize(value.`isGitRepo`) +
+            FfiConverterSequenceTypeFfiNestedGitRepo.allocationSize(value.`nestedGitRepos`) +
             FfiConverterOptionalString.allocationSize(value.`pinnedProjectId`) +
             FfiConverterBoolean.allocationSize(value.`isHomeWorkspace`) +
             FfiConverterLong.allocationSize(value.`sortWeightMs`) +
-            FfiConverterSequenceTypeFfiSidebarConversation.allocationSize(value.`conversations`)
+            FfiConverterString.allocationSize(value.`sortOrderKey`) +
+            FfiConverterSequenceTypeFfiSidebarConversation.allocationSize(value.`conversations`) +
+            FfiConverterSequenceTypeFfiSidebarWorkspaceGroup.allocationSize(value.`workspaces`) +
+            FfiConverterSequenceTypeFfiSidebarConversation.allocationSize(value.`unclassifiedConversations`)
     )
 
     override fun write(value: FfiSidebarProjectGroup, buf: ByteBuffer) {
@@ -7561,9 +9566,112 @@ public object FfiConverterTypeFfiSidebarProjectGroup: FfiConverterRustBuffer<Ffi
             FfiConverterString.write(value.`primaryCwd`, buf)
             FfiConverterSequenceString.write(value.`directories`, buf)
             FfiConverterOptionalString.write(value.`gitBranch`, buf)
+            FfiConverterBoolean.write(value.`isGitRepo`, buf)
+            FfiConverterSequenceTypeFfiNestedGitRepo.write(value.`nestedGitRepos`, buf)
             FfiConverterOptionalString.write(value.`pinnedProjectId`, buf)
             FfiConverterBoolean.write(value.`isHomeWorkspace`, buf)
             FfiConverterLong.write(value.`sortWeightMs`, buf)
+            FfiConverterString.write(value.`sortOrderKey`, buf)
+            FfiConverterSequenceTypeFfiSidebarConversation.write(value.`conversations`, buf)
+            FfiConverterSequenceTypeFfiSidebarWorkspaceGroup.write(value.`workspaces`, buf)
+            FfiConverterSequenceTypeFfiSidebarConversation.write(value.`unclassifiedConversations`, buf)
+    }
+}
+
+
+
+data class FfiSidebarWorkspaceGroup (
+    var `workspaceId`: kotlin.String
+    , 
+    var `title`: kotlin.String
+    , 
+    var `missionGoal`: kotlin.String?
+    , 
+    var `cwd`: kotlin.String
+    , 
+    var `gitBranch`: kotlin.String?
+    , 
+    var `isWorktree`: kotlin.Boolean
+    , 
+    var `boardRevision`: kotlin.ULong
+    , 
+    var `hasConflict`: kotlin.Boolean
+    , 
+    var `peerCount`: kotlin.UInt
+    , 
+    var `runningCount`: kotlin.UInt
+    , 
+    var `unreadCount`: kotlin.UInt
+    , 
+    var `isMultiAgent`: kotlin.Boolean
+    , 
+    var `isCurated`: kotlin.Boolean
+    , 
+    var `conversations`: List<FfiSidebarConversation>
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiSidebarWorkspaceGroup: FfiConverterRustBuffer<FfiSidebarWorkspaceGroup> {
+    override fun read(buf: ByteBuffer): FfiSidebarWorkspaceGroup {
+        return FfiSidebarWorkspaceGroup(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterSequenceTypeFfiSidebarConversation.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiSidebarWorkspaceGroup) = (
+            FfiConverterString.allocationSize(value.`workspaceId`) +
+            FfiConverterString.allocationSize(value.`title`) +
+            FfiConverterOptionalString.allocationSize(value.`missionGoal`) +
+            FfiConverterString.allocationSize(value.`cwd`) +
+            FfiConverterOptionalString.allocationSize(value.`gitBranch`) +
+            FfiConverterBoolean.allocationSize(value.`isWorktree`) +
+            FfiConverterULong.allocationSize(value.`boardRevision`) +
+            FfiConverterBoolean.allocationSize(value.`hasConflict`) +
+            FfiConverterUInt.allocationSize(value.`peerCount`) +
+            FfiConverterUInt.allocationSize(value.`runningCount`) +
+            FfiConverterUInt.allocationSize(value.`unreadCount`) +
+            FfiConverterBoolean.allocationSize(value.`isMultiAgent`) +
+            FfiConverterBoolean.allocationSize(value.`isCurated`) +
+            FfiConverterSequenceTypeFfiSidebarConversation.allocationSize(value.`conversations`)
+    )
+
+    override fun write(value: FfiSidebarWorkspaceGroup, buf: ByteBuffer) {
+            FfiConverterString.write(value.`workspaceId`, buf)
+            FfiConverterString.write(value.`title`, buf)
+            FfiConverterOptionalString.write(value.`missionGoal`, buf)
+            FfiConverterString.write(value.`cwd`, buf)
+            FfiConverterOptionalString.write(value.`gitBranch`, buf)
+            FfiConverterBoolean.write(value.`isWorktree`, buf)
+            FfiConverterULong.write(value.`boardRevision`, buf)
+            FfiConverterBoolean.write(value.`hasConflict`, buf)
+            FfiConverterUInt.write(value.`peerCount`, buf)
+            FfiConverterUInt.write(value.`runningCount`, buf)
+            FfiConverterUInt.write(value.`unreadCount`, buf)
+            FfiConverterBoolean.write(value.`isMultiAgent`, buf)
+            FfiConverterBoolean.write(value.`isCurated`, buf)
             FfiConverterSequenceTypeFfiSidebarConversation.write(value.`conversations`, buf)
     }
 }
@@ -7633,6 +9741,94 @@ public object FfiConverterTypeFfiSlashCommand: FfiConverterRustBuffer<FfiSlashCo
             FfiConverterString.write(value.`iconKey`, buf)
             FfiConverterSequenceString.write(value.`keywords`, buf)
             FfiConverterBoolean.write(value.`desktopOnly`, buf)
+    }
+}
+
+
+
+data class FfiSpawnWorkspacePeerRequest (
+    var `hostId`: kotlin.String
+    , 
+    var `workspaceId`: kotlin.String
+    , 
+    var `cwd`: kotlin.String
+    , 
+    var `extraDirs`: List<kotlin.String>
+    , 
+    var `provider`: FfiProviderKind
+    , 
+    var `model`: kotlin.String?
+    , 
+    var `effort`: FfiReasoningEffort?
+    , 
+    var `mode`: FfiSessionMode
+    , 
+    var `initialPrompt`: kotlin.String
+    , 
+    var `worktreeBranch`: kotlin.String?
+    , 
+    var `handle`: kotlin.String?
+    , 
+    var `profileId`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiSpawnWorkspacePeerRequest: FfiConverterRustBuffer<FfiSpawnWorkspacePeerRequest> {
+    override fun read(buf: ByteBuffer): FfiSpawnWorkspacePeerRequest {
+        return FfiSpawnWorkspacePeerRequest(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterSequenceString.read(buf),
+            FfiConverterTypeFfiProviderKind.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalTypeFfiReasoningEffort.read(buf),
+            FfiConverterTypeFfiSessionMode.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiSpawnWorkspacePeerRequest) = (
+            FfiConverterString.allocationSize(value.`hostId`) +
+            FfiConverterString.allocationSize(value.`workspaceId`) +
+            FfiConverterString.allocationSize(value.`cwd`) +
+            FfiConverterSequenceString.allocationSize(value.`extraDirs`) +
+            FfiConverterTypeFfiProviderKind.allocationSize(value.`provider`) +
+            FfiConverterOptionalString.allocationSize(value.`model`) +
+            FfiConverterOptionalTypeFfiReasoningEffort.allocationSize(value.`effort`) +
+            FfiConverterTypeFfiSessionMode.allocationSize(value.`mode`) +
+            FfiConverterString.allocationSize(value.`initialPrompt`) +
+            FfiConverterOptionalString.allocationSize(value.`worktreeBranch`) +
+            FfiConverterOptionalString.allocationSize(value.`handle`) +
+            FfiConverterOptionalString.allocationSize(value.`profileId`)
+    )
+
+    override fun write(value: FfiSpawnWorkspacePeerRequest, buf: ByteBuffer) {
+            FfiConverterString.write(value.`hostId`, buf)
+            FfiConverterString.write(value.`workspaceId`, buf)
+            FfiConverterString.write(value.`cwd`, buf)
+            FfiConverterSequenceString.write(value.`extraDirs`, buf)
+            FfiConverterTypeFfiProviderKind.write(value.`provider`, buf)
+            FfiConverterOptionalString.write(value.`model`, buf)
+            FfiConverterOptionalTypeFfiReasoningEffort.write(value.`effort`, buf)
+            FfiConverterTypeFfiSessionMode.write(value.`mode`, buf)
+            FfiConverterString.write(value.`initialPrompt`, buf)
+            FfiConverterOptionalString.write(value.`worktreeBranch`, buf)
+            FfiConverterOptionalString.write(value.`handle`, buf)
+            FfiConverterOptionalString.write(value.`profileId`, buf)
     }
 }
 
@@ -8621,6 +10817,190 @@ public object FfiConverterTypeFfiWorkSummaryResult: FfiConverterRustBuffer<FfiWo
 
 
 
+data class FfiWorkspaceBoardSnapshot (
+    var `workspaceId`: kotlin.String
+    , 
+    var `content`: kotlin.String
+    , 
+    var `revision`: kotlin.ULong
+    , 
+    var `updatedBy`: kotlin.String?
+    , 
+    var `updatedAtRfc3339`: kotlin.String
+    , 
+    var `boardPath`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiWorkspaceBoardSnapshot: FfiConverterRustBuffer<FfiWorkspaceBoardSnapshot> {
+    override fun read(buf: ByteBuffer): FfiWorkspaceBoardSnapshot {
+        return FfiWorkspaceBoardSnapshot(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiWorkspaceBoardSnapshot) = (
+            FfiConverterString.allocationSize(value.`workspaceId`) +
+            FfiConverterString.allocationSize(value.`content`) +
+            FfiConverterULong.allocationSize(value.`revision`) +
+            FfiConverterOptionalString.allocationSize(value.`updatedBy`) +
+            FfiConverterString.allocationSize(value.`updatedAtRfc3339`) +
+            FfiConverterOptionalString.allocationSize(value.`boardPath`)
+    )
+
+    override fun write(value: FfiWorkspaceBoardSnapshot, buf: ByteBuffer) {
+            FfiConverterString.write(value.`workspaceId`, buf)
+            FfiConverterString.write(value.`content`, buf)
+            FfiConverterULong.write(value.`revision`, buf)
+            FfiConverterOptionalString.write(value.`updatedBy`, buf)
+            FfiConverterString.write(value.`updatedAtRfc3339`, buf)
+            FfiConverterOptionalString.write(value.`boardPath`, buf)
+    }
+}
+
+
+
+data class FfiWorkspaceClusterSuggestion (
+    var `targetWorkspaceId`: kotlin.String
+    , 
+    var `targetWorkspaceTitle`: kotlin.String
+    , 
+    var `confidence`: kotlin.Float
+    , 
+    var `reason`: kotlin.String
+    , 
+    var `autoApplied`: kotlin.Boolean
+    , 
+    var `previousWorkspaceId`: kotlin.String?
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiWorkspaceClusterSuggestion: FfiConverterRustBuffer<FfiWorkspaceClusterSuggestion> {
+    override fun read(buf: ByteBuffer): FfiWorkspaceClusterSuggestion {
+        return FfiWorkspaceClusterSuggestion(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterFloat.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiWorkspaceClusterSuggestion) = (
+            FfiConverterString.allocationSize(value.`targetWorkspaceId`) +
+            FfiConverterString.allocationSize(value.`targetWorkspaceTitle`) +
+            FfiConverterFloat.allocationSize(value.`confidence`) +
+            FfiConverterString.allocationSize(value.`reason`) +
+            FfiConverterBoolean.allocationSize(value.`autoApplied`) +
+            FfiConverterOptionalString.allocationSize(value.`previousWorkspaceId`)
+    )
+
+    override fun write(value: FfiWorkspaceClusterSuggestion, buf: ByteBuffer) {
+            FfiConverterString.write(value.`targetWorkspaceId`, buf)
+            FfiConverterString.write(value.`targetWorkspaceTitle`, buf)
+            FfiConverterFloat.write(value.`confidence`, buf)
+            FfiConverterString.write(value.`reason`, buf)
+            FfiConverterBoolean.write(value.`autoApplied`, buf)
+            FfiConverterOptionalString.write(value.`previousWorkspaceId`, buf)
+    }
+}
+
+
+
+data class FfiWorkspaceEvent (
+    var `seq`: kotlin.ULong
+    , 
+    var `workspaceId`: kotlin.String
+    , 
+    var `agentId`: kotlin.String?
+    , 
+    var `agentHandle`: kotlin.String?
+    , 
+    var `kind`: FfiWorkspaceEventKind
+    , 
+    var `summary`: kotlin.String
+    , 
+    var `filePath`: kotlin.String?
+    , 
+    var `createdAtRfc3339`: kotlin.String
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiWorkspaceEvent: FfiConverterRustBuffer<FfiWorkspaceEvent> {
+    override fun read(buf: ByteBuffer): FfiWorkspaceEvent {
+        return FfiWorkspaceEvent(
+            FfiConverterULong.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterTypeFfiWorkspaceEventKind.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiWorkspaceEvent) = (
+            FfiConverterULong.allocationSize(value.`seq`) +
+            FfiConverterString.allocationSize(value.`workspaceId`) +
+            FfiConverterOptionalString.allocationSize(value.`agentId`) +
+            FfiConverterOptionalString.allocationSize(value.`agentHandle`) +
+            FfiConverterTypeFfiWorkspaceEventKind.allocationSize(value.`kind`) +
+            FfiConverterString.allocationSize(value.`summary`) +
+            FfiConverterOptionalString.allocationSize(value.`filePath`) +
+            FfiConverterString.allocationSize(value.`createdAtRfc3339`)
+    )
+
+    override fun write(value: FfiWorkspaceEvent, buf: ByteBuffer) {
+            FfiConverterULong.write(value.`seq`, buf)
+            FfiConverterString.write(value.`workspaceId`, buf)
+            FfiConverterOptionalString.write(value.`agentId`, buf)
+            FfiConverterOptionalString.write(value.`agentHandle`, buf)
+            FfiConverterTypeFfiWorkspaceEventKind.write(value.`kind`, buf)
+            FfiConverterString.write(value.`summary`, buf)
+            FfiConverterOptionalString.write(value.`filePath`, buf)
+            FfiConverterString.write(value.`createdAtRfc3339`, buf)
+    }
+}
+
+
+
 data class FfiWorkspaceFile (
     var `hostId`: kotlin.String
     , 
@@ -8709,6 +11089,64 @@ public object FfiConverterTypeFfiWorkspaceFile: FfiConverterRustBuffer<FfiWorksp
 
 
 
+data class FfiWorkspaceOrganizeStatus (
+    var `projectRoot`: kotlin.String
+    , 
+    var `phase`: FfiWorkspaceOrganizePhase
+    , 
+    var `message`: kotlin.String
+    , 
+    var `createdWorkspaces`: kotlin.UInt
+    , 
+    var `groupedAgents`: kotlin.UInt
+    , 
+    var `summarizedAgents`: kotlin.UInt
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiWorkspaceOrganizeStatus: FfiConverterRustBuffer<FfiWorkspaceOrganizeStatus> {
+    override fun read(buf: ByteBuffer): FfiWorkspaceOrganizeStatus {
+        return FfiWorkspaceOrganizeStatus(
+            FfiConverterString.read(buf),
+            FfiConverterTypeFfiWorkspaceOrganizePhase.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiWorkspaceOrganizeStatus) = (
+            FfiConverterString.allocationSize(value.`projectRoot`) +
+            FfiConverterTypeFfiWorkspaceOrganizePhase.allocationSize(value.`phase`) +
+            FfiConverterString.allocationSize(value.`message`) +
+            FfiConverterUInt.allocationSize(value.`createdWorkspaces`) +
+            FfiConverterUInt.allocationSize(value.`groupedAgents`) +
+            FfiConverterUInt.allocationSize(value.`summarizedAgents`)
+    )
+
+    override fun write(value: FfiWorkspaceOrganizeStatus, buf: ByteBuffer) {
+            FfiConverterString.write(value.`projectRoot`, buf)
+            FfiConverterTypeFfiWorkspaceOrganizePhase.write(value.`phase`, buf)
+            FfiConverterString.write(value.`message`, buf)
+            FfiConverterUInt.write(value.`createdWorkspaces`, buf)
+            FfiConverterUInt.write(value.`groupedAgents`, buf)
+            FfiConverterUInt.write(value.`summarizedAgents`, buf)
+    }
+}
+
+
+
 data class FfiWorkspaceSummary (
     var `workspaceId`: kotlin.String
     , 
@@ -8719,6 +11157,18 @@ data class FfiWorkspaceSummary (
     var `gitBranch`: kotlin.String?
     , 
     var `isWorktree`: kotlin.Boolean
+    , 
+    var `missionGoal`: kotlin.String?
+    , 
+    var `projectRoot`: kotlin.String?
+    , 
+    var `sourceCwd`: kotlin.String?
+    , 
+    var `boardRevision`: kotlin.ULong
+    , 
+    var `isCurated`: kotlin.Boolean
+    , 
+    var `updatedAtRfc3339`: kotlin.String
     
 ){
     
@@ -8740,6 +11190,12 @@ public object FfiConverterTypeFfiWorkspaceSummary: FfiConverterRustBuffer<FfiWor
             FfiConverterString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterString.read(buf),
         )
     }
 
@@ -8748,7 +11204,13 @@ public object FfiConverterTypeFfiWorkspaceSummary: FfiConverterRustBuffer<FfiWor
             FfiConverterString.allocationSize(value.`title`) +
             FfiConverterString.allocationSize(value.`cwd`) +
             FfiConverterOptionalString.allocationSize(value.`gitBranch`) +
-            FfiConverterBoolean.allocationSize(value.`isWorktree`)
+            FfiConverterBoolean.allocationSize(value.`isWorktree`) +
+            FfiConverterOptionalString.allocationSize(value.`missionGoal`) +
+            FfiConverterOptionalString.allocationSize(value.`projectRoot`) +
+            FfiConverterOptionalString.allocationSize(value.`sourceCwd`) +
+            FfiConverterULong.allocationSize(value.`boardRevision`) +
+            FfiConverterBoolean.allocationSize(value.`isCurated`) +
+            FfiConverterString.allocationSize(value.`updatedAtRfc3339`)
     )
 
     override fun write(value: FfiWorkspaceSummary, buf: ByteBuffer) {
@@ -8757,8 +11219,49 @@ public object FfiConverterTypeFfiWorkspaceSummary: FfiConverterRustBuffer<FfiWor
             FfiConverterString.write(value.`cwd`, buf)
             FfiConverterOptionalString.write(value.`gitBranch`, buf)
             FfiConverterBoolean.write(value.`isWorktree`, buf)
+            FfiConverterOptionalString.write(value.`missionGoal`, buf)
+            FfiConverterOptionalString.write(value.`projectRoot`, buf)
+            FfiConverterOptionalString.write(value.`sourceCwd`, buf)
+            FfiConverterULong.write(value.`boardRevision`, buf)
+            FfiConverterBoolean.write(value.`isCurated`, buf)
+            FfiConverterString.write(value.`updatedAtRfc3339`, buf)
     }
 }
+
+
+
+
+enum class FfiAgentMessageKind {
+    
+    DIRECT_MESSAGE,
+    FINISH_NOTIFICATION,
+    HEARTBEAT;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiAgentMessageKind: FfiConverterRustBuffer<FfiAgentMessageKind> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiAgentMessageKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiAgentMessageKind) = 4UL
+
+    override fun write(value: FfiAgentMessageKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 
@@ -8790,6 +11293,80 @@ public object FfiConverterTypeFfiClientPlatform: FfiConverterRustBuffer<FfiClien
     override fun allocationSize(value: FfiClientPlatform) = 4UL
 
     override fun write(value: FfiClientPlatform, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiCloudSyncDevicePollStatus {
+    
+    PENDING,
+    SLOW_DOWN,
+    AUTHORIZED,
+    EXPIRED,
+    DENIED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncDevicePollStatus: FfiConverterRustBuffer<FfiCloudSyncDevicePollStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiCloudSyncDevicePollStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiCloudSyncDevicePollStatus) = 4UL
+
+    override fun write(value: FfiCloudSyncDevicePollStatus, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiCloudSyncState {
+    
+    SIGNED_OUT,
+    LOCKED,
+    READY,
+    SYNCING,
+    ERROR;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiCloudSyncState: FfiConverterRustBuffer<FfiCloudSyncState> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiCloudSyncState.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiCloudSyncState) = 4UL
+
+    override fun write(value: FfiCloudSyncState, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -9461,6 +12038,42 @@ public object FfiConverterTypeFfiProviderKind: FfiConverterRustBuffer<FfiProvide
 
 
 
+enum class FfiProviderSubagentStatus {
+    
+    RUNNING,
+    COMPLETED,
+    FAILED,
+    CANCELED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiProviderSubagentStatus: FfiConverterRustBuffer<FfiProviderSubagentStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiProviderSubagentStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiProviderSubagentStatus) = 4UL
+
+    override fun write(value: FfiProviderSubagentStatus, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
 enum class FfiReasoningEffort {
     
     OFF,
@@ -9717,6 +12330,111 @@ public object FfiConverterTypeFfiRichBlock : FfiConverterRustBuffer<FfiRichBlock
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
+    }
+}
+
+
+
+
+
+
+enum class FfiScheduleKind {
+    
+    SCHEDULE,
+    HEARTBEAT;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiScheduleKind: FfiConverterRustBuffer<FfiScheduleKind> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiScheduleKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiScheduleKind) = 4UL
+
+    override fun write(value: FfiScheduleKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiScheduleRunStatus {
+    
+    RUNNING,
+    SUCCEEDED,
+    FAILED,
+    SKIPPED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiScheduleRunStatus: FfiConverterRustBuffer<FfiScheduleRunStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiScheduleRunStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiScheduleRunStatus) = 4UL
+
+    override fun write(value: FfiScheduleRunStatus, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiScheduleStatus {
+    
+    ACTIVE,
+    PAUSED,
+    COMPLETED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiScheduleStatus: FfiConverterRustBuffer<FfiScheduleStatus> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiScheduleStatus.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiScheduleStatus) = 4UL
+
+    override fun write(value: FfiScheduleStatus, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
@@ -10283,6 +13001,25 @@ sealed class FfiTimelineItem {
         companion object
     }
     
+    data class AgentMessage(
+        val `seq`: kotlin.ULong, 
+        val `messageId`: kotlin.String, 
+        val `kind`: uniffi.orbit_ffi_uniffi.FfiAgentMessageKind, 
+        val `sourceAgentId`: kotlin.String?, 
+        val `sourceHostId`: kotlin.String?, 
+        val `sourceTitle`: kotlin.String?, 
+        val `event`: kotlin.String?, 
+        val `text`: kotlin.String, 
+        val `permissionContext`: uniffi.orbit_ffi_uniffi.FfiPermissionCheckpointRef?, 
+        val `blocks`: List<uniffi.orbit_ffi_uniffi.FfiRichBlock>, 
+        val `timestampMs`: kotlin.Long?) : FfiTimelineItem()
+        
+    {
+        
+
+        companion object
+    }
+    
 
     
 
@@ -10354,6 +13091,19 @@ public object FfiConverterTypeFfiTimelineItem : FfiConverterRustBuffer<FfiTimeli
                 FfiConverterULong.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
+                FfiConverterOptionalLong.read(buf),
+                )
+            8 -> FfiTimelineItem.AgentMessage(
+                FfiConverterULong.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterTypeFfiAgentMessageKind.read(buf),
+                FfiConverterOptionalString.read(buf),
+                FfiConverterOptionalString.read(buf),
+                FfiConverterOptionalString.read(buf),
+                FfiConverterOptionalString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterOptionalTypeFfiPermissionCheckpointRef.read(buf),
+                FfiConverterSequenceTypeFfiRichBlock.read(buf),
                 FfiConverterOptionalLong.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -10446,6 +13196,23 @@ public object FfiConverterTypeFfiTimelineItem : FfiConverterRustBuffer<FfiTimeli
                 + FfiConverterOptionalLong.allocationSize(value.`timestampMs`)
             )
         }
+        is FfiTimelineItem.AgentMessage -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterULong.allocationSize(value.`seq`)
+                + FfiConverterString.allocationSize(value.`messageId`)
+                + FfiConverterTypeFfiAgentMessageKind.allocationSize(value.`kind`)
+                + FfiConverterOptionalString.allocationSize(value.`sourceAgentId`)
+                + FfiConverterOptionalString.allocationSize(value.`sourceHostId`)
+                + FfiConverterOptionalString.allocationSize(value.`sourceTitle`)
+                + FfiConverterOptionalString.allocationSize(value.`event`)
+                + FfiConverterString.allocationSize(value.`text`)
+                + FfiConverterOptionalTypeFfiPermissionCheckpointRef.allocationSize(value.`permissionContext`)
+                + FfiConverterSequenceTypeFfiRichBlock.allocationSize(value.`blocks`)
+                + FfiConverterOptionalLong.allocationSize(value.`timestampMs`)
+            )
+        }
     }
 
     override fun write(value: FfiTimelineItem, buf: ByteBuffer) {
@@ -10518,6 +13285,21 @@ public object FfiConverterTypeFfiTimelineItem : FfiConverterRustBuffer<FfiTimeli
                 FfiConverterULong.write(value.`seq`, buf)
                 FfiConverterString.write(value.`level`, buf)
                 FfiConverterString.write(value.`message`, buf)
+                FfiConverterOptionalLong.write(value.`timestampMs`, buf)
+                Unit
+            }
+            is FfiTimelineItem.AgentMessage -> {
+                buf.putInt(8)
+                FfiConverterULong.write(value.`seq`, buf)
+                FfiConverterString.write(value.`messageId`, buf)
+                FfiConverterTypeFfiAgentMessageKind.write(value.`kind`, buf)
+                FfiConverterOptionalString.write(value.`sourceAgentId`, buf)
+                FfiConverterOptionalString.write(value.`sourceHostId`, buf)
+                FfiConverterOptionalString.write(value.`sourceTitle`, buf)
+                FfiConverterOptionalString.write(value.`event`, buf)
+                FfiConverterString.write(value.`text`, buf)
+                FfiConverterOptionalTypeFfiPermissionCheckpointRef.write(value.`permissionContext`, buf)
+                FfiConverterSequenceTypeFfiRichBlock.write(value.`blocks`, buf)
                 FfiConverterOptionalLong.write(value.`timestampMs`, buf)
                 Unit
             }
@@ -11031,6 +13813,80 @@ public object FfiConverterTypeFfiTurnLiveSegment : FfiConverterRustBuffer<FfiTur
 
 
 
+enum class FfiWorkspaceEventKind {
+    
+    PEER_JOINED,
+    PEER_FINISHED,
+    BOARD_UPDATED,
+    PEER_MESSAGE,
+    FILE_EDITED,
+    CONFLICT_WARNING,
+    WORKSPACE_MERGED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiWorkspaceEventKind: FfiConverterRustBuffer<FfiWorkspaceEventKind> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiWorkspaceEventKind.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiWorkspaceEventKind) = 4UL
+
+    override fun write(value: FfiWorkspaceEventKind, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiWorkspaceOrganizePhase {
+    
+    RUNNING,
+    COMPLETED,
+    FAILED;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiWorkspaceOrganizePhase: FfiConverterRustBuffer<FfiWorkspaceOrganizePhase> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiWorkspaceOrganizePhase.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiWorkspaceOrganizePhase) = 4UL
+
+    override fun write(value: FfiWorkspaceOrganizePhase, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
 /**
  * @suppress
  */
@@ -11322,6 +14178,38 @@ public object FfiConverterOptionalTypeFfiAgentCard: FfiConverterRustBuffer<FfiAg
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeFfiCloudSyncStatus: FfiConverterRustBuffer<FfiCloudSyncStatus?> {
+    override fun read(buf: ByteBuffer): FfiCloudSyncStatus? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiCloudSyncStatus.read(buf)
+    }
+
+    override fun allocationSize(value: FfiCloudSyncStatus?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiCloudSyncStatus.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiCloudSyncStatus?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiCloudSyncStatus.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeFfiDirectoryListing: FfiConverterRustBuffer<FfiDirectoryListing?> {
     override fun read(buf: ByteBuffer): FfiDirectoryListing? {
         if (buf.get().toInt() == 0) {
@@ -11354,6 +14242,38 @@ public object FfiConverterOptionalTypeFfiDirectoryListing: FfiConverterRustBuffe
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeFfiGitReposInspection: FfiConverterRustBuffer<FfiGitReposInspection?> {
+    override fun read(buf: ByteBuffer): FfiGitReposInspection? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiGitReposInspection.read(buf)
+    }
+
+    override fun allocationSize(value: FfiGitReposInspection?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiGitReposInspection.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiGitReposInspection?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiGitReposInspection.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeFfiHostDetail: FfiConverterRustBuffer<FfiHostDetail?> {
     override fun read(buf: ByteBuffer): FfiHostDetail? {
         if (buf.get().toInt() == 0) {
@@ -11376,6 +14296,38 @@ public object FfiConverterOptionalTypeFfiHostDetail: FfiConverterRustBuffer<FfiH
         } else {
             buf.put(1)
             FfiConverterTypeFfiHostDetail.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiPermissionCheckpointRef: FfiConverterRustBuffer<FfiPermissionCheckpointRef?> {
+    override fun read(buf: ByteBuffer): FfiPermissionCheckpointRef? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiPermissionCheckpointRef.read(buf)
+    }
+
+    override fun allocationSize(value: FfiPermissionCheckpointRef?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiPermissionCheckpointRef.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiPermissionCheckpointRef?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiPermissionCheckpointRef.write(value, buf)
         }
     }
 }
@@ -11482,6 +14434,70 @@ public object FfiConverterOptionalTypeFfiToolStepDescriptor: FfiConverterRustBuf
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeFfiWorkspaceBoardSnapshot: FfiConverterRustBuffer<FfiWorkspaceBoardSnapshot?> {
+    override fun read(buf: ByteBuffer): FfiWorkspaceBoardSnapshot? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiWorkspaceBoardSnapshot.read(buf)
+    }
+
+    override fun allocationSize(value: FfiWorkspaceBoardSnapshot?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiWorkspaceBoardSnapshot.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiWorkspaceBoardSnapshot?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiWorkspaceBoardSnapshot.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiWorkspaceClusterSuggestion: FfiConverterRustBuffer<FfiWorkspaceClusterSuggestion?> {
+    override fun read(buf: ByteBuffer): FfiWorkspaceClusterSuggestion? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiWorkspaceClusterSuggestion.read(buf)
+    }
+
+    override fun allocationSize(value: FfiWorkspaceClusterSuggestion?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiWorkspaceClusterSuggestion.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiWorkspaceClusterSuggestion?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiWorkspaceClusterSuggestion.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeFfiDiagramKind: FfiConverterRustBuffer<FfiDiagramKind?> {
     override fun read(buf: ByteBuffer): FfiDiagramKind? {
         if (buf.get().toInt() == 0) {
@@ -11546,6 +14562,38 @@ public object FfiConverterOptionalTypeFfiHostRouteMode: FfiConverterRustBuffer<F
 /**
  * @suppress
  */
+public object FfiConverterOptionalTypeFfiProviderKind: FfiConverterRustBuffer<FfiProviderKind?> {
+    override fun read(buf: ByteBuffer): FfiProviderKind? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiProviderKind.read(buf)
+    }
+
+    override fun allocationSize(value: FfiProviderKind?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiProviderKind.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiProviderKind?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiProviderKind.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterOptionalTypeFfiReasoningEffort: FfiConverterRustBuffer<FfiReasoningEffort?> {
     override fun read(buf: ByteBuffer): FfiReasoningEffort? {
         if (buf.get().toInt() == 0) {
@@ -11568,6 +14616,38 @@ public object FfiConverterOptionalTypeFfiReasoningEffort: FfiConverterRustBuffer
         } else {
             buf.put(1)
             FfiConverterTypeFfiReasoningEffort.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiSessionMode: FfiConverterRustBuffer<FfiSessionMode?> {
+    override fun read(buf: ByteBuffer): FfiSessionMode? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiSessionMode.read(buf)
+    }
+
+    override fun allocationSize(value: FfiSessionMode?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiSessionMode.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiSessionMode?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiSessionMode.write(value, buf)
         }
     }
 }
@@ -12122,6 +15202,34 @@ public object FfiConverterSequenceTypeFfiMentionCandidate: FfiConverterRustBuffe
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeFfiNestedGitRepo: FfiConverterRustBuffer<List<FfiNestedGitRepo>> {
+    override fun read(buf: ByteBuffer): List<FfiNestedGitRepo> {
+        val len = buf.getInt()
+        return List<FfiNestedGitRepo>(len) {
+            FfiConverterTypeFfiNestedGitRepo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiNestedGitRepo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiNestedGitRepo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiNestedGitRepo>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiNestedGitRepo.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeFfiPromptBadge: FfiConverterRustBuffer<List<FfiPromptBadge>> {
     override fun read(buf: ByteBuffer): List<FfiPromptBadge> {
         val len = buf.getInt()
@@ -12234,6 +15342,62 @@ public object FfiConverterSequenceTypeFfiProviderQuota: FfiConverterRustBuffer<L
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeFfiProviderSubagentDescriptor: FfiConverterRustBuffer<List<FfiProviderSubagentDescriptor>> {
+    override fun read(buf: ByteBuffer): List<FfiProviderSubagentDescriptor> {
+        val len = buf.getInt()
+        return List<FfiProviderSubagentDescriptor>(len) {
+            FfiConverterTypeFfiProviderSubagentDescriptor.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiProviderSubagentDescriptor>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiProviderSubagentDescriptor.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiProviderSubagentDescriptor>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiProviderSubagentDescriptor.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiProviderSubagentEvent: FfiConverterRustBuffer<List<FfiProviderSubagentEvent>> {
+    override fun read(buf: ByteBuffer): List<FfiProviderSubagentEvent> {
+        val len = buf.getInt()
+        return List<FfiProviderSubagentEvent>(len) {
+            FfiConverterTypeFfiProviderSubagentEvent.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiProviderSubagentEvent>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiProviderSubagentEvent.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiProviderSubagentEvent>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiProviderSubagentEvent.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeFfiQuestionItem: FfiConverterRustBuffer<List<FfiQuestionItem>> {
     override fun read(buf: ByteBuffer): List<FfiQuestionItem> {
         val len = buf.getInt()
@@ -12308,6 +15472,62 @@ public object FfiConverterSequenceTypeFfiQuotaWindow: FfiConverterRustBuffer<Lis
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFfiQuotaWindow.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiScheduleRunRecord: FfiConverterRustBuffer<List<FfiScheduleRunRecord>> {
+    override fun read(buf: ByteBuffer): List<FfiScheduleRunRecord> {
+        val len = buf.getInt()
+        return List<FfiScheduleRunRecord>(len) {
+            FfiConverterTypeFfiScheduleRunRecord.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiScheduleRunRecord>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiScheduleRunRecord.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiScheduleRunRecord>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiScheduleRunRecord.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiScheduleSpec: FfiConverterRustBuffer<List<FfiScheduleSpec>> {
+    override fun read(buf: ByteBuffer): List<FfiScheduleSpec> {
+        val len = buf.getInt()
+        return List<FfiScheduleSpec>(len) {
+            FfiConverterTypeFfiScheduleSpec.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiScheduleSpec>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiScheduleSpec.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiScheduleSpec>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiScheduleSpec.write(it, buf)
         }
     }
 }
@@ -12448,6 +15668,34 @@ public object FfiConverterSequenceTypeFfiSidebarProjectGroup: FfiConverterRustBu
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeFfiSidebarProjectGroup.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiSidebarWorkspaceGroup: FfiConverterRustBuffer<List<FfiSidebarWorkspaceGroup>> {
+    override fun read(buf: ByteBuffer): List<FfiSidebarWorkspaceGroup> {
+        val len = buf.getInt()
+        return List<FfiSidebarWorkspaceGroup>(len) {
+            FfiConverterTypeFfiSidebarWorkspaceGroup.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiSidebarWorkspaceGroup>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiSidebarWorkspaceGroup.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiSidebarWorkspaceGroup>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiSidebarWorkspaceGroup.write(it, buf)
         }
     }
 }
@@ -12766,6 +16014,34 @@ public object FfiConverterSequenceTypeFfiTurnFileDiffSummary: FfiConverterRustBu
 /**
  * @suppress
  */
+public object FfiConverterSequenceTypeFfiWorkspaceEvent: FfiConverterRustBuffer<List<FfiWorkspaceEvent>> {
+    override fun read(buf: ByteBuffer): List<FfiWorkspaceEvent> {
+        val len = buf.getInt()
+        return List<FfiWorkspaceEvent>(len) {
+            FfiConverterTypeFfiWorkspaceEvent.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiWorkspaceEvent>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiWorkspaceEvent.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiWorkspaceEvent>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiWorkspaceEvent.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterSequenceTypeFfiWorkspaceSummary: FfiConverterRustBuffer<List<FfiWorkspaceSummary>> {
     override fun read(buf: ByteBuffer): List<FfiWorkspaceSummary> {
         val len = buf.getInt()
@@ -13029,6 +16305,201 @@ public object FfiConverterMapStringString: FfiConverterRustBuffer<Map<kotlin.Str
 /**
  * @suppress
  */
+public object FfiConverterMapStringTypeFfiGitReposInspection: FfiConverterRustBuffer<Map<kotlin.String, FfiGitReposInspection>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, FfiGitReposInspection> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, FfiGitReposInspection>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterTypeFfiGitReposInspection.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, FfiGitReposInspection>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren = value.map { (k, v) ->
+            FfiConverterString.allocationSize(k) +
+            FfiConverterTypeFfiGitReposInspection.allocationSize(v)
+        }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(value: Map<kotlin.String, FfiGitReposInspection>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterTypeFfiGitReposInspection.write(v, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterMapStringTypeFfiWorkspaceBoardSnapshot: FfiConverterRustBuffer<Map<kotlin.String, FfiWorkspaceBoardSnapshot>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, FfiWorkspaceBoardSnapshot> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, FfiWorkspaceBoardSnapshot>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterTypeFfiWorkspaceBoardSnapshot.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, FfiWorkspaceBoardSnapshot>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren = value.map { (k, v) ->
+            FfiConverterString.allocationSize(k) +
+            FfiConverterTypeFfiWorkspaceBoardSnapshot.allocationSize(v)
+        }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(value: Map<kotlin.String, FfiWorkspaceBoardSnapshot>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterTypeFfiWorkspaceBoardSnapshot.write(v, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterMapStringTypeFfiWorkspaceOrganizeStatus: FfiConverterRustBuffer<Map<kotlin.String, FfiWorkspaceOrganizeStatus>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, FfiWorkspaceOrganizeStatus> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, FfiWorkspaceOrganizeStatus>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterTypeFfiWorkspaceOrganizeStatus.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, FfiWorkspaceOrganizeStatus>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren = value.map { (k, v) ->
+            FfiConverterString.allocationSize(k) +
+            FfiConverterTypeFfiWorkspaceOrganizeStatus.allocationSize(v)
+        }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(value: Map<kotlin.String, FfiWorkspaceOrganizeStatus>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterTypeFfiWorkspaceOrganizeStatus.write(v, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterMapStringSequenceTypeFfiProviderSubagentDescriptor: FfiConverterRustBuffer<Map<kotlin.String, List<FfiProviderSubagentDescriptor>>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, List<FfiProviderSubagentDescriptor>> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, List<FfiProviderSubagentDescriptor>>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterSequenceTypeFfiProviderSubagentDescriptor.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, List<FfiProviderSubagentDescriptor>>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren = value.map { (k, v) ->
+            FfiConverterString.allocationSize(k) +
+            FfiConverterSequenceTypeFfiProviderSubagentDescriptor.allocationSize(v)
+        }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(value: Map<kotlin.String, List<FfiProviderSubagentDescriptor>>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterSequenceTypeFfiProviderSubagentDescriptor.write(v, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterMapStringSequenceTypeFfiWorkspaceEvent: FfiConverterRustBuffer<Map<kotlin.String, List<FfiWorkspaceEvent>>> {
+    override fun read(buf: ByteBuffer): Map<kotlin.String, List<FfiWorkspaceEvent>> {
+        val len = buf.getInt()
+        return buildMap<kotlin.String, List<FfiWorkspaceEvent>>(len) {
+            repeat(len) {
+                val k = FfiConverterString.read(buf)
+                val v = FfiConverterSequenceTypeFfiWorkspaceEvent.read(buf)
+                this[k] = v
+            }
+        }
+    }
+
+    override fun allocationSize(value: Map<kotlin.String, List<FfiWorkspaceEvent>>): ULong {
+        val spaceForMapSize = 4UL
+        val spaceForChildren = value.map { (k, v) ->
+            FfiConverterString.allocationSize(k) +
+            FfiConverterSequenceTypeFfiWorkspaceEvent.allocationSize(v)
+        }.sum()
+        return spaceForMapSize + spaceForChildren
+    }
+
+    override fun write(value: Map<kotlin.String, List<FfiWorkspaceEvent>>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        // The parens on `(k, v)` here ensure we're calling the right method,
+        // which is important for compatibility with older android devices.
+        // Ref https://blog.danlew.net/2017/03/16/kotlin-puzzler-whose-line-is-it-anyways/
+        value.forEach { (k, v) ->
+            FfiConverterString.write(k, buf)
+            FfiConverterSequenceTypeFfiWorkspaceEvent.write(v, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
 public object FfiConverterMapStringSequenceSequenceString: FfiConverterRustBuffer<Map<kotlin.String, List<List<kotlin.String>>>> {
     override fun read(buf: ByteBuffer): Map<kotlin.String, List<List<kotlin.String>>> {
         val len = buf.getInt()
@@ -13123,6 +16594,18 @@ public object FfiConverterMapStringSequenceSequenceString: FfiConverterRustBuffe
     
         
         FfiConverterTypeFfiReasoningEffort.lower(`effort`),_status)
+}
+    )
+    }
+    
+ fun `parseMarkdownPreview`(`markdown`: kotlin.String, `streaming`: kotlin.Boolean): List<FfiRichBlock> {
+            return FfiConverterSequenceTypeFfiRichBlock.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_orbit_ffi_uniffi_fn_func_parse_markdown_preview(
+    
+        
+        FfiConverterString.lower(`markdown`),
+        FfiConverterBoolean.lower(`streaming`),_status)
 }
     )
     }

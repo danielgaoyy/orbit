@@ -104,7 +104,8 @@ fn default_dark_theme() -> Option<&'static Theme> {
 }
 
 /// Heal an unclosed fenced code block while assistant tokens are still streaming so the UI never flickers.
-fn heal_streaming_fences(markdown: &str) -> String {
+/// Returns `(healed_markdown, had_unclosed_fence)`.
+fn heal_streaming_fences(markdown: &str) -> (String, bool) {
     let mut open_fence: Option<&str> = None;
     for line in markdown.lines() {
         let trimmed = line.trim_start();
@@ -130,10 +131,39 @@ fn heal_streaming_fences(markdown: &str) -> String {
     }
 
     if let Some(unclosed) = open_fence {
-        format!("{markdown}\n{unclosed}")
+        (format!("{markdown}\n{unclosed}"), true)
     } else {
-        markdown.to_string()
+        (markdown.to_string(), false)
     }
+}
+
+/// Fast plain-token code line builder used for actively streaming unclosed code blocks
+/// so incremental token chunks never invoke `syntect` or pollute the global LRU highlight cache.
+fn plain_code_lines(code: &str) -> Vec<HighlightedLineView> {
+    let mut out: Vec<HighlightedLineView> = LinesWithEndings::from(code)
+        .enumerate()
+        .map(|(idx, line)| HighlightedLineView {
+            line_number: (idx + 1) as u32,
+            tokens: vec![HighlightedTokenView {
+                text: line.trim_end_matches(&['\r', '\n'][..]).to_string(),
+                fg_hex: "#E2E8F0".to_string(),
+                bold: false,
+                italic: false,
+            }],
+        })
+        .collect();
+    if out.is_empty() && !code.is_empty() {
+        out.push(HighlightedLineView {
+            line_number: 1,
+            tokens: vec![HighlightedTokenView {
+                text: code.to_string(),
+                fg_hex: "#E2E8F0".to_string(),
+                bold: false,
+                italic: false,
+            }],
+        });
+    }
+    out
 }
 
 /// Map a file path or filename to a canonical syntax highlighting token for `syntect`.
@@ -293,6 +323,21 @@ pub(crate) fn code_highlight_cache_len() -> usize {
         .lock()
         .map(|g| g.total_entries)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn code_highlight_cache_contains(lang: &str, code: &str) -> bool {
+    let key = CodeHighlightCacheKey {
+        lang_token: lang.trim().to_string(),
+        content_hash: fnv1a_64(code.as_bytes()),
+        content_len: code.len(),
+        max_highlighted_lines: usize::MAX,
+    };
+    code_highlight_cache().lock().ok().is_some_and(|g| {
+        g.entries
+            .get(&key)
+            .is_some_and(|bucket| bucket.iter().any(|e| e.raw_code.as_ref() == code))
+    })
 }
 
 /// Highlight up to `max_highlighted_lines` with `syntect`, emitting fast plain-styled lines beyond the cap.
@@ -528,16 +573,16 @@ fn flush_active_list_item_prefix(
 
 /// Parse streaming or completed Markdown into platform-agnostic native render blocks.
 pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockView> {
-    let normalized = if streaming {
+    let (normalized, had_unclosed_fence) = if streaming {
         heal_streaming_fences(markdown)
     } else {
-        markdown.to_string()
+        (markdown.to_string(), false)
     };
 
     let mut options = Options::empty();
     options
         .insert(Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS);
-    let parser = Parser::new_ext(&normalized, options);
+    let parser = Parser::new_ext(&normalized, options).into_offset_iter();
 
     let mut blocks = Vec::new();
     let mut cur_spans: Vec<InlineSpanView> = Vec::new();
@@ -562,8 +607,9 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
 
     let mut in_code_block: Option<String> = None;
     let mut code_buf = String::new();
+    let normalized_len = normalized.len();
 
-    for event in parser {
+    for (event, range) in parser {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -681,7 +727,12 @@ pub fn parse_markdown_blocks(markdown: &str, streaming: bool) -> Vec<RichBlockVi
                 TagEnd::CodeBlock => {
                     let language = in_code_block.take().unwrap_or_default();
                     let raw_code = code_buf.trim_end_matches('\n').to_string();
-                    let lines = highlight_code_lines(&language, &raw_code);
+                    let is_streaming_tail = had_unclosed_fence && range.end >= normalized_len;
+                    let lines = if is_streaming_tail {
+                        plain_code_lines(&raw_code)
+                    } else {
+                        highlight_code_lines(&language, &raw_code)
+                    };
                     blocks.push(RichBlockView::CodeBlock {
                         language,
                         raw_code,
@@ -1765,5 +1816,49 @@ diff --git a/src/lib.rs b/src/lib.rs
             let _ = highlight_code_lines_capped("rust", &s, 50);
         }
         assert!(code_highlight_cache_len() <= CODE_HIGHLIGHT_CACHE_CAP);
+    }
+
+    #[test]
+    fn streaming_unclosed_code_block_uses_plain_lines_without_polluting_cache() {
+        let streaming_md =
+            "Intro\n```rust\nfn unique_streaming_prefix_9911(a: i32) {\n    let x = a + 1;";
+        let streaming_blocks = parse_markdown_blocks(streaming_md, true);
+        match streaming_blocks.last() {
+            Some(RichBlockView::CodeBlock {
+                language,
+                raw_code,
+                lines,
+            }) => {
+                assert_eq!(language, "rust");
+                assert!(raw_code.contains("unique_streaming_prefix_9911"));
+                assert_eq!(lines.len(), 2);
+                assert_eq!(lines[0].tokens.len(), 1);
+                assert_eq!(lines[0].tokens[0].fg_hex, "#E2E8F0");
+                assert!(
+                    !code_highlight_cache_contains("rust", raw_code),
+                    "streaming unclosed code prefix must not pollute global highlight cache"
+                );
+            }
+            other => panic!("expected CodeBlock, got {other:?}"),
+        }
+
+        // Once finalized (closed fence / streaming = false), full syntect highlighting applies
+        let final_md = format!("{streaming_md}\n}}\n```");
+        let final_blocks = parse_markdown_blocks(&final_md, false);
+        match final_blocks.last() {
+            Some(RichBlockView::CodeBlock {
+                raw_code, lines, ..
+            }) => {
+                assert!(
+                    lines[0].tokens.len() > 1,
+                    "finalized rust code block must be syntax-highlighted"
+                );
+                assert!(
+                    code_highlight_cache_contains("rust", raw_code),
+                    "finalized code block should be cached for subsequent renders"
+                );
+            }
+            other => panic!("expected CodeBlock, got {other:?}"),
+        }
     }
 }

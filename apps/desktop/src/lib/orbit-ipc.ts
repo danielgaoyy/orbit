@@ -62,6 +62,63 @@ export interface LocalDaemonSyncResult {
   source: "bundled" | "github" | "existing" | "dev" | string;
 }
 
+export type CloudSyncState = "signed_out" | "locked" | "ready" | "syncing" | "error";
+
+export type CloudSyncDevicePollStatus =
+  | "pending"
+  | "slow_down"
+  | "authorized"
+  | "expired"
+  | "denied";
+
+export interface CloudSyncStatusView {
+  state: CloudSyncState;
+  provider: string;
+  github_oauth_configured: boolean;
+  github_client_id_override: string | null;
+  account_login: string | null;
+  account_name: string | null;
+  account_avatar_url: string | null;
+  gist_id: string | null;
+  gist_html_url: string | null;
+  remote_vault_exists: boolean;
+  auto_sync_enabled: boolean;
+  last_synced_at_ms: number | null;
+  last_vault_revision: number;
+  synced_host_count: number;
+  synced_project_count: number;
+  last_error: string | null;
+}
+
+export interface GitHubDeviceFlowStartView {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  expires_in_secs: number;
+  interval_secs: number;
+}
+
+export interface CloudSyncDevicePollView {
+  status: CloudSyncDevicePollStatus;
+  interval_secs: number | null;
+  error: string | null;
+  sync_status: CloudSyncStatusView | null;
+}
+
+export interface CloudSyncResultView {
+  hosts_added: number;
+  hosts_updated: number;
+  hosts_removed: number;
+  projects_added: number;
+  projects_updated: number;
+  projects_removed: number;
+  preferences_updated: number;
+  pushed_remote: boolean;
+  vault_revision: number;
+  synced_at_ms: number;
+  gist_html_url: string | null;
+}
+
 export function normalizeSemver(raw: string | null | undefined): string | null {
   if (!raw) return null;
   const trimmed = raw.trim().replace(/^v/i, "");
@@ -2687,7 +2744,7 @@ export const orbitIpc = {
   },
 
   getAppVersion: async (): Promise<string> => {
-    if (!isTauriRuntime()) return "0.7.0";
+    if (!isTauriRuntime()) return "0.8.0";
     return invoke<string>("get_app_version");
   },
 
@@ -2729,5 +2786,95 @@ export const orbitIpc = {
       hostId,
       targetVersion: targetVersion ?? null,
     });
+  },
+
+  getCloudSyncStatus: async (): Promise<CloudSyncStatusView> => {
+    if (!isTauriRuntime()) {
+      return {
+        state: "signed_out",
+        provider: "github_gist",
+        github_oauth_configured: false,
+        github_client_id_override: null,
+        account_login: null,
+        account_name: null,
+        account_avatar_url: null,
+        gist_id: null,
+        gist_html_url: null,
+        remote_vault_exists: false,
+        auto_sync_enabled: true,
+        last_synced_at_ms: null,
+        last_vault_revision: 0,
+        synced_host_count: 0,
+        synced_project_count: 0,
+        last_error: null,
+      };
+    }
+    return invoke<CloudSyncStatusView>("get_cloud_sync_status");
+  },
+
+  cloudSyncGeneratePassphrase: async (): Promise<string> => {
+    if (!isTauriRuntime()) return "orbit-DEMO-KEY1-KEY2-KEY3-KEY4";
+    return invoke<string>("cloud_sync_generate_passphrase");
+  },
+
+  cloudSyncSetGithubClientId: async (
+    clientId: string | null,
+  ): Promise<CloudSyncStatusView> => {
+    return invoke<CloudSyncStatusView>("cloud_sync_set_github_client_id", {
+      clientId,
+    });
+  },
+
+  cloudSyncSetAutoSync: async (enabled: boolean): Promise<CloudSyncStatusView> => {
+    return invoke<CloudSyncStatusView>("cloud_sync_set_auto_sync", { enabled });
+  },
+
+  cloudSyncStartGithubDeviceFlow: async (
+    clientIdOverride?: string | null,
+  ): Promise<GitHubDeviceFlowStartView> => {
+    return invoke<GitHubDeviceFlowStartView>("cloud_sync_start_github_device_flow", {
+      clientIdOverride: clientIdOverride ?? null,
+    });
+  },
+
+  cloudSyncPollGithubDeviceFlow: async (
+    deviceCode: string,
+    clientIdOverride?: string | null,
+  ): Promise<CloudSyncDevicePollView> => {
+    return invoke<CloudSyncDevicePollView>("cloud_sync_poll_github_device_flow", {
+      deviceCode,
+      clientIdOverride: clientIdOverride ?? null,
+    });
+  },
+
+  cloudSyncLoginWithToken: async (token: string): Promise<CloudSyncStatusView> => {
+    return invoke<CloudSyncStatusView>("cloud_sync_login_with_token", { token });
+  },
+
+  cloudSyncUnlockWithPassphrase: async (passphrase: string): Promise<CloudSyncResultView> => {
+    return invoke<CloudSyncResultView>("cloud_sync_unlock_with_passphrase", { passphrase });
+  },
+
+  cloudSyncNow: async (): Promise<CloudSyncResultView> => {
+    return invoke<CloudSyncResultView>("cloud_sync_now");
+  },
+
+  cloudSyncTriggerBackground: async (): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("cloud_sync_trigger_background").catch(() => undefined);
+  },
+
+  cloudSyncLogout: async (clearLocalHosts = false): Promise<CloudSyncStatusView> => {
+    return invoke<CloudSyncStatusView>("cloud_sync_logout", { clearLocalHosts });
+  },
+
+  cloudSyncGetPreferences: async (): Promise<Record<string, unknown>> => {
+    if (!isTauriRuntime()) return {};
+    return invoke<Record<string, unknown>>("cloud_sync_get_preferences");
+  },
+
+  cloudSyncUpdatePreferences: async (patch: Record<string, unknown>): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("cloud_sync_update_preferences", { patch }).catch(() => undefined);
   },
 };

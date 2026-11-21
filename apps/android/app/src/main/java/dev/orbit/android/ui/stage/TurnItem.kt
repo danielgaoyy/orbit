@@ -559,6 +559,7 @@ private fun stepStableKey(item: FfiTimelineItem): String = when (item) {
     is FfiTimelineItem.PermissionRequest -> "perm:${item.requestId}"
     is FfiTimelineItem.QuestionRequest -> "q:${item.requestId}"
     is FfiTimelineItem.Notice -> "notice:${item.seq}"
+    is FfiTimelineItem.AgentMessage -> "agent-msg:${item.messageId}:${item.seq}"
 }
 
 @Composable
@@ -1026,6 +1027,12 @@ private fun StepRow(
 
         is FfiTimelineItem.Notice -> NoticeBannerRow(notice = item)
         is FfiTimelineItem.AssistantMessage -> {
+            MarkdownBlocks(
+                blocks = item.blocks,
+                fallbackText = item.text,
+            )
+        }
+        is FfiTimelineItem.AgentMessage -> {
             MarkdownBlocks(
                 blocks = item.blocks,
                 fallbackText = item.text,

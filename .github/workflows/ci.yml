@@ -12,6 +12,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  ORBIT_GITHUB_CLIENT_ID: ${{ vars.ORBIT_GITHUB_CLIENT_ID }}
+
 jobs:
   rust-quality-and-e2e:
     name: Rust Clippy & E2E Tests
@@ -38,3 +41,117 @@ jobs:
           cache-dependency-path: apps/desktop/package-lock.json
       - run: npm --prefix apps/desktop ci
       - run: npm --prefix apps/desktop run build
+
+  ios-build-and-simulator-smoke:
+    name: Native iOS Build & Simulator Launch Smoke Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - name: Build OrbitCoreFFI.xcframework & Generate Xcode Project
+        run: |
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          ./apps/ios/scripts/build-rust-xcframework.sh
+          cd apps/ios && xcodegen generate
+      - name: Build iOS Device Target (Release, Unsigned)
+        working-directory: apps/ios
+        run: |
+          xcodebuild \
+            -project OrbitMobile.xcodeproj \
+            -scheme OrbitMobile \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ReleaseDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Build & Launch on iOS Simulator with Live Orbit Daemon
+        run: |
+          set -euo pipefail
+          cargo build -p orbit-cli
+          ./target/debug/orbit daemon >/tmp/orbit-daemon.log 2>&1 &
+          DAEMON_PID=$!
+          trap 'kill $DAEMON_PID 2>/dev/null || true' EXIT
+          sleep 2
+
+          SIM_UDID="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in sorted(data.get("devices", {}).items(), reverse=True):
+              if "iOS" not in runtime:
+                  continue
+              for d in devices:
+                  if d.get("isAvailable") and "iPhone" in d.get("name", ""):
+                      print(d["udid"])
+                      sys.exit(0)
+          sys.exit(1)
+          ')"
+          echo "Selected Simulator UDID: $SIM_UDID"
+          xcrun simctl boot "$SIM_UDID" || true
+          xcrun simctl bootstatus "$SIM_UDID" -b
+
+          xcodebuild \
+            -project apps/ios/OrbitMobile.xcodeproj \
+            -scheme OrbitMobile \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIM_UDID" \
+            -derivedDataPath apps/ios/build/SimDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+          APP_PATH="apps/ios/build/SimDerivedData/Build/Products/Debug-iphonesimulator/OrbitMobile.app"
+          BUNDLE_ID="dev.orbit.app"
+          xcrun simctl install "$SIM_UDID" "$APP_PATH"
+          mkdir -p /tmp/ios-sim-screenshots
+
+          PAIR_URI="$(./target/debug/orbit pair 2>/dev/null | grep -oE 'orbit://pair/[^[:space:]]+' | head -n 1 || true)"
+          echo "Local daemon pair URI detected: ${PAIR_URI:+yes}"
+
+          for mode in stage drawer settings automations sidequestion files; do
+            xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
+            if [ -n "$PAIR_URI" ]; then
+              if [ "$mode" = "stage" ]; then
+                xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" -orbitTheme dark -orbitPairUri "$PAIR_URI"
+              else
+                xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" -orbitTheme dark -orbitPairUri "$PAIR_URI" -orbitOpenSheet "$mode"
+              fi
+            else
+              if [ "$mode" = "stage" ]; then
+                xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" -orbitTheme dark
+              else
+                xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" -orbitTheme dark -orbitOpenSheet "$mode"
+              fi
+            fi
+            sleep 3
+            xcrun simctl io "$SIM_UDID" screenshot "/tmp/ios-sim-screenshots/${mode}.png"
+          done
+          ls -la /tmp/ios-sim-screenshots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-simulator-screenshots
+          path: /tmp/ios-sim-screenshots
+
+  android-build-check:
+    name: Native Android UniFFI & Debug APK Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Rust UniFFI JNI Libraries (API 29+)
+        run: ./apps/android/scripts/build-rust-android.sh
+      - name: Assemble Debug APK
+        working-directory: apps/android
+        run: gradle assembleDebug --no-daemon

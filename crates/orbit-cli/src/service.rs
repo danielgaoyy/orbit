@@ -752,13 +752,65 @@ async fn resolve_latest_release_tag(current_ver: &str) -> anyhow::Result<String>
         .ok_or_else(|| anyhow::anyhow!("missing tag_name in GitHub release metadata"))
 }
 
-pub async fn self_upgrade_cli(home_dir: &Path, force: bool) -> anyhow::Result<()> {
+pub async fn self_upgrade_cli(
+    home_dir: &Path,
+    force: bool,
+    upgrade_all_hosts: bool,
+) -> anyhow::Result<()> {
     let current_ver = env!("CARGO_PKG_VERSION");
     let tag = resolve_latest_release_tag(current_ver).await?;
     let latest_ver = tag.trim_start_matches(['v', 'V']);
 
+    if upgrade_all_hosts && let Ok(rt) = orbit_daemon::DaemonRuntime::bootstrap(home_dir).await {
+        let self_host_id = rt.host_info.host_id.clone();
+        let store = rt.store.clone();
+        drop(rt);
+        println!("Checking connected remote hosts for Orbit {tag}...");
+        match orbit_daemon::connected_hosts::upgrade_all_saved_connected_hosts(
+            &store,
+            &self_host_id,
+            latest_ver,
+            force,
+        )
+        .await
+        {
+            Ok(reports) if reports.is_empty() => {
+                println!("  (no connected remote hosts registered in this daemon's mesh)");
+            }
+            Ok(reports) => {
+                for rep in reports {
+                    match rep.outcome {
+                        orbit_daemon::connected_hosts::RemotePeerUpgradeOutcome::Upgraded {
+                            from_version,
+                            target_version,
+                        } => {
+                            println!(
+                                "  [✓] {}: upgraded v{from_version} -> v{target_version} (hot-restarting)",
+                                rep.label
+                            );
+                        }
+                        orbit_daemon::connected_hosts::RemotePeerUpgradeOutcome::AlreadyUpToDate {
+                            version,
+                        } => {
+                            println!("  [=] {}: already on v{version}", rep.label);
+                        }
+                        orbit_daemon::connected_hosts::RemotePeerUpgradeOutcome::SkippedDisabled => {
+                            println!("  [-] {}: disabled, skipped", rep.label);
+                        }
+                        orbit_daemon::connected_hosts::RemotePeerUpgradeOutcome::Failed(err) => {
+                            println!("  [!] {}: upgrade failed: {err}", rep.label);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                println!("  [!] Failed to inspect connected remote hosts: {err}");
+            }
+        }
+    }
+
     if !force && latest_ver == current_ver {
-        println!("[✓] Orbit is already at the latest version (v{current_ver}).");
+        println!("[✓] Local Orbit is already at the latest version (v{current_ver}).");
         return Ok(());
     }
 

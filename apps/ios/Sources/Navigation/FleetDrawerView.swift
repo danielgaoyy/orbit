@@ -42,7 +42,7 @@ struct FleetDrawerView: View {
     private var needsAttentionItems: [(conv: FfiSidebarConversation, projectName: String)] {
         guard let hostId = store.selectedHostId else { return [] }
         return (store.sidebarView?.needsAttention ?? [])
-            .filter { $0.hostId == hostId }
+            .filter { $0.hostId == hostId && !isHiddenSameHostSubagent($0.agent) }
             .map { conv in
                 (conv: conv, projectName: projectDisplayName(forCwd: conv.agent.cwd))
             }
@@ -50,7 +50,21 @@ struct FleetDrawerView: View {
 
     private var pinnedItems: [FfiSidebarConversation] {
         guard let hostId = store.selectedHostId else { return [] }
-        return (store.sidebarView?.pinnedConversations ?? []).filter { $0.hostId == hostId }
+        return (store.sidebarView?.pinnedConversations ?? []).filter {
+            $0.hostId == hostId && !isHiddenSameHostSubagent($0.agent)
+        }
+    }
+
+    private func isHiddenSameHostSubagent(_ agent: FfiAgentCard) -> Bool {
+        agent.parentAgentId != nil && agent.parentHostId == nil
+    }
+
+    private var activeScheduleCount: Int {
+        (store.currentHostDetail?.schedules ?? []).filter { $0.status == .active }.count
+    }
+
+    private var archivedCount: Int {
+        store.currentHostDetail?.archivedAgents.count ?? 0
     }
 
     private var displayProjects: [FfiSidebarProjectGroup] {
@@ -338,13 +352,16 @@ struct FleetDrawerView: View {
 
     @ViewBuilder
     private var missionControlContent: some View {
+        // 0. Quick Automations Entry
+        automationsNavRow
+
         // 1. Conditional Needs Attention (0pt when empty)
         if !needsAttentionItems.isEmpty {
             sectionHeaderRow(
                 "Needs Attention",
                 count: needsAttentionItems.count,
                 accentColor: palette.warning,
-                topPadding: 4
+                topPadding: 6
             )
             ForEach(needsAttentionItems, id: \.conv.id) { item in
                 attentionRow(agent: item.conv.agent, projectName: item.projectName)
@@ -355,16 +372,16 @@ struct FleetDrawerView: View {
         if !pinnedItems.isEmpty {
             sectionHeaderRow(
                 "Pinned",
-                topPadding: needsAttentionItems.isEmpty ? 4 : 14
+                topPadding: needsAttentionItems.isEmpty ? 6 : 14
             )
             ForEach(pinnedItems) { conv in
-                sessionRow(conv: conv)
+                sessionRow(conv: conv, project: projectForCwd(conv.agent.cwd))
             }
         }
 
         // 3. Projects Tree Header + Groups
         projectsSectionHeaderRow(
-            topPadding: (needsAttentionItems.isEmpty && pinnedItems.isEmpty) ? 4 : 14
+            topPadding: (needsAttentionItems.isEmpty && pinnedItems.isEmpty) ? 6 : 14
         )
 
         if displayProjects.isEmpty {
@@ -392,37 +409,405 @@ struct FleetDrawerView: View {
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
         } else {
-            ForEach(displayProjects) { project in
-                let conversations = project.conversations
+            ForEach(Array(displayProjects.enumerated()), id: \.element.id) { projIdx, project in
                 let isCollapsed = store.collapsedProjectIds.contains(project.id)
                 let hostId = store.selectedHostId ?? ""
-                let selectedIdx = conversations.firstIndex {
-                    !store.isDraftNewSession && store.selectedAgentId == $0.agent.agentId
-                } ?? -1
-                let isExpandedAll = expandedMoreProjectIds.contains(project.id)
-                    || selectedIdx >= Self.maxVisibleConversationsPerProject
-                let hiddenCount = max(0, conversations.count - Self.maxVisibleConversationsPerProject)
-                let sliced = isExpandedAll
-                    ? conversations
-                    : Array(conversations.prefix(Self.maxVisibleConversationsPerProject))
+                let curatedWorkspaces = project.workspaces.filter { $0.isCurated || $0.isMultiAgent }
+                let visibleUnclassified = (curatedWorkspaces.isEmpty ? project.conversations : project.unclassifiedConversations)
+                    .filter { !isHiddenSameHostSubagent($0.agent) }
+                let orgStatus = store.organizeStatus(forProjectRoot: project.primaryCwd)
 
                 projectHeaderRow(
                     project: project,
+                    projectIndex: projIdx,
+                    totalProjects: displayProjects.count,
                     isCollapsed: isCollapsed,
                     hostId: hostId
                 )
 
-                if !isCollapsed && !sliced.isEmpty {
-                    ForEach(sliced) { conv in
-                        sessionRow(conv: conv)
+                if !isCollapsed {
+                    if let status = orgStatus, status.phase == .running {
+                        organizingProgressRow(status: status)
                     }
 
-                    if hiddenCount > 0 {
-                        showMoreLessRow(projectId: project.id, hiddenCount: hiddenCount, isExpandedAll: isExpandedAll)
+                    // Curated Mission Workspace Groups
+                    ForEach(curatedWorkspaces) { ws in
+                        let wsCollapsed = store.collapsedWorkspaceIds.contains(ws.workspaceId)
+                        let wsConvs = ws.conversations.filter { !isHiddenSameHostSubagent($0.agent) }
+                        workspaceHeaderRow(
+                            workspace: ws,
+                            project: project,
+                            siblingWorkspaces: curatedWorkspaces,
+                            isCollapsed: wsCollapsed
+                        )
+                        if !wsCollapsed {
+                            if wsConvs.isEmpty {
+                                emptyWorkspacePlaceholderRow(workspace: ws, project: project)
+                            } else {
+                                ForEach(wsConvs) { conv in
+                                    sessionRow(conv: conv, project: project, isInsideWorkspace: true)
+                                }
+                            }
+                        }
+                    }
+
+                    // Unclassified (`待归类`) Inbox or Flat Conversations
+                    if !visibleUnclassified.isEmpty {
+                        if !curatedWorkspaces.isEmpty {
+                            let inboxCollapsed = store.isInboxCollapsed(for: project)
+                            unclassifiedInboxHeaderRow(
+                                project: project,
+                                count: visibleUnclassified.count,
+                                isCollapsed: inboxCollapsed,
+                                unclassifiedIds: visibleUnclassified.map(\.agent.agentId)
+                            )
+                            if !inboxCollapsed {
+                                unclassifiedConversationSlice(
+                                    project: project,
+                                    conversations: visibleUnclassified,
+                                    indented: true
+                                )
+                            }
+                        } else {
+                            unclassifiedConversationSlice(
+                                project: project,
+                                conversations: visibleUnclassified,
+                                indented: false
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func unclassifiedConversationSlice(
+        project: FfiSidebarProjectGroup,
+        conversations: [FfiSidebarConversation],
+        indented: Bool
+    ) -> some View {
+        let selectedIdx = conversations.firstIndex {
+            !store.isDraftNewSession && store.selectedAgentId == $0.agent.agentId
+        } ?? -1
+        let isExpandedAll = expandedMoreProjectIds.contains(project.id)
+            || selectedIdx >= Self.maxVisibleConversationsPerProject
+        let hiddenCount = max(0, conversations.count - Self.maxVisibleConversationsPerProject)
+        let sliced = isExpandedAll
+            ? conversations
+            : Array(conversations.prefix(Self.maxVisibleConversationsPerProject))
+
+        ForEach(sliced) { conv in
+            sessionRow(conv: conv, project: project, isInsideWorkspace: indented)
+        }
+
+        if hiddenCount > 0 {
+            showMoreLessRow(projectId: project.id, hiddenCount: hiddenCount, isExpandedAll: isExpandedAll)
+        }
+    }
+
+    private var automationsNavRow: some View {
+        Button {
+            store.hapticLight()
+            if isCompactOverlay {
+                store.isDrawerOpen = false
+            }
+            store.activeSheet = .automations
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(palette.fgSecondary)
+                    .frame(width: 16, height: 16)
+
+                Text("Automations")
+                    .font(OrbitTypography.subhead(.medium))
+                    .foregroundStyle(palette.fgPrimary.opacity(0.9))
+
+                Spacer(minLength: 4)
+
+                if activeScheduleCount > 0 {
+                    Text("\(activeScheduleCount)")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.direct)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(palette.direct.opacity(0.14), in: Capsule())
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(minHeight: 34)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 2, trailing: 8))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+    }
+
+    private func organizingProgressRow(status: FfiWorkspaceOrganizeStatus) -> some View {
+        HStack(spacing: 8) {
+            OrbitSpinnerRingView(color: palette.accentViolet, size: 11.5)
+            Text(status.message.isEmpty ? "AI organizing workspaces…" : status.message)
+                .font(OrbitTypography.meta(.medium))
+                .foregroundStyle(palette.accentViolet)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 22)
+        .padding(.trailing, 8)
+        .padding(.vertical, 5)
+        .background(palette.accentViolet.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .listRowInsets(EdgeInsets(top: 1, leading: 10, bottom: 2, trailing: 10))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+    }
+
+    private func workspaceHeaderRow(
+        workspace: FfiSidebarWorkspaceGroup,
+        project: FfiSidebarProjectGroup,
+        siblingWorkspaces: [FfiSidebarWorkspaceGroup],
+        isCollapsed: Bool
+    ) -> some View {
+        let extraDirs = Array(project.directories.dropFirst())
+        let otherWorkspaces = siblingWorkspaces.filter { $0.workspaceId != workspace.workspaceId }
+
+        return HStack(spacing: 4) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    store.toggleWorkspaceCollapsed(workspace.workspaceId)
+                }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(palette.fgMuted)
+                        .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                        .frame(width: 10)
+
+                    Image(systemName: "square.stack.3d.up")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(palette.accentViolet)
+
+                    Text(workspace.title)
+                        .font(OrbitTypography.subhead(.semibold))
+                        .foregroundStyle(palette.fgPrimary.opacity(0.92))
+                        .lineLimit(1)
+
+                    if workspace.peerCount > 0 {
+                        Text("\(workspace.peerCount)")
+                            .font(.system(size: 10.5, weight: .medium))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+
+                    Spacer(minLength: 2)
+                }
+                .padding(.leading, 14)
+                .padding(.vertical, 5)
+                .frame(minHeight: 34)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if workspace.hasConflict {
+                Circle().fill(palette.warning).frame(width: 6, height: 6)
+            } else if workspace.runningCount > 0 {
+                OrbitSpinnerRingView(color: palette.fgSecondary, size: 11)
+            } else if workspace.unreadCount > 0 {
+                Circle().fill(palette.accentSky).frame(width: 5.5, height: 5.5)
+            }
+
+            Button {
+                if isCompactOverlay { store.isDrawerOpen = false }
+                store.openWorkspaceBoard(workspaceId: workspace.workspaceId)
+            } label: {
+                Image(systemName: "doc.richtext")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(palette.fgMuted)
+                    .frame(width: 26, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open Board for \(workspace.title)")
+
+            Button {
+                store.startNewSessionDraft(
+                    cwd: workspace.cwd,
+                    extraDirs: extraDirs,
+                    workspaceId: workspace.workspaceId
+                )
+            } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(palette.fgMuted)
+                    .frame(width: 26, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("New Session in \(workspace.title)")
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(palette.accentViolet.opacity(palette.isDark ? 0.08 : 0.05))
+        )
+        .contextMenu {
+            Button {
+                store.startNewSessionDraft(
+                    cwd: workspace.cwd,
+                    extraDirs: extraDirs,
+                    workspaceId: workspace.workspaceId
+                )
+            } label: {
+                Label("New Conversation in Workspace", systemImage: "square.and.pencil")
+            }
+
+            Button {
+                if isCompactOverlay { store.isDrawerOpen = false }
+                store.openWorkspaceBoard(workspaceId: workspace.workspaceId)
+            } label: {
+                Label("Open Mission Board", systemImage: "doc.richtext")
+            }
+
+            Button {
+                if isCompactOverlay { store.isDrawerOpen = false }
+                store.activeSheet = .spawnPeer(workspaceId: workspace.workspaceId)
+            } label: {
+                Label("Add Workspace Peer", systemImage: "person.badge.plus")
+            }
+
+            if let hid = store.selectedHostId {
+                Button {
+                    store.renameTarget = .workspace(
+                        hostId: hid,
+                        workspaceId: workspace.workspaceId,
+                        currentTitle: workspace.title
+                    )
+                } label: {
+                    Label("Rename Workspace", systemImage: "pencil")
+                }
+            }
+
+            if !otherWorkspaces.isEmpty {
+                Menu {
+                    ForEach(otherWorkspaces) { target in
+                        Button(target.title) {
+                            store.mergeWorkspaces(
+                                sourceWorkspaceId: workspace.workspaceId,
+                                targetWorkspaceId: target.workspaceId
+                            )
+                        }
+                    }
+                } label: {
+                    Label("Merge Into…", systemImage: "arrow.triangle.merge")
+                }
+            }
+
+            Divider()
+
+            Button {
+                store.archiveWorkspace(workspace.workspaceId, keepAgentsUnclassified: true)
+            } label: {
+                Label("Dissolve (Keep Sessions)", systemImage: "tray")
+            }
+
+            Button(role: .destructive) {
+                store.archiveWorkspace(workspace.workspaceId, keepAgentsUnclassified: false)
+            } label: {
+                Label("Archive Workspace & Sessions", systemImage: "archivebox")
+            }
+        }
+        .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 1, trailing: 8))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+    }
+
+    private func emptyWorkspacePlaceholderRow(
+        workspace: FfiSidebarWorkspaceGroup,
+        project: FfiSidebarProjectGroup
+    ) -> some View {
+        Button {
+            store.startNewSessionDraft(
+                cwd: workspace.cwd,
+                extraDirs: Array(project.directories.dropFirst()),
+                workspaceId: workspace.workspaceId
+            )
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "plus.circle")
+                    .font(.system(size: 11.5))
+                Text("Start first conversation")
+                    .font(OrbitTypography.meta(.regular))
+                Spacer()
+            }
+            .foregroundStyle(palette.fgMuted)
+            .padding(.leading, 32)
+            .frame(minHeight: 30)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 2, trailing: 8))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+    }
+
+    private func unclassifiedInboxHeaderRow(
+        project: FfiSidebarProjectGroup,
+        count: Int,
+        isCollapsed: Bool,
+        unclassifiedIds: [String]
+    ) -> some View {
+        HStack(spacing: 4) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    store.toggleInboxCollapsed(projectId: project.id, currentlyCollapsed: isCollapsed)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(palette.fgMuted)
+                        .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                        .frame(width: 10)
+
+                    Image(systemName: "tray")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(palette.fgMuted)
+
+                    Text("待归类 (\(count))")
+                        .font(OrbitTypography.meta(.medium))
+                        .foregroundStyle(palette.fgMuted)
+
+                    Spacer(minLength: 2)
+                }
+                .padding(.leading, 14)
+                .frame(minHeight: 30)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                store.organizeProjectWorkspaces(
+                    projectRoot: project.primaryCwd,
+                    agentIds: unclassifiedIds,
+                    autoApply: true
+                )
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 10.5, weight: .semibold))
+                    Text("AI 归类")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundStyle(palette.accentViolet)
+                .padding(.horizontal, 7)
+                .frame(height: 24)
+                .background(palette.accentViolet.opacity(0.12), in: Capsule())
+            }
+            .buttonStyle(.plain)
+        }
+        .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 1, trailing: 8))
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
     }
 
     // MARK: - Section & Project Headers
@@ -555,6 +940,8 @@ struct FleetDrawerView: View {
 
     private func projectHeaderRow(
         project: FfiSidebarProjectGroup,
+        projectIndex: Int,
+        totalProjects: Int,
         isCollapsed: Bool,
         hostId: String
     ) -> some View {
@@ -576,9 +963,9 @@ struct FleetDrawerView: View {
                     store.toggleProjectCollapsed(project.id)
                 }
             } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: isCollapsed ? "folder" : "folder")
-                        .font(.system(size: 14, weight: .medium))
+                HStack(spacing: 8) {
+                    Image(systemName: isCollapsed ? "folder" : "folder.fill")
+                        .font(.system(size: 13.5, weight: .medium))
                         .foregroundStyle(palette.fgSecondary)
                         .frame(width: 16, height: 16)
 
@@ -606,7 +993,7 @@ struct FleetDrawerView: View {
                     .padding(.trailing, 2)
             } else if hasCollapsedUnread {
                 Circle()
-                    .fill(Color(hex: "#0EA5E9"))
+                    .fill(palette.accentSky)
                     .frame(width: 6, height: 6)
                     .padding(.trailing, 2)
             }
@@ -635,6 +1022,44 @@ struct FleetDrawerView: View {
                 Label("New Conversation", systemImage: "square.and.pencil")
             }
 
+            Button {
+                if isCompactOverlay { store.isDrawerOpen = false }
+                store.activeSheet = .createWorkspace(
+                    projectRoot: project.primaryCwd,
+                    projectName: project.name,
+                    isGitRepo: project.isGitRepo,
+                    moveAgentId: nil
+                )
+            } label: {
+                Label("New Mission Workspace", systemImage: "square.stack.3d.up")
+            }
+
+            Button {
+                store.organizeProjectWorkspaces(
+                    projectRoot: project.primaryCwd,
+                    agentIds: project.unclassifiedConversations.map(\.agent.agentId),
+                    autoApply: true
+                )
+            } label: {
+                Label("AI Organize Workspaces", systemImage: "sparkles")
+            }
+
+            if projectIndex > 0 {
+                Button {
+                    store.moveProject(sortOrderKey: project.sortOrderKey, offset: -1, within: displayProjects)
+                } label: {
+                    Label("Move Project Up", systemImage: "arrow.up")
+                }
+            }
+
+            if projectIndex < totalProjects - 1 {
+                Button {
+                    store.moveProject(sortOrderKey: project.sortOrderKey, offset: 1, within: displayProjects)
+                } label: {
+                    Label("Move Project Down", systemImage: "arrow.down")
+                }
+            }
+
             if let pinnedId = project.pinnedProjectId {
                 Button {
                     store.unpinProject(pinnedId)
@@ -647,6 +1072,14 @@ struct FleetDrawerView: View {
                 } label: {
                     Label("Pin Project", systemImage: "pin")
                 }
+            }
+
+            Button {
+                if isCompactOverlay { store.isDrawerOpen = false }
+                store.selectWorkspaceDirectory(project.primaryCwd)
+                store.openWorkspaceFiles()
+            } label: {
+                Label("Files Explorer", systemImage: "folder")
             }
 
             Button {
@@ -714,6 +1147,8 @@ struct FleetDrawerView: View {
 
     private func sessionRow(
         conv: FfiSidebarConversation,
+        project: FfiSidebarProjectGroup? = nil,
+        isInsideWorkspace: Bool = false,
         trailingTag: String? = nil
     ) -> some View {
         let hostId = conv.hostId
@@ -726,6 +1161,17 @@ struct FleetDrawerView: View {
         let titleColor = (isSelected || isUnread) ? palette.fgPrimary : mutedRowForeground
         let rightLabel = trailingTag
             ?? (agent.isRunning ? "now" : OrbitFormatters.relativeUpdatedTime(rfc3339: agent.updatedAtRfc3339))
+        let semanticHandle: String? = {
+            guard isInsideWorkspace,
+                  let raw = agent.handle?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty,
+                  !OrbitFormatters.isGenericHarnessHandle(raw) else {
+                return nil
+            }
+            return raw.hasPrefix("@") ? raw : "@\(raw)"
+        }()
+        let curatedWorkspaces = (project?.workspaces ?? []).filter { $0.isCurated || $0.isMultiAgent }
+        let effectiveProjectRoot = project?.primaryCwd ?? agent.cwd
 
         return Button {
             store.selectAgent(agent.agentId)
@@ -739,6 +1185,16 @@ struct FleetDrawerView: View {
                     .foregroundStyle(titleColor)
                     .lineLimit(1)
 
+                if let handleTag = semanticHandle {
+                    Text(handleTag)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(palette.accentViolet)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(palette.accentViolet.opacity(0.12), in: Capsule())
+                        .lineLimit(1)
+                }
+
                 Spacer(minLength: OrbitSpacing.xs)
 
                 if !rightLabel.isEmpty {
@@ -748,7 +1204,8 @@ struct FleetDrawerView: View {
                         .lineLimit(1)
                 }
             }
-            .padding(.horizontal, 8)
+            .padding(.leading, isInsideWorkspace ? 20 : 8)
+            .padding(.trailing, 8)
             .frame(minHeight: 40)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -759,6 +1216,73 @@ struct FleetDrawerView: View {
         .buttonStyle(.plain)
         .contextMenu {
             if !hostId.isEmpty {
+                Button {
+                    store.renameTarget = .agent(
+                        hostId: hostId,
+                        agentId: agent.agentId,
+                        currentTitle: agent.title,
+                        currentHandle: agent.handle
+                    )
+                } label: {
+                    Label("Rename", systemImage: "pencil")
+                }
+
+                Button {
+                    store.organizeProjectWorkspaces(
+                        projectRoot: effectiveProjectRoot,
+                        agentIds: [agent.agentId],
+                        autoApply: true
+                    )
+                } label: {
+                    Label("AI 归类此会话", systemImage: "sparkles")
+                }
+
+                Button {
+                    store.summarizeAgent(agent.agentId)
+                } label: {
+                    Label("AI Update Summary", systemImage: "text.badge.star")
+                }
+
+                Menu {
+                    ForEach(curatedWorkspaces) { ws in
+                        Button {
+                            store.moveAgentToWorkspace(
+                                agentId: agent.agentId,
+                                targetWorkspaceId: ws.workspaceId
+                            )
+                        } label: {
+                            Label(
+                                ws.title,
+                                systemImage: ws.workspaceId == agent.workspaceId ? "checkmark" : "square.stack.3d.up"
+                            )
+                        }
+                    }
+                    Button {
+                        if isCompactOverlay { store.isDrawerOpen = false }
+                        store.activeSheet = .createWorkspace(
+                            projectRoot: effectiveProjectRoot,
+                            projectName: project?.name ?? OrbitFormatters.shortPath(effectiveProjectRoot),
+                            isGitRepo: project?.isGitRepo ?? false,
+                            moveAgentId: agent.agentId
+                        )
+                    } label: {
+                        Label("New Workspace…", systemImage: "plus.rectangle.on.folder")
+                    }
+                    Button {
+                        store.moveAgentToWorkspace(
+                            agentId: agent.agentId,
+                            targetWorkspaceId: nil,
+                            makeUnclassified: true
+                        )
+                    } label: {
+                        Label("移回待归类", systemImage: "tray")
+                    }
+                } label: {
+                    Label("Move to Workspace", systemImage: "folder.badge.gearshape")
+                }
+
+                Divider()
+
                 Button {
                     store.togglePinThread(hostId: hostId, agentId: agent.agentId)
                 } label: {
@@ -790,6 +1314,14 @@ struct FleetDrawerView: View {
                 store.copyPathToClipboard(agent.cwd)
             } label: {
                 Label("Copy Path", systemImage: "square.on.square")
+            }
+
+            Button {
+                UIPasteboard.general.string = agent.agentId
+                store.hapticLight()
+                store.showToast("Copied thread ID")
+            } label: {
+                Label("Copy Thread ID", systemImage: "number")
             }
 
             Divider()
@@ -968,6 +1500,35 @@ struct FleetDrawerView: View {
                 .buttonStyle(.plain)
             }
 
+            if archivedCount > 0 {
+                Button {
+                    store.hapticLight()
+                    if isCompactOverlay {
+                        store.isDrawerOpen = false
+                    }
+                    store.activeSheet = .archivedThreads
+                } label: {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "archivebox")
+                            .font(.system(size: 14.5, weight: .medium))
+                            .foregroundStyle(palette.fgSecondary)
+                            .frame(width: 38, height: 38)
+                            .background(softSurfaceFill, in: Circle())
+                            .contentShape(Circle())
+
+                        Text("\(min(archivedCount, 99))")
+                            .font(.system(size: 9.5, weight: .bold))
+                            .foregroundStyle(palette.onPrimary)
+                            .padding(.horizontal, 4)
+                            .frame(minWidth: 16, minHeight: 16)
+                            .background(palette.fgMuted, in: Capsule())
+                            .offset(x: 3, y: -2)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Archived Conversations (\(archivedCount))")
+            }
+
             Button {
                 store.hapticLight()
                 if isCompactOverlay {
@@ -976,12 +1537,21 @@ struct FleetDrawerView: View {
                 store.refreshQuotas()
                 store.activeSheet = .settings
             } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 15.5, weight: .medium))
-                    .foregroundStyle(palette.fgPrimary)
-                    .frame(width: 38, height: 38)
-                    .background(softSurfaceFill, in: Circle())
-                    .contentShape(Circle())
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 15.5, weight: .medium))
+                        .foregroundStyle(palette.fgPrimary)
+                        .frame(width: 38, height: 38)
+                        .background(softSurfaceFill, in: Circle())
+                        .contentShape(Circle())
+
+                    if !store.outdatedOnlineHosts.isEmpty {
+                        Circle()
+                            .fill(palette.accentSky)
+                            .frame(width: 7.5, height: 7.5)
+                            .offset(x: -2, y: 2)
+                    }
+                }
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Settings")
@@ -1001,11 +1571,15 @@ struct FleetDrawerView: View {
 
     // MARK: - Sidebar Helpers
 
-    private func projectDisplayName(forCwd cwd: String) -> String {
-        if let matched = hostProjects.first(where: { grp in
+    private func projectForCwd(_ cwd: String) -> FfiSidebarProjectGroup? {
+        hostProjects.first(where: { grp in
             grp.directories.contains { OrbitFormatters.arePathsEquivalent($0, cwd) }
                 || OrbitFormatters.arePathsEquivalent(grp.primaryCwd, cwd)
-        }) {
+        })
+    }
+
+    private func projectDisplayName(forCwd cwd: String) -> String {
+        if let matched = projectForCwd(cwd) {
             return matched.name
         }
         return OrbitFormatters.shortPath(cwd)

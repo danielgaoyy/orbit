@@ -1,3 +1,4 @@
+mod cloud_sync_cli;
 mod mcp_bridge;
 mod orchestration_cli;
 mod service;
@@ -172,6 +173,9 @@ enum Commands {
         /// Force reinstall even if already on the latest version.
         #[arg(long)]
         force: bool,
+        /// Also upgrade all connected remote Orbit hosts in the fleet mesh before upgrading this machine.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Auto-discover `~/.ssh/config` or attach to an E2EE Relay, auto-deploy via SSH if given an SSH alias, and print Pairing Code.
@@ -200,6 +204,42 @@ enum Commands {
         endpoints: Vec<String>,
         #[arg(long)]
         relay: Option<String>,
+    },
+
+    /// Sign in with GitHub (zero-server E2EE Secret Gist) to sync hosts, projects & settings across all devices.
+    Login {
+        /// Optional GitHub Personal Access Token (`gist` scope) for non-interactive or fallback sign-in.
+        #[arg(long, env = "ORBIT_GITHUB_TOKEN")]
+        token: Option<String>,
+        /// Optional GitHub OAuth App Client ID for RFC 8628 Device Flow.
+        #[arg(long, env = "ORBIT_GITHUB_CLIENT_ID")]
+        client_id: Option<String>,
+        /// Optional Sync Passphrase to unlock or initialize the encrypted Vault non-interactively.
+        #[arg(long, env = "ORBIT_SYNC_PASSPHRASE")]
+        passphrase: Option<String>,
+        /// Skip registering this machine's local Orbit Daemon into the synced fleet.
+        #[arg(long)]
+        no_register_host: bool,
+        /// Also wire all other synced hosts into this machine's local Daemon Connected Hosts mesh.
+        #[arg(long)]
+        mesh: bool,
+    },
+
+    /// Sync this machine's Daemon & multi-device fleet config with your encrypted GitHub Vault.
+    Sync {
+        /// Pull/merge without pushing this machine's local Daemon identity.
+        #[arg(long)]
+        no_register_host: bool,
+        /// Also wire all other synced hosts into this machine's local Daemon Connected Hosts mesh.
+        #[arg(long)]
+        mesh: bool,
+    },
+
+    /// Sign out of GitHub Cloud Sync on this machine (keeps your remote encrypted GitHub Gist intact).
+    Logout {
+        /// Also clear saved client hosts from local desktop replica SQLite.
+        #[arg(long)]
+        clear_local_hosts: bool,
     },
 
     /// Run or manage the host-local Orbit Daemon (`orbit daemon up | status | restart | down`).
@@ -410,9 +450,26 @@ fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
         .join(".orbit")
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let rt = match &cli.command {
+        Commands::Daemon { action: None, .. } | Commands::Relay { .. } => {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(2, 4))
+                .unwrap_or(4);
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(workers)
+                .enable_all()
+                .build()?
+        }
+        _ => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?,
+    };
+    rt.block_on(run_cli(cli))
+}
+
+async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let home_dir = resolve_home(cli.home);
     let json_mode = cli.json;
     let via_relay = cli.via_relay;
@@ -515,8 +572,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Upgrade { force } => {
-            self_upgrade_cli(&home_dir, force).await?;
+        Commands::Upgrade { force, all } => {
+            self_upgrade_cli(&home_dir, force, all).await?;
         }
 
         Commands::Quotas => {
@@ -723,6 +780,46 @@ async fn main() -> anyhow::Result<()> {
             relay,
         } => {
             print_pairing_summary(&home_dir, port, endpoints, relay).await?;
+        }
+
+        Commands::Login {
+            token,
+            client_id,
+            passphrase,
+            no_register_host,
+            mesh,
+        } => {
+            cloud_sync_cli::cmd_login(
+                &home_dir,
+                cloud_sync_cli::LoginOptions {
+                    token,
+                    client_id,
+                    passphrase,
+                    no_register_host,
+                    sync_mesh: mesh,
+                    json_mode,
+                },
+            )
+            .await?;
+        }
+
+        Commands::Sync {
+            no_register_host,
+            mesh,
+        } => {
+            cloud_sync_cli::cmd_sync(
+                &home_dir,
+                cloud_sync_cli::SyncOptions {
+                    no_register_host,
+                    sync_mesh: mesh,
+                    json_mode,
+                },
+            )
+            .await?;
+        }
+
+        Commands::Logout { clear_local_hosts } => {
+            cloud_sync_cli::cmd_logout(&home_dir, clear_local_hosts, json_mode).await?;
         }
 
         Commands::Daemon {

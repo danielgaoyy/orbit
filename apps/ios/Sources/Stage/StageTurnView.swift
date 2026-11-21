@@ -62,6 +62,8 @@ struct StageTurnView: View {
 
     @Environment(\.orbitPalette) private var palette
     @State private var isFoldedStepsExpanded = false
+    @State private var isRewindDialogPresented = false
+    @State private var rewindTargetSeq: UInt64? = nil
 
     private var isFirstStepBearingTurn: Bool {
         if let firstWithSteps = store.agentStage?.turns.first(where: { !$0.foldedSteps.isEmpty }) {
@@ -82,7 +84,7 @@ struct StageTurnView: View {
     }
 
     private var canFoldPreReplyWork: Bool {
-        turn.terminalReply != nil && !turn.foldedSteps.isEmpty
+        store.coalesceExploration && turn.terminalReply != nil && !turn.foldedSteps.isEmpty
     }
 
     private var terminalReplyText: String? {
@@ -104,10 +106,33 @@ struct StageTurnView: View {
             } else {
                 VStack(alignment: .leading, spacing: OrbitSpacing.md) {
                     if let promptItem = turn.userPrompt,
-                       case let .userPrompt(_, _, text, badges, blocks, timestampMs) = promptItem {
+                       case let .userPrompt(promptSeq, _, text, badges, blocks, timestampMs) = promptItem {
                         UserPromptBubbleView(
                             text: text,
                             badges: badges,
+                            blocks: blocks,
+                            timestampMs: timestampMs,
+                            onCopy: {
+                                store.copyAssistantReply(text)
+                            },
+                            onRewind: !store.isActiveAgentRunning ? {
+                                rewindTargetSeq = promptSeq
+                                isRewindDialogPresented = true
+                            } : nil
+                        )
+                    }
+
+                    if let agentMsg = turn.agentMessage,
+                       case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs) = agentMsg {
+                        AgentMessageCardView(
+                            store: store,
+                            kind: kind,
+                            sourceAgentId: sourceAgentId,
+                            sourceHostId: sourceHostId,
+                            sourceTitle: sourceTitle,
+                            event: event,
+                            text: text,
+                            permissionContext: permissionContext,
                             blocks: blocks,
                             timestampMs: timestampMs
                         )
@@ -162,12 +187,36 @@ struct StageTurnView: View {
                                 replyText: !isTurnActive ? terminalReplyText : nil,
                                 onCopy: { reply in
                                     store.copyAssistantReply(reply)
+                                },
+                                onQuote: { reply in
+                                    store.quoteAssistantReply(turnKey: turn.key, text: reply)
                                 }
                             )
                         }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .confirmationDialog(
+                    "Rewind conversation to before this message?",
+                    isPresented: $isRewindDialogPresented,
+                    titleVisibility: .visible
+                ) {
+                    if let seq = rewindTargetSeq {
+                        Button("Restore Conversation & Files", role: .destructive) {
+                            store.rewindAgent(toBeforeSeq: seq, restoreFiles: true)
+                            rewindTargetSeq = nil
+                        }
+                        Button("Rewind Conversation Only") {
+                            store.rewindAgent(toBeforeSeq: seq, restoreFiles: false)
+                            rewindTargetSeq = nil
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {
+                        rewindTargetSeq = nil
+                    }
+                } message: {
+                    Text("Messages after this turn will be removed and this prompt will return to your composer.")
+                }
             }
         }
         .onAppear {
@@ -251,7 +300,7 @@ struct StageTurnView: View {
                     let isSegLiveActive = isTurnActive && isTrailingSeg && !hasFollowingContent
                     let segSettled = !isSegLiveActive && !hasRunningStep
                     let keepOpenForTrailingFailure = !hasFollowingContent && summary.counts.unrecoveredFailureCount > 0
-                    let shouldFold = segSettled && !keepOpenForTrailingFailure
+                    let shouldFold = store.coalesceExploration && segSettled && !keepOpenForTrailingFailure
 
                     LiveStepGroupView(
                         store: store,
@@ -372,6 +421,7 @@ private struct TurnFooterView: View {
     let completedAtMs: Int64?
     let replyText: String?
     let onCopy: (String) -> Void
+    var onQuote: ((String) -> Void)? = nil
 
     @Environment(\.orbitPalette) private var palette
     @State private var copied = false
@@ -408,6 +458,20 @@ private struct TurnFooterView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel(copied ? "Copied Reply" : "Copy Assistant Reply")
+
+                        if let onQuote {
+                            Button {
+                                onQuote(reply)
+                            } label: {
+                                Image(systemName: "text.quote")
+                                    .font(.system(size: 12.5, weight: .medium))
+                                    .foregroundStyle(palette.fgSecondary.opacity(0.75))
+                                    .frame(width: 28, height: 28)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Quote Reply into Composer")
+                        }
                     }
 
                     if let completedMs = completedAtMs {
@@ -715,6 +779,8 @@ struct UserPromptBubbleView: View {
     let badges: [FfiPromptBadge]
     var blocks: [FfiRichBlock] = []
     var timestampMs: Int64? = nil
+    var onCopy: (() -> Void)? = nil
+    var onRewind: (() -> Void)? = nil
 
     @Environment(\.orbitPalette) private var palette
     @State private var isExpanded = false
@@ -824,6 +890,22 @@ struct UserPromptBubbleView: View {
                         x: 0,
                         y: 1
                     )
+            }
+            .contextMenu {
+                if let onCopy {
+                    Button {
+                        onCopy()
+                    } label: {
+                        Label("Copy Prompt", systemImage: "square.on.square")
+                    }
+                }
+                if let onRewind {
+                    Button {
+                        onRewind()
+                    } label: {
+                        Label("Rewind to Here", systemImage: "arrow.uturn.backward")
+                    }
+                }
             }
         }
     }
@@ -1232,6 +1314,8 @@ struct StepRailListView: View {
             return id.isEmpty ? "q-seq-\(seq)" : "q-\(id)"
         case let .notice(seq, _, _, _):
             return "notice-\(seq)-\(fallbackIndex)"
+        case let .agentMessage(seq, id, _, _, _, _, _, _, _, _, _):
+            return id.isEmpty ? "agmsg-seq-\(seq)" : "agmsg-\(id)"
         }
     }
 
@@ -1244,6 +1328,7 @@ struct StepRailListView: View {
         case let .permissionRequest(seq, _, _, _, _, _, _, _): return seq
         case let .questionRequest(seq, _, _, _, _): return seq
         case let .notice(seq, _, _, _): return seq
+        case let .agentMessage(seq, _, _, _, _, _, _, _, _, _, _): return seq
         }
     }
 }
@@ -1296,6 +1381,20 @@ struct StepRowView: View {
 
             case let .notice(_, level, message, _):
                 TurnNoticeRow(level: level, message: message)
+
+            case let .agentMessage(_, _, kind, sourceAgentId, sourceHostId, sourceTitle, event, text, permissionContext, blocks, timestampMs):
+                AgentMessageCardView(
+                    store: store,
+                    kind: kind,
+                    sourceAgentId: sourceAgentId,
+                    sourceHostId: sourceHostId,
+                    sourceTitle: sourceTitle,
+                    event: event,
+                    text: text,
+                    permissionContext: permissionContext,
+                    blocks: blocks,
+                    timestampMs: timestampMs
+                )
 
             case .userPrompt:
                 EmptyView()
@@ -2096,5 +2195,202 @@ struct TurnNoticeRow: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(accentColor.opacity(0.22), lineWidth: 0.5)
         )
+    }
+}
+
+// MARK: - Inter-Agent Peer Message / Finish Notification / Heartbeat / Child Permission Card
+
+struct AgentMessageCardView: View {
+    @ObservedObject var store: OrbitIosStore
+    let kind: FfiAgentMessageKind
+    let sourceAgentId: String?
+    let sourceHostId: String?
+    let sourceTitle: String?
+    let event: String?
+    let text: String
+    let permissionContext: FfiPermissionCheckpointRef?
+    let blocks: [FfiRichBlock]
+    let timestampMs: Int64?
+
+    @Environment(\.orbitPalette) private var palette
+    @State private var isHeartbeatExpanded = false
+    @State private var resolvedChildDecision: String? = nil
+
+    private var headerTitle: String {
+        let sender = sourceTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch kind {
+        case .heartbeat:
+            return (sender?.isEmpty == false) ? "Heartbeat · \(sender!)" : "Heartbeat Wake-up"
+        case .finishNotification:
+            return (sender?.isEmpty == false) ? "\(sender!) finished" : "Child agent finished"
+        case .directMessage:
+            if permissionContext != nil {
+                return (sender?.isEmpty == false) ? "Approval Needed · \(sender!)" : "Child Approval Needed"
+            }
+            return (sender?.isEmpty == false) ? "Message from \(sender!)" : "Peer Message"
+        }
+    }
+
+    private var accentColor: Color {
+        if permissionContext != nil { return palette.warning }
+        switch kind {
+        case .heartbeat: return palette.fgMuted
+        case .finishNotification: return palette.direct
+        case .directMessage: return palette.accentViolet
+        }
+    }
+
+    private var iconName: String {
+        if permissionContext != nil { return "exclamationmark.shield.fill" }
+        switch kind {
+        case .heartbeat: return "heart.text.square"
+        case .finishNotification: return "checkmark.circle.fill"
+        case .directMessage: return "bubble.left.and.bubble.right.fill"
+        }
+    }
+
+    private var canJumpToSource: Bool {
+        guard let aid = sourceAgentId, !aid.isEmpty else { return false }
+        if let shid = sourceHostId, !shid.isEmpty, shid != store.selectedHostId {
+            return false
+        }
+        return true
+    }
+
+    var body: some View {
+        if kind == .heartbeat && permissionContext == nil {
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    store.hapticLight()
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        isHeartbeatExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: iconName)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(palette.fgMuted)
+                        Text(headerTitle)
+                            .font(OrbitTypography.meta(.medium))
+                            .foregroundStyle(palette.fgSecondary)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted)
+                            .rotationEffect(.degrees(isHeartbeatExpanded ? 90 : 0))
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if isHeartbeatExpanded && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    RichMarkdownView(
+                        blocks: blocks.isEmpty ? parseMarkdownPreview(markdown: text, streaming: false) : blocks,
+                        fallbackText: text
+                    )
+                }
+            }
+            .padding(.horizontal, OrbitSpacing.md)
+            .padding(.vertical, 8)
+            .background(palette.subtleFill.opacity(0.65))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(palette.hairline, lineWidth: 0.5)
+            )
+        } else {
+            VStack(alignment: .leading, spacing: OrbitSpacing.sm) {
+                HStack(spacing: 8) {
+                    Image(systemName: iconName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(accentColor)
+
+                    Text(headerTitle)
+                        .font(OrbitTypography.subhead(.semibold))
+                        .foregroundStyle(palette.fgPrimary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 4)
+
+                    if canJumpToSource, let aid = sourceAgentId {
+                        Button {
+                            store.selectAgent(aid)
+                        } label: {
+                            Text("Open")
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(accentColor)
+                                .padding(.horizontal, 9)
+                                .frame(height: 24)
+                                .background(accentColor.opacity(0.14), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    RichMarkdownView(
+                        blocks: blocks.isEmpty ? parseMarkdownPreview(markdown: text, streaming: false) : blocks,
+                        fallbackText: text
+                    )
+                }
+
+                if let perm = permissionContext {
+                    OrbitHairline()
+                    if let decided = resolvedChildDecision {
+                        HStack(spacing: 6) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 12))
+                                .foregroundStyle(palette.direct)
+                            Text("Responded: \(OrbitFormatters.decisionLabel(decided))")
+                                .font(OrbitTypography.meta(.medium))
+                                .foregroundStyle(palette.fgSecondary)
+                        }
+                    } else {
+                        let decisions = perm.allowedDecisions.isEmpty
+                            ? ["deny", "allow_always", "allow"]
+                            : perm.allowedDecisions
+                        HStack(spacing: OrbitSpacing.sm) {
+                            ForEach(decisions, id: \.self) { dec in
+                                let lower = dec.lowercased()
+                                let isDeny = lower.contains("deny") || lower.contains("reject")
+                                let isPrimary = !isDeny && !lower.contains("always")
+                                Button {
+                                    resolvedChildDecision = dec
+                                    store.resolveChildPermission(
+                                        childHostId: perm.childHostId,
+                                        childAgentId: perm.childAgentId,
+                                        requestId: perm.permissionRequestId,
+                                        decision: dec
+                                    )
+                                } label: {
+                                    Text(OrbitFormatters.decisionLabel(dec))
+                                        .font(OrbitTypography.meta(.semibold))
+                                        .foregroundStyle(
+                                            isDeny ? palette.danger :
+                                            isPrimary ? palette.onPrimary :
+                                            palette.fgPrimary
+                                        )
+                                        .frame(maxWidth: .infinity, minHeight: 34)
+                                        .background(
+                                            isDeny ? palette.danger.opacity(0.12) :
+                                            isPrimary ? palette.primary :
+                                            palette.subtleFill,
+                                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(OrbitSpacing.md)
+            .background(accentColor.opacity(palette.isDark ? 0.10 : 0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(accentColor.opacity(0.28), lineWidth: 0.5)
+            )
+        }
     }
 }

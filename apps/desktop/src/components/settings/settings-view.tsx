@@ -4,6 +4,7 @@ import {
   Bell,
   Check,
   ChevronsUpDown,
+  Cloud,
   Cpu,
   Keyboard,
   Palette,
@@ -14,6 +15,7 @@ import {
 } from "lucide-react";
 import { AddHostSection } from "@/components/settings/add-host-section";
 import { AppearanceSection } from "@/components/settings/appearance-section";
+import { CloudSyncSection } from "@/components/settings/cloud-sync-section";
 import { GeneralSection } from "@/components/settings/general-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
@@ -44,11 +46,15 @@ import {
 import { cn } from "@/lib/utils";
 
 const APP_SECTIONS: {
-  id: Extract<SettingsSection, "general" | "appearance" | "shortcuts" | "notifications">;
+  id: Extract<
+    SettingsSection,
+    "general" | "cloud_sync" | "appearance" | "shortcuts" | "notifications"
+  >;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: "general", label: "General", icon: Settings2 },
+  { id: "cloud_sync", label: "Cloud Sync", icon: Cloud },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
   { id: "notifications", label: "Notifications", icon: Bell },
@@ -429,6 +435,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
         <ScrollArea className="min-h-0 flex-1" viewportClassName="px-10 py-8">
           <div key={section} className="orbit-stage-enter mx-auto w-full max-w-[640px] pb-8">
             {section === "general" && <GeneralSection />}
+            {section === "cloud_sync" && <CloudSyncSection />}
             {section === "appearance" && <AppearanceSection />}
             {section === "shortcuts" && <ShortcutsSection />}
             {section === "notifications" && <NotificationsSection />}

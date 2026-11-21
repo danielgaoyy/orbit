@@ -1,17 +1,25 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  ArrowUpRight,
   Check,
+  CheckCircle2,
+  ChevronRight,
+  ClipboardList,
   Columns2,
   Edit3,
   Eye,
+  FileCode2,
   FileEdit,
   FileText,
   GitBranch,
+  History,
+  Lightbulb,
   Loader2,
   MessageSquare,
   RefreshCw,
   Save,
+  ShieldCheck,
   Target,
   Users,
 } from "lucide-react";
@@ -27,17 +35,243 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
-function formatEventTime(iso: string): string {
-  try {
-    return new Date(iso).toLocaleTimeString(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false,
+interface ParsedBoardSection {
+  key: string;
+  rawHeading: string;
+  displayTitle: string;
+  kind: "decisions" | "tasks" | "findings" | "custom";
+  markdown: string;
+}
+
+interface ParsedBoardDoc {
+  extractedGoal: string | null;
+  sections: ParsedBoardSection[];
+}
+
+const TEMPLATE_PLACEHOLDER_PATTERNS = [
+  /^\(record shared apis/i,
+  /^\(track peer ownership/i,
+  /^\(record review findings/i,
+  /^coordinate peers in this mission workspace\.?$/i,
+];
+
+function isBoilerplateLine(line: string): boolean {
+  const cleaned = line.trim().replace(/^[-*•]\s+/, "").trim();
+  if (!cleaned) return false;
+  return TEMPLATE_PLACEHOLDER_PATTERNS.some((re) => re.test(cleaned));
+}
+
+function classifySectionHeading(heading: string): {
+  kind: ParsedBoardSection["kind"];
+  displayTitle: string;
+} {
+  const lower = heading.trim().toLowerCase();
+  if (lower.includes("decision") || lower.includes("contract") || lower.includes("决策") || lower.includes("约定")) {
+    return { kind: "decisions", displayTitle: "决策与约定" };
+  }
+  if (lower.includes("task") || lower.includes("todo") || lower.includes("任务") || lower.includes("分工")) {
+    return { kind: "tasks", displayTitle: "任务分工" };
+  }
+  if (lower.includes("finding") || lower.includes("result") || lower.includes("progress") || lower.includes("结论") || lower.includes("进展")) {
+    return { kind: "findings", displayTitle: "进展与结论" };
+  }
+  return { kind: "custom", displayTitle: heading.trim() };
+}
+
+function parseBoardMarkdown(raw: string): ParsedBoardDoc {
+  const lines = raw.split(/\r?\n/);
+  let extractedGoal: string | null = null;
+  const rawSections: { heading: string; lines: string[] }[] = [];
+  let current: { heading: string; lines: string[] } | null = null;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("# ") && !trimmed.startsWith("## ")) {
+      // Skip redundant H1 workspace title (already rendered in header)
+      continue;
+    }
+    if (trimmed.startsWith("## ")) {
+      if (current) rawSections.push(current);
+      current = { heading: trimmed.slice(3).trim(), lines: [] };
+      continue;
+    }
+    if (!current) {
+      if (trimmed) {
+        current = { heading: "协作备忘", lines: [line] };
+      }
+    } else {
+      current.lines.push(line);
+    }
+  }
+  if (current) rawSections.push(current);
+
+  const sections: ParsedBoardSection[] = [];
+  for (const sec of rawSections) {
+    const keptLines = sec.lines.filter((l) => !isBoilerplateLine(l));
+    const body = keptLines.join("\n").trim();
+    if (!body) continue;
+
+    const lowerHeading = sec.heading.toLowerCase();
+    if (lowerHeading === "goal" || lowerHeading === "目标" || lowerHeading === "mission goal") {
+      extractedGoal = body.replace(/^[-*•]\s+/, "").trim();
+      continue;
+    }
+
+    const { kind, displayTitle } = classifySectionHeading(sec.heading);
+    sections.push({
+      key: `${sec.heading}-${sections.length}`,
+      rawHeading: sec.heading,
+      displayTitle,
+      kind,
+      markdown: body,
     });
+  }
+
+  return { extractedGoal, sections };
+}
+
+function SectionIcon({ kind }: { kind: ParsedBoardSection["kind"] }) {
+  switch (kind) {
+    case "decisions":
+      return <ShieldCheck className="h-[13.5px] w-[13.5px] shrink-0 text-sky-500" />;
+    case "tasks":
+      return <ClipboardList className="h-[13.5px] w-[13.5px] shrink-0 text-violet-500" />;
+    case "findings":
+      return <Lightbulb className="h-[13.5px] w-[13.5px] shrink-0 text-emerald-500" />;
+    default:
+      return <FileText className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0" />;
+  }
+}
+
+function shortFileLabel(rawPath: string, rootCwd?: string): string {
+  const clean = rawPath.trim().replace(/^`|`$/g, "");
+  if (!clean) return "";
+  if (rootCwd) {
+    const cleanRoot = rootCwd.replace(/\/+$/, "");
+    if (clean.startsWith(`${cleanRoot}/`)) {
+      const rel = clean.slice(cleanRoot.length + 1);
+      const parts = rel.split("/");
+      return parts.length > 3 ? `…/${parts.slice(-2).join("/")}` : rel;
+    }
+  }
+  const parts = clean.split("/").filter(Boolean);
+  if (parts.length <= 2) return parts.join("/") || clean;
+  return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+}
+
+function stripRawMarkdownNoise(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/[*#_~]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatRelativeEventTime(iso: string): string {
+  try {
+    const ts = Date.parse(iso);
+    if (!Number.isFinite(ts)) return "";
+    const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (diffSec < 60) return "刚刚";
+    const mins = Math.floor(diffSec / 60);
+    if (mins < 60) return `${mins} 分钟前`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours} 小时前`;
+    return new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric" });
   } catch {
     return "";
   }
+}
+
+interface HumanActivityItem {
+  key: string;
+  kind: WorkspaceEventRecord["kind"];
+  actor: string;
+  description: string;
+  createdAt: string;
+  count: number;
+  filePath?: string | null;
+}
+
+function buildHumanActivities(
+  events: WorkspaceEventRecord[],
+  rootCwd?: string,
+): HumanActivityItem[] {
+  const out: HumanActivityItem[] = [];
+
+  for (const ev of events) {
+    const actor = ev.agent_handle?.trim() || "系统";
+    let description = "";
+
+    switch (ev.kind) {
+      case "conflict_warning": {
+        const f = ev.file_path ? shortFileLabel(ev.file_path, rootCwd) : "同一文件";
+        description = `检测到多人同时修改 ${f}`;
+        break;
+      }
+      case "board_updated": {
+        const secMatch = /section `([^`]+)`/i.exec(ev.summary);
+        description = secMatch
+          ? `更新了协作笔记「${classifySectionHeading(secMatch[1]).displayTitle}」`
+          : "更新了协作笔记";
+        break;
+      }
+      case "file_edited": {
+        const f = ev.file_path ? shortFileLabel(ev.file_path, rootCwd) : "工作区文件";
+        description = `编辑了 ${f}`;
+        break;
+      }
+      case "peer_message": {
+        const cleaned = stripRawMarkdownNoise(ev.summary).slice(0, 72);
+        description = cleaned || "发送了协作消息";
+        break;
+      }
+      case "peer_joined": {
+        description = ev.summary.includes("AI Triage")
+          ? "通过 AI 归类加入工作区"
+          : "加入当前工作区";
+        break;
+      }
+      case "peer_finished": {
+        const rawRest = ev.summary.replace(/^@\S+\s+finished:\s*/i, "").trim();
+        const cleaned = stripRawMarkdownNoise(rawRest);
+        if (!cleaned || /^finished turn$/i.test(cleaned)) {
+          description = "完成了本轮任务";
+        } else {
+          description = `完成阶段进展：${cleaned.slice(0, 64)}${cleaned.length > 64 ? "…" : ""}`;
+        }
+        break;
+      }
+      default: {
+        description = stripRawMarkdownNoise(ev.summary).slice(0, 72) || "状态更新";
+      }
+    }
+
+    // Coalesce consecutive identical edits/actions from the same actor
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      prev.kind === ev.kind &&
+      prev.actor === actor &&
+      prev.description === description
+    ) {
+      prev.count += 1;
+      continue;
+    }
+
+    out.push({
+      key: `${ev.seq}`,
+      kind: ev.kind,
+      actor,
+      description,
+      createdAt: ev.created_at,
+      count: 1,
+      filePath: ev.file_path,
+    });
+  }
+
+  return out;
 }
 
 function EventIcon({ kind }: { kind: WorkspaceEventRecord["kind"] }) {
@@ -50,6 +284,8 @@ function EventIcon({ kind }: { kind: WorkspaceEventRecord["kind"] }) {
       return <MessageSquare className="h-[13px] w-[13px] shrink-0 text-violet-500" />;
     case "file_edited":
       return <FileEdit className="text-muted-foreground h-[13px] w-[13px] shrink-0" />;
+    case "peer_finished":
+      return <CheckCircle2 className="h-[13px] w-[13px] shrink-0 text-emerald-500" />;
     default:
       return <Users className="text-muted-foreground h-[13px] w-[13px] shrink-0" />;
   }
@@ -74,10 +310,15 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
     () => [...(hostDetail?.workspace_events?.[workspaceId] ?? [])].reverse(),
     [hostDetail, workspaceId],
   );
+  // Exclude child subagents so only top-level workspace conversations appear in the roster
   const peers = useMemo(
     () =>
       (hostDetail?.agents ?? []).filter(
-        (a) => a.workspace_id === workspaceId && !a.archived_at_rfc3339 && !a.background,
+        (a) =>
+          a.workspace_id === workspaceId &&
+          !a.archived_at_rfc3339 &&
+          !a.background &&
+          !a.parent_agent_id,
       ),
     [hostDetail, workspaceId],
   );
@@ -89,7 +330,48 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
   const [editingGoal, setEditingGoal] = useState(false);
   const [titleDraft, setTitleDraft] = useState(workspace?.title ?? "");
   const [editingTitle, setEditingTitle] = useState(false);
-  const [previewBlocks, setPreviewBlocks] = useState<RichBlockView[]>([]);
+  const [activityExpanded, setActivityExpanded] = useState(false);
+  const [sectionBlocks, setSectionBlocks] = useState<Record<string, RichBlockView[]>>({});
+
+  const parsedDoc = useMemo(
+    () => parseBoardMarkdown(board?.content ?? ""),
+    [board?.content],
+  );
+
+  const rootCwd = workspace?.project_root || workspace?.source_cwd || workspace?.cwd || "";
+
+  const conflictEvents = useMemo(
+    () => events.filter((ev) => ev.kind === "conflict_warning").slice(0, 5),
+    [events],
+  );
+
+  const touchedFiles = useMemo(() => {
+    const byPath = new Map<
+      string,
+      { path: string; label: string; lastActor: string; count: number; lastAt: string }
+    >();
+    for (const ev of events) {
+      if (ev.kind !== "file_edited" || !ev.file_path) continue;
+      const existing = byPath.get(ev.file_path);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        byPath.set(ev.file_path, {
+          path: ev.file_path,
+          label: shortFileLabel(ev.file_path, rootCwd),
+          lastActor: ev.agent_handle?.trim() || "会话",
+          count: 1,
+          lastAt: ev.created_at,
+        });
+      }
+    }
+    return Array.from(byPath.values()).slice(0, 8);
+  }, [events, rootCwd]);
+
+  const humanActivities = useMemo(
+    () => buildHumanActivities(events, rootCwd).slice(0, 24),
+    [events, rootCwd],
+  );
 
   useEffect(() => {
     if (!hostId || !workspaceId) return;
@@ -104,29 +386,40 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
 
   useEffect(() => {
     if (!editingGoal) {
-      setGoalDraft(workspace?.mission_goal ?? "");
+      setGoalDraft(workspace?.mission_goal ?? parsedDoc.extractedGoal ?? "");
     }
-  }, [workspace?.mission_goal, editingGoal]);
+  }, [workspace?.mission_goal, parsedDoc.extractedGoal, editingGoal]);
 
   useEffect(() => {
-    const content = board?.content ?? "";
-    if (!content.trim()) {
-      setPreviewBlocks([]);
+    if (parsedDoc.sections.length === 0) {
+      setSectionBlocks({});
       return;
     }
     let cancelled = false;
-    void orbitIpc
-      .parseMarkdownPreview(content, false)
-      .then((blocks) => {
-        if (!cancelled) setPreviewBlocks(blocks);
-      })
-      .catch(() => {
-        if (!cancelled) setPreviewBlocks([]);
-      });
+    void Promise.all(
+      parsedDoc.sections.map(async (sec) => {
+        try {
+          const blocks = await orbitIpc.parseMarkdownPreview(sec.markdown, false);
+          return [sec.key, blocks] as const;
+        } catch {
+          return [sec.key, [] as RichBlockView[]] as const;
+        }
+      }),
+    ).then((entries) => {
+      if (!cancelled) {
+        setSectionBlocks(Object.fromEntries(entries));
+      }
+    });
     return () => {
       cancelled = true;
     };
-  }, [board?.content]);
+  }, [parsedDoc.sections]);
+
+  useEffect(() => {
+    if (!editingTitle) {
+      setTitleDraft(workspace?.title ?? "");
+    }
+  }, [workspace?.title, editingTitle]);
 
   const handleSaveBoard = async () => {
     if (!hostId || !workspaceId || savingBoard) return;
@@ -138,12 +431,6 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
       setSavingBoard(false);
     }
   };
-
-  useEffect(() => {
-    if (!editingTitle) {
-      setTitleDraft(workspace?.title ?? "");
-    }
-  }, [workspace?.title, editingTitle]);
 
   const handleSaveTitle = async () => {
     const clean = titleDraft.trim();
@@ -161,10 +448,13 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
     setEditingGoal(false);
   };
 
+  const runningPeersCount = peers.filter((p) => p.is_running).length;
+  const effectiveGoal = workspace?.mission_goal?.trim() || parsedDoc.extractedGoal || "";
+
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       {/* Header */}
-      <div className="border-border/70 flex items-center justify-between gap-2 border-b px-3.5 py-2.5">
+      <div className="border-border/70 flex items-center justify-between gap-2 border-b px-4 py-2.5">
         <div className="min-w-0 flex-1">
           {editingTitle ? (
             <input
@@ -184,22 +474,28 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           ) : (
             <button
               type="button"
-              title="点击重命名 Workspace"
+              title="点击重命名工作区"
               onClick={() => setEditingTitle(true)}
-              className="text-foreground hover:text-primary flex max-w-full cursor-pointer items-center gap-1.5 truncate text-left text-[13.5px] font-semibold transition-colors"
+              className="text-foreground hover:text-primary flex max-w-full cursor-pointer items-center gap-1.5 truncate text-left text-[14px] font-semibold transition-colors"
             >
-              <span className="truncate">{workspace?.title || "Mission Workspace"}</span>
-              <Edit3 className="text-muted-foreground/70 h-[11.5px] w-[11.5px] shrink-0" />
+              <span className="truncate">{workspace?.title || "工作区概览"}</span>
+              <Edit3 className="text-muted-foreground/65 h-[11.5px] w-[11.5px] shrink-0" />
             </button>
           )}
-          <div className="text-muted-foreground flex items-center gap-2 text-[11.5px]">
-            <span>
-              {peers.length} {peers.length === 1 ? "peer" : "peers"}
-            </span>
-            {board && (
+          <div className="text-muted-foreground mt-0.5 flex items-center gap-2 text-[11.5px]">
+            <span>{peers.length} 个会话</span>
+            {runningPeersCount > 0 && (
               <>
                 <span>·</span>
-                <span className="font-mono">BOARD.md rev {board.revision}</span>
+                <span className="text-sky-600 dark:text-sky-400">
+                  {runningPeersCount} 个运行中
+                </span>
+              </>
+            )}
+            {touchedFiles.length > 0 && (
+              <>
+                <span>·</span>
+                <span>{touchedFiles.length} 个改动文件</span>
               </>
             )}
           </div>
@@ -208,7 +504,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
         <div className="flex shrink-0 items-center gap-1">
           <button
             type="button"
-            title="Refresh board & activity"
+            title="刷新概览"
             onClick={() => void orbitActions.fetchWorkspaceBoardAndEvents(hostId, workspaceId)}
             className="text-muted-foreground hover:text-foreground inline-flex h-[26px] w-[26px] cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.05] dark:hover:bg-white/[0.07]"
           >
@@ -221,26 +517,26 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           >
             {editingBoard ? (
               <>
-                <Eye className="h-[12.5px] w-[12.5px]" />
-                <span>Preview</span>
+                <Eye className="h-[12px] w-[12px]" />
+                <span>返回概览</span>
               </>
             ) : (
               <>
-                <Edit3 className="h-[12.5px] w-[12.5px]" />
-                <span>Edit</span>
+                <Edit3 className="h-[12px] w-[12px]" />
+                <span>编辑笔记</span>
               </>
             )}
           </button>
         </div>
       </div>
 
-      <ScrollArea className="min-h-0 flex-1" viewportClassName="p-3.5 space-y-4">
-        {/* 1. Mission Goal */}
-        <section className="border-border/70 bg-elevated/45 space-y-1.5 rounded-xl border p-3">
+      <ScrollArea className="min-h-0 flex-1" viewportClassName="p-4 space-y-4">
+        {/* 1. Mission Goal Card */}
+        <section className="border-border/70 bg-elevated/45 space-y-1.5 rounded-xl border p-3.5">
           <div className="flex items-center justify-between">
             <span className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
-              <Target className="h-[12.5px] w-[12.5px]" />
-              <span>Mission Goal</span>
+              <Target className="h-[13px] w-[13px] text-sky-500" />
+              <span>工作区目标</span>
             </span>
             {!editingGoal && (
               <button
@@ -248,22 +544,23 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                 onClick={() => setEditingGoal(true)}
                 className="text-muted-foreground hover:text-foreground cursor-pointer text-[11.5px]"
               >
-                Edit
+                编辑
               </button>
             )}
           </div>
 
           {editingGoal ? (
-            <div className="space-y-1.5">
+            <div className="space-y-2">
               <input
+                autoFocus
                 value={goalDraft}
                 onChange={(e) => setGoalDraft(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") void handleSaveGoal();
                   if (e.key === "Escape") setEditingGoal(false);
                 }}
-                placeholder="Shared objective visible to all peers in this workspace…"
-                className="border-border bg-canvas text-foreground w-full rounded-md border px-2 py-1 text-[12.5px] outline-none"
+                placeholder="用一句话描述本工作区的共同目标…"
+                className="border-border bg-canvas text-foreground w-full rounded-md border px-2.5 py-1.5 text-[12.5px] outline-none"
               />
               <div className="flex justify-end gap-1.5">
                 <button
@@ -271,81 +568,124 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   onClick={() => setEditingGoal(false)}
                   className="text-muted-foreground hover:text-foreground cursor-pointer px-2 py-0.5 text-[11.5px]"
                 >
-                  Cancel
+                  取消
                 </button>
                 <button
                   type="button"
                   onClick={() => void handleSaveGoal()}
-                  className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] font-medium"
+                  className="bg-foreground text-background inline-flex cursor-pointer items-center gap-1 rounded-md px-2.5 py-0.5 text-[11.5px] font-medium"
                 >
                   <Check className="h-[11px] w-[11px]" />
-                  <span>Save</span>
+                  <span>保存</span>
                 </button>
               </div>
             </div>
           ) : (
-            <p className="text-foreground/85 text-[12.5px] leading-relaxed">
-              {workspace?.mission_goal || "No mission goal set yet — click Edit to align all peers."}
+            <p className="text-foreground/90 text-[13px] leading-relaxed">
+              {effectiveGoal || "暂未设置目标，点击右上角「编辑」补充后，工作区内所有会话都会共享该目标。"}
             </p>
           )}
         </section>
 
-        {/* 2. Live Peer Roster */}
-        {peers.length > 0 && (
-          <section className="space-y-1.5">
-            <div className="text-muted-foreground text-[11.5px] font-medium">
-              Active Peers ({peers.length})
+        {/* 2. Conflict Alerts (only visible when real multi-session file conflicts exist) */}
+        {conflictEvents.length > 0 && (
+          <section className="space-y-1.5 rounded-xl border border-amber-500/35 bg-amber-500/[0.08] p-3">
+            <div className="flex items-center gap-1.5 text-[12px] font-medium text-amber-700 dark:text-amber-300">
+              <AlertTriangle className="h-[13.5px] w-[13.5px]" />
+              <span>协作冲突提醒 ({conflictEvents.length})</span>
             </div>
             <div className="space-y-1">
+              {conflictEvents.map((ev) => (
+                <div
+                  key={ev.seq}
+                  className="flex items-center justify-between gap-2 text-[12px] text-amber-800/90 dark:text-amber-200/90"
+                >
+                  <span className="truncate">
+                    {ev.agent_handle ? `${ev.agent_handle} · ` : ""}
+                    {ev.file_path ? shortFileLabel(ev.file_path, rootCwd) : ev.summary}
+                  </span>
+                  <span className="shrink-0 text-[11px] opacity-75">
+                    {formatRelativeEventTime(ev.created_at)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* 3. Participating Sessions */}
+        {peers.length > 0 && (
+          <section className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
+                <Users className="h-[12.5px] w-[12.5px]" />
+                <span>协作会话 ({peers.length})</span>
+              </span>
+            </div>
+            <div className="space-y-1.5">
               {peers.map((peer) => {
                 const isFocused = peer.agent_id === selectedAgentId;
                 const handle = semanticAgentTabLabel(peer);
+                const statusText = peer.is_running
+                  ? "运行中"
+                  : peer.is_awaiting_permission
+                    ? "待确认"
+                    : "空闲";
                 return (
                   <div
                     key={peer.agent_id}
                     className={cn(
-                      "border-border/60 flex items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 text-[12px]",
-                      isFocused ? "bg-foreground/[0.05]" : "bg-elevated/35",
+                      "border-border/65 flex items-start justify-between gap-2 rounded-xl border px-3 py-2 text-[12px] transition-colors",
+                      isFocused
+                        ? "border-foreground/20 bg-foreground/[0.04]"
+                        : "bg-elevated/35 hover:bg-elevated/65",
                     )}
                   >
                     <button
                       type="button"
                       onClick={() => orbitActions.selectAgent(hostId, peer.agent_id)}
-                      className="flex min-w-0 flex-1 cursor-pointer items-start gap-2 text-left"
+                      className="flex min-w-0 flex-1 cursor-pointer items-start gap-2.5 text-left"
                     >
                       {peer.is_running ? (
-                        <Loader2 className="mt-0.5 h-[12px] w-[12px] shrink-0 animate-spin text-sky-500" />
+                        <Loader2 className="mt-0.5 h-[13px] w-[13px] shrink-0 animate-spin text-sky-500" />
                       ) : (
                         <ProviderIcon
                           provider={peer.provider}
-                          className="mt-0.5 h-[13px] w-[13px] shrink-0 opacity-80"
+                          className="mt-0.5 h-[13.5px] w-[13.5px] shrink-0 opacity-85"
                         />
                       )}
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5">
+                      <div className="min-w-0 flex-1 space-y-0.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <span className="text-foreground truncate font-medium">{handle}</span>
-                          <span className="text-muted-foreground shrink-0 text-[11px]">
-                            {peer.provider_label}
+                          <span
+                            className={cn(
+                              "rounded-full px-1.5 py-[1px] text-[10px] font-medium",
+                              peer.is_running
+                                ? "bg-sky-500/12 text-sky-600 dark:text-sky-400"
+                                : peer.is_awaiting_permission
+                                  ? "bg-amber-500/15 text-amber-700 dark:text-amber-300"
+                                  : "bg-black/[0.05] text-muted-foreground dark:bg-white/[0.08]",
+                            )}
+                          >
+                            {statusText}
                           </span>
                           {peer.worktree_branch && (
-                            <span className="bg-muted text-muted-foreground inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 font-mono text-[10.5px]">
-                              <GitBranch className="h-[10px] w-[10px]" />
+                            <span className="bg-muted text-muted-foreground inline-flex items-center gap-0.5 rounded px-1.5 py-[1px] font-mono text-[10px]">
+                              <GitBranch className="h-[9.5px] w-[9.5px]" />
                               {peer.worktree_branch}
                             </span>
                           )}
                         </div>
-                        {peer.task_summary && (
-                          <div className="text-muted-foreground/85 truncate text-[11px]">
-                            {peer.task_summary}
-                          </div>
-                        )}
+                        <div className="text-muted-foreground line-clamp-2 text-[11.5px] leading-snug">
+                          {peer.task_summary || peer.title}
+                        </div>
                       </div>
                     </button>
                     <button
                       type="button"
-                      title="Open in side-by-side split tab"
+                      title="分屏并排查看"
                       onClick={() => orbitActions.openPeerSplitTab(hostId, peer.agent_id, handle)}
-                      className="text-muted-foreground hover:text-foreground inline-flex h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
+                      className="text-muted-foreground hover:text-foreground mt-0.5 inline-flex h-[22px] w-[22px] shrink-0 cursor-pointer items-center justify-center rounded-md hover:bg-black/[0.06] dark:hover:bg-white/[0.09]"
                     >
                       <Columns2 className="h-[12px] w-[12px]" />
                     </button>
@@ -356,15 +696,16 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
           </section>
         )}
 
-        {/* 3. Shared Blackboard (BOARD.md) */}
+        {/* 4. Structured Workspace Notes (Clean Cards Instead of Raw Boilerplate Markdown Dump) */}
         <section className="space-y-2">
           <div className="flex items-center justify-between">
-            <span className="text-muted-foreground text-[11.5px] font-medium">
-              Shared Blackboard (BOARD.md)
+            <span className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
+              <FileText className="h-[12.5px] w-[12.5px]" />
+              <span>协作笔记与关键结论</span>
             </span>
-            {board?.updated_by && (
-              <span className="text-muted-foreground/75 text-[11px]">
-                Updated by {board.updated_by}
+            {board?.updated_by && !editingBoard && parsedDoc.sections.length > 0 && (
+              <span className="text-muted-foreground/70 text-[11px]">
+                最近更新：{board.updated_by}
               </span>
             )}
           </div>
@@ -375,7 +716,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                 rows={12}
                 value={boardDraft}
                 onChange={(e) => setBoardDraft(e.target.value)}
-                placeholder="# Mission Board&#10;&#10;## Goal&#10;...&#10;&#10;## Decisions & Handoffs&#10;..."
+                placeholder={"## 决策与约定\n- ...\n\n## 任务分工\n- ...\n\n## 进展与结论\n- ..."}
                 className="border-border bg-canvas text-foreground w-full rounded-xl border p-3 font-mono text-[12px] leading-relaxed outline-none"
               />
               <div className="flex justify-end gap-2">
@@ -387,7 +728,7 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   }}
                   className="border-border hover:bg-accent cursor-pointer rounded-lg border px-2.5 py-1 text-[12px]"
                 >
-                  Cancel
+                  取消
                 </button>
                 <button
                   type="button"
@@ -400,78 +741,137 @@ export const WorkspaceBoardTab = memo(function WorkspaceBoardTab({
                   ) : (
                     <Save className="h-[12px] w-[12px]" />
                   )}
-                  <span>Save BOARD.md</span>
+                  <span>保存笔记</span>
                 </button>
               </div>
             </div>
-          ) : board?.content?.trim() ? (
-            <div className="border-border/70 bg-elevated/35 rounded-xl border p-3.5 text-[13px] select-text">
-              {previewBlocks.length > 0 ? (
-                <MarkdownBlocksView blocks={previewBlocks} />
-              ) : (
-                <pre className="text-foreground/85 whitespace-pre-wrap font-mono text-[12px] leading-relaxed">
-                  {board.content}
-                </pre>
-              )}
+          ) : parsedDoc.sections.length > 0 ? (
+            <div className="space-y-2.5">
+              {parsedDoc.sections.map((sec) => {
+                const blocks = sectionBlocks[sec.key] ?? [];
+                return (
+                  <div
+                    key={sec.key}
+                    className="border-border/65 bg-elevated/35 space-y-2 rounded-xl border p-3.5 select-text"
+                  >
+                    <div className="flex items-center gap-1.5 text-[12px] font-semibold">
+                      <SectionIcon kind={sec.kind} />
+                      <span className="text-foreground/90">{sec.displayTitle}</span>
+                    </div>
+                    <div className="text-[12.5px] leading-relaxed">
+                      {blocks.length > 0 ? (
+                        <MarkdownBlocksView blocks={blocks} compact />
+                      ) : (
+                        <div className="text-foreground/85 whitespace-pre-wrap text-[12.5px] leading-relaxed">
+                          {stripRawMarkdownNoise(sec.markdown)}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           ) : (
-            <div className="border-border/70 text-muted-foreground rounded-xl border border-dashed p-4 text-center text-[12.5px]">
-              No notes on BOARD.md yet. Agents can write here with{" "}
-              <code className="bg-muted rounded px-1 py-0.5 text-[11px]">
-                workspace_board_update
-              </code>
-              , or click <strong>Edit</strong> above to add shared context.
+            <div className="border-border/65 text-muted-foreground rounded-xl border border-dashed px-4 py-5 text-center text-[12px] leading-relaxed">
+              还没有记录协作笔记。点击右上角 <strong>编辑笔记</strong> 添加关键约定与任务分工，或让会话在推进过程中自动沉淀结论。
             </div>
           )}
         </section>
 
-        {/* 4. Activity & Conflict Radar Feed */}
-        <section className="space-y-1.5">
-          <div className="text-muted-foreground text-[11.5px] font-medium">
-            Activity & Conflict Radar ({events.length})
-          </div>
-          {events.length === 0 ? (
-            <div className="text-muted-foreground/75 text-[12px]">
-              No workspace events recorded yet.
+        {/* 5. Touched Files Summary (Deduplicated & Clickable — Replaces Wall of Duplicate File Paths) */}
+        {touchedFiles.length > 0 && (
+          <section className="space-y-1.5">
+            <div className="text-muted-foreground flex items-center gap-1.5 text-[11.5px] font-medium">
+              <FileCode2 className="h-[12.5px] w-[12.5px]" />
+              <span>近期改动文件 ({touchedFiles.length})</span>
             </div>
-          ) : (
-            <div className="space-y-1">
-              {events.slice(0, 40).map((ev) => (
-                <div
-                  key={ev.seq}
-                  className={cn(
-                    "flex items-start gap-2 rounded-lg px-2.5 py-1.5 text-[12px]",
-                    ev.kind === "conflict_warning"
-                      ? "border border-amber-500/35 bg-amber-500/10 text-amber-800 dark:text-amber-200"
-                      : "bg-elevated/30 text-foreground/85",
-                  )}
+            <div className="border-border/60 bg-elevated/25 divide-border/50 divide-y rounded-xl border">
+              {touchedFiles.map((file) => (
+                <button
+                  key={file.path}
+                  type="button"
+                  title={file.path}
+                  onClick={() =>
+                    orbitActions.openFileInSidePanel(file.path, {
+                      hostId,
+                      cwd: rootCwd || undefined,
+                    })
+                  }
+                  className="hover:bg-accent/55 flex w-full cursor-pointer items-center justify-between gap-2 px-3 py-1.5 text-left text-[12px] transition-colors first:rounded-t-xl last:rounded-b-xl"
                 >
-                  <div className="mt-0.5">
-                    <EventIcon kind={ev.kind} />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="leading-snug break-words">
-                      {ev.agent_handle && (
-                        <span className="text-foreground mr-1 font-medium">
-                          @{ev.agent_handle}
-                        </span>
-                      )}
-                      <span>{ev.summary}</span>
-                    </div>
-                    {ev.file_path && (
-                      <div className="text-muted-foreground mt-0.5 truncate font-mono text-[11px]">
-                        {ev.file_path}
-                      </div>
+                  <span className="flex min-w-0 flex-1 items-center gap-2">
+                    <span className="text-foreground/88 truncate font-mono text-[11.5px]">
+                      {file.label}
+                    </span>
+                    {file.count > 1 && (
+                      <span className="text-muted-foreground/75 shrink-0 text-[10.5px] tabular-nums">
+                        ×{file.count}
+                      </span>
                     )}
-                  </div>
-                  <span className="text-muted-foreground/65 shrink-0 font-mono text-[10.5px]">
-                    {formatEventTime(ev.created_at)}
                   </span>
-                </div>
+                  <span className="text-muted-foreground/75 flex shrink-0 items-center gap-1.5 text-[11px]">
+                    <span className="max-w-20 truncate">{file.lastActor}</span>
+                    <ArrowUpRight className="h-[11.5px] w-[11.5px] opacity-65" />
+                  </span>
+                </button>
               ))}
             </div>
-          )}
-        </section>
+          </section>
+        )}
+
+        {/* 6. Collapsible Clean Activity Feed (Collapsed by Default, Human-Readable Summaries) */}
+        {humanActivities.length > 0 && (
+          <section className="border-border/60 border-t pt-2.5">
+            <button
+              type="button"
+              onClick={() => setActivityExpanded((v) => !v)}
+              className="text-muted-foreground hover:text-foreground flex w-full cursor-pointer items-center justify-between rounded-lg px-1 py-1 text-[11.5px] font-medium transition-colors"
+            >
+              <span className="flex items-center gap-1.5">
+                <History className="h-[12.5px] w-[12.5px]" />
+                <span>近期动态 ({humanActivities.length})</span>
+              </span>
+              <ChevronRight
+                className={cn(
+                  "h-[13px] w-[13px] transition-transform duration-150",
+                  activityExpanded && "rotate-90",
+                )}
+              />
+            </button>
+
+            {activityExpanded && (
+              <div className="mt-1.5 space-y-1">
+                {humanActivities.map((item) => (
+                  <div
+                    key={item.key}
+                    className={cn(
+                      "flex items-start gap-2 rounded-lg px-2.5 py-1.5 text-[11.5px]",
+                      item.kind === "conflict_warning"
+                        ? "border border-amber-500/35 bg-amber-500/10 text-amber-800 dark:text-amber-200"
+                        : "bg-elevated/30 text-foreground/82",
+                    )}
+                  >
+                    <div className="mt-0.5">
+                      <EventIcon kind={item.kind} />
+                    </div>
+                    <div className="min-w-0 flex-1 leading-snug">
+                      <span className="text-foreground mr-1.5 font-medium">{item.actor}</span>
+                      <span>{item.description}</span>
+                      {item.count > 1 && (
+                        <span className="text-muted-foreground ml-1 text-[10.5px] tabular-nums">
+                          ({item.count} 次)
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-muted-foreground/65 shrink-0 text-[10.5px]">
+                      {formatRelativeEventTime(item.createdAt)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
       </ScrollArea>
     </div>
   );

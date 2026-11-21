@@ -515,12 +515,11 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 needs_attention.push(conv.clone());
             }
 
-            // Collapse same-workspace managed subagents under their parent's Subagents Track
+            // Collapse same-host managed subagents under their parent's Subagents Track (even if parent moved workspace)
             if let Some(ref parent_id) = agent.parent_agent_id
                 && agent.parent_host_id.is_none()
                 && let Some(parent) = agents_by_id.get(parent_id.as_str())
                 && parent.archived_at_rfc3339.is_none()
-                && parent.workspace_id == agent.workspace_id
             {
                 continue;
             }
@@ -863,10 +862,18 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 .conversations
                 .retain(|c| matches_conversation_filter(c, params.filter));
             group.conversations.sort_by(|a, b| {
-                let ta = parse_rfc3339_ms(&a.agent.updated_at_rfc3339);
-                let tb = parse_rfc3339_ms(&b.agent.updated_at_rfc3339);
-                tb.cmp(&ta)
-                    .then_with(|| b.agent.latest_seq.cmp(&a.agent.latest_seq))
+                if params.sort == SidebarProjectSort::Alphabetical {
+                    a.agent
+                        .title
+                        .to_lowercase()
+                        .cmp(&b.agent.title.to_lowercase())
+                        .then_with(|| b.agent.latest_seq.cmp(&a.agent.latest_seq))
+                } else {
+                    let ta = parse_rfc3339_ms(&a.agent.updated_at_rfc3339);
+                    let tb = parse_rfc3339_ms(&b.agent.updated_at_rfc3339);
+                    tb.cmp(&ta)
+                        .then_with(|| b.agent.latest_seq.cmp(&a.agent.latest_seq))
+                }
             });
 
             let project_curated_ws = curated_ws_by_group_idx
@@ -1027,15 +1034,23 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 ));
             }
             curated_ws_list.sort_by(|(ta, wa), (tb, wb)| {
-                tb.cmp(ta)
-                    .then_with(|| wa.title.to_lowercase().cmp(&wb.title.to_lowercase()))
+                if params.sort == SidebarProjectSort::Alphabetical {
+                    wa.title
+                        .to_lowercase()
+                        .cmp(&wb.title.to_lowercase())
+                        .then_with(|| tb.cmp(ta))
+                } else {
+                    tb.cmp(ta)
+                        .then_with(|| wa.title.to_lowercase().cmp(&wb.title.to_lowercase()))
+                }
             });
             group.workspaces = curated_ws_list.into_iter().map(|(_, w)| w).collect();
 
             all_groups.push(group);
         }
 
-        // 4. Launchpad candidate projects for the selected host (or single host)
+        // 4. Launchpad candidate projects for the selected host (or single host).
+        //    Projects are strictly directory/codebase roots — NEVER curated Mission Workspace titles.
         let include_launchpad =
             params.active_host_id.is_none() || params.active_host_id == Some(host_id);
         if include_launchpad {
@@ -1086,6 +1101,19 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                 });
             };
 
+            let project_name_for_path = |clean_path: &str| -> String {
+                if let Some(dp) = host
+                    .discovered_projects
+                    .iter()
+                    .find(|p| cwd_paths_equivalent(&p.path, clean_path))
+                    && !dp.name.trim().is_empty()
+                {
+                    return dp.name.trim().to_string();
+                }
+                basename_of_project_path(clean_path)
+            };
+
+            // 4a. Pinned projects always come first with their explicit user-facing project name.
             for proj in &host_pinned {
                 if let Some(primary) = proj.directories.first() {
                     push_lp(
@@ -1097,48 +1125,80 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
                     );
                 }
             }
+
+            // 4b. Active workspace project roots (derived strictly from directory path, NEVER `ws.title`).
+            //     Skip archived, background, bare-home, and raw worktree paths.
             for ws in host.workspaces {
-                if !ws.is_worktree && !is_bare_home_dir(&ws.cwd) {
-                    push_lp(
-                        &mut host_lp,
-                        format!("{host_id}::ws::{}", ws.workspace_id),
-                        &ws.title,
-                        &ws.cwd,
-                        ws.git_branch.clone(),
-                    );
+                if ws.archived_at.is_some() || ws.background {
+                    continue;
                 }
+                let raw_root = ws
+                    .project_root
+                    .as_deref()
+                    .or(ws.source_cwd.as_deref())
+                    .unwrap_or(&ws.cwd);
+                let clean_root = normalize_project_path(raw_root);
+                if (ws.is_worktree && ws.project_root.is_none() && ws.source_cwd.is_none())
+                    || is_bare_home_dir(&clean_root)
+                    || clean_root.contains("/worktrees/")
+                {
+                    continue;
+                }
+                let proj_name = project_name_for_path(&clean_root);
+                let branch = if cwd_paths_equivalent(&ws.cwd, &clean_root) && !ws.is_worktree {
+                    ws.git_branch.clone()
+                } else {
+                    None
+                };
+                push_lp(
+                    &mut host_lp,
+                    format!("{host_id}::{clean_root}"),
+                    &proj_name,
+                    &clean_root,
+                    branch,
+                );
             }
+
+            // 4c. Discovered directories on this host (excluding bare home & worktrees).
             for dp in host.discovered_projects {
                 if !is_bare_home_dir(&dp.path) && !dp.path.contains("/worktrees/") {
+                    let clean_dp = normalize_project_path(&dp.path);
                     push_lp(
                         &mut host_lp,
-                        format!("{host_id}::dp::{}", dp.path),
+                        format!("{host_id}::{clean_dp}"),
                         &dp.name,
-                        &dp.path,
+                        &clean_dp,
                         dp.git_branch.clone(),
                     );
                 }
             }
+
+            // 4d. Currently selected active directory if not already represented.
             if let Some(a_cwd) = params.active_cwd
                 && !a_cwd.trim().is_empty()
                 && !is_bare_home_dir(a_cwd)
+                && !a_cwd.contains("/worktrees/")
             {
+                let clean_active = normalize_project_path(a_cwd);
+                let proj_name = project_name_for_path(&clean_active);
                 push_lp(
                     &mut host_lp,
-                    format!("{host_id}::active::{a_cwd}"),
-                    &basename_of_project_path(a_cwd),
-                    a_cwd,
+                    format!("{host_id}::{clean_active}"),
+                    &proj_name,
+                    &clean_active,
                     host.active_git_branch.clone(),
                 );
             }
+
             if host_lp.is_empty()
                 && let Some(first_dp) = host.discovered_projects.first()
             {
+                let clean_dp = normalize_project_path(&first_dp.path);
                 push_lp(
                     &mut host_lp,
-                    format!("{host_id}::dp::{}", first_dp.path),
+                    format!("{host_id}::{clean_dp}"),
                     &first_dp.name,
-                    &first_dp.path,
+                    &clean_dp,
                     first_dp.git_branch.clone(),
                 );
             }
@@ -1146,62 +1206,43 @@ pub fn build_fleet_sidebar(params: FleetSidebarParams<'_>) -> FleetSidebarView {
         }
     }
 
-    // Sort projects uniformly
-    match params.sort {
-        SidebarProjectSort::Alphabetical => {
-            all_groups.sort_by(|a, b| {
-                a.is_home_workspace
-                    .cmp(&b.is_home_workspace)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                    .then_with(|| a.primary_cwd.cmp(&b.primary_cwd))
-            });
+    // Projects ALWAYS follow stable manual order (representing project priority).
+    // Conversation / Workspace activity NEVER reorders Projects automatically.
+    let order_index: HashMap<&str, usize> = params
+        .project_order
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k.as_str(), i))
+        .collect();
+    let lookup_order = |g: &SidebarProjectGroupView| -> Option<usize> {
+        order_index
+            .get(g.sort_order_key.as_str())
+            .or_else(|| order_index.get(g.id.as_str()))
+            .or_else(|| {
+                let fallback_key = format!("{}::{}", g.host_id, g.primary_cwd);
+                order_index.get(fallback_key.as_str())
+            })
+            .copied()
+    };
+    all_groups.sort_by(|a, b| {
+        let oa = lookup_order(a);
+        let ob = lookup_order(b);
+        match (oa, ob) {
+            (Some(ia), Some(ib)) => ia.cmp(&ib),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a
+                .is_home_workspace
+                .cmp(&b.is_home_workspace)
+                .then_with(|| {
+                    a.pinned_project_id
+                        .is_none()
+                        .cmp(&b.pinned_project_id.is_none())
+                })
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| a.primary_cwd.cmp(&b.primary_cwd)),
         }
-        SidebarProjectSort::Recent => {
-            all_groups.sort_by(|a, b| {
-                a.is_home_workspace
-                    .cmp(&b.is_home_workspace)
-                    .then_with(|| {
-                        (b.conversations.is_empty() && b.workspaces.is_empty())
-                            .cmp(&(a.conversations.is_empty() && a.workspaces.is_empty()))
-                    })
-                    .then_with(|| b.sort_weight_ms.cmp(&a.sort_weight_ms))
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            });
-        }
-        SidebarProjectSort::Manual => {
-            let order_index: HashMap<&str, usize> = params
-                .project_order
-                .iter()
-                .enumerate()
-                .map(|(i, k)| (k.as_str(), i))
-                .collect();
-            let lookup_order = |g: &SidebarProjectGroupView| -> Option<usize> {
-                order_index
-                    .get(g.sort_order_key.as_str())
-                    .or_else(|| order_index.get(g.id.as_str()))
-                    .or_else(|| {
-                        let fallback_key = format!("{}::{}", g.host_id, g.primary_cwd);
-                        order_index.get(fallback_key.as_str())
-                    })
-                    .copied()
-            };
-            all_groups.sort_by(|a, b| {
-                let oa = lookup_order(a);
-                let ob = lookup_order(b);
-                match (oa, ob) {
-                    (Some(ia), Some(ib)) => ia.cmp(&ib),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => a
-                        .is_home_workspace
-                        .cmp(&b.is_home_workspace)
-                        .then_with(|| b.conversations.is_empty().cmp(&a.conversations.is_empty()))
-                        .then_with(|| b.sort_weight_ms.cmp(&a.sort_weight_ms))
-                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-                }
-            });
-        }
-    }
+    });
 
     needs_attention.sort_by(|a, b| {
         let ta = parse_rfc3339_ms(&a.agent.updated_at_rfc3339);
@@ -1773,5 +1814,263 @@ mod tests {
             proj.unclassified_conversations[0].agent.agent_id,
             "ag_inbox"
         );
+    }
+
+    #[test]
+    fn launchpad_projects_never_leak_curated_workspace_titles() {
+        let now = chrono::Utc::now();
+        let workspaces = vec![
+            WorkspaceSummary {
+                workspace_id: "ws_curated_1".into(),
+                title: "Orbit 客户端缺陷修复与版本发布".into(),
+                mission_goal: Some("修复缺陷并发布版本".into()),
+                cwd: "/home/gzc/workspace/research".into(),
+                project_root: Some("/home/gzc/workspace/research".into()),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: true,
+                auto_clustered: true,
+                is_curated: true,
+            },
+            WorkspaceSummary {
+                workspace_id: "ws_curated_2".into(),
+                title: "Orbit 工作区体验与 v0.7.0 升级".into(),
+                mission_goal: None,
+                cwd: "/home/gzc/workspace/research".into(),
+                project_root: Some("/home/gzc/workspace/research".into()),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: true,
+                auto_clustered: true,
+                is_curated: true,
+            },
+            WorkspaceSummary {
+                workspace_id: "ws_archived".into(),
+                title: "Old Archived Mission".into(),
+                mission_goal: None,
+                cwd: "/home/gzc/workspace/stale_dir".into(),
+                project_root: None,
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: Some(now),
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: true,
+            },
+        ];
+        let discovered = vec![
+            DiscoveredProject {
+                path: "/home/gzc/workspace/research".into(),
+                name: "research".into(),
+                git_branch: None,
+                is_git_repo: false,
+                nested_git_repos: Vec::new(),
+                last_modified_unix: 200,
+            },
+            DiscoveredProject {
+                path: "/home/gzc/workspace/orbit".into(),
+                name: "orbit".into(),
+                git_branch: Some("main".into()),
+                is_git_repo: true,
+                nested_git_repos: Vec::new(),
+                last_modified_unix: 100,
+            },
+        ];
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 6,
+            hosts: vec![SidebarHostInput {
+                host_id: "h1",
+                workspaces: &workspaces,
+                discovered_projects: &discovered,
+                agents: Vec::new(),
+                active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
+            }],
+            pinned_projects: &[],
+            project_order: &[],
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h1"),
+            active_agent_id: None,
+            active_cwd: Some("/home/gzc/workspace/research"),
+        });
+
+        assert_eq!(view.launchpad_projects.len(), 2);
+        let research = view
+            .launchpad_projects
+            .iter()
+            .find(|p| p.path == "/home/gzc/workspace/research")
+            .expect("research project present");
+        assert_eq!(research.name, "research");
+        assert_eq!(research.id, "h1::/home/gzc/workspace/research");
+        assert!(
+            view.launchpad_projects
+                .iter()
+                .all(|p| !p.name.contains("Orbit 客户端") && !p.name.contains("工作区体验")),
+            "Curated workspace titles must never appear in launchpad_projects: {:?}",
+            view.launchpad_projects
+        );
+        assert!(
+            view.launchpad_projects
+                .iter()
+                .all(|p| p.path != "/home/gzc/workspace/stale_dir"),
+            "Archived workspace directories must not pollute launchpad_projects"
+        );
+    }
+
+    #[test]
+    fn project_order_stays_stable_when_conversations_and_workspaces_update() {
+        let now = chrono::Utc::now();
+        let pinned = vec![
+            ClientProjectView {
+                project_id: "proj_primary".into(),
+                host_id: "h1".into(),
+                name: "Primary".into(),
+                directories: vec!["/work/primary".into()],
+                updated_at_ms: 1_000,
+            },
+            ClientProjectView {
+                project_id: "proj_secondary".into(),
+                host_id: "h1".into(),
+                name: "Secondary".into(),
+                directories: vec!["/work/secondary".into()],
+                updated_at_ms: 500,
+            },
+        ];
+        let manual_order = vec!["proj_primary".to_string(), "proj_secondary".to_string()];
+
+        // Secondary has much newer conversation & workspace timestamps than Primary,
+        // yet even under `SidebarProjectSort::Recent`, Projects MUST keep their manual order
+        // while conversations inside each project sort by recency.
+        let workspaces = vec![
+            WorkspaceSummary {
+                workspace_id: "ws_sec_old".into(),
+                title: "Older WS".into(),
+                mission_goal: None,
+                cwd: "/work/secondary".into(),
+                project_root: Some("/work/secondary".into()),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now - chrono::Duration::hours(2),
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: true,
+            },
+            WorkspaceSummary {
+                workspace_id: "ws_sec_new".into(),
+                title: "Newer WS".into(),
+                mission_goal: None,
+                cwd: "/work/secondary".into(),
+                project_root: Some("/work/secondary".into()),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: orbit_protocol::WorkspaceSetupStatus::default(),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: true,
+            },
+        ];
+        let mut ag_primary = sample_agent(
+            "ag_p",
+            "/work/primary",
+            "2026-11-19T08:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        ag_primary.workspace_id = "ws_p".into();
+        let mut ag_sec_new = sample_agent(
+            "ag_s_new",
+            "/work/secondary",
+            "2026-11-21T12:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        ag_sec_new.workspace_id = "ws_sec_new".into();
+        let mut ag_sec_old = sample_agent(
+            "ag_s_old",
+            "/work/secondary",
+            "2026-11-20T09:00:00Z",
+            false,
+            false,
+            false,
+            false,
+        );
+        ag_sec_old.workspace_id = "ws_sec_old".into();
+
+        let empty_git_repos = HashMap::new();
+        let empty_conflicts = HashSet::new();
+        let view = build_fleet_sidebar(FleetSidebarParams {
+            revision: 7,
+            hosts: vec![SidebarHostInput {
+                host_id: "h1",
+                workspaces: &workspaces,
+                discovered_projects: &[],
+                agents: vec![(ag_primary, 0), (ag_sec_old, 0), (ag_sec_new, 0)],
+                active_git_branch: None,
+                git_repos_by_cwd: &empty_git_repos,
+                workspace_conflict_ids: &empty_conflicts,
+            }],
+            pinned_projects: &pinned,
+            project_order: &manual_order,
+            sort: SidebarProjectSort::Recent,
+            filter: SidebarThreadFilter::All,
+            query: "",
+            active_host_id: Some("h1"),
+            active_agent_id: None,
+            active_cwd: None,
+        });
+
+        assert_eq!(view.projects.len(), 2);
+        assert_eq!(view.projects[0].id, "proj_primary");
+        assert_eq!(view.projects[1].id, "proj_secondary");
+        // Inside Secondary, workspaces & conversations still sort by recency
+        assert_eq!(view.projects[1].workspaces[0].workspace_id, "ws_sec_new");
+        assert_eq!(view.projects[1].workspaces[1].workspace_id, "ws_sec_old");
     }
 }

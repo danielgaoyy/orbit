@@ -5,21 +5,123 @@ import UIKit
 
 // MARK: - Navigation & Composer Models
 
-public enum OrbitSheetDestination: String, Identifiable, Equatable {
+public enum OrbitSheetDestination: Identifiable, Equatable {
     case gitDiff
     case pty
     case qrPair
     case directoryBrowser
     case settings
+    case workspaceBoard(workspaceId: String)
+    case sessionOverview
+    case sideQuestion
+    case workspaceFiles(initialPath: String?)
+    case automations
+    case archivedThreads
+    case spawnPeer(workspaceId: String)
+    case createWorkspace(projectRoot: String, projectName: String, isGitRepo: Bool, moveAgentId: String?)
 
-    public var id: String { rawValue }
+    public var id: String {
+        switch self {
+        case .gitDiff: return "gitDiff"
+        case .pty: return "pty"
+        case .qrPair: return "qrPair"
+        case .directoryBrowser: return "directoryBrowser"
+        case .settings: return "settings"
+        case let .workspaceBoard(wsId): return "workspaceBoard:\(wsId)"
+        case .sessionOverview: return "sessionOverview"
+        case .sideQuestion: return "sideQuestion"
+        case let .workspaceFiles(path): return "workspaceFiles:\(path ?? "")"
+        case .automations: return "automations"
+        case .archivedThreads: return "archivedThreads"
+        case let .spawnPeer(wsId): return "spawnPeer:\(wsId)"
+        case let .createWorkspace(root, _, _, moveId): return "createWorkspace:\(root):\(moveId ?? "")"
+        }
+    }
 
     public var defaultDetent: PresentationDetent {
         switch self {
-        case .gitDiff, .pty, .settings, .directoryBrowser, .qrPair:
+        case .spawnPeer, .createWorkspace:
+            return .large
+        default:
             return .large
         }
     }
+}
+
+public enum OrbitPadInspectorTab: String, CaseIterable, Identifiable, Equatable {
+    case overview
+    case diff
+    case board
+    case files
+    case sideQuestion
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        switch self {
+        case .overview: return "Overview"
+        case .diff: return "Diff"
+        case .board: return "Board"
+        case .files: return "Files"
+        case .sideQuestion: return "Side Q&A"
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .overview: return "sidebar.right"
+        case .diff: return "arrow.left.arrow.right"
+        case .board: return "doc.richtext"
+        case .files: return "folder"
+        case .sideQuestion: return "bubble.left.and.text.bubble.right"
+        }
+    }
+}
+
+public enum OrbitRenameTarget: Identifiable, Equatable {
+    case agent(hostId: String, agentId: String, currentTitle: String, currentHandle: String?)
+    case workspace(hostId: String, workspaceId: String, currentTitle: String)
+
+    public var id: String {
+        switch self {
+        case let .agent(hid, aid, _, _): return "agent:\(hid):\(aid)"
+        case let .workspace(hid, wid, _): return "ws:\(hid):\(wid)"
+        }
+    }
+}
+
+public struct SideQuestionEntry: Identifiable, Equatable {
+    public let id: String
+    public var requestId: String
+    public let question: String
+    public var answer: String
+    public var error: String?
+    public var isStreaming: Bool
+    public let createdAt: Date
+
+    public init(
+        id: String = UUID().uuidString,
+        requestId: String = "",
+        question: String,
+        answer: String = "",
+        error: String? = nil,
+        isStreaming: Bool = true,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.requestId = requestId
+        self.question = question
+        self.answer = answer
+        self.error = error
+        self.isStreaming = isStreaming
+        self.createdAt = createdAt
+    }
+}
+
+public struct HostDaemonUpgradeState: Equatable {
+    public var isUpgrading: Bool = false
+    public var statusMessage: String? = nil
+    public var error: String? = nil
 }
 
 public enum OrbitSlashDirective: String, CaseIterable, Identifiable, Equatable {
@@ -103,6 +205,8 @@ public extension OrbitSlashDirective {
         case "plan": return "checklist"
         case "review": return "doc.text.magnifyingglass"
         case "diff": return "arrow.left.arrow.right"
+        case "btw": return "bubble.left.and.text.bubble.right"
+        case "files": return "folder"
         case "compact": return "rectangle.compress.vertical"
         case "orbit": return "square.3.layers.3d"
         case "orbit-handoff": return "paperplane"
@@ -126,6 +230,30 @@ extension FfiSidebarConversation: Identifiable {
 }
 
 extension FfiSidebarProjectGroup: Identifiable {}
+
+extension FfiSidebarWorkspaceGroup: Identifiable {
+    public var id: String { workspaceId }
+}
+
+extension FfiScheduleSpec: Identifiable {
+    public var id: String { scheduleId }
+}
+
+extension FfiScheduleRunRecord: Identifiable {
+    public var id: String { runId }
+}
+
+extension FfiWorkspaceEvent: Identifiable {
+    public var id: String { "\(workspaceId)::\(seq)" }
+}
+
+extension FfiProviderSubagentDescriptor: Identifiable {
+    public var id: String { subagentId }
+}
+
+extension FfiNestedGitRepo: Identifiable {
+    public var id: String { path }
+}
 
 extension FfiSlashCommand: Identifiable {}
 
@@ -312,6 +440,7 @@ public struct QueuedPromptItem: Identifiable, Equatable {
     public var slashDirective: OrbitSlashDirective?
     public var attachedContexts: [ComposerContextItem]
     public var quotedDiffSnippets: [QuotedDiffSnippet]
+    public var badges: [FfiPromptBadge]
     public let createdAt: Date
 
     public init(
@@ -320,6 +449,7 @@ public struct QueuedPromptItem: Identifiable, Equatable {
         slashDirective: OrbitSlashDirective?,
         attachedContexts: [ComposerContextItem],
         quotedDiffSnippets: [QuotedDiffSnippet],
+        badges: [FfiPromptBadge] = [],
         createdAt: Date = Date()
     ) {
         self.id = id
@@ -327,6 +457,7 @@ public struct QueuedPromptItem: Identifiable, Equatable {
         self.slashDirective = slashDirective
         self.attachedContexts = attachedContexts
         self.quotedDiffSnippets = quotedDiffSnippets
+        self.badges = badges
         self.createdAt = createdAt
     }
 
@@ -344,11 +475,37 @@ public struct QueuedPromptItem: Identifiable, Equatable {
         if let firstQuote = quotedDiffSnippets.first {
             return firstQuote.chipLabel
         }
+        if let firstBadge = badges.first {
+            return firstBadge.label
+        }
         return "Queued follow-up"
     }
 
     public var attachmentCount: Int {
-        (slashDirective != nil ? 1 : 0) + attachedContexts.count + quotedDiffSnippets.count
+        let localCount = (slashDirective != nil ? 1 : 0) + attachedContexts.count + quotedDiffSnippets.count
+        return max(localCount, badges.count)
+    }
+}
+
+// MARK: - Side Question Stream Bridge
+
+private final class WeakSideQuestionListenerBridge: SideQuestionListener, @unchecked Sendable {
+    weak var owner: OrbitIosStore?
+    let scopeKey: String
+    let entryId: String
+
+    init(owner: OrbitIosStore, scopeKey: String, entryId: String) {
+        self.owner = owner
+        self.scopeKey = scopeKey
+        self.entryId = entryId
+    }
+
+    func onSideQuestionEvent(event: FfiSideQuestionEvent) {
+        let scope = scopeKey
+        let entry = entryId
+        Task { @MainActor [weak owner] in
+            owner?.handleSideQuestionEvent(scopeKey: scope, entryId: entry, event: event)
+        }
     }
 }
 
@@ -375,6 +532,7 @@ public final class OrbitIosStore: ObservableObject {
     // Fleet & Host State
     @Published public private(set) var hosts: [FfiHostCard] = []
     @Published public private(set) var projects: [FfiClientProject] = []
+    @Published public private(set) var projectOrder: [String] = []
     @Published public private(set) var totalPendingApprovals: UInt32 = 0
     @Published public var selectedHostId: String?
     @Published public private(set) var currentHostDetail: FfiHostDetail?
@@ -389,13 +547,35 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var activeCwd: String = "~"
     @Published public var activeExtraDirs: [String] = []
     @Published public var draftUseWorktree: Bool = false
+    @Published public var draftWorkspaceId: String? = nil
+    @Published public var draftWorktreeRepoPath: String? = nil
     @Published public private(set) var workspaceFilesList: [String] = []
+    @Published public var activeWorkspaceFilePath: String? = nil
+    @Published public private(set) var workspaceFileCache: [String: FfiWorkspaceFile] = [:]
+    @Published public private(set) var workspaceFileLoadingPath: String? = nil
+    @Published public private(set) var workspaceFileError: String? = nil
     @Published public private(set) var gitReview: FfiGitReview?
     @Published public var gitStagedMode: Bool = false
     @Published public var jumpToDiffFilePath: String?
     @Published public private(set) var terminalScreen: FfiTerminalScreen?
     @Published public private(set) var localDaemonUri: String?
     @Published public private(set) var pasteboardHasStrings: Bool = false
+
+    // Mission Workspaces, Side Questions, Subagents, Schedules & Updates
+    @Published public var collapsedWorkspaceIds: Set<String> = []
+    @Published public var collapsedInboxProjectIds: Set<String> = []
+    @Published public var archivedSubagentKeys: Set<String> = []
+    @Published public var padInspectorTab: OrbitPadInspectorTab = .overview
+    @Published public var sideQuestionsByScope: [String: [SideQuestionEntry]] = [:]
+    @Published public var sideQuestionDraftsByScope: [String: String] = [:]
+    @Published public var hostUpgradeStates: [String: HostDaemonUpgradeState] = [:]
+    @Published public var dismissedVersionMismatchHosts: Set<String> = []
+    @Published public private(set) var isNetworkOffline: Bool = false
+    @Published public var coalesceExploration: Bool = true
+    @Published public var defaultPermissionModeRaw: String = "accept_edits"
+    @Published public var renameTarget: OrbitRenameTarget? = nil
+    @Published public private(set) var subagentTimelinesCache: [String: [FfiProviderSubagentEvent]] = [:]
+    @Published public private(set) var scheduleRunsCache: [String: [FfiScheduleRunRecord]] = [:]
 
     // Composer State & Live Queueing
     @Published public var composerText: String = ""
@@ -449,6 +629,13 @@ public final class OrbitIosStore: ObservableObject {
     @Published public var lastError: String?
     @Published public var toastMessage: String?
 
+    // Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist)
+    @Published public private(set) var cloudSyncStatus: FfiCloudSyncStatus?
+    @Published public private(set) var cloudSyncBusy: Bool = false
+    @Published public var cloudSyncError: String?
+    @Published public private(set) var cloudSyncDeviceFlow: FfiGitHubDeviceFlowStart?
+    private var cloudDeviceFlowTask: Task<Void, Never>?
+
     private var core: OrbitMobileCore?
     private var listenerBridge: WeakMobileListenerBridge?
     private let pathMonitor = NWPathMonitor()
@@ -463,13 +650,28 @@ public final class OrbitIosStore: ObservableObject {
     private var pendingLaunchPtyCommand: String?
     private var ptyLaunchCmdDispatched: Bool = false
     private var cachedFallbackCatalogs: [FfiProviderModelCatalog] = []
+    private var lastMarkedSeenSeqByAgent: [String: UInt64] = [:]
+    private var activeSideQuestionListeners: [String: WeakSideQuestionListenerBridge] = [:]
 
     private static let legacyPinnedThreadKeysDefaultsKey = "orbit.ios.pinnedThreadKeys"
     private static let migratedThreadPrefsDefaultsKey = "orbit.ios.migratedThreadPrefsV1"
     private static let draftUseWorktreeDefaultsKey = "orbit.ios.draftUseWorktree"
+    private static let archivedSubagentsDefaultsKey = "orbit.ios.archivedSubagentKeys"
+    private static let coalesceExplorationDefaultsKey = "orbit.ios.coalesceExploration"
+    private static let defaultPermissionModeDefaultsKey = "orbit.ios.defaultPermissionMode"
 
     public init() {
         self.draftUseWorktree = UserDefaults.standard.bool(forKey: Self.draftUseWorktreeDefaultsKey)
+        if let savedArchived = UserDefaults.standard.stringArray(forKey: Self.archivedSubagentsDefaultsKey) {
+            self.archivedSubagentKeys = Set(savedArchived)
+        }
+        if UserDefaults.standard.object(forKey: Self.coalesceExplorationDefaultsKey) != nil {
+            self.coalesceExploration = UserDefaults.standard.bool(forKey: Self.coalesceExplorationDefaultsKey)
+        }
+        if let savedPerm = UserDefaults.standard.string(forKey: Self.defaultPermissionModeDefaultsKey), !savedPerm.isEmpty {
+            self.defaultPermissionModeRaw = savedPerm
+            self.selectedMode = Self.sessionModeFromRaw(savedPerm)
+        }
         let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         let dbPath = docDir?.appendingPathComponent("orbit_ios_v3.sqlite").path ?? ":memory:"
 
@@ -518,6 +720,7 @@ public final class OrbitIosStore: ObservableObject {
             instance.subscribeThrottled(listener: bridge, intervalMs: 24)
 
             self.localDaemonUri = instance.discoverLocalDaemonUri()
+            self.cloudSyncStatus = instance.cloudSyncStatus()
             self.refreshPasteboardAvailability()
 
             reloadFleet()
@@ -601,7 +804,8 @@ public final class OrbitIosStore: ObservableObject {
                     text: q.displayText,
                     slashDirective: nil,
                     attachedContexts: [],
-                    quotedDiffSnippets: []
+                    quotedDiffSnippets: [],
+                    badges: q.badges
                 )
             }
         }
@@ -699,6 +903,11 @@ public final class OrbitIosStore: ObservableObject {
         seq: UInt64,
         refreshSidebarAfter: Bool = true
     ) {
+        let key = "\(hostId)::\(agentId)"
+        if let lastSeq = lastMarkedSeenSeqByAgent[key], lastSeq >= seq {
+            return
+        }
+        lastMarkedSeenSeqByAgent[key] = seq
         core?.markAgentSeen(hostId: hostId, agentId: agentId, seq: seq)
         if refreshSidebarAfter {
             refreshSidebar()
@@ -706,6 +915,7 @@ public final class OrbitIosStore: ObservableObject {
     }
 
     public func markAgentUnread(hostId: String, agentId: String) {
+        lastMarkedSeenSeqByAgent.removeValue(forKey: "\(hostId)::\(agentId)")
         core?.markAgentUnread(hostId: hostId, agentId: agentId)
         refreshSidebar()
         hapticLight()
@@ -837,9 +1047,13 @@ public final class OrbitIosStore: ObservableObject {
 
     private func startNetworkMonitor() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
+            let isOffline = path.status != .satisfied
             let sig = "\(path.status)-\(path.usesInterfaceType(.wifi))-\(path.usesInterfaceType(.cellular))-\(path.usesInterfaceType(.wiredEthernet))"
             Task { @MainActor [weak self] in
                 guard let self = self else { return }
+                if self.isNetworkOffline != isOffline {
+                    self.isNetworkOffline = isOffline
+                }
                 if let previous = self.lastNetworkSignature, previous != sig {
                     self.core?.onNetworkChanged()
                 }
@@ -1066,8 +1280,22 @@ public final class OrbitIosStore: ObservableObject {
                     self.isModelPickerPresented = true
                 case "pair", "qr":
                     self.activeSheet = .qrPair
-                case "directory", "files":
+                case "directory":
                     self.openDirectoryBrowser()
+                case "files":
+                    self.openWorkspaceFiles()
+                case "overview":
+                    self.openSessionOverview()
+                case "board":
+                    if let wsId = self.activeWorkspace?.workspaceId {
+                        self.openWorkspaceBoard(workspaceId: wsId)
+                    }
+                case "sidequestion", "btw":
+                    self.openSideQuestion()
+                case "automations", "schedules":
+                    self.activeSheet = .automations
+                case "archived":
+                    self.activeSheet = .archivedThreads
                 case "settings", "quotas":
                     self.activeSheet = .settings
                 default:
@@ -1139,6 +1367,7 @@ public final class OrbitIosStore: ObservableObject {
         guard let snap = core?.fleetOverview() else { return }
         hosts = snap.hosts
         projects = snap.projects
+        projectOrder = snap.projectOrder
         totalPendingApprovals = snap.totalPendingApprovals
 
         if selectedHostId == nil, let firstHost = snap.hosts.first {
@@ -1199,7 +1428,7 @@ public final class OrbitIosStore: ObservableObject {
         // Advance active thread's seen cursor if currently viewing it
         if selectedHostId == hostId, let currentAid = selectedAgentId, !isDraftNewSession,
            let ag = detail.agents.first(where: { $0.agentId == currentAid }) {
-            core?.markAgentSeen(hostId: hostId, agentId: currentAid, seq: ag.latestSeq)
+            markAgentSeen(hostId: hostId, agentId: currentAid, seq: ag.latestSeq, refreshSidebarAfter: false)
         }
 
         // Seamlessly migrate optimistic agent ID when daemon assigns permanent ID
@@ -1293,6 +1522,7 @@ public final class OrbitIosStore: ObservableObject {
         selectedAgentId = agentId
         isDrawerOpen = false
         core?.openAgentTimeline(hostId: hid, agentId: agentId)
+        core?.listProviderSubagents(hostId: hid, parentAgentId: agentId)
         reloadAgentStage(hostId: hid, agentId: agentId)
 
         if let card = currentHostDetail?.agents.first(where: { $0.agentId == agentId }) ?? agentStage?.agent {
@@ -1301,6 +1531,13 @@ public final class OrbitIosStore: ObservableObject {
             selectedEffort = card.effort
             selectedMode = card.mode
             updateActiveWorkspaceCwd(card.cwd)
+            if !card.workspaceId.isEmpty {
+                core?.fetchWorkspaceEvents(hostId: hid, workspaceId: card.workspaceId, limit: 40)
+                if let ws = currentHostDetail?.workspaces.first(where: { $0.workspaceId == card.workspaceId }),
+                   ws.isCurated || ws.boardRevision > 0 {
+                    core?.fetchWorkspaceBoard(hostId: hid, workspaceId: card.workspaceId)
+                }
+            }
             markAgentSeen(hostId: hid, agentId: agentId, seq: max(card.latestSeq, agentStage?.latestSeq ?? 0))
         }
         refreshSidebar()
@@ -1392,13 +1629,17 @@ public final class OrbitIosStore: ObservableObject {
     public func startNewSessionDraft(
         cwd: String? = nil,
         extraDirs: [String] = [],
-        provider: FfiProviderKind? = nil
+        provider: FfiProviderKind? = nil,
+        workspaceId: String? = nil
     ) {
         let wasViewingAgent = selectedAgentId != nil
         selectedAgentId = nil
         agentStage = nil
         isDrawerOpen = false
         activeExtraDirs = extraDirs
+        draftWorkspaceId = workspaceId
+        draftWorktreeRepoPath = nil
+        selectedMode = Self.sessionModeFromRaw(defaultPermissionModeRaw)
         if let provider = provider {
             selectedProvider = provider
             if let saved = draftSelectionsByProvider[provider] {
@@ -1422,6 +1663,8 @@ public final class OrbitIosStore: ObservableObject {
         }
         if let cwd = cwd, !cwd.isEmpty {
             updateActiveWorkspaceCwd(cwd)
+        } else if let hid = selectedHostId, !activeCwd.isEmpty, activeCwd != "~" {
+            core?.requestGitReposInspection(hostId: hid, path: activeCwd, extraDirs: activeExtraDirs)
         }
         refreshSidebar()
         hapticLight()
@@ -1482,12 +1725,16 @@ public final class OrbitIosStore: ObservableObject {
         guard !cwd.isEmpty else { return }
         let changed = activeCwd != cwd
         activeCwd = cwd
+        if changed {
+            draftWorktreeRepoPath = nil
+        }
         if changed, let hid = selectedHostId {
             core?.fetchGitStatus(hostId: hid, cwd: cwd)
             core?.fetchGitDiff(hostId: hid, cwd: cwd, path: nil, staged: gitStagedMode)
             gitReview = core?.gitReview(hostId: hid, cwd: cwd, path: nil)
             core?.fetchWorkspaceFiles(hostId: hid, cwd: cwd)
             workspaceFilesList = core?.workspaceFiles(hostId: hid, cwd: cwd) ?? []
+            core?.requestGitReposInspection(hostId: hid, path: cwd, extraDirs: activeExtraDirs)
             refreshSidebar()
         }
     }
@@ -2004,13 +2251,13 @@ public final class OrbitIosStore: ObservableObject {
 
     public func rankMentionCandidates(query: String, limit: UInt32 = 11) -> [FfiMentionCandidate] {
         guard let core, let hid = selectedHostId else { return [] }
-        return core.rankMentionCandidates(
-            req: FfiMentionRankRequest(
-                hostId: hid,
-                cwd: activeCwd,
-                query: query,
-                limit: limit
-            )
+        return core.rankMentionCandidatesWithWorkspace(
+            hostId: hid,
+            cwd: activeCwd,
+            query: query,
+            limit: limit,
+            workspaceId: activeWorkspace?.workspaceId,
+            activeAgentId: selectedAgentId
         )
     }
 
@@ -2041,7 +2288,11 @@ public final class OrbitIosStore: ObservableObject {
         ) {
             guard !preview.isEmpty else { return }
             if preview.isBtw {
-                showToast("Side question (/btw) is available on Desktop & HarmonyOS")
+                composerText = ""
+                slashDirective = nil
+                hapticLight()
+                let q = (preview.btwQuestion ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                openSideQuestion(prefillAndSubmit: q.isEmpty ? nil : q)
                 return
             }
             if preview.isCompact && selectedAgentId == nil {
@@ -2323,7 +2574,8 @@ public final class OrbitIosStore: ObservableObject {
         }
 
         if composed.isBtw {
-            showToast("Side question (/btw) is available on Desktop & HarmonyOS")
+            let q = (composed.btwQuestion ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            openSideQuestion(prefillAndSubmit: q.isEmpty ? nil : q)
             return
         }
 
@@ -2358,9 +2610,12 @@ public final class OrbitIosStore: ObservableObject {
                 reloadAgentStage(hostId: hid, agentId: aid)
             }
         } else {
-            let createdId = core?.createAgentFull(
+            let effectiveCwd = (draftUseWorktree && (draftWorktreeRepoPath?.isEmpty == false))
+                ? (draftWorktreeRepoPath ?? activeCwd)
+                : activeCwd
+            let req = FfiCreateSessionRequest(
                 hostId: hid,
-                cwd: activeCwd,
+                cwd: effectiveCwd,
                 extraDirs: activeExtraDirs,
                 provider: selectedProvider,
                 model: selectedModel,
@@ -2371,7 +2626,15 @@ public final class OrbitIosStore: ObservableObject {
                 initialBadges: composed.badges,
                 worktreeBranch: draftUseWorktree ? "auto" : nil
             )
+            let createdId = core?.createSessionInWorkspace(
+                req: req,
+                workspaceId: draftWorkspaceId,
+                handle: nil,
+                autoCluster: false
+            )
             if let newId = createdId, !newId.isEmpty {
+                draftWorkspaceId = nil
+                draftWorktreeRepoPath = nil
                 lastKnownRunningByAgentKey["\(hid)::\(newId)"] = true
                 selectedAgentId = newId
                 core?.openAgentTimeline(hostId: hid, agentId: newId)
@@ -2485,6 +2748,7 @@ public final class OrbitIosStore: ObservableObject {
             if activeSheet == .gitDiff {
                 activeSheet = nil
             }
+            padInspectorTab = .diff
             withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
                 isPadDiffInspectorVisible = true
             }
@@ -2820,5 +3084,1217 @@ public final class OrbitIosStore: ObservableObject {
         diagramRenderCacheOrder.append(key)
         diagramRenderCache[key] = result
         return result
+    }
+
+    // MARK: - General Preferences (Aligned with Desktop Settings)
+
+    public static func sessionModeFromRaw(_ raw: String) -> FfiSessionMode {
+        switch raw.lowercased() {
+        case "default", "ask": return .default
+        case "full_access", "full": return .fullAccess
+        default: return .acceptEdits
+        }
+    }
+
+    public static func rawFromSessionMode(_ mode: FfiSessionMode) -> String {
+        switch OrbitFormatters.normalizePermissionMode(mode) {
+        case .default, .plan, .custom: return "default"
+        case .acceptEdits: return "accept_edits"
+        case .fullAccess: return "full_access"
+        }
+    }
+
+    public func setCoalesceExploration(_ enabled: Bool) {
+        coalesceExploration = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.coalesceExplorationDefaultsKey)
+        hapticLight()
+    }
+
+    public func setDefaultPermissionMode(_ mode: FfiSessionMode) {
+        let raw = Self.rawFromSessionMode(mode)
+        defaultPermissionModeRaw = raw
+        UserDefaults.standard.set(raw, forKey: Self.defaultPermissionModeDefaultsKey)
+        if isDraftNewSession {
+            selectedMode = OrbitFormatters.normalizePermissionMode(mode)
+        }
+        hapticLight()
+    }
+
+    // MARK: - Mission Workspaces, Peers, Board, Events & Auto-Organize
+
+    public var activeWorkspace: FfiWorkspaceSummary? {
+        guard let detail = currentHostDetail else { return nil }
+        if let agent = activeAgent, !agent.workspaceId.isEmpty {
+            return detail.workspaces.first(where: { $0.workspaceId == agent.workspaceId })
+        }
+        if let draftWs = draftWorkspaceId {
+            return detail.workspaces.first(where: { $0.workspaceId == draftWs })
+        }
+        return nil
+    }
+
+    public var activeWorkspacePeers: [FfiAgentCard] {
+        guard let ws = activeWorkspace, let detail = currentHostDetail else { return [] }
+        return detail.agents.filter { ag in
+            ag.workspaceId == ws.workspaceId
+                && ag.archivedAtRfc3339 == nil
+                && !(ag.parentAgentId != nil && ag.parentHostId == nil)
+        }
+    }
+
+    public var activeProjectGroup: FfiSidebarProjectGroup? {
+        guard let hid = selectedHostId else { return nil }
+        let groups = (sidebarView?.projects ?? []).filter { $0.hostId == hid }
+        if let agent = activeAgent {
+            if let matched = groups.first(where: { g in
+                g.conversations.contains(where: { $0.agent.agentId == agent.agentId })
+                    || g.workspaces.contains(where: { $0.workspaceId == agent.workspaceId })
+            }) {
+                return matched
+            }
+        }
+        return groups.first(where: { g in
+            OrbitFormatters.arePathsEquivalent(g.primaryCwd, activeCwd)
+                || g.directories.contains(where: { OrbitFormatters.arePathsEquivalent($0, activeCwd) })
+        })
+    }
+
+    public var activeProjectRoot: String {
+        activeWorkspace?.projectRoot ?? activeProjectGroup?.primaryCwd ?? activeCwd
+    }
+
+    public var activeProjectCuratedWorkspaces: [FfiWorkspaceSummary] {
+        guard let detail = currentHostDetail else { return [] }
+        let root = activeProjectRoot
+        return detail.workspaces.filter { ws in
+            ws.isCurated && (
+                OrbitFormatters.arePathsEquivalent(ws.projectRoot ?? ws.sourceCwd ?? ws.cwd, root)
+                    || OrbitFormatters.arePathsEquivalent(ws.cwd, root)
+            )
+        }
+    }
+
+    public func workspaceBoard(for workspaceId: String) -> FfiWorkspaceBoardSnapshot? {
+        if let snap = currentHostDetail?.workspaceBoards[workspaceId] {
+            return snap
+        }
+        guard let hid = selectedHostId else { return nil }
+        return core?.workspaceBoard(hostId: hid, workspaceId: workspaceId)
+    }
+
+    public func workspaceEvents(for workspaceId: String) -> [FfiWorkspaceEvent] {
+        if let cached = currentHostDetail?.workspaceEvents[workspaceId], !cached.isEmpty {
+            return cached
+        }
+        guard let hid = selectedHostId else { return [] }
+        return core?.workspaceEvents(hostId: hid, workspaceId: workspaceId) ?? []
+    }
+
+    public var activeWorkspaceConflictEvents: [FfiWorkspaceEvent] {
+        guard let ws = activeWorkspace else { return [] }
+        return workspaceEvents(for: ws.workspaceId).filter { $0.kind == .conflictWarning }
+    }
+
+    public func organizeStatus(forProjectRoot root: String) -> FfiWorkspaceOrganizeStatus? {
+        guard let map = currentHostDetail?.workspaceOrganizeStatus else { return nil }
+        if let direct = map[root] { return direct }
+        return map.first(where: { OrbitFormatters.arePathsEquivalent($0.key, root) })?.value
+    }
+
+    public func toggleWorkspaceCollapsed(_ workspaceId: String) {
+        if collapsedWorkspaceIds.contains(workspaceId) {
+            collapsedWorkspaceIds.remove(workspaceId)
+        } else {
+            collapsedWorkspaceIds.insert(workspaceId)
+        }
+        hapticLight()
+    }
+
+    public func toggleInboxCollapsed(projectId: String, currentlyCollapsed: Bool) {
+        if currentlyCollapsed {
+            collapsedInboxProjectIds.remove(projectId)
+            collapsedInboxProjectIds.insert("expanded::\(projectId)")
+        } else {
+            collapsedInboxProjectIds.remove("expanded::\(projectId)")
+            collapsedInboxProjectIds.insert(projectId)
+        }
+        hapticLight()
+    }
+
+    public func isInboxCollapsed(for project: FfiSidebarProjectGroup) -> Bool {
+        if collapsedInboxProjectIds.contains("expanded::\(project.id)") {
+            return false
+        }
+        if collapsedInboxProjectIds.contains(project.id) {
+            return true
+        }
+        // Auto-expand if there are no curated workspaces or active agent is inside inbox
+        let hasActiveInInbox = project.unclassifiedConversations.contains {
+            !isDraftNewSession && $0.agent.agentId == selectedAgentId
+        }
+        if hasActiveInInbox || project.workspaces.isEmpty {
+            return false
+        }
+        return true
+    }
+
+    public func fetchWorkspaceBoardAndEvents(_ workspaceId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.fetchWorkspaceBoard(hostId: hid, workspaceId: workspaceId)
+        core?.fetchWorkspaceEvents(hostId: hid, workspaceId: workspaceId, limit: 60)
+    }
+
+    public func updateWorkspaceBoard(
+        workspaceId: String,
+        content: String,
+        section: String? = nil
+    ) {
+        guard let hid = selectedHostId else { return }
+        core?.updateWorkspaceBoard(
+            hostId: hid,
+            workspaceId: workspaceId,
+            content: content,
+            section: section,
+            updatedBy: "user"
+        )
+        hapticLight()
+        showToast("Board updated")
+    }
+
+    public func createMissionWorkspace(
+        sourceCwd: String,
+        title: String,
+        missionGoal: String?,
+        useWorktree: Bool,
+        moveAgentId: String? = nil
+    ) {
+        guard let hid = selectedHostId else { return }
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanTitle.isEmpty else { return }
+        if let moveId = moveAgentId {
+            core?.moveAgentToWorkspaceV2(
+                hostId: hid,
+                agentId: moveId,
+                targetWorkspaceId: nil,
+                newWorkspaceTitle: cleanTitle,
+                makeUnclassified: false
+            )
+            hapticSuccess()
+            showToast("Created \"\(cleanTitle)\"")
+            return
+        }
+        let cleanGoal = missionGoal?.trimmingCharacters(in: .whitespacesAndNewlines)
+        core?.createMissionWorkspace(
+            hostId: hid,
+            sourceCwd: sourceCwd,
+            title: cleanTitle,
+            missionGoal: (cleanGoal?.isEmpty == false) ? cleanGoal : nil,
+            useWorktree: useWorktree,
+            worktreeBranch: nil,
+            baseRef: nil
+        )
+        hapticSuccess()
+        showToast("Created workspace \"\(cleanTitle)\"")
+    }
+
+    public func renameWorkspace(hostId: String, workspaceId: String, title: String) {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        core?.renameWorkspace(hostId: hostId, workspaceId: workspaceId, title: clean)
+        hapticLight()
+        showToast("Renamed workspace")
+    }
+
+    public func updateWorkspaceGoal(workspaceId: String, goal: String) {
+        guard let hid = selectedHostId else { return }
+        core?.updateWorkspaceGoal(
+            hostId: hid,
+            workspaceId: workspaceId,
+            goal: goal.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        hapticLight()
+        showToast("Updated mission goal")
+    }
+
+    public func archiveWorkspace(_ workspaceId: String, keepAgentsUnclassified: Bool) {
+        guard let hid = selectedHostId else { return }
+        core?.archiveWorkspace(
+            hostId: hid,
+            workspaceId: workspaceId,
+            keepAgentsUnclassified: keepAgentsUnclassified
+        )
+        if activeWorkspace?.workspaceId == workspaceId && !keepAgentsUnclassified {
+            selectedAgentId = nil
+            agentStage = nil
+        }
+        hapticMedium()
+        showToast(keepAgentsUnclassified ? "Dissolved workspace" : "Archived workspace")
+    }
+
+    public func mergeWorkspaces(sourceWorkspaceId: String, targetWorkspaceId: String) {
+        guard let hid = selectedHostId, sourceWorkspaceId != targetWorkspaceId else { return }
+        core?.mergeWorkspaces(
+            hostId: hid,
+            sourceWorkspaceId: sourceWorkspaceId,
+            targetWorkspaceId: targetWorkspaceId
+        )
+        hapticSuccess()
+        showToast("Merged workspaces")
+    }
+
+    public func moveAgentToWorkspace(
+        agentId: String,
+        targetWorkspaceId: String?,
+        newWorkspaceTitle: String? = nil,
+        makeUnclassified: Bool = false
+    ) {
+        guard let hid = selectedHostId else { return }
+        core?.moveAgentToWorkspaceV2(
+            hostId: hid,
+            agentId: agentId,
+            targetWorkspaceId: targetWorkspaceId,
+            newWorkspaceTitle: newWorkspaceTitle,
+            makeUnclassified: makeUnclassified
+        )
+        hapticLight()
+        if makeUnclassified {
+            showToast("Moved to 待归类")
+        } else if let title = newWorkspaceTitle, !title.isEmpty {
+            showToast("Moved to \"\(title)\"")
+        } else {
+            showToast("Moved conversation")
+        }
+    }
+
+    public func organizeProjectWorkspaces(
+        projectRoot: String,
+        agentIds: [String] = [],
+        autoApply: Bool = true
+    ) {
+        guard let hid = selectedHostId else { return }
+        core?.organizeProjectWorkspaces(
+            hostId: hid,
+            projectRoot: projectRoot,
+            agentIds: agentIds,
+            autoApply: autoApply
+        )
+        hapticLight()
+        showToast(agentIds.count == 1 ? "AI classifying conversation…" : "AI organizing workspaces…")
+    }
+
+    public func summarizeAgent(_ agentId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.summarizeAgent(hostId: hid, agentId: agentId)
+        hapticLight()
+        showToast("Generating AI summary…")
+    }
+
+    public func dismissClusterSuggestion(_ agentId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.dismissClusterSuggestion(hostId: hid, agentId: agentId)
+        hapticLight()
+    }
+
+    public func updateAgentIdentity(
+        hostId: String,
+        agentId: String,
+        handle: String? = nil,
+        title: String? = nil,
+        taskSummary: String? = nil,
+        lockHandle: Bool = false,
+        lockTitle: Bool = false
+    ) {
+        core?.updateAgentIdentity(
+            hostId: hostId,
+            agentId: agentId,
+            handle: handle,
+            title: title,
+            taskSummary: taskSummary,
+            lockHandle: lockHandle,
+            lockTitle: lockTitle
+        )
+        hapticLight()
+        showToast("Updated session")
+    }
+
+    public func spawnWorkspacePeer(
+        workspaceId: String,
+        provider: FfiProviderKind,
+        model: String?,
+        effort: FfiReasoningEffort?,
+        mode: FfiSessionMode,
+        handle: String?,
+        initialPrompt: String,
+        useWorktree: Bool
+    ) {
+        guard let hid = selectedHostId else { return }
+        let ws = currentHostDetail?.workspaces.first(where: { $0.workspaceId == workspaceId })
+        let cwd = ws?.cwd ?? activeCwd
+        let cleanHandle = handle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let req = FfiSpawnWorkspacePeerRequest(
+            hostId: hid,
+            workspaceId: workspaceId,
+            cwd: cwd,
+            extraDirs: activeExtraDirs,
+            provider: provider,
+            model: model,
+            effort: effort,
+            mode: mode,
+            initialPrompt: initialPrompt,
+            worktreeBranch: useWorktree ? "auto" : nil,
+            handle: (cleanHandle?.isEmpty == false) ? cleanHandle : nil,
+            profileId: nil
+        )
+        let newId = core?.spawnWorkspacePeer(req: req) ?? ""
+        if !newId.isEmpty {
+            selectedAgentId = newId
+            core?.openAgentTimeline(hostId: hid, agentId: newId)
+            reloadHostDetail(hid)
+            reloadAgentStage(hostId: hid, agentId: newId)
+        }
+        hapticSuccess()
+        showToast("Spawned workspace peer")
+    }
+
+    public func unarchiveAgent(_ agentId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.unarchiveAgent(hostId: hid, agentId: agentId)
+        hapticSuccess()
+        showToast("Conversation restored")
+    }
+
+    public func deleteAgentPermanently(_ agentId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.deleteAgent(hostId: hid, agentId: agentId)
+        hapticMedium()
+        showToast("Conversation deleted")
+    }
+
+    public func detachAgent(_ agentId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.detachAgent(hostId: hid, agentId: agentId)
+        hapticLight()
+        showToast("Detached as standalone session")
+    }
+
+    public func resolveChildPermission(
+        childHostId: String?,
+        childAgentId: String,
+        requestId: String,
+        decision: String
+    ) {
+        guard let hid = childHostId ?? selectedHostId else { return }
+        core?.resolvePermission(
+            hostId: hid,
+            agentId: childAgentId,
+            permissionRequestId: requestId,
+            decision: decision
+        )
+        hapticMedium()
+        showToast("Sent decision: \(OrbitFormatters.decisionLabel(decision))")
+    }
+
+    // MARK: - Git Repos Inspection (Non-Git Guard & Nested Repo Picker)
+
+    public func gitReposInspection(for path: String) -> FfiGitReposInspection? {
+        if let map = currentHostDetail?.gitReposByCwd {
+            if let direct = map[path] { return direct }
+            if let matched = map.first(where: { OrbitFormatters.arePathsEquivalent($0.key, path) }) {
+                return matched.value
+            }
+        }
+        guard let hid = selectedHostId else { return nil }
+        return core?.gitReposInspection(hostId: hid, path: path)
+    }
+
+    public func requestGitReposInspection(for path: String) {
+        guard let hid = selectedHostId, !path.isEmpty, path != "~" else { return }
+        core?.requestGitReposInspection(hostId: hid, path: path, extraDirs: activeExtraDirs)
+    }
+
+    // MARK: - Subagents (Managed & Provider Native)
+
+    public var activeManagedSubagents: [FfiAgentCard] {
+        guard let aid = selectedAgentId, let detail = currentHostDetail else { return [] }
+        return detail.agents.filter { ag in
+            ag.parentAgentId == aid && ag.archivedAtRfc3339 == nil
+        }
+    }
+
+    public var activeProviderSubagents: [FfiProviderSubagentDescriptor] {
+        guard let aid = selectedAgentId, let detail = currentHostDetail else { return [] }
+        return detail.providerSubagents[aid] ?? []
+    }
+
+    public func subagentArchiveKey(kind: String, id: String) -> String {
+        let hid = selectedHostId ?? "local"
+        return "\(hid)::\(kind)::\(id)"
+    }
+
+    public func isSubagentArchived(kind: String, id: String) -> Bool {
+        archivedSubagentKeys.contains(subagentArchiveKey(kind: kind, id: id))
+    }
+
+    public func archiveManagedSubagent(_ childAgentId: String) {
+        archiveSession(childAgentId)
+        let key = subagentArchiveKey(kind: "managed", id: childAgentId)
+        archivedSubagentKeys.insert(key)
+        UserDefaults.standard.set(Array(archivedSubagentKeys), forKey: Self.archivedSubagentsDefaultsKey)
+    }
+
+    public func archiveNativeSubagent(_ subagentId: String) {
+        let key = subagentArchiveKey(kind: "native", id: subagentId)
+        archivedSubagentKeys.insert(key)
+        UserDefaults.standard.set(Array(archivedSubagentKeys), forKey: Self.archivedSubagentsDefaultsKey)
+        hapticLight()
+        showToast("Archived subagent")
+    }
+
+    public func archiveFinishedSubagents() {
+        var count = 0
+        for child in activeManagedSubagents where !child.isRunning && !child.isAwaitingPermission {
+            archiveManagedSubagent(child.agentId)
+            count += 1
+        }
+        for native in activeProviderSubagents where native.status != .running {
+            let key = subagentArchiveKey(kind: "native", id: native.subagentId)
+            if !archivedSubagentKeys.contains(key) {
+                archivedSubagentKeys.insert(key)
+                count += 1
+            }
+        }
+        UserDefaults.standard.set(Array(archivedSubagentKeys), forKey: Self.archivedSubagentsDefaultsKey)
+        if count > 0 {
+            hapticLight()
+            showToast("Archived \(count) finished \(count == 1 ? "subagent" : "subagents")")
+        }
+    }
+
+    public var visibleManagedSubagents: [FfiAgentCard] {
+        activeManagedSubagents.filter { !isSubagentArchived(kind: "managed", id: $0.agentId) }
+    }
+
+    public var visibleProviderSubagents: [FfiProviderSubagentDescriptor] {
+        activeProviderSubagents.filter { !isSubagentArchived(kind: "native", id: $0.subagentId) }
+    }
+
+    public var activeVisibleSubagentCount: Int {
+        visibleManagedSubagents.count + visibleProviderSubagents.count
+    }
+
+    public var activeRunningBackgroundTaskCount: Int {
+        (agentStage?.insights.backgroundTasks ?? []).filter { $0.status == .running }.count
+    }
+
+    public func openProviderSubagentTimeline(parentAgentId: String, subagentId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.openProviderSubagentTimeline(
+            hostId: hid,
+            parentAgentId: parentAgentId,
+            subagentId: subagentId
+        )
+        let events = core?.providerSubagentTimeline(
+            hostId: hid,
+            parentAgentId: parentAgentId,
+            subagentId: subagentId
+        ) ?? []
+        subagentTimelinesCache["\(parentAgentId)::\(subagentId)"] = events
+    }
+
+    public func providerSubagentEvents(parentAgentId: String, subagentId: String) -> [FfiProviderSubagentEvent] {
+        if let hid = selectedHostId, let live = core?.providerSubagentTimeline(
+            hostId: hid,
+            parentAgentId: parentAgentId,
+            subagentId: subagentId
+        ), !live.isEmpty {
+            return live
+        }
+        return subagentTimelinesCache["\(parentAgentId)::\(subagentId)"] ?? []
+    }
+
+    // MARK: - Inspector & Sheet Openers (iPad 3rd Column + iPhone Sheets)
+
+    public func openWorkspaceBoard(workspaceId: String) {
+        fetchWorkspaceBoardAndEvents(workspaceId)
+        hapticLight()
+        if canShowInlineDiffInspector && activeWorkspace?.workspaceId == workspaceId {
+            padInspectorTab = .board
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                isPadDiffInspectorVisible = true
+            }
+        } else {
+            activeSheet = .workspaceBoard(workspaceId: workspaceId)
+        }
+    }
+
+    public func openSessionOverview() {
+        if let aid = selectedAgentId, let hid = selectedHostId {
+            core?.listProviderSubagents(hostId: hid, parentAgentId: aid)
+        }
+        hapticLight()
+        if canShowInlineDiffInspector {
+            padInspectorTab = .overview
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                isPadDiffInspectorVisible = true
+            }
+        } else {
+            activeSheet = .sessionOverview
+        }
+    }
+
+    public func openWorkspaceFiles(initialPath: String? = nil) {
+        refreshWorkspaceFiles()
+        if let p = initialPath, !p.isEmpty {
+            activeWorkspaceFilePath = p
+            loadWorkspaceFile(path: p)
+        }
+        hapticLight()
+        if canShowInlineDiffInspector {
+            padInspectorTab = .files
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                isPadDiffInspectorVisible = true
+            }
+        } else {
+            activeSheet = .workspaceFiles(initialPath: initialPath)
+        }
+    }
+
+    public func openSideQuestion(prefillAndSubmit question: String? = nil) {
+        hapticLight()
+        if canShowInlineDiffInspector {
+            padInspectorTab = .sideQuestion
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
+                isPadDiffInspectorVisible = true
+            }
+        } else {
+            activeSheet = .sideQuestion
+        }
+        if let q = question?.trimmingCharacters(in: .whitespacesAndNewlines), !q.isEmpty {
+            submitSideQuestion(q)
+        }
+    }
+
+    // MARK: - Workspace File Viewer & Quote
+
+    public func loadWorkspaceFile(path: String, forceRefresh: Bool = false) {
+        guard let hid = selectedHostId, let coreRef = core else { return }
+        let cwd = activeCwd
+        let cacheKey = "\(hid)::\(cwd)::\(path)"
+        activeWorkspaceFilePath = path
+        if !forceRefresh, workspaceFileCache[cacheKey] != nil {
+            workspaceFileError = nil
+            return
+        }
+        workspaceFileLoadingPath = path
+        workspaceFileError = nil
+        Task { @MainActor [weak self] in
+            do {
+                let file: FfiWorkspaceFile = try await Task.detached(priority: .userInitiated) {
+                    try coreRef.readWorkspaceFile(hostId: hid, cwd: cwd, path: path)
+                }.value
+                guard let self else { return }
+                self.workspaceFileCache[cacheKey] = file
+                if self.workspaceFileLoadingPath == path {
+                    self.workspaceFileLoadingPath = nil
+                }
+            } catch {
+                guard let self else { return }
+                if self.workspaceFileLoadingPath == path {
+                    self.workspaceFileLoadingPath = nil
+                }
+                if case let FfiOrbitError.Core(detail) = error {
+                    self.workspaceFileError = detail
+                } else {
+                    self.workspaceFileError = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    public func cachedWorkspaceFile(path: String) -> FfiWorkspaceFile? {
+        guard let hid = selectedHostId else { return nil }
+        return workspaceFileCache["\(hid)::\(activeCwd)::\(path)"]
+    }
+
+    public func quoteFileLine(path: String, lineNumber: UInt32, content: String) {
+        let snippetId = "\(path):\(lineNumber):\(content.hashValue)"
+        guard !quotedDiffSnippets.contains(where: { $0.id == snippetId }) else {
+            showToast("Line already quoted")
+            return
+        }
+        let snippet = QuotedDiffSnippet(
+            id: snippetId,
+            path: path,
+            lineNumber: lineNumber,
+            kind: .context,
+            content: content
+        )
+        quotedDiffSnippets.append(snippet)
+        hapticLight()
+        showToast("Quoted \(snippet.chipLabel)")
+    }
+
+    public func attachWorkspaceFileToComposer(_ path: String) {
+        let item = ComposerContextItem.file(path: path)
+        if !attachedContexts.contains(item) {
+            attachedContexts.append(item)
+        }
+        hapticLight()
+        showToast("Attached @\(OrbitFormatters.shortPath(path))")
+    }
+
+    // MARK: - Checkpoint Rewind
+
+    public func rewindAgent(toBeforeSeq seq: UInt64, restoreFiles: Bool) {
+        guard let hid = selectedHostId, let aid = selectedAgentId, let coreRef = core else { return }
+        hapticMedium()
+        showToast(restoreFiles ? "Rewinding conversation & files…" : "Rewinding conversation…")
+        Task { @MainActor [weak self] in
+            do {
+                let result: FfiRewindAgentResult = try await Task.detached(priority: .userInitiated) {
+                    try coreRef.rewindAgent(
+                        hostId: hid,
+                        agentId: aid,
+                        toBeforeSeq: seq,
+                        restoreFiles: restoreFiles
+                    )
+                }.value
+                guard let self else { return }
+                if let prompt = result.restoredPrompt, !prompt.isEmpty, self.composerText.isEmpty {
+                    self.composerText = prompt
+                }
+                self.reloadHostDetail(hid)
+                self.reloadAgentStage(hostId: hid, agentId: aid)
+                self.refreshGitReview()
+                self.hapticSuccess()
+                let msg = result.restoredFiles > 0
+                    ? "Rewound (\(result.restoredFiles) files restored)"
+                    : (result.notice ?? "Rewound conversation")
+                self.showToast(msg)
+            } catch {
+                guard let self else { return }
+                if case let FfiOrbitError.Core(detail) = error {
+                    self.lastError = detail
+                } else {
+                    self.lastError = error.localizedDescription
+                }
+                self.hapticWarning()
+            }
+        }
+    }
+
+    // MARK: - Side Question (/btw) Streaming
+
+    public var activeSideQuestionScopeKey: String {
+        let hid = selectedHostId ?? "none"
+        let scope = selectedAgentId ?? "draft::\(activeCwd)"
+        return "\(hid)::\(scope)"
+    }
+
+    public var activeSideQuestions: [SideQuestionEntry] {
+        sideQuestionsByScope[activeSideQuestionScopeKey] ?? []
+    }
+
+    public func sideQuestionDraft(for scopeKey: String) -> String {
+        sideQuestionDraftsByScope[scopeKey] ?? ""
+    }
+
+    public func setSideQuestionDraft(_ text: String, for scopeKey: String) {
+        sideQuestionDraftsByScope[scopeKey] = text
+    }
+
+    public func submitSideQuestion(_ rawQuestion: String) {
+        let question = rawQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty, let hid = selectedHostId, let coreRef = core else { return }
+        let scopeKey = activeSideQuestionScopeKey
+        let entry = SideQuestionEntry(question: question, isStreaming: true)
+        var list = sideQuestionsByScope[scopeKey] ?? []
+        list.append(entry)
+        sideQuestionsByScope[scopeKey] = list
+        sideQuestionDraftsByScope[scopeKey] = ""
+
+        let listener = WeakSideQuestionListenerBridge(owner: self, scopeKey: scopeKey, entryId: entry.id)
+        activeSideQuestionListeners[entry.id] = listener
+
+        let req = FfiAskSideQuestionRequest(
+            hostId: hid,
+            agentId: selectedAgentId,
+            cwd: activeCwd,
+            provider: selectedProvider,
+            model: selectedModel,
+            question: question,
+            contextSummary: ""
+        )
+        hapticLight()
+
+        Task { @MainActor [weak self] in
+            do {
+                let reqId: String = try await Task.detached(priority: .userInitiated) {
+                    try coreRef.askSideQuestion(req: req, listener: listener)
+                }.value
+                guard let self else { return }
+                if var items = self.sideQuestionsByScope[scopeKey],
+                   let idx = items.firstIndex(where: { $0.id == entry.id }) {
+                    items[idx].requestId = reqId
+                    self.sideQuestionsByScope[scopeKey] = items
+                }
+            } catch {
+                guard let self else { return }
+                let detail: String
+                if case let FfiOrbitError.Core(msg) = error {
+                    detail = msg
+                } else {
+                    detail = error.localizedDescription
+                }
+                if var items = self.sideQuestionsByScope[scopeKey],
+                   let idx = items.firstIndex(where: { $0.id == entry.id }) {
+                    items[idx].isStreaming = false
+                    items[idx].error = detail
+                    self.sideQuestionsByScope[scopeKey] = items
+                }
+                self.activeSideQuestionListeners.removeValue(forKey: entry.id)
+            }
+        }
+    }
+
+    func handleSideQuestionEvent(scopeKey: String, entryId: String, event: FfiSideQuestionEvent) {
+        guard var items = sideQuestionsByScope[scopeKey],
+              let idx = items.firstIndex(where: { $0.id == entryId }) else {
+            return
+        }
+        switch event {
+        case let .delta(_, textDelta):
+            items[idx].answer.append(textDelta)
+        case let .done(_, fullText, error):
+            if !fullText.isEmpty {
+                items[idx].answer = fullText
+            }
+            items[idx].error = error
+            items[idx].isStreaming = false
+            activeSideQuestionListeners.removeValue(forKey: entryId)
+        }
+        sideQuestionsByScope[scopeKey] = items
+    }
+
+    public func clearSideQuestions() {
+        sideQuestionsByScope.removeValue(forKey: activeSideQuestionScopeKey)
+        hapticLight()
+    }
+
+    public func promoteSideQuestionToComposer(_ entry: SideQuestionEntry) {
+        let excerpt = entry.answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = entry.question.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !excerpt.isEmpty {
+            quoteAssistantReply(turnKey: "btw-\(entry.id)", text: "Q: \(prefix)\n\n\(excerpt)")
+        } else if !prefix.isEmpty {
+            composerText = composerText.isEmpty ? prefix : "\(composerText)\n\(prefix)"
+        }
+        activeSheet = nil
+        requestComposerFocus()
+    }
+
+    // MARK: - Fleet Daemon Version & One-Click Over-the-Wire Update
+
+    public var appShortVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.8.0"
+    }
+
+    public func isHostProtocolBehind(_ host: FfiHostCard) -> Bool {
+        guard OrbitFormatters.isHostOnline(host.connectionState),
+              let daemonProto = host.daemonProtocolVersion else {
+            return false
+        }
+        return daemonProto < host.clientProtocolVersion
+    }
+
+    public func isHostDaemonOutdated(_ host: FfiHostCard) -> Bool {
+        guard OrbitFormatters.isHostOnline(host.connectionState),
+              let daemonSemver = OrbitFormatters.normalizeSemver(host.daemonVersion),
+              let appSemver = OrbitFormatters.normalizeSemver(appShortVersion) else {
+            return false
+        }
+        return OrbitFormatters.compareSemver(daemonSemver, appSemver) < 0
+    }
+
+    public var outdatedOnlineHosts: [FfiHostCard] {
+        hosts.filter { isHostDaemonOutdated($0) || isHostProtocolBehind($0) }
+    }
+
+    public func dismissVersionMismatch(for hostId: String) {
+        dismissedVersionMismatchHosts.insert(hostId)
+        hapticLight()
+    }
+
+    public func upgradeHostDaemon(_ hostId: String, targetVersion: String? = nil) {
+        guard let coreRef = core else { return }
+        if hostUpgradeStates[hostId]?.isUpgrading == true { return }
+        hostUpgradeStates[hostId] = HostDaemonUpgradeState(
+            isUpgrading: true,
+            statusMessage: "Upgrading daemon…",
+            error: nil
+        )
+        hapticMedium()
+        Task { @MainActor [weak self] in
+            do {
+                let message: String = try await Task.detached(priority: .userInitiated) {
+                    try coreRef.upgradeHostDaemonOverWire(hostId: hostId, targetVersion: targetVersion)
+                }.value
+                guard let self else { return }
+                self.hostUpgradeStates[hostId] = HostDaemonUpgradeState(
+                    isUpgrading: false,
+                    statusMessage: message.isEmpty ? "Upgrade triggered" : message,
+                    error: nil
+                )
+                self.hapticSuccess()
+                self.showToast("Daemon upgrade sent")
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                self.reconnectHost(hostId)
+            } catch {
+                guard let self else { return }
+                let detail: String
+                if case let FfiOrbitError.Core(msg) = error {
+                    detail = msg
+                } else {
+                    detail = error.localizedDescription
+                }
+                self.hostUpgradeStates[hostId] = HostDaemonUpgradeState(
+                    isUpgrading: false,
+                    statusMessage: nil,
+                    error: detail
+                )
+                self.hapticWarning()
+            }
+        }
+    }
+
+    public func upgradeAllOutdatedHosts() {
+        for host in outdatedOnlineHosts {
+            upgradeHostDaemon(host.hostId)
+        }
+    }
+
+    // MARK: - Project Reordering
+
+    public func moveProject(sortOrderKey: String, offset: Int, within projects: [FfiSidebarProjectGroup]) {
+        let keys = projects.map(\.sortOrderKey)
+        guard let idx = keys.firstIndex(of: sortOrderKey) else { return }
+        let targetIdx = idx + offset
+        guard targetIdx >= 0 && targetIdx < keys.count else { return }
+        var reordered = keys
+        let moved = reordered.remove(at: idx)
+        reordered.insert(moved, at: targetIdx)
+        do {
+            if let updated = try core?.reorderProjects(orderedKeys: reordered) {
+                projectOrder = updated
+            }
+            sidebarProjectSort = .manual
+            refreshSidebar()
+            hapticLight()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    // MARK: - Automations (Cron Schedules & Heartbeats)
+
+    public func createSchedule(
+        name: String,
+        cronExpr: String,
+        prompt: String,
+        cwd: String,
+        provider: FfiProviderKind,
+        mode: FfiSessionMode,
+        worktree: Bool,
+        archiveOnFinish: Bool
+    ) {
+        guard let hid = selectedHostId else { return }
+        let req = FfiCreateScheduleRequest(
+            hostId: hid,
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            cronExpr: cronExpr.trimmingCharacters(in: .whitespacesAndNewlines),
+            timezone: TimeZone.current.identifier,
+            prompt: prompt.trimmingCharacters(in: .whitespacesAndNewlines),
+            cwd: cwd,
+            workspaceId: activeWorkspace?.workspaceId,
+            provider: provider,
+            model: selectedModel,
+            effort: selectedEffort,
+            mode: mode,
+            worktree: worktree,
+            archiveOnFinish: archiveOnFinish,
+            maxRuns: nil
+        )
+        core?.createSchedule(req: req)
+        hapticSuccess()
+        showToast("Created automation")
+    }
+
+    public func pauseSchedule(_ scheduleId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.pauseSchedule(hostId: hid, scheduleId: scheduleId)
+        hapticLight()
+    }
+
+    public func resumeSchedule(_ scheduleId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.resumeSchedule(hostId: hid, scheduleId: scheduleId)
+        hapticLight()
+    }
+
+    public func runScheduleOnce(_ scheduleId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.runScheduleOnce(hostId: hid, scheduleId: scheduleId)
+        hapticLight()
+        showToast("Triggered automation run")
+    }
+
+    public func deleteSchedule(_ scheduleId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.deleteSchedule(hostId: hid, scheduleId: scheduleId)
+        hapticMedium()
+        showToast("Deleted automation")
+    }
+
+    public func fetchScheduleRuns(_ scheduleId: String) {
+        guard let hid = selectedHostId else { return }
+        core?.fetchScheduleRuns(hostId: hid, scheduleId: scheduleId, limit: 20)
+        if let runs = core?.scheduleRuns(hostId: hid, scheduleId: scheduleId) {
+            scheduleRunsCache[scheduleId] = runs
+        }
+    }
+
+    public func scheduleRuns(for scheduleId: String) -> [FfiScheduleRunRecord] {
+        if let hid = selectedHostId, let live = core?.scheduleRuns(hostId: hid, scheduleId: scheduleId), !live.isEmpty {
+            return live
+        }
+        return scheduleRunsCache[scheduleId] ?? []
+    }
+
+    // MARK: - Stop Background Task (Desktop Parity)
+
+    public func stopBackgroundTask(_ task: FfiSessionBackgroundTask) {
+        guard let hid = selectedHostId, let aid = selectedAgentId else { return }
+        let prompt = "Please stop the running background task \"\(task.title)\" (id: \(task.id))."
+        core?.sendPrompt(hostId: hid, agentId: aid, prompt: prompt)
+        hapticLight()
+        showToast("Requested stop for \(task.title)")
+    }
+
+    // MARK: - Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist)
+
+    public func refreshCloudSyncStatus() {
+        cloudSyncStatus = core?.cloudSyncStatus()
+    }
+
+    public func generateCloudSyncPassphrase() -> String {
+        core?.cloudSyncGeneratePassphrase() ?? ""
+    }
+
+    public func startGithubCloudLogin(clientIdOverride: String? = nil) {
+        guard let core = self.core else { return }
+        cloudDeviceFlowTask?.cancel()
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        let cleanCid = clientIdOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveCid = (cleanCid?.isEmpty == false) ? cleanCid : nil
+
+        cloudDeviceFlowTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let started: FfiGitHubDeviceFlowStart = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncStartGithubDeviceFlow(clientIdOverride: effectiveCid)
+                }.value
+                guard !Task.isCancelled else { return }
+                self.cloudSyncBusy = false
+                self.cloudSyncDeviceFlow = started
+                self.cloudSyncError = nil
+
+                var intervalSecs = max(UInt64(2), started.intervalSecs)
+                let deadline = Date().addingTimeInterval(TimeInterval(started.expiresInSecs))
+
+                while !Task.isCancelled && Date() < deadline {
+                    try? await Task.sleep(nanoseconds: intervalSecs * 1_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    let polled: FfiCloudSyncDevicePoll = try await Task.detached(priority: .userInitiated) {
+                        try core.cloudSyncPollGithubDeviceFlow(
+                            deviceCode: started.deviceCode,
+                            clientIdOverride: effectiveCid
+                        )
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    switch polled.status {
+                    case .pending:
+                        continue
+                    case .slowDown:
+                        intervalSecs = max(intervalSecs + 5, polled.intervalSecs ?? 10)
+                    case .authorized:
+                        let nextStatus = polled.syncStatus ?? core.cloudSyncStatus()
+                        self.cloudSyncDeviceFlow = nil
+                        self.cloudSyncStatus = nextStatus
+                        self.cloudSyncError = nil
+                        self.hapticSuccess()
+                        if let login = nextStatus.accountLogin {
+                            self.showToast("Signed in to GitHub as @\(login)")
+                        } else {
+                            self.showToast("Signed in to GitHub")
+                        }
+                        return
+                    case .expired, .denied:
+                        self.cloudSyncDeviceFlow = nil
+                        self.cloudSyncError = polled.error ?? "GitHub authorization did not complete."
+                        return
+                    }
+                }
+                if !Task.isCancelled {
+                    self.cloudSyncDeviceFlow = nil
+                    self.cloudSyncError = "GitHub verification code expired — please try again."
+                }
+            } catch {
+                if !Task.isCancelled {
+                    self.cloudSyncBusy = false
+                    self.cloudSyncDeviceFlow = nil
+                    self.cloudSyncError = Self.describeCloudSyncError(error)
+                }
+            }
+        }
+    }
+
+    public func cancelGithubCloudLogin() {
+        cloudDeviceFlowTask?.cancel()
+        cloudDeviceFlowTask = nil
+        cloudSyncBusy = false
+        cloudSyncDeviceFlow = nil
+        cloudSyncError = nil
+    }
+
+    public func loginCloudSyncWithToken(_ token: String) {
+        guard let core = self.core else { return }
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            cloudSyncError = "GitHub token cannot be empty."
+            return
+        }
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let status: FfiCloudSyncStatus = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncLoginWithToken(token: trimmed)
+                }.value
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = status
+                self.cloudSyncError = nil
+                self.hapticSuccess()
+                if let login = status.accountLogin {
+                    self.showToast("Signed in to GitHub as @\(login)")
+                }
+            } catch {
+                self.cloudSyncBusy = false
+                self.cloudSyncError = Self.describeCloudSyncError(error)
+            }
+        }
+    }
+
+    public func unlockCloudSyncWithPassphrase(_ passphrase: String) {
+        guard let core = self.core else { return }
+        let trimmed = passphrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            cloudSyncError = "Sync Passphrase cannot be empty."
+            return
+        }
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result: FfiCloudSyncResult = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncUnlockWithPassphrase(passphrase: trimmed)
+                }.value
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = nil
+                self.reloadFleet()
+                self.refreshSidebar()
+                self.hapticSuccess()
+                self.showToast(Self.formatCloudSyncResult(result))
+            } catch {
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = Self.describeCloudSyncError(error)
+            }
+        }
+    }
+
+    public func syncCloudNow() {
+        guard let core = self.core else { return }
+        cloudSyncBusy = true
+        cloudSyncError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result: FfiCloudSyncResult = try await Task.detached(priority: .userInitiated) {
+                    try core.cloudSyncNow()
+                }.value
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = nil
+                self.reloadFleet()
+                self.refreshSidebar()
+                self.hapticSuccess()
+                self.showToast(Self.formatCloudSyncResult(result))
+            } catch {
+                self.cloudSyncBusy = false
+                self.cloudSyncStatus = core.cloudSyncStatus()
+                self.cloudSyncError = Self.describeCloudSyncError(error)
+            }
+        }
+    }
+
+    public func setCloudAutoSync(_ enabled: Bool) {
+        guard let core = self.core else { return }
+        do {
+            cloudSyncStatus = try core.cloudSyncSetAutoSync(enabled: enabled)
+        } catch {
+            cloudSyncError = Self.describeCloudSyncError(error)
+        }
+    }
+
+    public func logoutCloudSync(clearLocalHosts: Bool = false) {
+        guard let core = self.core else { return }
+        cloudDeviceFlowTask?.cancel()
+        cloudDeviceFlowTask = nil
+        do {
+            cloudSyncStatus = try core.cloudSyncLogout(clearLocalHosts: clearLocalHosts)
+            cloudSyncDeviceFlow = nil
+            cloudSyncError = nil
+            if clearLocalHosts {
+                reloadFleet()
+                refreshSidebar()
+            }
+            hapticLight()
+            showToast("Signed out of Cloud Sync")
+        } catch {
+            cloudSyncError = Self.describeCloudSyncError(error)
+        }
+    }
+
+    private static func describeCloudSyncError(_ error: Error) -> String {
+        if case let FfiOrbitError.Core(detail) = error {
+            return detail
+        }
+        return error.localizedDescription
+    }
+
+    private static func formatCloudSyncResult(_ res: FfiCloudSyncResult) -> String {
+        var parts: [String] = []
+        if res.hostsAdded > 0 { parts.append("+\(res.hostsAdded) host\(res.hostsAdded == 1 ? "" : "s")") }
+        if res.hostsUpdated > 0 { parts.append("\(res.hostsUpdated) updated") }
+        if res.hostsRemoved > 0 { parts.append("-\(res.hostsRemoved) removed") }
+        if res.projectsAdded > 0 { parts.append("+\(res.projectsAdded) project\(res.projectsAdded == 1 ? "" : "s")") }
+        if parts.isEmpty {
+            return res.pushedRemote ? "Cloud Sync uploaded (rev #\(res.vaultRevision))" : "Cloud Sync up to date"
+        }
+        return "Cloud Synced: \(parts.joined(separator: ", "))"
     }
 }

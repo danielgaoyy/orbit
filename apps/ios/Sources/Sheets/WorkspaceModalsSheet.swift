@@ -138,7 +138,7 @@ struct SpawnPeerSheet: View {
                                     .foregroundStyle(palette.fgMuted)
                             }
                         }
-                        .tint(palette.primary)
+                        .tint(palette.direct)
                         .padding(OrbitSpacing.md)
 
                         OrbitHairline().padding(.leading, OrbitSpacing.md)
@@ -322,7 +322,7 @@ struct CreateWorkspaceSheet: View {
                                         .foregroundStyle(palette.fgMuted)
                                 }
                             }
-                            .tint(palette.primary)
+                            .tint(palette.direct)
                             .padding(OrbitSpacing.md)
                         }
                     }

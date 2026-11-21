@@ -343,14 +343,14 @@ private struct CreateAutomationSheet: View {
 
                         Toggle("Run in isolated Git Worktree", isOn: $useWorktree)
                             .font(OrbitTypography.subhead(.regular))
-                            .tint(palette.primary)
+                            .tint(palette.direct)
                             .padding(OrbitSpacing.md)
 
                         OrbitHairline().padding(.leading, OrbitSpacing.md)
 
                         Toggle("Archive session on finish", isOn: $archiveOnFinish)
                             .font(OrbitTypography.subhead(.regular))
-                            .tint(palette.primary)
+                            .tint(palette.direct)
                             .padding(OrbitSpacing.md)
 
                         OrbitHairline().padding(.leading, OrbitSpacing.md)

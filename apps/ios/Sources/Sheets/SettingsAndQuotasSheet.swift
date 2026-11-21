@@ -192,7 +192,7 @@ struct SettingsAndQuotasSheet: View {
                             .foregroundStyle(palette.fgMuted)
                     }
                 }
-                .tint(palette.primary)
+                .tint(palette.direct)
                 .padding(.horizontal, OrbitSpacing.md)
                 .padding(.vertical, 10)
             }

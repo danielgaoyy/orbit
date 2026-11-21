@@ -454,134 +454,12 @@ struct StreamStageView: View {
                         .minimumScaleFactor(0.84)
 
                     // Compact Contextual Readiness Pills: [Project ▾] [Workspace ▾] [Host ▾] [Local / Worktree ▾]
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: OrbitSpacing.sm) {
-                            Button {
-                                store.hapticLight()
-                                projectSearchQuery = ""
-                                isProjectPickerPresented.toggle()
-                            } label: {
-                                launchpadPillLabel {
-                                    Image(systemName: "folder")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundStyle(palette.fgSecondary)
-                                    Text(activeProjectLabel)
-                                        .font(OrbitTypography.subhead(.medium))
-                                        .foregroundStyle(palette.fgPrimary)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                    Image(systemName: "chevron.down")
-                                        .font(.system(size: 8.5, weight: .semibold))
-                                        .foregroundStyle(palette.fgMuted)
-                                }
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Project: \(activeProjectLabel)")
-                            .orbitCompactPopover(
-                                isPresented: $isProjectPickerPresented,
-                                arrowEdge: .top,
-                                palette: palette
-                            ) {
-                                projectPickerPopover
-                            }
-
-                            if store.isDraftNewSession && !store.activeProjectCuratedWorkspaces.isEmpty {
-                                Button {
-                                    store.hapticLight()
-                                    isWorkspacePickerPresented.toggle()
-                                } label: {
-                                    launchpadPillLabel {
-                                        Image(systemName: store.draftWorkspaceId != nil ? "square.stack.3d.up" : "tray")
-                                            .font(.system(size: 11.5, weight: .medium))
-                                            .foregroundStyle(store.draftWorkspaceId != nil ? palette.accentViolet : palette.fgSecondary)
-                                        Text(draftSelectedWorkspaceTitle)
-                                            .font(OrbitTypography.subhead(.medium))
-                                            .foregroundStyle(palette.fgPrimary)
-                                            .lineLimit(1)
-                                        Image(systemName: "chevron.down")
-                                            .font(.system(size: 8.5, weight: .semibold))
-                                            .foregroundStyle(palette.fgMuted)
-                                    }
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Workspace: \(draftSelectedWorkspaceTitle)")
-                                .orbitCompactPopover(
-                                    isPresented: $isWorkspacePickerPresented,
-                                    arrowEdge: .top,
-                                    palette: palette
-                                ) {
-                                    draftWorkspacePickerPopover
-                                }
-                            }
-
-                            if store.hosts.count > 1, let activeHost = store.activeHost {
-                                Button {
-                                    store.hapticLight()
-                                    isHostPickerPresented.toggle()
-                                } label: {
-                                    launchpadPillLabel {
-                                        Circle()
-                                            .fill(palette.connectionColor(activeHost.connectionState))
-                                            .frame(width: 6, height: 6)
-                                        Text(activeHost.displayName)
-                                            .font(OrbitTypography.subhead(.medium))
-                                            .foregroundStyle(palette.fgPrimary)
-                                            .lineLimit(1)
-                                        Image(systemName: "chevron.down")
-                                            .font(.system(size: 8.5, weight: .semibold))
-                                            .foregroundStyle(palette.fgMuted)
-                                    }
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Host: \(activeHost.displayName)")
-                                .orbitCompactPopover(
-                                    isPresented: $isHostPickerPresented,
-                                    arrowEdge: .top,
-                                    palette: palette
-                                ) {
-                                    OrbitHostPickerPopover(
-                                        store: store,
-                                        showPairingActions: false,
-                                        onSelectHost: { hostId in
-                                            store.hapticLight()
-                                            store.selectHost(hostId)
-                                            isHostPickerPresented = false
-                                        }
-                                    )
-                                }
-                            }
-
-                            if store.isDraftNewSession {
-                                Button {
-                                    store.hapticLight()
-                                    store.requestGitReposInspection(for: store.activeCwd)
-                                    isEnvironmentPickerPresented.toggle()
-                                } label: {
-                                    launchpadPillLabel {
-                                        Image(systemName: store.draftUseWorktree ? "arrow.triangle.branch" : "laptopcomputer")
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundStyle(palette.fgSecondary)
-                                        Text(activeWorktreeLabel)
-                                            .font(OrbitTypography.subhead(.medium))
-                                            .foregroundStyle(palette.fgPrimary)
-                                            .lineLimit(1)
-                                        Image(systemName: "chevron.down")
-                                            .font(.system(size: 8.5, weight: .semibold))
-                                            .foregroundStyle(palette.fgMuted)
-                                    }
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Execution environment: \(activeWorktreeLabel)")
-                                .orbitCompactPopover(
-                                    isPresented: $isEnvironmentPickerPresented,
-                                    arrowEdge: .top,
-                                    palette: palette
-                                ) {
-                                    environmentPickerPopover
-                                }
-                            }
+                    ViewThatFits(in: .horizontal) {
+                        launchpadReadinessPillsRow
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            launchpadReadinessPillsRow
+                                .padding(.horizontal, 4)
                         }
-                        .padding(.horizontal, 4)
                     }
                     .padding(.top, 14)
 
@@ -610,7 +488,10 @@ struct StreamStageView: View {
                         }
                         .padding(.top, 10)
                     } else if !isActiveFolderGitRepo {
-                        Text(activeNestedGitRepos.isEmpty ? "Local folder (not a Git repo)" : "Multi-repo folder · \(activeNestedGitRepos.count) nested Git repos")
+                        let nestedCount = activeNestedGitRepos.count
+                        Text(nestedCount == 0
+                            ? "Local folder (not a Git repo)"
+                            : "Multi-repo folder · \(nestedCount) nested Git \(nestedCount == 1 ? "repo" : "repos")")
                             .font(OrbitTypography.meta(.regular))
                             .foregroundStyle(palette.fgMuted)
                             .padding(.top, 10)
@@ -626,6 +507,135 @@ struct StreamStageView: View {
             .scrollDismissesKeyboard(.interactively)
             .refreshable {
                 await store.pullToRefreshStage()
+            }
+        }
+    }
+
+    private var launchpadReadinessPillsRow: some View {
+        HStack(spacing: OrbitSpacing.sm) {
+            Button {
+                store.hapticLight()
+                projectSearchQuery = ""
+                isProjectPickerPresented.toggle()
+            } label: {
+                launchpadPillLabel {
+                    Image(systemName: "folder")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(palette.fgSecondary)
+                    Text(activeProjectLabel)
+                        .font(OrbitTypography.subhead(.medium))
+                        .foregroundStyle(palette.fgPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8.5, weight: .semibold))
+                        .foregroundStyle(palette.fgMuted)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Project: \(activeProjectLabel)")
+            .orbitCompactPopover(
+                isPresented: $isProjectPickerPresented,
+                arrowEdge: .top,
+                palette: palette
+            ) {
+                projectPickerPopover
+            }
+
+            if store.isDraftNewSession && !store.activeProjectCuratedWorkspaces.isEmpty {
+                Button {
+                    store.hapticLight()
+                    isWorkspacePickerPresented.toggle()
+                } label: {
+                    launchpadPillLabel {
+                        Image(systemName: store.draftWorkspaceId != nil ? "square.stack.3d.up" : "tray")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(store.draftWorkspaceId != nil ? palette.accentViolet : palette.fgSecondary)
+                        Text(draftSelectedWorkspaceTitle)
+                            .font(OrbitTypography.subhead(.medium))
+                            .foregroundStyle(palette.fgPrimary)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Workspace: \(draftSelectedWorkspaceTitle)")
+                .orbitCompactPopover(
+                    isPresented: $isWorkspacePickerPresented,
+                    arrowEdge: .top,
+                    palette: palette
+                ) {
+                    draftWorkspacePickerPopover
+                }
+            }
+
+            if store.hosts.count > 1, let activeHost = store.activeHost {
+                Button {
+                    store.hapticLight()
+                    isHostPickerPresented.toggle()
+                } label: {
+                    launchpadPillLabel {
+                        Circle()
+                            .fill(palette.connectionColor(activeHost.connectionState))
+                            .frame(width: 6, height: 6)
+                        Text(activeHost.displayName)
+                            .font(OrbitTypography.subhead(.medium))
+                            .foregroundStyle(palette.fgPrimary)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Host: \(activeHost.displayName)")
+                .orbitCompactPopover(
+                    isPresented: $isHostPickerPresented,
+                    arrowEdge: .top,
+                    palette: palette
+                ) {
+                    OrbitHostPickerPopover(
+                        store: store,
+                        showPairingActions: false,
+                        onSelectHost: { hostId in
+                            store.hapticLight()
+                            store.selectHost(hostId)
+                            isHostPickerPresented = false
+                        }
+                    )
+                }
+            }
+
+            if store.isDraftNewSession {
+                Button {
+                    store.hapticLight()
+                    store.requestGitReposInspection(for: store.activeCwd)
+                    isEnvironmentPickerPresented.toggle()
+                } label: {
+                    launchpadPillLabel {
+                        Image(systemName: store.draftUseWorktree ? "arrow.triangle.branch" : "laptopcomputer")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(palette.fgSecondary)
+                        Text(activeWorktreeLabel)
+                            .font(OrbitTypography.subhead(.medium))
+                            .foregroundStyle(palette.fgPrimary)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Execution environment: \(activeWorktreeLabel)")
+                .orbitCompactPopover(
+                    isPresented: $isEnvironmentPickerPresented,
+                    arrowEdge: .top,
+                    palette: palette
+                ) {
+                    environmentPickerPopover
+                }
             }
         }
     }

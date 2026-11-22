@@ -99,7 +99,7 @@ export function GeneralSection() {
   const isBrowserOffline = useOrbitSelector((s) => s.isBrowserOffline);
   const mod = modSymbol();
 
-  const appVersion = normalizeSemver(storeAppVersion) ?? "0.8.1";
+  const appVersion = normalizeSemver(storeAppVersion) ?? "0.8.2";
   const autoCheckedRef = useRef(false);
 
   // Gently check for the latest release once when opening General settings

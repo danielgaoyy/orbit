@@ -304,6 +304,8 @@ pub struct ProviderModelSpec {
     pub default_effort: Option<ReasoningEffort>,
     #[serde(default)]
     pub thinking_options: Vec<ThinkingOptionSpec>,
+    #[serde(default)]
+    pub supports_fast_mode: bool,
 }
 
 /// Dynamic model & thinking catalog for a single provider on a specific Orbit host.
@@ -494,6 +496,8 @@ pub struct AgentSummary {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub mode: SessionMode,
     pub status: AgentStatus,
     pub parent_agent_id: Option<String>,
@@ -1005,6 +1009,10 @@ pub enum WireMessage {
         /// Override automatic clustering into an existing Mission Workspace (defaults to host config).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auto_cluster: Option<bool>,
+        /// Enable Fast output mode (lower latency, higher quota usage) when supported by the model.
+        /// `None` inherits the profile default; `Some(false)` explicitly disables fast mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_mode: Option<bool>,
     },
     AgentCreated {
         request_id: Uuid,
@@ -1163,6 +1171,8 @@ pub enum WireMessage {
         handle: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fast_mode: Option<bool>,
     },
     ListPendingPermissions {
         request_id: Uuid,
@@ -1813,14 +1823,20 @@ mod tests {
             branch: None,
             handle: Some("lead".into()),
             auto_cluster: None,
+            fast_mode: Some(true),
         };
         let raw_json = serde_json::to_vec(&msg).expect("serialize");
         let compressed = msg.encode_zstd(3).expect("compress");
         assert!(compressed.len() < raw_json.len());
         let decoded = WireMessage::decode_zstd(&compressed).expect("decompress");
         match decoded {
-            WireMessage::CreateAgent { provider, .. } => {
+            WireMessage::CreateAgent {
+                provider,
+                fast_mode,
+                ..
+            } => {
                 assert_eq!(provider, ProviderKind::Antigravity);
+                assert_eq!(fast_mode, Some(true));
             }
             _ => panic!("unexpected variant"),
         }
@@ -2066,6 +2082,7 @@ mod tests {
                 provider: ProviderKind::ClaudeCode,
                 model: Some("sonnet".into()),
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::Default,
                 status: AgentStatus::Idle,
                 parent_agent_id: None,
@@ -2240,6 +2257,7 @@ mod tests {
                 provider: ProviderKind::ClaudeCode,
                 model: Some("sonnet".into()),
                 effort: Some(ReasoningEffort::High),
+                fast_mode: false,
                 mode: SessionMode::AcceptEdits,
                 status: AgentStatus::Idle,
                 parent_agent_id: None,
@@ -2323,5 +2341,115 @@ mod tests {
         let parsed: AgentSummary = serde_json::from_value(legacy_agent).expect("legacy agent");
         assert!(parsed.forked_from_agent_id.is_none());
         assert!(parsed.forked_at_seq.is_none());
+    }
+
+    #[test]
+    fn fast_mode_legacy_wire_deserialization_defaults_false() {
+        let legacy_agent_json = r#"{
+            "agent_id": "ag_legacy",
+            "workspace_id": "ws_1",
+            "cwd": "/repo",
+            "title": "Legacy",
+            "provider": "claude_code",
+            "model": "claude-opus-4-6",
+            "mode": "accept_edits",
+            "status": { "state": "idle" },
+            "parent_agent_id": null,
+            "latest_seq": 1,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let agent: AgentSummary = serde_json::from_str(legacy_agent_json).expect("legacy agent");
+        assert!(!agent.fast_mode);
+
+        let legacy_create_json = format!(
+            r#"{{
+                "op": "create_agent",
+                "request_id": "{}",
+                "cwd": "/repo",
+                "title": null,
+                "provider": "codex",
+                "model": "gpt-5.4",
+                "mode": "accept_edits",
+                "initial_prompt": "hello"
+            }}"#,
+            Uuid::new_v4()
+        );
+        match serde_json::from_str::<WireMessage>(&legacy_create_json).expect("legacy create") {
+            WireMessage::CreateAgent { fast_mode, .. } => assert_eq!(fast_mode, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let explicit_false_create_json = format!(
+            r#"{{
+                "op": "create_agent",
+                "request_id": "{}",
+                "cwd": "/repo",
+                "title": null,
+                "provider": "codex",
+                "model": "gpt-5.4",
+                "mode": "accept_edits",
+                "initial_prompt": "hello",
+                "fast_mode": false
+            }}"#,
+            Uuid::new_v4()
+        );
+        match serde_json::from_str::<WireMessage>(&explicit_false_create_json)
+            .expect("explicit false create")
+        {
+            WireMessage::CreateAgent { fast_mode, .. } => assert_eq!(fast_mode, Some(false)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy_update_json = format!(
+            r#"{{
+                "op": "update_agent",
+                "request_id": "{}",
+                "agent_id": "ag_legacy",
+                "title": "Renamed"
+            }}"#,
+            Uuid::new_v4()
+        );
+        match serde_json::from_str::<WireMessage>(&legacy_update_json).expect("legacy update") {
+            WireMessage::UpdateAgent { fast_mode, .. } => assert_eq!(fast_mode, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let update_fast = WireMessage::UpdateAgent {
+            request_id: Uuid::new_v4(),
+            agent_id: "ag_legacy".into(),
+            title: None,
+            model: None,
+            effort: None,
+            mode: None,
+            labels: None,
+            handle: None,
+            task_summary: None,
+            fast_mode: Some(true),
+        };
+        let encoded = update_fast.encode_zstd(3).expect("encode update fast");
+        match WireMessage::decode_zstd(&encoded).expect("decode update fast") {
+            WireMessage::UpdateAgent { fast_mode, .. } => assert_eq!(fast_mode, Some(true)),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let legacy_model_json = r#"{
+            "id": "claude-opus-4-6",
+            "label": "Opus 4.6"
+        }"#;
+        let spec: ProviderModelSpec =
+            serde_json::from_str(legacy_model_json).expect("legacy model spec");
+        assert!(!spec.supports_fast_mode);
+
+        let legacy_profile_json = r#"{
+            "profile_id": "p1",
+            "name": "Reviewer",
+            "provider": "codex",
+            "mode": "plan",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let prof: AgentProfile = serde_json::from_str(legacy_profile_json).expect("legacy profile");
+        assert!(!prof.fast_mode);
     }
 }

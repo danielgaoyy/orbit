@@ -510,114 +510,108 @@ impl OrbitStore {
         labels: Option<&HashMap<String, String>>,
         handle: Option<&str>,
         task_summary: Option<&str>,
+        fast_mode: Option<bool>,
     ) -> Result<(), StoreError> {
-        struct EditableAgentFields {
-            title: String,
-            model: Option<String>,
-            effort_json: Option<String>,
-            mode_json: String,
-            labels_json: String,
-            handle: Option<String>,
-            task_summary: Option<String>,
-        }
+        use rusqlite::types::Value as SqlValue;
 
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
-        let row_opt: Option<EditableAgentFields> = tx
-            .query_row(
-                "SELECT title, model, effort_json, mode_json, labels_json, handle, task_summary
-                 FROM agents WHERE agent_id = ?1",
-                params![agent_id],
-                |r| {
-                    Ok(EditableAgentFields {
-                        title: r.get(0)?,
-                        model: r.get(1)?,
-                        effort_json: r.get(2)?,
-                        mode_json: r.get(3)?,
-                        labels_json: r.get(4)?,
-                        handle: r.get(5)?,
-                        task_summary: r.get(6)?,
-                    })
-                },
-            )
-            .optional()?;
-        let Some(EditableAgentFields {
-            title: mut cur_title,
-            model: mut cur_model,
-            effort_json: mut cur_effort_json,
-            mode_json: mut cur_mode_json,
-            labels_json: cur_labels_json,
-            handle: mut cur_handle,
-            task_summary: mut cur_task_summary,
-        }) = row_opt
-        else {
-            return Ok(());
+
+        let mut set_clauses: Vec<String> = Vec::new();
+        let mut bind_vals: Vec<SqlValue> = Vec::new();
+        let mut push_field = |col: &'static str, val: SqlValue| {
+            bind_vals.push(val);
+            set_clauses.push(format!("{col} = ?{}", bind_vals.len()));
         };
 
         if let Some(t) = title {
-            cur_title = t.to_string();
+            push_field("title", SqlValue::Text(t.to_string()));
         }
         if let Some(m) = model {
-            cur_model = m.map(ToOwned::to_owned);
+            push_field(
+                "model",
+                match m {
+                    Some(s) => SqlValue::Text(s.to_string()),
+                    None => SqlValue::Null,
+                },
+            );
         }
         if let Some(e) = effort {
-            cur_effort_json = e.as_ref().map(serde_json::to_string).transpose()?;
+            let eff_val = match e {
+                Some(eff) => SqlValue::Text(serde_json::to_string(&eff)?),
+                None => SqlValue::Null,
+            };
+            push_field("effort_json", eff_val);
         }
         if let Some(md) = mode {
-            cur_mode_json = serde_json::to_string(md)?;
+            push_field("mode_json", SqlValue::Text(serde_json::to_string(md)?));
         }
-        let mut cur_labels: HashMap<String, String> =
-            serde_json::from_str(&cur_labels_json).unwrap_or_default();
         if let Some(lbls) = labels {
+            let existing_raw: Option<String> = tx
+                .query_row(
+                    "SELECT labels_json FROM agents WHERE agent_id = ?1",
+                    params![agent_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(raw_json) = existing_raw else {
+                tx.commit()?;
+                return Ok(());
+            };
+            let mut merged: HashMap<String, String> =
+                serde_json::from_str(&raw_json).unwrap_or_default();
             for (k, v) in lbls {
                 if v.is_empty() {
-                    cur_labels.remove(k);
+                    merged.remove(k);
                 } else {
-                    cur_labels.insert(k.clone(), v.clone());
+                    merged.insert(k.clone(), v.clone());
                 }
             }
+            push_field(
+                "labels_json",
+                SqlValue::Text(serde_json::to_string(&merged)?),
+            );
         }
         if let Some(h) = handle {
             let trimmed = h.trim();
-            cur_handle = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
+            push_field(
+                "handle",
+                if trimmed.is_empty() {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Text(trimmed.to_string())
+                },
+            );
         }
         if let Some(ts) = task_summary {
             let trimmed = ts.trim();
-            cur_task_summary = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
+            push_field(
+                "task_summary",
+                if trimmed.is_empty() {
+                    SqlValue::Null
+                } else {
+                    SqlValue::Text(trimmed.to_string())
+                },
+            );
+        }
+        if let Some(fm) = fast_mode {
+            push_field("fast_mode", SqlValue::Integer(i64::from(fm)));
         }
 
-        let next_labels_json = serde_json::to_string(&cur_labels)?;
-        tx.execute(
-            "UPDATE agents
-             SET title = ?1,
-                 model = ?2,
-                 effort_json = ?3,
-                 mode_json = ?4,
-                 labels_json = ?5,
-                 handle = ?6,
-                 task_summary = ?7,
-                 updated_at = ?8
-             WHERE agent_id = ?9",
-            params![
-                cur_title,
-                cur_model,
-                cur_effort_json,
-                cur_mode_json,
-                next_labels_json,
-                cur_handle,
-                cur_task_summary,
-                Utc::now().to_rfc3339(),
-                agent_id,
-            ],
-        )?;
+        if set_clauses.is_empty() {
+            tx.commit()?;
+            return Ok(());
+        }
+
+        bind_vals.push(SqlValue::Text(Utc::now().to_rfc3339()));
+        set_clauses.push(format!("updated_at = ?{}", bind_vals.len()));
+        bind_vals.push(SqlValue::Text(agent_id.to_string()));
+        let sql = format!(
+            "UPDATE agents SET {} WHERE agent_id = ?{}",
+            set_clauses.join(", "),
+            bind_vals.len()
+        );
+        tx.execute(&sql, rusqlite::params_from_iter(bind_vals))?;
         tx.commit()?;
         Ok(())
     }
@@ -771,8 +765,8 @@ impl OrbitStore {
         conn.execute(
             "INSERT INTO agent_profiles (
                 profile_id, name, provider_json, model, effort_json, mode_json,
-                when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at, fast_mode
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(profile_id) DO UPDATE SET
                 name = excluded.name,
                 provider_json = excluded.provider_json,
@@ -782,7 +776,8 @@ impl OrbitStore {
                 when_to_use = excluded.when_to_use,
                 system_prompt_append = excluded.system_prompt_append,
                 mcp_policy_json = excluded.mcp_policy_json,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at,
+                fast_mode = excluded.fast_mode",
             params![
                 profile.profile_id,
                 profile.name,
@@ -795,6 +790,7 @@ impl OrbitStore {
                 mcp_policy_json,
                 profile.created_at.to_rfc3339(),
                 profile.updated_at.to_rfc3339(),
+                i32::from(profile.fast_mode),
             ],
         )?;
         Ok(())
@@ -804,7 +800,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at, fast_mode
              FROM agent_profiles ORDER BY name COLLATE NOCASE ASC",
         )?;
         let rows = stmt.query_map([], map_profile_row)?;
@@ -815,7 +811,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at, fast_mode
              FROM agent_profiles WHERE profile_id = ?1",
             params![profile_id],
             map_profile_row,
@@ -828,7 +824,7 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at, fast_mode
              FROM agent_profiles WHERE LOWER(name) = LOWER(?1)",
             params![name],
             map_profile_row,
@@ -1359,6 +1355,7 @@ fn map_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentProfile> {
     let mcp_s: String = row.get(8)?;
     let created_s: String = row.get(9)?;
     let updated_s: String = row.get(10)?;
+    let fast_mode: bool = row.get::<_, i32>(11).unwrap_or(0) != 0;
     Ok(AgentProfile {
         profile_id: row.get(0)?,
         name: row.get(1)?,
@@ -1368,6 +1365,7 @@ fn map_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentProfile> {
         effort: effort_opt
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok()),
+        fast_mode,
         mode: serde_json::from_str(&mode_s).unwrap_or(SessionMode::AcceptEdits),
         when_to_use: row.get(6)?,
         system_prompt_append: row.get(7)?,

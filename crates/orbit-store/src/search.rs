@@ -1499,6 +1499,7 @@ mod tests {
             provider: ProviderKind::Antigravity,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::Default,
             status: AgentStatus::Idle,
             parent_agent_id: None,

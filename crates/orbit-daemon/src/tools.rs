@@ -152,6 +152,7 @@ async fn execute_tool_inner(
             let effort = opt_str(args, "effort")
                 .and_then(|s| ReasoningEffort::from_slug(&s))
                 .or_else(|| local_profile.as_ref().and_then(|p| p.effort));
+            let fast_mode = args.get("fast_mode").and_then(|v| v.as_bool());
             let mode = opt_str(args, "mode")
                 .map(|s| parse_session_mode(&s))
                 .or_else(|| local_profile.as_ref().map(|p| p.mode.clone()))
@@ -218,6 +219,7 @@ async fn execute_tool_inner(
                             provider,
                             model,
                             effort,
+                            fast_mode,
                             mode,
                             initial_prompt,
                             initial_display_prompt: None,
@@ -274,6 +276,7 @@ async fn execute_tool_inner(
                         provider,
                         model,
                         effort,
+                        fast_mode,
                         mode,
                         initial_prompt,
                         initial_display_prompt: None,
@@ -649,6 +652,7 @@ async fn execute_tool_inner(
             let title = opt_str(args, "title");
             let model = opt_str(args, "model");
             let effort = opt_str(args, "effort").and_then(|s| ReasoningEffort::from_slug(&s));
+            let fast_mode = args.get("fast_mode").and_then(|v| v.as_bool());
             let mode = opt_str(args, "mode").map(|s| parse_session_mode(&s));
             let labels: Option<HashMap<String, String>> = args
                 .get("labels")
@@ -666,6 +670,7 @@ async fn execute_tool_inner(
                             title,
                             model,
                             effort,
+                            fast_mode,
                             mode,
                             labels,
                             handle: opt_str(args, "handle"),
@@ -683,6 +688,7 @@ async fn execute_tool_inner(
                     title,
                     model,
                     effort,
+                    fast_mode,
                     mode,
                     labels,
                     opt_str(args, "handle"),
@@ -1011,6 +1017,10 @@ async fn execute_tool_inner(
                 provider,
                 model,
                 effort,
+                fast_mode: args
+                    .get("fast_mode")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 mode,
                 profile_id: opt_str(args, "profile_id"),
                 worktree: args
@@ -1562,6 +1572,7 @@ async fn execute_tool_inner(
             let effort = opt_str(args, "effort")
                 .and_then(|s| ReasoningEffort::from_slug(&s))
                 .or_else(|| local_profile.as_ref().and_then(|p| p.effort));
+            let fast_mode = args.get("fast_mode").and_then(|v| v.as_bool());
             let mode = opt_str(args, "mode")
                 .map(|s| parse_session_mode(&s))
                 .or_else(|| local_profile.as_ref().map(|p| p.mode.clone()))
@@ -1591,6 +1602,7 @@ async fn execute_tool_inner(
                     provider,
                     model,
                     effort,
+                    fast_mode,
                     mode,
                     initial_prompt,
                     initial_display_prompt: None,
@@ -1911,6 +1923,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`) or `provider/model` pair." },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
                     "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
                     "profile_id": { "type": "string", "description": "Optional saved profile ID or name from `list_profiles`." },
                     "workspace_id": { "type": "string", "description": "Existing workspace ID from `create_workspace` or `list_workspaces`." },
@@ -2042,7 +2055,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "update_agent",
-            description: "Update an agent's title, model, reasoning effort, session mode, or labels.",
+            description: "Update an agent's title, model, reasoning effort, fast mode, session mode, or labels.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -2050,6 +2063,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "title": { "type": "string" },
                     "model": { "type": "string" },
                     "effort": { "type": "string" },
+                    "fast_mode": { "type": "boolean", "description": "Toggle Fast output mode (lower latency, higher quota usage)." },
                     "mode": { "type": "string" },
                     "labels": { "type": "object" },
                     "host_id": { "type": "string" }
@@ -2231,6 +2245,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "provider": { "type": "string" },
                     "model": { "type": "string" },
                     "effort": { "type": "string" },
+                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
                     "mode": { "type": "string" },
                     "profile_id": { "type": "string" },
                     "worktree": { "type": "boolean" },
@@ -2476,6 +2491,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`) or `provider/model`." },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
+                    "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
                     "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
                     "profile_id": { "type": "string" },
                     "cwd": { "type": "string" },

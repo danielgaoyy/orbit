@@ -25,7 +25,8 @@ use orbit_client_core::cloud_sync::{
 };
 use orbit_client_core::composer::{
     ClientPlatform, ComposePromptRequest, ComposedPromptView, ComposerContextInput,
-    ComposerPasteInput, ComposerQuoteInput, MentionCandidateView, SlashCommandView, SlashDirective,
+    ComposerPasteInput, ComposerQuoteInput, FastModeSlashAction, MentionCandidateView,
+    SlashCommandView, SlashDirective,
 };
 use orbit_client_core::contract::{
     AgentStageDeltaRequest, BridgeInfoView, ConversationSearchHit, CreateSessionRequest,
@@ -684,6 +685,7 @@ pub struct FfiProviderModelSpec {
     pub is_default: bool,
     pub default_effort: Option<FfiReasoningEffort>,
     pub thinking_options: Vec<FfiThinkingOptionSpec>,
+    pub supports_fast_mode: bool,
 }
 
 impl From<ProviderModelSpec> for FfiProviderModelSpec {
@@ -695,6 +697,7 @@ impl From<ProviderModelSpec> for FfiProviderModelSpec {
             is_default: v.is_default,
             default_effort: v.default_effort.map(Into::into),
             thinking_options: v.thinking_options.into_iter().map(Into::into).collect(),
+            supports_fast_mode: v.supports_fast_mode,
         }
     }
 }
@@ -708,6 +711,7 @@ impl From<FfiProviderModelSpec> for ProviderModelSpec {
             is_default: v.is_default,
             default_effort: v.default_effort.map(Into::into),
             thinking_options: v.thinking_options.into_iter().map(Into::into).collect(),
+            supports_fast_mode: v.supports_fast_mode,
         }
     }
 }
@@ -1206,6 +1210,7 @@ pub struct FfiAgentCard {
     pub provider_label: String,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
+    pub fast_mode: bool,
     pub mode: FfiSessionMode,
     pub status_label: String,
     pub is_running: bool,
@@ -1247,6 +1252,7 @@ impl From<AgentCardView> for FfiAgentCard {
             provider_label: v.provider_label,
             model: v.model,
             effort: v.effort.map(Into::into),
+            fast_mode: v.fast_mode,
             mode: v.mode.into(),
             status_label: v.status_label,
             is_running: v.is_running,
@@ -3377,6 +3383,23 @@ impl From<FfiComposePromptRequest> for ComposePromptRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiFastModeSlashAction {
+    Toggle,
+    Enable,
+    Disable,
+}
+
+impl From<FastModeSlashAction> for FfiFastModeSlashAction {
+    fn from(v: FastModeSlashAction) -> Self {
+        match v {
+            FastModeSlashAction::Toggle => Self::Toggle,
+            FastModeSlashAction::Enable => Self::Enable,
+            FastModeSlashAction::Disable => Self::Disable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiComposedPrompt {
     pub wire_prompt: String,
@@ -3390,6 +3413,7 @@ pub struct FfiComposedPrompt {
     pub fork_worktree: bool,
     pub fork_branch: Option<String>,
     pub fork_prompt: Option<String>,
+    pub fast_mode_action: Option<FfiFastModeSlashAction>,
     pub is_empty: bool,
 }
 
@@ -3407,6 +3431,7 @@ impl From<ComposedPromptView> for FfiComposedPrompt {
             fork_worktree: v.fork_worktree,
             fork_branch: v.fork_branch,
             fork_prompt: v.fork_prompt,
+            fast_mode_action: v.fast_mode_action.map(Into::into),
             is_empty: v.is_empty,
         }
     }
@@ -3488,6 +3513,7 @@ pub struct FfiResolvedModelSelection {
     pub selected_effort: Option<FfiReasoningEffort>,
     pub selected_effort_label: Option<String>,
     pub thinking_options: Vec<FfiThinkingOptionSpec>,
+    pub supports_fast_mode: bool,
 }
 
 impl From<ResolvedModelSelectionView> for FfiResolvedModelSelection {
@@ -3500,6 +3526,7 @@ impl From<ResolvedModelSelectionView> for FfiResolvedModelSelection {
             selected_effort: v.selected_effort.map(Into::into),
             selected_effort_label: v.selected_effort_label,
             thinking_options: v.thinking_options.into_iter().map(Into::into).collect(),
+            supports_fast_mode: v.supports_fast_mode,
         }
     }
 }
@@ -3512,6 +3539,7 @@ pub struct FfiCreateSessionRequest {
     pub provider: FfiProviderKind,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
+    pub fast_mode: Option<bool>,
     pub mode: FfiSessionMode,
     pub initial_prompt: String,
     pub initial_display_prompt: Option<String>,
@@ -3528,6 +3556,7 @@ impl From<FfiCreateSessionRequest> for CreateSessionRequest {
             provider: v.provider.into(),
             model: v.model,
             effort: v.effort.map(Into::into),
+            fast_mode: v.fast_mode,
             mode: v.mode.into(),
             initial_prompt: v.initial_prompt,
             initial_display_prompt: v.initial_display_prompt,
@@ -3707,6 +3736,7 @@ pub struct FfiSpawnWorkspacePeerRequest {
     pub provider: FfiProviderKind,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
+    pub fast_mode: Option<bool>,
     pub mode: FfiSessionMode,
     pub initial_prompt: String,
     pub worktree_branch: Option<String>,
@@ -3724,6 +3754,7 @@ impl From<FfiSpawnWorkspacePeerRequest> for SpawnWorkspacePeerRequest {
             provider: v.provider.into(),
             model: v.model,
             effort: v.effort.map(Into::into),
+            fast_mode: v.fast_mode,
             mode: v.mode.into(),
             initial_prompt: v.initial_prompt,
             worktree_branch: v.worktree_branch,
@@ -3745,6 +3776,7 @@ pub struct FfiCreateScheduleRequest {
     pub provider: FfiProviderKind,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
+    pub fast_mode: bool,
     pub mode: FfiSessionMode,
     pub worktree: bool,
     pub archive_on_finish: bool,
@@ -4423,6 +4455,7 @@ impl OrbitMobileCore {
             provider: provider.into(),
             model,
             effort: effort.map(Into::into),
+            fast_mode: None,
             mode: mode.into(),
             initial_prompt: &initial_prompt,
             initial_display_prompt,
@@ -4526,6 +4559,11 @@ impl OrbitMobileCore {
     ) {
         self.inner
             .set_agent_config(&host_id, &agent_id, model, effort.map(Into::into));
+    }
+
+    pub fn set_agent_fast_mode(&self, host_id: String, agent_id: String, fast_mode: bool) {
+        self.inner
+            .set_agent_fast_mode(&host_id, &agent_id, fast_mode);
     }
 
     pub fn switch_agent_provider(
@@ -5017,6 +5055,7 @@ impl OrbitMobileCore {
             provider: req.provider.into(),
             model: req.model,
             effort: req.effort.map(Into::into),
+            fast_mode: req.fast_mode,
             mode: req.mode.into(),
             profile_id: None,
             worktree: req.worktree,
@@ -5399,6 +5438,7 @@ mod tests {
             provider: FfiProviderKind::ClaudeCode,
             model: None,
             effort: None,
+            fast_mode: None,
             mode: FfiSessionMode::Default,
             initial_prompt: "Verify sidebar & stage delta".into(),
             initial_display_prompt: None,

@@ -674,6 +674,7 @@ impl OhosCoreFacade {
             provider: parse_provider_str(provider_str),
             model,
             effort: parse_effort_opt(effort_str),
+            fast_mode: None,
             mode: parse_mode_str(mode_str),
             initial_prompt,
             initial_display_prompt,
@@ -763,6 +764,10 @@ impl OhosCoreFacade {
     ) {
         self.inner
             .set_agent_config(host_id, agent_id, model, parse_effort_opt(effort_str));
+    }
+
+    pub fn set_agent_fast_mode(&self, host_id: &str, agent_id: &str, fast_mode: bool) {
+        self.inner.set_agent_fast_mode(host_id, agent_id, fast_mode);
     }
 
     pub fn switch_agent_provider(
@@ -1815,6 +1820,12 @@ mod ohos_napi {
         ) {
             self.facade
                 .set_agent_config(&host_id, &agent_id, model, effort.as_deref());
+        }
+
+        #[napi]
+        pub fn set_agent_fast_mode(&self, host_id: String, agent_id: String, fast_mode: bool) {
+            self.facade
+                .set_agent_fast_mode(&host_id, &agent_id, fast_mode);
         }
 
         #[napi]

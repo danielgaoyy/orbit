@@ -312,6 +312,9 @@ pub enum ProfileAction {
         model: Option<String>,
         #[arg(long, value_enum)]
         effort: Option<CliEffort>,
+        /// Enable Fast output mode by default for agents using this profile.
+        #[arg(long)]
+        fast: bool,
         #[arg(short, long, value_enum, default_value = "accept-edits")]
         mode: CliMode,
         #[arg(long, default_value = "")]
@@ -1202,6 +1205,7 @@ pub async fn cmd_schedule(
                 provider: provider.into(),
                 model,
                 effort: None,
+                fast_mode: false,
                 profile_id: profile,
                 mode: mode.into(),
                 worktree,
@@ -1561,6 +1565,7 @@ pub async fn cmd_profile(
             id,
             model,
             effort,
+            fast,
             mode,
             when_to_use,
             system_prompt,
@@ -1576,6 +1581,7 @@ pub async fn cmd_profile(
                 provider: ProviderKind::from(provider),
                 model,
                 effort: effort.map(Into::into),
+                fast_mode: fast,
                 mode: SessionMode::from(mode),
                 when_to_use,
                 system_prompt_append: system_prompt,
@@ -2239,6 +2245,7 @@ mod fork_rpc_tests {
                 provider: orbit_protocol::ProviderKind::ClaudeCode,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: orbit_protocol::SessionMode::Default,
                 status: orbit_protocol::AgentStatus::Idle,
                 parent_agent_id: None,

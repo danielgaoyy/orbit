@@ -79,6 +79,7 @@ pub fn fallback_acp_provider_models(provider: ProviderKind) -> ProviderModelCata
         is_default,
         default_effort: None,
         thinking_options: Vec::new(),
+        supports_fast_mode: false,
     };
 
     match provider {
@@ -1427,7 +1428,11 @@ async fn run_acp_actor(
                             }
                         }
                     }
-                    DriverCommand::SetConfig { model, effort } => {
+                    DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode: _,
+                    } => {
                         if let Some(m) = model
                             .as_deref()
                             .map(str::trim)
@@ -2610,6 +2615,7 @@ mod tests {
             attachments_dir: None,
             model: Some("claude-sonnet-4-5".into()),
             effort: None,
+            fast_mode: false,
             mode: SessionMode::Default,
             resume_session_id: None,
             fork_from_session_id: None,

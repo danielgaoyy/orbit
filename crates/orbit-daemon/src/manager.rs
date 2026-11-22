@@ -11,16 +11,16 @@ use chrono::Utc;
 use orbit_protocol::{
     ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, ForkTarget, HostProjectEntry,
     HostSyncState, KeepAwakeStatus, OrchestrationConfig, PendingPermissionSummary, PromptBadge,
-    ProviderKind, ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort,
-    ScheduleSpec, SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
-    ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord,
-    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceScriptKind,
-    WorkspaceScriptStatus, WorkspaceSetupProgress, WorkspaceSetupStatus, WorkspaceSummary,
-    WorktreeCreateMode,
+    ProviderKind, ProviderModelCatalog, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    QuestionItem, ReasoningEffort, ScheduleSpec, SessionMode, TerminalSummary, TimelineEvent,
+    TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceScriptKind, WorkspaceScriptStatus, WorkspaceSetupProgress, WorkspaceSetupStatus,
+    WorkspaceSummary, WorktreeCreateMode,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, SessionLaunchConfig,
-    find_provider_executable, spawn_provider_session,
+    find_provider_executable, provider_model_supports_fast_mode, spawn_provider_session,
 };
 use orbit_shim::{
     ShimClient, ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, kill_existing_shim,
@@ -151,6 +151,7 @@ pub struct CreateAgentSpec {
     pub provider: ProviderKind,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+    pub fast_mode: Option<bool>,
     pub mode: SessionMode,
     pub initial_prompt: String,
     pub initial_display_prompt: Option<String>,
@@ -180,6 +181,7 @@ pub struct AgentOrchestrator {
     store: Arc<OrbitStore>,
     pub scripts: Arc<WorkspaceScriptRegistry>,
     keep_awake: Arc<KeepAwakeManager>,
+    provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub worktree_pool: Arc<WorktreePool>,
     live_agents: RwLock<HashMap<String, LiveAgentEntry>>,
     /// Per-agent mutex serializing driver startup (e.g. concurrent eager fork startup and
@@ -239,6 +241,7 @@ impl AgentOrchestrator {
         store: Arc<OrbitStore>,
         scripts: Arc<WorkspaceScriptRegistry>,
         keep_awake: Arc<KeepAwakeManager>,
+        provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     ) -> Arc<Self> {
         let orbit_exe = resolve_orbit_exe();
         let (broadcast_tx, _) = broadcast::channel(2048);
@@ -253,6 +256,7 @@ impl AgentOrchestrator {
             store,
             scripts,
             keep_awake,
+            provider_catalogs,
             worktree_pool,
             live_agents: RwLock::new(HashMap::new()),
             driver_start_locks: RwLock::new(HashMap::new()),
@@ -1093,6 +1097,23 @@ impl AgentOrchestrator {
         let effort = spec
             .effort
             .or_else(|| profile.as_ref().and_then(|p| p.effort));
+        let supports_fast = self
+            .model_supports_fast_mode(provider, model.as_deref())
+            .await;
+        let fast_mode = match spec.fast_mode {
+            Some(true) => {
+                if !supports_fast {
+                    anyhow::bail!(
+                        "Fast mode is not supported by {} model `{}`",
+                        provider.display_name(),
+                        model.as_deref().unwrap_or("default")
+                    );
+                }
+                true
+            }
+            Some(false) => false,
+            None => profile.as_ref().is_some_and(|p| p.fast_mode) && supports_fast,
+        };
         let mode = if profile.is_some() && matches!(spec.mode, SessionMode::Default) {
             profile
                 .as_ref()
@@ -1329,6 +1350,7 @@ impl AgentOrchestrator {
             provider,
             model,
             effort,
+            fast_mode,
             mode,
             status: AgentStatus::Initializing,
             parent_agent_id: spec.parent_agent_id,
@@ -1717,6 +1739,7 @@ impl AgentOrchestrator {
             provider: source.provider,
             model: source.model.clone(),
             effort: source.effort,
+            fast_mode: source.fast_mode,
             mode: source.mode.clone(),
             status: if has_initial_prompt {
                 AgentStatus::Initializing
@@ -2457,16 +2480,39 @@ impl AgentOrchestrator {
         Ok(())
     }
 
+    async fn model_supports_fast_mode(&self, provider: ProviderKind, model: Option<&str>) -> bool {
+        let cached = self.provider_catalogs.read().await;
+        provider_model_supports_fast_mode(provider, model, cached.as_deref())
+    }
+
     pub async fn set_agent_config(
         &self,
         agent_id: &str,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
     ) -> anyhow::Result<()> {
+        let clear_fast = if let Some(existing) = self.store.get_agent(agent_id)? {
+            let supports_fast = self
+                .model_supports_fast_mode(existing.provider, model.as_deref())
+                .await;
+            if existing.fast_mode && !supports_fast {
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         self.store
-            .update_agent_config(agent_id, model.as_deref(), effort)?;
+            .update_agent_config(agent_id, model.as_deref(), effort, clear_fast)?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
-            let _ = tx.send(DriverCommand::SetConfig { model, effort }).await;
+            let _ = tx
+                .send(DriverCommand::SetConfig {
+                    model,
+                    effort,
+                    fast_mode: clear_fast,
+                })
+                .await;
         }
         if let Ok(Some(updated)) = self.store.get_agent(agent_id) {
             let _ = self
@@ -2481,12 +2527,26 @@ impl AgentOrchestrator {
         agent_id: &str,
         model: Option<String>,
     ) -> anyhow::Result<()> {
-        self.store.update_agent_model(agent_id, model.as_deref())?;
+        let clear_fast = if let Some(existing) = self.store.get_agent(agent_id)? {
+            let supports_fast = self
+                .model_supports_fast_mode(existing.provider, model.as_deref())
+                .await;
+            if existing.fast_mode && !supports_fast {
+                Some(false)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.store
+            .update_agent_model(agent_id, model.as_deref(), clear_fast)?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             let _ = tx
                 .send(DriverCommand::SetConfig {
                     model,
                     effort: None,
+                    fast_mode: clear_fast,
                 })
                 .await;
         }
@@ -2505,11 +2565,41 @@ impl AgentOrchestrator {
         title: Option<String>,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        fast_mode: Option<bool>,
         mode: Option<SessionMode>,
         labels: Option<HashMap<String, String>>,
         handle: Option<String>,
         task_summary: Option<String>,
     ) -> anyhow::Result<AgentSummary> {
+        let existing = self
+            .store
+            .get_agent(agent_id)?
+            .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
+        let effective_model = model.as_deref().or(existing.model.as_deref());
+        let supports_fast = self
+            .model_supports_fast_mode(existing.provider, effective_model)
+            .await;
+        let effective_fast_mode = match fast_mode {
+            Some(true) => {
+                if !supports_fast {
+                    anyhow::bail!(
+                        "Fast mode is not supported by {} model `{}`",
+                        existing.provider.display_name(),
+                        effective_model.unwrap_or("default")
+                    );
+                }
+                Some(true)
+            }
+            Some(false) => Some(false),
+            None => {
+                if model.is_some() && existing.fast_mode && !supports_fast {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        };
+
         let clean_handle = handle.map(|h| sanitize_handle(&h));
         let mut effective_labels = labels;
         // Explicit user/API title edits automatically lock the title against future AI auto-naming
@@ -2528,13 +2618,20 @@ impl AgentOrchestrator {
             effective_labels.as_ref(),
             clean_handle.as_deref(),
             task_summary.as_deref(),
+            effective_fast_mode,
         )?;
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             if let Some(md) = mode {
                 let _ = tx.send(DriverCommand::SetMode { mode: md }).await;
             }
-            if model.is_some() || effort.is_some() {
-                let _ = tx.send(DriverCommand::SetConfig { model, effort }).await;
+            if model.is_some() || effort.is_some() || effective_fast_mode.is_some() {
+                let _ = tx
+                    .send(DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode: effective_fast_mode,
+                    })
+                    .await;
             }
         }
         let updated = self
@@ -2562,11 +2659,38 @@ impl AgentOrchestrator {
             )
         })?;
 
+        let prev_fast_mode = self
+            .store
+            .get_agent(agent_id)?
+            .map(|a| a.fast_mode)
+            .unwrap_or(false);
+        let supports_fast = self
+            .model_supports_fast_mode(provider, model.as_deref())
+            .await;
+        let next_fast_mode = prev_fast_mode && supports_fast;
+        if prev_fast_mode
+            && !next_fast_mode
+            && let Some(tx) = self.live_agent_tx(agent_id).await
+        {
+            let _ = tx
+                .send(DriverCommand::SetConfig {
+                    model: None,
+                    effort: None,
+                    fast_mode: Some(false),
+                })
+                .await;
+        }
+
         let _ = self.stop_and_wait_driver(agent_id).await;
         kill_existing_shim(&self.shim_socket_path("a", agent_id)).await;
         kill_existing_shim(&self.legacy_shim_socket_path("agent", agent_id)).await;
-        self.store
-            .switch_agent_provider(agent_id, provider, model.as_deref(), effort)?;
+        self.store.switch_agent_provider(
+            agent_id,
+            provider,
+            model.as_deref(),
+            effort,
+            next_fast_mode,
+        )?;
 
         if let Ok(ev) = self.store.append_timeline_event(
             agent_id,
@@ -3858,6 +3982,7 @@ impl AgentOrchestrator {
             attachments_dir: Some(attachments_dir),
             model: summary.model.clone(),
             effort: summary.effort,
+            fast_mode: summary.fast_mode,
             mode: summary.mode.clone(),
             resume_session_id,
             fork_from_session_id,
@@ -4983,6 +5108,7 @@ mod streaming_buffer_tests {
             Arc::clone(&store),
             scripts,
             keep_awake,
+            Arc::new(RwLock::new(None)),
         )
         .await;
         (orch, store)
@@ -5028,6 +5154,7 @@ mod streaming_buffer_tests {
                     provider: ProviderKind::ClaudeCode,
                     model: Some("sonnet".into()),
                     effort: Some(ReasoningEffort::High),
+                    fast_mode: false,
                     mode: SessionMode::AcceptEdits,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -5419,5 +5546,426 @@ mod streaming_buffer_tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+}
+
+#[cfg(test)]
+mod fast_mode_orchestrator_tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    fn ensure_mock_provider_binaries() {
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let exe = if Path::new("/usr/bin/true").exists() {
+                PathBuf::from("/usr/bin/true")
+            } else {
+                PathBuf::from("/bin/true")
+            };
+            orbit_providers::set_provider_executable_override(
+                ProviderKind::ClaudeCode,
+                exe.clone(),
+            );
+            orbit_providers::set_provider_executable_override(ProviderKind::Codex, exe.clone());
+            orbit_providers::set_provider_executable_override(ProviderKind::Antigravity, exe);
+        });
+    }
+
+    async fn test_orchestrator(tag: &str) -> (PathBuf, Arc<OrbitStore>, Arc<AgentOrchestrator>) {
+        ensure_mock_provider_binaries();
+        let dir =
+            std::env::temp_dir().join(format!("orbit_mgr_fast_{tag}_{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("shims")).expect("create shims dir");
+        let store = Arc::new(OrbitStore::open(dir.join("orbit.db")).expect("open store"));
+        let listen_port = Arc::new(RwLock::new(0u16));
+        let orch_config = Arc::new(RwLock::new(OrchestrationConfig::default()));
+        let scripts = WorkspaceScriptRegistry::new();
+        let keep_awake = Arc::new(KeepAwakeManager::new(false));
+        let provider_catalogs = Arc::new(RwLock::new(None));
+        let orch = AgentOrchestrator::new(
+            dir.clone(),
+            "host_test".into(),
+            "tok_test".into(),
+            listen_port,
+            orch_config,
+            store.clone(),
+            scripts,
+            keep_awake,
+            provider_catalogs,
+        )
+        .await;
+        (dir, store, orch)
+    }
+
+    fn mk_spec(
+        cwd: &Path,
+        provider: ProviderKind,
+        model: Option<&str>,
+        profile_id: Option<&str>,
+        fast_mode: Option<bool>,
+    ) -> CreateAgentSpec {
+        CreateAgentSpec {
+            cwd: cwd.to_string_lossy().to_string(),
+            extra_dirs: Vec::new(),
+            title: Some("Test Agent".into()),
+            provider,
+            model: model.map(ToOwned::to_owned),
+            effort: None,
+            fast_mode,
+            mode: SessionMode::AcceptEdits,
+            initial_prompt: String::new(),
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree: false,
+            workspace_id: None,
+            parent_agent_id: None,
+            parent_host_id: None,
+            profile_id: profile_id.map(ToOwned::to_owned),
+            background: false,
+            auto_archive: false,
+            base_ref: None,
+            worktree_mode: WorktreeCreateMode::BranchOff,
+            branch: None,
+            pr_number: None,
+            handle: None,
+            auto_cluster: Some(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_agent_explicit_false_overrides_fast_profile_and_gates_capability() {
+        let (dir, store, orch) = test_orchestrator("create_override").await;
+        let now = Utc::now();
+        store
+            .upsert_profile(&orbit_protocol::AgentProfile {
+                profile_id: "prof_fast".into(),
+                name: "Fast Opus".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: Some("claude-opus-4-6".into()),
+                effort: Some(ReasoningEffort::High),
+                fast_mode: true,
+                mode: SessionMode::AcceptEdits,
+                when_to_use: "Fast coding".into(),
+                system_prompt_append: None,
+                mcp_policy: orbit_protocol::McpToolPolicy::default(),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("save profile");
+
+        // 1. Explicit `Some(false)` overrides `profile.fast_mode == true`
+        let ag_override = orch
+            .create_and_start_agent(mk_spec(
+                &dir,
+                ProviderKind::ClaudeCode,
+                None,
+                Some("prof_fast"),
+                Some(false),
+            ))
+            .await
+            .expect("create with explicit false");
+        assert!(
+            !ag_override.fast_mode,
+            "explicit fast_mode=Some(false) must override profile.fast_mode=true"
+        );
+        let persisted = store
+            .get_agent(&ag_override.agent_id)
+            .expect("get")
+            .expect("exists");
+        assert!(!persisted.fast_mode);
+
+        // 2. `None` inherits `profile.fast_mode == true` on a fast-capable model
+        let ag_inherit = orch
+            .create_and_start_agent(mk_spec(
+                &dir,
+                ProviderKind::ClaudeCode,
+                None,
+                Some("prof_fast"),
+                None,
+            ))
+            .await
+            .expect("create inheriting profile fast_mode");
+        assert!(
+            ag_inherit.fast_mode,
+            "fast_mode=None must inherit profile.fast_mode=true"
+        );
+
+        // 3. `None` inheriting fast profile while overridden to unsupported model clamps to `false`
+        let ag_clamped = orch
+            .create_and_start_agent(mk_spec(
+                &dir,
+                ProviderKind::ClaudeCode,
+                Some("claude-sonnet-4-6"),
+                Some("prof_fast"),
+                None,
+            ))
+            .await
+            .expect("create clamped to false on unsupported model");
+        assert!(
+            !ag_clamped.fast_mode,
+            "inherited profile fast_mode must clamp to false on unsupported model"
+        );
+
+        // 4. Explicit `Some(true)` on an unsupported model returns an actionable error
+        let err = orch
+            .create_and_start_agent(mk_spec(
+                &dir,
+                ProviderKind::ClaudeCode,
+                Some("claude-haiku-4-5"),
+                None,
+                Some(true),
+            ))
+            .await
+            .expect_err("explicit fast_mode=true on haiku must be rejected");
+        assert!(
+            err.to_string().contains("Fast mode is not supported"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn model_and_provider_switches_enforce_fast_mode_capability() {
+        let (dir, store, orch) = test_orchestrator("capability_switch").await;
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_cap".into(),
+                title: "Cap".into(),
+                cwd: dir.to_string_lossy().to_string(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let ag = AgentSummary {
+            agent_id: "ag_cap".into(),
+            workspace_id: "ws_cap".into(),
+            cwd: dir.to_string_lossy().to_string(),
+            title: "Cap Agent".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: true,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: Some("lead".into()),
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+        };
+        store.upsert_agent(&ag, None).expect("seed agent");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<DriverCommand>(16);
+        let done_notify = Arc::new(tokio::sync::Notify::new());
+        done_notify.notify_one();
+        let dummy_task = tokio::spawn(std::future::pending::<()>());
+        orch.live_agents.write().await.insert(
+            "ag_cap".into(),
+            LiveAgentEntry {
+                generation: 1,
+                cmd_tx,
+                done_notify,
+                ingest_abort: dummy_task.abort_handle(),
+                shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            },
+        );
+
+        // 1. `update_agent` switching to non-fast model auto-clears fast_mode in DB + live driver
+        let updated = orch
+            .update_agent(
+                "ag_cap",
+                None,
+                Some("claude-sonnet-4-6".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("update_agent to sonnet");
+        assert!(!updated.fast_mode);
+        let cmd = cmd_rx.try_recv().expect("driver SetConfig on update_agent");
+        assert!(matches!(
+            cmd,
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                fast_mode: Some(false),
+                ..
+            } if m == "claude-sonnet-4-6"
+        ));
+
+        // 2. `update_agent` rejects explicit `fast_mode: Some(true)` on non-fast model
+        let err = orch
+            .update_agent(
+                "ag_cap",
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("explicit fast_mode=true on sonnet must fail");
+        assert!(err.to_string().contains("Fast mode is not supported"));
+
+        // 3. Re-enable fast_mode on opus, then `set_agent_config` to haiku clears DB + sends Some(false)
+        let re_enabled = orch
+            .update_agent(
+                "ag_cap",
+                None,
+                Some("claude-opus-4-6".into()),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("re-enable fast_mode on opus");
+        assert!(re_enabled.fast_mode);
+        let _ = cmd_rx.try_recv();
+
+        orch.set_agent_config(
+            "ag_cap",
+            Some("claude-haiku-4-5".into()),
+            Some(ReasoningEffort::Low),
+        )
+        .await
+        .expect("set_agent_config");
+        assert!(
+            !store
+                .get_agent("ag_cap")
+                .expect("get")
+                .expect("some")
+                .fast_mode
+        );
+        let cmd2 = cmd_rx
+            .try_recv()
+            .expect("driver SetConfig on set_agent_config");
+        assert!(matches!(
+            cmd2,
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                fast_mode: Some(false),
+                ..
+            } if m == "claude-haiku-4-5"
+        ));
+
+        // 4. Re-enable fast_mode on opus, then `set_agent_model` to sonnet clears DB + sends Some(false)
+        orch.update_agent(
+            "ag_cap",
+            None,
+            Some("claude-opus-4-6".into()),
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("re-enable on opus");
+        let _ = cmd_rx.try_recv();
+
+        orch.set_agent_model("ag_cap", Some("claude-sonnet-4-6".into()))
+            .await
+            .expect("set_agent_model");
+        assert!(
+            !store
+                .get_agent("ag_cap")
+                .expect("get")
+                .expect("some")
+                .fast_mode
+        );
+        let cmd3 = cmd_rx
+            .try_recv()
+            .expect("driver SetConfig on set_agent_model");
+        assert!(matches!(
+            cmd3,
+            DriverCommand::SetConfig {
+                model: Some(ref m),
+                fast_mode: Some(false),
+                ..
+            } if m == "claude-sonnet-4-6"
+        ));
+
+        // 5. Re-enable fast_mode on opus, then `switch_agent_provider` to Codex `gpt-oss-120b` clears fast_mode
+        orch.update_agent(
+            "ag_cap",
+            None,
+            Some("claude-opus-4-6".into()),
+            None,
+            Some(true),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("re-enable on opus");
+        let _ = cmd_rx.try_recv();
+
+        orch.switch_agent_provider(
+            "ag_cap",
+            ProviderKind::Codex,
+            Some("gpt-oss-120b".into()),
+            None,
+        )
+        .await
+        .expect("switch_agent_provider");
+        let switched = store.get_agent("ag_cap").expect("get").expect("some");
+        assert_eq!(switched.provider, ProviderKind::Codex);
+        assert!(!switched.fast_mode);
+        let cmd4 = cmd_rx
+            .try_recv()
+            .expect("driver SetConfig on switch_agent_provider");
+        assert!(matches!(
+            cmd4,
+            DriverCommand::SetConfig {
+                fast_mode: Some(false),
+                ..
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

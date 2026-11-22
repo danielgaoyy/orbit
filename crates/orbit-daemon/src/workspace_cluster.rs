@@ -605,6 +605,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::Idle,
             parent_agent_id: None,

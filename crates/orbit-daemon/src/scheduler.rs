@@ -435,6 +435,7 @@ impl ScheduleEngine {
                     provider: cfg.provider,
                     model: cfg.model.clone(),
                     effort: cfg.effort,
+                    fast_mode: if cfg.fast_mode { Some(true) } else { None },
                     mode: cfg.mode.clone(),
                     initial_prompt: sched.prompt.clone(),
                     initial_display_prompt: None,

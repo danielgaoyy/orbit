@@ -179,6 +179,8 @@ pub struct AgentCardView {
     pub provider_label: String,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub mode: SessionMode,
     pub status: AgentStatus,
     pub status_label: String,
@@ -234,6 +236,7 @@ pub struct CreateAgentRequest<'a> {
     pub provider: ProviderKind,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+    pub fast_mode: Option<bool>,
     pub mode: SessionMode,
     pub initial_prompt: &'a str,
     pub initial_display_prompt: Option<String>,
@@ -2346,6 +2349,7 @@ impl OrbitAppCore {
             provider: req.provider,
             model: req.model,
             effort: req.effort,
+            fast_mode: req.fast_mode,
             mode: req.mode,
             initial_prompt: &req.initial_prompt,
             initial_display_prompt: req.initial_display_prompt,
@@ -5099,6 +5103,7 @@ impl OrbitAppCore {
             provider,
             model: None,
             effort: None,
+            fast_mode: None,
             mode,
             initial_prompt,
             initial_display_prompt: None,
@@ -5130,6 +5135,7 @@ impl OrbitAppCore {
             provider,
             model,
             effort: None,
+            fast_mode: None,
             mode,
             initial_prompt,
             initial_display_prompt: None,
@@ -5188,6 +5194,17 @@ impl OrbitAppCore {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(req.host_id)
         {
+            let opt_fast_mode = req.fast_mode.unwrap_or_else(|| {
+                profile_id
+                    .as_deref()
+                    .and_then(|pid| {
+                        h.profiles
+                            .iter()
+                            .find(|p| p.profile_id == pid || p.name == pid)
+                            .map(|p| p.fast_mode)
+                    })
+                    .unwrap_or(false)
+            });
             let opt_agent = AgentSummary {
                 agent_id: opt_id.clone(),
                 workspace_id: explicit_ws
@@ -5198,6 +5215,7 @@ impl OrbitAppCore {
                 provider: req.provider,
                 model: clean_model.clone(),
                 effort: req.effort,
+                fast_mode: opt_fast_mode,
                 mode: req.mode.clone(),
                 status: AgentStatus::Initializing,
                 parent_agent_id: None,
@@ -5269,6 +5287,7 @@ impl OrbitAppCore {
                 provider: req.provider,
                 model: clean_model,
                 effort: req.effort,
+                fast_mode: req.fast_mode,
                 mode: req.mode,
                 initial_prompt: req.initial_prompt.to_string(),
                 initial_display_prompt: req.initial_display_prompt,
@@ -5906,39 +5925,88 @@ impl OrbitAppCore {
         labels: Option<HashMap<String, String>>,
         handle: Option<String>,
     ) {
+        self.update_agent_full(
+            host_id, agent_id, title, model, effort, None, mode, labels, handle,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_agent_full(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        title: Option<String>,
+        model: Option<String>,
+        effort: Option<ReasoningEffort>,
+        fast_mode: Option<bool>,
+        mode: Option<SessionMode>,
+        labels: Option<HashMap<String, String>>,
+        handle: Option<String>,
+    ) {
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
-            && let Some(ag) = h.agents.get_mut(agent_id)
         {
-            if let Some(ref t) = title {
-                ag.title = t.clone();
-            }
-            if let Some(ref h_val) = handle {
-                let clean = h_val.trim().trim_start_matches('@');
-                if !clean.is_empty() {
-                    ag.handle = Some(clean.to_string());
+            if let Some(ag) = h.agents.get_mut(agent_id) {
+                if let Some(ref t) = title {
+                    ag.title = t.clone();
+                }
+                if let Some(ref m) = model {
+                    ag.model = Some(m.clone());
+                }
+                if let Some(e) = effort {
+                    ag.effort = Some(e);
+                }
+                if let Some(fm) = fast_mode {
+                    ag.fast_mode = fm;
+                }
+                if let Some(ref md) = mode {
+                    ag.mode = md.clone();
+                }
+                if let Some(ref h_val) = handle {
+                    let clean = h_val.trim().trim_start_matches('@');
+                    if !clean.is_empty() {
+                        ag.handle = Some(clean.to_string());
+                    }
                 }
             }
+            h.mark_stage_meta_dirty(agent_id);
         }
-        self.dispatch_wire_queued(
-            host_id,
-            WireMessage::UpdateAgent {
-                request_id: Uuid::new_v4(),
-                agent_id: agent_id.to_string(),
-                title,
-                model,
-                effort,
-                mode,
-                labels,
-                handle,
-                task_summary: None,
-            },
-        );
+        if !agent_id.starts_with("opt_") {
+            self.dispatch_wire_queued(
+                host_id,
+                WireMessage::UpdateAgent {
+                    request_id: Uuid::new_v4(),
+                    agent_id: agent_id.to_string(),
+                    title,
+                    model,
+                    effort,
+                    fast_mode,
+                    mode,
+                    labels,
+                    handle,
+                    task_summary: None,
+                },
+            );
+        }
         self.emit(|revision| CoreNotification::FleetChanged { revision });
         self.emit(|revision| CoreNotification::HostChanged {
             revision,
             host_id: host_id.to_string(),
         });
+    }
+
+    pub fn set_agent_fast_mode(self: &Arc<Self>, host_id: &str, agent_id: &str, fast_mode: bool) {
+        self.update_agent_full(
+            host_id,
+            agent_id,
+            None,
+            None,
+            None,
+            Some(fast_mode),
+            None,
+            None,
+            None,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5990,6 +6058,7 @@ impl OrbitAppCore {
                 title,
                 model: None,
                 effort: None,
+                fast_mode: None,
                 mode: None,
                 labels: (!labels.is_empty()).then_some(labels),
                 handle: clean_handle,
@@ -6358,6 +6427,7 @@ impl OrbitAppCore {
                 provider: req.provider,
                 model: req.model,
                 effort: req.effort,
+                fast_mode: req.fast_mode,
                 mode: req.mode,
                 initial_prompt: &req.initial_prompt,
                 initial_display_prompt: None,
@@ -10263,6 +10333,7 @@ fn agent_stage_meta_unchanged(prev: &AgentSummary, next: &AgentSummary) -> bool 
         && prev.provider == next.provider
         && prev.model == next.model
         && prev.effort == next.effort
+        && prev.fast_mode == next.fast_mode
         && prev.mode == next.mode
         && prev.status == next.status
         && prev.parent_agent_id == next.parent_agent_id
@@ -10334,6 +10405,7 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         provider_label: a.provider.display_name().to_string(),
         model: a.model.clone(),
         effort: a.effort,
+        fast_mode: a.fast_mode,
         mode: a.mode.clone(),
         status: a.status.clone(),
         status_label,
@@ -10818,6 +10890,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: Some("claude-opus-5-5".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: None,
             mode: SessionMode::AcceptEdits,
             initial_prompt: "Run clippy",
             initial_display_prompt: None,
@@ -11088,6 +11161,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -11204,6 +11278,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -11348,6 +11423,7 @@ mod tests {
                     provider: ProviderKind::Codex,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Running {
                         turn_id: "t2".into(),
@@ -11527,6 +11603,7 @@ mod tests {
                     provider: ProviderKind::Codex,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -11631,6 +11708,7 @@ mod tests {
                     provider: ProviderKind::ClaudeCode,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -11678,6 +11756,7 @@ mod tests {
                     provider: ProviderKind::Codex,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Initializing,
                     parent_agent_id: None,
@@ -11718,6 +11797,7 @@ mod tests {
                     provider: ProviderKind::Codex,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -11901,6 +11981,7 @@ mod tests {
                 provider: ProviderKind::Codex,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::Default,
                 status: AgentStatus::Running {
                     turn_id: "t1".into(),
@@ -12077,6 +12158,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     created_at: now,
@@ -12128,6 +12210,7 @@ mod tests {
                     provider: ProviderKind::ClaudeCode,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Running {
                         turn_id: "t1".into(),
@@ -12215,6 +12298,7 @@ mod tests {
             provider: ProviderKind::Antigravity,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status,
             parent_agent_id: None,
@@ -12440,6 +12524,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::FullAccess,
                     status: AgentStatus::Running {
                         turn_id: "t1".into(),
@@ -12523,6 +12608,7 @@ mod tests {
             provider: ProviderKind::Antigravity,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status: AgentStatus::Running {
                 turn_id: "t1".into(),
@@ -12627,6 +12713,7 @@ mod tests {
                         provider: ProviderKind::Antigravity,
                         model: None,
                         effort: None,
+                        fast_mode: false,
                         mode: SessionMode::FullAccess,
                         status: if idx == 0 {
                             AgentStatus::Running {
@@ -13021,6 +13108,7 @@ mod tests {
                 provider: ProviderKind::Antigravity,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::Default,
                 status: AgentStatus::Running {
                     turn_id: "t2".into(),
@@ -13230,6 +13318,7 @@ mod tests {
                 provider: ProviderKind::Antigravity,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::Default,
                 status: AgentStatus::Idle,
                 parent_agent_id: None,
@@ -13280,6 +13369,7 @@ mod tests {
                 provider: ProviderKind::ClaudeCode,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: SessionMode::Default,
                 status: AgentStatus::Idle,
                 parent_agent_id: None,
@@ -13526,6 +13616,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: Some("sonnet".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::Idle,
             parent_agent_id: None,
@@ -13596,6 +13687,103 @@ mod tests {
                 .workspaces
                 .iter()
                 .any(|w| w.workspace_id == "ws_wt_fork")
+        );
+    }
+
+    #[test]
+    fn update_agent_full_guards_optimistic_id_and_uses_narrow_invalidation() {
+        use std::sync::atomic::AtomicU64;
+
+        struct EventCounter {
+            fleet: AtomicU64,
+            host: AtomicU64,
+            timeline: AtomicU64,
+        }
+        impl CoreEventSubscriber for EventCounter {
+            fn on_notification(&self, notification: CoreNotification) {
+                match notification {
+                    CoreNotification::FleetChanged { .. } => {
+                        self.fleet.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CoreNotification::HostChanged { .. } => {
+                        self.host.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CoreNotification::TimelineChanged { .. } => {
+                        self.timeline.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let core = OrbitAppCore::open_in_memory().expect("core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        let offer = PairingOffer {
+            host_id: "host_opt".into(),
+            hostname: "devbox".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let opt_id = core.create_agent_with_config(CreateAgentRequest {
+            host_id: "host_opt",
+            cwd: "/repo",
+            extra_dirs: Vec::new(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: Some(false),
+            mode: SessionMode::AcceptEdits,
+            initial_prompt: "hello",
+            initial_display_prompt: None,
+            initial_badges: Vec::new(),
+            worktree_branch: None,
+            workspace_id: None,
+            handle: None,
+            auto_cluster: None,
+        });
+        assert!(opt_id.starts_with("opt_"));
+
+        // Clear any pending queued wire messages from `create_agent`
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            if let Some(h) = hosts.get_mut("host_opt") {
+                h.pending_outbox.clear();
+            }
+        }
+
+        let counter = Arc::new(EventCounter {
+            fleet: AtomicU64::new(0),
+            host: AtomicU64::new(0),
+            timeline: AtomicU64::new(0),
+        });
+        core.subscribe(counter.clone());
+
+        // Toggle fast mode on an optimistic `opt_*` agent:
+        // 1. Updates local optimistic agent state
+        // 2. Does NOT dispatch a wire UpdateAgent for `opt_*`
+        // 3. Emits FleetChanged + HostChanged WITHOUT forcing TimelineChanged
+        core.set_agent_fast_mode("host_opt", &opt_id, true);
+
+        {
+            let hosts = core.hosts.read().expect("hosts");
+            let h = hosts.get("host_opt").expect("host");
+            assert!(h.agents.get(&opt_id).expect("opt agent").fast_mode);
+            assert!(
+                h.pending_outbox.is_empty(),
+                "update_agent_full must not dispatch wire messages for opt_* agents"
+            );
+        }
+        assert!(counter.fleet.load(Ordering::Relaxed) >= 1);
+        assert!(counter.host.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            counter.timeline.load(Ordering::Relaxed),
+            0,
+            "metadata-only update_agent_full must not force TimelineChanged"
         );
     }
 }

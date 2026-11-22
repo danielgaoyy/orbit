@@ -1619,6 +1619,7 @@ mod tests {
             Arc::clone(&store),
             scripts,
             keep_awake,
+            Arc::new(tokio::sync::RwLock::new(None)),
         )
         .await;
         (mgr, store)
@@ -1660,6 +1661,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: orbit_protocol::SessionMode::Default,
             status: orbit_protocol::AgentStatus::Idle,
             parent_agent_id: None,
@@ -1801,6 +1803,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("rename agent");
@@ -1859,6 +1862,7 @@ mod tests {
         mgr.update_agent(
             "ag_atomic",
             Some("User Locked Title".into()),
+            None,
             None,
             None,
             None,

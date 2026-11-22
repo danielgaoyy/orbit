@@ -323,6 +323,12 @@ enum Commands {
         model: Option<String>,
         #[arg(long, value_enum)]
         effort: Option<CliEffort>,
+        /// Enable Fast output mode (lower latency, higher quota usage) when supported by the model.
+        #[arg(long, conflicts_with = "no_fast")]
+        fast: bool,
+        /// Explicitly disable Fast output mode (overrides a fast-enabled Agent Profile).
+        #[arg(long, conflicts_with = "fast")]
+        no_fast: bool,
         /// Apply a saved Agent Profile ID (fills provider/model/effort/mode/system prompt/MCP policy).
         #[arg(long)]
         profile: Option<String>,
@@ -1193,6 +1199,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             mode,
             model,
             effort,
+            fast,
+            no_fast,
             profile,
             cwd,
             workspace,
@@ -1231,6 +1239,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         provider: provider.into(),
                         model,
                         effort: effort.map(Into::into),
+                        fast_mode: if no_fast {
+                            Some(false)
+                        } else if fast {
+                            Some(true)
+                        } else {
+                            None
+                        },
                         mode: mode.into(),
                         initial_prompt: prompt,
                         initial_display_prompt: None,

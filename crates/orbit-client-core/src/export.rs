@@ -2217,6 +2217,7 @@ mod tests {
             provider: ProviderKind::Codex,
             model: Some("gpt-5-codex".into()),
             effort: None,
+            fast_mode: false,
             mode: orbit_protocol::SessionMode::AcceptEdits,
             status: AgentStatus::Idle,
             parent_agent_id: None,

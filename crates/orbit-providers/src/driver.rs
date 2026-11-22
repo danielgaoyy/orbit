@@ -44,6 +44,7 @@ pub struct SessionLaunchConfig {
     pub attachments_dir: Option<PathBuf>,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
+    pub fast_mode: bool,
     pub mode: SessionMode,
     pub resume_session_id: Option<String>,
     /// Optional upstream session ID to natively fork from on startup (full-tail forks only).
@@ -90,6 +91,7 @@ pub enum DriverCommand {
     SetConfig {
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        fast_mode: Option<bool>,
     },
     ResolvePermission {
         request_id: String,

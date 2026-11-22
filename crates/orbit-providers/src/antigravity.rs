@@ -28,6 +28,29 @@ use crate::driver::{
     DriverCommand, DriverEvent, ProviderSessionHandle, RpcId, SessionLaunchConfig,
 };
 
+fn build_agy_launch_env(cfg: &SessionLaunchConfig) -> HashMap<String, String> {
+    let mut env = cfg.extra_env.clone();
+    env.insert("NO_COLOR".into(), "1".into());
+    if let Some(eff) = cfg.effort {
+        let eff_str = match eff {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+            ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
+        };
+        if let Some(s) = eff_str {
+            env.insert("AGY_EFFORT".into(), s.into());
+        }
+    }
+    if cfg.fast_mode {
+        env.insert("AGY_FAST_MODE".into(), "1".into());
+    }
+    crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
+    env
+}
+
 pub async fn spawn_antigravity_session(
     cfg: SessionLaunchConfig,
 ) -> Result<ProviderSessionHandle, String> {
@@ -52,22 +75,7 @@ pub async fn spawn_antigravity_session(
             args.push(extra.to_string_lossy().to_string());
         }
 
-        let mut env = cfg.extra_env.clone();
-        env.insert("NO_COLOR".into(), "1".into());
-        if let Some(eff) = cfg.effort {
-            let eff_str = match eff {
-                ReasoningEffort::Off => None,
-                ReasoningEffort::Low => Some("low"),
-                ReasoningEffort::Medium => Some("medium"),
-                ReasoningEffort::High => Some("high"),
-                ReasoningEffort::Xhigh => Some("xhigh"),
-                ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
-            };
-            if let Some(s) = eff_str {
-                env.insert("AGY_EFFORT".into(), s.into());
-            }
-        }
-        crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
+        let env = build_agy_launch_env(&cfg);
 
         let spec = ShimSpawnSpec {
             shim_id: format!("agy_{}", cfg.agent_id),
@@ -158,18 +166,60 @@ fn build_agy_mcp_servers_stdio(cfg: &SessionLaunchConfig) -> Value {
 }
 
 fn build_agy_session_meta(cfg: &SessionLaunchConfig) -> Option<Value> {
-    let append = cfg
+    let mut agy_meta = serde_json::Map::new();
+    if let Some(append) = cfg
         .system_prompt_append
         .as_deref()
         .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    Some(json!({
-        "antigravity": {
-            "systemPrompt": {
+        .filter(|s| !s.is_empty())
+    {
+        agy_meta.insert(
+            "systemPrompt".to_string(),
+            json!({
                 "append": append
-            }
+            }),
+        );
+    }
+    if cfg.fast_mode {
+        agy_meta.insert("fastMode".to_string(), Value::Bool(true));
+    }
+    if agy_meta.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "antigravity": Value::Object(agy_meta)
+        }))
+    }
+}
+
+fn build_agy_set_fast_mode_request(rpc_id: i64, session_id: &str, enabled: bool) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "method": "session/set_config_option",
+        "params": {
+            "sessionId": session_id,
+            "configId": "fast_mode",
+            "value": if enabled { "on" } else { "off" }
         }
-    }))
+    })
+}
+
+fn parse_agy_fast_mode_config_value(sess_val: &Value) -> Option<bool> {
+    let opt = sess_val
+        .get("configOptions")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("fast_mode"))?;
+    let current = opt.get("currentValue").or_else(|| opt.get("value"))?;
+    if let Some(b) = current.as_bool() {
+        return Some(b);
+    }
+    match current.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "enabled" => Some(true),
+        "off" | "false" | "0" | "disabled" => Some(false),
+        _ => None,
+    }
 }
 
 struct OpenedAgySession {
@@ -399,6 +449,25 @@ async fn open_agy_session(
         let _ = wait_rpc_during_boot(shim, pending_rpcs, rx, &cfg.shim_seq_tracker).await;
     }
 
+    // Reconcile `fast_mode` when ACP advertises a differing `configOptions` value (e.g. cold `session/load`)
+    if let Some(advertised_fast) = parse_agy_fast_mode_config_value(&sess_val)
+        && advertised_fast != cfg.fast_mode
+        && let Ok(rx) = send_acp_req(
+            shim,
+            next_rpc_id,
+            pending_rpcs,
+            "session/set_config_option",
+            json!({
+                "sessionId": session_id,
+                "configId": "fast_mode",
+                "value": if cfg.fast_mode { "on" } else { "off" }
+            }),
+        )
+        .await
+    {
+        let _ = wait_rpc_during_boot(shim, pending_rpcs, rx, &cfg.shim_seq_tracker).await;
+    }
+
     Ok(OpenedAgySession {
         session_id,
         available_model_ids,
@@ -408,7 +477,7 @@ async fn open_agy_session(
 }
 
 async fn run_agy_actor(
-    cfg: SessionLaunchConfig,
+    mut cfg: SessionLaunchConfig,
     mut shim: orbit_shim::ShimClient,
     is_reattached: bool,
     mut cmd_rx: mpsc::Receiver<DriverCommand>,
@@ -677,6 +746,7 @@ async fn run_agy_actor(
     let mut reattached_turn_in_flight = is_reattached && active_turn_id.is_some();
     let mut active_prompt_rpc_key: Option<String> = None;
     let mut post_reattach_non_prompt_rpcs: HashSet<String> = HashSet::new();
+    let mut pending_fast_mode_rpcs: HashMap<String, bool> = HashMap::new();
     let mut last_dispatched_prompt: Option<(String, String)> = None;
     let mut seg_state = if let Some(ref tid) = active_turn_id {
         AgyStreamSegmentState {
@@ -1014,7 +1084,12 @@ async fn run_agy_actor(
                             let _ = shim.write_stdin_line(req).await;
                         }
                     }
-                    DriverCommand::SetConfig { model, effort } => {
+                    DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode,
+                    } => {
+                        let model_or_effort_changed = model.is_some() || effort.is_some();
                         if let Some(m) = model {
                             current_base_model =
                                 Some(normalize_agy_base_model_id(&m, &canonical_base_ids));
@@ -1022,7 +1097,9 @@ async fn run_agy_actor(
                         if effort.is_some() {
                             active_effort = effort;
                         }
-                        if let Some(ref base_m) = current_base_model {
+                        if model_or_effort_changed
+                            && let Some(ref base_m) = current_base_model
+                        {
                             let wire_model_id = resolve_agy_wire_model_id(
                                 base_m,
                                 active_effort,
@@ -1042,6 +1119,18 @@ async fn run_agy_actor(
                                 }
                             })
                             .to_string();
+                            let _ = shim.write_stdin_line(req).await;
+                        }
+                        if let Some(enabled) = fast_mode
+                            && enabled != cfg.fast_mode
+                        {
+                            cfg.fast_mode = enabled;
+                            let id = next_rpc_id;
+                            next_rpc_id += 1;
+                            pending_fast_mode_rpcs.insert(RpcId::Num(id).as_key(), enabled);
+                            let req =
+                                build_agy_set_fast_mode_request(id, &session_id, enabled)
+                                    .to_string();
                             let _ = shim.write_stdin_line(req).await;
                         }
                     }
@@ -1150,6 +1239,20 @@ async fn run_agy_actor(
                             // Response to our request (e.g. `session/prompt` completion)
                             if let Ok(rid) = serde_json::from_value::<RpcId>(val["id"].clone()) {
                                 let key = rid.as_key();
+                                if let Some(enabled) = pending_fast_mode_rpcs.remove(&key) {
+                                    if val.get("error").filter(|v| !v.is_null()).is_some() {
+                                        let state_label = if enabled { "on" } else { "off" };
+                                        let _ = evt_tx
+                                            .send(DriverEvent::Notice {
+                                                level: "info".into(),
+                                                message: format!(
+                                                    "Fast mode ({state_label}) saved; takes effect on next Antigravity session restart."
+                                                ),
+                                            })
+                                            .await;
+                                    }
+                                    continue;
+                                }
                                 if post_reattach_non_prompt_rpcs.remove(&key) {
                                     continue;
                                 }
@@ -5964,6 +6067,33 @@ struct AgyFallbackRow<'a> {
     efforts: &'a [ReasoningEffort],
 }
 
+pub fn antigravity_model_supports_fast_mode(
+    model_id: &str,
+    opt: Option<&Value>,
+    has_fast_config_option: bool,
+) -> bool {
+    if let Some(obj) = opt
+        && let Some(explicit) = obj
+            .get("supportsFastMode")
+            .or_else(|| obj.get("supports_fast_mode"))
+            .and_then(|v| v.as_bool())
+    {
+        return explicit;
+    }
+    let lower = model_id.trim().to_ascii_lowercase();
+    if lower.contains("orchestrator")
+        || lower.contains("flash")
+        || lower.contains("haiku")
+        || lower.starts_with("gpt-oss")
+    {
+        return false;
+    }
+    has_fast_config_option
+        || lower.starts_with("gemini-4-")
+        || lower.starts_with("gemini-3")
+        || lower.contains("opus")
+}
+
 pub fn fallback_antigravity_models() -> ProviderModelCatalog {
     let std_efforts = [
         ReasoningEffort::Low,
@@ -6062,6 +6192,7 @@ pub fn fallback_antigravity_models() -> ProviderModelCatalog {
                     is_default: Some(*e) == row.default_effort,
                 })
                 .collect(),
+            supports_fast_mode: antigravity_model_supports_fast_mode(row.id, None, false),
         })
         .collect();
 
@@ -6201,6 +6332,9 @@ pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderMode
     let thought_opt = config_options
         .iter()
         .find(|o| o.get("id").and_then(|x| x.as_str()) == Some("thought_level"));
+    let has_fast_config_option = config_options
+        .iter()
+        .any(|o| o.get("id").and_then(|x| x.as_str()) == Some("fast_mode"));
 
     let default_model_id = model_opt
         .and_then(|o| o.get("currentValue"))
@@ -6278,6 +6412,11 @@ pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderMode
                 is_default: default_model_id.as_deref() == Some(base_id),
                 default_effort: model_def_eff,
                 thinking_options,
+                supports_fast_mode: antigravity_model_supports_fast_mode(
+                    base_id,
+                    Some(opt),
+                    has_fast_config_option,
+                ),
             });
         }
     }
@@ -8459,6 +8598,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             attachments_dir: None,
             model: Some("gemini-4-neon".into()),
             effort: Some(ReasoningEffort::Xhigh),
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             resume_session_id: Some("f8c809f0-5617-41ca-b27f-63bd7019833f".into()),
             fork_from_session_id: None,
@@ -8636,6 +8776,7 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             attachments_dir: None,
             model: Some("gemini-4-carbon".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             resume_session_id: Some("sess_live_reattach".into()),
             fork_from_session_id: None,
@@ -8689,6 +8830,499 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         drop(cmd_tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn agy_fast_mode_launch_env_and_session_meta() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        let mut cfg = SessionLaunchConfig {
+            agent_id: "ag_fast".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: PathBuf::from("/tmp/agy_fast.sock"),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-4-carbon".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+        };
+
+        let env_off = build_agy_launch_env(&cfg);
+        assert!(!env_off.contains_key("AGY_FAST_MODE"));
+        assert!(build_agy_session_meta(&cfg).is_none());
+
+        cfg.fast_mode = true;
+        let env_on = build_agy_launch_env(&cfg);
+        assert_eq!(env_on.get("AGY_FAST_MODE").map(String::as_str), Some("1"));
+        assert_eq!(
+            build_agy_session_meta(&cfg),
+            Some(json!({ "antigravity": { "fastMode": true } }))
+        );
+
+        cfg.system_prompt_append = Some("Keep it concise.".into());
+        assert_eq!(
+            build_agy_session_meta(&cfg),
+            Some(json!({
+                "antigravity": {
+                    "systemPrompt": { "append": "Keep it concise." },
+                    "fastMode": true
+                }
+            }))
+        );
+
+        let req_on = build_agy_set_fast_mode_request(42, "sess_1", true);
+        assert_eq!(req_on["method"], "session/set_config_option");
+        assert_eq!(req_on["params"]["sessionId"], "sess_1");
+        assert_eq!(req_on["params"]["configId"], "fast_mode");
+        assert_eq!(req_on["params"]["value"], "on");
+
+        let req_off = build_agy_set_fast_mode_request(43, "sess_1", false);
+        assert_eq!(req_off["params"]["value"], "off");
+
+        let catalog = fallback_antigravity_models();
+        let carbon = catalog
+            .models
+            .iter()
+            .find(|m| m.id == "gemini-4-carbon")
+            .expect("carbon");
+        assert!(carbon.supports_fast_mode);
+        let opus = catalog
+            .models
+            .iter()
+            .find(|m| m.id == "claude-opus-5-5")
+            .expect("opus");
+        assert!(opus.supports_fast_mode);
+        let flash = catalog
+            .models
+            .iter()
+            .find(|m| m.id == "gemini-3.8-flash")
+            .expect("flash");
+        assert!(!flash.supports_fast_mode);
+    }
+
+    #[tokio::test]
+    async fn agy_live_fast_mode_toggle_ignores_unsupported_method_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_fast_toggle_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind mock shim");
+        let observed_fast_calls: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_fast_calls);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(
+                wh: &mut tokio::net::unix::OwnedWriteHalf,
+                seq: &mut u64,
+                v: Value,
+            ) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":1}}),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{
+                                    "sessionId":"sess_fast_live",
+                                    "models":{
+                                        "currentModelId":"gemini-4-carbon",
+                                        "availableModels":[{"modelId":"gemini-4-carbon"}]
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/set_config_option" => {
+                        observed_bg.lock().await.push(rpc.clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "error":{"code":-32601,"message":"Method not found"}
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "method":"session/update",
+                                "params":{
+                                    "sessionId":"sess_fast_live",
+                                    "update":{
+                                        "sessionUpdate":"agent_message_chunk",
+                                        "content":{"type":"text","text":"Fast mode ok"}
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}),
+                        )
+                        .await;
+                        break;
+                    }
+                    _ => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_fast_live".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-4-carbon".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(true),
+            })
+            .await
+            .expect("send fast toggle");
+        // Redundant toggle to the same state must NOT send a duplicate RPC
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(true),
+            })
+            .await
+            .expect("send redundant fast toggle");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "turn_fast_1".into(),
+                prompt: "ping".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("send prompt");
+
+        let mut saw_error = false;
+        let mut saw_reply = false;
+        let mut saw_restart_notice = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::StatusChanged(AgentStatus::Error { .. }) => saw_error = true,
+                DriverEvent::Notice { level, message }
+                    if level == "info"
+                        && message.contains("takes effect on next Antigravity session restart") =>
+                {
+                    saw_restart_notice = true;
+                }
+                DriverEvent::AssistantText {
+                    text,
+                    streaming: false,
+                    ..
+                } if text == "Fast mode ok" => saw_reply = true,
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+
+        assert!(
+            !saw_error,
+            "unsupported set_config_option must not fail session"
+        );
+        assert!(
+            saw_restart_notice,
+            "unsupported set_config_option should inform user via info notice"
+        );
+        assert!(saw_reply);
+        let calls = observed_fast_calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["params"]["configId"], "fast_mode");
+        assert_eq!(calls[0]["params"]["value"], "on");
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn agy_open_session_reconciles_fast_mode_config_option() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_fast_reconcile_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind mock shim");
+        let observed_set_opts: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_set_opts);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(
+                wh: &mut tokio::net::unix::OwnedWriteHalf,
+                seq: &mut u64,
+                v: Value,
+            ) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "session/load" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{
+                                    "sessionId":"sess_resume_1",
+                                    "models":{
+                                        "currentModelId":"gemini-4-carbon",
+                                        "availableModels":[{"modelId":"gemini-4-carbon"}]
+                                    },
+                                    "configOptions":[
+                                        {"id":"fast_mode","currentValue":"on"}
+                                    ]
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/set_config_option" => {
+                        observed_bg.lock().await.push(rpc.clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                        break;
+                    }
+                    _ => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let mut shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_fast_reconcile".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::FullAccess,
+            resume_session_id: Some("sess_resume_1".into()),
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+        };
+
+        let mut next_id = 1i64;
+        let mut pending = HashMap::new();
+        let opened = open_agy_session(
+            &cfg,
+            &mut shim,
+            &mut next_id,
+            &mut pending,
+            AgySessionOpenMode::Load("sess_resume_1"),
+            None,
+            None,
+            &SessionMode::FullAccess,
+        )
+        .await
+        .expect("open session");
+        assert_eq!(opened.session_id, "sess_resume_1");
+
+        let opts = observed_set_opts.lock().await;
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0]["params"]["sessionId"], "sess_resume_1");
+        assert_eq!(opts[0]["params"]["configId"], "fast_mode");
+        assert_eq!(opts[0]["params"]["value"], "off");
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = std::fs::remove_file(&sock_path);
     }
 }

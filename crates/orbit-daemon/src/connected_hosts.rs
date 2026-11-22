@@ -974,6 +974,7 @@ mod tests {
                 provider: orbit_protocol::ProviderKind::ClaudeCode,
                 model: None,
                 effort: None,
+                fast_mode: false,
                 mode: orbit_protocol::SessionMode::Default,
                 status: orbit_protocol::AgentStatus::Idle,
                 parent_agent_id: None,

@@ -28,6 +28,7 @@ import {
   collapseStrippedToken,
   normalizePermissionMode,
 } from "@/components/composer/composer-constants";
+import { ComposerFastToggle } from "@/components/composer/composer-fast-toggle";
 import { ComposerHeroHeader } from "@/components/composer/composer-hero-header";
 import { ComposerModePicker } from "@/components/composer/composer-mode-picker";
 import { ComposerModelPicker } from "@/components/composer/composer-model-picker";
@@ -591,6 +592,9 @@ export const OmniComposer = memo(function OmniComposer({
           return;
         }
         orbitActions.showToast("Start an active session first to copy");
+        break;
+      case "fast":
+        orbitActions.toggleActiveFastMode();
         break;
       case "orbit":
       case "orbit-handoff":
@@ -1357,8 +1361,9 @@ export const OmniComposer = memo(function OmniComposer({
                   </DropdownMenuContent>
                 </DropdownMenu>
 
-                {/* 2. Isolated Agent + Model + Thinking Mode Selector */}
+                {/* 2. Isolated Agent + Model + Thinking Mode Selector + Subtle Fast Toggle */}
                 <ComposerModelPicker />
+                <ComposerFastToggle iconOnly={isCompactBar} />
               </div>
 
               {/* Right Cluster: Isolated Access Permissions Selector + `34×34` Primary Action Circle */}

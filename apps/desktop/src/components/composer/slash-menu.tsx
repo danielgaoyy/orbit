@@ -21,6 +21,7 @@ import {
   SquareTerminal,
   Terminal,
   Users,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { modSymbol } from "@/lib/keybindings";
@@ -51,6 +52,9 @@ function resolveSlashCommandIcon(cmd: SlashCommandView): LucideIcon {
       return Download;
     case "copy":
       return Copy;
+    case "fast":
+    case "zap":
+      return Zap;
     case "orbit":
       return Layers;
     case "orbit-handoff":

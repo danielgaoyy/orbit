@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { PROVIDERS } from "@/components/composer/composer-constants";
 import {
   createDraftPersistenceController,
   hasNonEmptyScopeDraft,
@@ -351,6 +352,7 @@ export interface OrbitUiState {
   draftProvider: ProviderKind;
   draftModels: Partial<Record<ProviderKind, string | null>>;
   draftEffort: ReasoningEffort;
+  draftFastMode: boolean;
   draftMode: SessionMode;
   draftProfileId: string | null;
   draftUseWorktree: boolean;
@@ -507,6 +509,7 @@ interface PersistedPrefs {
   draftProvider?: ProviderKind;
   draftModels?: Partial<Record<ProviderKind, string | null>>;
   draftEffort?: ReasoningEffort;
+  draftFastMode?: boolean;
   draftMode?: SessionMode;
   draftUseWorktree?: boolean;
   promptHistory?: string[];
@@ -563,6 +566,7 @@ function writePrefsNow(snap: OrbitUiState): void {
       draftProvider: snap.draftProvider,
       draftModels: snap.draftModels,
       draftEffort: snap.draftEffort,
+      draftFastMode: snap.draftFastMode,
       draftMode: snap.draftMode,
       draftUseWorktree: snap.draftUseWorktree,
       promptHistory: snap.promptHistory.slice(-30),
@@ -699,6 +703,7 @@ const defaultInitialState: OrbitUiState = {
     ...(initialPrefs.draftModels ?? {}),
   },
   draftEffort: initialPrefs.draftEffort ?? "medium",
+  draftFastMode: initialPrefs.draftFastMode ?? false,
   draftMode:
     initialPrefs.draftMode && initialPrefs.draftMode !== "plan"
       ? initialPrefs.draftMode
@@ -2988,6 +2993,7 @@ export const orbitActions = {
     provider?: ProviderKind;
     model?: string | null;
     effort?: ReasoningEffort;
+    fastMode?: boolean;
     mode?: SessionMode;
     profileId?: string | null;
     useWorktree?: boolean;
@@ -3007,6 +3013,7 @@ export const orbitActions = {
           draftProvider: nextProvider,
           draftModels: nextModels,
           draftEffort: patch.effort ?? s.draftEffort,
+          draftFastMode: patch.fastMode ?? s.draftFastMode,
           draftMode: patch.mode ?? s.draftMode,
           draftProfileId:
             patch.profileId !== undefined
@@ -3028,6 +3035,60 @@ export const orbitActions = {
       },
       true,
     );
+  },
+
+  toggleActiveFastMode(action: "toggle" | "enable" | "disable" | boolean = "toggle"): void {
+    const hostId = state.selectedHostId;
+    const detail = hostId ? state.hostDetails[hostId] : undefined;
+    const activeAgent =
+      !state.isDraftNewSession && hostId && state.selectedAgentId
+        ? detail?.agents.find((a) => a.agent_id === state.selectedAgentId)
+        : undefined;
+
+    const availableProviders = detail?.host.available_providers ?? [];
+    const draftProvider: ProviderKind =
+      availableProviders.length > 0 && !availableProviders.includes(state.draftProvider)
+        ? (PROVIDERS.find((p) => availableProviders.includes(p.id))?.id ?? availableProviders[0])
+        : state.draftProvider;
+
+    const activeProvider: ProviderKind = activeAgent ? activeAgent.provider : draftProvider;
+    const rawModel = activeAgent ? activeAgent.model : (state.draftModels[activeProvider] ?? null);
+    const cat = getCatalogForProvider(detail?.provider_catalogs, activeProvider);
+    const spec = resolveActiveModelSpec(cat, rawModel);
+    const isDraft = !activeAgent;
+
+    if (!spec?.supports_fast_mode && (isDraft || !activeAgent.fast_mode)) {
+      if (isDraft && (action === false || action === "disable" || state.draftFastMode)) {
+        orbitActions.setDraftConfig({ fastMode: false });
+      }
+      notifyToast("Fast mode unavailable for this model");
+      return;
+    }
+
+    const current = activeAgent ? Boolean(activeAgent.fast_mode) : state.draftFastMode;
+
+    const next =
+      action === true || action === "enable"
+        ? true
+        : action === false || action === "disable"
+          ? false
+          : !current;
+
+    if (next && !spec?.supports_fast_mode) {
+      notifyToast("Fast mode unavailable for this model");
+      return;
+    }
+
+    if (activeAgent && hostId) {
+      void orbitIpc.updateAgent({
+        hostId,
+        agentId: activeAgent.agent_id,
+        fastMode: next,
+      });
+    } else {
+      orbitActions.setDraftConfig({ fastMode: next });
+    }
+    notifyToast(next ? "Fast mode on" : "Fast mode off");
   },
 
   cycleActiveMode(): void {
@@ -3561,6 +3622,17 @@ export const orbitActions = {
       return;
     }
 
+    if (composed.fast_mode_action) {
+      setState((s) => ({
+        ...s,
+        composerDrafts: { ...s.composerDrafts, [key]: "" },
+        slashDirectives: { ...s.slashDirectives, [key]: null },
+      }));
+      draftPersistence.flushNow();
+      orbitActions.toggleActiveFastMode(composed.fast_mode_action);
+      return;
+    }
+
     if (composed.is_btw) {
       setState((s) => ({
         ...s,
@@ -3761,6 +3833,8 @@ export const orbitActions = {
           state.draftEffort,
           cat.configured_default_effort,
         );
+      const supportsFast =
+        resolvedSel?.supports_fast_mode ?? Boolean(spec?.supports_fast_mode);
 
       pendingDraftCreate = { hostId, optimisticAgentId: null, startedAt: Date.now() };
       let optimisticId: string | undefined;
@@ -3772,6 +3846,7 @@ export const orbitActions = {
           provider: effectiveProvider,
           model: resolvedModel,
           effort: resolvedEffort,
+          fastMode: Boolean(state.draftFastMode && supportsFast),
           mode: state.draftMode,
           initialPrompt: assembledWirePrompt,
           initialDisplayPrompt: cleanUserText,

@@ -172,6 +172,8 @@ pub struct AgentProfile {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub mode: SessionMode,
     #[serde(default)]
     pub when_to_use: String,
@@ -284,6 +286,8 @@ pub struct ScheduleNewAgentConfig {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: bool,
     pub mode: SessionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,

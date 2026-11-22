@@ -463,6 +463,7 @@ export interface SpawnWorkspacePeerRequest {
   provider: ProviderKind;
   model?: string | null;
   effort?: ReasoningEffort | null;
+  fast_mode?: boolean;
   mode: SessionMode;
   initial_prompt: string;
   worktree_branch?: string | null;
@@ -499,6 +500,7 @@ export interface AgentProfile {
   provider: ProviderKind;
   model: string | null;
   effort: ReasoningEffort | null;
+  fast_mode?: boolean;
   mode: SessionMode;
   when_to_use: string;
   system_prompt_append: string | null;
@@ -541,6 +543,7 @@ export interface ScheduleNewAgentConfig {
   provider: ProviderKind;
   model?: string | null;
   effort?: ReasoningEffort | null;
+  fast_mode?: boolean;
   profile_id?: string | null;
   mode: SessionMode;
   worktree: boolean;
@@ -666,6 +669,7 @@ export interface AgentCardView {
   provider_label: string;
   model: string | null;
   effort: ReasoningEffort | null;
+  fast_mode?: boolean;
   mode: SessionMode;
   status_label: string;
   is_running: boolean;
@@ -771,6 +775,7 @@ export interface ProviderModelSpec {
   is_default: boolean;
   default_effort: ReasoningEffort | null;
   thinking_options: ThinkingOptionSpec[];
+  supports_fast_mode?: boolean;
 }
 
 export interface ProviderModelCatalog {
@@ -1481,6 +1486,7 @@ export interface ResolvedModelSelectionView {
   selected_effort: ReasoningEffort | null;
   selected_effort_label: string | null;
   thinking_options: ThinkingOptionSpec[];
+  supports_fast_mode?: boolean;
 }
 
 export type ClientPlatform = "desktop" | "ios" | "android" | "harmony";
@@ -1536,6 +1542,8 @@ export interface ComposePromptRequest {
   pastes: ComposerPasteInput[];
 }
 
+export type FastModeSlashAction = "toggle" | "enable" | "disable";
+
 export interface ComposedPromptView {
   wire_prompt: string;
   display_prompt: string;
@@ -1548,6 +1556,7 @@ export interface ComposedPromptView {
   fork_worktree?: boolean;
   fork_branch?: string | null;
   fork_prompt?: string | null;
+  fast_mode_action?: FastModeSlashAction | null;
   is_empty: boolean;
 }
 
@@ -1736,6 +1745,47 @@ export const orbitIpc = {
   async composePrompt(req: ComposePromptRequest): Promise<ComposedPromptView> {
     if (!isTauriRuntime()) {
       const text = req.raw_text.trim();
+      const fastAction = (() => {
+        if (
+          req.explicit_directive ||
+          req.contexts.length > 0 ||
+          req.quotes.length > 0 ||
+          req.pastes.length > 0
+        ) {
+          return null;
+        }
+        if (!text.startsWith("/")) return null;
+        const parts = text.split(/\s+/);
+        if (parts[0]?.toLowerCase() !== "/fast") return null;
+        if (parts.length === 1) return "toggle" as const;
+        if (parts.length === 2) {
+          const arg = parts[1].toLowerCase();
+          if (arg === "on" || arg === "true" || arg === "enable" || arg === "1") {
+            return "enable" as const;
+          }
+          if (arg === "off" || arg === "false" || arg === "disable" || arg === "0") {
+            return "disable" as const;
+          }
+        }
+        return null;
+      })();
+      if (fastAction) {
+        return {
+          wire_prompt: "",
+          display_prompt: "",
+          badges: [],
+          effective_directive: null,
+          is_compact: false,
+          is_btw: false,
+          btw_question: null,
+          is_fork: false,
+          fork_worktree: false,
+          fork_branch: null,
+          fork_prompt: null,
+          fast_mode_action: fastAction,
+          is_empty: false,
+        };
+      }
       return {
         wire_prompt: text,
         display_prompt: text,
@@ -1748,6 +1798,7 @@ export const orbitIpc = {
         fork_worktree: false,
         fork_branch: null,
         fork_prompt: null,
+        fast_mode_action: null,
         is_empty: text.length === 0,
       };
     }
@@ -1991,6 +2042,7 @@ export const orbitIpc = {
     provider: ProviderKind;
     model?: string | null;
     effort?: ReasoningEffort | null;
+    fastMode?: boolean | null;
     mode: SessionMode;
     initialPrompt: string;
     initialDisplayPrompt?: string | null;
@@ -2006,6 +2058,7 @@ export const orbitIpc = {
       ...params,
       model: params.model ?? null,
       effort: params.effort ?? null,
+      fastMode: params.fastMode ?? null,
       initialDisplayPrompt: params.initialDisplayPrompt ?? null,
       initialBadges: params.initialBadges ?? [],
       profileId: params.profileId ?? null,
@@ -2170,6 +2223,7 @@ export const orbitIpc = {
     title?: string | null;
     model?: string | null;
     effort?: ReasoningEffort | null;
+    fastMode?: boolean | null;
     mode?: SessionMode | null;
     labels?: Record<string, string> | null;
     handle?: string | null;
@@ -2181,6 +2235,7 @@ export const orbitIpc = {
       title: params.title ?? null,
       model: params.model ?? null,
       effort: params.effort ?? null,
+      fastMode: params.fastMode ?? null,
       mode: params.mode ?? null,
       labels: params.labels ?? null,
       handle: params.handle ?? null,

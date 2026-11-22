@@ -31,6 +31,111 @@ fn codex_startup_mutex() -> &'static AsyncMutex<()> {
     LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
+fn build_codex_launch_args(fast_mode: bool) -> Vec<String> {
+    let mut args = vec!["app-server".to_string()];
+    if fast_mode {
+        args.push("-c".to_string());
+        args.push("service_tier=\"fast\"".to_string());
+    }
+    args
+}
+
+fn build_codex_thread_start_params(
+    cfg: &SessionLaunchConfig,
+    approval_policy: &str,
+    start_sandbox: &str,
+    inner_config: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut params = json!({
+        "cwd": cfg.cwd.to_string_lossy(),
+        "approvalPolicy": approval_policy,
+        "sandbox": start_sandbox,
+        "approvalsReviewer": "user",
+        "ephemeral": false
+    });
+    if let Some(ref m) = cfg.model {
+        params["model"] = Value::String(m.clone());
+    }
+    if cfg.fast_mode {
+        params["serviceTier"] = Value::String("fast".to_string());
+    }
+    if !inner_config.is_empty() {
+        params["config"] = Value::Object(inner_config.clone());
+    }
+    params
+}
+
+fn build_codex_thread_resume_params(
+    tid: &str,
+    fast_mode: bool,
+    inner_config: &serde_json::Map<String, Value>,
+) -> Value {
+    let mut params = json!({
+        "threadId": tid,
+        "excludeTurns": true
+    });
+    if fast_mode {
+        params["serviceTier"] = Value::String("fast".to_string());
+    }
+    if !inner_config.is_empty() {
+        params["config"] = Value::Object(inner_config.clone());
+    }
+    params
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_codex_turn_start_params(
+    cfg: &SessionLaunchConfig,
+    thread_id: &str,
+    mode: &SessionMode,
+    resolved_model: &Option<String>,
+    current_effort: Option<ReasoningEffort>,
+    fast_mode: bool,
+    service_tier_explicitly_controlled: bool,
+    input_items: Value,
+) -> Value {
+    let (pol, sandbox_policy) = codex_turn_policies(mode, &cfg.extra_dirs);
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": input_items,
+        "cwd": cfg.cwd.to_string_lossy(),
+        "approvalPolicy": pol,
+        "approvalsReviewer": "user",
+        "sandboxPolicy": sandbox_policy
+    });
+    if let Some(m) = resolved_model {
+        params["model"] = Value::String(m.clone());
+    }
+    if let Some(eff) = current_effort {
+        let eff_str = match eff {
+            ReasoningEffort::Off => Some("none"),
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+            ReasoningEffort::Max => Some("max"),
+            ReasoningEffort::Ultra => Some("ultra"),
+        };
+        if let Some(s) = eff_str {
+            params["effort"] = Value::String(s.to_string());
+        }
+    }
+    if fast_mode {
+        params["serviceTier"] = Value::String("fast".to_string());
+    } else if service_tier_explicitly_controlled {
+        // Codex app-server uses three-state `Option<Option<ServiceTier>>`:
+        // explicit `null` clears `-c service_tier="fast"` / thread / user config.
+        params["serviceTier"] = Value::Null;
+    }
+    if matches!(mode, SessionMode::Plan) {
+        params["collaborationMode"] = json!({
+            "mode": "plan",
+            "settings": {}
+        });
+    }
+    params
+}
+
 pub async fn spawn_codex_session(
     cfg: SessionLaunchConfig,
 ) -> Result<ProviderSessionHandle, String> {
@@ -53,7 +158,7 @@ pub async fn spawn_codex_session(
             shim_id: format!("codex_{}", cfg.agent_id),
             mode: ShimMode::Stdio,
             program: cfg.executable.to_string_lossy().to_string(),
-            args: vec!["app-server".to_string()],
+            args: build_codex_launch_args(cfg.fast_mode),
             cwd: cfg.cwd.clone(),
             env,
         };
@@ -184,6 +289,9 @@ async fn run_codex_actor(
                 if let Some(ref m) = cfg.model {
                     params["model"] = Value::String(m.clone());
                 }
+                if cfg.fast_mode {
+                    params["serviceTier"] = Value::String("fast".to_string());
+                }
                 if !inner_config.is_empty() {
                     params["config"] = Value::Object(inner_config.clone());
                 }
@@ -194,13 +302,7 @@ async fn run_codex_actor(
                 })
             }
             CodexThreadOpenMode::Resume(tid) => {
-                let mut params = json!({
-                    "threadId": tid,
-                    "excludeTurns": true
-                });
-                if !inner_config.is_empty() {
-                    params["config"] = Value::Object(inner_config.clone());
-                }
+                let params = build_codex_thread_resume_params(tid, cfg.fast_mode, &inner_config);
                 json!({
                     "id": req_id,
                     "method": "thread/resume",
@@ -208,19 +310,12 @@ async fn run_codex_actor(
                 })
             }
             CodexThreadOpenMode::Start => {
-                let mut params = json!({
-                    "cwd": cfg.cwd.to_string_lossy(),
-                    "approvalPolicy": approval_policy,
-                    "sandbox": start_sandbox,
-                    "approvalsReviewer": "user",
-                    "ephemeral": false
-                });
-                if let Some(ref m) = cfg.model {
-                    params["model"] = Value::String(m.clone());
-                }
-                if !inner_config.is_empty() {
-                    params["config"] = Value::Object(inner_config.clone());
-                }
+                let params = build_codex_thread_start_params(
+                    &cfg,
+                    approval_policy,
+                    start_sandbox,
+                    &inner_config,
+                );
                 json!({
                     "id": req_id,
                     "method": "thread/start",
@@ -366,6 +461,8 @@ async fn run_codex_actor(
         (tid, model)
     };
     let mut current_effort = cfg.effort;
+    let mut current_fast_mode = cfg.fast_mode;
+    let mut service_tier_explicitly_controlled = cfg.fast_mode;
 
     let _ = evt_tx
         .send(DriverEvent::SessionInitialized {
@@ -462,6 +559,8 @@ async fn run_codex_actor(
                             &mode,
                             &resolved_model,
                             current_effort,
+                            current_fast_mode,
+                            service_tier_explicitly_controlled,
                             &turn_id,
                             &prompt,
                             &mut next_id,
@@ -495,9 +594,21 @@ async fn run_codex_actor(
                     DriverCommand::SetMode { mode: new_mode } => {
                         mode = new_mode;
                     }
-                    DriverCommand::SetConfig { model, effort } => {
-                        resolved_model = model;
-                        current_effort = effort;
+                    DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode,
+                    } => {
+                        if model.is_some() {
+                            resolved_model = model;
+                        }
+                        if effort.is_some() {
+                            current_effort = effort;
+                        }
+                        if let Some(fm) = fast_mode {
+                            current_fast_mode = fm;
+                            service_tier_explicitly_controlled = true;
+                        }
                     }
                     DriverCommand::ResolvePermission { request_id, decision } => {
                         if let Some(app) = pending_approvals.remove(&request_id) {
@@ -596,6 +707,8 @@ async fn run_codex_actor(
                                     &mode,
                                     &resolved_model,
                                     current_effort,
+                                    current_fast_mode,
+                                    service_tier_explicitly_controlled,
                                     &next_tid,
                                     &next_prompt,
                                     &mut next_id,
@@ -717,6 +830,8 @@ async fn dispatch_codex_turn(
     mode: &SessionMode,
     resolved_model: &Option<String>,
     current_effort: Option<ReasoningEffort>,
+    fast_mode: bool,
+    service_tier_explicitly_controlled: bool,
     turn_id: &str,
     prompt: &str,
     next_id: &mut u64,
@@ -736,40 +851,18 @@ async fn dispatch_codex_turn(
         }))
         .await;
 
-    let (pol, sandbox_policy) = codex_turn_policies(mode, &cfg.extra_dirs);
     let req_id = *next_id;
     *next_id += 1;
-    let mut params = json!({
-        "threadId": thread_id,
-        "input": input_items,
-        "cwd": cfg.cwd.to_string_lossy(),
-        "approvalPolicy": pol,
-        "approvalsReviewer": "user",
-        "sandboxPolicy": sandbox_policy
-    });
-    if let Some(m) = resolved_model {
-        params["model"] = Value::String(m.clone());
-    }
-    if let Some(eff) = current_effort {
-        let eff_str = match eff {
-            ReasoningEffort::Off => Some("none"),
-            ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium => Some("medium"),
-            ReasoningEffort::High => Some("high"),
-            ReasoningEffort::Xhigh => Some("xhigh"),
-            ReasoningEffort::Max => Some("max"),
-            ReasoningEffort::Ultra => Some("ultra"),
-        };
-        if let Some(s) = eff_str {
-            params["effort"] = Value::String(s.to_string());
-        }
-    }
-    if matches!(mode, SessionMode::Plan) {
-        params["collaborationMode"] = json!({
-            "mode": "plan",
-            "settings": {}
-        });
-    }
+    let params = build_codex_turn_start_params(
+        cfg,
+        thread_id,
+        mode,
+        resolved_model,
+        current_effort,
+        fast_mode,
+        service_tier_explicitly_controlled,
+        Value::Array(input_items),
+    );
 
     let req = json!({
         "id": req_id,
@@ -1581,6 +1674,34 @@ fn build_codex_thinking_options(
     out
 }
 
+pub fn codex_model_supports_fast_mode(model_id: &str, item: Option<&Value>) -> bool {
+    if let Some(obj) = item {
+        if let Some(explicit) = obj
+            .get("supportsFastMode")
+            .or_else(|| obj.get("supports_fast_mode"))
+            .and_then(|v| v.as_bool())
+        {
+            return explicit;
+        }
+        if let Some(tiers) = obj
+            .get("supportedServiceTiers")
+            .or_else(|| obj.get("supported_service_tiers"))
+            .or_else(|| obj.get("service_tiers"))
+            .and_then(|v| v.as_array())
+        {
+            return tiers
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|t| t.eq_ignore_ascii_case("fast"));
+        }
+    }
+    let lower = model_id.trim().to_ascii_lowercase();
+    if lower.starts_with("gpt-oss") {
+        return false;
+    }
+    lower.starts_with("gpt-5") || lower.starts_with("gpt-6") || lower.contains("codex")
+}
+
 pub async fn fallback_codex_models() -> ProviderModelCatalog {
     let (cfg_model, cfg_effort) = read_codex_config_toml_defaults().await;
 
@@ -1657,6 +1778,7 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
                 is_default: false,
                 default_effort: resolved_eff,
                 thinking_options: build_codex_thinking_options(&effort_entries, resolved_eff),
+                supports_fast_mode: codex_model_supports_fast_mode(id, Some(item)),
             });
         }
 
@@ -1777,6 +1899,7 @@ pub async fn fallback_codex_models() -> ProviderModelCatalog {
                 },
                 default_effort: Some(resolved_eff),
                 thinking_options: build_codex_thinking_options(&full_efforts, Some(resolved_eff)),
+                supports_fast_mode: codex_model_supports_fast_mode(id, None),
             }
         })
         .collect();
@@ -1974,6 +2097,7 @@ pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatal
                 &effort_entries,
                 resolved_default_effort,
             ),
+            supports_fast_mode: codex_model_supports_fast_mode(id, Some(item)),
         });
     }
 
@@ -1992,5 +2116,498 @@ pub async fn probe_codex_models(executable: Option<&Path>) -> ProviderModelCatal
         models,
         configured_default_model: configured_model,
         configured_default_effort: configured_effort,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    fn sample_cfg(fast_mode: bool) -> SessionLaunchConfig {
+        SessionLaunchConfig {
+            agent_id: "ag_codex_test".into(),
+            provider: ProviderKind::Codex,
+            executable: PathBuf::from("/usr/bin/codex"),
+            orbit_exe: PathBuf::from("/usr/bin/orbit"),
+            shim_socket: PathBuf::from("/tmp/codex.sock"),
+            cwd: PathBuf::from("/repo"),
+            extra_dirs: Vec::new(),
+            attachments_dir: None,
+            model: Some("gpt-5.4".into()),
+            effort: Some(ReasoningEffort::Medium),
+            fast_mode,
+            mode: SessionMode::AcceptEdits,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: Vec::new(),
+            persisted_bg_wait: false,
+        }
+    }
+
+    #[test]
+    fn launch_args_and_rpc_params_respect_fast_mode() {
+        assert_eq!(build_codex_launch_args(false), vec!["app-server"]);
+        assert_eq!(
+            build_codex_launch_args(true),
+            vec!["app-server", "-c", "service_tier=\"fast\""]
+        );
+
+        let empty_cfg = serde_json::Map::new();
+        let off_thread = build_codex_thread_start_params(
+            &sample_cfg(false),
+            "on-request",
+            "workspace-write",
+            &empty_cfg,
+        );
+        assert!(off_thread.get("serviceTier").is_none());
+        assert!(off_thread.get("service_tier").is_none());
+
+        let on_thread = build_codex_thread_start_params(
+            &sample_cfg(true),
+            "on-request",
+            "workspace-write",
+            &empty_cfg,
+        );
+        assert_eq!(on_thread["serviceTier"], json!("fast"));
+        assert!(on_thread.get("service_tier").is_none());
+
+        let resume_off = build_codex_thread_resume_params("thr_old", false, &empty_cfg);
+        assert!(resume_off.get("serviceTier").is_none());
+        let resume_on = build_codex_thread_resume_params("thr_old", true, &empty_cfg);
+        assert_eq!(resume_on["serviceTier"], json!("fast"));
+
+        let cfg = sample_cfg(false);
+        let turn_uncontrolled_off = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::AcceptEdits,
+            &Some("gpt-5.4".into()),
+            Some(ReasoningEffort::High),
+            false,
+            false,
+            json!([]),
+        );
+        assert!(turn_uncontrolled_off.get("serviceTier").is_none());
+
+        let turn_on = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::AcceptEdits,
+            &Some("gpt-5.4".into()),
+            Some(ReasoningEffort::High),
+            true,
+            true,
+            json!([]),
+        );
+        assert_eq!(turn_on["serviceTier"], json!("fast"));
+
+        let turn_explicit_reset = build_codex_turn_start_params(
+            &cfg,
+            "thr_1",
+            &SessionMode::AcceptEdits,
+            &Some("gpt-5.4".into()),
+            Some(ReasoningEffort::High),
+            false,
+            true,
+            json!([]),
+        );
+        assert_eq!(
+            turn_explicit_reset
+                .as_object()
+                .expect("object")
+                .get("serviceTier"),
+            Some(&Value::Null)
+        );
+    }
+
+    #[test]
+    fn codex_catalog_marks_gpt5_and_codex_models_as_fast_capable() {
+        assert!(codex_model_supports_fast_mode("gpt-5.4", None));
+        assert!(codex_model_supports_fast_mode("gpt-5.3-codex", None));
+        assert!(codex_model_supports_fast_mode("gpt-6.2-sol", None));
+        assert!(!codex_model_supports_fast_mode("gpt-oss-120b", None));
+        assert!(!codex_model_supports_fast_mode("o3-mini", None));
+        assert!(codex_model_supports_fast_mode(
+            "custom-model",
+            Some(&json!({ "supportedServiceTiers": ["standard", "fast"] }))
+        ));
+        assert!(!codex_model_supports_fast_mode(
+            "gpt-5.4",
+            Some(&json!({ "supportsFastMode": false }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_live_fast_mode_toggle_updates_subsequent_turn_start() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_codex_fast_toggle_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind mock shim");
+        let observed_turns: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_turns);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(
+                wh: &mut tokio::net::unix::OwnedWriteHalf,
+                seq: &mut u64,
+                v: Value,
+            ) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "thread/start" => {
+                        assert!(rpc["params"].get("serviceTier").is_none());
+                        assert!(rpc["params"].get("service_tier").is_none());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "thread": { "id": "thr_live_1" },
+                                    "model": "gpt-5.4"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "turn/start" => {
+                        let turn_idx = {
+                            let mut guard = observed_bg.lock().await;
+                            guard.push(rpc["params"].clone());
+                            guard.len()
+                        };
+                        let nat_tid = format!("nat_turn_{turn_idx}");
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": { "turn": { "id": nat_tid } }
+                            }),
+                        )
+                        .await;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "method": "turn/completed",
+                                "params": { "turn": { "id": nat_tid, "status": "completed" } }
+                            }),
+                        )
+                        .await;
+                        if turn_idx >= 2 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut cfg = sample_cfg(false);
+        cfg.shim_socket = sock_path.clone();
+
+        let actor = tokio::spawn(run_codex_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // Toggle fast mode ON without specifying model/effort -> must preserve existing model & effort!
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(true),
+            })
+            .await
+            .expect("toggle on");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t1".into(),
+                prompt: "first".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("prompt 1");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn 1 timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // Toggle fast mode OFF -> next turn omits service_tier
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(false),
+            })
+            .await
+            .expect("toggle off");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t2".into(),
+                prompt: "second".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("prompt 2");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn 2 timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        let turns = observed_turns.lock().await;
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["serviceTier"], json!("fast"));
+        assert!(turns[0].get("service_tier").is_none());
+        assert_eq!(turns[0]["model"], json!("gpt-5.4"));
+        assert_eq!(turns[0]["effort"], json!("medium"));
+        assert_eq!(
+            turns[1].as_object().expect("turn 2 obj").get("serviceTier"),
+            Some(&Value::Null)
+        );
+        assert_eq!(turns[1]["model"], json!("gpt-5.4"));
+        assert_eq!(turns[1]["effort"], json!("medium"));
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn codex_start_fast_true_then_toggle_false_sends_null_service_tier() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_codex_fast_reset_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind mock shim");
+        let observed_thread_start: Arc<tokio::sync::Mutex<Option<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let observed_turns: Arc<tokio::sync::Mutex<Vec<Value>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_ts_bg = Arc::clone(&observed_thread_start);
+        let observed_turns_bg = Arc::clone(&observed_turns);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(
+                wh: &mut tokio::net::unix::OwnedWriteHalf,
+                seq: &mut u64,
+                v: Value,
+            ) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(rpc) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+                let method = rpc.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "thread/start" => {
+                        *observed_ts_bg.lock().await = Some(rpc["params"].clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": {
+                                    "thread": { "id": "thr_fast_init" },
+                                    "model": "gpt-5.4"
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "turn/start" => {
+                        observed_turns_bg.lock().await.push(rpc["params"].clone());
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "id": id,
+                                "result": { "turn": { "id": "nat_turn_reset" } }
+                            }),
+                        )
+                        .await;
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "method": "turn/completed",
+                                "params": { "turn": { "id": "nat_turn_reset", "status": "completed" } }
+                            }),
+                        )
+                        .await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut cfg = sample_cfg(true);
+        cfg.shim_socket = sock_path.clone();
+
+        let actor = tokio::spawn(run_codex_actor(cfg, shim, false, cmd_rx, evt_tx));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // Disable fast mode on a session that booted with `fast_mode: true`
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(false),
+            })
+            .await
+            .expect("toggle off");
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "t_reset".into(),
+                prompt: "standard tier please".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("prompt");
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        let ts = observed_thread_start
+            .lock()
+            .await
+            .clone()
+            .expect("thread/start observed");
+        assert_eq!(ts["serviceTier"], json!("fast"));
+
+        let turns = observed_turns.lock().await;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].as_object().expect("turn obj").get("serviceTier"),
+            Some(&Value::Null),
+            "toggling true -> false must emit explicit null serviceTier to override -c service_tier=fast"
+        );
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

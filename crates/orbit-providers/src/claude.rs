@@ -30,6 +30,103 @@ enum ClaudeSessionStartMode<'a> {
     ForkFrom(&'a str),
 }
 
+fn apply_claude_settings_json(args: &mut Vec<String>, key: &str, value: Value) {
+    let mut idx = 0;
+    while idx < args.len() {
+        if args[idx] == "--settings"
+            && let Some(raw) = args.get(idx + 1)
+        {
+            if let Some(mut obj) = serde_json::from_str::<Value>(raw)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+            {
+                obj.insert(key.to_string(), value);
+                args[idx + 1] = Value::Object(obj).to_string();
+                return;
+            }
+            // Do not clobber a file path argument such as `--settings /path/to/settings.json`.
+            idx += 2;
+            continue;
+        }
+        if let Some(raw) = args[idx].strip_prefix("--settings=")
+            && let Some(mut obj) = serde_json::from_str::<Value>(raw)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+        {
+            obj.insert(key.to_string(), value);
+            args[idx] = format!("--settings={}", Value::Object(obj));
+            return;
+        }
+        idx += 1;
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert(key.to_string(), value);
+    args.push("--settings".to_string());
+    args.push(Value::Object(obj).to_string());
+}
+
+fn extract_claude_control_error(val: &Value) -> Option<String> {
+    let candidates = [
+        val.pointer("/response/error"),
+        val.pointer("/response/error/message"),
+        val.get("error"),
+        val.pointer("/error/message"),
+    ];
+    for cand in candidates.into_iter().flatten() {
+        if let Some(s) = cand.as_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_claude_unsupported_control_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("unknown control")
+        || lower.contains("unknown subtype")
+        || lower.contains("unrecognized subtype")
+        || lower.contains("unrecognized control")
+        || lower.contains("unsupported control")
+        || lower.contains("unsupported subtype")
+        || lower.contains("invalid subtype")
+        || lower.contains("method not found")
+        || (lower.contains("apply_flag_settings")
+            && (lower.contains("unknown")
+                || lower.contains("unsupported")
+                || lower.contains("unrecognized")
+                || lower.contains("not found")
+                || lower.contains("invalid")))
+}
+
+pub fn claude_model_supports_fast_mode(model_id: &str) -> bool {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(row) = CLAUDE_MANIFEST
+        .iter()
+        .find(|r| r.id.eq_ignore_ascii_case(&lower))
+    {
+        return row.supports_fast_mode;
+    }
+    if lower == "opus" {
+        return true;
+    }
+    if lower.starts_with("claude-opus-") {
+        return lower.starts_with("claude-opus-4-6")
+            || lower.starts_with("claude-opus-4.6")
+            || lower.starts_with("claude-opus-4-8")
+            || lower.starts_with("claude-opus-4.8")
+            || lower.starts_with("claude-opus-5")
+            || lower.starts_with("claude-opus-6");
+    }
+    false
+}
+
 fn build_claude_launch_args(
     cfg: &SessionLaunchConfig,
     start_mode: ClaudeSessionStartMode<'_>,
@@ -93,7 +190,23 @@ fn build_claude_launch_args(
         args.push("--append-system-prompt".to_string());
         args.push(sys_append.clone());
     }
+    if cfg.fast_mode {
+        apply_claude_settings_json(&mut args, "fastMode", Value::Bool(true));
+    }
     args
+}
+
+fn build_claude_fast_mode_control_request(request_id: &str, enabled: bool) -> Value {
+    json!({
+        "request_id": request_id,
+        "type": "control_request",
+        "request": {
+            "subtype": "apply_flag_settings",
+            "settings": {
+                "fastMode": enabled
+            }
+        }
+    })
 }
 
 async fn spawn_claude_shim_and_init(
@@ -356,6 +469,9 @@ async fn run_claude_actor(
         HashMap::new();
     let mut bg_tool_use_to_task: HashMap<String, String> = HashMap::new();
     let mut bg_tool_uses: HashMap<String, BackgroundTaskInfo> = HashMap::new();
+    let mut confirmed_fast_mode: bool = cfg.fast_mode;
+    let mut active_fast_mode: bool = cfg.fast_mode;
+    let mut pending_fast_mode_reqs: HashMap<String, bool> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -458,7 +574,11 @@ async fn run_claude_actor(
                         });
                         let _ = shim.write_stdin_line(req.to_string()).await;
                     }
-                    DriverCommand::SetConfig { model, effort } => {
+                    DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode,
+                    } => {
                         if let Some(m) = model {
                             let rid = format!("ctrl_{ctrl_seq}");
                             ctrl_seq += 1;
@@ -491,6 +611,16 @@ async fn run_claude_actor(
                                     "max_thinking_tokens": max_tokens
                                 }
                             });
+                            let _ = shim.write_stdin_line(req.to_string()).await;
+                        }
+                        if let Some(enabled) = fast_mode
+                            && enabled != active_fast_mode
+                        {
+                            active_fast_mode = enabled;
+                            let rid = format!("ctrl_{ctrl_seq}");
+                            ctrl_seq += 1;
+                            let req = build_claude_fast_mode_control_request(&rid, enabled);
+                            pending_fast_mode_reqs.insert(rid, enabled);
                             let _ = shim.write_stdin_line(req.to_string()).await;
                         }
                     }
@@ -1204,6 +1334,51 @@ async fn run_claude_actor(
                                 )
                                 .await;
                             }
+                            "control_response" => {
+                                if let Some(resp_rid) = val
+                                    .pointer("/response/request_id")
+                                    .and_then(|v| v.as_str())
+                                    && let Some(enabled) = pending_fast_mode_reqs.remove(resp_rid)
+                                {
+                                    let was_err = val
+                                        .pointer("/response/subtype")
+                                        .and_then(|v| v.as_str())
+                                        == Some("error");
+                                    if !was_err {
+                                        confirmed_fast_mode = enabled;
+                                    } else {
+                                        if pending_fast_mode_reqs.is_empty() {
+                                            active_fast_mode = confirmed_fast_mode;
+                                        }
+                                        let state_label = if enabled { "on" } else { "off" };
+                                        let raw_err = extract_claude_control_error(&val);
+                                        let (level, message) = match raw_err {
+                                            Some(err_msg)
+                                                if !is_claude_unsupported_control_error(&err_msg) =>
+                                            {
+                                                (
+                                                    "error",
+                                                    format!(
+                                                        "Fast mode ({state_label}) rejected by Claude: {err_msg}"
+                                                    ),
+                                                )
+                                            }
+                                            _ => (
+                                                "info",
+                                                format!(
+                                                    "Fast mode ({state_label}) saved; takes effect on next Claude session restart."
+                                                ),
+                                            ),
+                                        };
+                                        let _ = evt_tx
+                                            .send(DriverEvent::Notice {
+                                                level: level.into(),
+                                                message,
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
                             "result" => {
                                 active_turn_id = None;
                                 let is_err = val
@@ -1810,6 +1985,7 @@ struct ClaudeManifestRow {
     default_priority: u8,
     default_effort: Option<ReasoningEffort>,
     efforts: &'static [ReasoningEffort],
+    supports_fast_mode: bool,
 }
 
 const EFFORTS_XHIGH_WITH_OFF: &[ReasoningEffort] = &[
@@ -1846,6 +2022,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 3,
         default_effort: Some(ReasoningEffort::Medium),
         efforts: EFFORTS_XHIGH,
+        supports_fast_mode: true,
     },
     ClaudeManifestRow {
         id: "claude-fable-5-2",
@@ -1855,6 +2032,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 0,
         default_effort: Some(ReasoningEffort::Medium),
         efforts: EFFORTS_XHIGH,
+        supports_fast_mode: false,
     },
     ClaudeManifestRow {
         id: "claude-sonnet-5-5",
@@ -1864,6 +2042,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 0,
         default_effort: Some(ReasoningEffort::Medium),
         efforts: EFFORTS_XHIGH,
+        supports_fast_mode: false,
     },
     ClaudeManifestRow {
         id: "claude-haiku-5-5",
@@ -1873,6 +2052,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 0,
         default_effort: Some(ReasoningEffort::Medium),
         efforts: EFFORTS_XHIGH_WITH_OFF,
+        supports_fast_mode: false,
     },
     ClaudeManifestRow {
         id: "claude-opus-5",
@@ -1882,6 +2062,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 2,
         default_effort: Some(ReasoningEffort::High),
         efforts: EFFORTS_XHIGH_WITH_OFF,
+        supports_fast_mode: true,
     },
     ClaudeManifestRow {
         id: "claude-fable-5-1",
@@ -1891,6 +2072,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 0,
         default_effort: Some(ReasoningEffort::High),
         efforts: EFFORTS_XHIGH,
+        supports_fast_mode: false,
     },
     ClaudeManifestRow {
         id: "claude-sonnet-5",
@@ -1900,6 +2082,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 0,
         default_effort: Some(ReasoningEffort::High),
         efforts: EFFORTS_XHIGH_WITH_OFF,
+        supports_fast_mode: false,
     },
     ClaudeManifestRow {
         id: "claude-opus-4-8",
@@ -1909,6 +2092,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 1,
         default_effort: Some(ReasoningEffort::High),
         efforts: EFFORTS_XHIGH_WITH_OFF,
+        supports_fast_mode: true,
     },
     ClaudeManifestRow {
         id: "claude-opus-4-6",
@@ -1918,6 +2102,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 0,
         default_effort: Some(ReasoningEffort::High),
         efforts: EFFORTS_STANDARD_WITH_OFF,
+        supports_fast_mode: true,
     },
     ClaudeManifestRow {
         id: "claude-sonnet-4-6",
@@ -1927,6 +2112,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 0,
         default_effort: Some(ReasoningEffort::High),
         efforts: EFFORTS_STANDARD_WITH_OFF,
+        supports_fast_mode: false,
     },
     ClaudeManifestRow {
         id: "claude-haiku-4-5",
@@ -1936,6 +2122,7 @@ const CLAUDE_MANIFEST: &[ClaudeManifestRow] = &[
         default_priority: 0,
         default_effort: None,
         efforts: &[],
+        supports_fast_mode: false,
     },
 ];
 
@@ -1988,6 +2175,7 @@ fn build_claude_catalog_for_version(version: Option<(u32, u32, u32)>) -> Provide
                 is_default: Some(row.id) == best_default_id,
                 default_effort: row.default_effort,
                 thinking_options,
+                supports_fast_mode: row.supports_fast_mode,
             }
         })
         .collect();
@@ -2029,7 +2217,7 @@ pub async fn probe_claude_models(executable: Option<&Path>) -> ProviderModelCata
 }
 
 #[cfg(test)]
-mod fork_tests {
+mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
@@ -2046,6 +2234,7 @@ mod fork_tests {
             attachments_dir: None,
             model: Some("sonnet".into()),
             effort: None,
+            fast_mode: false,
             mode: SessionMode::Default,
             resume_session_id: None,
             fork_from_session_id: fork_sid.map(ToOwned::to_owned),
@@ -2062,6 +2251,37 @@ mod fork_tests {
                 "[Prior Conversation Context in this Workspace]\nUser: hi".into(),
             ),
             persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+        }
+    }
+
+    fn sample_cfg(fast_mode: bool) -> SessionLaunchConfig {
+        SessionLaunchConfig {
+            agent_id: "ag_claude_test".into(),
+            provider: ProviderKind::ClaudeCode,
+            executable: PathBuf::from("/usr/bin/claude"),
+            orbit_exe: PathBuf::from("/usr/bin/orbit"),
+            shim_socket: PathBuf::from("/tmp/claude.sock"),
+            cwd: PathBuf::from("/repo"),
+            extra_dirs: Vec::new(),
+            attachments_dir: None,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode,
+            mode: SessionMode::AcceptEdits,
+            resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: Vec::new(),
             persisted_bg_wait: false,
         }
     }
@@ -2160,6 +2380,287 @@ mod fork_tests {
         );
         let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    fn launch_args_include_settings_only_when_fast_mode_enabled() {
+        let off_args =
+            build_claude_launch_args(&sample_cfg(false), ClaudeSessionStartMode::Fresh("sess-1"));
+        assert!(!off_args.iter().any(|a| a.starts_with("--settings")));
+
+        let on_args =
+            build_claude_launch_args(&sample_cfg(true), ClaudeSessionStartMode::Fresh("sess-1"));
+        let idx = on_args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings flag");
+        let parsed: Value = serde_json::from_str(&on_args[idx + 1]).expect("valid settings json");
+        assert_eq!(parsed, json!({ "fastMode": true }));
+    }
+
+    #[test]
+    fn apply_claude_settings_merges_existing_json_cleanly() {
+        let mut args = vec![
+            "--verbose".to_string(),
+            "--settings".to_string(),
+            r#"{"theme":"dark"}"#.to_string(),
+        ];
+        apply_claude_settings_json(&mut args, "fastMode", Value::Bool(true));
+        let idx = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("settings flag");
+        let merged: Value = serde_json::from_str(&args[idx + 1]).expect("merged json");
+        assert_eq!(merged["theme"], json!("dark"));
+        assert_eq!(merged["fastMode"], json!(true));
+        assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
+
+        let mut eq_args = vec![r#"--settings={"a":1}"#.to_string()];
+        apply_claude_settings_json(&mut eq_args, "fastMode", Value::Bool(true));
+        let raw = eq_args[0]
+            .strip_prefix("--settings=")
+            .expect("inline settings");
+        let merged_eq: Value = serde_json::from_str(raw).expect("merged eq");
+        assert_eq!(merged_eq["a"], json!(1));
+        assert_eq!(merged_eq["fastMode"], json!(true));
+    }
+
+    #[test]
+    fn fast_mode_control_request_and_catalog_flags() {
+        let req = build_claude_fast_mode_control_request("ctrl_7", true);
+        assert_eq!(req["type"], json!("control_request"));
+        assert_eq!(req["request_id"], json!("ctrl_7"));
+        assert_eq!(req["request"]["subtype"], json!("apply_flag_settings"));
+        assert_eq!(req["request"]["settings"]["fastMode"], json!(true));
+
+        let cat = fallback_claude_models();
+        let opus = cat
+            .models
+            .iter()
+            .find(|m| m.id == "claude-opus-4-6")
+            .expect("opus 4.6");
+        let haiku = cat
+            .models
+            .iter()
+            .find(|m| m.id == "claude-haiku-4-5")
+            .expect("haiku 4.5");
+        assert!(opus.supports_fast_mode);
+        assert!(!haiku.supports_fast_mode);
+        assert!(claude_model_supports_fast_mode("opus"));
+        assert!(claude_model_supports_fast_mode("claude-opus-4-6"));
+        assert!(!claude_model_supports_fast_mode("claude-sonnet-4-6"));
+        assert!(!claude_model_supports_fast_mode("sonnet"));
+    }
+
+    #[test]
+    fn apply_claude_settings_preserves_file_path_argument() {
+        let mut args = vec![
+            "--verbose".to_string(),
+            "--settings".to_string(),
+            "/path/to/settings.json".to_string(),
+        ];
+        apply_claude_settings_json(&mut args, "fastMode", Value::Bool(true));
+        assert_eq!(args[1], "--settings");
+        assert_eq!(args[2], "/path/to/settings.json");
+        assert_eq!(args[3], "--settings");
+        let parsed: Value = serde_json::from_str(&args[4]).expect("appended settings json");
+        assert_eq!(parsed, json!({ "fastMode": true }));
+
+        let mut eq_file_args = vec!["--settings=/etc/claude/settings.json".to_string()];
+        apply_claude_settings_json(&mut eq_file_args, "fastMode", Value::Bool(true));
+        assert_eq!(eq_file_args[0], "--settings=/etc/claude/settings.json");
+        assert_eq!(eq_file_args[1], "--settings");
+        let parsed2: Value = serde_json::from_str(&eq_file_args[2]).expect("appended json");
+        assert_eq!(parsed2, json!({ "fastMode": true }));
+    }
+
+    #[tokio::test]
+    async fn claude_live_fast_mode_tracks_multiple_requests_and_surfaces_policy_errors() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_claude_fast_ctrl_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind mock shim");
+        let observed_reqs: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let observed_bg = Arc::clone(&observed_reqs);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq: u64 = 1;
+
+            async fn send_stdout(
+                wh: &mut tokio::net::unix::OwnedWriteHalf,
+                seq: &mut u64,
+                v: Value,
+            ) {
+                let frame = ShimFrame::StdoutLine {
+                    seq: Some(*seq),
+                    line: v.to_string(),
+                };
+                *seq += 1;
+                let mut enc = serde_json::to_string(&frame).expect("enc");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            let mut ack =
+                serde_json::to_string(&ShimFrame::AttachAck { latest_seq: 0 }).expect("ack");
+            ack.push('\n');
+            let _ = wh.write_all(ack.as_bytes()).await;
+            let _ = wh.flush().await;
+
+            let mut count = 0usize;
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if val.get("type").and_then(|v| v.as_str()) == Some("control_request")
+                    && val.pointer("/request/subtype").and_then(|v| v.as_str())
+                        == Some("apply_flag_settings")
+                {
+                    let rid = val
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    observed_bg.lock().await.push(rid.clone());
+                    count += 1;
+                    match count {
+                        1 => {
+                            // Real policy error -> must emit level="error" and revert active_fast_mode
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "error",
+                                        "request_id": rid,
+                                        "error": "Fast mode is disabled by organization policy"
+                                    }
+                                }),
+                            )
+                            .await;
+                        }
+                        2 => {
+                            // Retry after revert -> unsupported subtype -> info notice
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "error",
+                                        "request_id": rid,
+                                        "error": "Unknown control request subtype: apply_flag_settings"
+                                    }
+                                }),
+                            )
+                            .await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let mut cfg = sample_cfg(false);
+        cfg.shim_socket = sock_path.clone();
+
+        let actor = tokio::spawn(run_claude_actor(
+            cfg,
+            "sess_ctrl_1".into(),
+            shim,
+            false,
+            false,
+            false,
+            None,
+            cmd_rx,
+            evt_tx,
+        ));
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        // First toggle ON -> rejected by org policy
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(true),
+            })
+            .await
+            .expect("toggle 1");
+        let notice1 = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+            .await
+            .expect("notice 1 timeout")
+            .expect("ev");
+        match notice1 {
+            DriverEvent::Notice { level, message } => {
+                assert_eq!(level, "error");
+                assert!(
+                    message.contains("organization policy"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected error Notice, got {other:?}"),
+        }
+
+        // Because active_fast_mode was reverted to false on rejection, retrying `Some(true)`
+        // MUST emit a second control_request rather than being deduplicated!
+        cmd_tx
+            .send(DriverCommand::SetConfig {
+                model: None,
+                effort: None,
+                fast_mode: Some(true),
+            })
+            .await
+            .expect("toggle 2");
+        let notice2 = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+            .await
+            .expect("notice 2 timeout")
+            .expect("ev");
+        match notice2 {
+            DriverEvent::Notice { level, message } => {
+                assert_eq!(level, "info");
+                assert!(
+                    message.contains("takes effect on next Claude session restart"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected info Notice, got {other:?}"),
+        }
+
+        assert_eq!(observed_reqs.lock().await.len(), 2);
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
         let _ = std::fs::remove_file(&sock_path);
     }
 }

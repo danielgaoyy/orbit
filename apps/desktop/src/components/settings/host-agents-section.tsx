@@ -10,6 +10,7 @@ import {
   Server,
   Sparkles,
   Trash2,
+  Zap,
 } from "lucide-react";
 import {
   SettingCard,
@@ -66,6 +67,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
   const [profSystemPrompt, setProfSystemPrompt] = useState("");
   const [profDisabledTools, setProfDisabledTools] = useState("");
   const [profMcpEnabled, setProfMcpEnabled] = useState(true);
+  const [profFastMode, setProfFastMode] = useState(false);
 
   // Connected Host form state
   const [peerUri, setPeerUri] = useState("");
@@ -123,6 +125,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
       provider: effectiveProfProvider,
       model: profModel.trim() || null,
       effort: null,
+      fast_mode: profFastMode,
       mode: profMode,
       when_to_use: profWhenToUse.trim(),
       system_prompt_append: profSystemPrompt.trim() || null,
@@ -139,6 +142,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
     setProfWhenToUse("");
     setProfSystemPrompt("");
     setProfDisabledTools("");
+    setProfFastMode(false);
     setAddingProfile(false);
     orbitActions.showToast(`Saved profile "${profile.name}"`);
   };
@@ -472,15 +476,38 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
               placeholder="Disabled MCP tools (comma-separated, e.g. delete_agent,kill_terminal)"
               className="border-border bg-canvas w-full rounded-lg border px-2.5 py-1.5 font-mono text-[11.5px] outline-none"
             />
-            <div className="flex items-center justify-between">
-              <label className="inline-flex cursor-pointer items-center gap-1.5">
-                <input
-                  type="checkbox"
-                  checked={profMcpEnabled}
-                  onChange={(e) => setProfMcpEnabled(e.target.checked)}
-                />
-                <span>Inject Orbit MCP tools</span>
-              </label>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-4">
+                <div className="inline-flex items-center gap-2">
+                  <ToggleSwitch
+                    checked={profMcpEnabled}
+                    onChange={setProfMcpEnabled}
+                    ariaLabel="Inject Orbit MCP tools"
+                  />
+                  <span
+                    className="cursor-pointer select-none"
+                    onClick={() => setProfMcpEnabled((v) => !v)}
+                  >
+                    Inject Orbit MCP tools
+                  </span>
+                </div>
+                <div
+                  className="inline-flex items-center gap-2"
+                  title="Lower latency, higher quota usage"
+                >
+                  <ToggleSwitch
+                    checked={profFastMode}
+                    onChange={setProfFastMode}
+                    ariaLabel="Fast mode"
+                  />
+                  <span
+                    className="cursor-pointer select-none"
+                    onClick={() => setProfFastMode((v) => !v)}
+                  >
+                    Fast mode
+                  </span>
+                </div>
+              </div>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
@@ -520,6 +547,12 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                       <code className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 text-[11px]">
                         {p.model}
                       </code>
+                    )}
+                    {p.fast_mode && (
+                      <span className="inline-flex items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10.5px] font-medium text-amber-700 dark:border-amber-400/30 dark:bg-amber-400/12 dark:text-amber-300">
+                        <Zap className="size-2.5 fill-current stroke-[2]" />
+                        <span>Fast</span>
+                      </span>
                     )}
                   </span>
                 }

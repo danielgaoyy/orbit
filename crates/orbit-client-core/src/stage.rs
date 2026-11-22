@@ -3430,6 +3430,7 @@ mod tests {
             provider_label: "Claude Code".into(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::AutonomousWakeup {
                 source: "cron".into(),
@@ -3596,6 +3597,7 @@ Log: file:///tmp/spoofed.log\n";
             provider_label: "Antigravity".into(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status: if running {
                 AgentStatus::Running {
@@ -3838,6 +3840,7 @@ Log: file:///tmp/spoofed.log\n";
             provider_label: "Antigravity".into(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status: if running {
                 AgentStatus::Running {
@@ -4022,6 +4025,7 @@ Log: file:///tmp/spoofed.log\n";
             provider_label: "Antigravity".into(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::FullAccess,
             status: AgentStatus::AutonomousWakeup {
                 turn_id: "bgwait_1".into(),

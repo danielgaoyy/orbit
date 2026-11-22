@@ -396,6 +396,101 @@ pub async fn discover_all_provider_models() -> Vec<ProviderModelCatalog> {
     probe_all_provider_models().await
 }
 
+/// Determine whether `(provider, model)` supports Fast output mode, preferring live probed
+/// `ProviderModelCatalog` capabilities when cached and falling back to provider heuristics.
+pub fn provider_model_supports_fast_mode(
+    provider: ProviderKind,
+    model: Option<&str>,
+    cached_catalogs: Option<&[ProviderModelCatalog]>,
+) -> bool {
+    let trimmed_model = model.map(str::trim).filter(|s| !s.is_empty());
+
+    if let Some(catalog) = cached_catalogs.and_then(|cats| {
+        cats.iter()
+            .find(|c| c.provider == provider && !c.models.is_empty())
+    }) {
+        if let Some(m) = trimmed_model {
+            if let Some(found) = catalog.models.iter().find(|s| s.id.eq_ignore_ascii_case(m)) {
+                return found.supports_fast_mode;
+            }
+            // Strip Antigravity wire thinking-effort suffix (e.g. `gemini-4-carbon-high`)
+            if provider == ProviderKind::Antigravity {
+                let lower = m.to_ascii_lowercase();
+                for suffix in [
+                    "-off", "-low", "-medium", "-high", "-xhigh", "-max", "-ultra",
+                ] {
+                    if let Some(base) = lower.strip_suffix(suffix)
+                        && let Some(found) = catalog
+                            .models
+                            .iter()
+                            .find(|s| s.id.eq_ignore_ascii_case(base))
+                    {
+                        return found.supports_fast_mode;
+                    }
+                }
+            }
+            // Resolve Claude short family aliases (`opus`, `sonnet`, `haiku`, `fable`) against catalog
+            if provider == ProviderKind::ClaudeCode {
+                let lower = m.to_ascii_lowercase();
+                if matches!(lower.as_str(), "opus" | "sonnet" | "haiku" | "fable") {
+                    let needle = format!("-{lower}-");
+                    let tail = format!("-{lower}");
+                    if let Some(found) = catalog.models.iter().find(|s| {
+                        let sid = s.id.to_ascii_lowercase();
+                        sid.contains(&needle) || sid.ends_with(&tail)
+                    }) {
+                        return found.supports_fast_mode;
+                    }
+                }
+            }
+        } else {
+            // No explicit model: resolve catalog's configured or marked default
+            if let Some(def_id) = catalog.configured_default_model.as_deref()
+                && let Some(found) = catalog
+                    .models
+                    .iter()
+                    .find(|s| s.id.eq_ignore_ascii_case(def_id))
+            {
+                return found.supports_fast_mode;
+            }
+            if let Some(found) = catalog
+                .models
+                .iter()
+                .find(|s| s.is_default)
+                .or_else(|| catalog.models.first())
+            {
+                return found.supports_fast_mode;
+            }
+        }
+    }
+
+    match provider {
+        ProviderKind::ClaudeCode => match trimmed_model {
+            Some(m) => claude::claude_model_supports_fast_mode(m),
+            None => claude::fallback_claude_models()
+                .models
+                .iter()
+                .find(|m| m.is_default)
+                .map(|m| m.supports_fast_mode)
+                .unwrap_or(true),
+        },
+        ProviderKind::Codex => match trimmed_model {
+            Some(m) => codex::codex_model_supports_fast_mode(m, None),
+            None => true,
+        },
+        ProviderKind::Antigravity => match trimmed_model {
+            Some(m) => antigravity::antigravity_model_supports_fast_mode(m, None, false),
+            None => antigravity::fallback_antigravity_models()
+                .models
+                .iter()
+                .find(|m| m.is_default)
+                .map(|m| m.supports_fast_mode)
+                .unwrap_or(true),
+        },
+        _ => false,
+    }
+}
+
 /// Project structured `ProviderModelCatalog` slices into legacy `ModelOption` maps for mobile FFI.
 pub fn catalogs_to_model_map(
     catalogs: &[ProviderModelCatalog],
@@ -545,5 +640,115 @@ mod discovery_tests {
                 "empty fallback catalog for {kind:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use orbit_protocol::ProviderModelSpec;
+
+    #[test]
+    fn provider_model_supports_fast_mode_uses_catalog_and_fallbacks() {
+        let catalogs = vec![
+            ProviderModelCatalog {
+                provider: ProviderKind::ClaudeCode,
+                models: vec![
+                    ProviderModelSpec {
+                        id: "claude-opus-4-6".into(),
+                        label: "Opus 4.6".into(),
+                        description: String::new(),
+                        is_default: true,
+                        default_effort: None,
+                        thinking_options: Vec::new(),
+                        supports_fast_mode: true,
+                    },
+                    ProviderModelSpec {
+                        id: "claude-sonnet-4-6".into(),
+                        label: "Sonnet 4.6".into(),
+                        description: String::new(),
+                        is_default: false,
+                        default_effort: None,
+                        thinking_options: Vec::new(),
+                        supports_fast_mode: false,
+                    },
+                ],
+                configured_default_model: Some("claude-opus-4-6".into()),
+                configured_default_effort: None,
+            },
+            ProviderModelCatalog {
+                provider: ProviderKind::Antigravity,
+                models: vec![
+                    ProviderModelSpec {
+                        id: "gemini-4-carbon".into(),
+                        label: "Gemini 4 Carbon".into(),
+                        description: String::new(),
+                        is_default: true,
+                        default_effort: None,
+                        thinking_options: Vec::new(),
+                        supports_fast_mode: true,
+                    },
+                    ProviderModelSpec {
+                        id: "gemini-3.8-flash".into(),
+                        label: "Gemini 3.8 Flash".into(),
+                        description: String::new(),
+                        is_default: false,
+                        default_effort: None,
+                        thinking_options: Vec::new(),
+                        supports_fast_mode: false,
+                    },
+                ],
+                configured_default_model: None,
+                configured_default_effort: None,
+            },
+        ];
+
+        assert!(provider_model_supports_fast_mode(
+            ProviderKind::ClaudeCode,
+            Some("opus"),
+            Some(&catalogs)
+        ));
+        assert!(!provider_model_supports_fast_mode(
+            ProviderKind::ClaudeCode,
+            Some("sonnet"),
+            Some(&catalogs)
+        ));
+        assert!(provider_model_supports_fast_mode(
+            ProviderKind::Antigravity,
+            Some("gemini-4-carbon-high"),
+            Some(&catalogs)
+        ));
+        assert!(!provider_model_supports_fast_mode(
+            ProviderKind::Antigravity,
+            Some("gemini-3.8-flash-medium"),
+            Some(&catalogs)
+        ));
+        // Fallbacks when no cached catalog exists
+        assert!(provider_model_supports_fast_mode(
+            ProviderKind::Codex,
+            Some("gpt-5.4"),
+            None
+        ));
+        assert!(!provider_model_supports_fast_mode(
+            ProviderKind::Codex,
+            Some("gpt-oss-120b"),
+            None
+        ));
+        assert!(!provider_model_supports_fast_mode(
+            ProviderKind::ClaudeCode,
+            Some("claude-haiku-4-5"),
+            None
+        ));
+        // Non-core ACP/Pi providers default to false unless catalog specifies otherwise
+        assert!(!provider_model_supports_fast_mode(
+            ProviderKind::OpenCode,
+            Some("openai/gpt-5"),
+            None
+        ));
+        assert!(!provider_model_supports_fast_mode(
+            ProviderKind::Pi,
+            Some("default"),
+            None
+        ));
     }
 }

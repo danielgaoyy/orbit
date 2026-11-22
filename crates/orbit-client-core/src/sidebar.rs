@@ -1292,6 +1292,7 @@ mod tests {
             provider_label: "Claude Code".to_string(),
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::Idle,
             status_label: if is_running {

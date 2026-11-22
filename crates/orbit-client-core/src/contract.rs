@@ -63,6 +63,8 @@ pub struct CreateSessionRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
     pub mode: SessionMode,
     pub initial_prompt: String,
     #[serde(default)]
@@ -211,6 +213,8 @@ pub struct SpawnWorkspacePeerRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Option<ReasoningEffort>,
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
     pub mode: SessionMode,
     pub initial_prompt: String,
     #[serde(default)]

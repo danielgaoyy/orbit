@@ -49,6 +49,14 @@ impl SlashDirective {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastModeSlashAction {
+    Toggle,
+    Enable,
+    Disable,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientPlatform {
@@ -223,6 +231,22 @@ pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
                 "snippet".into(),
                 "block".into(),
                 "clipboard".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
+            id: "fast".into(),
+            command: "/fast".into(),
+            label: "Toggle Fast Mode".into(),
+            description: "Toggle Fast output mode".into(),
+            shortcut_key: None,
+            icon_key: "zap".into(),
+            keywords: vec![
+                "fast".into(),
+                "speed".into(),
+                "turbo".into(),
+                "quick".into(),
+                "latency".into(),
             ],
             desktop_only: false,
         },
@@ -502,6 +526,26 @@ pub fn parse_leading_fork_command(raw_text: &str) -> Option<ParsedForkCommand> {
     })
 }
 
+pub fn parse_fast_mode_slash_command(raw_text: &str) -> Option<FastModeSlashAction> {
+    let trimmed = raw_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "/fast" {
+        return Some(FastModeSlashAction::Toggle);
+    }
+    if lower.starts_with("/fast")
+        && let Some(after) = trimmed.get(5..)
+        && after.starts_with(char::is_whitespace)
+    {
+        return match after.trim().to_ascii_lowercase().as_str() {
+            "" => Some(FastModeSlashAction::Toggle),
+            "on" | "true" | "enable" | "enabled" | "1" => Some(FastModeSlashAction::Enable),
+            "off" | "false" | "disable" | "disabled" | "0" => Some(FastModeSlashAction::Disable),
+            _ => None,
+        };
+    }
+    None
+}
+
 pub fn parse_leading_btw_question(raw_text: &str) -> Option<String> {
     let trimmed = raw_text.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -667,6 +711,8 @@ pub struct ComposedPromptView {
     pub fork_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_mode_action: Option<FastModeSlashAction>,
     pub is_empty: bool,
 }
 
@@ -702,10 +748,29 @@ pub fn compose_prompt(
             fork_worktree: fork_cmd.worktree,
             fork_branch: fork_cmd.branch,
             fork_prompt: fork_cmd.initial_prompt,
+            fast_mode_action: None,
             is_empty: false,
         };
     }
-
+    if req.explicit_directive.is_none()
+        && let Some(action) = parse_fast_mode_slash_command(raw_trimmed)
+    {
+        return ComposedPromptView {
+            wire_prompt: String::new(),
+            display_prompt: String::new(),
+            badges: Vec::new(),
+            effective_directive: None,
+            is_compact: false,
+            is_btw: false,
+            btw_question: None,
+            is_fork: false,
+            fork_worktree: false,
+            fork_branch: None,
+            fork_prompt: None,
+            fast_mode_action: Some(action),
+            is_empty: false,
+        };
+    }
     if req.explicit_directive.is_none()
         && let Some(btw_q) = parse_leading_btw_question(raw_trimmed)
     {
@@ -721,6 +786,7 @@ pub fn compose_prompt(
             fork_worktree: false,
             fork_branch: None,
             fork_prompt: None,
+            fast_mode_action: None,
             is_empty: false,
         };
     }
@@ -767,6 +833,7 @@ pub fn compose_prompt(
             fork_worktree: false,
             fork_branch: None,
             fork_prompt: None,
+            fast_mode_action: None,
             is_empty: false,
         };
     }
@@ -801,6 +868,7 @@ pub fn compose_prompt(
             fork_worktree: false,
             fork_branch: None,
             fork_prompt: None,
+            fast_mode_action: None,
             is_empty: true,
         };
     }
@@ -1034,6 +1102,7 @@ pub fn compose_prompt(
         fork_worktree: false,
         fork_branch: None,
         fork_prompt: None,
+        fast_mode_action: None,
         is_empty: false,
     }
 }
@@ -1591,5 +1660,47 @@ mod tests {
 
         // Non-fork command prefix does not false-trigger
         assert!(parse_leading_fork_command("/forking something").is_none());
+    }
+
+    #[test]
+    fn fast_mode_slash_command_parses_and_filters() {
+        let filtered = filter_slash_commands("fast", ClientPlatform::Desktop);
+        assert!(
+            filtered
+                .iter()
+                .any(|c| c.id == "fast" && c.command == "/fast")
+        );
+        assert_eq!(
+            parse_fast_mode_slash_command("/fast"),
+            Some(FastModeSlashAction::Toggle)
+        );
+        assert_eq!(
+            parse_fast_mode_slash_command("  /FAST  on "),
+            Some(FastModeSlashAction::Enable)
+        );
+        assert_eq!(
+            parse_fast_mode_slash_command("/fast off"),
+            Some(FastModeSlashAction::Disable)
+        );
+        assert_eq!(parse_fast_mode_slash_command("/faster"), None);
+        assert_eq!(parse_fast_mode_slash_command("/fast invalid arg"), None);
+
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::Codex,
+                raw_text: "/fast on".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert_eq!(composed.fast_mode_action, Some(FastModeSlashAction::Enable));
+        assert!(!composed.is_empty);
+        assert!(composed.wire_prompt.is_empty());
     }
 }

@@ -32,7 +32,7 @@ pub(crate) const AGENT_SELECT_COLS: &str =
     status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
     parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
     attention_state, last_activity_at, timeline_epoch, read_seq, is_pinned, pinned_order,
-    handle, cluster_suggestion_json, task_summary, forked_from_agent_id, forked_at_seq";
+    handle, cluster_suggestion_json, task_summary, forked_from_agent_id, forked_at_seq, fast_mode";
 
 /// Atomic result of [`OrbitStore::clone_timeline_events_up_to`], computed inside the same
 /// `IMMEDIATE` transaction as the copy so callers avoid TOCTOU races.
@@ -396,19 +396,21 @@ impl OrbitStore {
             ",
         )?;
         search::migrate_fts5_schema(&mut conn)?;
-        // Idempotent provenance column migrations (NO `PRAGMA user_version` bump)
+        // Idempotent column migrations checked via `PRAGMA table_info` (NO `PRAGMA user_version` bump)
         for (table, col, col_type) in [
             ("agents", "forked_from_agent_id", "TEXT"),
             ("agents", "forked_at_seq", "INTEGER"),
+            ("agents", "fast_mode", "INTEGER NOT NULL DEFAULT 0"),
             ("client_replica_agents", "forked_from_agent_id", "TEXT"),
             ("client_replica_agents", "forked_at_seq", "INTEGER"),
+            (
+                "client_replica_agents",
+                "fast_mode",
+                "INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("agent_profiles", "fast_mode", "INTEGER NOT NULL DEFAULT 0"),
         ] {
-            if !table_has_column(&conn, table, col)? {
-                conn.execute(
-                    &format!("ALTER TABLE {table} ADD COLUMN {col} {col_type}"),
-                    [],
-                )?;
-            }
+            ensure_column_exists(&conn, table, col, col_type)?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -523,9 +525,9 @@ impl OrbitStore {
                 latest_seq, timeline_epoch, created_at, updated_at, archived_at, background, auto_archive,
                 profile_id, labels_json, attention_state, last_activity_at,
                 read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json, task_summary,
-                forked_from_agent_id, forked_at_seq
+                forked_from_agent_id, forked_at_seq, fast_mode
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
             ON CONFLICT(agent_id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 title = excluded.title,
@@ -553,7 +555,8 @@ impl OrbitStore {
                 cluster_suggestion_json = excluded.cluster_suggestion_json,
                 task_summary = COALESCE(excluded.task_summary, agents.task_summary),
                 forked_from_agent_id = COALESCE(excluded.forked_from_agent_id, agents.forked_from_agent_id),
-                forked_at_seq = COALESCE(excluded.forked_at_seq, agents.forked_at_seq)
+                forked_at_seq = COALESCE(excluded.forked_at_seq, agents.forked_at_seq),
+                fast_mode = excluded.fast_mode
             ",
             params![
                 agent.agent_id,
@@ -587,6 +590,7 @@ impl OrbitStore {
                 agent.task_summary,
                 agent.forked_from_agent_id,
                 forked_at_seq_i64,
+                i32::from(agent.fast_mode),
             ],
         )?;
         Ok(())
@@ -798,13 +802,22 @@ impl OrbitStore {
         agent_id: &str,
         model: Option<&str>,
         effort: Option<ReasoningEffort>,
+        fast_mode: Option<bool>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let effort_json = effort.as_ref().map(serde_json::to_string).transpose()?;
-        conn.execute(
-            "UPDATE agents SET model = ?1, effort_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
-            params![model, effort_json, Utc::now().to_rfc3339(), agent_id],
-        )?;
+        let now = Utc::now().to_rfc3339();
+        if let Some(fm) = fast_mode {
+            conn.execute(
+                "UPDATE agents SET model = ?1, effort_json = ?2, fast_mode = ?3, updated_at = ?4 WHERE agent_id = ?5",
+                params![model, effort_json, i64::from(fm), now, agent_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE agents SET model = ?1, effort_json = ?2, updated_at = ?3 WHERE agent_id = ?4",
+                params![model, effort_json, now, agent_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -812,12 +825,21 @@ impl OrbitStore {
         &self,
         agent_id: &str,
         model: Option<&str>,
+        fast_mode: Option<bool>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        conn.execute(
-            "UPDATE agents SET model = ?1, updated_at = ?2 WHERE agent_id = ?3",
-            params![model, Utc::now().to_rfc3339(), agent_id],
-        )?;
+        let now = Utc::now().to_rfc3339();
+        if let Some(fm) = fast_mode {
+            conn.execute(
+                "UPDATE agents SET model = ?1, fast_mode = ?2, updated_at = ?3 WHERE agent_id = ?4",
+                params![model, i64::from(fm), now, agent_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE agents SET model = ?1, updated_at = ?2 WHERE agent_id = ?3",
+                params![model, now, agent_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -827,6 +849,7 @@ impl OrbitStore {
         provider: ProviderKind,
         model: Option<&str>,
         effort: Option<ReasoningEffort>,
+        fast_mode: bool,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let provider_json = serde_json::to_string(&provider)?;
@@ -834,13 +857,14 @@ impl OrbitStore {
         let status_json = serde_json::to_string(&AgentStatus::Idle)?;
         conn.execute(
             "UPDATE agents
-             SET provider_json = ?1, model = ?2, effort_json = ?3, persistence_ref = NULL,
-                 status_json = ?4, updated_at = ?5
-             WHERE agent_id = ?6",
+             SET provider_json = ?1, model = ?2, effort_json = ?3, fast_mode = ?4,
+                 persistence_ref = NULL, status_json = ?5, updated_at = ?6
+             WHERE agent_id = ?7",
             params![
                 provider_json,
                 model,
                 effort_json,
+                i64::from(fast_mode),
                 status_json,
                 Utc::now().to_rfc3339(),
                 agent_id
@@ -1728,14 +1752,15 @@ impl OrbitStore {
             let forked_at_i64 = ag.forked_at_seq.and_then(|s| i64::try_from(s).ok());
             tx.execute(
                 "INSERT INTO client_replica_agents (
-                    host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq, fast_mode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     host_id,
                     ag.agent_id,
                     json,
                     ag.forked_from_agent_id,
-                    forked_at_i64
+                    forked_at_i64,
+                    i32::from(ag.fast_mode),
                 ],
             )?;
         }
@@ -1753,18 +1778,20 @@ impl OrbitStore {
         let forked_at_i64 = ag.forked_at_seq.and_then(|s| i64::try_from(s).ok());
         conn.execute(
             "INSERT INTO client_replica_agents (
-                host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
+                host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq, fast_mode
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(host_id, agent_id) DO UPDATE SET
                 payload_json = excluded.payload_json,
                 forked_from_agent_id = excluded.forked_from_agent_id,
-                forked_at_seq = excluded.forked_at_seq",
+                forked_at_seq = excluded.forked_at_seq,
+                fast_mode = excluded.fast_mode",
             params![
                 host_id,
                 ag.agent_id,
                 json,
                 ag.forked_from_agent_id,
-                forked_at_i64
+                forked_at_i64,
+                i32::from(ag.fast_mode),
             ],
         )?;
         Ok(())
@@ -1792,12 +1819,19 @@ impl OrbitStore {
 
     pub fn list_replica_agents(&self, host_id: &str) -> Result<Vec<AgentSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let mut stmt =
-            conn.prepare("SELECT payload_json FROM client_replica_agents WHERE host_id = ?1")?;
-        let rows = stmt.query_map(params![host_id], |r| r.get::<_, String>(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT payload_json, fast_mode FROM client_replica_agents WHERE host_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![host_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1).unwrap_or(0) != 0))
+        })?;
         let mut out = Vec::new();
         for r in rows {
-            if let Ok(ag) = serde_json::from_str::<AgentSummary>(&r?) {
+            let (raw_json, fast_col) = r?;
+            if let Ok(mut ag) = serde_json::from_str::<AgentSummary>(&raw_json) {
+                if fast_col {
+                    ag.fast_mode = true;
+                }
                 out.push(ag);
             }
         }
@@ -2746,6 +2780,21 @@ impl OrbitStore {
     }
 }
 
+fn ensure_column_exists(
+    conn: &Connection,
+    table: &'static str,
+    column: &'static str,
+    column_def: &'static str,
+) -> Result<(), StoreError> {
+    if !table_has_column(conn, table, column)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn query_coalesce_boundary_seq(
     tx: &rusqlite::Transaction<'_>,
     is_daemon_table: bool,
@@ -2919,6 +2968,7 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         .unwrap_or(None)
         .filter(|&v| v >= 0)
         .map(|v| v as u64);
+    let fast_mode: bool = row.get::<_, i32>(30).unwrap_or(0) != 0;
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
@@ -2941,6 +2991,7 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         provider,
         model: row.get(5)?,
         effort,
+        fast_mode,
         mode,
         status,
         parent_agent_id: row.get(8)?,
@@ -3086,6 +3137,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: Some(ReasoningEffort::High),
+                    fast_mode: false,
                     mode: SessionMode::AcceptEdits,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -3194,6 +3246,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: Some("claude-opus".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::Running {
                 turn_id: "t1".into(),
@@ -3284,6 +3337,7 @@ mod tests {
             provider: ProviderKind::Codex,
             model: Some("gpt-5.4".into()),
             effort: Some(ReasoningEffort::Xhigh),
+            fast_mode: true,
             mode: SessionMode::Plan,
             when_to_use: "Review diffs independently without editing files".into(),
             system_prompt_append: Some("Never edit files.".into()),
@@ -3405,6 +3459,7 @@ mod tests {
                     provider: ProviderKind::ClaudeCode,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -3569,6 +3624,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -3665,6 +3721,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::Default,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -3889,6 +3946,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::FullAccess,
                     status: AgentStatus::Running {
                         turn_id: "t1".into(),
@@ -4040,6 +4098,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::FullAccess,
                     status: AgentStatus::Idle,
                     parent_agent_id: None,
@@ -4208,6 +4267,7 @@ mod tests {
                     provider: ProviderKind::Antigravity,
                     model: None,
                     effort: None,
+                    fast_mode: false,
                     mode: SessionMode::FullAccess,
                     status: AgentStatus::Running {
                         turn_id: "turn_abc".into(),
@@ -4377,6 +4437,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: Some("sonnet".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             status: AgentStatus::Idle,
             parent_agent_id: None,
@@ -4571,6 +4632,7 @@ mod tests {
             provider: ProviderKind::ClaudeCode,
             model: None,
             effort: None,
+            fast_mode: false,
             mode: SessionMode::Default,
             status: AgentStatus::Idle,
             parent_agent_id: None,
@@ -4778,6 +4840,343 @@ mod tests {
             .expect("ver");
         assert_eq!(ver1, ver2);
         drop(store2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fast_mode_migration_idempotency_and_crud_persistence() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_fast_mode_test_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("orbit.sqlite");
+
+        // 1. Seed a pre-existing database WITHOUT fast_mode columns and with user_version = 6
+        {
+            let raw = Connection::open(&db_path).expect("open raw");
+            raw.execute_batch(
+                "
+                CREATE TABLE workspaces (
+                    workspace_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    git_branch TEXT,
+                    is_worktree INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE agents (
+                    agent_id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    provider_json TEXT NOT NULL,
+                    model TEXT,
+                    effort_json TEXT,
+                    mode_json TEXT NOT NULL,
+                    status_json TEXT NOT NULL,
+                    parent_agent_id TEXT,
+                    persistence_ref TEXT,
+                    latest_seq INTEGER NOT NULL DEFAULT 0,
+                    timeline_epoch INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE client_replica_agents (
+                    host_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (host_id, agent_id)
+                );
+                CREATE TABLE agent_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    provider_json TEXT NOT NULL,
+                    model TEXT,
+                    effort_json TEXT,
+                    mode_json TEXT NOT NULL,
+                    when_to_use TEXT NOT NULL DEFAULT '',
+                    system_prompt_append TEXT,
+                    mcp_policy_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                PRAGMA user_version = 6;
+                ",
+            )
+            .expect("seed legacy schema");
+        }
+
+        // 2. Open with OrbitStore twice to confirm idempotent PRAGMA table_info migration
+        //    and confirm PRAGMA user_version stays 6 (not bumped in parallel with other Wave 2 work).
+        let store = OrbitStore::open(&db_path).expect("first open");
+        drop(store);
+        let store = OrbitStore::open(&db_path).expect("second idempotent open");
+        {
+            let conn = store.conn.lock().expect("lock");
+            let ver: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .expect("user_version");
+            assert_eq!(ver, 6);
+            for tbl in ["agents", "client_replica_agents", "agent_profiles"] {
+                let mut stmt = conn
+                    .prepare(&format!("PRAGMA table_info({tbl})"))
+                    .expect("pragma");
+                let has_col = stmt
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .expect("query")
+                    .filter_map(Result::ok)
+                    .any(|c| c == "fast_mode");
+                assert!(has_col, "missing fast_mode column on {tbl}");
+            }
+        }
+
+        // 3. Verify CRUD persistence on agents, client_replica_agents, and agent_profiles
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_fast".into(),
+                title: "Fast".into(),
+                cwd: "/repo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let ag = AgentSummary {
+            agent_id: "ag_fast".into(),
+            workspace_id: "ws_fast".into(),
+            cwd: "/repo".into(),
+            title: "Fast Session".into(),
+            provider: ProviderKind::Codex,
+            model: Some("gpt-5.4".into()),
+            effort: Some(ReasoningEffort::Medium),
+            fast_mode: true,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+        };
+        store.upsert_agent(&ag, None).expect("upsert agent");
+        let loaded = store.get_agent("ag_fast").expect("get").expect("some");
+        assert!(loaded.fast_mode);
+
+        store
+            .update_agent_fields(
+                "ag_fast",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+            )
+            .expect("disable fast");
+        let disabled = store.get_agent("ag_fast").expect("get").expect("some");
+        assert!(!disabled.fast_mode);
+
+        // Replica persistence
+        store
+            .upsert_replica_agents("h_fast", std::slice::from_ref(&ag))
+            .expect("upsert replica batch");
+        let rep1 = store.list_replica_agents("h_fast").expect("list replica");
+        assert_eq!(rep1.len(), 1);
+        assert!(rep1[0].fast_mode);
+
+        let mut ag_off = ag.clone();
+        ag_off.fast_mode = false;
+        store
+            .upsert_single_replica_agent("h_fast", &ag_off)
+            .expect("upsert single replica");
+        let rep2 = store.list_replica_agents("h_fast").expect("list replica 2");
+        assert_eq!(rep2.len(), 1);
+        assert!(!rep2[0].fast_mode);
+
+        // Profile persistence
+        let prof = orbit_protocol::AgentProfile {
+            profile_id: "prof_fast".into(),
+            name: "Fast Coder".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: true,
+            mode: SessionMode::AcceptEdits,
+            when_to_use: "Rapid iteration".into(),
+            system_prompt_append: None,
+            mcp_policy: orbit_protocol::McpToolPolicy::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_profile(&prof).expect("upsert prof");
+        let loaded_prof = store
+            .get_profile("prof_fast")
+            .expect("get prof")
+            .expect("some prof");
+        assert!(loaded_prof.fast_mode);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_agent_fields_preserves_unrelated_runtime_columns() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_atomic_update_test_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db_path = dir.join("orbit.sqlite");
+        let store = OrbitStore::open(&db_path).expect("open store");
+
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_atomic".into(),
+                title: "Atomic".into(),
+                cwd: "/repo".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let mut labels = HashMap::new();
+        labels.insert("env".into(), "prod".into());
+        let ag = AgentSummary {
+            agent_id: "ag_atomic".into(),
+            workspace_id: "ws_atomic".into(),
+            cwd: "/repo".into(),
+            title: "Original Title".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("claude-opus-4-6".into()),
+            effort: Some(ReasoningEffort::High),
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Running {
+                turn_id: "turn_active".into(),
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 9,
+            timeline_epoch: 2,
+            created_at: now,
+            updated_at: now,
+            archived_at: Some(now),
+            background: false,
+            auto_archive: false,
+            profile_id: Some("prof_1".into()),
+            labels,
+            attention: AttentionState::Permission,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 5,
+            is_pinned: true,
+            pinned_order: 7,
+            handle: Some("lead".into()),
+            cluster_suggestion: None,
+            task_summary: Some("Working".into()),
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+        };
+        store
+            .upsert_agent(&ag, Some("native_sess_atomic"))
+            .expect("upsert agent");
+
+        // Targeted update changing ONLY fast_mode must leave all other runtime columns intact
+        store
+            .update_agent_fields(
+                "ag_atomic",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .expect("targeted fast_mode update");
+
+        let updated = store
+            .get_agent("ag_atomic")
+            .expect("get")
+            .expect("agent exists");
+        assert!(updated.fast_mode);
+        assert_eq!(updated.title, "Original Title");
+        assert_eq!(
+            updated.status,
+            AgentStatus::Running {
+                turn_id: "turn_active".into()
+            }
+        );
+        assert_eq!(updated.attention, AttentionState::Permission);
+        assert!(updated.is_pinned);
+        assert_eq!(updated.pinned_order, 7);
+        assert!(updated.archived_at.is_some());
+        assert_eq!(updated.labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(updated.handle.as_deref(), Some("lead"));
+        assert_eq!(updated.task_summary.as_deref(), Some("Working"));
+        assert_eq!(
+            store.get_persistence_ref("ag_atomic").expect("pref"),
+            Some("native_sess_atomic".to_string())
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

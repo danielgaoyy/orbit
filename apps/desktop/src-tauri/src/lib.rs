@@ -578,6 +578,7 @@ fn create_agent(
     provider: ProviderKind,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
+    fast_mode: Option<bool>,
     mode: SessionMode,
     initial_prompt: String,
     initial_display_prompt: Option<String>,
@@ -596,6 +597,7 @@ fn create_agent(
             provider,
             model,
             effort,
+            fast_mode,
             mode,
             initial_prompt: &initial_prompt,
             initial_display_prompt,
@@ -776,12 +778,13 @@ fn update_agent(
     title: Option<String>,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
+    fast_mode: Option<bool>,
     mode: Option<SessionMode>,
     labels: Option<HashMap<String, String>>,
     handle: Option<String>,
 ) {
-    state.core.update_agent_with_handle(
-        &host_id, &agent_id, title, model, effort, mode, labels, handle,
+    state.core.update_agent_full(
+        &host_id, &agent_id, title, model, effort, fast_mode, mode, labels, handle,
     );
 }
 

@@ -439,6 +439,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                             provider: prof.provider,
                             model: prof.model,
                             ...(prof.effort ? { effort: prof.effort } : {}),
+                            fastMode: Boolean(prof.fast_mode),
                             mode: prof.mode,
                             profileId: prof.profile_id,
                           });

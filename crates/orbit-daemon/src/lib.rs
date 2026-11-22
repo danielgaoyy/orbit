@@ -198,7 +198,7 @@ pub struct DaemonRuntime {
     pub scheduler: Arc<ScheduleEngine>,
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     pub keep_awake: Arc<KeepAwakeManager>,
-    provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
+    provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     catalog_refresh_lock: AsyncMutex<()>,
     upgrade_lock: AsyncMutex<()>,
 }
@@ -241,6 +241,7 @@ impl DaemonRuntime {
         let store = Arc::new(OrbitStore::open(home_dir.join("orbit.db"))?);
         let scripts = WorkspaceScriptRegistry::new();
         let keep_awake = Arc::new(KeepAwakeManager::new(keep_awake_enabled));
+        let provider_catalogs = Arc::new(RwLock::new(None));
         let orchestrator = AgentOrchestrator::new(
             home_dir.to_path_buf(),
             host_id.clone(),
@@ -250,6 +251,7 @@ impl DaemonRuntime {
             store.clone(),
             scripts,
             keep_awake.clone(),
+            provider_catalogs.clone(),
         )
         .await;
         let ka_bcast_tx = orchestrator.broadcast_tx.clone();
@@ -314,7 +316,7 @@ impl DaemonRuntime {
             scheduler,
             idle_cleanup,
             keep_awake,
-            provider_catalogs: RwLock::new(None),
+            provider_catalogs,
             catalog_refresh_lock: AsyncMutex::new(()),
             upgrade_lock: AsyncMutex::new(()),
         }))
@@ -1481,6 +1483,7 @@ async fn handle_wire_rpc(
             provider,
             model,
             effort,
+            fast_mode,
             mode,
             initial_prompt,
             initial_display_prompt,
@@ -1509,6 +1512,7 @@ async fn handle_wire_rpc(
                     "title": title,
                     "provider": provider,
                     "model": model,
+                    "fast_mode": fast_mode,
                     "mode": mode,
                     "initial_prompt": initial_prompt,
                     "worktree": worktree,
@@ -1559,6 +1563,7 @@ async fn handle_wire_rpc(
                     provider,
                     model,
                     effort,
+                    fast_mode,
                     mode,
                     initial_prompt,
                     initial_display_prompt,
@@ -1963,6 +1968,7 @@ async fn handle_wire_rpc(
             title,
             model,
             effort,
+            fast_mode,
             mode,
             labels,
             handle,
@@ -1974,6 +1980,7 @@ async fn handle_wire_rpc(
                 title,
                 model,
                 effort,
+                fast_mode,
                 mode,
                 labels,
                 handle,

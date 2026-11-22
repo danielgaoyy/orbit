@@ -63,6 +63,7 @@ pub fn fallback_pi_models() -> ProviderModelCatalog {
                 is_default: true,
                 default_effort: Some(ReasoningEffort::Medium),
                 thinking_options: pi_efforts(ReasoningEffort::Medium),
+                supports_fast_mode: false,
             },
             ProviderModelSpec {
                 id: "anthropic/claude-sonnet-4-5".to_string(),
@@ -71,6 +72,7 @@ pub fn fallback_pi_models() -> ProviderModelCatalog {
                 is_default: false,
                 default_effort: Some(ReasoningEffort::Medium),
                 thinking_options: pi_efforts(ReasoningEffort::Medium),
+                supports_fast_mode: false,
             },
             ProviderModelSpec {
                 id: "openai/gpt-5".to_string(),
@@ -79,6 +81,7 @@ pub fn fallback_pi_models() -> ProviderModelCatalog {
                 is_default: false,
                 default_effort: Some(ReasoningEffort::Medium),
                 thinking_options: pi_efforts(ReasoningEffort::Medium),
+                supports_fast_mode: false,
             },
         ],
     }
@@ -953,7 +956,11 @@ async fn run_pi_actor(
                     DriverCommand::SetMode { mode: new_mode } => {
                         mode = new_mode;
                     }
-                    DriverCommand::SetConfig { model, effort } => {
+                    DriverCommand::SetConfig {
+                        model,
+                        effort,
+                        fast_mode: _,
+                    } => {
                         if let Some(m) = model
                             .as_deref()
                             .map(str::trim)
@@ -1622,6 +1629,7 @@ mod tests {
             attachments_dir: None,
             model: Some("anthropic/claude-sonnet-4-5".into()),
             effort: Some(ReasoningEffort::High),
+            fast_mode: false,
             mode: SessionMode::AcceptEdits,
             resume_session_id: None,
             fork_from_session_id: None,
@@ -1906,6 +1914,7 @@ done
             .send(DriverCommand::SetConfig {
                 model: Some("claude-opus-4-5".into()),
                 effort: None,
+                fast_mode: None,
             })
             .await
             .expect("set bare model");
@@ -1913,6 +1922,7 @@ done
             .send(DriverCommand::SetConfig {
                 model: Some("openai/gpt-5".into()),
                 effort: Some(ReasoningEffort::Xhigh),
+                fast_mode: None,
             })
             .await
             .expect("set config");

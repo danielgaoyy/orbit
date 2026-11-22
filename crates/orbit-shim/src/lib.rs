@@ -304,7 +304,7 @@ async fn connect_shim_stream(socket_path: &Path) -> std::io::Result<ShimStream> 
         // - A transiently busy shim still in kernel backlog returns `TimedOut` (never unlinked).
         let mut buf = Vec::with_capacity(64);
         let mut byte = [0u8; 1];
-        let ack_res = tokio::time::timeout(Duration::from_millis(250), async {
+        let ack_res = tokio::time::timeout(Duration::from_millis(1000), async {
             while buf.len() < 128 {
                 match stream.read(&mut byte).await {
                     Ok(0) => {
@@ -1421,9 +1421,6 @@ async fn run_pty_shim(
     rows: u16,
 ) -> Result<(), ShimError> {
     prepare_socket_path(socket_path)?;
-    let listener = ShimListener::bind(socket_path).await?;
-    let _socket_guard = SocketCleanupGuard::new(socket_path.to_path_buf());
-    write_pid_file(socket_path, std::process::id(), None, None);
 
     let pty_system = NativePtySystem::default();
     let pair = pty_system
@@ -1448,6 +1445,8 @@ async fn run_pty_shim(
         .spawn_command(cmd)
         .map_err(|e| ShimError::Pty(e.to_string()))?;
     let pty_child_pid = child.process_id();
+    let listener = ShimListener::bind(socket_path).await?;
+    let _socket_guard = SocketCleanupGuard::new(socket_path.to_path_buf());
     write_pid_file(
         socket_path,
         std::process::id(),

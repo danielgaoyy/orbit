@@ -5912,6 +5912,14 @@ fn resolve_orbit_exe() -> PathBuf {
     {
         return PathBuf::from(explicit);
     }
+    if let Ok(cargo_bin) = std::env::var("CARGO_BIN_EXE_orbit")
+        && !cargo_bin.trim().is_empty()
+    {
+        let p = PathBuf::from(cargo_bin);
+        if p.is_file() {
+            return p;
+        }
+    }
     if let Ok(cur) = std::env::current_exe() {
         let is_orbit_bin = cur
             .file_stem()

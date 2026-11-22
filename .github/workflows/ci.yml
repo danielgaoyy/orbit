@@ -52,6 +52,7 @@ jobs:
           CARGO_INCREMENTAL: "0"
         run: |
           cargo check --workspace --all-targets
+          cargo build -p orbit-cli --bin orbit
           cargo test --workspace -- --skip live_devbox_ssh_one_click_e2e
       - name: Build Desktop frontend & check Tauri Windows crate
         env:

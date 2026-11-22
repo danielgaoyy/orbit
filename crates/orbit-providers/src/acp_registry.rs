@@ -1381,6 +1381,18 @@ async fn kill_process_group_and_reap(child: &mut tokio::process::Child) {
             .status()
             .await;
     }
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let pid_str = pid.to_string();
+        let mut kill_cmd = Command::new("taskkill");
+        kill_cmd
+            .args(["/PID", &pid_str, "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000);
+        let _ = kill_cmd.status().await;
+    }
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
@@ -1450,6 +1462,10 @@ pub async fn probe_acp_agent(spec: &AcpAgentSpec, cwd: Option<&Path>) -> AcpProb
     #[cfg(unix)]
     {
         cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x0000_0200 | 0x0800_0000);
     }
     crate::shell_snapshot::apply_cached_shell_env(&mut cmd);
     cmd.env("NO_COLOR", "1");

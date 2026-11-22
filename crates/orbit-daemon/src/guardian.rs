@@ -2206,14 +2206,14 @@ pub fn is_path_within_workspace(raw_path: &str, workspace_cwd: &str) -> bool {
 
 fn expand_tilde(raw: &str) -> PathBuf {
     if raw == "~"
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = crate::platform::resolve_user_home_dir()
     {
-        return PathBuf::from(home);
+        return home;
     }
-    if let Some(rest) = raw.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix(r"~\"))
+        && let Some(home) = crate::platform::resolve_user_home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     PathBuf::from(raw)
 }

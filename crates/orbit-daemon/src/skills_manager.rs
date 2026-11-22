@@ -529,7 +529,7 @@ fn validate_project_cwd(cwd: &str, user_home: &Path) -> Result<PathBuf, SkillMan
             SkillManagerError::InvalidInput(msg)
         }
     })?;
-    if let Ok(canon_user_home) = fs::canonicalize(user_home)
+    if let Ok(canon_user_home) = crate::platform::canonicalize_clean(user_home)
         && canonical_cwd == canon_user_home
     {
         return Err(SkillManagerError::PermissionDenied(
@@ -599,7 +599,7 @@ fn walk_contained_dir_segments(
         }
         current = next;
     }
-    let canonical_leaf = fs::canonicalize(&current).map_err(|e| {
+    let canonical_leaf = crate::platform::canonicalize_clean(&current).map_err(|e| {
         SkillManagerError::Io(format!("canonicalize `{}` failed: {e}", current.display()))
     })?;
     if !canonical_leaf.starts_with(canonical_boundary) {
@@ -733,7 +733,7 @@ pub fn list_managed_skills(
     let mut seen_slugs: HashSet<String> = HashSet::new();
 
     for spec in discovery_root_specs(orbit_home, user_home, resolved_cwd.as_deref()) {
-        let Ok(canonical_boundary) = fs::canonicalize(&spec.boundary) else {
+        let Ok(canonical_boundary) = crate::platform::canonicalize_clean(&spec.boundary) else {
             continue;
         };
         let Ok(canonical_root) =
@@ -773,7 +773,7 @@ pub fn list_managed_skills(
                 }
             };
 
-            let Ok(canonical_dir) = fs::canonicalize(&skill_dir) else {
+            let Ok(canonical_dir) = crate::platform::canonicalize_clean(&skill_dir) else {
                 continue;
             };
             if canonical_dir.parent() != Some(canonical_root.as_path()) {
@@ -793,7 +793,7 @@ pub fn list_managed_skills(
                 continue;
             }
 
-            let Ok(canonical_md) = fs::canonicalize(&md_path) else {
+            let Ok(canonical_md) = crate::platform::canonicalize_clean(&md_path) else {
                 continue;
             };
             if !canonical_md.starts_with(&canonical_root)
@@ -933,9 +933,10 @@ fn resolve_write_root(
             fs::create_dir_all(orbit_home).map_err(|e| {
                 SkillManagerError::Io(format!("create orbit_home directory failed: {e}"))
             })?;
-            let canonical_orbit_home = fs::canonicalize(orbit_home).map_err(|e| {
-                SkillManagerError::Io(format!("canonicalize orbit_home failed: {e}"))
-            })?;
+            let canonical_orbit_home =
+                crate::platform::canonicalize_clean(orbit_home).map_err(|e| {
+                    SkillManagerError::Io(format!("canonicalize orbit_home failed: {e}"))
+                })?;
             Ok(WriteRootTarget {
                 source: SkillSource::OrbitUser,
                 canonical_boundary: canonical_orbit_home,
@@ -1123,10 +1124,10 @@ pub fn delete_managed_skill(
     let mut candidate_targets: Vec<(PathBuf, &'static [&'static str])> = Vec::new();
     match scope {
         SkillWriteScope::User => {
-            if let Ok(canon_orbit) = fs::canonicalize(orbit_home) {
+            if let Ok(canon_orbit) = crate::platform::canonicalize_clean(orbit_home) {
                 candidate_targets.push((canon_orbit, &["skills"]));
             }
-            if let Ok(canon_home) = fs::canonicalize(user_home) {
+            if let Ok(canon_home) = crate::platform::canonicalize_clean(user_home) {
                 let home_orbit = canon_home.join(".orbit").join("skills");
                 if !candidate_targets
                     .iter()
@@ -1187,7 +1188,7 @@ pub fn delete_managed_skill(
             }
         }
 
-        let canonical_dir = fs::canonicalize(&candidate_dir).map_err(|e| {
+        let canonical_dir = crate::platform::canonicalize_clean(&candidate_dir).map_err(|e| {
             SkillManagerError::Io(format!("canonicalize skill directory failed: {e}"))
         })?;
         if canonical_dir.parent() != Some(canonical_root.as_path()) {
@@ -1278,7 +1279,7 @@ fn allowed_import_bases(
         if fs::symlink_metadata(&raw).is_ok_and(|m| m.file_type().is_symlink()) {
             continue;
         }
-        if let Ok(canon) = fs::canonicalize(&raw) {
+        if let Ok(canon) = crate::platform::canonicalize_clean(&raw) {
             pairs.push((raw, canon));
         }
     }
@@ -1380,7 +1381,7 @@ fn resolve_import_local_file(
         )));
     }
 
-    let canonical_file = fs::canonicalize(&target_file).map_err(|e| {
+    let canonical_file = crate::platform::canonicalize_clean(&target_file).map_err(|e| {
         SkillManagerError::NotFound(format!(
             "import source `{trimmed}` could not be resolved: {e}"
         ))
@@ -1406,7 +1407,7 @@ fn resolve_import_local_file(
             continue;
         };
         let walked = verify_relative_path_no_symlinks(canon_base, rel_path)?;
-        let walked_canon = fs::canonicalize(&walked)
+        let walked_canon = crate::platform::canonicalize_clean(&walked)
             .map_err(|e| SkillManagerError::Io(format!("canonicalize import path failed: {e}")))?;
         if walked_canon == canonical_file {
             verified_under_base = true;

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Comprehensive End-to-End Integration Tests for Orbit v0.6.0:
 //! 1. Non-Git Worktree Guard + Nested Git Repo Discovery & Sidebar Worktree Folding
 //! 2. Dual-Client Real-Time Multi-Device Sync (Read/Unread, ManualUnread, Pin, Rename, Projects, Manual Reorder, Offline Queue)

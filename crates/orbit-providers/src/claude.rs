@@ -2172,6 +2172,8 @@ async fn load_claude_credentials_json() -> Option<String> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".claude")
@@ -2534,18 +2536,20 @@ mod tests {
 
     #[tokio::test]
     async fn claude_fork_aborts_when_init_returns_parent_session_id() {
+        use orbit_shim::ShimListener;
         use tokio::io::AsyncWriteExt;
-        use tokio::net::UnixListener;
 
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_claude_fork_guard_{}.sock",
             Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind mock claude shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock claude shim");
 
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut stream = listener.accept().await.expect("accept");
             let frames = [
                 ShimFrame::AttachAck { latest_seq: 0 },
                 ShimFrame::StdoutLine {
@@ -2697,30 +2701,28 @@ mod tests {
 
     #[tokio::test]
     async fn claude_live_fast_mode_tracks_multiple_requests_and_surfaces_policy_errors() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
 
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_claude_fast_ctrl_{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind mock shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
         let observed_reqs: Arc<tokio::sync::Mutex<Vec<String>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let observed_bg = Arc::clone(&observed_reqs);
 
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
+            let stream = listener.accept().await.expect("accept");
             let (rh, mut wh) = stream.into_split();
             let mut lines = BufReader::new(rh).lines();
             let mut seq: u64 = 1;
 
-            async fn send_stdout(
-                wh: &mut tokio::net::unix::OwnedWriteHalf,
-                seq: &mut u64,
-                v: Value,
-            ) {
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
                 let frame = ShimFrame::StdoutLine {
                     seq: Some(*seq),
                     line: v.to_string(),

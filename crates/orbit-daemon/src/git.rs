@@ -324,7 +324,7 @@ fn managed_artifact_roots(extra_attachments_dir: Option<&Path>) -> Vec<PathBuf> 
     if let Some(extra) = extra_attachments_dir {
         roots.push(extra.to_path_buf());
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::platform::resolve_user_home_dir();
     let orbit_home = std::env::var_os("ORBIT_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|h| h.join(".orbit")));
@@ -357,8 +357,11 @@ async fn resolve_managed_artifact_file_if_allowed(
     if !allow_managed_artifacts {
         return None;
     }
-    let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest))?
+    let candidate = if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix(r"~\"))
+    {
+        crate::platform::resolve_user_home_dir().map(|h| h.join(rest))?
     } else {
         let p = Path::new(trimmed);
         if !p.is_absolute() {
@@ -367,9 +370,11 @@ async fn resolve_managed_artifact_file_if_allowed(
         p.to_path_buf()
     };
 
-    let canonical = tokio::fs::canonicalize(&candidate).await.ok()?;
+    let canonical = crate::platform::canonicalize_clean_async(&candidate)
+        .await
+        .ok()?;
     for root in managed_artifact_roots(extra_attachments_dir) {
-        if let Ok(canon_root) = tokio::fs::canonicalize(&root).await
+        if let Ok(canon_root) = crate::platform::canonicalize_clean_async(&root).await
             && canonical.starts_with(&canon_root)
         {
             return Some(canonical);
@@ -402,13 +407,16 @@ async fn resolve_contained_file_path(
         return Ok(artifact_path);
     }
 
-    let canonical_cwd = tokio::fs::canonicalize(cwd)
+    let canonical_cwd = crate::platform::canonicalize_clean_async(cwd)
         .await
         .map_err(|e| format!("Workspace directory unavailable: {e}"))?;
 
-    let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join(rest))
+    let candidate = if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix(r"~\"))
+    {
+        crate::platform::resolve_user_home_dir()
+            .map(|h| h.join(rest))
             .ok_or_else(|| "Cannot resolve home directory".to_string())?
     } else {
         let p = Path::new(trimmed);
@@ -424,7 +432,7 @@ async fn resolve_contained_file_path(
         }
     };
 
-    let canonical = tokio::fs::canonicalize(&candidate)
+    let canonical = crate::platform::canonicalize_clean_async(&candidate)
         .await
         .map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
 
@@ -434,7 +442,7 @@ async fn resolve_contained_file_path(
 
     if allow_managed_artifacts {
         for root in managed_artifact_roots(extra_attachments_dir) {
-            if let Ok(canon_root) = tokio::fs::canonicalize(&root).await
+            if let Ok(canon_root) = crate::platform::canonicalize_clean_async(&root).await
                 && canonical.starts_with(&canon_root)
             {
                 return Ok(canonical);
@@ -465,7 +473,7 @@ async fn compute_workspace_file_writable(
     if !is_metadata_writable(meta) {
         return false;
     }
-    let Ok(canonical_cwd) = tokio::fs::canonicalize(cwd).await else {
+    let Ok(canonical_cwd) = crate::platform::canonicalize_clean_async(cwd).await else {
         return false;
     };
     if !canonical.starts_with(&canonical_cwd) || is_path_inside_git(&canonical_cwd, canonical) {
@@ -718,10 +726,10 @@ pub(crate) async fn resolve_git_scope(cwd: &Path) -> Option<(PathBuf, Option<Str
         return None;
     }
     let repo_root = PathBuf::from(raw);
-    let canon_root = tokio::fs::canonicalize(&repo_root)
+    let canon_root = crate::platform::canonicalize_clean_async(&repo_root)
         .await
         .unwrap_or_else(|_| repo_root.clone());
-    let canon_cwd = tokio::fs::canonicalize(cwd)
+    let canon_cwd = crate::platform::canonicalize_clean_async(cwd)
         .await
         .unwrap_or_else(|_| cwd.to_path_buf());
     let subdir_scope = canon_cwd
@@ -1063,7 +1071,7 @@ fn diff_header_indicates_new_file(diff: &str) -> bool {
 /// Fallback restoration when no Git tree checkpoint exists: reverse-applies recorded `FileEdit`
 /// unified diffs in reverse chronological order, strictly contained inside canonical `cwd`.
 pub async fn reverse_apply_file_edit_diffs(cwd: &Path, edits: &[(String, String)]) -> u32 {
-    let Ok(canonical_cwd) = tokio::fs::canonicalize(cwd).await else {
+    let Ok(canonical_cwd) = crate::platform::canonicalize_clean_async(cwd).await else {
         return 0;
     };
     let mut restored_paths = std::collections::HashSet::new();
@@ -1089,7 +1097,8 @@ pub async fn reverse_apply_file_edit_diffs(cwd: &Path, edits: &[(String, String)
         if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
             continue;
         }
-        let Ok(canonical_target) = tokio::fs::canonicalize(&candidate).await else {
+        let Ok(canonical_target) = crate::platform::canonicalize_clean_async(&candidate).await
+        else {
             continue;
         };
         if !canonical_target.starts_with(&canonical_cwd) {

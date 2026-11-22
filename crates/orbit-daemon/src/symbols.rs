@@ -160,7 +160,7 @@ impl WorkspaceSymbolIndex {
     /// Invalidate any cached symbol index for `cwd` as well as parent/nested cached roots
     /// (called after workspace file mutations).
     pub fn invalidate(&self, cwd: &Path) {
-        let key = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let key = crate::platform::canonicalize_clean(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         if let Ok(mut guard) = self.cache.write() {
             guard.retain(|k, _| !(k == &key || key.starts_with(k) || k.starts_with(&key)));
         }
@@ -2324,8 +2324,8 @@ pub fn read_symbol_snippet(
     }
 
     let candidate = canonical_cwd.join(rel);
-    let canonical_file =
-        fs::canonicalize(&candidate).map_err(|e| format!("Symbol file unavailable: {e}"))?;
+    let canonical_file = crate::platform::canonicalize_clean(&candidate)
+        .map_err(|e| format!("Symbol file unavailable: {e}"))?;
     if !canonical_file.starts_with(&canonical_cwd) {
         return Err(format!("Symbol path `{raw_path}` escapes workspace root"));
     }

@@ -2107,18 +2107,7 @@ async fn run_verify_command(
     timeout: Duration,
     child_pgid: Arc<std::sync::Mutex<Option<u32>>>,
 ) -> VerifyCommandOutcome {
-    #[cfg(unix)]
-    let mut cmd = {
-        let mut c = tokio::process::Command::new("/bin/sh");
-        c.arg("-c").arg(command_str);
-        c
-    };
-    #[cfg(not(unix))]
-    let mut cmd = {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(command_str);
-        c
-    };
+    let mut cmd = crate::platform::build_shell_command(command_str, false);
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     configure_isolated_child(&mut cmd, authorized_cwd);
@@ -2377,64 +2366,30 @@ fn configure_isolated_child(cmd: &mut tokio::process::Command, authorized_cwd: &
         }
     }
 
-    #[cfg(unix)]
-    {
-        // Safe Rust API (`Command::process_group`): puts child into its own process group (`pgid == pid`).
-        cmd.process_group(0);
-    }
+    crate::platform::configure_isolated_process_group(cmd);
 }
 
-/// Async, portable, zero-`unsafe` process-group termination (`kill -9 -<pgid>`).
+/// Async, portable, zero-`unsafe` process-group / process-tree termination
+/// (`kill -9 -<pgid>` on Unix, `taskkill /PID <pid> /T /F` on Windows).
 async fn terminate_process_group(pgid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = pgid
-        && pid > 1
-    {
-        let target = format!("-{pid}");
-        for bin in ["/bin/kill", "/usr/bin/kill", "kill"] {
-            let status = tokio::process::Command::new(bin)
-                .args(["-9", &target])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-            if status.is_ok() {
-                break;
-            }
-        }
+    if let Some(pid) = pgid {
+        crate::platform::terminate_process_tree_async(pid).await;
     }
-    #[cfg(not(unix))]
-    let _ = pgid;
 }
 
-/// Non-blocking PGID cleanup used exclusively inside synchronous `Drop` guards.
+/// Non-blocking PGID / process-tree cleanup used exclusively inside synchronous `Drop` guards.
 fn spawn_detached_pgid_kill(pid: u32) {
-    #[cfg(unix)]
     if pid > 1 {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                terminate_process_group(Some(pid)).await;
+                crate::platform::terminate_process_tree_async(pid).await;
             });
         } else {
             let _ = std::thread::spawn(move || {
-                let target = format!("-{pid}");
-                for bin in ["/bin/kill", "/usr/bin/kill", "kill"] {
-                    let res = std::process::Command::new(bin)
-                        .args(["-9", &target])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    if res.is_ok() {
-                        break;
-                    }
-                }
+                crate::platform::terminate_process_tree_sync(pid);
             });
         }
     }
-    #[cfg(not(unix))]
-    let _ = pid;
 }
 
 // ==================== WORKSPACE-CONFINED LOG FILE VALIDATION ====================
@@ -2563,7 +2518,7 @@ pub(crate) fn resolve_confined_log_path(
         .iter()
         .fold(canon_root.clone(), |acc, p| acc.join(p));
     if leaf_exists {
-        let canon_target = std::fs::canonicalize(&final_path).map_err(|e| {
+        let canon_target = crate::platform::canonicalize_clean(&final_path).map_err(|e| {
             format!(
                 "failed to canonicalize LogFileTail path `{}`: {e}",
                 final_path.display()
@@ -3469,6 +3424,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancel_during_verify_command_terminates_child_process_group_immediately() {
         let dir = std::env::temp_dir().join(format!(
@@ -3611,6 +3567,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_stream_monitor_matches_pattern_coalesces_bursts_and_caps_huge_lines() {
         let dir = std::env::temp_dir().join(format!("orbit_mon_cmd_{}", Uuid::new_v4().simple()));

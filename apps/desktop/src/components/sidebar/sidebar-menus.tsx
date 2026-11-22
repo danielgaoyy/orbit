@@ -33,6 +33,7 @@ import {
 import {
   type AgentCardView,
   type HostCardView,
+  isWindowsDesktop,
   type SidebarProjectGroupView,
   type SidebarWorkspaceGroupView,
   isAgentBackgroundWaiting,
@@ -635,7 +636,13 @@ export function SharedProjectMenu({
           >
             <span className="flex items-center gap-2 whitespace-nowrap">
               <FolderOpen className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
-              <span>{isMac ? "Reveal in Finder" : "Open folder"}</span>
+              <span>
+                {isMac
+                  ? "Reveal in Finder"
+                  : isWindowsDesktop()
+                    ? "Reveal in File Explorer"
+                    : "Open folder"}
+              </span>
             </span>
           </DropdownMenuItem>
         )}

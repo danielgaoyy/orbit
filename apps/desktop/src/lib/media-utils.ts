@@ -4,6 +4,8 @@
  * and concise citation formatting for Composer insertion.
  */
 
+import { stripWindowsVerbatimPrefix } from "@/lib/stage-cache";
+
 export type AttachmentModality = "image" | "pdf" | "audio" | "video";
 export type RichMediaKind = "pdf" | "audio" | "video";
 
@@ -22,7 +24,8 @@ const AUDIO_EXTS = new Set(["mp3", "wav", "m4a", "aac", "ogg", "flac", "opus", "
 const VIDEO_EXTS = new Set(["mp4", "mov", "m4v", "webm", "mkv"]);
 
 export function basenameOfPath(rawPath: string): string {
-  const normalized = rawPath.replace(/\\/g, "/");
+  const withoutVerbatim = stripWindowsVerbatimPrefix(rawPath);
+  const normalized = withoutVerbatim.replace(/\\/g, "/").replace(/\/+$/, "");
   const idx = normalized.lastIndexOf("/");
   const rawBase = idx >= 0 ? normalized.slice(idx + 1) : normalized;
   return rawBase.replace(/[\r\n`]+/g, "").trim();

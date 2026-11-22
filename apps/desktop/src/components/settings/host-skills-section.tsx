@@ -22,6 +22,7 @@ import {
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
 import { isImeKeyEvent } from "@/lib/ime";
+import { modSymbol } from "@/lib/keybindings";
 import {
   type ManagedSkillRecord,
   type SkillSource,
@@ -1067,7 +1068,7 @@ export function HostSkillsSection({ hostId }: { hostId: string }) {
                             <Sparkles className="h-3 w-3" />
                             <span>Type /{skill.slug} in the composer to invoke</span>
                           </span>
-                          <span>⌘S to save</span>
+                          <span>{modSymbol()}S to save</span>
                         </div>
                       </div>
                     ) : (

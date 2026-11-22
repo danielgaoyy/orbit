@@ -218,12 +218,12 @@ pub fn instruction_template_for_filename(filename: &str) -> &'static str {
 }
 
 fn resolve_default_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    crate::platform::resolve_user_home_dir()
 }
 
 fn canonicalize_optional_home(home: Option<&Path>) -> Option<PathBuf> {
     let raw = home?;
-    fs::canonicalize(raw).ok().or_else(|| {
+    crate::platform::canonicalize_clean(raw).ok().or_else(|| {
         if raw.is_absolute() {
             Some(raw.to_path_buf())
         } else {
@@ -533,7 +533,7 @@ fn is_allowed_global_config_path(canon_target: &Path, home_dir: &Path) -> bool {
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return false;
         }
-        let Ok(canon_dir) = fs::canonicalize(&dir) else {
+        let Ok(canon_dir) = crate::platform::canonicalize_clean(&dir) else {
             return false;
         };
         canon_dir.starts_with(home_dir) && canon_target.starts_with(&canon_dir)
@@ -675,7 +675,7 @@ fn resolve_imports_recursive(
             }
         };
 
-        let Ok(canon_target) = fs::canonicalize(&candidate) else {
+        let Ok(canon_target) = crate::platform::canonicalize_clean(&candidate) else {
             continue;
         };
         if !is_import_target_contained(
@@ -810,7 +810,8 @@ pub fn discover_instruction_hierarchy_with_home(
         };
 
         if let Some((content, raw_bytes)) = read_opt {
-            let canon_file = fs::canonicalize(&safe_target).unwrap_or(safe_target.clone());
+            let canon_file =
+                crate::platform::canonicalize_clean(&safe_target).unwrap_or(safe_target.clone());
             if !seen_canon_paths.insert(canon_file.clone()) {
                 continue;
             }
@@ -1018,7 +1019,7 @@ fn resolve_allowlisted_instruction_path(
 
     // Also try matching after canonicalizing the parent directory (handles macOS `/var` -> `/private/var` symlinks)
     if let (Some(parent), Some(file_name)) = (normalized.parent(), normalized.file_name())
-        && let Ok(canon_parent) = fs::canonicalize(parent)
+        && let Ok(canon_parent) = crate::platform::canonicalize_clean(parent)
     {
         let resolved = canon_parent.join(file_name);
         if let Some(found) = allowlist.get(&resolved) {
@@ -1076,7 +1077,7 @@ fn ensure_safe_parent_dir(
                 )));
             }
         }
-        let canon_parent = fs::canonicalize(allowed_root).map_err(|e| {
+        let canon_parent = crate::platform::canonicalize_clean(allowed_root).map_err(|e| {
             InstructionError::Io(format!("Cannot canonicalize config directory: {e}"))
         })?;
         if !canon_parent.starts_with(home) {
@@ -1088,7 +1089,7 @@ fn ensure_safe_parent_dir(
     }
 
     // Workspace/repo/ancestor file: `parent` is either `allowed_root` or `allowed_root/.github`
-    let canon_root = fs::canonicalize(allowed_root)
+    let canon_root = crate::platform::canonicalize_clean(allowed_root)
         .map_err(|e| InstructionError::Io(format!("Cannot canonicalize workspace root: {e}")))?;
     if parent == allowed_root {
         return Ok(canon_root);
@@ -1133,7 +1134,7 @@ fn ensure_safe_parent_dir(
         }
     }
 
-    let canon_github = fs::canonicalize(&github_dir)
+    let canon_github = crate::platform::canonicalize_clean(&github_dir)
         .map_err(|e| InstructionError::Io(format!("Cannot canonicalize `.github`: {e}")))?;
     if !canon_github.starts_with(&canon_root) || is_path_inside_git(&canon_root, &canon_github) {
         return Err(InstructionError::PathRejected(
@@ -1735,8 +1736,8 @@ mod tests {
         .expect("write app agents");
 
         // Workspace inside `$HOME` with `~/.git` MUST NOT adopt `$HOME` as repo_root!
-        let canon_ws = fs::canonicalize(&workspace).expect("canon ws");
-        let canon_home = fs::canonicalize(&home).expect("canon home");
+        let canon_ws = crate::platform::canonicalize_clean(&workspace).expect("canon ws");
+        let canon_home = crate::platform::canonicalize_clean(&home).expect("canon home");
         assert!(find_git_repo_root(&canon_ws, Some(&canon_home)).is_none());
 
         let res = discover_instruction_hierarchy_with_home(&workspace, Some(&home))

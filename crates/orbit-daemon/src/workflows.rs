@@ -2524,18 +2524,7 @@ async fn run_workflow_verify_command(
         };
     }
 
-    #[cfg(unix)]
-    let mut cmd = {
-        let mut c = tokio::process::Command::new("/bin/sh");
-        c.arg("-c").arg(command_str);
-        c
-    };
-    #[cfg(not(unix))]
-    let mut cmd = {
-        let mut c = tokio::process::Command::new("cmd");
-        c.arg("/C").arg(command_str);
-        c
-    };
+    let mut cmd = crate::platform::build_shell_command(command_str, false);
 
     cmd.current_dir(authorized_cwd)
         .stdin(Stdio::null())
@@ -2551,10 +2540,7 @@ async fn run_workflow_verify_command(
         }
     }
 
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
+    crate::platform::configure_isolated_process_group(&mut cmd);
 
     // Re-check cancel immediately before spawn to close the env-setup window.
     if *cancel_rx.borrow() {
@@ -2710,26 +2696,9 @@ async fn drain_tail<R: AsyncRead + Unpin>(mut reader: R, tail: Arc<Mutex<TailBuf
 }
 
 async fn terminate_process_group(pgid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = pgid
-        && pid > 1
-    {
-        let target = format!("-{pid}");
-        for bin in ["/bin/kill", "/usr/bin/kill", "kill"] {
-            let status = tokio::process::Command::new(bin)
-                .args(["-9", &target])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-            if status.is_ok() {
-                break;
-            }
-        }
+    if let Some(pid) = pgid {
+        crate::platform::terminate_process_tree_async(pid).await;
     }
-    #[cfg(not(unix))]
-    let _ = pgid;
 }
 
 // ==================== UNIT TESTS ====================

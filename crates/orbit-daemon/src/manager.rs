@@ -5656,7 +5656,7 @@ impl AgentOrchestrator {
         env: HashMap<String, String>,
     ) -> anyhow::Result<TerminalSummary> {
         let term_id = format!("term_{}", Uuid::new_v4().simple());
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        let shell = crate::platform::default_shell_program();
         let sock_path = self.shim_socket_path("p", &term_id);
         let candidate_cwd = crate::expand_host_path(&cwd);
         let resolved_cwd = if candidate_cwd.is_dir() {
@@ -5668,15 +5668,8 @@ impl AgentOrchestrator {
 
         let mut env = env;
         let (program, args) = if let Some(cmd_line) = initial_command {
-            let shell_flag = if orbit_providers::merge_cached_shell_env_into_map(&mut env) {
-                "-c"
-            } else {
-                "-lc"
-            };
-            (
-                "/bin/sh".to_string(),
-                vec![shell_flag.to_string(), cmd_line],
-            )
+            let has_cached_env = orbit_providers::merge_cached_shell_env_into_map(&mut env);
+            crate::platform::shell_command_for_platform(&cmd_line, !has_cached_env)
         } else {
             (shell.clone(), Vec::new())
         };

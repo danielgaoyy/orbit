@@ -29,7 +29,11 @@ impl SshHostEntry {
 
 /// Parse `~/.ssh/config` (including `Include` directives) and return concrete remote server entries.
 pub fn discover_ssh_hosts() -> Vec<SshHostEntry> {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+    let Some(home) = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+    else {
         return Vec::new();
     };
     let ssh_dir = home.join(".ssh");

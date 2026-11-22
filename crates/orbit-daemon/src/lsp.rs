@@ -398,7 +398,7 @@ pub fn resolve_workspace_file(
         canonical_cwd.join(candidate)
     };
 
-    let canonical_file = std::fs::canonicalize(&full)
+    let canonical_file = crate::platform::canonicalize_clean(&full)
         .map_err(|e| format!("File `{trimmed}` not found in workspace: {e}"))?;
     if !canonical_file.starts_with(canonical_cwd) {
         return Err(format!("Path `{trimmed}` escapes workspace boundary"));
@@ -430,12 +430,20 @@ fn path_to_unix_string(path: &Path) -> String {
 }
 
 /// Convert a canonical filesystem path into a standards-compliant `file://` URI.
+/// Handles Unix paths (`/tmp/a.rs`), Windows drive paths (`C:\Users\me\a.rs`, `\\?\C:\...`),
+/// and Windows UNC paths (`\\server\share\a.rs`, `\\?\UNC\server\share\a.rs`).
 pub fn path_to_file_uri(path: &Path) -> String {
-    let raw = path.to_string_lossy();
+    let stripped = crate::platform::strip_windows_verbatim_prefix_str(&path.to_string_lossy());
+    let raw = stripped.replace('\\', "/");
     let mut encoded = String::with_capacity(raw.len() + 8);
-    encoded.push_str("file://");
-    if !raw.starts_with('/') {
-        encoded.push('/');
+    if raw.starts_with("//") {
+        // RFC 8089 UNC authority form: `\\server\share\a.rs` -> `file://server/share/a.rs`
+        encoded.push_str("file:");
+    } else {
+        encoded.push_str("file://");
+        if !raw.starts_with('/') {
+            encoded.push('/');
+        }
     }
     for &b in raw.as_bytes() {
         let keep =
@@ -450,7 +458,9 @@ pub fn path_to_file_uri(path: &Path) -> String {
 }
 
 /// Convert a local `file:///` or `file://localhost/` URI back into a `PathBuf`.
-/// Rejects remote authorities (e.g. `file://evil.host/etc/passwd`), relative file URIs, and NUL bytes.
+/// Rejects remote authorities (e.g. `file://evil.host/etc/passwd`), relative file URIs,
+/// drive-relative Windows URIs (`file:///C:foo.rs`), and NUL bytes.
+/// Supports both Unix (`/tmp/a.rs`) and Windows absolute drive-letter URIs (`file:///C:/Users/me/a.rs`).
 pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let without_suffix = uri.find(['?', '#']).map(|idx| &uri[..idx]).unwrap_or(uri);
 
@@ -460,7 +470,6 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
 
     let bytes = path_part.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len() + 1);
-    decoded.push(b'/');
     let mut i = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'%'
@@ -482,7 +491,15 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
         i += 1;
     }
     let s = String::from_utf8(decoded).ok()?;
-    Some(PathBuf::from(s))
+    let sb = s.as_bytes();
+    if sb.len() >= 2 && sb[0].is_ascii_alphabetic() && sb[1] == b':' {
+        if sb.len() == 2 || sb[2] == b'/' || sb[2] == b'\\' {
+            return Some(PathBuf::from(s));
+        }
+        // Reject ambiguous drive-relative Windows paths like `file:///C:foo.rs`
+        return None;
+    }
+    Some(PathBuf::from(format!("/{s}")))
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -533,12 +550,16 @@ pub fn resolve_binary(command: &str) -> Option<PathBuf> {
     if let Some(path_var) = std::env::var_os("PATH") {
         search_dirs.extend(std::env::split_paths(&path_var));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        search_dirs.push(home.join(".cargo/bin"));
-        search_dirs.push(home.join("go/bin"));
-        search_dirs.push(home.join(".local/bin"));
+    if let Some(home) = crate::platform::resolve_user_home_dir() {
+        search_dirs.push(home.join(".cargo").join("bin"));
+        search_dirs.push(home.join("go").join("bin"));
+        search_dirs.push(home.join(".local").join("bin"));
+        #[cfg(unix)]
         search_dirs.push(home.join(".nvm/current/bin"));
+        #[cfg(windows)]
+        search_dirs.push(home.join("AppData").join("Roaming").join("npm"));
     }
+    #[cfg(unix)]
     for sys_dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
         search_dirs.push(PathBuf::from(sys_dir));
     }
@@ -548,9 +569,10 @@ pub fn resolve_binary(command: &str) -> Option<PathBuf> {
         if !seen.insert(dir.clone()) {
             continue;
         }
-        let candidate = dir.join(trimmed);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
+        if let Some(found) =
+            crate::platform::find_executable_in_dir(&dir, trimmed, is_executable_file)
+        {
+            return Some(found);
         }
     }
     None
@@ -1713,7 +1735,7 @@ fn normalize_uri_to_display_path_lexical(uri: &str, canonical_cwd: &Path) -> Opt
 /// Blocking-thread URI-to-display-path normalizer with `fs::canonicalize` fallback.
 fn normalize_uri_to_display_path_blocking(uri: &str, canonical_cwd: &Path) -> Option<String> {
     let raw_path = file_uri_to_path(uri)?;
-    let resolved = std::fs::canonicalize(&raw_path).unwrap_or(raw_path);
+    let resolved = crate::platform::canonicalize_clean(&raw_path).unwrap_or(raw_path);
     if let Ok(rel) = resolved.strip_prefix(canonical_cwd) {
         return Some(path_to_unix_string(rel));
     }
@@ -2002,7 +2024,7 @@ fn parse_single_location(item: &Value, canonical_cwd: &Path) -> Option<LspLocati
 /// Blocks `.git`, symlinks escaping workspace, FIFOs/devices/dirs (`!meta.is_file()`), and huge files.
 pub fn read_line_preview(uri: &str, canonical_cwd: &Path, line_1based: u32) -> Option<String> {
     let file_path = file_uri_to_path(uri)?;
-    let canon = std::fs::canonicalize(&file_path).ok()?;
+    let canon = crate::platform::canonicalize_clean(&file_path).ok()?;
     if !canon.starts_with(canonical_cwd) {
         return None;
     }
@@ -3159,6 +3181,21 @@ mod tests {
             file_uri_to_path("file://localhost/tmp/demo.rs"),
             Some(PathBuf::from("/tmp/demo.rs"))
         );
+        // Windows drive-letter and verbatim `\\?\` file URI round-tripping
+        assert_eq!(
+            path_to_file_uri(Path::new(r"\\?\C:\Users\me\my file.rs")),
+            "file:///C:/Users/me/my%20file.rs"
+        );
+        assert_eq!(
+            path_to_file_uri(Path::new(r"\\?\UNC\server\share\my file.rs")),
+            "file://server/share/my%20file.rs"
+        );
+        assert_eq!(
+            file_uri_to_path("file:///C:/Users/me/my%20file.rs"),
+            Some(PathBuf::from("C:/Users/me/my file.rs"))
+        );
+        // Drive-relative Windows URI rejected
+        assert!(file_uri_to_path("file:///C:foo.rs").is_none());
         // Remote authority, relative URI, and NUL byte rejected
         assert!(file_uri_to_path("file://evil.host/etc/passwd").is_none());
         assert!(file_uri_to_path("file://relative/path.rs").is_none());

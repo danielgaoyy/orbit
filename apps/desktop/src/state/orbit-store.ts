@@ -131,7 +131,9 @@ import {
   type WorkspaceFileView,
   isAgentBackgroundWaiting,
   isAgentForegroundRunning,
+  isLinuxDesktop,
   isMacDesktop,
+  isWindowsDesktop,
   compareSemver,
   normalizeSemver,
   orbitIpc,
@@ -954,10 +956,9 @@ applyDocumentTheme(initialResolvedTheme);
 if (typeof document !== "undefined") {
   if (isMacDesktop()) {
     document.documentElement.classList.add("orbit-mac");
-  } else if (
-    typeof navigator !== "undefined" &&
-    /Linux/i.test(navigator.platform || navigator.userAgent)
-  ) {
+  } else if (isWindowsDesktop()) {
+    document.documentElement.classList.add("orbit-windows");
+  } else if (isLinuxDesktop()) {
     document.documentElement.classList.add("orbit-linux");
   }
 }

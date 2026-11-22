@@ -4,21 +4,36 @@ import type {
   HostCardView,
   HostDetailView,
 } from "@/lib/orbit-ipc";
+import { stripWindowsVerbatimPrefix } from "@/lib/stage-cache";
 
 export function basenameOfProjectPath(path: string): string {
   if (!path || path === "~") return "~";
-  const clean = path.replace(/\/+$/, "");
-  const i = clean.lastIndexOf("/");
-  return i >= 0 ? clean.slice(i + 1) || "/" : clean;
+  const clean = normalizeProjectPath(path);
+  if (clean === "/" || clean === "\\" || /^[A-Za-z]:[\\/]?$/.test(clean)) {
+    return clean;
+  }
+  const normalized = clean.replace(/\\/g, "/").replace(/\/+$/, "");
+  const i = normalized.lastIndexOf("/");
+  return i >= 0 ? normalized.slice(i + 1) || "/" : normalized;
 }
 
 export function normalizeProjectPath(path: string): string {
   if (!path || path === "~") return "~";
-  return path.replace(/\/+$/, "") || "/";
+  const clean = stripWindowsVerbatimPrefix(path.trim());
+  if (!clean) return "~";
+  if (clean === "/" || clean === "\\") return clean;
+  if (/^[A-Za-z]:[\\/]+$/.test(clean)) {
+    return `${clean.slice(0, 2)}${clean[2]}`;
+  }
+  return clean.replace(/[\\/]+$/, "") || "/";
 }
 
 export function formatTildeProjectPath(path: string): string {
-  return normalizeProjectPath(path).replace(/^\/(?:Users|home)\/[^/]+/, "~");
+  const normalized = normalizeProjectPath(path);
+  if (/^[A-Za-z]:[\\/]Users[\\/][^\\/]+/i.test(normalized)) {
+    return normalized.replace(/^[A-Za-z]:[\\/]Users[\\/][^\\/]+/i, "~");
+  }
+  return normalized.replace(/^\/(?:Users|home)\/[^/]+/, "~");
 }
 
 /**
@@ -169,18 +184,24 @@ export function projectPathScopeKey(hostId: string, dirPath: string): string {
 
 export function isBareHomeDir(path: string): boolean {
   const clean = normalizeProjectPath(path);
-  if (clean === "~" || clean === "/") return true;
+  if (clean === "~" || clean === "/" || clean === "\\" || /^[A-Za-z]:[\\/]?$/.test(clean)) {
+    return true;
+  }
+  if (/^[A-Za-z]:[\\/]Users[\\/][^\\/]+$/i.test(clean)) {
+    return true;
+  }
   const parts = clean.split("/");
   return parts.length === 3 && (parts[1] === "Users" || parts[1] === "home");
 }
 
 export function matchesProjectDirectory(directories: string[], cwd: string): boolean {
   const cleanCwd = normalizeProjectPath(cwd);
+  const slashCwd = cleanCwd.replace(/\\/g, "/");
   for (const dir of directories) {
     const cleanDir = normalizeProjectPath(dir);
-    if (cleanDir === cleanCwd) return true;
+    if (cleanDir === cleanCwd || cleanDir.replace(/\\/g, "/") === slashCwd) return true;
     const repoBase = basenameOfProjectPath(cleanDir);
-    if (repoBase && repoBase !== "~" && cleanCwd.includes(`/worktrees/${repoBase}-`)) {
+    if (repoBase && repoBase !== "~" && slashCwd.includes(`/worktrees/${repoBase}-`)) {
       return true;
     }
   }

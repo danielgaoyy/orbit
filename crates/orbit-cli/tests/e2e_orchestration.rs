@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Comprehensive 10-scenario End-to-End Orchestration Integration Test Suite.
 //!
 //! Uses a deterministic Python3 mock Claude Code stream-json provider (injected via safe

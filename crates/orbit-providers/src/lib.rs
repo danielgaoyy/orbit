@@ -513,7 +513,13 @@ fn default_executable_search_dirs() -> Vec<PathBuf> {
         ] {
             push_unique(extra);
         }
+        #[cfg(windows)]
+        {
+            push_unique(home.join("AppData").join("Roaming").join("npm"));
+            push_unique(home.join("AppData").join("Local").join("Programs"));
+        }
     }
+    #[cfg(unix)]
     for extra in [
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
@@ -524,11 +530,60 @@ fn default_executable_search_dirs() -> Vec<PathBuf> {
     search_dirs
 }
 
+/// Build ordered executable candidate filenames for Windows (`PATHEXT` / `.exe`, `.cmd`, `.bat`, `.com`).
+pub fn windows_executable_candidates(
+    dir: &Path,
+    binary_name: &str,
+    pathext: Option<&str>,
+) -> Vec<PathBuf> {
+    let trimmed = binary_name.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let exts: Vec<String> = pathext
+        .unwrap_or(".EXE;.CMD;.BAT;.COM")
+        .split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let lower = e.to_ascii_lowercase();
+            if lower.starts_with('.') {
+                lower
+            } else {
+                format!(".{lower}")
+            }
+        })
+        .collect();
+    let lower_name = trimmed.to_ascii_lowercase();
+    if exts.iter().any(|ext| lower_name.ends_with(ext)) {
+        return vec![dir.join(trimmed)];
+    }
+    let mut out = Vec::with_capacity(exts.len() + 1);
+    for ext in &exts {
+        out.push(dir.join(format!("{trimmed}{ext}")));
+    }
+    out.push(dir.join(trimmed));
+    out
+}
+
 fn find_executable_in_dirs(binary_name: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let pathext = env::var("PATHEXT").ok();
     for dir in search_dirs {
-        let candidate = dir.join(binary_name);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
+        #[cfg(windows)]
+        {
+            for candidate in windows_executable_candidates(dir, binary_name, pathext.as_deref()) {
+                if is_executable_file(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let candidate = dir.join(binary_name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -1130,6 +1185,26 @@ mod capability_tests {
             compacted.matches("@@ ").count(),
             1,
             "deleted -- and added ++ lines must NOT split the hunk:\n{compacted}"
+        );
+    }
+
+    #[test]
+    fn windows_executable_candidates_append_pathext_extensions() {
+        let dir = Path::new(r"C:\Users\dev\AppData\Roaming\npm");
+        let cands = windows_executable_candidates(dir, "codex", Some(".EXE;.CMD;.BAT"));
+        let names: Vec<String> = cands
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(names, vec!["codex.exe", "codex.cmd", "codex.bat", "codex"]);
+
+        let already_ext = windows_executable_candidates(dir, "claude.exe", Some(".EXE;.CMD"));
+        assert_eq!(already_ext.len(), 1);
+        assert_eq!(
+            already_ext[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string()),
+            Some("claude.exe".to_string())
         );
     }
 }

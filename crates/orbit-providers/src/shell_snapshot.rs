@@ -2094,10 +2094,12 @@ mod tests {
     #[test]
     fn explicit_caller_env_takes_precedence_over_cached_snapshot() {
         let mut snapshot = HashMap::new();
-        snapshot.insert(
-            "PATH".into(),
-            "/opt/orbit-login-bin:/opt/homebrew/bin:/usr/bin".into(),
-        );
+        let joined_snapshot_path =
+            std::env::join_paths(["/opt/orbit-login-bin", "/opt/homebrew/bin", "/usr/bin"])
+                .expect("join snapshot PATH")
+                .to_string_lossy()
+                .into_owned();
+        snapshot.insert("PATH".into(), joined_snapshot_path);
         snapshot.insert("ORBIT_TEST_SNAP_EXPLICIT".into(), "from_snapshot".into());
         snapshot.insert("ORBIT_TEST_SNAP_ONLY".into(), "snapshot_value".into());
         snapshot.insert(
@@ -2155,8 +2157,10 @@ mod tests {
             .and_then(|v| v.as_ref())
             .and_then(|v| v.to_str())
             .expect("merged PATH present");
+        let path_sep = if cfg!(windows) { ';' } else { ':' };
+        let expected_prefix = format!("/opt/orbit-login-bin{path_sep}");
         assert!(
-            merged_path.starts_with("/opt/orbit-login-bin:"),
+            merged_path.starts_with(&expected_prefix) || merged_path == "/opt/orbit-login-bin",
             "login PATH entries should lead merged PATH, got: {merged_path}"
         );
 
@@ -2177,7 +2181,7 @@ mod tests {
         assert!(
             map_target
                 .get("PATH")
-                .is_some_and(|p| p.starts_with("/opt/orbit-login-bin:"))
+                .is_some_and(|p| p.starts_with(&expected_prefix) || p == "/opt/orbit-login-bin")
         );
 
         // 4. Verify real child process observes explicit caller precedence end-to-end

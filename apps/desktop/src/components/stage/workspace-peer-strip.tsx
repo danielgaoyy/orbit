@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import {
   formatProviderShortLabel,
+  isMacDesktop,
   type ProviderKind,
   type SessionMode,
   semanticAgentTabLabel,
@@ -757,7 +758,9 @@ export const WorkspacePeerStrip = memo(function WorkspacePeerStrip() {
             const tooltipParts = [
               `${label} (${providerShortName(peer.provider)}${peer.model ? ` · ${peer.model}` : ""})`,
               peer.task_summary || peer.title,
-              isActive ? "Double-click to rename" : "Click to switch · ⌘/Ctrl+click to split",
+              isActive
+                ? "Double-click to rename"
+                : `Click to switch · ${isMacDesktop() ? "⌘" : "Ctrl"}+click to split`,
             ];
 
             return (

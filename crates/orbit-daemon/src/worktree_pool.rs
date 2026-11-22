@@ -643,7 +643,9 @@ async fn resolve_git_common_dir(source_cwd: &Path) -> anyhow::Result<PathBuf> {
     } else {
         source_cwd.join(candidate)
     };
-    Ok(tokio::fs::canonicalize(&resolved).await.unwrap_or(resolved))
+    Ok(crate::platform::canonicalize_clean_async(&resolved)
+        .await
+        .unwrap_or(resolved))
 }
 
 fn hash_repo_key(common_dir: &Path) -> String {
@@ -750,7 +752,7 @@ async fn list_standby_dirs(pool_dir: &Path) -> Vec<PathBuf> {
 }
 
 async fn write_repo_source_meta(pool_dir: &Path, source_cwd: &Path) {
-    let canon = tokio::fs::canonicalize(source_cwd)
+    let canon = crate::platform::canonicalize_clean_async(source_cwd)
         .await
         .unwrap_or_else(|_| source_cwd.to_path_buf());
     let _ = tokio::fs::write(

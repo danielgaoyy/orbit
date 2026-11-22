@@ -296,7 +296,7 @@ pub async fn resolve_git_checkout_info(dir: &Path) -> anyhow::Result<GitCheckout
             dir.display()
         );
     }
-    let toplevel = tokio::fs::canonicalize(&top_raw)
+    let toplevel = crate::platform::canonicalize_clean_async(Path::new(&top_raw))
         .await
         .unwrap_or_else(|_| PathBuf::from(&top_raw));
 
@@ -319,7 +319,7 @@ pub async fn resolve_git_checkout_info(dir: &Path) -> anyhow::Result<GitCheckout
         let p = PathBuf::from(&common_raw);
         if p.is_absolute() { p } else { toplevel.join(p) }
     };
-    let common_dir = tokio::fs::canonicalize(&common_candidate)
+    let common_dir = crate::platform::canonicalize_clean_async(&common_candidate)
         .await
         .unwrap_or(common_candidate);
 
@@ -399,7 +399,9 @@ pub async fn resolve_primary_local_checkout(worktree_cwd: &Path) -> anyhow::Resu
             let trimmed = path_str.trim();
             if !trimmed.is_empty() {
                 let p = PathBuf::from(trimmed);
-                let canon = tokio::fs::canonicalize(&p).await.unwrap_or(p);
+                let canon = crate::platform::canonicalize_clean_async(&p)
+                    .await
+                    .unwrap_or(p);
                 candidates.push(canon);
             }
         }
@@ -772,7 +774,7 @@ fn inspect_untracked_files_sync(
                 escaping.push(rel);
             }
         } else if ft.is_file() {
-            match std::fs::canonicalize(&abs) {
+            match crate::platform::canonicalize_clean(&abs) {
                 Ok(canon) if canon.starts_with(canon_root) => {
                     let insertions = count_text_lines_capped(&canon);
                     valid.push(ValidatedUntracked {

@@ -643,58 +643,12 @@ impl Drop for BrowserProcessHandle {
 
 /// Kill an isolated child process group asynchronously without using `unsafe` code.
 async fn terminate_process_group_async(pid: u32) {
-    if pid <= 1 {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        let pgid_arg = format!("-{pid}");
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &pgid_arg])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
-    #[cfg(windows)]
-    {
-        let pid_str = pid.to_string();
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid_str, "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
-    }
+    crate::platform::terminate_process_tree_async(pid).await;
 }
 
 /// Synchronous fallback for `Drop` only.
 fn terminate_process_group_sync(pid: u32) {
-    if pid <= 1 {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        let pgid_arg = format!("-{pid}");
-        let _ = std::process::Command::new("/bin/kill")
-            .args(["-KILL", "--", &pgid_arg])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let pid_str = pid.to_string();
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid_str, "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    crate::platform::terminate_process_tree_sync(pid);
 }
 
 /// Create a symlink-safe isolated browser profile directory under `$ORBIT_HOME/browser-profiles`.

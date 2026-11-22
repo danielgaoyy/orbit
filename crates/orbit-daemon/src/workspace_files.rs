@@ -183,18 +183,18 @@ fn validate_rel_segments(raw_path: &str) -> Result<Vec<String>, String> {
 /// Canonicalize `cwd` and reject unsafe workspace roots (filesystem root, `$HOME` root,
 /// non-directories, or any path containing `.git`).
 pub fn canonicalize_workspace_root(cwd: &Path) -> Result<PathBuf, String> {
-    let canonical_cwd =
-        fs::canonicalize(cwd).map_err(|e| format!("Workspace directory unavailable: {e}"))?;
+    let canonical_cwd = crate::platform::canonicalize_clean(cwd)
+        .map_err(|e| format!("Workspace directory unavailable: {e}"))?;
     let meta = fs::metadata(&canonical_cwd)
         .map_err(|e| format!("Workspace directory unavailable: {e}"))?;
     if !meta.is_dir() {
         return Err("Workspace root is not a directory".to_string());
     }
-    if canonical_cwd.parent().is_none() {
+    if crate::platform::is_filesystem_root_path(&canonical_cwd) {
         return Err("Refusing to mutate filesystem root directory".to_string());
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        let canon_home = fs::canonicalize(&home).unwrap_or(home);
+    if let Some(home) = crate::platform::resolve_user_home_dir() {
+        let canon_home = crate::platform::canonicalize_clean(&home).unwrap_or(home);
         if canonical_cwd == canon_home {
             return Err("Refusing to mutate home directory root".to_string());
         }
@@ -221,7 +221,7 @@ fn resolve_parent_dir_strict(
         match fs::symlink_metadata(&next) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
-                    let canon = fs::canonicalize(&next).map_err(|e| {
+                    let canon = crate::platform::canonicalize_clean(&next).map_err(|e| {
                         format!("Refusing to traverse invalid symlink `{seg}`: {e}")
                     })?;
                     if !canon.starts_with(canonical_cwd) {
@@ -240,7 +240,7 @@ fn resolve_parent_dir_strict(
                     if !meta.is_dir() {
                         return Err(format!("Parent `{seg}` is not a directory"));
                     }
-                    let canon = fs::canonicalize(&next)
+                    let canon = crate::platform::canonicalize_clean(&next)
                         .map_err(|e| format!("Cannot resolve parent `{seg}`: {e}"))?;
                     if !canon.starts_with(canonical_cwd) {
                         return Err("Parent directory escapes workspace directory".to_string());
@@ -257,7 +257,7 @@ fn resolve_parent_dir_strict(
                 }
                 fs::create_dir(&next)
                     .map_err(|ce| format!("Failed creating parent directory `{seg}`: {ce}"))?;
-                let canon = fs::canonicalize(&next)
+                let canon = crate::platform::canonicalize_clean(&next)
                     .map_err(|ce| format!("Cannot resolve created directory `{seg}`: {ce}"))?;
                 if !canon.starts_with(canonical_cwd) || is_path_inside_git(canonical_cwd, &canon) {
                     return Err("Created directory escapes workspace boundary".to_string());
@@ -286,13 +286,13 @@ fn verify_existing_parents_not_inside(
         match fs::symlink_metadata(&next) {
             Ok(meta) => {
                 let canon = if meta.file_type().is_symlink() {
-                    fs::canonicalize(&next)
+                    crate::platform::canonicalize_clean(&next)
                         .map_err(|e| format!("Refusing to traverse invalid symlink `{seg}`: {e}"))?
                 } else {
                     if !meta.is_dir() {
                         return Err(format!("Parent `{seg}` is not a directory"));
                     }
-                    fs::canonicalize(&next)
+                    crate::platform::canonicalize_clean(&next)
                         .map_err(|e| format!("Cannot resolve parent `{seg}`: {e}"))?
                 };
                 if !canon.starts_with(canonical_cwd) {
@@ -348,7 +348,7 @@ fn link_target_escapes_or_targets_git(
         return true;
     }
 
-    if let Ok(canon) = fs::canonicalize(&candidate)
+    if let Ok(canon) = crate::platform::canonicalize_clean(&candidate)
         && (!canon.starts_with(canonical_cwd) || is_path_inside_git(canonical_cwd, &canon))
     {
         return true;
@@ -360,7 +360,7 @@ fn link_target_escapes_or_targets_git(
 /// Check if a symlink at `target` escapes `canonical_cwd` or points into `.git/`.
 /// Dangling symlinks whose lexical/read_link target points outside `canonical_cwd` are treated as escaping.
 fn symlink_escapes_or_targets_git(canonical_cwd: &Path, target: &Path) -> bool {
-    if let Ok(canon) = fs::canonicalize(target) {
+    if let Ok(canon) = crate::platform::canonicalize_clean(target) {
         return !canon.starts_with(canonical_cwd) || is_path_inside_git(canonical_cwd, &canon);
     }
     let Ok(link_dest) = fs::read_link(target) else {
@@ -446,7 +446,7 @@ fn write_workspace_file_sync(
                     segments.join("/")
                 ));
             }
-            let canon_target = fs::canonicalize(&target)
+            let canon_target = crate::platform::canonicalize_clean(&target)
                 .map_err(|e| format!("Cannot resolve target file: {e}"))?;
             if !canon_target.starts_with(&canonical_cwd)
                 || is_path_inside_git(&canonical_cwd, &canon_target)
@@ -694,7 +694,7 @@ fn rename_workspace_entry_sync(
             ));
         }
     } else {
-        let canon_old = fs::canonicalize(&old_target)
+        let canon_old = crate::platform::canonicalize_clean(&old_target)
             .map_err(|e| format!("Cannot resolve `{old_rel}`: {e}"))?;
         if !canon_old.starts_with(&canonical_cwd)
             || canon_old == canonical_cwd
@@ -837,7 +837,7 @@ fn delete_workspace_entry_sync(
         fs::remove_file(&target)
             .map_err(|e| format!("Failed removing symlink `{normalized_rel}`: {e}"))?;
     } else if meta.is_dir() {
-        let canon_target = fs::canonicalize(&target)
+        let canon_target = crate::platform::canonicalize_clean(&target)
             .map_err(|e| format!("Cannot resolve `{normalized_rel}`: {e}"))?;
         if !canon_target.starts_with(&canonical_cwd)
             || canon_target == canonical_cwd
@@ -849,7 +849,7 @@ fn delete_workspace_entry_sync(
         }
         remove_dir_all_no_follow(&canonical_cwd, &canon_target)?;
     } else {
-        let canon_target = fs::canonicalize(&target)
+        let canon_target = crate::platform::canonicalize_clean(&target)
             .map_err(|e| format!("Cannot resolve `{normalized_rel}`: {e}"))?;
         if !canon_target.starts_with(&canonical_cwd)
             || is_path_inside_git(&canonical_cwd, &canon_target)

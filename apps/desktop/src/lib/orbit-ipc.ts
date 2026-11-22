@@ -424,6 +424,8 @@ export interface ReleaseUpdateInfo {
   macos_dmg_url: string | null;
   linux_arm64_deb_url: string | null;
   linux_x64_deb_url: string | null;
+  windows_nsis_url?: string | null;
+  windows_msi_url?: string | null;
 }
 
 export interface AppUpdateProgress {
@@ -2591,6 +2593,16 @@ export function isTauriRuntime(): boolean {
 export function isMacDesktop(): boolean {
   if (typeof navigator === "undefined") return false;
   return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent);
+}
+
+export function isWindowsDesktop(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Win/i.test(navigator.platform || navigator.userAgent);
+}
+
+export function isLinuxDesktop(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /Linux/i.test(navigator.platform || navigator.userAgent) && !isWindowsDesktop();
 }
 
 export function timelineItemLogicalKey(item: TimelineItemView): string {

@@ -1292,8 +1292,19 @@ fn resolve_executable_path(cmd: &str, cwd: Option<&Path>) -> Option<PathBuf> {
                 search_dirs.push(ep);
             }
         }
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Some(home) = crate::platform::resolve_user_home_dir() {
             for rel in [".local/bin", ".cargo/bin", ".npm-global/bin"] {
+                let ep = home.join(rel);
+                if !search_dirs.contains(&ep) {
+                    search_dirs.push(ep);
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(home) = crate::platform::resolve_user_home_dir() {
+            for rel in [".local\\bin", ".cargo\\bin", "AppData\\Roaming\\npm"] {
                 let ep = home.join(rel);
                 if !search_dirs.contains(&ep) {
                     search_dirs.push(ep);
@@ -1303,33 +1314,19 @@ fn resolve_executable_path(cmd: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     }
 
     for dir in search_dirs {
-        let candidate = dir.join(trimmed);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
+        if let Some(found) =
+            crate::platform::find_executable_in_dir(&dir, trimmed, is_executable_file)
+        {
+            return Some(found);
         }
     }
     None
 }
 
 async fn kill_process_group_by_pid(pid: Option<u32>) {
-    #[cfg(unix)]
     if let Some(pid) = pid {
-        let pgid_arg = format!("-{pid}");
-        let kill_bin = if Path::new("/bin/kill").is_file() {
-            "/bin/kill"
-        } else {
-            "kill"
-        };
-        let _ = Command::new(kill_bin)
-            .args(["-KILL", "--", &pgid_arg])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        crate::platform::terminate_process_tree_async(pid).await;
     }
-    #[cfg(not(unix))]
-    let _ = pid;
 }
 
 async fn kill_process_group_and_reap(child: &mut tokio::process::Child, pid: Option<u32>) {
@@ -1436,12 +1433,9 @@ async fn execute_command_hook(
         cmd.current_dir(dir);
     }
 
-    // Isolate into its own process group on Unix so timeouts terminate all descendants safely
+    // Isolate into its own process group so timeouts terminate all descendants safely
     // without requiring any `unsafe` code.
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
+    crate::platform::configure_isolated_process_group(&mut cmd);
 
     // Scrub dangerous environment variables from inherited environment + hook config.
     cmd.env_clear();
@@ -1900,6 +1894,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn untrusted_project_hooks_refused_until_sha256_trusted_and_invalidated_on_modify() {
         let home = temp_dir("trust-home");
@@ -2031,6 +2026,7 @@ mod tests {
         let _ = fs::remove_dir_all(&project);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_allow_block_exit_2_and_modify_json_decisions() {
         let home = temp_dir("decisions");
@@ -2150,6 +2146,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_timeout_kills_child_process_group() {
         let home = temp_dir("timeout");
@@ -2268,37 +2265,40 @@ mod tests {
         }
 
         // Verify safe env passes through while dangerous keys are scrubbed.
-        engine
-            .upsert_hook(
-                None,
-                LifecycleHookRule {
-                    id: "hk_env_check".into(),
-                    name: "Check Env".into(),
-                    scope: HookScope::UserGlobal,
-                    event: HookEventKind::Notification,
-                    matcher: None,
-                    action: HookAction::Command {
-                        command: "/bin/sh".into(),
-                        args: vec![
-                            "-c".into(),
-                            "printf 'SAFE=%s|ORBIT=%s|LD=%s|NODE=%s' \"$SAFE_VAR\" \"$ORBIT_MCP_TOKEN\" \"$LD_PRELOAD\" \"$NODE_OPTIONS\"".into(),
-                        ],
-                        env: BTreeMap::from([("SAFE_VAR".into(), "ok123".into())]),
+        #[cfg(unix)]
+        {
+            engine
+                .upsert_hook(
+                    None,
+                    LifecycleHookRule {
+                        id: "hk_env_check".into(),
+                        name: "Check Env".into(),
+                        scope: HookScope::UserGlobal,
+                        event: HookEventKind::Notification,
+                        matcher: None,
+                        action: HookAction::Command {
+                            command: "/bin/sh".into(),
+                            args: vec![
+                                "-c".into(),
+                                "printf 'SAFE=%s|ORBIT=%s|LD=%s|NODE=%s' \"$SAFE_VAR\" \"$ORBIT_MCP_TOKEN\" \"$LD_PRELOAD\" \"$NODE_OPTIONS\"".into(),
+                            ],
+                            env: BTreeMap::from([("SAFE_VAR".into(), "ok123".into())]),
+                        },
+                        timeout_ms: 5_000,
+                        enabled: true,
+                        trusted: true,
+                        description: None,
                     },
-                    timeout_ms: 5_000,
-                    enabled: true,
-                    trusted: true,
-                    description: None,
-                },
-            )
-            .await
-            .expect("upsert safe env hook");
+                )
+                .await
+                .expect("upsert safe env hook");
 
-        let rec = engine
-            .test_hook(None, "hk_env_check", json!({}))
-            .await
-            .expect("run env check");
-        assert_eq!(rec.stdout_preview, "SAFE=ok123|ORBIT=|LD=|NODE=");
+            let rec = engine
+                .test_hook(None, "hk_env_check", json!({}))
+                .await
+                .expect("run env check");
+            assert_eq!(rec.stdout_preview, "SAFE=ok123|ORBIT=|LD=|NODE=");
+        }
 
         let _ = fs::remove_dir_all(&home);
     }
@@ -2427,6 +2427,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pre_prompt_submit_hook_blocks_agent_prompt_integration() {
         let home = temp_dir("pre-prompt-int");
@@ -2631,6 +2632,7 @@ mod tests {
         assert_eq!(normalized.host_str(), Some("hooks.example.com"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn detached_grandchild_holding_stdout_does_not_hang_past_timeout() {
         let home = temp_dir("detached-grandchild");
@@ -2786,6 +2788,7 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn test_hook_scope_prefix_prevents_user_global_shadowing_project_hook() {
         let home = temp_dir("scope-shadow-home");
@@ -2923,6 +2926,7 @@ mod tests {
         let _ = fs::remove_dir_all(&project);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pre_prompt_submit_block_during_create_agent_leaves_zero_ghost_rows_or_keep_awake() {
         let home = temp_dir("create-block-home");

@@ -47,8 +47,9 @@ fn resolve_home_dir(cfg: &SessionLaunchConfig) -> PathBuf {
     {
         return PathBuf::from(dir.trim());
     }
-    if let Ok(home) = std::env::var("HOME")
-        && !home.trim().is_empty()
+    if let Some(home) = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
     {
         return PathBuf::from(home).join(".orbit");
     }

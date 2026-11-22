@@ -528,9 +528,7 @@ fn validate_transport(transport: &McpTransportKind) -> Result<(), String> {
 }
 
 fn resolve_user_home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    crate::platform::resolve_user_home_dir()
 }
 
 /// Strictly validate a project workspace directory and resolve `<canonical_cwd>/.mcp.json`.
@@ -552,7 +550,7 @@ pub fn resolve_project_dot_mcp_path(cwd: &Path, for_write: bool) -> Result<PathB
             if for_write {
                 return Err("Refusing to write through a symlinked `.mcp.json`".to_string());
             }
-            let canon_target = fs::canonicalize(&target)
+            let canon_target = crate::platform::canonicalize_clean(&target)
                 .map_err(|e| format!("Invalid `.mcp.json` symlink: {e}"))?;
             if !canon_target.starts_with(&canonical_cwd) {
                 return Err("`.mcp.json` symlink escapes the workspace directory".to_string());
@@ -1842,26 +1840,30 @@ fn resolve_executable_path(cmd: &str) -> Option<PathBuf> {
         }
     }
 
+    #[cfg(windows)]
+    {
+        if let Some(home) = resolve_user_home_dir() {
+            for rel in [".local\\bin", ".cargo\\bin", "AppData\\Roaming\\npm"] {
+                let ep = home.join(rel);
+                if !search_dirs.contains(&ep) {
+                    search_dirs.push(ep);
+                }
+            }
+        }
+    }
+
     for dir in search_dirs {
-        let candidate = dir.join(trimmed);
-        if candidate.is_file() {
-            return Some(candidate);
+        if let Some(found) = crate::platform::find_executable_in_dir(&dir, trimmed, |p| p.is_file())
+        {
+            return Some(found);
         }
     }
     None
 }
 
 async fn kill_process_group_and_reap(child: &mut tokio::process::Child) {
-    #[cfg(unix)]
     if let Some(pid) = child.id() {
-        let pgid_arg = format!("-{pid}");
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &pgid_arg])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        crate::platform::terminate_process_tree_async(pid).await;
     }
     let _ = child.kill().await;
     let _ = child.wait().await;
@@ -2135,10 +2137,7 @@ async fn probe_stdio_mcp(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
+    crate::platform::configure_isolated_process_group(&mut cmd);
 
     // Strip any dangerous inherited loader, shell-hook, or internal ORBIT_* env variables.
     for (k_os, _) in std::env::vars_os() {

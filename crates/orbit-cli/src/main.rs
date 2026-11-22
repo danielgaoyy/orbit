@@ -527,6 +527,8 @@ fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
         return h;
     }
     std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".orbit")

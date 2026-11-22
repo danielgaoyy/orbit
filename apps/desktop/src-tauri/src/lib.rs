@@ -23,6 +23,7 @@ use crate::updater::{
 };
 
 use orbit_client_core::HostRouteMode;
+use orbit_client_core::app_core::LifecycleHooksSnapshotView;
 use orbit_client_core::app_core::{
     AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest, ClientProjectView,
     ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView,
@@ -55,7 +56,6 @@ use orbit_client_core::contract::{
     WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WorkspaceSymbolsView,
     WriteWorkspaceFileRequest,
 };
-use orbit_client_core::app_core::LifecycleHooksSnapshotView;
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
@@ -79,9 +79,8 @@ use orbit_protocol::{
     ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
     ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
-    WorkspaceBoardSnapshot,
-    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode, WorktreeHandoffOutcome,
-    WorktreeHandoffPreview,
+    WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
+    WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -1150,7 +1149,10 @@ async fn delete_artifact(
 }
 
 #[tauri::command]
-fn list_acp_agents(state: State<'_, DesktopAppState>, host_id: String) -> Vec<AcpAgentAvailability> {
+fn list_acp_agents(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Vec<AcpAgentAvailability> {
     state.core.list_acp_agents(&host_id)
 }
 
@@ -2265,7 +2267,10 @@ async fn upsert_im_channel(
     host_id: String,
     request: UpsertImChannelRequest,
 ) -> Result<ImChannelsSnapshotView, String> {
-    state.core.upsert_im_channel_on_host(&host_id, request).await
+    state
+        .core
+        .upsert_im_channel_on_host(&host_id, request)
+        .await
 }
 
 #[tauri::command]
@@ -2395,10 +2400,7 @@ async fn list_goal_runs(
     host_id: String,
     agent_id: Option<String>,
 ) -> Result<Vec<orbit_protocol::GoalRunRecord>, String> {
-    state
-        .core
-        .list_goal_runs_on_host(&host_id, agent_id)
-        .await
+    state.core.list_goal_runs_on_host(&host_id, agent_id).await
 }
 
 #[tauri::command]
@@ -2659,14 +2661,12 @@ async fn select_best_of_n_winner(
 ) -> Result<orbit_protocol::WorkflowRunRecord, String> {
     state
         .core
-        .select_best_of_n_winner_on_host(
-            orbit_client_core::contract::SelectBestOfNWinnerRequest {
-                host_id,
-                run_id,
-                winner_step_id,
-                apply_to_workspace: apply_to_workspace.unwrap_or(true),
-            },
-        )
+        .select_best_of_n_winner_on_host(orbit_client_core::contract::SelectBestOfNWinnerRequest {
+            host_id,
+            run_id,
+            winner_step_id,
+            apply_to_workspace: apply_to_workspace.unwrap_or(true),
+        })
         .await
 }
 

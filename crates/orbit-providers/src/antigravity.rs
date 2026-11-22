@@ -6365,6 +6365,8 @@ pub fn resolve_agy_data_dir() -> PathBuf {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "antigravity-cli".into());
     std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".gemini")
@@ -6723,6 +6725,8 @@ pub async fn probe_antigravity_models(executable: Option<&Path>) -> ProviderMode
     };
 
     let probe_cwd = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
@@ -8936,38 +8940,36 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
     #[tokio::test]
     async fn agy_prompt_missing_trajectory_transparently_recreates_session_with_handoff() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
 
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_agy_evicted_{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind mock agy shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock agy shim");
 
         let received_prompts: Arc<tokio::sync::Mutex<Vec<(String, String)>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let received_bg = Arc::clone(&received_prompts);
 
-        // Mock ACP server over shim UDS:
+        // Mock ACP server over shim IPC:
         // - `initialize` -> OK
         // - `session/load` for stale UUID -> silently returns OK (matching real `agy` bug!)
         // - `session/prompt` on stale UUID -> returns `Failed to send user message: not_found: trajectory not found: ...`
         // - `session/new` -> returns fresh UUID `fresh-sess-9999`
         // - `session/prompt` on fresh UUID -> streams assistant chunk and returns `stopReason: end_turn`
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
+            let stream = listener.accept().await.expect("accept");
             let (rh, mut wh) = stream.into_split();
             let mut lines = BufReader::new(rh).lines();
             let mut seq = 0u64;
-            async fn send_stdout(
-                wh: &mut tokio::net::unix::OwnedWriteHalf,
-                seq: &mut u64,
-                payload: Value,
-            ) {
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, payload: Value) {
                 *seq += 1;
                 let frame = ShimFrame::StdoutLine {
                     line: payload.to_string(),
@@ -9222,22 +9224,24 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
     #[tokio::test]
     async fn agy_reattach_restores_active_turn_segment_ids_and_settles_preflight_prompt() {
+        use orbit_shim::ShimListener;
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
         use tokio::io::AsyncWriteExt;
-        use tokio::net::UnixListener;
 
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_agy_reattach_{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind mock reattached shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock reattached shim");
 
         // Simulate frames arriving after daemon hot-restart for an in-flight turn whose
         // original `session/prompt` RPC had `id: 7` (from before restart).
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut stream = listener.accept().await.expect("accept");
             let frames = [
                 ShimFrame::AttachAck { latest_seq: 500 },
                 ShimFrame::StdoutLine {
@@ -9441,32 +9445,30 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
     #[tokio::test]
     async fn agy_live_fast_mode_toggle_ignores_unsupported_method_error() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
 
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_agy_fast_toggle_{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind mock shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
         let observed_fast_calls: Arc<tokio::sync::Mutex<Vec<Value>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let observed_bg = Arc::clone(&observed_fast_calls);
 
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
+            let stream = listener.accept().await.expect("accept");
             let (rh, mut wh) = stream.into_split();
             let mut lines = BufReader::new(rh).lines();
             let mut seq: u64 = 1;
 
-            async fn send_stdout(
-                wh: &mut tokio::net::unix::OwnedWriteHalf,
-                seq: &mut u64,
-                v: Value,
-            ) {
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
                 let frame = ShimFrame::StdoutLine {
                     seq: Some(*seq),
                     line: v.to_string(),
@@ -9692,32 +9694,30 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
     #[tokio::test]
     async fn agy_open_session_reconciles_fast_mode_config_option() {
+        use orbit_shim::{ShimListener, ShimWriteHalf};
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
 
         let sock_path = std::env::temp_dir().join(format!(
             "orbit_test_agy_fast_reconcile_{}.sock",
             uuid::Uuid::new_v4().simple()
         ));
         let _ = std::fs::remove_file(&sock_path);
-        let listener = UnixListener::bind(&sock_path).expect("bind mock shim");
+        let listener = ShimListener::bind(&sock_path)
+            .await
+            .expect("bind mock shim");
         let observed_set_opts: Arc<tokio::sync::Mutex<Vec<Value>>> =
             Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let observed_bg = Arc::clone(&observed_set_opts);
 
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept");
+            let stream = listener.accept().await.expect("accept");
             let (rh, mut wh) = stream.into_split();
             let mut lines = BufReader::new(rh).lines();
             let mut seq: u64 = 1;
 
-            async fn send_stdout(
-                wh: &mut tokio::net::unix::OwnedWriteHalf,
-                seq: &mut u64,
-                v: Value,
-            ) {
+            async fn send_stdout(wh: &mut ShimWriteHalf, seq: &mut u64, v: Value) {
                 let frame = ShimFrame::StdoutLine {
                     seq: Some(*seq),
                     line: v.to_string(),

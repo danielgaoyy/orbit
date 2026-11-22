@@ -12,11 +12,14 @@
 //!   with a piped stdin handle so closing stdin (or daemon `SIGKILL`) cleanly sends EOF to `cat`
 //!   and lets `systemd-inhibit` release the lock and exit with zero orphaned child processes,
 //!   with graceful no-op fallback on headless/non-systemd hosts.
-//! - **Windows / other**: clean no-op stub behind the `SleepInhibitorBackend` trait, ready for a
-//!   future safe process/power backend without changing callers.
+//! - **Windows**: spawns a hidden `powershell.exe` / `pwsh.exe` helper with piped stdin that calls
+//!   `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` and blocks on
+//!   `[Console]::In.ReadLine()`, so closing stdin (or daemon termination) automatically clears the
+//!   execution state and exits cleanly with zero Rust `unsafe` code.
+//! - **Other**: clean no-op stub behind the `SleepInhibitorBackend` trait.
 
 use std::collections::HashMap;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -201,7 +204,7 @@ pub trait SleepInhibitorBackend: Send + Sync + 'static {
 
 /// Default cross-platform OS sleep-inhibitor backend using safe native OS helpers.
 pub struct OsSleepInhibitorBackend {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     binary: Option<PathBuf>,
 }
 
@@ -225,7 +228,23 @@ impl OsSleepInhibitorBackend {
             });
             Self { binary }
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            let binary = find_in_path("powershell.exe")
+                .or_else(|| find_in_path("pwsh.exe"))
+                .or_else(|| {
+                    std::env::var_os("SystemRoot").and_then(|root| {
+                        let fallback = PathBuf::from(root)
+                            .join("System32")
+                            .join("WindowsPowerShell")
+                            .join("v1.0")
+                            .join("powershell.exe");
+                        fallback.is_file().then_some(fallback)
+                    })
+                });
+            Self { binary }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             Self {}
         }
@@ -258,7 +277,11 @@ impl SleepInhibitorBackend for OsSleepInhibitorBackend {
         }
         #[cfg(target_os = "windows")]
         {
-            "windows-stub"
+            if self.binary.is_some() {
+                "windows-powershell"
+            } else {
+                "noop"
+            }
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
@@ -304,16 +327,47 @@ impl SleepInhibitorBackend for OsSleepInhibitorBackend {
                 ProcessInhibitorHandle::new(child),
             ))))
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
         {
-            // Windows and unsupported platforms degrade gracefully to a no-op stub while
-            // preserving the exact process/backend abstraction for future native support.
+            use std::os::windows::process::CommandExt;
+            let Some(ref bin) = self.binary else {
+                return Ok(None);
+            };
+            // Pure safe Rust: delegates `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`
+            // to a hidden PowerShell helper that blocks until stdin closes (EOF on guard drop or
+            // daemon crash), then clears the assertion cleanly.
+            const PS_KEEP_AWAKE_SCRIPT: &str = concat!(
+                "$sig = '[DllImport(\"kernel32.dll\")] public static extern uint SetThreadExecutionState(uint esFlags);';",
+                "$t = Add-Type -MemberDefinition $sig -Name 'OrbitKeepAwake' -Namespace 'Orbit' -PassThru;",
+                "$null = $t::SetThreadExecutionState(2147483649);",
+                "try { [Console]::In.ReadLine() | Out-Null } finally { $null = $t::SetThreadExecutionState(2147483648) }"
+            );
+            let child = Command::new(bin)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-Command",
+                    PS_KEEP_AWAKE_SCRIPT,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(crate::platform::WIN_CREATE_NO_WINDOW)
+                .spawn()?;
+            Ok(Some(KeepAwakeGuard::new(Box::new(
+                ProcessInhibitorHandle::new(child),
+            ))))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
             Ok(None)
         }
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn find_in_path(binary: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {

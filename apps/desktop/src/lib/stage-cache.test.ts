@@ -525,7 +525,13 @@ describe("git review snapshot merge & CWD normalization", () => {
     assert.equal(normalizeCwdForCompare("/Users/jess/repo"), "/Users/jess/repo");
     assert.equal(normalizeCwdForCompare("/"), "/");
     assert.equal(normalizeCwdForCompare("C:\\"), "C:\\");
+    assert.equal(normalizeCwdForCompare("c:\\"), "C:\\");
+    assert.equal(normalizeCwdForCompare("c:/repo/"), "C:/repo");
     assert.equal(normalizeCwdForCompare("C:/repo/"), "C:/repo");
+    assert.equal(normalizeCwdForCompare("\\\\?\\c:\\Users\\jess\\orbit\\"), "C:\\Users\\jess\\orbit");
+    assert.equal(normalizeCwdForCompare("\\\\?\\C:\\Users\\jess\\orbit\\"), "C:\\Users\\jess\\orbit");
+    assert.equal(normalizeCwdForCompare("\\\\?\\C:\\"), "C:\\");
+    assert.equal(normalizeCwdForCompare("\\\\?\\UNC\\server\\share\\repo\\"), "\\\\server\\share\\repo");
     assert.equal(normalizeCwdForCompare(""), "");
     assert.equal(normalizeCwdForCompare(null), "");
   });

@@ -392,12 +392,31 @@ export function computeGitReviewSignature(review: GitReviewView | null | undefin
 }
 
 /**
- * Normalizes a workspace CWD for equality comparison by trimming whitespace and stripping
+ * Strips Windows extended-length verbatim path prefixes (`\\?\C:\...` -> `C:\...`,
+ * `\\?\UNC\server\share` -> `\\server\share`) and normalizes Windows drive-letter casing
+ * (`c:\...` -> `C:\...`) while leaving Unix paths untouched.
+ */
+export function stripWindowsVerbatimPrefix(rawPath: string): string {
+  let out = rawPath;
+  if (/^\\\\\?\\UNC\\/i.test(out)) {
+    out = `\\\\${out.slice(8)}`;
+  } else if (out.startsWith("\\\\?\\") && /^[A-Za-z]:/.test(out.slice(4))) {
+    out = out.slice(4);
+  }
+  if (/^[a-z]:(?:[\\/]|$)/.test(out)) {
+    out = `${out[0].toUpperCase()}${out.slice(1)}`;
+  }
+  return out;
+}
+
+/**
+ * Normalizes a workspace CWD for equality comparison by trimming whitespace, stripping
+ * Windows verbatim `\\?\` prefixes, normalizing Windows drive-letter casing, and stripping
  * redundant trailing slashes while preserving root paths (`/`, `C:\`, `C:/`).
  */
 export function normalizeCwdForCompare(cwd: string | null | undefined): string {
   if (!cwd) return "";
-  const trimmed = cwd.trim();
+  const trimmed = stripWindowsVerbatimPrefix(cwd.trim());
   if (!trimmed) return "";
   if (trimmed === "/" || trimmed === "\\") return trimmed;
   if (/^[A-Za-z]:[\\/]+$/.test(trimmed)) {

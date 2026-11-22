@@ -228,7 +228,7 @@ pub fn validate_workspace_file_path(
                         segments.join("/")
                     );
                 }
-                if let Ok(canon) = std::fs::canonicalize(&cursor) {
+                if let Ok(canon) = crate::platform::canonicalize_clean(&cursor) {
                     if !canon.starts_with(&root) {
                         anyhow::bail!(
                             "file watch path `{trimmed}` escapes agent workspace `{}`",

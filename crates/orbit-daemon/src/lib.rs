@@ -27,6 +27,7 @@ pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
 pub mod messaging;
+pub mod platform;
 pub mod push;
 pub mod rules;
 pub mod scheduler;
@@ -559,9 +560,7 @@ pub fn read_live_daemon_port(home_dir: &Path) -> u16 {
 }
 
 fn resolve_user_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    crate::platform::resolve_user_home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
@@ -5518,14 +5517,14 @@ fn hash_payload(val: &serde_json::Value) -> String {
 pub(crate) fn expand_host_path(raw: &str) -> PathBuf {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        return crate::platform::resolve_user_home_dir().unwrap_or_else(|| PathBuf::from("."));
     }
-    if let Some(rest) = trimmed.strip_prefix("~/")
-        && let Some(home) = std::env::var_os("HOME")
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix(r"~\"))
+        && let Some(home) = crate::platform::resolve_user_home_dir()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     PathBuf::from(trimmed)
 }
@@ -5623,6 +5622,7 @@ fn rpc_err(request_id: uuid::Uuid, code: &str, message: impl ToString) -> WireMe
 fn hostname_string() -> String {
     std::env::var("HOSTNAME")
         .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .or_else(|| {
             std::fs::read_to_string("/etc/hostname")
                 .ok()
@@ -5636,19 +5636,53 @@ fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
+#[allow(dead_code)]
+fn ps_single_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "''"))
+}
+
+#[allow(dead_code)]
+fn build_windows_self_upgrade_ps_script(
+    install_path: &Path,
+    custom_home: Option<&Path>,
+    port: u16,
+    restart_relay: bool,
+) -> String {
+    let exe_q = ps_single_quote(&install_path.to_string_lossy());
+    let home_prefix = match custom_home {
+        Some(h) => format!("'--home', {}, ", ps_single_quote(&h.to_string_lossy())),
+        None => String::new(),
+    };
+    let port_suffix = if port > 0 {
+        format!(", '--port', '{port}'")
+    } else {
+        String::new()
+    };
+    let mut script = format!(
+        "Start-Sleep -Milliseconds 400; & {exe_q} @({home_prefix}'daemon', 'up'{port_suffix}) *>$null"
+    );
+    if restart_relay {
+        script.push_str(&format!(
+            "; & {exe_q} @({home_prefix}'relay', 'up') *>$null"
+        ));
+    }
+    script
+}
+
 fn daemon_release_asset_name() -> anyhow::Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("orbit-cli-macos-arm64"),
         ("linux", "x86_64") => Ok("orbit-cli-linux-x64"),
         ("linux", "aarch64") => Ok("orbit-cli-linux-arm64"),
+        ("windows", "x86_64") => Ok("orbit-windows-x86_64.exe"),
         (os, arch) => anyhow::bail!("Unsupported platform for self-upgrade: {os}/{arch}"),
     }
 }
 
 impl DaemonRuntime {
     /// Download the matching Orbit release binary, verify `--version`, atomically install to
-    /// `~/.local/bin/orbit`, and trigger a detached `orbit daemon up` hot-restart so all
-    /// `orbit shim` agent & PTY sessions stay alive uninterrupted.
+    /// `~/.local/bin/orbit` (or `%USERPROFILE%\.local\bin\orbit.exe` on Windows), and trigger a
+    /// detached `orbit daemon up` hot-restart so all `orbit shim` agent & PTY sessions stay alive.
     pub async fn self_upgrade_and_restart(
         &self,
         target_version: Option<String>,
@@ -5658,17 +5692,26 @@ impl DaemonRuntime {
         let _upgrade_guard = self.upgrade_lock.lock().await;
 
         let asset = daemon_release_asset_name()?;
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("Unable to resolve HOME directory"))?;
-        let install_dir = home.join(".local/bin");
+        let home = crate::platform::resolve_user_home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Unable to resolve user home directory"))?;
+        let install_dir = home.join(".local").join("bin");
         std::fs::create_dir_all(&install_dir)?;
-        let install_path = install_dir.join("orbit");
-        let tmp_path = install_dir.join(format!(
-            "orbit.upgrade.{}.{}",
-            std::process::id(),
-            Uuid::new_v4().simple()
-        ));
+        let exe_name = if cfg!(windows) { "orbit.exe" } else { "orbit" };
+        let install_path = install_dir.join(exe_name);
+        let tmp_name = if cfg!(windows) {
+            format!(
+                "orbit.upgrade.{}.{}.exe",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            )
+        } else {
+            format!(
+                "orbit.upgrade.{}.{}",
+                std::process::id(),
+                Uuid::new_v4().simple()
+            )
+        };
+        let tmp_path = install_dir.join(tmp_name);
 
         let repo = std::env::var("ORBIT_REPO")
             .ok()
@@ -5780,45 +5823,74 @@ impl DaemonRuntime {
             }
         }
 
-        if let Err(e) = std::fs::rename(&tmp_path, &install_path) {
+        if let Err(e) = crate::platform::replace_executable_safely(&tmp_path, &install_path) {
             let _ = std::fs::remove_file(&tmp_path);
             anyhow::bail!("Failed to replace {}: {e}", install_path.display());
         }
 
         let port = *self.listen_port.read().await;
         let default_home = home.join(".orbit");
-        let is_default_home = std::fs::canonicalize(&self.home_dir)
+        let is_default_home = crate::platform::canonicalize_clean(&self.home_dir)
             .unwrap_or_else(|_| self.home_dir.clone())
-            == std::fs::canonicalize(&default_home).unwrap_or(default_home);
+            == crate::platform::canonicalize_clean(&default_home).unwrap_or(default_home);
 
         let restart_relay = detect_running_local_relay(&self.home_dir).await;
-        let restart_script = build_self_upgrade_restart_script(
-            &install_path,
-            if is_default_home {
-                None
-            } else {
-                Some(&self.home_dir)
-            },
-            port,
-            restart_relay,
-        );
+        let custom_home = (!is_default_home).then_some(self.home_dir.as_path());
+        let restart_script =
+            build_self_upgrade_restart_script(&install_path, custom_home, port, restart_relay);
 
         // Persist exact shim frame cursors before launching the hot-restart script so reattached
         // shims resume strictly after the last consumed frame with zero history replay.
         self.orchestrator.flush_all_shim_cursors().await;
 
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &restart_script])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
         #[cfg(unix)]
         {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", &restart_script])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
+            cmd.spawn()
+                .map_err(|e| anyhow::anyhow!("Failed to spawn daemon hot-restart: {e}"))?;
         }
-        cmd.spawn()
-            .map_err(|e| anyhow::anyhow!("Failed to spawn daemon hot-restart: {e}"))?;
+        #[cfg(windows)]
+        {
+            let _ = restart_script;
+            use std::os::windows::process::CommandExt;
+            // Delay 400ms in a detached background PowerShell helper so the current RPC ack flushes
+            // cleanly over WebSocket/Relay before `orbit.exe daemon up` restarts the daemon (and
+            // optionally `orbit.exe relay up`), matching Unix hot-upgrade behavior.
+            let ps_script = build_windows_self_upgrade_ps_script(
+                &install_path,
+                custom_home,
+                port,
+                restart_relay,
+            );
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &ps_script,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(
+                crate::platform::WIN_CREATE_NEW_PROCESS_GROUP
+                    | crate::platform::WIN_CREATE_NO_WINDOW,
+            );
+            cmd.spawn()
+                .map_err(|e| anyhow::anyhow!("Failed to spawn Windows daemon hot-restart: {e}"))?;
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = restart_script;
+        }
 
         tracing::info!(
             install_path = %install_path.display(),
@@ -6464,5 +6536,21 @@ mod self_upgrade_tests {
 
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&rogue_dir);
+    }
+
+    #[test]
+    fn windows_self_upgrade_ps_script_delays_and_handles_custom_home_and_relay() {
+        let exe = Path::new(r"C:\Users\O'Connor\.local\bin\orbit.exe");
+        let default_script = build_windows_self_upgrade_ps_script(exe, None, 17890, false);
+        assert!(default_script.starts_with("Start-Sleep -Milliseconds 400; "));
+        assert!(default_script.contains(r"'C:\Users\O''Connor\.local\bin\orbit.exe'"));
+        assert!(default_script.contains("@('daemon', 'up', '--port', '17890')"));
+        assert!(!default_script.contains("'relay', 'up'"));
+
+        let custom_home = Path::new(r"C:\Orbit's Home");
+        let full_script = build_windows_self_upgrade_ps_script(exe, Some(custom_home), 0, true);
+        assert!(full_script.contains(r"'--home', 'C:\Orbit''s Home', 'daemon', 'up'"));
+        assert!(!full_script.contains("'--port'"));
+        assert!(full_script.contains(r"'--home', 'C:\Orbit''s Home', 'relay', 'up'"));
     }
 }

@@ -76,8 +76,8 @@ export const FileViewerTab = memo(function FileViewerTab({
 
   const isTaskLogPath = useMemo(
     () =>
-      /\/\.system_generated\/tasks\/[^/]+$/i.test(path) ||
-      /\/claude\/[^/]*\/tasks\/[^/]+$/i.test(path),
+      /[/\\]\.system_generated[/\\]tasks[/\\][^/\\]+$/i.test(path) ||
+      /[/\\]claude[/\\][^/\\]*[/\\]tasks[/\\][^/\\]+$/i.test(path),
     [path],
   );
   const isLogFile = useMemo(

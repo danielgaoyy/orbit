@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -12,7 +13,9 @@ use orbit_protocol::{
     QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload,
     ToolCallDetail, ToolCallStatus,
 };
-use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, spawn_detached_shim};
+use orbit_shim::{
+    ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim_after, spawn_detached_shim,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -29,7 +32,7 @@ pub async fn spawn_antigravity_session(
     cfg: SessionLaunchConfig,
 ) -> Result<ProviderSessionHandle, String> {
     let reattached = if cfg.reattach_existing_shim {
-        connect_existing_shim(&cfg.shim_socket).await
+        connect_existing_shim_after(&cfg.shim_socket, cfg.shim_after_seq).await
     } else {
         None
     };
@@ -168,6 +171,204 @@ fn build_agy_session_meta(cfg: &SessionLaunchConfig) -> Option<Value> {
     }))
 }
 
+struct OpenedAgySession {
+    session_id: String,
+    available_model_ids: HashSet<String>,
+    canonical_base_ids: HashSet<String>,
+    current_base_model: Option<String>,
+}
+
+fn is_agy_missing_trajectory_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("trajectory not found")
+        || (lower.contains("not_found") && lower.contains("trajectory"))
+        || (lower.contains("trajectory") && lower.contains("does not exist"))
+        || lower.contains("session not found")
+}
+
+fn prepend_handoff_context(ctx: Option<String>, prompt: &str) -> String {
+    let Some(ctx) = ctx.filter(|c| !c.trim().is_empty()) else {
+        return prompt.to_string();
+    };
+    if prompt.contains("[Prior Conversation Context in this Workspace]") {
+        return prompt.to_string();
+    }
+    format!("{ctx}\n\n{prompt}")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_agy_session(
+    cfg: &SessionLaunchConfig,
+    shim: &mut orbit_shim::ShimClient,
+    next_rpc_id: &mut i64,
+    pending_rpcs: &mut HashMap<String, oneshot::Sender<Result<Value, Value>>>,
+    resume_id: Option<&str>,
+    requested_model: Option<&str>,
+    requested_effort: Option<ReasoningEffort>,
+    mode: &SessionMode,
+) -> Result<OpenedAgySession, String> {
+    let is_resume = resume_id.is_some();
+    let open_session_with = |mcp_val: Value| {
+        let mut params = if let Some(sid) = resume_id {
+            json!({
+                "sessionId": sid,
+                "cwd": cfg.cwd.to_string_lossy(),
+                "mcpServers": mcp_val
+            })
+        } else {
+            json!({
+                "cwd": cfg.cwd.to_string_lossy(),
+                "mcpServers": mcp_val
+            })
+        };
+        if let Some(meta) = build_agy_session_meta(cfg) {
+            params["_meta"] = meta;
+        }
+        let method = if is_resume {
+            "session/load"
+        } else {
+            "session/new"
+        };
+        (method, params)
+    };
+
+    let (method, params) = open_session_with(build_agy_mcp_servers_http(cfg));
+    let sess_rx = send_acp_req(shim, next_rpc_id, pending_rpcs, method, params)
+        .await
+        .map_err(|e| format!("failed to send {method}: {e}"))?;
+
+    let sess_val =
+        match wait_rpc_during_boot(shim, pending_rpcs, sess_rx, &cfg.shim_seq_tracker).await {
+            Ok(v) => v,
+            Err(first_err) if cfg.mcp_spec.is_some() => {
+                // Fallback to stdio `orbit mcp` if ACP binary rejects HTTP MCP descriptor
+                let (fb_method, fb_params) = open_session_with(build_agy_mcp_servers_stdio(cfg));
+                let fb_rx = send_acp_req(shim, next_rpc_id, pending_rpcs, fb_method, fb_params)
+                    .await
+                    .map_err(|e| format!("failed to send stdio fallback {fb_method}: {e}"))?;
+                wait_rpc_during_boot(shim, pending_rpcs, fb_rx, &cfg.shim_seq_tracker)
+                    .await
+                    .map_err(|e| format!("{first_err} (stdio fallback: {e})"))?
+            }
+            Err(e) => return Err(e),
+        };
+
+    // Drain replay notifications on `session/load` until 50ms of quiet
+    if is_resume {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(50), shim.rx.recv()).await {
+                Ok(Some(frame)) => {
+                    if let Some(seq) = frame.seq() {
+                        cfg.shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
+    let session_id = sess_val
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .or(resume_id)
+        .unwrap_or("unknown")
+        .to_string();
+
+    let available_model_ids: HashSet<String> = sess_val
+        .pointer("/models/availableModels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("modelId").and_then(|s| s.as_str()))
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let canonical_base_ids: HashSet<String> = sess_val
+        .get("configOptions")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("model"))
+        })
+        .and_then(|opt| opt.get("options"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("value").and_then(|s| s.as_str()))
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let raw_initial_model = sess_val
+        .pointer("/models/currentModelId")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| requested_model.map(ToOwned::to_owned));
+
+    let mut current_base_model = raw_initial_model
+        .as_deref()
+        .map(|m| normalize_agy_base_model_id(m, &canonical_base_ids))
+        .or_else(|| requested_model.map(ToOwned::to_owned));
+
+    // Optional `session/set_model` when explicit model or effort was requested
+    if (requested_model.is_some() || requested_effort.is_some())
+        && let Some(base_m) = requested_model
+            .map(ToOwned::to_owned)
+            .or_else(|| current_base_model.clone())
+    {
+        let wire_model_id = resolve_agy_wire_model_id(
+            &base_m,
+            requested_effort,
+            &available_model_ids,
+            &canonical_base_ids,
+        );
+        if let Ok(rx) = send_acp_req(
+            shim,
+            next_rpc_id,
+            pending_rpcs,
+            "session/set_model",
+            json!({
+                "sessionId": session_id,
+                "modelId": wire_model_id
+            }),
+        )
+        .await
+            && let Ok(v) = wait_rpc_during_boot(shim, pending_rpcs, rx, &cfg.shim_seq_tracker).await
+            && let Some(m) = v.pointer("/models/currentModelId").and_then(|x| x.as_str())
+        {
+            current_base_model = Some(normalize_agy_base_model_id(m, &canonical_base_ids));
+        }
+    }
+
+    // Optional `session/set_mode` for `accept-edits` (ignore -32601)
+    if matches!(mode, SessionMode::AcceptEdits)
+        && let Ok(rx) = send_acp_req(
+            shim,
+            next_rpc_id,
+            pending_rpcs,
+            "session/set_mode",
+            json!({
+                "sessionId": session_id,
+                "modeId": "accept-edits"
+            }),
+        )
+        .await
+    {
+        let _ = wait_rpc_during_boot(shim, pending_rpcs, rx, &cfg.shim_seq_tracker).await;
+    }
+
+    Ok(OpenedAgySession {
+        session_id,
+        available_model_ids,
+        canonical_base_ids,
+        current_base_model,
+    })
+}
+
 async fn run_agy_actor(
     cfg: SessionLaunchConfig,
     mut shim: orbit_shim::ShimClient,
@@ -175,13 +376,16 @@ async fn run_agy_actor(
     mut cmd_rx: mpsc::Receiver<DriverCommand>,
     evt_tx: mpsc::Sender<DriverEvent>,
 ) {
-    let mut next_rpc_id: i64 = if is_reattached { 1000 } else { 1 };
+    let mut next_rpc_id: i64 = if is_reattached { 100_000 } else { 1 };
     let mut pending_rpcs: HashMap<String, oneshot::Sender<Result<Value, Value>>> = HashMap::new();
+    let mut inject_handoff_on_next_prompt = false;
+    let mut recovered_missing_trajectory = false;
+    let mut pending_handoff_context = cfg.fallback_handoff_context.clone();
 
     let (
-        session_id,
-        available_model_ids,
-        canonical_base_ids,
+        mut session_id,
+        mut available_model_ids,
+        mut canonical_base_ids,
         mut active_effort,
         mut current_base_model,
     ) = if is_reattached && let Some(ref sid) = cfg.resume_session_id {
@@ -219,7 +423,7 @@ async fn run_agy_actor(
             }
         };
 
-        if wait_rpc_during_boot(&mut shim, &mut pending_rpcs, init_rx)
+        if wait_rpc_during_boot(&mut shim, &mut pending_rpcs, init_rx, &cfg.shim_seq_tracker)
             .await
             .is_err()
         {
@@ -234,65 +438,70 @@ async fn run_agy_actor(
         }
 
         // 2. `session/load` or `session/new` with Orbit MCP servers (HTTP first, stdio fallback)
-        let is_resume = cfg.resume_session_id.is_some();
-        let open_session_with = |mcp_val: Value| {
-            let mut params = if let Some(ref sid) = cfg.resume_session_id {
-                json!({
-                    "sessionId": sid,
-                    "cwd": cfg.cwd.to_string_lossy(),
-                    "mcpServers": mcp_val
-                })
-            } else {
-                json!({
-                    "cwd": cfg.cwd.to_string_lossy(),
-                    "mcpServers": mcp_val
-                })
-            };
-            if let Some(meta) = build_agy_session_meta(&cfg) {
-                params["_meta"] = meta;
-            }
-            let method = if is_resume {
-                "session/load"
-            } else {
-                "session/new"
-            };
-            (method, params)
-        };
-
-        let (method, params) = open_session_with(build_agy_mcp_servers_http(&cfg));
-        let Ok(sess_rx) =
-            send_acp_req(&shim, &mut next_rpc_id, &mut pending_rpcs, method, params).await
-        else {
-            return;
-        };
-
-        let sess_val = match wait_rpc_during_boot(&mut shim, &mut pending_rpcs, sess_rx).await {
-            Ok(v) => v,
-            Err(first_err) if cfg.mcp_spec.is_some() => {
-                // Fallback to stdio `orbit mcp` if ACP binary rejects HTTP MCP descriptor
-                let (fb_method, fb_params) = open_session_with(build_agy_mcp_servers_stdio(&cfg));
-                let Ok(fb_rx) = send_acp_req(
-                    &shim,
+        let opened = match open_agy_session(
+            &cfg,
+            &mut shim,
+            &mut next_rpc_id,
+            &mut pending_rpcs,
+            cfg.resume_session_id.as_deref(),
+            cfg.model.as_deref(),
+            cfg.effort,
+            &cfg.mode,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(first_err)
+                if cfg.resume_session_id.is_some()
+                    && is_agy_missing_trajectory_error(&first_err) =>
+            {
+                let old_short: String = cfg
+                    .resume_session_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(8)
+                    .collect();
+                warn!(
+                    agent_id = %cfg.agent_id,
+                    old_session_id = ?cfg.resume_session_id,
+                    error = %first_err,
+                    "Antigravity session/load failed with missing trajectory; transparently creating fresh session"
+                );
+                match open_agy_session(
+                    &cfg,
+                    &mut shim,
                     &mut next_rpc_id,
                     &mut pending_rpcs,
-                    fb_method,
-                    fb_params,
+                    None,
+                    cfg.model.as_deref(),
+                    cfg.effort,
+                    &cfg.mode,
                 )
                 .await
-                else {
-                    return;
-                };
-                match wait_rpc_during_boot(&mut shim, &mut pending_rpcs, fb_rx).await {
-                    Ok(v) => v,
+                {
+                    Ok(fresh) => {
+                        inject_handoff_on_next_prompt = true;
+                        recovered_missing_trajectory = true;
+                        let _ = evt_tx
+                            .send(DriverEvent::Notice {
+                                level: "info".into(),
+                                message: format!(
+                                    "Previous Antigravity session ({old_short}…) was evicted from local cache; automatically started a fresh session with recent conversation context restored."
+                                ),
+                            })
+                            .await;
+                        fresh
+                    }
                     Err(e) => {
                         let _ = evt_tx
-                                .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                                    message: format!(
-                                        "Antigravity session open failed: {first_err} (stdio fallback: {e})"
-                                    ),
-                                    recoverable: false,
-                                }))
-                                .await;
+                            .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                message: format!(
+                                    "Antigravity session open failed: {first_err} (fresh session fallback: {e})"
+                                ),
+                                recoverable: false,
+                            }))
+                            .await;
                         return;
                     }
                 }
@@ -308,117 +517,12 @@ async fn run_agy_actor(
             }
         };
 
-        // Drain replay notifications on `session/load` until 50ms of quiet
-        if is_resume {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-            while tokio::time::Instant::now() < deadline {
-                if tokio::time::timeout(Duration::from_millis(50), shim.rx.recv())
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
-
-        let session_id = sess_val
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .or(cfg.resume_session_id.as_deref())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let available_model_ids: HashSet<String> = sess_val
-            .pointer("/models/availableModels")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| item.get("modelId").and_then(|s| s.as_str()))
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let canonical_base_ids: HashSet<String> = sess_val
-            .get("configOptions")
-            .and_then(|v| v.as_array())
-            .and_then(|arr| {
-                arr.iter()
-                    .find(|opt| opt.get("id").and_then(|x| x.as_str()) == Some("model"))
-            })
-            .and_then(|opt| opt.get("options"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|item| item.get("value").and_then(|s| s.as_str()))
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let raw_initial_model = sess_val
-            .pointer("/models/currentModelId")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-            .or_else(|| cfg.model.clone());
-
-        let active_effort = cfg.effort;
-        let mut current_base_model = raw_initial_model
-            .as_deref()
-            .map(|m| normalize_agy_base_model_id(m, &canonical_base_ids))
-            .or_else(|| cfg.model.clone());
-
-        // Optional `session/set_model` when explicit model or effort was requested
-        if (cfg.model.is_some() || cfg.effort.is_some())
-            && let Some(ref base_m) = cfg.model.as_ref().or(current_base_model.as_ref()).cloned()
-        {
-            let wire_model_id = resolve_agy_wire_model_id(
-                base_m,
-                active_effort,
-                &available_model_ids,
-                &canonical_base_ids,
-            );
-            if let Ok(rx) = send_acp_req(
-                &shim,
-                &mut next_rpc_id,
-                &mut pending_rpcs,
-                "session/set_model",
-                json!({
-                    "sessionId": session_id,
-                    "modelId": wire_model_id
-                }),
-            )
-            .await
-                && let Ok(v) = wait_rpc_during_boot(&mut shim, &mut pending_rpcs, rx).await
-                && let Some(m) = v.pointer("/models/currentModelId").and_then(|x| x.as_str())
-            {
-                current_base_model = Some(normalize_agy_base_model_id(m, &canonical_base_ids));
-            }
-        }
-
-        // Optional `session/set_mode` for `accept-edits` (ignore -32601)
-        if matches!(cfg.mode, SessionMode::AcceptEdits)
-            && let Ok(rx) = send_acp_req(
-                &shim,
-                &mut next_rpc_id,
-                &mut pending_rpcs,
-                "session/set_mode",
-                json!({
-                    "sessionId": session_id,
-                    "modeId": "accept-edits"
-                }),
-            )
-            .await
-        {
-            let _ = wait_rpc_during_boot(&mut shim, &mut pending_rpcs, rx).await;
-        }
-
         (
-            session_id,
-            available_model_ids,
-            canonical_base_ids,
-            active_effort,
-            current_base_model,
+            opened.session_id,
+            opened.available_model_ids,
+            opened.canonical_base_ids,
+            cfg.effort,
+            opened.current_base_model,
         )
     };
 
@@ -436,9 +540,24 @@ async fn run_agy_actor(
 
     // Active runtime state
     let mut mode = cfg.mode.clone();
-    let mut active_turn_id: Option<String> = None;
+    let mut active_turn_id: Option<String> = if is_reattached {
+        cfg.persisted_active_turn_id.clone()
+    } else {
+        None
+    };
+    let mut reattached_turn_in_flight = is_reattached && active_turn_id.is_some();
     let mut active_prompt_rpc_key: Option<String> = None;
-    let mut seg_state = AgyStreamSegmentState::default();
+    let mut post_reattach_non_prompt_rpcs: HashSet<String> = HashSet::new();
+    let mut last_dispatched_prompt: Option<(String, String)> = None;
+    let mut seg_state = if let Some(ref tid) = active_turn_id {
+        AgyStreamSegmentState {
+            turn_tag: tid.clone(),
+            step_seq: cfg.persisted_turn_step_seq,
+            ..AgyStreamSegmentState::default()
+        }
+    } else {
+        AgyStreamSegmentState::default()
+    };
     let mut tool_cache: HashMap<String, ToolCallDetail> = HashMap::new();
     let mut pending_perms: HashMap<String, PendingPerm> = HashMap::new();
     let mut pending_elicits: HashMap<String, PendingElicitation> = HashMap::new();
@@ -508,7 +627,7 @@ async fn run_agy_actor(
     }
     let now_utc = Utc::now();
     let mut stale_settlements: Vec<(String, ToolCallStatus)> = Vec::new();
-    for persisted in cfg.persisted_running_bg_tasks {
+    for persisted in &cfg.persisted_running_bg_tasks {
         let tid_opt = persisted
             .info
             .task_id
@@ -520,7 +639,7 @@ async fn run_agy_actor(
             && let Some(&canceled) = historical_finished.get(tid)
         {
             stale_settlements.push((
-                persisted.call_id,
+                persisted.call_id.clone(),
                 if canceled {
                     ToolCallStatus::Failed
                 } else {
@@ -528,13 +647,13 @@ async fn run_agy_actor(
                 },
             ));
         } else if !is_reattached {
-            stale_settlements.push((persisted.call_id, ToolCallStatus::Failed));
+            stale_settlements.push((persisted.call_id.clone(), ToolCallStatus::Failed));
         } else if let Some(tid) = tid_opt
             && let Some(hist) = historical_started.get(&tid)
         {
             if is_one_shot_timer_expired(hist.expires_at, now_utc) {
                 bg_tracker.mark_finished(tid);
-                stale_settlements.push((persisted.call_id, ToolCallStatus::Completed));
+                stale_settlements.push((persisted.call_id.clone(), ToolCallStatus::Completed));
             } else {
                 wakeup_tools.register_synthetic_bg_task(
                     &persisted.call_id,
@@ -544,14 +663,14 @@ async fn run_agy_actor(
                 tool_cache.insert(persisted.call_id.clone(), persisted.detail.clone());
                 bg_tracker.record_started_with_expiry(
                     tid,
-                    Some(persisted.call_id),
+                    Some(persisted.call_id.clone()),
                     persisted.info.log_path.clone(),
-                    Some(persisted.info),
+                    Some(persisted.info.clone()),
                     hist.expires_at,
                 );
             }
         } else {
-            stale_settlements.push((persisted.call_id, ToolCallStatus::Completed));
+            stale_settlements.push((persisted.call_id.clone(), ToolCallStatus::Completed));
         }
     }
     if is_reattached {
@@ -655,6 +774,14 @@ async fn run_agy_actor(
                             continue;
                         }
 
+                        let effective_prompt = if inject_handoff_on_next_prompt {
+                            inject_handoff_on_next_prompt = false;
+                            prepend_handoff_context(pending_handoff_context.take(), &prompt)
+                        } else {
+                            prompt
+                        };
+                        last_dispatched_prompt =
+                            Some((turn_id.clone(), effective_prompt.clone()));
                         wakeup_tools.begin_turn();
                         if dispatch_agy_prompt(
                             &shim,
@@ -669,7 +796,7 @@ async fn run_agy_actor(
                             &mut last_ask_question_raw,
                             &evt_tx,
                             turn_id,
-                            prompt,
+                            effective_prompt,
                         )
                         .await
                         .is_err()
@@ -744,6 +871,7 @@ async fn run_agy_actor(
                             };
                             let id = next_rpc_id;
                             next_rpc_id += 1;
+                            post_reattach_non_prompt_rpcs.insert(RpcId::Num(id).as_key());
                             let req = json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
@@ -774,6 +902,7 @@ async fn run_agy_actor(
                             );
                             let id = next_rpc_id;
                             next_rpc_id += 1;
+                            post_reattach_non_prompt_rpcs.insert(RpcId::Num(id).as_key());
                             let req = json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
@@ -879,8 +1008,11 @@ async fn run_agy_actor(
 
             maybe_frame = shim.rx.recv() => {
                 let Some(frame) = maybe_frame else { break; };
+                if let Some(seq) = frame.seq() {
+                    cfg.shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);
+                }
                 match frame {
-                    ShimFrame::StdoutLine { line } => {
+                    ShimFrame::StdoutLine { line, .. } => {
                         let Ok(val) = serde_json::from_str::<Value>(&line) else { continue; };
                         let has_id = val.get("id").filter(|v| !v.is_null()).is_some();
                         let method = val.get("method").and_then(|v| v.as_str());
@@ -889,7 +1021,17 @@ async fn run_agy_actor(
                             // Response to our request (e.g. `session/prompt` completion)
                             if let Ok(rid) = serde_json::from_value::<RpcId>(val["id"].clone()) {
                                 let key = rid.as_key();
-                                if active_prompt_rpc_key.as_deref() == Some(key.as_str()) {
+                                if post_reattach_non_prompt_rpcs.remove(&key) {
+                                    continue;
+                                }
+                                let is_reattached_completion = reattached_turn_in_flight
+                                    && active_prompt_rpc_key.is_none()
+                                    && (val.pointer("/result/stopReason").is_some()
+                                        || val.get("error").is_some());
+                                if active_prompt_rpc_key.as_deref() == Some(key.as_str())
+                                    || is_reattached_completion
+                                {
+                                    reattached_turn_in_flight = false;
                                     active_prompt_rpc_key = None;
                                     pending_perms.clear();
                                     pending_elicits.clear();
@@ -907,6 +1049,108 @@ async fn run_agy_actor(
                                             .await;
                                     }
                                     active_turn_id = None;
+
+                                    // Transparently recover when `session/load` silently accepted an
+                                    // evicted Antigravity session ID and `session/prompt` then fails
+                                    // with `trajectory not found`: open a fresh `session/new`, update
+                                    // `persistence_ref`, carry over recent conversation context, and
+                                    // re-dispatch the user's prompt seamlessly.
+                                    if let Some(err_obj) = val.get("error") {
+                                        let err_msg = err_obj
+                                            .get("message")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        if !recovered_missing_trajectory
+                                            && is_agy_missing_trajectory_error(err_msg)
+                                            && let Some((failed_turn_id, failed_prompt)) =
+                                                last_dispatched_prompt.take()
+                                        {
+                                            recovered_missing_trajectory = true;
+                                            let old_short: String =
+                                                session_id.chars().take(8).collect();
+                                            warn!(
+                                                agent_id = %cfg.agent_id,
+                                                old_session_id = %session_id,
+                                                error = %err_msg,
+                                                "Antigravity trajectory missing on disk; transparently recreating session with conversation handoff"
+                                            );
+                                            match open_agy_session(
+                                                &cfg,
+                                                &mut shim,
+                                                &mut next_rpc_id,
+                                                &mut pending_rpcs,
+                                                None,
+                                                current_base_model.as_deref(),
+                                                active_effort,
+                                                &mode,
+                                            )
+                                            .await
+                                            {
+                                                Ok(fresh) => {
+                                                    session_id = fresh.session_id;
+                                                    available_model_ids = fresh.available_model_ids;
+                                                    canonical_base_ids = fresh.canonical_base_ids;
+                                                    current_base_model = fresh.current_base_model;
+                                                    transcript_monitor =
+                                                        AgyTranscriptMonitor::new(&session_id);
+                                                    transcript_monitor.sync_silent();
+                                                    let _ = evt_tx
+                                                        .send(DriverEvent::SessionInitialized {
+                                                            persistence_ref: session_id.clone(),
+                                                            model: current_base_model.clone(),
+                                                        })
+                                                        .await;
+                                                    let _ = evt_tx
+                                                        .send(DriverEvent::Notice {
+                                                            level: "info".into(),
+                                                            message: format!(
+                                                                "Previous Antigravity session ({old_short}…) was evicted from local cache; automatically started a fresh session with recent conversation context restored."
+                                                            ),
+                                                        })
+                                                        .await;
+                                                    let recovered_prompt = prepend_handoff_context(
+                                                        pending_handoff_context.take(),
+                                                        &failed_prompt,
+                                                    );
+                                                    last_dispatched_prompt = Some((
+                                                        failed_turn_id.clone(),
+                                                        recovered_prompt.clone(),
+                                                    ));
+                                                    wakeup_tools.begin_turn();
+                                                    if dispatch_agy_prompt(
+                                                        &shim,
+                                                        &session_id,
+                                                        cfg.attachments_dir.as_deref(),
+                                                        &mut next_rpc_id,
+                                                        &mut active_turn_id,
+                                                        &mut active_prompt_rpc_key,
+                                                        &mut autonomous_turn_id,
+                                                        &mut transcript_monitor,
+                                                        &mut seg_state,
+                                                        &mut last_ask_question_raw,
+                                                        &evt_tx,
+                                                        failed_turn_id,
+                                                        recovered_prompt,
+                                                    )
+                                                    .await
+                                                    .is_err()
+                                                    {
+                                                        break;
+                                                    }
+                                                    continue;
+                                                }
+                                                Err(reopen_err) => {
+                                                    warn!(
+                                                        agent_id = %cfg.agent_id,
+                                                        error = %reopen_err,
+                                                        "Failed to create fresh Antigravity session after missing trajectory"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    last_dispatched_prompt = None;
+
                                     // Fast-forward transcript reader past foreground steps while still
                                     // capturing any newly spawned/completed background task IDs.
                                     let bg_deltas = transcript_monitor.sync_silent_with_bg_tasks();
@@ -943,8 +1187,10 @@ async fn run_agy_actor(
                                     if let Some((next_turn_id, next_prompt)) =
                                         pending_prompts.pop_front()
                                     {
+                                        last_dispatched_prompt =
+                                            Some((next_turn_id.clone(), next_prompt.clone()));
                                         wakeup_tools.begin_turn();
-                        if dispatch_agy_prompt(
+                                        if dispatch_agy_prompt(
                                             &shim,
                                             &session_id,
                                             cfg.attachments_dir.as_deref(),
@@ -1723,6 +1969,7 @@ async fn wait_rpc_during_boot(
     shim: &mut orbit_shim::ShimClient,
     pending_rpcs: &mut HashMap<String, oneshot::Sender<Result<Value, Value>>>,
     mut target_rx: oneshot::Receiver<Result<Value, Value>>,
+    shim_seq_tracker: &std::sync::atomic::AtomicU64,
 ) -> Result<Value, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -1740,24 +1987,31 @@ async fn wait_rpc_during_boot(
             }
             frame = tokio::time::timeout(remaining, shim.rx.recv()) => {
                 match frame {
-                    Ok(Some(ShimFrame::StdoutLine { line })) => {
-                        if let Ok(val) = serde_json::from_str::<Value>(&line)
-                            && val.get("method").is_none()
-                            && let Some(id_val) = val.get("id")
-                            && let Ok(rid) = serde_json::from_value::<RpcId>(id_val.clone())
-                            && let Some(tx) = pending_rpcs.remove(&rid.as_key())
-                        {
-                            if let Some(err) = val.get("error").filter(|v| !v.is_null()) {
-                                let _ = tx.send(Err(err.clone()));
-                            } else {
-                                let _ = tx.send(Ok(val.get("result").cloned().unwrap_or(Value::Null)));
+                    Ok(Some(f)) => {
+                        if let Some(seq) = f.seq() {
+                            shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);
+                        }
+                        match f {
+                            ShimFrame::StdoutLine { line, .. } => {
+                                if let Ok(val) = serde_json::from_str::<Value>(&line)
+                                    && val.get("method").is_none()
+                                    && let Some(id_val) = val.get("id")
+                                    && let Ok(rid) = serde_json::from_value::<RpcId>(id_val.clone())
+                                    && let Some(tx) = pending_rpcs.remove(&rid.as_key())
+                                {
+                                    if let Some(err) = val.get("error").filter(|v| !v.is_null()) {
+                                        let _ = tx.send(Err(err.clone()));
+                                    } else {
+                                        let _ = tx.send(Ok(val.get("result").cloned().unwrap_or(Value::Null)));
+                                    }
+                                }
                             }
+                            ShimFrame::Exited { code } => {
+                                return Err(format!("agy exited early with code {code:?}"));
+                            }
+                            _ => {}
                         }
                     }
-                    Ok(Some(ShimFrame::Exited { code })) => {
-                        return Err(format!("agy exited early with code {code:?}"));
-                    }
-                    Ok(Some(_)) => {}
                     _ => return Err("agy shim closed".into()),
                 }
             }
@@ -7892,5 +8146,411 @@ Task logs are available at: file:///tmp/task-1295.log\n";
         assert!(tracker.is_finished("sess/task-expired"));
         assert!(tracker.tasks.contains_key("sess/task-live"));
         assert!(tracker.tasks.contains_key("sess/task-shell"));
+    }
+
+    #[tokio::test]
+    async fn agy_prompt_missing_trajectory_transparently_recreates_session_with_handoff() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_evicted_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind mock agy shim");
+
+        let received_prompts: Arc<tokio::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let received_bg = Arc::clone(&received_prompts);
+
+        // Mock ACP server over shim UDS:
+        // - `initialize` -> OK
+        // - `session/load` for stale UUID -> silently returns OK (matching real `agy` bug!)
+        // - `session/prompt` on stale UUID -> returns `Failed to send user message: not_found: trajectory not found: ...`
+        // - `session/new` -> returns fresh UUID `fresh-sess-9999`
+        // - `session/prompt` on fresh UUID -> streams assistant chunk and returns `stopReason: end_turn`
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (rh, mut wh) = stream.into_split();
+            let mut lines = BufReader::new(rh).lines();
+            let mut seq = 0u64;
+            async fn send_stdout(
+                wh: &mut tokio::net::unix::OwnedWriteHalf,
+                seq: &mut u64,
+                payload: Value,
+            ) {
+                *seq += 1;
+                let frame = ShimFrame::StdoutLine {
+                    line: payload.to_string(),
+                    seq: Some(*seq),
+                };
+                let mut enc = serde_json::to_string(&frame).expect("encode frame");
+                enc.push('\n');
+                let _ = wh.write_all(enc.as_bytes()).await;
+                let _ = wh.flush().await;
+            }
+
+            while let Ok(Some(raw)) = lines.next_line().await {
+                let Ok(ShimFrame::WriteStdin { line }) = serde_json::from_str::<ShimFrame>(&raw)
+                else {
+                    continue;
+                };
+                let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                match method {
+                    "initialize" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                    "session/load" => {
+                        // Mimics real `agy`: returns OK even though trajectory file was evicted!
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{
+                                    "sessionId":"f8c809f0-5617-41ca-b27f-63bd7019833f",
+                                    "models":{"currentModelId":"gemini-4-neon-xhigh"}
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/new" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({
+                                "jsonrpc":"2.0",
+                                "id":id,
+                                "result":{
+                                    "sessionId":"fresh-sess-9999",
+                                    "models":{"currentModelId":"gemini-4-neon-xhigh"}
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "session/set_model" | "session/set_mode" => {
+                        send_stdout(
+                            &mut wh,
+                            &mut seq,
+                            json!({"jsonrpc":"2.0","id":id,"result":{}}),
+                        )
+                        .await;
+                    }
+                    "session/prompt" => {
+                        let sid = req
+                            .pointer("/params/sessionId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let text = req
+                            .pointer("/params/prompt/0/text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        received_bg.lock().await.push((sid.clone(), text));
+                        if sid == "f8c809f0-5617-41ca-b27f-63bd7019833f" {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc":"2.0",
+                                    "id":id,
+                                    "error":{
+                                        "code":-32000,
+                                        "message":"Failed to send user message: not_found: trajectory not found: f8c809f0-5617-41ca-b27f-63bd7019833f: not found"
+                                    }
+                                }),
+                            )
+                            .await;
+                        } else {
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({
+                                    "jsonrpc":"2.0",
+                                    "method":"session/update",
+                                    "params":{
+                                        "sessionId":sid,
+                                        "update":{
+                                            "sessionUpdate":"agent_message_chunk",
+                                            "content":{"type":"text","text":"Recovered seamlessly!"}
+                                        }
+                                    }
+                                }),
+                            )
+                            .await;
+                            send_stdout(
+                                &mut wh,
+                                &mut seq,
+                                json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}),
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect mock");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let seq_tracker = Arc::new(AtomicU64::new(0));
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_evicted".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-4-neon".into()),
+            effort: Some(ReasoningEffort::Xhigh),
+            mode: SessionMode::FullAccess,
+            resume_session_id: Some("f8c809f0-5617-41ca-b27f-63bd7019833f".into()),
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::clone(&seq_tracker),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: Some(
+                "[Prior Conversation Context in this Workspace]\nUser: 设计免服登录\n\nAssistant: 已发布 v0.8.0"
+                    .into(),
+            ),
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
+
+        // Wait for initial Idle
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("boot timeout")
+                .expect("ev");
+            if matches!(ev, DriverEvent::StatusChanged(AgentStatus::Idle)) {
+                break;
+            }
+        }
+
+        cmd_tx
+            .send(DriverCommand::SendPrompt {
+                turn_id: "turn_recover_1".into(),
+                prompt: "做一个友好的登录界面".into(),
+                behavior: ActiveTurnBehavior::Steer,
+            })
+            .await
+            .expect("send prompt");
+
+        let mut saw_new_session = false;
+        let mut saw_notice = false;
+        let mut saw_reply = false;
+        let mut saw_error = false;
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv())
+                .await
+                .expect("turn timeout")
+                .expect("ev");
+            match ev {
+                DriverEvent::SessionInitialized {
+                    persistence_ref, ..
+                } if persistence_ref == "fresh-sess-9999" => {
+                    saw_new_session = true;
+                }
+                DriverEvent::Notice { level, message }
+                    if level == "info" && message.contains("f8c809f0") =>
+                {
+                    saw_notice = true;
+                }
+                DriverEvent::AssistantText {
+                    text,
+                    streaming: false,
+                    ..
+                } if text == "Recovered seamlessly!" => {
+                    saw_reply = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Error { .. }) => {
+                    saw_error = true;
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) => break,
+                _ => {}
+            }
+        }
+
+        assert!(saw_new_session, "must persist fresh sessionId");
+        assert!(
+            saw_notice,
+            "must inform user of transparent session recreation"
+        );
+        assert!(saw_reply, "must deliver recovered assistant reply");
+        assert!(
+            !saw_error,
+            "must NOT surface trajectory-not-found error to user"
+        );
+
+        let prompts = received_prompts.lock().await;
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0].0, "f8c809f0-5617-41ca-b27f-63bd7019833f");
+        assert_eq!(prompts[1].0, "fresh-sess-9999");
+        assert!(
+            prompts[1]
+                .1
+                .contains("[Prior Conversation Context in this Workspace]")
+        );
+        assert!(prompts[1].1.contains("做一个友好的登录界面"));
+        assert!(seq_tracker.load(Ordering::Relaxed) >= 4);
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn agy_reattach_restores_active_turn_segment_ids_and_settles_preflight_prompt() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_agy_reattach_{}.sock",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind mock reattached shim");
+
+        // Simulate frames arriving after daemon hot-restart for an in-flight turn whose
+        // original `session/prompt` RPC had `id: 7` (from before restart).
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let frames = [
+                ShimFrame::AttachAck { latest_seq: 500 },
+                ShimFrame::StdoutLine {
+                    seq: Some(501),
+                    line: json!({
+                        "jsonrpc":"2.0",
+                        "method":"session/update",
+                        "params":{
+                            "sessionId":"sess_live_reattach",
+                            "update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text","text":"Continued after hot restart."}
+                            }
+                        }
+                    })
+                    .to_string(),
+                },
+                ShimFrame::StdoutLine {
+                    seq: Some(502),
+                    line: json!({
+                        "jsonrpc":"2.0",
+                        "id":7,
+                        "result":{"stopReason":"end_turn"}
+                    })
+                    .to_string(),
+                },
+            ];
+            for f in frames {
+                let mut enc = serde_json::to_string(&f).expect("encode frame");
+                enc.push('\n');
+                let _ = stream.write_all(enc.as_bytes()).await;
+            }
+            let _ = stream.flush().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let shim = orbit_shim::connect_existing_shim_after(&sock_path, Some(500))
+            .await
+            .expect("reattach");
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (evt_tx, mut evt_rx) = mpsc::channel(64);
+        let seq_tracker = Arc::new(AtomicU64::new(500));
+        let cfg = SessionLaunchConfig {
+            agent_id: "ag_reattach".into(),
+            provider: ProviderKind::Antigravity,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: sock_path.clone(),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("gemini-4-carbon".into()),
+            effort: Some(ReasoningEffort::High),
+            mode: SessionMode::FullAccess,
+            resume_session_id: Some("sess_live_reattach".into()),
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: true,
+            shim_after_seq: Some(500),
+            shim_seq_tracker: Arc::clone(&seq_tracker),
+            persisted_active_turn_id: Some("turn_cbc687".into()),
+            persisted_turn_step_seq: 8,
+            fallback_handoff_context: None,
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+        };
+
+        let actor = tokio::spawn(run_agy_actor(cfg, shim, true, cmd_rx, evt_tx));
+
+        let mut finalized_id = None;
+        let mut settled_idle = false;
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(3), evt_rx.recv()).await {
+            match ev {
+                DriverEvent::AssistantText {
+                    item_id,
+                    text,
+                    streaming: false,
+                } => {
+                    assert_eq!(text, "Continued after hot restart.");
+                    finalized_id = Some(item_id);
+                }
+                DriverEvent::StatusChanged(AgentStatus::Idle) => {
+                    settled_idle = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            finalized_id.as_deref(),
+            Some("agy_msg_turn_cbc687_9"),
+            "must continue persisted turn_id + step_seq instead of falling back to `agy_msg_init_1`"
+        );
+        assert!(
+            settled_idle,
+            "must recognize pre-restart session/prompt completion (`id: 7`) and transition to Idle"
+        );
+        assert_eq!(seq_tracker.load(Ordering::Relaxed), 502);
+
+        drop(cmd_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 }

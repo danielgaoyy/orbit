@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use orbit_protocol::{
     ActiveTurnBehavior, AgentStatus, BackgroundTaskInfo, ProviderKind, ProviderSubagentDescriptor,
@@ -49,6 +51,17 @@ pub struct SessionLaunchConfig {
     pub extra_env: HashMap<String, String>,
     /// When `true`, attempt to reattach to an already-running `orbit shim` UDS before spawning.
     pub reattach_existing_shim: bool,
+    /// Last consumed `orbit-shim` Stdio frame sequence number (`Attach { after_seq }`) on reattach.
+    pub shim_after_seq: Option<u64>,
+    /// Lock-free tracker updated by drivers with the latest consumed `orbit-shim` frame sequence.
+    pub shim_seq_tracker: Arc<AtomicU64>,
+    /// Active foreground `turn_id` persisted in SQLite (`AgentStatus::Running { turn_id }`) when reattaching.
+    pub persisted_active_turn_id: Option<String>,
+    /// Highest persisted stream segment suffix (`_N`) for `persisted_active_turn_id` when reattaching.
+    pub persisted_turn_step_seq: u64,
+    /// Compact conversation handoff context used only if resuming a persisted upstream session fails
+    /// because the provider evicted/deleted its local session cache and Orbit falls back to a fresh session.
+    pub fallback_handoff_context: Option<String>,
     /// Previously persisted `Running` background task tool calls for reconciliation on startup.
     pub persisted_running_bg_tasks: Vec<PersistedBackgroundTask>,
     /// True when the persisted `AgentStatus` in SQLite was `AutonomousWakeup { source: "waiting:..." }`.

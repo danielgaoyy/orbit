@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -52,21 +52,60 @@ pub struct ShimSpawnSpec {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ShimFrame {
     // Daemon -> Shim (Stdio)
-    WriteStdin { line: String },
+    WriteStdin {
+        line: String,
+    },
     // Daemon -> Shim (PTY)
-    PtyInput { data_b64: String },
-    PtyResize { cols: u16, rows: u16 },
+    PtyInput {
+        data_b64: String,
+    },
+    PtyResize {
+        cols: u16,
+        rows: u16,
+    },
     // Daemon -> Shim (Lifecycle)
     Kill,
+    // Daemon -> Shim (Cursor-aware Stdio attach handshake)
+    Attach {
+        #[serde(default)]
+        after_seq: Option<u64>,
+    },
 
+    // Shim -> Daemon (Cursor-aware Stdio attach acknowledgement)
+    AttachAck {
+        latest_seq: u64,
+    },
     // Shim -> Daemon (Stdio)
-    StdoutLine { line: String },
-    StderrLine { line: String },
+    StdoutLine {
+        line: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+    },
+    StderrLine {
+        line: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
+    },
     // Shim -> Daemon (PTY)
-    PtySnapshot { data_b64: String },
-    PtyOutput { data_b64: String },
+    PtySnapshot {
+        data_b64: String,
+    },
+    PtyOutput {
+        data_b64: String,
+    },
     // Shim -> Daemon (Lifecycle)
-    Exited { code: Option<i32> },
+    Exited {
+        code: Option<i32>,
+    },
+}
+
+impl ShimFrame {
+    pub fn seq(&self) -> Option<u64> {
+        match self {
+            ShimFrame::StdoutLine { seq, .. } | ShimFrame::StderrLine { seq, .. } => *seq,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +132,115 @@ pub struct ShimClient {
 impl ShimClient {
     pub async fn connect(socket_path: &Path) -> Result<Self, ShimError> {
         let stream = UnixStream::connect(socket_path).await?;
+        Ok(Self::from_stream(stream, Vec::new()))
+    }
+
+    /// Connect to a Stdio `orbit shim` with an optional replay cursor (`after_seq`).
+    ///
+    /// - Modern shims immediately reply with `AttachAck` and stream only frames with `seq > after_seq`.
+    /// - Legacy pre-cursor shims ignore `Attach` and immediately dump their unsequenced (`seq: None`)
+    ///   ring buffer; when `drain_legacy_unsequenced` is true, that synchronous burst is drained so
+    ///   hot-upgrading from an older shim never duplicates historical output into the timeline.
+    pub async fn connect_with_cursor(
+        socket_path: &Path,
+        after_seq: Option<u64>,
+        drain_legacy_unsequenced: bool,
+    ) -> Result<Self, ShimError> {
+        let stream = UnixStream::connect(socket_path).await?;
+        let (read_half, mut write_half) = stream.into_split();
+
+        let mut attach_line = serde_json::to_string(&ShimFrame::Attach { after_seq })?;
+        attach_line.push('\n');
+        write_half.write_all(attach_line.as_bytes()).await?;
+        let _ = write_half.flush().await;
+
+        let mut lines = BufReader::new(read_half).lines();
+        let mut preloaded: Vec<ShimFrame> = Vec::new();
+        let handshake_deadline = tokio::time::Instant::now() + Duration::from_millis(180);
+        let mut quiet_window = Duration::from_millis(50);
+        let mut legacy_drained: usize = 0;
+
+        loop {
+            let remaining =
+                handshake_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait = remaining.min(quiet_window);
+            match tokio::time::timeout(wait, lines.next_line()).await {
+                Ok(Ok(Some(raw))) => {
+                    let Ok(frame) = serde_json::from_str::<ShimFrame>(&raw) else {
+                        continue;
+                    };
+                    match frame {
+                        ShimFrame::AttachAck { .. } => {
+                            // Modern cursor-aware shim confirmed our cursor; every subsequent
+                            // frame is strictly unseen (`seq > after_seq`).
+                            break;
+                        }
+                        ShimFrame::StdoutLine { seq: None, .. }
+                        | ShimFrame::StderrLine { seq: None, .. }
+                            if drain_legacy_unsequenced =>
+                        {
+                            // Legacy shim dumping its unsequenced ring buffer — discard burst.
+                            legacy_drained += 1;
+                            quiet_window = Duration::from_millis(25);
+                            if legacy_drained >= STDIO_RING_CAPACITY {
+                                break;
+                            }
+                        }
+                        other => {
+                            preloaded.push(other);
+                            break;
+                        }
+                    }
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+
+        let (in_tx, mut in_rx) = mpsc::channel::<ShimFrame>(256);
+        let (out_tx, out_rx) = mpsc::channel::<ShimFrame>(512);
+
+        tokio::spawn(async move {
+            while let Some(frame) = in_rx.recv().await {
+                let Ok(mut line) = serde_json::to_string(&frame) else {
+                    continue;
+                };
+                line.push('\n');
+                if write_half.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            for frame in preloaded {
+                if out_tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(frame) = serde_json::from_str::<ShimFrame>(&line) {
+                    if matches!(frame, ShimFrame::AttachAck { .. }) {
+                        continue;
+                    }
+                    if out_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            tx: in_tx,
+            rx: out_rx,
+        })
+    }
+
+    fn from_stream(stream: UnixStream, preloaded: Vec<ShimFrame>) -> Self {
         let (read_half, mut write_half) = stream.into_split();
         let (in_tx, mut in_rx) = mpsc::channel::<ShimFrame>(256);
         let (out_tx, out_rx) = mpsc::channel::<ShimFrame>(512);
@@ -110,20 +258,28 @@ impl ShimClient {
         });
 
         tokio::spawn(async move {
+            for frame in preloaded {
+                if out_tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
             let mut lines = BufReader::new(read_half).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Ok(frame) = serde_json::from_str::<ShimFrame>(&line)
-                    && out_tx.send(frame).await.is_err()
-                {
-                    break;
+                if let Ok(frame) = serde_json::from_str::<ShimFrame>(&line) {
+                    if matches!(frame, ShimFrame::AttachAck { .. }) {
+                        continue;
+                    }
+                    if out_tx.send(frame).await.is_err() {
+                        break;
+                    }
                 }
             }
         });
 
-        Ok(Self {
+        Self {
             tx: in_tx,
             rx: out_rx,
-        })
+        }
     }
 
     pub async fn send(&self, frame: ShimFrame) -> Result<(), ShimError> {
@@ -153,6 +309,21 @@ impl ShimClient {
     }
 }
 
+/// Probe whether a shim UDS socket is alive without triggering ring-buffer replay.
+/// Removes stale socket files whose listener is gone (`ECONNREFUSED`).
+pub async fn probe_existing_shim(socket_path: &Path) -> bool {
+    if !socket_path.exists() {
+        return false;
+    }
+    match tokio::time::timeout(Duration::from_millis(300), UnixStream::connect(socket_path)).await {
+        Ok(Ok(_stream)) => true,
+        _ => {
+            let _ = std::fs::remove_file(socket_path);
+            false
+        }
+    }
+}
+
 /// Attempt to reconnect to an already-running `orbit shim` UDS socket (e.g. after Daemon hot-restart).
 /// If the socket file exists on disk but the shim process is gone (`ECONNREFUSED`), removes the stale file.
 pub async fn connect_existing_shim(socket_path: &Path) -> Option<ShimClient> {
@@ -160,6 +331,32 @@ pub async fn connect_existing_shim(socket_path: &Path) -> Option<ShimClient> {
         return None;
     }
     match tokio::time::timeout(Duration::from_millis(300), ShimClient::connect(socket_path)).await {
+        Ok(Ok(client)) => Some(client),
+        _ => {
+            let _ = std::fs::remove_file(socket_path);
+            None
+        }
+    }
+}
+
+/// Reconnect to an already-running Stdio `orbit shim`, requesting only frames with `seq > after_seq`.
+/// When `after_seq` is `None` (e.g. upgrading from a daemon that hadn't persisted cursors yet),
+/// sends `Some(u64::MAX)` so a modern shim skips historical ring frames and only delivers new live
+/// frames, while legacy unsequenced ring dumps are drained automatically.
+pub async fn connect_existing_shim_after(
+    socket_path: &Path,
+    after_seq: Option<u64>,
+) -> Option<ShimClient> {
+    if !socket_path.exists() {
+        return None;
+    }
+    let effective_cursor = Some(after_seq.unwrap_or(u64::MAX));
+    match tokio::time::timeout(
+        Duration::from_millis(500),
+        ShimClient::connect_with_cursor(socket_path, effective_cursor, true),
+    )
+    .await
+    {
         Ok(Ok(client)) => Some(client),
         _ => {
             let _ = std::fs::remove_file(socket_path);
@@ -330,15 +527,21 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
 
     let ring: Arc<Mutex<VecDeque<ShimFrame>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(STDIO_RING_CAPACITY)));
+    let next_seq = Arc::new(AtomicU64::new(1));
     let (out_tx, _) = broadcast::channel::<ShimFrame>(1024);
     let (in_tx, mut in_rx) = mpsc::channel::<ShimFrame>(256);
 
     let out_tx_stdout = out_tx.clone();
     let ring_stdout = ring.clone();
+    let seq_stdout = next_seq.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(child_stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let frame = ShimFrame::StdoutLine { line };
+            let seq = seq_stdout.fetch_add(1, Ordering::Relaxed);
+            let frame = ShimFrame::StdoutLine {
+                line,
+                seq: Some(seq),
+            };
             push_ring(&ring_stdout, frame.clone());
             let _ = out_tx_stdout.send(frame);
         }
@@ -346,10 +549,15 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
 
     let out_tx_stderr = out_tx.clone();
     let ring_stderr = ring.clone();
+    let seq_stderr = next_seq.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(child_stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let frame = ShimFrame::StderrLine { line };
+            let seq = seq_stderr.fetch_add(1, Ordering::Relaxed);
+            let frame = ShimFrame::StderrLine {
+                line,
+                seq: Some(seq),
+            };
             push_ring(&ring_stderr, frame.clone());
             let _ = out_tx_stderr.send(frame);
         }
@@ -382,11 +590,13 @@ async fn run_stdio_shim(socket_path: &Path, spec: ShimSpawnSpec) -> Result<(), S
         tokio::select! {
             accept_res = listener.accept() => {
                 if let Ok((stream, _)) = accept_res {
-                    let initial_frames: Vec<ShimFrame> = ring
-                        .lock()
-                        .map(|g| g.iter().cloned().collect())
-                        .unwrap_or_default();
-                    handle_daemon_attach(stream, initial_frames, out_tx.subscribe(), in_tx.clone(), None);
+                    handle_stdio_daemon_attach(
+                        stream,
+                        ring.clone(),
+                        next_seq.clone(),
+                        out_tx.subscribe(),
+                        in_tx.clone(),
+                    );
                 }
             }
             _ = kill_rx.recv() => {
@@ -576,6 +786,123 @@ fn push_ring(ring: &Arc<Mutex<VecDeque<ShimFrame>>>, frame: ShimFrame) {
     }
 }
 
+fn handle_stdio_daemon_attach(
+    stream: UnixStream,
+    ring: Arc<Mutex<VecDeque<ShimFrame>>>,
+    next_seq: Arc<AtomicU64>,
+    mut out_rx: broadcast::Receiver<ShimFrame>,
+    in_tx: mpsc::Sender<ShimFrame>,
+) {
+    tokio::spawn(async move {
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+
+        // Briefly inspect the first incoming frame to check for a cursor-aware `Attach` handshake.
+        // - If `probe_existing_shim` connects and immediately closes (EOF), return without writing.
+        // - If a modern daemon sends `Attach { after_seq }`, acknowledge with `AttachAck` and send
+        //   only frames strictly newer than `after_seq`.
+        // - If a legacy client sends `WriteStdin`/`Kill` or doesn't send `Attach` within 80ms,
+        //   fall back to replaying the full ring buffer for backward compatibility.
+        let mut send_ack = false;
+        let mut after_seq: Option<u64> = None;
+        let mut first_non_attach: Option<ShimFrame> = None;
+
+        match tokio::time::timeout(Duration::from_millis(80), lines.next_line()).await {
+            Ok(Ok(None)) => return,
+            Ok(Ok(Some(raw))) => {
+                if let Ok(frame) = serde_json::from_str::<ShimFrame>(&raw) {
+                    match frame {
+                        ShimFrame::Attach { after_seq: cursor } => {
+                            send_ack = true;
+                            after_seq = cursor;
+                        }
+                        other => {
+                            first_non_attach = Some(other);
+                        }
+                    }
+                }
+            }
+            Ok(Err(_)) => return,
+            Err(_) => {}
+        }
+
+        let latest_seq = next_seq.load(Ordering::Relaxed).saturating_sub(1);
+        let initial_frames: Vec<ShimFrame> = ring
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .filter(|f| match after_seq {
+                        Some(cursor) => f.seq().is_none_or(|s| s > cursor),
+                        None => true,
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Spawn reader loop for remaining inbound frames from the daemon.
+        let in_tx_reader = in_tx.clone();
+        tokio::spawn(async move {
+            if let Some(frame) = first_non_attach
+                && in_tx_reader.send(frame).await.is_err()
+            {
+                return;
+            }
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(frame) = serde_json::from_str::<ShimFrame>(&line) {
+                    if matches!(frame, ShimFrame::Attach { .. }) {
+                        continue;
+                    }
+                    if in_tx_reader.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut max_sent_seq = after_seq.unwrap_or(0).min(latest_seq);
+        if send_ack
+            && let Ok(mut encoded) = serde_json::to_string(&ShimFrame::AttachAck { latest_seq })
+        {
+            encoded.push('\n');
+            if write_half.write_all(encoded.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+        for frame in initial_frames {
+            if let Some(s) = frame.seq() {
+                max_sent_seq = max_sent_seq.max(s);
+            }
+            if let Ok(mut encoded) = serde_json::to_string(&frame) {
+                encoded.push('\n');
+                if write_half.write_all(encoded.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        }
+        loop {
+            match out_rx.recv().await {
+                Ok(frame) => {
+                    if let Some(s) = frame.seq() {
+                        if s <= max_sent_seq {
+                            continue;
+                        }
+                        max_sent_seq = s;
+                    }
+                    if let Ok(mut encoded) = serde_json::to_string(&frame) {
+                        encoded.push('\n');
+                        if write_half.write_all(encoded.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => break,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 fn handle_daemon_attach(
     stream: UnixStream,
     initial_frames: Vec<ShimFrame>,
@@ -731,19 +1058,25 @@ mod tests {
                 .expect("timeout")
                 .expect("frame");
             match frame {
-                ShimFrame::StdoutLine { line } => assert_eq!(line, "hello-across-restart"),
+                ShimFrame::StdoutLine { line, seq } => {
+                    assert_eq!(line, "hello-across-restart");
+                    assert_eq!(seq, Some(1));
+                }
                 other => panic!("unexpected frame: {other:?}"),
             }
         } // client1 dropped here!
 
-        // Second Daemon connection attaches to the SAME running shim and gets replay + live I/O
+        // Second Daemon connection attaches to the SAME running shim without a cursor and gets replay + live I/O
         let mut client2 = ShimClient::connect(&sock_path).await.expect("connect 2");
         let replayed = tokio::time::timeout(Duration::from_secs(2), client2.rx.recv())
             .await
             .expect("timeout")
             .expect("replay");
         match replayed {
-            ShimFrame::StdoutLine { line } => assert_eq!(line, "hello-across-restart"),
+            ShimFrame::StdoutLine { line, seq } => {
+                assert_eq!(line, "hello-across-restart");
+                assert_eq!(seq, Some(1));
+            }
             other => panic!("unexpected replay: {other:?}"),
         }
 
@@ -756,12 +1089,156 @@ mod tests {
             .expect("timeout")
             .expect("live");
         match live {
-            ShimFrame::StdoutLine { line } => assert_eq!(line, "second-turn"),
+            ShimFrame::StdoutLine { line, seq } => {
+                assert_eq!(line, "second-turn");
+                assert_eq!(seq, Some(2));
+            }
             other => panic!("unexpected live: {other:?}"),
         }
 
         client2.kill().await.expect("kill");
         let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
+    }
+
+    #[tokio::test]
+    async fn stdio_shim_cursor_attach_skips_consumed_frames_and_delivers_only_new_ones() {
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_shim_cursor_{}.sock",
+            std::process::id()
+        ));
+        let spec = ShimSpawnSpec {
+            shim_id: "test_cat_cursor".into(),
+            mode: ShimMode::Stdio,
+            program: "/bin/cat".into(),
+            args: vec![],
+            cwd: std::env::temp_dir(),
+            env: HashMap::new(),
+        };
+
+        let sock_bg = sock_path.clone();
+        let shim_task = tokio::spawn(async move {
+            run_shim(&sock_bg, spec).await.expect("shim run");
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // First daemon consumes seq 1 & 2, then disconnects.
+        let last_seq = {
+            let mut client1 = ShimClient::connect(&sock_path).await.expect("connect 1");
+            client1.write_stdin_line("old-turn-1").await.expect("w1");
+            client1.write_stdin_line("old-turn-2").await.expect("w2");
+            let f1 = tokio::time::timeout(Duration::from_secs(2), client1.rx.recv())
+                .await
+                .expect("t1")
+                .expect("f1");
+            let f2 = tokio::time::timeout(Duration::from_secs(2), client1.rx.recv())
+                .await
+                .expect("t2")
+                .expect("f2");
+            assert_eq!(f1.seq(), Some(1));
+            assert_eq!(f2.seq(), Some(2));
+            // Also verify probing does not disturb the shim
+            assert!(probe_existing_shim(&sock_path).await);
+            f2.seq().expect("f2 seq")
+        };
+
+        // Reconnect with `after_seq = Some(2)` -> must NOT replay old-turn-1 or old-turn-2!
+        let mut client2 = connect_existing_shim_after(&sock_path, Some(last_seq))
+            .await
+            .expect("reattach with cursor");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), client2.rx.recv())
+                .await
+                .is_err(),
+            "already-consumed frames must NOT be replayed across reattach"
+        );
+
+        // Live output after reattach must still arrive cleanly with seq = 3.
+        client2.write_stdin_line("new-turn-3").await.expect("w3");
+        let f3 = tokio::time::timeout(Duration::from_secs(2), client2.rx.recv())
+            .await
+            .expect("t3")
+            .expect("f3");
+        match f3 {
+            ShimFrame::StdoutLine { line, seq } => {
+                assert_eq!(line, "new-turn-3");
+                assert_eq!(seq, Some(3));
+            }
+            other => panic!("unexpected live frame: {other:?}"),
+        }
+
+        // Reconnect with `after_seq = Some(1)` -> must replay ONLY seq 2 & 3 (not seq 1).
+        drop(client2);
+        let mut client3 = connect_existing_shim_after(&sock_path, Some(1))
+            .await
+            .expect("reattach gap");
+        let r2 = tokio::time::timeout(Duration::from_secs(2), client3.rx.recv())
+            .await
+            .expect("tr2")
+            .expect("r2");
+        let r3 = tokio::time::timeout(Duration::from_secs(2), client3.rx.recv())
+            .await
+            .expect("tr3")
+            .expect("r3");
+        assert!(
+            matches!(r2, ShimFrame::StdoutLine { ref line, seq: Some(2) } if line == "old-turn-2")
+        );
+        assert!(
+            matches!(r3, ShimFrame::StdoutLine { ref line, seq: Some(3) } if line == "new-turn-3")
+        );
+
+        client3.kill().await.expect("kill");
+        let _ = tokio::time::timeout(Duration::from_secs(2), shim_task).await;
+    }
+
+    #[tokio::test]
+    async fn cursor_attach_drains_legacy_unsequenced_ring_dump() {
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_legacy_shim_{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind fake legacy shim");
+
+        // Simulate a legacy v0.8.0 shim that ignores `Attach` and dumps unsequenced ring frames.
+        let server = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let legacy_dump = concat!(
+                    "{\"type\":\"stdout_line\",\"line\":\"stale-truncated-chunk-1\"}\n",
+                    "{\"type\":\"stdout_line\",\"line\":\"stale-truncated-chunk-2\"}\n"
+                );
+                let _ = stream.write_all(legacy_dump.as_bytes()).await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let live = "{\"type\":\"stdout_line\",\"line\":\"fresh-after-attach\"}\n";
+                let _ = stream.write_all(live.as_bytes()).await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
+        let mut client = connect_existing_shim_after(&sock_path, None)
+            .await
+            .expect("connect legacy");
+        let frame = tokio::time::timeout(Duration::from_secs(2), client.rx.recv())
+            .await
+            .expect("timeout")
+            .expect("frame");
+        match frame {
+            ShimFrame::StdoutLine { line, seq } => {
+                assert_eq!(line, "fresh-after-attach");
+                assert_eq!(seq, None);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        let _ = server.await;
+        let _ = std::fs::remove_file(&sock_path);
     }
 
     #[tokio::test]

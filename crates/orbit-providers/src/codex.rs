@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
@@ -12,7 +13,9 @@ use orbit_protocol::{
     QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload, ToolCallDetail,
     ToolCallStatus,
 };
-use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, spawn_detached_shim};
+use orbit_shim::{
+    ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim_after, spawn_detached_shim,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -32,7 +35,7 @@ pub async fn spawn_codex_session(
     cfg: SessionLaunchConfig,
 ) -> Result<ProviderSessionHandle, String> {
     let reattached = if cfg.reattach_existing_shim {
-        connect_existing_shim(&cfg.shim_socket).await
+        connect_existing_shim_after(&cfg.shim_socket, cfg.shim_after_seq).await
     } else {
         None
     };
@@ -81,7 +84,7 @@ pub async fn spawn_codex_session(
             .await
             .map_err(|e| format!("codex write initialize failed: {e}"))?;
 
-        wait_codex_id_response(&mut fresh, 1).await?;
+        wait_codex_id_response(&mut fresh, 1, &cfg.shim_seq_tracker).await?;
 
         let initialized_notif = json!({
             "method": "initialized",
@@ -124,49 +127,54 @@ async fn run_codex_actor(
     let mut next_id: u64 = if is_reattached { 1000 } else { 2 };
     let mut mode = cfg.mode.clone();
 
-    let (thread_id, mut resolved_model) =
-        if is_reattached && let Some(ref tid) = cfg.resume_session_id {
-            (tid.clone(), cfg.model.clone())
-        } else {
-            // Start or resume thread (injecting Orbit MCP server into `config.mcp_servers`)
-            let (approval_policy, start_sandbox) = codex_thread_mode_strings(&mode);
-            let thread_req_id = next_id;
-            next_id += 1;
+    let mut inject_handoff_on_next_prompt = false;
+    let mut pending_handoff_context = cfg.fallback_handoff_context.clone();
 
-            let mut inner_config = serde_json::Map::new();
-            if let Some(ref mcp) = cfg.mcp_spec {
-                inner_config.insert(
-                    "mcp_servers".into(),
-                    json!({
-                        mcp.server_name.clone(): {
-                            "url": mcp.http_url,
-                            "http_headers": {
-                                "Authorization": format!("Bearer {}", mcp.bearer_token)
-                            },
-                            "tool_timeout_sec": 120
-                        }
-                    }),
-                );
-            }
-            if let Some(ref sys_append) = cfg.system_prompt_append
-                && !sys_append.trim().is_empty()
-            {
-                inner_config.insert(
-                    "developer_instructions".into(),
-                    Value::String(sys_append.clone()),
-                );
-            }
+    let (thread_id, mut resolved_model) = if is_reattached
+        && let Some(ref tid) = cfg.resume_session_id
+    {
+        (tid.clone(), cfg.model.clone())
+    } else {
+        // Start or resume thread (injecting Orbit MCP server into `config.mcp_servers`)
+        let (approval_policy, start_sandbox) = codex_thread_mode_strings(&mode);
+        let thread_req_id = next_id;
+        next_id += 1;
 
-            let start_msg = if let Some(ref tid) = cfg.resume_session_id {
+        let mut inner_config = serde_json::Map::new();
+        if let Some(ref mcp) = cfg.mcp_spec {
+            inner_config.insert(
+                "mcp_servers".into(),
+                json!({
+                    mcp.server_name.clone(): {
+                        "url": mcp.http_url,
+                        "http_headers": {
+                            "Authorization": format!("Bearer {}", mcp.bearer_token)
+                        },
+                        "tool_timeout_sec": 120
+                    }
+                }),
+            );
+        }
+        if let Some(ref sys_append) = cfg.system_prompt_append
+            && !sys_append.trim().is_empty()
+        {
+            inner_config.insert(
+                "developer_instructions".into(),
+                Value::String(sys_append.clone()),
+            );
+        }
+
+        let build_start_msg = |req_id: u64, resume_tid: Option<&str>| {
+            if let Some(tid) = resume_tid {
                 let mut params = json!({
                     "threadId": tid,
                     "excludeTurns": true
                 });
                 if !inner_config.is_empty() {
-                    params["config"] = Value::Object(inner_config);
+                    params["config"] = Value::Object(inner_config.clone());
                 }
                 json!({
-                    "id": thread_req_id,
+                    "id": req_id,
                     "method": "thread/resume",
                     "params": params
                 })
@@ -182,45 +190,101 @@ async fn run_codex_actor(
                     params["model"] = Value::String(m.clone());
                 }
                 if !inner_config.is_empty() {
-                    params["config"] = Value::Object(inner_config);
+                    params["config"] = Value::Object(inner_config.clone());
                 }
                 json!({
-                    "id": thread_req_id,
+                    "id": req_id,
                     "method": "thread/start",
                     "params": params
                 })
-            };
-
-            if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
-                return;
             }
+        };
 
-            let thread_res = match wait_codex_id_response(&mut shim, thread_req_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = evt_tx
-                        .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                            message: format!("Codex thread start failed: {e}"),
-                            recoverable: false,
-                        }))
-                        .await;
+        let start_msg = build_start_msg(thread_req_id, cfg.resume_session_id.as_deref());
+        if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
+            return;
+        }
+
+        let thread_res = match wait_codex_id_response(
+            &mut shim,
+            thread_req_id,
+            &cfg.shim_seq_tracker,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(first_err) if cfg.resume_session_id.is_some() => {
+                let fallback_id = next_id;
+                next_id += 1;
+                let fallback_msg = build_start_msg(fallback_id, None);
+                if shim
+                    .write_stdin_line(fallback_msg.to_string())
+                    .await
+                    .is_err()
+                {
                     return;
                 }
-            };
-
-            let tid = thread_res
-                .pointer("/thread/id")
-                .and_then(|v| v.as_str())
-                .or(cfg.resume_session_id.as_deref())
-                .unwrap_or("unknown")
-                .to_string();
-            let model = thread_res
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(ToOwned::to_owned)
-                .or_else(|| cfg.model.clone());
-            (tid, model)
+                match wait_codex_id_response(&mut shim, fallback_id, &cfg.shim_seq_tracker).await {
+                    Ok(v) => {
+                        inject_handoff_on_next_prompt = true;
+                        let old_short: String = cfg
+                            .resume_session_id
+                            .as_deref()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(8)
+                            .collect();
+                        let _ = evt_tx
+                                    .send(DriverEvent::Notice {
+                                        level: "info".into(),
+                                        message: format!(
+                                            "Previous Codex session ({old_short}…) could not be resumed ({first_err}); started a fresh session with recent conversation context restored."
+                                        ),
+                                    })
+                                    .await;
+                        v
+                    }
+                    Err(e) => {
+                        let _ = evt_tx
+                                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                        message: format!(
+                                            "Codex thread resume failed ({first_err}); fresh thread start also failed: {e}"
+                                        ),
+                                        recoverable: false,
+                                    }))
+                                    .await;
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = evt_tx
+                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                        message: format!("Codex thread start failed: {e}"),
+                        recoverable: false,
+                    }))
+                    .await;
+                return;
+            }
         };
+
+        let tid = thread_res
+            .pointer("/thread/id")
+            .and_then(|v| v.as_str())
+            .or(if inject_handoff_on_next_prompt {
+                None
+            } else {
+                cfg.resume_session_id.as_deref()
+            })
+            .unwrap_or("unknown")
+            .to_string();
+        let model = thread_res
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .or_else(|| cfg.model.clone());
+        (tid, model)
+    };
     let mut current_effort = cfg.effort;
 
     let _ = evt_tx
@@ -236,7 +300,11 @@ async fn run_codex_actor(
     }
 
     let mut native_turn_id: Option<String> = None;
-    let mut client_turn_id: Option<String> = None;
+    let mut client_turn_id: Option<String> = if is_reattached {
+        cfg.persisted_active_turn_id.clone()
+    } else {
+        None
+    };
     let mut msg_accum: HashMap<String, String> = HashMap::new();
     let mut thought_accum: HashMap<String, String> = HashMap::new();
     let mut file_change_cache: HashMap<String, ToolCallDetail> = HashMap::new();
@@ -249,7 +317,16 @@ async fn run_codex_actor(
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
-                    DriverCommand::SendPrompt { turn_id, prompt, behavior } => {
+                    DriverCommand::SendPrompt { turn_id, mut prompt, behavior } => {
+                        if inject_handoff_on_next_prompt {
+                            inject_handoff_on_next_prompt = false;
+                            if let Some(ctx) = pending_handoff_context.take()
+                                && !ctx.trim().is_empty()
+                                && !prompt.contains("[Prior Conversation Context in this Workspace]")
+                            {
+                                prompt = format!("{ctx}\n\n{prompt}");
+                            }
+                        }
                         let input_items =
                             build_codex_input_items(&prompt, cfg.attachments_dir.as_deref());
                         if let Some(ref active_nat_tid) = native_turn_id {
@@ -392,8 +469,11 @@ async fn run_codex_actor(
 
             maybe_frame = shim.rx.recv() => {
                 let Some(frame) = maybe_frame else { break; };
+                if let Some(seq) = frame.seq() {
+                    cfg.shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);
+                }
                 match frame {
-                    ShimFrame::StdoutLine { line } => {
+                    ShimFrame::StdoutLine { line, .. } => {
                         let Ok(val) = serde_json::from_str::<Value>(&line) else { continue; };
                         let rpc_id = val.get("id").and_then(|v| v.as_u64());
                         let method = val.get("method").and_then(|v| v.as_str());
@@ -483,6 +563,7 @@ async fn run_codex_actor(
 async fn wait_codex_id_response(
     shim: &mut orbit_shim::ShimClient,
     expected_id: u64,
+    shim_seq_tracker: &std::sync::atomic::AtomicU64,
 ) -> Result<Value, String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -491,23 +572,30 @@ async fn wait_codex_id_response(
             return Err(format!("Codex RPC #{expected_id} timed out"));
         }
         match tokio::time::timeout(rem, shim.rx.recv()).await {
-            Ok(Some(ShimFrame::StdoutLine { line })) => {
-                let Ok(val) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if val.get("method").is_none()
-                    && val.get("id").and_then(|v| v.as_u64()) == Some(expected_id)
-                {
-                    if let Some(err) = val.get("error").filter(|v| !v.is_null()) {
-                        return Err(err.to_string());
+            Ok(Some(frame)) => {
+                if let Some(seq) = frame.seq() {
+                    shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);
+                }
+                match frame {
+                    ShimFrame::StdoutLine { line, .. } => {
+                        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        if val.get("method").is_none()
+                            && val.get("id").and_then(|v| v.as_u64()) == Some(expected_id)
+                        {
+                            if let Some(err) = val.get("error").filter(|v| !v.is_null()) {
+                                return Err(err.to_string());
+                            }
+                            return Ok(val.get("result").cloned().unwrap_or(Value::Null));
+                        }
                     }
-                    return Ok(val.get("result").cloned().unwrap_or(Value::Null));
+                    ShimFrame::Exited { code } => {
+                        return Err(format!("codex app-server exited early ({code:?})"));
+                    }
+                    _ => {}
                 }
             }
-            Ok(Some(ShimFrame::Exited { code })) => {
-                return Err(format!("codex app-server exited early ({code:?})"));
-            }
-            Ok(Some(_)) => {}
             _ => return Err("codex shim closed".into()),
         }
     }

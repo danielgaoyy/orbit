@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
@@ -22,7 +23,7 @@ use orbit_providers::{
 };
 use orbit_shim::{
     ShimClient, ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, kill_existing_shim,
-    spawn_detached_shim,
+    probe_existing_shim, spawn_detached_shim,
 };
 use orbit_store::OrbitStore;
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -84,6 +85,7 @@ struct LiveAgentEntry {
     cmd_tx: mpsc::Sender<DriverCommand>,
     done_notify: Arc<tokio::sync::Notify>,
     ingest_abort: tokio::task::AbortHandle,
+    shim_seq_tracker: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -329,6 +331,24 @@ impl AgentOrchestrator {
         }
     }
 
+    /// Persist the exact last-consumed `orbit-shim` frame sequence for every live agent
+    /// right before a daemon shutdown or self-upgrade hot-restart so reattached shims resume
+    /// strictly from the gap without replaying already-ingested history.
+    pub async fn flush_all_shim_cursors(&self) {
+        let entries: Vec<(String, u64)> = self
+            .live_agents
+            .read()
+            .await
+            .iter()
+            .map(|(aid, entry)| (aid.clone(), entry.shim_seq_tracker.load(Ordering::Relaxed)))
+            .collect();
+        for (aid, seq) in entries {
+            if seq > 0 {
+                let _ = self.store.set_agent_shim_cursor(&aid, seq);
+            }
+        }
+    }
+
     /// Re-attach to surviving agent shims across daemon hot-upgrades, and optionally
     /// resume previously `Running` agents if `orchestration.resume_on_startup` is enabled.
     async fn reattach_or_recover_agents(self: &Arc<Self>) {
@@ -340,14 +360,13 @@ impl AgentOrchestrator {
         for ag in agents {
             let primary = self.shim_socket_path("a", &ag.agent_id);
             let legacy = self.legacy_shim_socket_path("agent", &ag.agent_id);
-            let surviving_sock =
-                if primary.exists() && connect_existing_shim(&primary).await.is_some() {
-                    Some(primary)
-                } else if legacy.exists() && connect_existing_shim(&legacy).await.is_some() {
-                    Some(legacy)
-                } else {
-                    None
-                };
+            let surviving_sock = if primary.exists() && probe_existing_shim(&primary).await {
+                Some(primary)
+            } else if legacy.exists() && probe_existing_shim(&legacy).await {
+                Some(legacy)
+            } else {
+                None
+            };
             let was_running = ag.status.is_foreground_busy();
 
             if surviving_sock.is_some()
@@ -1615,7 +1634,7 @@ impl AgentOrchestrator {
     }
 
     fn build_handoff_context(&self, agent_id: &str) -> Option<String> {
-        let (events, _) = self.store.fetch_timeline_since(agent_id, 0, 200).ok()?;
+        let events = self.store.fetch_recent_timeline(agent_id, 200).ok()?;
         let mut turns = Vec::new();
         for ev in events {
             match ev.payload {
@@ -3006,6 +3025,31 @@ impl AgentOrchestrator {
                 if source.trim().starts_with("waiting:")
         );
 
+        let shim_after_seq = if reattach_existing_shim {
+            self.store.get_agent_shim_cursor(&summary.agent_id)
+        } else {
+            let _ = self.store.clear_agent_shim_cursor(&summary.agent_id);
+            None
+        };
+        let shim_seq_tracker = Arc::new(AtomicU64::new(shim_after_seq.unwrap_or(0)));
+        let persisted_active_turn_id = if reattach_existing_shim {
+            match &summary.status {
+                AgentStatus::Running { turn_id } => Some(turn_id.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let persisted_turn_step_seq = persisted_active_turn_id
+            .as_deref()
+            .map(|tid| self.store.max_turn_segment_step(&summary.agent_id, tid))
+            .unwrap_or(0);
+        let fallback_handoff_context = if !reattach_existing_shim && resume_session_id.is_some() {
+            self.build_handoff_context(&summary.agent_id)
+        } else {
+            None
+        };
+
         let handle = spawn_provider_session(SessionLaunchConfig {
             agent_id: summary.agent_id.clone(),
             provider: summary.provider,
@@ -3023,6 +3067,11 @@ impl AgentOrchestrator {
             system_prompt_append: profile.and_then(|p| p.system_prompt_append),
             extra_env,
             reattach_existing_shim,
+            shim_after_seq,
+            shim_seq_tracker: Arc::clone(&shim_seq_tracker),
+            persisted_active_turn_id,
+            persisted_turn_step_seq,
+            fallback_handoff_context,
             persisted_running_bg_tasks,
             persisted_bg_wait,
         })
@@ -3040,11 +3089,13 @@ impl AgentOrchestrator {
         let mgr = Arc::clone(self);
         let ag_id = summary.agent_id.clone();
         let mut evt_rx = handle.evt_rx;
+        let shim_seq_bg = Arc::clone(&shim_seq_tracker);
 
         let ingest_task = tokio::spawn(async move {
             const STREAM_COALESCE_WINDOW: std::time::Duration =
                 std::time::Duration::from_millis(65);
             let mut stream_buf = StreamingEventBuffer::default();
+            let mut last_persisted_shim_seq = shim_seq_bg.load(Ordering::Relaxed);
             let sleep = tokio::time::sleep(STREAM_COALESCE_WINDOW);
             tokio::pin!(sleep);
 
@@ -3080,6 +3131,11 @@ impl AgentOrchestrator {
                                         }
                                         mgr.ingest_driver_event(&ag_id, expected_gen, *current)
                                             .await;
+                                        let cur_seq = shim_seq_bg.load(Ordering::Relaxed);
+                                        if cur_seq > last_persisted_shim_seq {
+                                            let _ = mgr.store.set_agent_shim_cursor(&ag_id, cur_seq);
+                                            last_persisted_shim_seq = cur_seq;
+                                        }
                                     }
                                 }
                             }
@@ -3088,6 +3144,10 @@ impl AgentOrchestrator {
                                     && mgr.current_generation(&ag_id).await == expected_gen
                                 {
                                     mgr.ingest_driver_event(&ag_id, expected_gen, pending).await;
+                                }
+                                let cur_seq = shim_seq_bg.load(Ordering::Relaxed);
+                                if cur_seq > last_persisted_shim_seq {
+                                    let _ = mgr.store.set_agent_shim_cursor(&ag_id, cur_seq);
                                 }
                                 break;
                             }
@@ -3098,6 +3158,11 @@ impl AgentOrchestrator {
                             && mgr.current_generation(&ag_id).await == expected_gen
                         {
                             mgr.ingest_driver_event(&ag_id, expected_gen, pending).await;
+                            let cur_seq = shim_seq_bg.load(Ordering::Relaxed);
+                            if cur_seq > last_persisted_shim_seq {
+                                let _ = mgr.store.set_agent_shim_cursor(&ag_id, cur_seq);
+                                last_persisted_shim_seq = cur_seq;
+                            }
                         }
                     }
                 }
@@ -3123,6 +3188,7 @@ impl AgentOrchestrator {
                 cmd_tx: cmd_tx.clone(),
                 done_notify,
                 ingest_abort: ingest_task.abort_handle(),
+                shim_seq_tracker,
             },
         );
 

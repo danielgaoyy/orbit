@@ -5920,9 +5920,10 @@ fn resolve_orbit_exe() -> PathBuf {
         if is_orbit_bin {
             return cur;
         }
+        let orbit_bin_name = format!("orbit{}", std::env::consts::EXE_SUFFIX);
         let mut anc = cur.parent();
         while let Some(dir) = anc {
-            let candidate = dir.join("orbit");
+            let candidate = dir.join(&orbit_bin_name);
             if candidate.is_file() {
                 return candidate;
             }
@@ -5930,7 +5931,7 @@ fn resolve_orbit_exe() -> PathBuf {
         }
         return cur;
     }
-    PathBuf::from("orbit")
+    PathBuf::from(format!("orbit{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn derive_human_seed(

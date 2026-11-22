@@ -1350,17 +1350,19 @@ mod tests {
             "pub fn ok() {}\n"
         );
 
-        // Rename directory into itself (including case-aliased on APFS) refused without leaking dirs
+        // Rename directory into itself (including case-aliased on case-insensitive FS) refused without leaking dirs
         assert!(
             rename_workspace_entry(&ws, "src/utils", "src/utils/nested")
                 .await
                 .is_err()
         );
-        assert!(
-            rename_workspace_entry(&ws, "src/utils", "src/UTILS/nested/deep")
-                .await
-                .is_err()
-        );
+        if ws.join("src/UTILS").exists() {
+            assert!(
+                rename_workspace_entry(&ws, "src/utils", "src/UTILS/nested/deep")
+                    .await
+                    .is_err()
+            );
+        }
         assert!(!ws.join("src/utils/nested").exists());
 
         // Delete file & directory

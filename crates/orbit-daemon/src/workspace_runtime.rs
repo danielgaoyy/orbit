@@ -196,6 +196,9 @@ fn record_copy_method(report: &mut WorktreeIncludeCopyReport, method: CopyMethod
     }
 }
 
+const MAX_WORKTREE_INCLUDE_WALK_DEPTH: usize = 6;
+const MAX_FILTERED_COPY_DEPTH: usize = 32;
+
 fn walk_and_copy_matching(
     root: &Path,
     dir: &Path,
@@ -204,7 +207,7 @@ fn walk_and_copy_matching(
     depth: usize,
     report: &mut WorktreeIncludeCopyReport,
 ) {
-    if depth > 6 || report.copied.len() >= 256 {
+    if depth > MAX_WORKTREE_INCLUDE_WALK_DEPTH || report.copied.len() >= 256 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -231,13 +234,25 @@ fn walk_and_copy_matching(
         let Ok(sym_meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        // Guard against any top-level or nested symlink escaping `root`
-        if sym_meta.file_type().is_symlink() && resolve_symlink_target_safe(&path, root).is_err() {
-            continue;
-        }
-
+        let ft = sym_meta.file_type();
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if path.is_dir() {
+
+        if ft.is_symlink() {
+            // Never recurse into symlinked directories (prevents `..`/`.` symlink cycles).
+            let Ok(resolved) = resolve_symlink_target_safe(&path, root) else {
+                continue;
+            };
+            if !matches_any_pattern(&rel_str, name, patterns) {
+                continue;
+            }
+            let target = dest_root.join(rel);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if recreate_validated_symlink(&path, &resolved, root, &target, report) {
+                report.copied.push(rel_str);
+            }
+        } else if ft.is_dir() {
             if matches_any_pattern(&rel_str, name, patterns) {
                 let target = dest_root.join(rel);
                 match copy_dir_cow_within(root, &path, &target) {
@@ -251,7 +266,7 @@ fn walk_and_copy_matching(
                             error = %err,
                             "CoW directory copy rejected; falling back to filtered safe file copy"
                         );
-                        copy_dir_filtered_cow(root, &path, &target, report);
+                        copy_dir_filtered_cow(root, &path, &target, 0, report);
                     }
                 }
             } else if !is_heavy_ignored_dir(name)
@@ -259,7 +274,7 @@ fn walk_and_copy_matching(
             {
                 walk_and_copy_matching(root, &path, dest_root, patterns, depth + 1, report);
             }
-        } else if path.is_file() && matches_any_pattern(&rel_str, name, patterns) {
+        } else if ft.is_file() && matches_any_pattern(&rel_str, name, patterns) {
             let target = dest_root.join(rel);
             if let Ok(method) = copy_file_cow_within(root, &path, &target) {
                 record_copy_method(report, method);
@@ -269,14 +284,56 @@ fn walk_and_copy_matching(
     }
 }
 
+/// Recreate an already-validated symlink safely without recursing into its target.
+fn recreate_validated_symlink(
+    src_link: &Path,
+    resolved_target: &Path,
+    root: &Path,
+    dst: &Path,
+    report: &mut WorktreeIncludeCopyReport,
+) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = (resolved_target, root);
+        let Ok(link_target) = std::fs::read_link(src_link) else {
+            return false;
+        };
+        if let Ok(dst_meta) = std::fs::symlink_metadata(dst) {
+            if dst_meta.file_type().is_dir() {
+                return false;
+            }
+            let _ = std::fs::remove_file(dst);
+        }
+        if std::os::unix::fs::symlink(&link_target, dst).is_ok() {
+            report.standard_copied += 1;
+            return true;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        if resolved_target.is_file()
+            && let Ok(method) = copy_file_cow_within(root, src_link, dst)
+        {
+            record_copy_method(report, method);
+            return true;
+        }
+        false
+    }
+}
+
 /// Safe per-entry fallback used only when a matched directory contains an escaping symlink that
 /// caused whole-directory CoW validation to reject the tree.
 fn copy_dir_filtered_cow(
     root: &Path,
     src_dir: &Path,
     dst_dir: &Path,
+    depth: usize,
     report: &mut WorktreeIncludeCopyReport,
 ) {
+    if depth > MAX_FILTERED_COPY_DEPTH || report.copied.len() >= 256 {
+        return;
+    }
     let _ = std::fs::create_dir_all(dst_dir);
     let Ok(entries) = std::fs::read_dir(src_dir) else {
         return;
@@ -289,13 +346,20 @@ fn copy_dir_filtered_cow(
         let Ok(sym_meta) = std::fs::symlink_metadata(&p) else {
             continue;
         };
-        if sym_meta.file_type().is_symlink() && resolve_symlink_target_safe(&p, root).is_err() {
-            continue;
-        }
+        let ft = sym_meta.file_type();
         let target = dst_dir.join(entry.file_name());
-        if p.is_dir() {
-            copy_dir_filtered_cow(root, &p, &target, report);
-        } else if p.is_file()
+        if ft.is_symlink() {
+            let Ok(resolved) = resolve_symlink_target_safe(&p, root) else {
+                continue;
+            };
+            if recreate_validated_symlink(&p, &resolved, root, &target, report)
+                && let Ok(rel) = p.strip_prefix(root)
+            {
+                report.copied.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        } else if ft.is_dir() {
+            copy_dir_filtered_cow(root, &p, &target, depth + 1, report);
+        } else if ft.is_file()
             && let Ok(method) = copy_file_cow_within(root, &p, &target)
             && let Ok(rel) = p.strip_prefix(root)
         {
@@ -352,6 +416,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 fn git_cmd_clean(cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd)
+        .kill_on_drop(true)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -609,11 +674,15 @@ where
             error: None,
         });
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-lc")
-            .arg(cmd_str)
-            .current_dir(worktree_cwd)
-            .envs(&env_map);
-        orbit_providers::apply_cached_shell_env(&mut cmd);
+        cmd.current_dir(worktree_cwd)
+            .envs(&env_map)
+            .kill_on_drop(true);
+        let shell_flag = if orbit_providers::apply_cached_shell_env(&mut cmd) {
+            "-c"
+        } else {
+            "-lc"
+        };
+        cmd.arg(shell_flag).arg(cmd_str);
         let output = cmd.output().await;
         match output {
             Ok(out) if out.status.success() => {
@@ -688,11 +757,15 @@ pub async fn teardown_and_remove_worktree(
     let env_map = build_worktree_hook_env(src, worktree_cwd, branch_name);
     for cmd_str in cmds {
         let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-lc")
-            .arg(&cmd_str)
-            .current_dir(worktree_cwd)
-            .envs(&env_map);
-        orbit_providers::apply_cached_shell_env(&mut cmd);
+        cmd.current_dir(worktree_cwd)
+            .envs(&env_map)
+            .kill_on_drop(true);
+        let shell_flag = if orbit_providers::apply_cached_shell_env(&mut cmd) {
+            "-c"
+        } else {
+            "-lc"
+        };
+        cmd.arg(shell_flag).arg(&cmd_str);
         let res = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await;
         if let Err(_) | Ok(Err(_)) = res {
             warn!(cmd = %cmd_str, "worktree teardown hook failed or timed out");
@@ -1243,6 +1316,58 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(wt3.join(".env.local")).expect("env copied cold"),
             "SECRET=dev"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktreeinclude_internal_parent_and_self_symlinks_do_not_recurse_infinitely() {
+        let root = std::env::temp_dir().join(format!(
+            "orbit_wt_symlink_loop_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let src = root.join("src");
+        let dst = root.join("dst");
+        let outside = root.join("outside.secret");
+        std::fs::create_dir_all(src.join("mixed/sub")).expect("mkdir mixed/sub");
+        std::fs::create_dir_all(&dst).expect("mkdir dst");
+        std::fs::write(&outside, "SECRET").expect("write outside");
+        std::fs::write(src.join(".worktreeinclude"), "mixed\n").expect("write include");
+        std::fs::write(src.join("mixed/sub/ok.txt"), "safe-payload").expect("write ok");
+
+        // Top-level internal loop symlink in root (exercising walk_and_copy_matching)
+        std::os::unix::fs::symlink(".", src.join("self_root")).expect("top self symlink");
+        // Inside `mixed`: an escaping symlink forces fallback into `copy_dir_filtered_cow`,
+        // alongside internal symlinks pointing to `.` and `..`.
+        std::os::unix::fs::symlink(&outside, src.join("mixed/escape")).expect("escape symlink");
+        std::os::unix::fs::symlink(".", src.join("mixed/self_loop")).expect("self loop symlink");
+        std::os::unix::fs::symlink("..", src.join("mixed/sub/parent_loop"))
+            .expect("parent loop symlink");
+
+        let report = copy_worktree_includes_with_report(&src, &dst);
+        assert_eq!(
+            std::fs::read_to_string(dst.join("mixed/sub/ok.txt")).expect("read safe payload"),
+            "safe-payload"
+        );
+        assert!(!dst.join("mixed/escape").exists());
+        assert!(
+            std::fs::symlink_metadata(dst.join("mixed/self_loop"))
+                .expect("self_loop recreated as symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(dst.join("mixed/sub/parent_loop"))
+                .expect("parent_loop recreated as symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            report.copied.len() < 256,
+            "symlink loops must not inflate copy count: {:?}",
+            report.copied
         );
 
         let _ = std::fs::remove_dir_all(&root);

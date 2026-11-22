@@ -30,15 +30,20 @@ export function encodeHostPairingUri(host: HostCardView): string {
 export function ToggleSwitch({
   checked,
   onChange,
+  ariaLabel,
+  "aria-label": ariaLabelAttr,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
+  ariaLabel?: string;
+  "aria-label"?: string;
 }) {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={checked}
+      aria-label={ariaLabel ?? ariaLabelAttr}
       onClick={() => onChange(!checked)}
       className={cn(
         "relative inline-flex h-[22px] w-[38px] shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-colors duration-150",

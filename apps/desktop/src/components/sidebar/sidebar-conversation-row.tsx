@@ -16,6 +16,8 @@ import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { orbitActions, useHasThreadDraft } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
+const DRAFT_BADGE_CLASS = "text-muted-foreground/70 text-[11px] font-medium leading-none";
+
 export interface SidebarConversationRowProps {
   threadKey: string;
   host: HostCardView;
@@ -219,10 +221,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
               )}
             >
               {hasUnsentDraft && (
-                <span
-                  data-draft-indicator="true"
-                  className="text-muted-foreground/68 text-[11px] font-normal leading-none"
-                >
+                <span data-draft-indicator="true" className={DRAFT_BADGE_CLASS}>
                   Draft
                 </span>
               )}
@@ -232,7 +231,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
             <span
               data-draft-indicator="true"
               className={cn(
-                "text-muted-foreground/72 text-[11px] font-medium leading-none",
+                DRAFT_BADGE_CLASS,
                 menuOpen ? "hidden" : "group-hover/item:hidden",
               )}
             >

@@ -8,18 +8,20 @@
 //! Pure safe Rust (`unsafe_code = "deny"`):
 //! - **macOS**: spawns `caffeinate -i -w <daemon_pid>` so macOS automatically releases the power
 //!   assertion if the daemon ever crashes or is killed with `SIGKILL`.
-//! - **Linux**: spawns `systemd-inhibit --what=idle --who=Orbit --why="Active AI coding agents running" --mode=block sleep infinity`
-//!   when `systemd-inhibit` is available, with graceful no-op fallback on headless/non-systemd hosts.
+//! - **Linux**: spawns `systemd-inhibit --what=idle --who=Orbit --why="Active AI coding agents running" --mode=block cat`
+//!   with a piped stdin handle so closing stdin (or daemon `SIGKILL`) cleanly sends EOF to `cat`
+//!   and lets `systemd-inhibit` release the lock and exit with zero orphaned child processes,
+//!   with graceful no-op fallback on headless/non-systemd hosts.
 //! - **Windows / other**: clean no-op stub behind the `SleepInhibitorBackend` trait, ready for a
 //!   future safe process/power backend without changing callers.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orbit_protocol::AgentStatus;
 pub use orbit_protocol::KeepAwakeStatus;
@@ -28,6 +30,15 @@ use tracing::{debug, info, warn};
 /// Default grace period before releasing the OS sleep inhibitor after the last busy task settles,
 /// preventing rapid process thrashing across consecutive agent turns.
 pub const DEFAULT_KEEP_AWAKE_GRACE_PERIOD: Duration = Duration::from_secs(15);
+
+/// If an inhibitor helper exits with a non-zero status faster than this threshold (for example,
+/// `systemd-inhibit` failing immediately on headless Linux without logind/D-Bus), latch the
+/// backend unavailable (`noop`) instead of respawning on every busy transition.
+const RAPID_EXIT_FAILURE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Clean EOF shutdown grace window for stdin-piped helpers (`systemd-inhibit ... cat`) before
+/// escalating to `SIGKILL`.
+const STDIN_EOF_REAP_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Returns `true` if the given agent lifecycle state requires keeping the host OS awake.
 pub fn status_requires_keep_awake(status: &AgentStatus) -> bool {
@@ -39,42 +50,113 @@ pub fn status_requires_keep_awake(status: &AgentStatus) -> bool {
     )
 }
 
+/// Liveness outcome of an underlying OS sleep inhibitor handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InhibitorLiveness {
+    Alive,
+    ExitedCleanly,
+    ExitedWithError,
+}
+
 /// Low-level handle to a held OS sleep-prevention assertion.
 /// Implementations must release/reap any underlying OS resource in `Drop`.
 pub trait InhibitorHandle: Send + 'static {
     /// Returns `true` while the underlying inhibitor process/assertion is still live.
     fn is_alive(&mut self) -> bool;
+
+    /// Detailed liveness check distinguishing clean exits from non-zero helper failures.
+    fn poll_liveness(&mut self) -> InhibitorLiveness {
+        if self.is_alive() {
+            InhibitorLiveness::Alive
+        } else {
+            InhibitorLiveness::ExitedCleanly
+        }
+    }
+
+    /// Returns `true` when dropping this handle performs blocking OS work (such as waiting on
+    /// a helper process) and should be offloaded to a blocking thread pool inside Tokio.
+    fn is_blocking_drop(&self) -> bool {
+        false
+    }
 }
 
 /// Child-process-backed sleep inhibitor handle (`caffeinate`, `systemd-inhibit`, etc.).
-/// Guarantees the child process is killed and reaped on drop with zero zombie leaks.
+/// Guarantees the child process is cleanly terminated and reaped on drop with zero zombie leaks.
 pub struct ProcessInhibitorHandle {
     child: Child,
+    stdin: Option<ChildStdin>,
+    exited_state: Option<InhibitorLiveness>,
 }
 
 impl ProcessInhibitorHandle {
-    pub fn new(child: Child) -> Self {
-        Self { child }
+    pub fn new(mut child: Child) -> Self {
+        let stdin = child.stdin.take();
+        Self {
+            child,
+            stdin,
+            exited_state: None,
+        }
     }
 
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
 
-    fn terminate_and_reap(&mut self) {
+    fn poll_child(&mut self) -> InhibitorLiveness {
+        if let Some(state) = self.exited_state {
+            return state;
+        }
         match self.child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+            Ok(None) => InhibitorLiveness::Alive,
+            Ok(Some(status)) => {
+                let state = if status.success() {
+                    InhibitorLiveness::ExitedCleanly
+                } else {
+                    InhibitorLiveness::ExitedWithError
+                };
+                self.exited_state = Some(state);
+                state
+            }
+            Err(_) => {
+                self.exited_state = Some(InhibitorLiveness::ExitedWithError);
+                InhibitorLiveness::ExitedWithError
             }
         }
+    }
+
+    fn terminate_and_reap(&mut self) {
+        let had_stdin = self.stdin.take().is_some();
+        if self.poll_child() != InhibitorLiveness::Alive {
+            return;
+        }
+        if had_stdin {
+            // Closing stdin delivers EOF to `cat`, letting `systemd-inhibit` release its D-Bus
+            // inhibitor cleanly and exit 0 without leaving orphaned child processes.
+            let deadline = Instant::now() + STDIN_EOF_REAP_TIMEOUT;
+            while Instant::now() < deadline {
+                if self.poll_child() != InhibitorLiveness::Alive {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.exited_state = Some(InhibitorLiveness::ExitedCleanly);
     }
 }
 
 impl InhibitorHandle for ProcessInhibitorHandle {
     fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        self.poll_child() == InhibitorLiveness::Alive
+    }
+
+    fn poll_liveness(&mut self) -> InhibitorLiveness {
+        self.poll_child()
+    }
+
+    fn is_blocking_drop(&self) -> bool {
+        true
     }
 }
 
@@ -97,6 +179,14 @@ impl KeepAwakeGuard {
 
     pub fn is_alive(&mut self) -> bool {
         self.handle.is_alive()
+    }
+
+    pub fn poll_liveness(&mut self) -> InhibitorLiveness {
+        self.handle.poll_liveness()
+    }
+
+    fn is_blocking_drop(&self) -> bool {
+        self.handle.is_blocking_drop()
     }
 }
 
@@ -204,10 +294,9 @@ impl SleepInhibitorBackend for OsSleepInhibitorBackend {
                     "--who=Orbit",
                     "--why=Active AI coding agents running",
                     "--mode=block",
-                    "sleep",
-                    "infinity",
+                    "cat",
                 ])
-                .stdin(Stdio::null())
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()?;
@@ -238,13 +327,21 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
 
 type StatusCallback = Arc<dyn Fn(KeepAwakeStatus) + Send + Sync>;
 
+struct ActiveGuard {
+    guard: KeepAwakeGuard,
+    acquired_at: Instant,
+}
+
 struct KeepAwakeInner {
-    busy_keys: HashSet<String>,
-    guard: Option<KeepAwakeGuard>,
+    busy_keys: HashMap<String, usize>,
+    guard: Option<ActiveGuard>,
+    acquiring: bool,
+    backend_latched_unavailable: bool,
     release_gen: u64,
     pending_release: Option<tokio::task::AbortHandle>,
     effective_backend: String,
     logged_backend_error: bool,
+    status_seq: u64,
     last_emitted: Option<KeepAwakeStatus>,
 }
 
@@ -253,7 +350,33 @@ struct KeepAwakeState {
     grace_period: Duration,
     backend: Arc<dyn SleepInhibitorBackend>,
     inner: Mutex<KeepAwakeInner>,
+    /// Serializes status callbacks and tracks the last broadcast sequence so stale snapshots can
+    /// never be emitted out-of-order after newer transitions.
+    emit_gate: Mutex<u64>,
     on_status_change: Mutex<Option<StatusCallback>>,
+}
+
+struct AcquiringResetGuard<'a>(&'a KeepAwakeState);
+
+impl Drop for AcquiringResetGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.lock_inner();
+        inner.acquiring = false;
+    }
+}
+
+/// Drop a guard, offloading blocking child-process reaping onto Tokio's blocking pool whenever
+/// invoked from inside a Tokio runtime.
+fn release_guard(guard: KeepAwakeGuard) {
+    if guard.is_blocking_drop()
+        && let Ok(rt) = tokio::runtime::Handle::try_current()
+    {
+        rt.spawn_blocking(move || {
+            drop(guard);
+        });
+        return;
+    }
+    drop(guard);
 }
 
 impl KeepAwakeState {
@@ -261,99 +384,179 @@ impl KeepAwakeState {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn compute_status_locked(&self, inner: &mut KeepAwakeInner) -> KeepAwakeStatus {
-        // Reconcile if the child process exited prematurely on its own.
-        if let Some(ref mut guard) = inner.guard
-            && !guard.is_alive()
-        {
-            inner.guard = None;
+    fn reconcile_guard_locked(&self, inner: &mut KeepAwakeInner) -> Option<KeepAwakeGuard> {
+        let active = inner.guard.as_mut()?;
+        match active.guard.poll_liveness() {
+            InhibitorLiveness::Alive => None,
+            liveness => {
+                let elapsed = active.acquired_at.elapsed();
+                let dead = inner.guard.take().map(|a| a.guard);
+                if liveness == InhibitorLiveness::ExitedWithError
+                    && elapsed < RAPID_EXIT_FAILURE_WINDOW
+                {
+                    inner.backend_latched_unavailable = true;
+                    inner.effective_backend = "noop".to_string();
+                    if !inner.logged_backend_error {
+                        inner.logged_backend_error = true;
+                        warn!(
+                            backend = %self.backend.name(),
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "OS keep-awake helper exited rapidly with non-zero status; latching backend to noop"
+                        );
+                    }
+                }
+                dead
+            }
         }
+    }
+
+    fn snapshot_status_locked(&self, inner: &KeepAwakeInner) -> KeepAwakeStatus {
         KeepAwakeStatus {
             enabled: self.enabled.load(Ordering::Acquire),
             active: inner.guard.is_some(),
-            active_agents: inner.busy_keys.len(),
+            active_agents: inner.busy_keys.values().copied().sum(),
             backend: inner.effective_backend.clone(),
         }
     }
 
-    fn emit_status(&self, status: KeepAwakeStatus) {
+    fn emit_status(&self, seq: u64, status: KeepAwakeStatus) {
+        let mut last_seq = self.emit_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if seq <= *last_seq {
+            return;
+        }
         let cb = self
             .on_status_change
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        *last_seq = seq;
         if let Some(cb) = cb {
             cb(status);
         }
     }
 
-    fn ensure_acquired_locked(&self, inner: &mut KeepAwakeInner) {
-        if !self.enabled.load(Ordering::Acquire) || inner.busy_keys.is_empty() {
-            return;
-        }
-        if let Some(ref mut guard) = inner.guard {
-            if guard.is_alive() {
-                return;
-            }
-            inner.guard = None;
-        }
+    /// Acquire a sleep-inhibitor guard without holding `self.inner` across blocking `Command::spawn()`.
+    fn finish_acquire_outside_lock(&self) -> KeepAwakeStatus {
+        let reset = AcquiringResetGuard(self);
+        let acquire_res = self.backend.acquire();
 
-        match self.backend.acquire() {
-            Ok(Some(guard)) => {
-                inner.guard = Some(guard);
-                inner.effective_backend = self.backend.name().to_string();
-                inner.logged_backend_error = false;
-                info!(
-                    backend = %inner.effective_backend,
-                    active_agents = inner.busy_keys.len(),
-                    "Acquired OS keep-awake sleep inhibitor"
-                );
-            }
-            Ok(None) => {
-                inner.effective_backend = self.backend.name().to_string();
-                debug!(
-                    backend = %inner.effective_backend,
-                    "Keep-awake backend is a no-op on this host"
-                );
-            }
-            Err(err) => {
-                inner.effective_backend = "noop".to_string();
-                if !inner.logged_backend_error {
-                    inner.logged_backend_error = true;
-                    warn!(
-                        backend = %self.backend.name(),
-                        error = %err,
-                        "Failed to start OS keep-awake helper; falling back to no-op"
+        let (extra_guard, status, maybe_emit) = {
+            let mut inner = self.lock_inner();
+            inner.acquiring = false;
+            std::mem::forget(reset);
+
+            let still_needed = self.enabled.load(Ordering::Acquire)
+                && !inner.busy_keys.is_empty()
+                && inner.guard.is_none()
+                && !inner.backend_latched_unavailable;
+            let mut extra_guard = None;
+
+            match acquire_res {
+                Ok(Some(guard)) if still_needed => {
+                    inner.guard = Some(ActiveGuard {
+                        guard,
+                        acquired_at: Instant::now(),
+                    });
+                    inner.effective_backend = self.backend.name().to_string();
+                    inner.logged_backend_error = false;
+                    info!(
+                        backend = %inner.effective_backend,
+                        active_agents = inner.busy_keys.values().copied().sum::<usize>(),
+                        "Acquired OS keep-awake sleep inhibitor"
                     );
                 }
+                Ok(Some(guard)) => {
+                    extra_guard = Some(guard);
+                }
+                Ok(None) => {
+                    inner.effective_backend = self.backend.name().to_string();
+                    debug!(
+                        backend = %inner.effective_backend,
+                        "Keep-awake backend is a no-op on this host"
+                    );
+                }
+                Err(err) => {
+                    inner.effective_backend = "noop".to_string();
+                    if !inner.logged_backend_error {
+                        inner.logged_backend_error = true;
+                        warn!(
+                            backend = %self.backend.name(),
+                            error = %err,
+                            "Failed to start OS keep-awake helper; falling back to no-op"
+                        );
+                    }
+                }
             }
-        }
-    }
 
-    fn mark_busy(self: &Arc<Self>, key: String) -> KeepAwakeStatus {
-        let (status, maybe_emit) = {
-            let mut inner = self.lock_inner();
-            inner.busy_keys.insert(key);
-            inner.release_gen = inner.release_gen.wrapping_add(1);
-            if let Some(handle) = inner.pending_release.take() {
-                handle.abort();
-            }
-            self.ensure_acquired_locked(&mut inner);
-            let status = self.compute_status_locked(&mut inner);
-            let maybe_emit = record_if_changed(&mut inner.last_emitted, &status);
-            (status, maybe_emit)
+            let status = self.snapshot_status_locked(&inner);
+            let maybe_emit = record_if_changed(&mut inner, &status);
+            (extra_guard, status, maybe_emit)
         };
-        if let Some(changed) = maybe_emit {
-            self.emit_status(changed);
+
+        if let Some(guard) = extra_guard {
+            release_guard(guard);
+        }
+        if let Some((seq, changed)) = maybe_emit {
+            self.emit_status(seq, changed);
         }
         status
     }
 
-    fn mark_idle(self: &Arc<Self>, key: &str) -> KeepAwakeStatus {
-        let (dropped_guard, status, maybe_emit) = {
+    fn mark_busy_inner(self: &Arc<Self>, key: String, refcounted: bool) -> KeepAwakeStatus {
+        let (dead_guard, should_acquire, status, maybe_emit) = {
             let mut inner = self.lock_inner();
-            inner.busy_keys.remove(key);
+            if refcounted {
+                let count = inner.busy_keys.entry(key).or_insert(0);
+                *count = count.saturating_add(1);
+            } else {
+                inner.busy_keys.entry(key).or_insert(1);
+            }
+            inner.release_gen = inner.release_gen.wrapping_add(1);
+            if let Some(handle) = inner.pending_release.take() {
+                handle.abort();
+            }
+            let dead_guard = self.reconcile_guard_locked(&mut inner);
+            let should_acquire = self.enabled.load(Ordering::Acquire)
+                && !inner.busy_keys.is_empty()
+                && inner.guard.is_none()
+                && !inner.backend_latched_unavailable
+                && !inner.acquiring;
+            if should_acquire {
+                inner.acquiring = true;
+                (dead_guard, true, self.snapshot_status_locked(&inner), None)
+            } else {
+                let status = self.snapshot_status_locked(&inner);
+                let maybe_emit = record_if_changed(&mut inner, &status);
+                (dead_guard, false, status, maybe_emit)
+            }
+        };
 
+        if let Some(guard) = dead_guard {
+            release_guard(guard);
+        }
+        if should_acquire {
+            return self.finish_acquire_outside_lock();
+        }
+        if let Some((seq, changed)) = maybe_emit {
+            self.emit_status(seq, changed);
+        }
+        status
+    }
+
+    fn mark_idle_inner(self: &Arc<Self>, key: &str, remove_all: bool) -> KeepAwakeStatus {
+        let (dead_guard, dropped_guard, status, maybe_emit) = {
+            let mut inner = self.lock_inner();
+            if remove_all {
+                inner.busy_keys.remove(key);
+            } else if let Some(count) = inner.busy_keys.get_mut(key) {
+                if *count <= 1 {
+                    inner.busy_keys.remove(key);
+                } else {
+                    *count -= 1;
+                }
+            }
+
+            let dead_guard = self.reconcile_guard_locked(&mut inner);
             let mut dropped_guard = None;
             if inner.busy_keys.is_empty() && inner.guard.is_some() {
                 let enabled = self.enabled.load(Ordering::Acquire);
@@ -362,7 +565,7 @@ impl KeepAwakeState {
                     if let Some(handle) = inner.pending_release.take() {
                         handle.abort();
                     }
-                    dropped_guard = inner.guard.take();
+                    dropped_guard = inner.guard.take().map(|a| a.guard);
                 } else if inner.pending_release.is_none() {
                     inner.release_gen = inner.release_gen.wrapping_add(1);
                     let expected_gen = inner.release_gen;
@@ -378,22 +581,25 @@ impl KeepAwakeState {
                         inner.pending_release = Some(task.abort_handle());
                     } else {
                         // Outside an async runtime, release synchronously so we never leak.
-                        dropped_guard = inner.guard.take();
+                        dropped_guard = inner.guard.take().map(|a| a.guard);
                     }
                 }
             }
 
-            let status = self.compute_status_locked(&mut inner);
-            let maybe_emit = record_if_changed(&mut inner.last_emitted, &status);
-            (dropped_guard, status, maybe_emit)
+            let status = self.snapshot_status_locked(&inner);
+            let maybe_emit = record_if_changed(&mut inner, &status);
+            (dead_guard, dropped_guard, status, maybe_emit)
         };
 
-        if dropped_guard.is_some() {
-            drop(dropped_guard);
+        if let Some(guard) = dead_guard {
+            release_guard(guard);
+        }
+        if let Some(guard) = dropped_guard {
+            release_guard(guard);
             info!("Released OS keep-awake sleep inhibitor");
         }
-        if let Some(changed) = maybe_emit {
-            self.emit_status(changed);
+        if let Some((seq, changed)) = maybe_emit {
+            self.emit_status(seq, changed);
         }
         status
     }
@@ -405,18 +611,18 @@ impl KeepAwakeState {
                 return;
             }
             inner.pending_release = None;
-            let dropped_guard = inner.guard.take();
-            let status = self.compute_status_locked(&mut inner);
-            let maybe_emit = record_if_changed(&mut inner.last_emitted, &status);
+            let dropped_guard = inner.guard.take().map(|a| a.guard);
+            let status = self.snapshot_status_locked(&inner);
+            let maybe_emit = record_if_changed(&mut inner, &status);
             (dropped_guard, maybe_emit)
         };
 
-        if dropped_guard.is_some() {
-            drop(dropped_guard);
+        if let Some(guard) = dropped_guard {
+            release_guard(guard);
             info!("Released OS keep-awake sleep inhibitor after idle grace window");
         }
-        if let Some(changed) = maybe_emit {
-            self.emit_status(changed);
+        if let Some((seq, changed)) = maybe_emit {
+            self.emit_status(seq, changed);
         }
     }
 
@@ -428,7 +634,7 @@ impl KeepAwakeState {
             if let Some(handle) = inner.pending_release.take() {
                 handle.abort();
             }
-            inner.guard.take()
+            inner.guard.take().map(|a| a.guard)
         };
         drop(dropped_guard);
     }
@@ -441,18 +647,19 @@ impl Drop for KeepAwakeState {
 }
 
 fn record_if_changed(
-    last_emitted: &mut Option<KeepAwakeStatus>,
+    inner: &mut KeepAwakeInner,
     current: &KeepAwakeStatus,
-) -> Option<KeepAwakeStatus> {
-    if last_emitted.as_ref() == Some(current) {
+) -> Option<(u64, KeepAwakeStatus)> {
+    if inner.last_emitted.as_ref() == Some(current) {
         return None;
     }
-    *last_emitted = Some(current.clone());
-    Some(current.clone())
+    inner.status_seq = inner.status_seq.saturating_add(1);
+    inner.last_emitted = Some(current.clone());
+    Some((inner.status_seq, current.clone()))
 }
 
 /// Scoped RAII lease keeping the host awake for a background workflow, scheduled run, or task.
-/// Dropping the lease automatically marks the key idle (subject to normal grace debounce).
+/// Dropping the lease decrements its reference count (subject to normal grace debounce).
 pub struct KeepAwakeLease {
     state: Weak<KeepAwakeState>,
     key: String,
@@ -461,7 +668,7 @@ pub struct KeepAwakeLease {
 impl Drop for KeepAwakeLease {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
-            let _ = state.mark_idle(&self.key);
+            let _ = state.mark_idle_inner(&self.key, false);
         }
     }
 }
@@ -494,14 +701,18 @@ impl KeepAwakeManager {
                 grace_period,
                 backend,
                 inner: Mutex::new(KeepAwakeInner {
-                    busy_keys: HashSet::new(),
+                    busy_keys: HashMap::new(),
                     guard: None,
+                    acquiring: false,
+                    backend_latched_unavailable: false,
                     release_gen: 0,
                     pending_release: None,
                     effective_backend: initial_backend,
                     logged_backend_error: false,
+                    status_seq: 0,
                     last_emitted: None,
                 }),
+                emit_gate: Mutex::new(0),
                 on_status_change: Mutex::new(None),
             }),
         }
@@ -525,72 +736,118 @@ impl KeepAwakeManager {
     /// without waiting for the idle grace window; enabling immediately acquires if work is busy.
     pub fn set_enabled(&self, enabled: bool) -> KeepAwakeStatus {
         self.state.enabled.store(enabled, Ordering::Release);
-        let (dropped_guard, status, maybe_emit) = {
+        let (dead_guard, dropped_guard, should_acquire, status, maybe_emit) = {
             let mut inner = self.state.lock_inner();
             inner.release_gen = inner.release_gen.wrapping_add(1);
             if let Some(handle) = inner.pending_release.take() {
                 handle.abort();
             }
-            let dropped_guard = if enabled {
-                self.state.ensure_acquired_locked(&mut inner);
-                None
+            let dead_guard = self.state.reconcile_guard_locked(&mut inner);
+            if enabled {
+                let should_acquire = !inner.busy_keys.is_empty()
+                    && inner.guard.is_none()
+                    && !inner.backend_latched_unavailable
+                    && !inner.acquiring;
+                if should_acquire {
+                    inner.acquiring = true;
+                    (
+                        dead_guard,
+                        None,
+                        true,
+                        self.state.snapshot_status_locked(&inner),
+                        None,
+                    )
+                } else {
+                    let status = self.state.snapshot_status_locked(&inner);
+                    let maybe_emit = record_if_changed(&mut inner, &status);
+                    (dead_guard, None, false, status, maybe_emit)
+                }
             } else {
-                inner.guard.take()
-            };
-            let status = self.state.compute_status_locked(&mut inner);
-            let maybe_emit = record_if_changed(&mut inner.last_emitted, &status);
-            (dropped_guard, status, maybe_emit)
+                let dropped_guard = inner.guard.take().map(|a| a.guard);
+                let status = self.state.snapshot_status_locked(&inner);
+                let maybe_emit = record_if_changed(&mut inner, &status);
+                (dead_guard, dropped_guard, false, status, maybe_emit)
+            }
         };
 
-        if dropped_guard.is_some() {
-            drop(dropped_guard);
+        if let Some(guard) = dead_guard {
+            release_guard(guard);
+        }
+        if let Some(guard) = dropped_guard {
+            release_guard(guard);
             info!("Released OS keep-awake sleep inhibitor (disabled by config)");
         }
-        if let Some(changed) = maybe_emit {
-            self.state.emit_status(changed);
+        if should_acquire {
+            return self.state.finish_acquire_outside_lock();
+        }
+        if let Some((seq, changed)) = maybe_emit {
+            self.state.emit_status(seq, changed);
         }
         status
     }
 
-    /// Synchronize an agent's lifecycle state into the keep-awake busy set (idempotent).
+    /// Synchronize an agent's lifecycle state into the keep-awake busy set (idempotent per agent).
     pub fn notify_agent_status(&self, agent_id: &str, status: &AgentStatus) -> KeepAwakeStatus {
-        let key = format!("agent:{agent_id}");
         if status_requires_keep_awake(status) {
-            self.state.mark_busy(key)
+            self.mark_agent_busy(agent_id)
         } else {
-            self.state.mark_idle(&key)
+            self.mark_agent_idle(agent_id)
         }
+    }
+
+    /// Explicitly mark an agent busy (idempotent per agent key).
+    pub fn mark_agent_busy(&self, agent_id: &str) -> KeepAwakeStatus {
+        self.state
+            .mark_busy_inner(format!("agent:{agent_id}"), false)
     }
 
     /// Explicitly mark an agent idle/removed (e.g. archived, killed, deleted, or driver closed).
     pub fn mark_agent_idle(&self, agent_id: &str) -> KeepAwakeStatus {
-        self.state.mark_idle(&format!("agent:{agent_id}"))
+        self.state
+            .mark_idle_inner(&format!("agent:{agent_id}"), true)
     }
 
-    /// Mark an arbitrary busy workload key active (e.g. background workflow or scheduled task).
+    /// Mark an arbitrary busy workload key active (refcounted for safe concurrent callers).
     pub fn mark_busy(&self, key: impl Into<String>) -> KeepAwakeStatus {
-        self.state.mark_busy(key.into())
+        self.state.mark_busy_inner(key.into(), true)
     }
 
-    /// Mark an arbitrary busy workload key idle.
+    /// Decrement an arbitrary busy workload key's refcount (releasing when it reaches zero).
     pub fn mark_idle(&self, key: &str) -> KeepAwakeStatus {
-        self.state.mark_idle(key)
+        self.state.mark_idle_inner(key, false)
     }
 
-    /// Acquire an RAII lease for a scoped background run or workflow.
+    /// Acquire an RAII refcounted lease for a scoped background run or workflow.
     pub fn acquire_lease(&self, key: impl Into<String>) -> KeepAwakeLease {
         let key = key.into();
-        let _ = self.state.mark_busy(key.clone());
+        let _ = self.state.mark_busy_inner(key.clone(), true);
         KeepAwakeLease {
             state: Arc::downgrade(&self.state),
             key,
         }
     }
 
-    /// Return a live snapshot of keep-awake state.
+    /// Return a live snapshot of keep-awake state, reconciling any unexpectedly exited helper
+    /// process and emitting a status update if a dead helper was detected.
     pub fn status(&self) -> KeepAwakeStatus {
-        let mut inner = self.state.lock_inner();
-        self.state.compute_status_locked(&mut inner)
+        let (dead_guard, status, maybe_emit) = {
+            let mut inner = self.state.lock_inner();
+            let dead_guard = self.state.reconcile_guard_locked(&mut inner);
+            let status = self.state.snapshot_status_locked(&inner);
+            let maybe_emit = if dead_guard.is_some() {
+                record_if_changed(&mut inner, &status)
+            } else {
+                None
+            };
+            (dead_guard, status, maybe_emit)
+        };
+        if let Some(guard) = dead_guard {
+            release_guard(guard);
+        }
+        if let Some((seq, changed)) = maybe_emit {
+            self.state.emit_status(seq, changed);
+        }
+        status
     }
 
     /// Immediately release any held OS sleep inhibitor and cancel pending grace timers.
@@ -602,17 +859,18 @@ impl KeepAwakeManager {
             if let Some(handle) = inner.pending_release.take() {
                 handle.abort();
             }
-            let dropped_guard = inner.guard.take();
-            let status = self.state.compute_status_locked(&mut inner);
-            let maybe_emit = record_if_changed(&mut inner.last_emitted, &status);
+            let dropped_guard = inner.guard.take().map(|a| a.guard);
+            let status = self.state.snapshot_status_locked(&inner);
+            let maybe_emit = record_if_changed(&mut inner, &status);
             (dropped_guard, maybe_emit)
         };
-        if dropped_guard.is_some() {
-            drop(dropped_guard);
+        if let Some(guard) = dropped_guard {
+            // Reap synchronously on shutdown so the helper process exits before daemon teardown.
+            drop(guard);
             info!("Released OS keep-awake sleep inhibitor on shutdown");
         }
-        if let Some(changed) = maybe_emit {
-            self.state.emit_status(changed);
+        if let Some((seq, changed)) = maybe_emit {
+            self.state.emit_status(seq, changed);
         }
     }
 }
@@ -991,6 +1249,140 @@ mod tests {
         assert!(
             !still_present,
             "sleep helper pid {pid} should be killed and reaped on Drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn rapid_nonzero_helper_exit_latches_noop_and_emits_status_on_refresh() {
+        struct RapidFailHandle;
+        impl InhibitorHandle for RapidFailHandle {
+            fn is_alive(&mut self) -> bool {
+                false
+            }
+            fn poll_liveness(&mut self) -> InhibitorLiveness {
+                InhibitorLiveness::ExitedWithError
+            }
+        }
+
+        struct RapidFailBackend {
+            acquires: AtomicUsize,
+        }
+        impl SleepInhibitorBackend for RapidFailBackend {
+            fn name(&self) -> &'static str {
+                "systemd-inhibit"
+            }
+            fn acquire(&self) -> std::io::Result<Option<KeepAwakeGuard>> {
+                self.acquires.fetch_add(1, Ordering::AcqRel);
+                Ok(Some(KeepAwakeGuard::new(Box::new(RapidFailHandle))))
+            }
+        }
+
+        let backend = Arc::new(RapidFailBackend {
+            acquires: AtomicUsize::new(0),
+        });
+        let mgr = KeepAwakeManager::with_backend(true, Duration::ZERO, backend.clone());
+        let events: Arc<Mutex<Vec<KeepAwakeStatus>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_cb = Arc::clone(&events);
+        mgr.set_on_status_change(move |st| {
+            events_cb.lock().unwrap_or_else(|e| e.into_inner()).push(st);
+        });
+
+        let st1 = mgr.mark_busy("job:1");
+        assert!(st1.active);
+        assert_eq!(backend.acquires.load(Ordering::Acquire), 1);
+
+        // Refreshing status detects the rapid non-zero exit, latches noop, and emits status.
+        let st2 = mgr.status();
+        assert!(!st2.active);
+        assert_eq!(st2.backend, "noop");
+        assert_eq!(st2.active_agents, 1);
+
+        // Subsequent mark_busy must NOT respawn the latched-broken helper.
+        let st3 = mgr.mark_busy("job:2");
+        assert!(!st3.active);
+        assert_eq!(st3.backend, "noop");
+        assert_eq!(st3.active_agents, 2);
+        assert_eq!(backend.acquires.load(Ordering::Acquire), 1);
+
+        let recorded = events.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            recorded
+                .iter()
+                .any(|e| !e.active && e.backend == "noop" && e.active_agents == 1),
+            "expected dead-child status update event, got: {:?}",
+            *recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_refcounting_and_agent_idempotency() {
+        let backend = MockBackend::new();
+        let mgr = KeepAwakeManager::with_backend(true, Duration::ZERO, backend.clone());
+
+        // Overlapping leases on the same key refcount cleanly.
+        let lease_a = mgr.acquire_lease("shared:workflow");
+        let lease_b = mgr.acquire_lease("shared:workflow");
+        assert!(mgr.status().active);
+        assert_eq!(mgr.status().active_agents, 2);
+        assert_eq!(backend.acquires(), 1);
+
+        drop(lease_a);
+        assert!(
+            mgr.status().active,
+            "dropping one of two overlapping leases must keep inhibitor active"
+        );
+        assert_eq!(mgr.status().active_agents, 1);
+        assert_eq!(backend.releases(), 0);
+
+        drop(lease_b);
+        assert!(!mgr.status().active);
+        assert_eq!(mgr.status().active_agents, 0);
+        assert_eq!(backend.releases(), 1);
+
+        // Agent status notifications remain idempotent per agent key.
+        mgr.notify_agent_status(
+            "ag_idem",
+            &AgentStatus::Running {
+                turn_id: "t1".into(),
+            },
+        );
+        mgr.notify_agent_status(
+            "ag_idem",
+            &AgentStatus::Running {
+                turn_id: "t2".into(),
+            },
+        );
+        assert_eq!(mgr.status().active_agents, 1);
+        mgr.notify_agent_status("ag_idem", &AgentStatus::Idle);
+        assert!(!mgr.status().active);
+        assert_eq!(mgr.status().active_agents, 0);
+        assert_eq!(backend.releases(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn piped_stdin_inhibitor_handle_exits_cleanly_on_eof() {
+        let child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        let handle = ProcessInhibitorHandle::new(child);
+        let pid = handle.pid();
+        assert!(handle.stdin.is_some());
+        drop(handle);
+
+        let still_present = Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !still_present,
+            "piped cat process pid {pid} should exit cleanly on stdin EOF and be reaped"
         );
     }
 }

@@ -210,6 +210,7 @@ impl DaemonRuntime {
     pub async fn bootstrap(home_dir: &Path) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(home_dir)?;
         std::fs::create_dir_all(home_dir.join("shims"))?;
+        orbit_providers::set_snapshot_orbit_home(home_dir);
 
         let keypair_path = home_dir.join("host-keypair.json");
         let keypair = if keypair_path.exists() {

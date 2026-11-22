@@ -4,7 +4,7 @@
 //! provisioning avoids cold `git worktree add` full-tree checkouts. On claim:
 //! 1. Runs `git worktree prune` and verifies the standby is detached-HEAD and completely clean.
 //! 2. Moves the standby atomically via `git worktree move` into the target worktree directory.
-//! 3. Switches branch via fast differential `git checkout -B <branch> <base>` (or `git checkout <branch>`).
+//! 3. Switches branch via fast differential `git checkout -b <branch> <base> --` (or `git checkout <branch> --`).
 //! 4. Schedules asynchronous background replenishment up to `max_standby_per_repo`.
 //!
 //! If the pool is disabled, empty, dirty, or any step fails, callers fall back seamlessly to
@@ -12,8 +12,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -100,6 +100,10 @@ pub struct WorktreePool {
     repo_locks: RwLock<HashMap<String, Arc<AsyncMutex<()>>>>,
     /// Deduplicates concurrent background replenishment spawns per `repo_hash`.
     replenishing: RwLock<HashSet<String>>,
+    /// Monotonic sequence counter for fencing stale background replenish tasks across cleanups.
+    seq_counter: AtomicU64,
+    /// Per-repo invalidation generation watermark keyed by `repo_hash`.
+    repo_generations: StdMutex<HashMap<String, u64>>,
     shutting_down: AtomicBool,
 }
 
@@ -110,8 +114,41 @@ impl WorktreePool {
             config,
             repo_locks: RwLock::new(HashMap::new()),
             replenishing: RwLock::new(HashSet::new()),
+            seq_counter: AtomicU64::new(1),
+            repo_generations: StdMutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
         })
+    }
+
+    fn bump_repo_generation(&self, repo_hash: &str) -> u64 {
+        let next = self.seq_counter.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut gens = self
+            .repo_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        gens.insert(repo_hash.to_string(), next);
+        next
+    }
+
+    fn bump_all_repo_generations(&self) {
+        let next = self.seq_counter.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut gens = self
+            .repo_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for value in gens.values_mut() {
+            *value = next;
+        }
+    }
+
+    fn is_stale_generation(&self, repo_hash: &str, started_seq: u64) -> bool {
+        let gens = self
+            .repo_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        gens.get(repo_hash)
+            .copied()
+            .is_some_and(|invalidated_at| invalidated_at > started_seq)
     }
 
     pub fn with_default_config(orbit_home: PathBuf) -> Arc<Self> {
@@ -156,7 +193,7 @@ impl WorktreePool {
     /// Inspect current standby count for `source_cwd`.
     pub async fn inspect_repo_pool(&self, source_cwd: &Path) -> anyhow::Result<WorktreePoolStats> {
         let (repo_hash, pool_dir) = self.repo_pool_dir(source_cwd).await?;
-        let standbys = list_standby_dirs(&pool_dir);
+        let standbys = list_standby_dirs(&pool_dir).await;
         Ok(WorktreePoolStats {
             repo_hash,
             pool_dir,
@@ -169,14 +206,26 @@ impl WorktreePool {
     /// Pre-warm detached-HEAD standbys for `source_cwd` up to `max_standby_per_repo`.
     /// Returns the number of newly created standbys.
     pub async fn prewarm_repo(&self, source_cwd: &Path) -> anyhow::Result<usize> {
+        let started_seq = self.seq_counter.fetch_add(1, Ordering::AcqRel);
+        self.prewarm_repo_with_seq(source_cwd, started_seq).await
+    }
+
+    async fn prewarm_repo_with_seq(
+        &self,
+        source_cwd: &Path,
+        started_seq: u64,
+    ) -> anyhow::Result<usize> {
         if !self.is_enabled() {
             return Ok(0);
         }
         let (repo_hash, pool_dir) = self.repo_pool_dir(source_cwd).await?;
+        if self.is_stale_generation(&repo_hash, started_seq) {
+            return Ok(0);
+        }
         let repo_lock = self.lock_for_repo(&repo_hash).await;
         let _guard = repo_lock.lock().await;
 
-        if !self.is_enabled() {
+        if !self.is_enabled() || self.is_stale_generation(&repo_hash, started_seq) {
             return Ok(0);
         }
 
@@ -191,7 +240,7 @@ impl WorktreePool {
 
         // Validate existing standbys: discard dirty/broken ones, trim any excess above cap.
         let mut clean_standbys = Vec::new();
-        for candidate in list_standby_dirs(&pool_dir) {
+        for candidate in list_standby_dirs(&pool_dir).await {
             if is_standby_clean(&candidate).await {
                 clean_standbys.push(candidate);
             } else {
@@ -214,7 +263,7 @@ impl WorktreePool {
             .saturating_sub(clean_standbys.len());
         let mut created = 0usize;
         for _ in 0..needed {
-            if !self.is_enabled() {
+            if !self.is_enabled() || self.is_stale_generation(&repo_hash, started_seq) {
                 break;
             }
             let standby_path = pool_dir.join(format!(
@@ -230,6 +279,10 @@ impl WorktreePool {
                 .output()
                 .await?;
             if out.status.success() {
+                if !self.is_enabled() || self.is_stale_generation(&repo_hash, started_seq) {
+                    discard_standby_worktree(Some(source_cwd), &standby_path).await;
+                    break;
+                }
                 created += 1;
                 debug!(
                     repo_hash = %repo_hash,
@@ -244,6 +297,7 @@ impl WorktreePool {
                     "Failed to pre-warm detached-HEAD worktree standby"
                 );
                 let _ = tokio::fs::remove_dir_all(&standby_path).await;
+                let _ = run_git_worktree_prune(source_cwd).await;
                 break;
             }
         }
@@ -255,18 +309,22 @@ impl WorktreePool {
         if !self.is_enabled() {
             return;
         }
+        let scheduled_seq = self.seq_counter.fetch_add(1, Ordering::AcqRel);
         let pool = Arc::clone(self);
         tokio::spawn(async move {
             let Ok((repo_hash, _)) = pool.repo_pool_dir(&source_cwd).await else {
                 return;
             };
+            if !pool.is_enabled() || pool.is_stale_generation(&repo_hash, scheduled_seq) {
+                return;
+            }
             {
                 let mut active = pool.replenishing.write().await;
                 if !active.insert(repo_hash.clone()) {
                     return;
                 }
             }
-            let res = pool.prewarm_repo(&source_cwd).await;
+            let res = pool.prewarm_repo_with_seq(&source_cwd, scheduled_seq).await;
             pool.replenishing.write().await.remove(&repo_hash);
             match res {
                 Ok(n) if n > 0 => {
@@ -289,7 +347,7 @@ impl WorktreePool {
     }
 
     /// Attempt to claim a clean warm standby for `WorktreeCreateMode::BranchOff`, moving it to
-    /// `target_dir` and running fast `git checkout -B <branch> <base>`.
+    /// `target_dir` and running fast `git checkout -b <branch> <base> --`.
     ///
     /// Returns `Ok(Some(target_dir))` on a warm hit, or `Ok(None)` when the pool is disabled,
     /// empty, dirty, or cannot satisfy the checkout (caller should fall back to `git worktree add`).
@@ -300,7 +358,10 @@ impl WorktreePool {
         branch: &str,
         base_ref: Option<&str>,
     ) -> anyhow::Result<Option<PathBuf>> {
-        if !self.is_enabled() || target_dir.exists() {
+        if !self.is_enabled()
+            || !is_valid_git_ref_name(branch)
+            || path_exists_async(target_dir).await
+        {
             return Ok(None);
         }
         let Some(resolved_base) = resolve_claim_base_ref(source_cwd, base_ref).await else {
@@ -309,23 +370,26 @@ impl WorktreePool {
         self.claim_and_checkout(
             source_cwd,
             target_dir,
-            &["checkout", "-B", branch, &resolved_base],
+            &["checkout", "-b", branch, &resolved_base, "--"],
         )
         .await
     }
 
     /// Attempt to claim a clean warm standby for `CheckoutBranch` or `CheckoutPr`, moving it to
-    /// `target_dir` and running `git checkout <branch>`.
+    /// `target_dir` and running `git checkout <branch> --`.
     pub async fn try_claim_checkout_branch(
         &self,
         source_cwd: &Path,
         target_dir: &Path,
         branch: &str,
     ) -> anyhow::Result<Option<PathBuf>> {
-        if !self.is_enabled() || target_dir.exists() {
+        if !self.is_enabled()
+            || !is_valid_git_ref_name(branch)
+            || path_exists_async(target_dir).await
+        {
             return Ok(None);
         }
-        self.claim_and_checkout(source_cwd, target_dir, &["checkout", branch])
+        self.claim_and_checkout(source_cwd, target_dir, &["checkout", branch, "--"])
             .await
     }
 
@@ -341,11 +405,11 @@ impl WorktreePool {
         let repo_lock = self.lock_for_repo(&repo_hash).await;
         let _guard = repo_lock.lock().await;
 
-        if !self.is_enabled() || target_dir.exists() {
+        if !self.is_enabled() || path_exists_async(target_dir).await {
             return Ok(None);
         }
 
-        let candidates = list_standby_dirs(&pool_dir);
+        let candidates = list_standby_dirs(&pool_dir).await;
         if candidates.is_empty() {
             return Ok(None);
         }
@@ -387,7 +451,7 @@ impl WorktreePool {
                     "git worktree move failed on pooled standby; discarding and falling back"
                 );
                 discard_standby_worktree(Some(source_cwd), &candidate).await;
-                if target_dir.exists() {
+                if path_exists_async(target_dir).await {
                     discard_standby_worktree(Some(source_cwd), target_dir).await;
                 }
                 continue;
@@ -429,7 +493,7 @@ impl WorktreePool {
 
         let _ = run_git_worktree_prune(source_cwd).await;
         let mut removed = 0usize;
-        for candidate in list_standby_dirs(&pool_dir) {
+        for candidate in list_standby_dirs(&pool_dir).await {
             if !is_standby_clean(&candidate).await {
                 discard_standby_worktree(Some(source_cwd), &candidate).await;
                 removed += 1;
@@ -443,8 +507,11 @@ impl WorktreePool {
         let Ok((repo_hash, pool_dir)) = self.repo_pool_dir(source_cwd).await else {
             return 0;
         };
+        // Bump before and after acquiring the per-repo lock to fence off queued and in-flight replenish tasks.
+        self.bump_repo_generation(&repo_hash);
         let repo_lock = self.lock_for_repo(&repo_hash).await;
         let _guard = repo_lock.lock().await;
+        self.bump_repo_generation(&repo_hash);
         cleanup_pool_dir_locked(&pool_dir, Some(source_cwd)).await
     }
 
@@ -452,13 +519,16 @@ impl WorktreePool {
     /// left behind by a previous unclean exit.
     pub async fn prune_stale_standbys(&self) -> usize {
         let root = self.pool_root();
-        let Ok(entries) = std::fs::read_dir(&root) else {
+        let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
             return 0;
         };
         let mut removed = 0usize;
-        for entry in entries.flatten() {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let pool_dir = entry.path();
-            if !pool_dir.is_dir() {
+            if !tokio::fs::metadata(&pool_dir)
+                .await
+                .is_ok_and(|m| m.is_dir())
+            {
                 continue;
             }
             let Some(repo_hash) = pool_dir
@@ -471,7 +541,10 @@ impl WorktreePool {
             let repo_lock = self.lock_for_repo(&repo_hash).await;
             let _guard = repo_lock.lock().await;
 
-            let src_repo = read_repo_source_meta(&pool_dir).filter(|p| p.exists());
+            let src_repo = match read_repo_source_meta(&pool_dir).await {
+                Some(p) if path_exists_async(&p).await => Some(p),
+                _ => None,
+            };
             if src_repo.is_none() {
                 removed += cleanup_pool_dir_locked(&pool_dir, None).await;
                 continue;
@@ -479,7 +552,7 @@ impl WorktreePool {
             if let Some(ref src) = src_repo {
                 let _ = run_git_worktree_prune(src).await;
             }
-            for standby in list_standby_dirs(&pool_dir) {
+            for standby in list_standby_dirs(&pool_dir).await {
                 if !is_standby_clean(&standby).await {
                     discard_standby_worktree(src_repo.as_deref(), &standby).await;
                     removed += 1;
@@ -493,14 +566,18 @@ impl WorktreePool {
     /// daemon shutdown.
     pub async fn shutdown_cleanup(&self) -> usize {
         self.shutting_down.store(true, Ordering::Release);
+        self.bump_all_repo_generations();
         let root = self.pool_root();
-        let Ok(entries) = std::fs::read_dir(&root) else {
+        let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
             return 0;
         };
         let mut removed = 0usize;
-        for entry in entries.flatten() {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let pool_dir = entry.path();
-            if !pool_dir.is_dir() {
+            if !tokio::fs::metadata(&pool_dir)
+                .await
+                .is_ok_and(|m| m.is_dir())
+            {
                 continue;
             }
             let Some(repo_hash) = pool_dir
@@ -510,9 +587,13 @@ impl WorktreePool {
             else {
                 continue;
             };
+            self.bump_repo_generation(&repo_hash);
             let repo_lock = self.lock_for_repo(&repo_hash).await;
             let _guard = repo_lock.lock().await;
-            let src_repo = read_repo_source_meta(&pool_dir).filter(|p| p.exists());
+            let src_repo = match read_repo_source_meta(&pool_dir).await {
+                Some(p) if path_exists_async(&p).await => Some(p),
+                _ => None,
+            };
             removed += cleanup_pool_dir_locked(&pool_dir, src_repo.as_deref()).await;
         }
         let _ = tokio::fs::remove_dir(&root).await;
@@ -522,9 +603,19 @@ impl WorktreePool {
 
 // --- Git & Filesystem Helpers ---
 
+fn is_valid_git_ref_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty() && !name.starts_with('-') && !trimmed.starts_with('-')
+}
+
+async fn path_exists_async(path: &Path) -> bool {
+    tokio::fs::try_exists(path).await.unwrap_or(false)
+}
+
 fn git_cmd(cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd)
+        .kill_on_drop(true)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -552,7 +643,7 @@ async fn resolve_git_common_dir(source_cwd: &Path) -> anyhow::Result<PathBuf> {
     } else {
         source_cwd.join(candidate)
     };
-    Ok(std::fs::canonicalize(&resolved).unwrap_or(resolved))
+    Ok(tokio::fs::canonicalize(&resolved).await.unwrap_or(resolved))
 }
 
 fn hash_repo_key(common_dir: &Path) -> String {
@@ -577,6 +668,9 @@ async fn resolve_head_sha(source_cwd: &Path) -> Option<String> {
 
 async fn resolve_claim_base_ref(source_cwd: &Path, base_ref: Option<&str>) -> Option<String> {
     if let Some(base) = base_ref.map(str::trim).filter(|b| !b.is_empty()) {
+        if !is_valid_git_ref_name(base) {
+            return None;
+        }
         let verify_arg = format!("{base}^{{commit}}");
         let out = git_cmd(source_cwd)
             .args(["rev-parse", "--verify", &verify_arg])
@@ -601,7 +695,10 @@ async fn run_git_worktree_prune(source_cwd: &Path) -> bool {
 
 /// Verify a standby directory is a valid, detached-HEAD, completely clean Git worktree.
 async fn is_standby_clean(standby_dir: &Path) -> bool {
-    if !standby_dir.is_dir() || !standby_dir.join(".git").exists() {
+    let is_dir = tokio::fs::metadata(standby_dir)
+        .await
+        .is_ok_and(|m| m.is_dir());
+    if !is_dir || !path_exists_async(&standby_dir.join(".git")).await {
         return false;
     }
 
@@ -633,26 +730,29 @@ async fn is_standby_clean(standby_dir: &Path) -> bool {
         .is_ok_and(|o| o.status.success() && o.stdout.is_empty())
 }
 
-fn list_standby_dirs(pool_dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(pool_dir) else {
+async fn list_standby_dirs(pool_dir: &Path) -> Vec<PathBuf> {
+    let Ok(mut entries) = tokio::fs::read_dir(pool_dir).await else {
         return Vec::new();
     };
-    let mut dirs: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(STANDBY_PREFIX))
-        })
-        .collect();
+    let mut dirs = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let matches_prefix = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(STANDBY_PREFIX));
+        if matches_prefix && tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) {
+            dirs.push(path);
+        }
+    }
     dirs.sort();
     dirs
 }
 
 async fn write_repo_source_meta(pool_dir: &Path, source_cwd: &Path) {
-    let canon = std::fs::canonicalize(source_cwd).unwrap_or_else(|_| source_cwd.to_path_buf());
+    let canon = tokio::fs::canonicalize(source_cwd)
+        .await
+        .unwrap_or_else(|_| source_cwd.to_path_buf());
     let _ = tokio::fs::write(
         pool_dir.join(REPO_SOURCE_META_FILE),
         canon.to_string_lossy().as_bytes(),
@@ -660,8 +760,10 @@ async fn write_repo_source_meta(pool_dir: &Path, source_cwd: &Path) {
     .await;
 }
 
-fn read_repo_source_meta(pool_dir: &Path) -> Option<PathBuf> {
-    let raw = std::fs::read_to_string(pool_dir.join(REPO_SOURCE_META_FILE)).ok()?;
+async fn read_repo_source_meta(pool_dir: &Path) -> Option<PathBuf> {
+    let raw = tokio::fs::read_to_string(pool_dir.join(REPO_SOURCE_META_FILE))
+        .await
+        .ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         None
@@ -680,7 +782,7 @@ async fn discard_standby_worktree(source_cwd: Option<&Path>, standby_dir: &Path)
             .output()
             .await;
     }
-    if standby_dir.exists() {
+    if path_exists_async(standby_dir).await {
         let _ = tokio::fs::remove_dir_all(standby_dir).await;
     }
     if let Some(src) = source_cwd {
@@ -690,7 +792,7 @@ async fn discard_standby_worktree(source_cwd: Option<&Path>, standby_dir: &Path)
 
 async fn cleanup_pool_dir_locked(pool_dir: &Path, source_cwd: Option<&Path>) -> usize {
     let mut removed = 0usize;
-    for standby in list_standby_dirs(pool_dir) {
+    for standby in list_standby_dirs(pool_dir).await {
         discard_standby_worktree(source_cwd, &standby).await;
         removed += 1;
     }
@@ -823,7 +925,7 @@ mod tests {
         assert_eq!(pool.prewarm_repo(&repo).await.expect("prewarm"), 2);
 
         let stats = pool.inspect_repo_pool(&repo).await.expect("stats");
-        let standbys = list_standby_dirs(&stats.pool_dir);
+        let standbys = list_standby_dirs(&stats.pool_dir).await;
         assert_eq!(standbys.len(), 2);
 
         // Pollute the first standby with an untracked file so it must be rejected and discarded.
@@ -932,6 +1034,100 @@ mod tests {
             0
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn branch_off_never_overwrites_existing_branch_and_rejects_flag_names() {
+        let root = temp_root("safe_branch");
+        let home = root.join("orbit_home");
+        let repo = root.join("safe-repo");
+        init_temp_git_repo(&repo).await;
+
+        // Create an existing feature branch with its own unique commit ahead of main.
+        run_git(&repo, &["checkout", "-b", "feat/existing"]).await;
+        std::fs::write(repo.join("FEATURE.txt"), "precious work\n").expect("write feature");
+        run_git(&repo, &["add", "FEATURE.txt"]).await;
+        run_git(&repo, &["commit", "-m", "feature commit"]).await;
+        let feature_sha = run_git(&repo, &["rev-parse", "HEAD"]).await;
+        run_git(&repo, &["checkout", "main"]).await;
+        let main_sha = run_git(&repo, &["rev-parse", "HEAD"]).await;
+        assert_ne!(feature_sha, main_sha);
+
+        let pool = WorktreePool::new(home.clone(), WorktreePoolConfig::with_max_standby(2));
+        assert_eq!(pool.prewarm_repo(&repo).await.expect("prewarm"), 2);
+
+        // Flag-like branch names must be rejected without consuming standbys.
+        let flag_target = home.join("worktrees").join("safe-repo-flag");
+        assert!(
+            pool.try_claim_branch_off(&repo, &flag_target, "--detach", Some("main"))
+                .await
+                .expect("reject -flag branch_off")
+                .is_none()
+        );
+        assert!(
+            pool.try_claim_checkout_branch(&repo, &flag_target, "-b")
+                .await
+                .expect("reject -flag checkout_branch")
+                .is_none()
+        );
+        assert_eq!(
+            pool.inspect_repo_pool(&repo)
+                .await
+                .expect("stats after flag rejection")
+                .available_standbys,
+            2
+        );
+
+        // Claiming an already-existing branch via BranchOff must fail safely without resetting it!
+        let existing_target = home.join("worktrees").join("safe-repo-existing");
+        let claimed = pool
+            .try_claim_branch_off(&repo, &existing_target, "feat/existing", Some("main"))
+            .await
+            .expect("claim existing branch");
+        assert!(
+            claimed.is_none(),
+            "BranchOff must not overwrite an existing branch"
+        );
+        assert!(!existing_target.exists());
+        assert_eq!(
+            run_git(&repo, &["rev-parse", "feat/existing"]).await,
+            feature_sha,
+            "existing branch commits must remain completely untouched"
+        );
+
+        let _ = pool.shutdown_cleanup().await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn cleanup_repo_pool_fences_stale_prewarm_generation() {
+        let root = temp_root("gen_fence");
+        let home = root.join("orbit_home");
+        let repo = root.join("fence-repo");
+        init_temp_git_repo(&repo).await;
+
+        let pool = WorktreePool::new(home.clone(), WorktreePoolConfig::with_max_standby(2));
+        let stale_seq = pool.seq_counter.fetch_add(1, Ordering::AcqRel);
+        let _ = pool.cleanup_repo_pool(&repo).await;
+
+        // A stale prewarm started before cleanup must not repopulate standbys.
+        let created = pool
+            .prewarm_repo_with_seq(&repo, stale_seq)
+            .await
+            .expect("stale prewarm");
+        assert_eq!(created, 0);
+        assert_eq!(
+            pool.inspect_repo_pool(&repo)
+                .await
+                .expect("inspect after stale prewarm")
+                .available_standbys,
+            0
+        );
+
+        // A fresh prewarm started after cleanup succeeds normally.
+        assert_eq!(pool.prewarm_repo(&repo).await.expect("fresh prewarm"), 2);
+        let _ = pool.shutdown_cleanup().await;
         let _ = std::fs::remove_dir_all(&root);
     }
 }

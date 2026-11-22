@@ -4,6 +4,7 @@ export const DRAFTS_STORAGE_KEY = "orbit.drafts.v1";
 export const DRAFT_SCHEMA_VERSION = 1 as const;
 export const DRAFT_SAVE_DEBOUNCE_MS = 350;
 export const DRAFT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const MAX_FUTURE_TIMESTAMP_SKEW_MS = 60_000;
 export const MAX_TOTAL_DRAFT_BYTES = 512 * 1024;
 export const MAX_ENTRY_DRAFT_BYTES = 128 * 1024;
 export const MAX_PASTE_ATTACHMENT_BYTES = 64 * 1024;
@@ -53,6 +54,13 @@ export interface PersistedScopeDraft {
 export interface PersistedDraftPayloadV1 {
   version: typeof DRAFT_SCHEMA_VERSION;
   drafts: Record<string, PersistedScopeDraft>;
+}
+
+export interface SerializedDraftPayload {
+  payload: PersistedDraftPayloadV1;
+  json: string | null;
+  keptKeys: string[];
+  evictedKeys: string[];
 }
 
 export interface DraftStateSlices {
@@ -323,7 +331,11 @@ function capScopeDraftToBudget(
     return null;
   }
 
-  while (estimateEntryRecordBytes(scopeKey, next) > budget.maxEntryBytes) {
+  while (true) {
+    const currentBytes = estimateEntryRecordBytes(scopeKey, next);
+    if (currentBytes <= budget.maxEntryBytes) {
+      break;
+    }
     if (next.pastedAttachments && next.pastedAttachments.length > 0) {
       next.pastedAttachments.shift();
       if (next.pastedAttachments.length === 0) {
@@ -343,8 +355,9 @@ function capScopeDraftToBudget(
     if (textBytes === 0 && sqBytes === 0) {
       return null;
     }
+    const excessBytes = currentBytes - budget.maxEntryBytes;
     if (sqBytes >= textBytes && next.sideQuestionDraft) {
-      const target = Math.floor(sqBytes / 2);
+      const target = Math.max(0, sqBytes - excessBytes);
       const shortened = truncateUtf8(next.sideQuestionDraft, target);
       if (shortened.trim().length === 0) {
         delete next.sideQuestionDraft;
@@ -352,7 +365,7 @@ function capScopeDraftToBudget(
         next.sideQuestionDraft = shortened;
       }
     } else if (next.text) {
-      const target = Math.floor(textBytes / 2);
+      const target = Math.max(0, textBytes - excessBytes);
       const shortened = truncateUtf8(next.text, target);
       if (shortened.trim().length === 0) {
         delete next.text;
@@ -387,15 +400,18 @@ export function hasNonEmptyScopeDraft(slices: DraftStateSlices, scopeKey: string
   return false;
 }
 
+const EMPTY_PAYLOAD_BYTES = utf8ByteLength(
+  JSON.stringify({ version: DRAFT_SCHEMA_VERSION, drafts: {} }),
+);
+
+function normalizeTimestamp(raw: number, nowMs: number): number {
+  return raw > nowMs + MAX_FUTURE_TIMESTAMP_SKEW_MS ? nowMs : raw;
+}
+
 function evictLruToBudget(
   drafts: Record<string, PersistedScopeDraft>,
   maxTotalBytes: number,
-): {
-  payload: PersistedDraftPayloadV1;
-  json: string | null;
-  keptKeys: string[];
-  evictedKeys: string[];
-} {
+): SerializedDraftPayload {
   const keys = Object.keys(drafts);
   if (keys.length === 0) {
     return {
@@ -413,6 +429,16 @@ function evictLruToBudget(
     return { payload, json, keptKeys: keys, evictedKeys: [] };
   }
 
+  // Pre-measure per-entry serialized UTF-8 byte sizes once (O(N)) to avoid O(N^2) re-stringification.
+  const entryBytes = new Map<string, number>();
+  let estimatedBytes = EMPTY_PAYLOAD_BYTES + Math.max(0, keys.length - 1);
+  for (const key of keys) {
+    const size =
+      utf8ByteLength(JSON.stringify(key)) + 1 + utf8ByteLength(JSON.stringify(working[key]));
+    entryBytes.set(key, size);
+    estimatedBytes += size;
+  }
+
   // Sort oldest-first by `updatedAt` (deterministic lexicographical tie-break) for LRU eviction.
   const orderedOldestFirst = keys.slice().sort((a, b) => {
     const diff = working[a].updatedAt - working[b].updatedAt;
@@ -420,11 +446,42 @@ function evictLruToBudget(
   });
 
   const evictedKeys: string[] = [];
-  for (const oldestKey of orderedOldestFirst) {
+  let remainingCount = orderedOldestFirst.length;
+  let nextIdx = 0;
+
+  while (nextIdx < orderedOldestFirst.length && estimatedBytes > maxTotalBytes) {
+    const oldestKey = orderedOldestFirst[nextIdx++];
     delete working[oldestKey];
     evictedKeys.push(oldestKey);
-    const remainingKeys = Object.keys(working);
-    if (remainingKeys.length === 0) {
+    remainingCount -= 1;
+    if (remainingCount === 0) {
+      return {
+        payload: { version: DRAFT_SCHEMA_VERSION, drafts: {} },
+        json: null,
+        keptKeys: [],
+        evictedKeys,
+      };
+    }
+    estimatedBytes -= (entryBytes.get(oldestKey) ?? 0) + 1;
+  }
+
+  // Verify exact serialized payload once (with defensive fallback if still over budget).
+  payload = { version: DRAFT_SCHEMA_VERSION, drafts: working };
+  json = JSON.stringify(payload);
+  while (utf8ByteLength(json) > maxTotalBytes) {
+    if (nextIdx >= orderedOldestFirst.length) {
+      return {
+        payload: { version: DRAFT_SCHEMA_VERSION, drafts: {} },
+        json: null,
+        keptKeys: [],
+        evictedKeys,
+      };
+    }
+    const oldestKey = orderedOldestFirst[nextIdx++];
+    delete working[oldestKey];
+    evictedKeys.push(oldestKey);
+    remainingCount -= 1;
+    if (remainingCount === 0) {
       return {
         payload: { version: DRAFT_SCHEMA_VERSION, drafts: {} },
         json: null,
@@ -434,17 +491,9 @@ function evictLruToBudget(
     }
     payload = { version: DRAFT_SCHEMA_VERSION, drafts: working };
     json = JSON.stringify(payload);
-    if (utf8ByteLength(json) <= maxTotalBytes) {
-      return { payload, json, keptKeys: remainingKeys, evictedKeys };
-    }
   }
 
-  return {
-    payload: { version: DRAFT_SCHEMA_VERSION, drafts: {} },
-    json: null,
-    keptKeys: [],
-    evictedKeys,
-  };
+  return { payload, json, keptKeys: Object.keys(working), evictedKeys };
 }
 
 function isReadonlyMap<K, V>(value: unknown): value is ReadonlyMap<K, V> {
@@ -455,11 +504,11 @@ function isReadonlySet<T>(value: unknown): value is ReadonlySet<T> {
   return value instanceof Set;
 }
 
-export function buildPersistedDraftPayload(
+export function buildSerializedDraftPayload(
   slices: DraftStateSlices,
   updatedAtByScope: ReadonlyMap<string, number> | Record<string, number>,
   options?: DraftBudgetOptions,
-): PersistedDraftPayloadV1 {
+): SerializedDraftPayload {
   const nowMs = options?.nowMs ?? Date.now();
   const budget = resolveBudget(options);
 
@@ -474,7 +523,10 @@ export function buildPersistedDraftPayload(
     const raw = isReadonlyMap<string, number>(updatedAtByScope)
       ? updatedAtByScope.get(key)
       : updatedAtByScope[key];
-    return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : nowMs;
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+      return nowMs;
+    }
+    return normalizeTimestamp(raw, nowMs);
   };
 
   const drafts: Record<string, PersistedScopeDraft> = {};
@@ -513,15 +565,15 @@ export function buildPersistedDraftPayload(
     }
   }
 
-  return evictLruToBudget(drafts, budget.maxTotalBytes).payload;
+  return evictLruToBudget(drafts, budget.maxTotalBytes);
 }
 
-export function serializePersistedDraftPayload(
-  payload: PersistedDraftPayloadV1,
-  maxTotalBytes = MAX_TOTAL_DRAFT_BYTES,
-): { json: string | null; keptKeys: string[]; evictedKeys: string[] } {
-  const { json, keptKeys, evictedKeys } = evictLruToBudget(payload.drafts, maxTotalBytes);
-  return { json, keptKeys, evictedKeys };
+export function buildPersistedDraftPayload(
+  slices: DraftStateSlices,
+  updatedAtByScope: ReadonlyMap<string, number> | Record<string, number>,
+  options?: DraftBudgetOptions,
+): PersistedDraftPayloadV1 {
+  return buildSerializedDraftPayload(slices, updatedAtByScope, options).payload;
 }
 
 export function parseAndValidatePersistedDrafts(
@@ -577,8 +629,9 @@ export function parseAndValidatePersistedDrafts(
       continue;
     }
 
-    const candidate: PersistedScopeDraft = { updatedAt: rawUpdatedAt };
-    let entryHadInvalidField = false;
+    const updatedAt = normalizeTimestamp(rawUpdatedAt, nowMs);
+    const candidate: PersistedScopeDraft = { updatedAt };
+    let entryHadInvalidField = updatedAt !== rawUpdatedAt;
 
     if (rawEntry.text !== undefined) {
       if (typeof rawEntry.text === "string" && rawEntry.text.trim().length > 0) {
@@ -684,25 +737,23 @@ export function parseAndValidatePersistedDrafts(
 function writePayloadWithQuotaFallback(
   storage: StorageLike,
   storageKey: string,
-  payload: PersistedDraftPayloadV1,
-  maxTotalBytes: number,
-): string[] {
-  const initial = evictLruToBudget(payload.drafts, maxTotalBytes);
-  if (!initial.json || initial.keptKeys.length === 0) {
+  serialized: SerializedDraftPayload,
+): void {
+  if (!serialized.json || serialized.keptKeys.length === 0) {
     try {
       storage.removeItem(storageKey);
     } catch {
       // Ignore storage access errors
     }
-    return [];
+    return;
   }
 
   try {
-    storage.setItem(storageKey, initial.json);
-    return initial.keptKeys;
+    storage.setItem(storageKey, serialized.json);
+    return;
   } catch {
     // Storage quota exceeded or restricted — progressively shed oldest drafts by updatedAt
-    const working: Record<string, PersistedScopeDraft> = { ...initial.payload.drafts };
+    const working: Record<string, PersistedScopeDraft> = { ...serialized.payload.drafts };
     const orderedOldestFirst = Object.keys(working).sort((a, b) => {
       const diff = working[a].updatedAt - working[b].updatedAt;
       return diff !== 0 ? diff : a.localeCompare(b);
@@ -720,18 +771,14 @@ function writePayloadWithQuotaFallback(
           storageKey,
           JSON.stringify({ version: DRAFT_SCHEMA_VERSION, drafts: working }),
         );
-        return Object.keys(working);
+        return;
       } catch {
         // Continue shedding
       }
     }
 
-    try {
-      storage.removeItem(storageKey);
-    } catch {
-      // Ignore storage access errors
-    }
-    return [];
+    // Do not call storage.removeItem(storageKey) on quota failure so previously
+    // persisted valid drafts survive transient quota errors.
   }
 }
 
@@ -784,20 +831,21 @@ export function createDraftPersistenceController(
     if (!dirty && !force) return;
     dirty = false;
 
-    const payload = buildPersistedDraftPayload(getSnapshot(), updatedAtByScope, {
+    const snapshot = getSnapshot();
+    const nowMs = now();
+    const serialized = buildSerializedDraftPayload(snapshot, updatedAtByScope, {
       ...budget,
-      nowMs: now(),
+      nowMs,
     });
-    const keptKeys = writePayloadWithQuotaFallback(
-      storage,
-      storageKey,
-      payload,
-      budget.maxTotalBytes,
-    );
-    const keptSet = new Set(keptKeys);
-    for (const k of Array.from(updatedAtByScope.keys())) {
-      if (!keptSet.has(k)) {
+    writePayloadWithQuotaFallback(storage, storageKey, serialized);
+
+    // Only delete timestamps for scopes that are genuinely empty in memory;
+    // preserve timestamps for still-in-memory LRU-evicted scopes to prevent LRU inversion.
+    for (const [k, ts] of Array.from(updatedAtByScope.entries())) {
+      if (!hasNonEmptyScopeDraft(snapshot, k)) {
         updatedAtByScope.delete(k);
+      } else if (ts > nowMs + MAX_FUTURE_TIMESTAMP_SKEW_MS) {
+        updatedAtByScope.set(k, nowMs);
       }
     }
   };
@@ -852,11 +900,11 @@ export function createDraftPersistenceController(
 
       // Persist cleanup immediately when hydration pruned expired, corrupt, or archived drafts
       if (hydrated.prunedCount > 0 && raw !== null) {
-        const cleanedPayload = buildPersistedDraftPayload(hydrated, updatedAtByScope, {
+        const cleaned = buildSerializedDraftPayload(hydrated, updatedAtByScope, {
           ...budget,
           nowMs: now(),
         });
-        writePayloadWithQuotaFallback(storage, storageKey, cleanedPayload, budget.maxTotalBytes);
+        writePayloadWithQuotaFallback(storage, storageKey, cleaned);
       }
 
       return hydrated;
@@ -912,9 +960,10 @@ export function createDraftPersistenceController(
     },
 
     restoreUpdatedAtByScope(map: Record<string, number>): void {
+      const nowMs = now();
       for (const [key, ts] of Object.entries(map)) {
         if (isValidScopeKey(key) && typeof ts === "number" && Number.isFinite(ts) && ts > 0) {
-          updatedAtByScope.set(key, ts);
+          updatedAtByScope.set(key, normalizeTimestamp(ts, nowMs));
         }
       }
     },

@@ -275,11 +275,10 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
             title="Built-in Orbit MCP Orchestrator"
             description="Auto-inject the local Streamable HTTP MCP server (/mcp/agents) into Claude, Codex, and Antigravity sessions so agents can delegate subagents, create worktrees, and schedule tasks."
           >
-            <input
-              type="checkbox"
+            <ToggleSwitch
               checked={orchConfig.mcp_inject_enabled}
-              onChange={(e) => void patchOrchConfig({ mcp_inject_enabled: e.target.checked })}
-              className="h-4 w-4 cursor-pointer"
+              onChange={(next) => void patchOrchConfig({ mcp_inject_enabled: next })}
+              aria-label="Built-in Orbit MCP Orchestrator"
             />
           </SettingRow>
 
@@ -287,10 +286,11 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
             title="Idle Runtime Cleanup"
             description="Automatically release idle provider processes after inactivity while preserving full session resume state and protecting active subagent trees."
           >
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2.5">
               <select
                 value={orchConfig.idle_timeout_secs}
                 disabled={!orchConfig.idle_cleanup_enabled}
+                aria-label="Idle runtime cleanup timeout"
                 onChange={(e) =>
                   void patchOrchConfig({ idle_timeout_secs: Number(e.target.value) })
                 }
@@ -301,11 +301,10 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                 <option value={1800}>30 min</option>
                 <option value={3600}>60 min</option>
               </select>
-              <input
-                type="checkbox"
+              <ToggleSwitch
                 checked={orchConfig.idle_cleanup_enabled}
-                onChange={(e) => void patchOrchConfig({ idle_cleanup_enabled: e.target.checked })}
-                className="h-4 w-4 cursor-pointer"
+                onChange={(next) => void patchOrchConfig({ idle_cleanup_enabled: next })}
+                aria-label="Idle Runtime Cleanup"
               />
             </div>
           </SettingRow>
@@ -314,11 +313,10 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
             title="Auto-Resume on Daemon Startup"
             description="Automatically send a resume prompt to non-background agents that were mid-turn if the host rebooted."
           >
-            <input
-              type="checkbox"
+            <ToggleSwitch
               checked={orchConfig.resume_on_startup}
-              onChange={(e) => void patchOrchConfig({ resume_on_startup: e.target.checked })}
-              className="h-4 w-4 cursor-pointer"
+              onChange={(next) => void patchOrchConfig({ resume_on_startup: next })}
+              aria-label="Auto-Resume on Daemon Startup"
             />
           </SettingRow>
 
@@ -351,6 +349,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
             <ToggleSwitch
               checked={keepAwakeEnabled}
               onChange={(next) => void patchOrchConfig({ keep_awake_while_running: next })}
+              aria-label="Keep awake while running"
             />
           </SettingRow>
         </SettingCard>

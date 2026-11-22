@@ -414,16 +414,17 @@ impl AgentOrchestrator {
             {
                 let resume_ref = self.store.get_persistence_ref(&ag.agent_id).ok().flatten();
                 let launch_gen = self.bump_generation(&ag.agent_id).await;
+                self.keep_awake
+                    .notify_agent_status(&ag.agent_id, &ag.status);
                 if self
                     .spawn_and_wire_driver(&ag, executable, resume_ref, true, launch_gen)
                     .await
                     .is_ok()
                 {
                     info!(agent_id = %ag.agent_id, "Reattached surviving agent shim across daemon restart");
-                    self.keep_awake
-                        .notify_agent_status(&ag.agent_id, &ag.status);
                     continue;
                 }
+                self.keep_awake.mark_agent_idle(&ag.agent_id);
             }
 
             // No surviving live shim -> normalize stale transient statuses to `Closed` and settle
@@ -753,25 +754,59 @@ impl AgentOrchestrator {
         Ok(())
     }
 
+    async fn resolve_canonical_repo_key(&self, path: &Path) -> String {
+        if let Ok((repo_hash, _)) = self.worktree_pool.repo_pool_dir(path).await {
+            return format!("git:{repo_hash}");
+        }
+        tokio::fs::canonicalize(path)
+            .await
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
     async fn reconcile_worktree_pool_after_archive(&self, source_cwd: &Path) {
-        let src_str = source_cwd.to_string_lossy();
-        let has_active_ws = self
+        let target_key = self.resolve_canonical_repo_key(source_cwd).await;
+
+        let mut ws_candidates = std::collections::HashSet::new();
+        for w in self
             .store
             .list_workspaces_filtered(false, true)
             .unwrap_or_default()
-            .iter()
-            .any(|w| w.cwd == src_str || w.source_cwd.as_deref() == Some(src_str.as_ref()));
-        let has_active_wt_agent = self
-            .store
-            .list_agents_filtered(None, false, true, None)
-            .unwrap_or_default()
-            .iter()
-            .any(|a| {
-                a.labels
-                    .get("orbit.worktree_source_cwd")
-                    .is_some_and(|s| s == src_str.as_ref())
-            });
-        if !has_active_ws && !has_active_wt_agent {
+        {
+            ws_candidates.insert(w.cwd);
+            if let Some(src) = w.source_cwd {
+                ws_candidates.insert(src);
+            }
+        }
+        let mut has_active_ref = false;
+        for candidate in ws_candidates {
+            if self.resolve_canonical_repo_key(Path::new(&candidate)).await == target_key {
+                has_active_ref = true;
+                break;
+            }
+        }
+
+        if !has_active_ref {
+            let mut agent_candidates = std::collections::HashSet::new();
+            for a in self
+                .store
+                .list_agents_filtered(None, false, true, None)
+                .unwrap_or_default()
+            {
+                if let Some(src) = a.labels.get("orbit.worktree_source_cwd") {
+                    agent_candidates.insert(src.clone());
+                }
+            }
+            for candidate in agent_candidates {
+                if self.resolve_canonical_repo_key(Path::new(&candidate)).await == target_key {
+                    has_active_ref = true;
+                    break;
+                }
+            }
+        }
+
+        if !has_active_ref {
             let _ = self.worktree_pool.cleanup_repo_pool(source_cwd).await;
         } else {
             let _ = self.worktree_pool.prune_repo_pool(source_cwd).await;
@@ -3721,8 +3756,15 @@ impl AgentOrchestrator {
 
         let mut env = env;
         let (program, args) = if let Some(cmd_line) = initial_command {
-            orbit_providers::merge_cached_shell_env_into_map(&mut env);
-            ("/bin/sh".to_string(), vec!["-lc".to_string(), cmd_line])
+            let shell_flag = if orbit_providers::merge_cached_shell_env_into_map(&mut env) {
+                "-c"
+            } else {
+                "-lc"
+            };
+            (
+                "/bin/sh".to_string(),
+                vec![shell_flag.to_string(), cmd_line],
+            )
         } else {
             (shell.clone(), Vec::new())
         };

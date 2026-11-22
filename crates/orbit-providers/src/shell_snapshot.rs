@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -28,8 +29,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex as AsyncMutex;
+#[cfg(unix)]
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -46,6 +49,7 @@ pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Upper bound on stdout bytes read from a single shell probe (1 MiB).
+#[cfg(unix)]
 const MAX_PROBE_STDOUT_BYTES: usize = 1024 * 1024;
 
 /// Maximum length of a single cached environment variable value (32 KiB).
@@ -53,6 +57,15 @@ const MAX_ENV_VALUE_BYTES: usize = 32 * 1024;
 
 /// Maximum number of environment variables stored in a single snapshot.
 const MAX_ENV_VARS: usize = 512;
+
+/// Minimum interval between repeated rc-file `stat()` checks on warm in-memory hits.
+const DEFAULT_RC_STAT_THROTTLE: Duration = Duration::from_secs(2);
+
+/// Maximum snapshot JSON file size loaded from disk (2 MiB).
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Maximum age of orphaned `.tmp` atomic-write artifacts before pruning (5 minutes).
+const STALE_TMP_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// Startup files under `$HOME` whose mtimes/sizes are folded into the snapshot fingerprint.
 pub const WATCHED_RC_FILES: &[&str] = &[
@@ -275,8 +288,11 @@ pub struct ShellSnapshotStats {
 #[derive(Debug, Clone)]
 struct CachedMemoryEntry {
     shell: String,
+    raw_shell_env: Option<String>,
     fingerprint: String,
     created_at_unix: u64,
+    created_at_instant: Option<Instant>,
+    last_rc_check_at: Instant,
     env: HashMap<String, String>,
 }
 
@@ -295,6 +311,7 @@ pub struct ShellSnapshotCache {
     ttl: Duration,
     probe_timeout: Duration,
     failure_backoff: Duration,
+    rc_stat_throttle: Duration,
     memory: RwLock<CacheMemoryState>,
     refresh_lock: AsyncMutex<()>,
     warmup_in_flight: AtomicBool,
@@ -316,13 +333,25 @@ pub fn set_snapshot_orbit_home(orbit_home: &Path) {
     }
 }
 
+fn is_orbit_home_configured() -> bool {
+    if let Some(lock) = ORBIT_HOME_OVERRIDE.get()
+        && let Ok(guard) = lock.read()
+        && guard.is_some()
+    {
+        return true;
+    }
+    std::env::var_os("ORBIT_HOME").is_some_and(|v| !v.is_empty())
+}
+
 /// Access the process-wide singleton [`ShellSnapshotCache`].
 pub fn global_shell_snapshot_cache() -> &'static ShellSnapshotCache {
     GLOBAL_SNAPSHOT_CACHE.get_or_init(ShellSnapshotCache::new_global)
 }
 
+#[cfg(unix)]
 struct WarmupFlagGuard<'a>(&'a AtomicBool);
 
+#[cfg(unix)]
 impl Drop for WarmupFlagGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
@@ -338,6 +367,7 @@ impl ShellSnapshotCache {
             ttl: DEFAULT_SNAPSHOT_TTL,
             probe_timeout: DEFAULT_PROBE_TIMEOUT,
             failure_backoff: PROBE_FAILURE_BACKOFF,
+            rc_stat_throttle: DEFAULT_RC_STAT_THROTTLE,
             memory: RwLock::new(CacheMemoryState::default()),
             refresh_lock: AsyncMutex::new(()),
             warmup_in_flight: AtomicBool::new(false),
@@ -363,6 +393,7 @@ impl ShellSnapshotCache {
             ttl,
             probe_timeout,
             failure_backoff: PROBE_FAILURE_BACKOFF,
+            rc_stat_throttle: DEFAULT_RC_STAT_THROTTLE,
             memory: RwLock::new(CacheMemoryState::default()),
             refresh_lock: AsyncMutex::new(()),
             warmup_in_flight: AtomicBool::new(false),
@@ -371,6 +402,12 @@ impl ShellSnapshotCache {
             disk_hits: AtomicU64::new(0),
             probe_errors: AtomicU64::new(0),
         }
+    }
+
+    /// Override the rc-file `stat()` throttling window used on warm in-memory hits.
+    pub fn with_rc_stat_throttle(mut self, throttle: Duration) -> Self {
+        self.rc_stat_throttle = throttle;
+        self
     }
 
     fn resolve_cache_dir(&self) -> PathBuf {
@@ -406,6 +443,14 @@ impl ShellSnapshotCache {
         detect_login_shell()
     }
 
+    fn current_raw_shell_env(&self) -> Option<String> {
+        if self.shell_override.is_some() {
+            None
+        } else {
+            std::env::var("SHELL").ok()
+        }
+    }
+
     fn current_key(&self) -> (String, BTreeMap<String, Option<RcFileStamp>>, String) {
         let shell = self.resolve_shell_path();
         let home = self.resolve_home_dir();
@@ -414,11 +459,67 @@ impl ShellSnapshotCache {
         (shell, rc_mtimes, fingerprint)
     }
 
-    fn is_entry_fresh(&self, entry: &CachedMemoryEntry, fingerprint: &str, now_unix: u64) -> bool {
-        if entry.fingerprint != fingerprint {
+    fn is_entry_time_fresh(&self, entry: &CachedMemoryEntry, now_unix: u64) -> bool {
+        if !is_timestamp_within_ttl(entry.created_at_unix, now_unix, self.ttl) {
             return false;
         }
-        is_timestamp_within_ttl(entry.created_at_unix, now_unix, self.ttl)
+        entry
+            .created_at_instant
+            .is_none_or(|inst| inst.elapsed() < self.ttl)
+    }
+
+    fn is_entry_fresh(&self, entry: &CachedMemoryEntry, fingerprint: &str, now_unix: u64) -> bool {
+        entry.fingerprint == fingerprint && self.is_entry_time_fresh(entry, now_unix)
+    }
+
+    /// Zero-syscall fast path: serves a fresh in-memory snapshot without re-statting rc files
+    /// when checked within `self.rc_stat_throttle`.
+    fn try_memory_hit_throttled(&self) -> Option<HashMap<String, String>> {
+        if self.rc_stat_throttle.is_zero() {
+            return None;
+        }
+        let now_unix = now_unix_secs();
+        let raw_shell_env = self.current_raw_shell_env();
+        let guard = self.memory.read().ok()?;
+        let entry = guard.entry.as_ref()?;
+        if !self.is_entry_time_fresh(entry, now_unix) {
+            return None;
+        }
+        if entry.last_rc_check_at.elapsed() >= self.rc_stat_throttle {
+            return None;
+        }
+        if self.shell_override.is_none() && entry.raw_shell_env != raw_shell_env {
+            return None;
+        }
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(entry.env.clone())
+    }
+
+    fn check_memory_with_fingerprint(
+        &self,
+        fingerprint: &str,
+        now_unix: u64,
+    ) -> Option<HashMap<String, String>> {
+        let matched = {
+            let guard = self.memory.read().ok()?;
+            let entry = guard.entry.as_ref()?;
+            if self.is_entry_fresh(entry, fingerprint, now_unix) {
+                Some(entry.env.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(env) = matched {
+            if let Ok(mut guard) = self.memory.write()
+                && let Some(ref mut entry) = guard.entry
+                && entry.fingerprint == fingerprint
+            {
+                entry.last_rc_check_at = Instant::now();
+            }
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(env);
+        }
+        None
     }
 
     /// Synchronous fast-path: returns a valid snapshot from memory or on-disk cache immediately
@@ -428,26 +529,31 @@ impl ShellSnapshotCache {
             return None;
         }
 
+        // 1. Throttled in-memory fast-path (avoids redundant rc-file stat calls on hot paths)
+        if let Some(env) = self.try_memory_hit_throttled() {
+            return Some(env);
+        }
+
         let (shell, rc_mtimes, fingerprint) = self.current_key();
         let now_unix = now_unix_secs();
 
-        // 1. In-memory fast-path
-        if let Ok(guard) = self.memory.read()
-            && let Some(ref entry) = guard.entry
-            && self.is_entry_fresh(entry, &fingerprint, now_unix)
-        {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Some(entry.env.clone());
+        // 2. Verified in-memory hit after re-checking rc file stamps
+        if let Some(env) = self.check_memory_with_fingerprint(&fingerprint, now_unix) {
+            return Some(env);
         }
 
-        // 2. On-disk fast-path (shared across daemon & short-lived CLI processes)
+        // 3. On-disk fast-path (shared across daemon & short-lived CLI processes)
         if let Some(disk_snap) = self.load_from_disk_if_valid(&fingerprint, &shell, &rc_mtimes) {
             let env_map: HashMap<String, String> = disk_snap.env.into_iter().collect();
+            let raw_shell_env = self.current_raw_shell_env();
             if let Ok(mut guard) = self.memory.write() {
                 guard.entry = Some(CachedMemoryEntry {
                     shell: disk_snap.shell,
+                    raw_shell_env,
                     fingerprint: disk_snap.fingerprint,
                     created_at_unix: disk_snap.created_at_unix,
+                    created_at_instant: None,
+                    last_rc_check_at: Instant::now(),
                     env: env_map.clone(),
                 });
                 guard.last_failure_at = None;
@@ -460,97 +566,208 @@ impl ShellSnapshotCache {
         None
     }
 
+    #[cfg(unix)]
+    async fn resolve_key_and_cached_async(
+        &self,
+    ) -> (
+        Option<HashMap<String, String>>,
+        String,
+        BTreeMap<String, Option<RcFileStamp>>,
+        String,
+    ) {
+        let shell_override = self.shell_override.clone();
+        let home_dir = self.resolve_home_dir();
+        let (shell, rc_mtimes, fingerprint) = tokio::task::spawn_blocking(move || {
+            let shell = shell_override.unwrap_or_else(detect_login_shell);
+            let rc_mtimes = collect_rc_file_stamps(&home_dir);
+            let fingerprint = compute_snapshot_fingerprint(&shell, &rc_mtimes);
+            (shell, rc_mtimes, fingerprint)
+        })
+        .await
+        .unwrap_or_else(|_| self.current_key());
+
+        let now_unix = now_unix_secs();
+        if let Some(env) = self.check_memory_with_fingerprint(&fingerprint, now_unix) {
+            return (Some(env), shell, rc_mtimes, fingerprint);
+        }
+
+        let cache_dir = self.resolve_cache_dir();
+        let fp_for_disk = fingerprint.clone();
+        let shell_for_disk = shell.clone();
+        let rc_for_disk = rc_mtimes.clone();
+        let ttl = self.ttl;
+        let disk_snap = tokio::task::spawn_blocking(move || {
+            load_from_disk_if_valid_in(&cache_dir, &fp_for_disk, &shell_for_disk, &rc_for_disk, ttl)
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(disk_snap) = disk_snap {
+            let env_map: HashMap<String, String> = disk_snap.env.into_iter().collect();
+            let raw_shell_env = self.current_raw_shell_env();
+            if let Ok(mut guard) = self.memory.write() {
+                guard.entry = Some(CachedMemoryEntry {
+                    shell: disk_snap.shell,
+                    raw_shell_env,
+                    fingerprint: disk_snap.fingerprint,
+                    created_at_unix: disk_snap.created_at_unix,
+                    created_at_instant: None,
+                    last_rc_check_at: Instant::now(),
+                    env: env_map.clone(),
+                });
+                guard.last_failure_at = None;
+            }
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.disk_hits.fetch_add(1, Ordering::Relaxed);
+            return (Some(env_map), shell, rc_mtimes, fingerprint);
+        }
+
+        (None, shell, rc_mtimes, fingerprint)
+    }
+
     /// Async full resolution: checks memory -> disk -> bounded login-shell probe (with
     /// single-flight deduplication so concurrent callers never spawn redundant shells).
     pub async fn resolve_env(&self) -> HashMap<String, String> {
         if self.cache_dir_override.is_none() && is_shell_snapshot_disabled() {
             return HashMap::new();
         }
-
-        if let Some(cached) = self.resolve_env_cached() {
-            return cached;
-        }
-
-        // Coalesce concurrent cold probes.
-        let _refresh_guard = self.refresh_lock.lock().await;
-
-        if let Some(cached) = self.resolve_env_cached() {
-            return cached;
-        }
-
-        // Respect negative backoff after recent probe failure/timeout.
-        if let Ok(guard) = self.memory.read()
-            && let Some(failed_at) = guard.last_failure_at
-            && failed_at.elapsed() < self.failure_backoff
+        #[cfg(not(unix))]
         {
-            return guard
-                .entry
-                .as_ref()
-                .map(|e| e.env.clone())
-                .unwrap_or_default();
+            return HashMap::new();
         }
 
-        self.misses.fetch_add(1, Ordering::Relaxed);
+        #[cfg(unix)]
+        {
+            if let Some(cached) = self.try_memory_hit_throttled() {
+                return cached;
+            }
 
-        let (shell, rc_mtimes, fingerprint) = self.current_key();
-        let home_dir = self.resolve_home_dir();
+            let (cached, _, _, _) = self.resolve_key_and_cached_async().await;
+            if let Some(cached) = cached {
+                return cached;
+            }
 
-        match probe_login_shell_env(&shell, &home_dir, self.probe_timeout).await {
-            Ok(env_map) if !env_map.is_empty() => {
-                let created_at_unix = now_unix_secs();
-                let persisted = PersistedShellSnapshot {
-                    version: SNAPSHOT_SCHEMA_VERSION,
-                    shell: shell.clone(),
-                    fingerprint: fingerprint.clone(),
-                    created_at_unix,
-                    rc_mtimes,
-                    env: env_map
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                };
+            // Coalesce concurrent cold probes.
+            let _refresh_guard = self.refresh_lock.lock().await;
 
-                if let Err(err) = self.save_to_disk_atomic(&persisted) {
-                    warn!(error = %err, "Failed to persist shell environment snapshot to disk");
-                } else {
-                    self.prune_stale_disk_snapshots(&fingerprint, &shell);
-                }
+            if let Some(cached) = self.try_memory_hit_throttled() {
+                return cached;
+            }
 
-                if let Ok(mut guard) = self.memory.write() {
-                    guard.entry = Some(CachedMemoryEntry {
-                        shell,
-                        fingerprint,
+            let (cached, shell, rc_mtimes, fingerprint) = self.resolve_key_and_cached_async().await;
+            if let Some(cached) = cached {
+                return cached;
+            }
+
+            // Respect negative backoff after recent probe failure/timeout.
+            if let Ok(guard) = self.memory.read()
+                && let Some(failed_at) = guard.last_failure_at
+                && failed_at.elapsed() < self.failure_backoff
+            {
+                return guard
+                    .entry
+                    .as_ref()
+                    .map(|e| e.env.clone())
+                    .unwrap_or_default();
+            }
+
+            if is_unsupported_non_posix_shell(&shell) {
+                debug!(
+                    shell = %shell,
+                    "Skipping login-shell snapshot probe for unsupported non-POSIX shell"
+                );
+                return HashMap::new();
+            }
+
+            self.misses.fetch_add(1, Ordering::Relaxed);
+
+            let home_dir = self.resolve_home_dir();
+
+            match probe_login_shell_env(&shell, &home_dir, self.probe_timeout).await {
+                Ok(env_map) if !env_map.is_empty() => {
+                    let created_at_unix = now_unix_secs();
+                    let persisted = PersistedShellSnapshot {
+                        version: SNAPSHOT_SCHEMA_VERSION,
+                        shell: shell.clone(),
+                        fingerprint: fingerprint.clone(),
                         created_at_unix,
-                        env: env_map.clone(),
-                    });
-                    guard.last_failure_at = None;
+                        rc_mtimes,
+                        env: env_map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                    };
+
+                    let cache_dir = self.resolve_cache_dir();
+                    let fp_for_prune = fingerprint.clone();
+                    let shell_for_prune = shell.clone();
+                    let ttl = self.ttl;
+                    let save_res = tokio::task::spawn_blocking(move || {
+                        let res = save_to_disk_atomic_in(&cache_dir, &persisted);
+                        if res.is_ok() {
+                            prune_stale_disk_snapshots_in(
+                                &cache_dir,
+                                &fp_for_prune,
+                                &shell_for_prune,
+                                ttl,
+                            );
+                        }
+                        res
+                    })
+                    .await;
+
+                    match save_res {
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "Failed to persist shell environment snapshot to disk");
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "Shell snapshot disk persistence task failed");
+                        }
+                        Ok(Ok(_)) => {}
+                    }
+
+                    let raw_shell_env = self.current_raw_shell_env();
+                    let now_inst = Instant::now();
+                    if let Ok(mut guard) = self.memory.write() {
+                        guard.entry = Some(CachedMemoryEntry {
+                            shell,
+                            raw_shell_env,
+                            fingerprint,
+                            created_at_unix,
+                            created_at_instant: Some(now_inst),
+                            last_rc_check_at: now_inst,
+                            env: env_map.clone(),
+                        });
+                        guard.last_failure_at = None;
+                    }
+                    env_map
                 }
-                env_map
-            }
-            Ok(_) => {
-                self.probe_errors.fetch_add(1, Ordering::Relaxed);
-                if let Ok(mut guard) = self.memory.write() {
-                    guard.last_failure_at = Some(Instant::now());
-                    return guard
-                        .entry
-                        .as_ref()
-                        .map(|e| e.env.clone())
-                        .unwrap_or_default();
+                Ok(_) => {
+                    self.probe_errors.fetch_add(1, Ordering::Relaxed);
+                    if let Ok(mut guard) = self.memory.write() {
+                        guard.last_failure_at = Some(Instant::now());
+                        return guard
+                            .entry
+                            .as_ref()
+                            .map(|e| e.env.clone())
+                            .unwrap_or_default();
+                    }
+                    HashMap::new()
                 }
-                HashMap::new()
-            }
-            Err(err) => {
-                self.probe_errors.fetch_add(1, Ordering::Relaxed);
-                warn!(shell = %shell, error = %err, "Login shell environment probe failed; falling back to inherited env");
-                if let Ok(mut guard) = self.memory.write() {
-                    guard.last_failure_at = Some(Instant::now());
-                    return guard
-                        .entry
-                        .as_ref()
-                        .map(|e| e.env.clone())
-                        .unwrap_or_default();
+                Err(err) => {
+                    self.probe_errors.fetch_add(1, Ordering::Relaxed);
+                    warn!(shell = %shell, error = %err, "Login shell environment probe failed; falling back to inherited env");
+                    if let Ok(mut guard) = self.memory.write() {
+                        guard.last_failure_at = Some(Instant::now());
+                        return guard
+                            .entry
+                            .as_ref()
+                            .map(|e| e.env.clone())
+                            .unwrap_or_default();
+                    }
+                    HashMap::new()
                 }
-                HashMap::new()
             }
         }
     }
@@ -560,30 +777,37 @@ impl ShellSnapshotCache {
         if self.cache_dir_override.is_none() && is_shell_snapshot_disabled() {
             return;
         }
-        if let Ok(guard) = self.memory.read()
-            && let Some(failed_at) = guard.last_failure_at
-            && failed_at.elapsed() < self.failure_backoff
+        #[cfg(not(unix))]
         {
             return;
         }
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        if self
-            .warmup_in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+        #[cfg(unix)]
         {
-            return;
+            if let Ok(guard) = self.memory.read()
+                && let Some(failed_at) = guard.last_failure_at
+                && failed_at.elapsed() < self.failure_backoff
+            {
+                return;
+            }
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return;
+            };
+            if self
+                .warmup_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            handle.spawn(async move {
+                let _flag_guard = WarmupFlagGuard(&self.warmup_in_flight);
+                let env = self.resolve_env().await;
+                debug!(
+                    var_count = env.len(),
+                    "Background login shell environment snapshot warm-up finished"
+                );
+            });
         }
-        handle.spawn(async move {
-            let _flag_guard = WarmupFlagGuard(&self.warmup_in_flight);
-            let env = self.resolve_env().await;
-            debug!(
-                var_count = env.len(),
-                "Background login shell environment snapshot warm-up finished"
-            );
-        });
     }
 
     /// Clear in-memory snapshot, reset failure backoff, and remove persisted snapshot files.
@@ -612,13 +836,16 @@ impl ShellSnapshotCache {
         let now_unix = now_unix_secs();
         let (shell, age_secs, var_count, warm, fingerprint) = match self.memory.read() {
             Ok(guard) => match guard.entry.as_ref() {
-                Some(entry) => (
-                    entry.shell.clone(),
-                    Some(now_unix.saturating_sub(entry.created_at_unix)),
-                    entry.env.len(),
-                    true,
-                    Some(entry.fingerprint.clone()),
-                ),
+                Some(entry) => {
+                    let is_warm = self.is_entry_time_fresh(entry, now_unix);
+                    (
+                        entry.shell.clone(),
+                        Some(now_unix.saturating_sub(entry.created_at_unix)),
+                        entry.env.len(),
+                        is_warm,
+                        Some(entry.fingerprint.clone()),
+                    )
+                }
                 None => (self.resolve_shell_path(), None, 0, false, None),
             },
             Err(_) => (self.resolve_shell_path(), None, 0, false, None),
@@ -649,28 +876,8 @@ impl ShellSnapshotCache {
         shell: &str,
         rc_mtimes: &BTreeMap<String, Option<RcFileStamp>>,
     ) -> Option<PersistedShellSnapshot> {
-        let path = self.snapshot_file_path(fingerprint);
-        let raw = std::fs::read_to_string(&path).ok()?;
-        let mut parsed: PersistedShellSnapshot = serde_json::from_str(&raw).ok()?;
-        if parsed.version != SNAPSHOT_SCHEMA_VERSION {
-            return None;
-        }
-        if parsed.shell != shell
-            || parsed.fingerprint != fingerprint
-            || &parsed.rc_mtimes != rc_mtimes
-        {
-            return None;
-        }
-        if !is_timestamp_within_ttl(parsed.created_at_unix, now_unix_secs(), self.ttl) {
-            return None;
-        }
-        // Defense-in-depth: re-apply secret/volatile filter when loading from disk.
-        let filtered = filter_snapshot_env(parsed.env.into_iter().collect(), &HashSet::new());
-        if filtered.is_empty() {
-            return None;
-        }
-        parsed.env = filtered.into_iter().collect();
-        Some(parsed)
+        let cache_dir = self.resolve_cache_dir();
+        load_from_disk_if_valid_in(&cache_dir, fingerprint, shell, rc_mtimes, self.ttl)
     }
 
     /// Atomically write a snapshot JSON file with `0600` permissions (and `0700` parent dir on Unix).
@@ -679,76 +886,133 @@ impl ShellSnapshotCache {
         snapshot: &PersistedShellSnapshot,
     ) -> std::io::Result<PathBuf> {
         let cache_dir = self.resolve_cache_dir();
-        std::fs::create_dir_all(&cache_dir)?;
+        save_to_disk_atomic_in(&cache_dir, snapshot)
+    }
+}
 
+fn load_from_disk_if_valid_in(
+    cache_dir: &Path,
+    fingerprint: &str,
+    shell: &str,
+    rc_mtimes: &BTreeMap<String, Option<RcFileStamp>>,
+    ttl: Duration,
+) -> Option<PersistedShellSnapshot> {
+    let path = cache_dir.join(format!("{fingerprint}.json"));
+    let meta = std::fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SNAPSHOT_FILE_BYTES {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let mut parsed: PersistedShellSnapshot = serde_json::from_str(&raw).ok()?;
+    if parsed.version != SNAPSHOT_SCHEMA_VERSION {
+        return None;
+    }
+    if parsed.shell != shell || parsed.fingerprint != fingerprint || &parsed.rc_mtimes != rc_mtimes
+    {
+        return None;
+    }
+    if !is_timestamp_within_ttl(parsed.created_at_unix, now_unix_secs(), ttl) {
+        return None;
+    }
+    // Defense-in-depth: re-apply secret/volatile/probe-guard filter when loading from disk.
+    let filtered = filter_snapshot_env(parsed.env.into_iter().collect(), &HashSet::new());
+    if filtered.is_empty() {
+        return None;
+    }
+    parsed.env = filtered.into_iter().collect();
+    Some(parsed)
+}
+
+fn save_to_disk_atomic_in(
+    cache_dir: &Path,
+    snapshot: &PersistedShellSnapshot,
+) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(cache_dir)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(cache_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let final_path = cache_dir.join(format!("{}.json", snapshot.fingerprint));
+    let tmp_name = format!(
+        ".snap-{}-{}-{}.tmp",
+        snapshot.fingerprint,
+        std::process::id(),
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
+    let tmp_path = cache_dir.join(tmp_name);
+    let payload = serde_json::to_vec_pretty(snapshot).map_err(std::io::Error::other)?;
+
+    let write_result: std::io::Result<()> = (|| {
+        let mut file = create_private_file(&tmp_path)?;
+        file.write_all(&payload)?;
+        file.flush()?;
+        let _ = file.sync_all();
+        drop(file);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700));
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
         }
+        std::fs::rename(&tmp_path, &final_path)?;
+        Ok(())
+    })();
 
-        let final_path = cache_dir.join(format!("{}.json", snapshot.fingerprint));
-        let tmp_name = format!(
-            ".snap-{}-{}-{}.tmp",
-            snapshot.fingerprint,
-            std::process::id(),
-            &Uuid::new_v4().simple().to_string()[..8]
-        );
-        let tmp_path = cache_dir.join(tmp_name);
-        let payload = serde_json::to_vec_pretty(snapshot).map_err(std::io::Error::other)?;
-
-        let write_result: std::io::Result<()> = (|| {
-            let mut file = create_private_file(&tmp_path)?;
-            file.write_all(&payload)?;
-            file.flush()?;
-            let _ = file.sync_all();
-            drop(file);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
-            }
-            std::fs::rename(&tmp_path, &final_path)?;
-            Ok(())
-        })();
-
-        if let Err(err) = write_result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-
-        Ok(final_path)
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
     }
 
-    fn prune_stale_disk_snapshots(&self, keep_fingerprint: &str, shell: &str) {
-        let cache_dir = self.resolve_cache_dir();
-        let keep_name = format!("{keep_fingerprint}.json");
-        let now_unix = now_unix_secs();
-        let max_stale_ttl = self.ttl.saturating_mul(2);
-        let Ok(entries) = std::fs::read_dir(&cache_dir) else {
-            return;
+    Ok(final_path)
+}
+
+fn prune_stale_disk_snapshots_in(
+    cache_dir: &Path,
+    keep_fingerprint: &str,
+    shell: &str,
+    ttl: Duration,
+) {
+    let keep_name = format!("{keep_fingerprint}.json");
+    let now_unix = now_unix_secs();
+    let max_stale_ttl = ttl.saturating_mul(2);
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if file_name == keep_name || !file_name.ends_with(".json") {
-                continue;
-            }
-            let should_remove = match std::fs::read_to_string(&path)
+        if file_name.ends_with(".tmp") {
+            let is_stale_tmp = std::fs::metadata(&path)
                 .ok()
-                .and_then(|raw| serde_json::from_str::<PersistedShellSnapshot>(&raw).ok())
-            {
-                Some(snap) => {
-                    snap.shell == shell
-                        || !is_timestamp_within_ttl(snap.created_at_unix, now_unix, max_stale_ttl)
-                }
-                None => true,
-            };
-            if should_remove {
+                .and_then(|m| m.modified().ok())
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .is_some_and(|age| age > STALE_TMP_MAX_AGE);
+            if is_stale_tmp {
                 let _ = std::fs::remove_file(&path);
             }
+            continue;
+        }
+        if file_name == keep_name || !file_name.ends_with(".json") {
+            continue;
+        }
+        let should_remove = match std::fs::metadata(&path)
+            .ok()
+            .filter(|m| m.is_file() && m.len() <= MAX_SNAPSHOT_FILE_BYTES)
+            .and_then(|_| std::fs::read_to_string(&path).ok())
+            .and_then(|raw| serde_json::from_str::<PersistedShellSnapshot>(&raw).ok())
+        {
+            Some(snap) => {
+                snap.shell == shell
+                    || !is_timestamp_within_ttl(snap.created_at_unix, now_unix, max_stale_ttl)
+            }
+            None => true,
+        };
+        if should_remove {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
@@ -759,14 +1023,16 @@ pub async fn resolve_login_shell_env() -> HashMap<String, String> {
 }
 
 /// Non-blocking synchronous fast-path returning cached login-shell env (from memory or disk).
-/// On cold miss, triggers a deduplicated background warm-up (if a Tokio runtime is active) and
-/// returns `None` immediately so command launches never stall.
+/// On cold miss, triggers a deduplicated background warm-up (when `$ORBIT_HOME` is configured and
+/// a Tokio runtime is active) and returns `None` immediately so command launches never stall.
 pub fn resolve_login_shell_env_cached() -> Option<HashMap<String, String>> {
     let cache = global_shell_snapshot_cache();
     if let Some(env) = cache.resolve_env_cached() {
         return Some(env);
     }
-    cache.warm_in_background();
+    if cache.cache_dir_override.is_some() || is_orbit_home_configured() {
+        cache.warm_in_background();
+    }
     None
 }
 
@@ -787,16 +1053,22 @@ pub fn shell_snapshot_stats() -> ShellSnapshotStats {
 
 /// Merge cached login-shell `PATH` & non-conflicting environment variables into a
 /// `tokio::process::Command` without overwriting any explicit caller env vars.
-pub fn apply_cached_shell_env(cmd: &mut tokio::process::Command) {
-    apply_cached_std_shell_env(cmd.as_std_mut());
+/// Returns `true` when a warm snapshot was applied.
+pub fn apply_cached_shell_env(cmd: &mut tokio::process::Command) -> bool {
+    apply_cached_std_shell_env(cmd.as_std_mut())
 }
 
 /// Merge cached login-shell `PATH` & non-conflicting environment variables into a
 /// `std::process::Command` without overwriting any explicit caller env vars.
-pub fn apply_cached_std_shell_env(cmd: &mut std::process::Command) {
-    if let Some(snapshot) = resolve_login_shell_env_cached() {
+/// Returns `true` when a warm snapshot was applied.
+pub fn apply_cached_std_shell_env(cmd: &mut std::process::Command) -> bool {
+    if let Some(snapshot) = resolve_login_shell_env_cached()
+        && !snapshot.is_empty()
+    {
         apply_shell_env_to_std_command(cmd, &snapshot);
+        return true;
     }
+    false
 }
 
 /// Apply an explicit snapshot map onto a `tokio::process::Command` without overwriting
@@ -844,11 +1116,15 @@ pub fn apply_shell_env_to_std_command(
 
 /// Merge cached login-shell `PATH` & non-conflicting environment variables into a target map
 /// (such as [`orbit_shim::ShimSpawnSpec::env`]) without overwriting any explicit keys already
-/// present in `target`.
-pub fn merge_cached_shell_env_into_map(target: &mut HashMap<String, String>) {
-    if let Some(snapshot) = resolve_login_shell_env_cached() {
+/// present in `target`. Returns `true` when a warm snapshot was applied.
+pub fn merge_cached_shell_env_into_map(target: &mut HashMap<String, String>) -> bool {
+    if let Some(snapshot) = resolve_login_shell_env_cached()
+        && !snapshot.is_empty()
+    {
         merge_shell_env_into_map(&snapshot, target);
+        return true;
     }
+    false
 }
 
 /// Merge a specific snapshot map into `target` without overwriting explicit entries in `target`
@@ -880,9 +1156,10 @@ pub fn merge_shell_env_into_map(
     }
 }
 
-/// Return cached login-shell `PATH` directories (strictly non-blocking; empty if cold).
+/// Return cached login-shell `PATH` directories (strictly read-only and non-blocking; never
+/// spawns background probe tasks during read-only bootstrap or executable discovery).
 pub fn cached_login_shell_path_dirs() -> Vec<PathBuf> {
-    let Some(snapshot) = resolve_login_shell_env_cached() else {
+    let Some(snapshot) = global_shell_snapshot_cache().resolve_env_cached() else {
         return Vec::new();
     };
     let Some(login_path) = snapshot.get("PATH") else {
@@ -921,34 +1198,64 @@ fn now_unix_secs() -> u64 {
 }
 
 fn is_timestamp_within_ttl(created_at_unix: u64, now_unix: u64, ttl: Duration) -> bool {
+    if ttl.is_zero() {
+        return false;
+    }
     // Reject far-future timestamps caused by clock jumps (>60s skew).
     if created_at_unix > now_unix.saturating_add(60) {
         return false;
     }
-    now_unix.saturating_sub(created_at_unix) < ttl.as_secs()
+    Duration::from_secs(now_unix.saturating_sub(created_at_unix)) < ttl
 }
 
 fn resolve_default_home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Detect the current user's preferred login shell path.
 pub fn detect_login_shell() -> String {
-    if let Ok(shell) = std::env::var("SHELL") {
-        let trimmed = shell.trim();
-        if !trimmed.is_empty() && Path::new(trimmed).is_file() {
-            return trimmed.to_string();
-        }
+    #[cfg(not(unix))]
+    {
+        return std::env::var("COMSPEC")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "cmd.exe".to_string());
     }
-    for candidate in ["/bin/zsh", "/bin/bash", "/usr/bin/zsh", "/usr/bin/bash"] {
-        if Path::new(candidate).is_file() {
-            return candidate.to_string();
+
+    #[cfg(unix)]
+    {
+        if let Ok(shell) = std::env::var("SHELL") {
+            let trimmed = shell.trim();
+            if !trimmed.is_empty() && Path::new(trimmed).is_file() {
+                return trimmed.to_string();
+            }
         }
+        for candidate in ["/bin/zsh", "/bin/bash", "/usr/bin/zsh", "/usr/bin/bash"] {
+            if Path::new(candidate).is_file() {
+                return candidate.to_string();
+            }
+        }
+        "/bin/sh".to_string()
     }
-    "/bin/sh".to_string()
+}
+
+/// Returns `true` for non-POSIX login shells (`csh`, `tcsh`, `nu`, `pwsh`, etc.) that do not
+/// accept POSIX `||` / redirection probe scripts and should be skipped cleanly.
+pub fn is_unsupported_non_posix_shell(shell_path: &str) -> bool {
+    let base = Path::new(shell_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    matches!(
+        stem,
+        "csh" | "tcsh" | "nu" | "nushell" | "pwsh" | "powershell" | "cmd"
+    )
 }
 
 /// Stat all watched shell startup rc files under `home_dir` (following symlinks).
@@ -1039,6 +1346,7 @@ pub fn merge_paths(login_path: &str, current_path: Option<&OsStr>) -> Option<OsS
     std::env::join_paths(merged).ok()
 }
 
+#[cfg(unix)]
 fn build_probe_command_args(shell_path: &str, nonce: &str) -> Vec<String> {
     let base = Path::new(shell_path)
         .file_name()
@@ -1081,11 +1389,36 @@ fn build_probe_command_args(shell_path: &str, nonce: &str) -> Vec<String> {
     }
 }
 
+#[cfg(unix)]
+async fn kill_probe_process_group_and_wait(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id()
+        && pid > 0
+    {
+        // The probe shell was launched in its own process group (`process_group(0)`), so
+        // PGID == PID. Terminate the entire process group via safe `/bin/kill` so lingering
+        // grandchildren (`sleep`, `nvm`, `brew`, etc.) never leak orphaned.
+        let _ = tokio::process::Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
 async fn probe_login_shell_env(
     shell_path: &str,
     home_dir: &Path,
     timeout: Duration,
 ) -> Result<HashMap<String, String>, String> {
+    if is_unsupported_non_posix_shell(shell_path) {
+        return Ok(HashMap::new());
+    }
+
     let nonce = Uuid::new_v4().simple().to_string();
     let start_marker = format!("__ORBIT_SHELL_ENV_START_{nonce}__");
     let end_marker = format!("__ORBIT_SHELL_ENV_END_{nonce}__");
@@ -1103,21 +1436,11 @@ async fn probe_login_shell_env(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .process_group(0);
 
-    // Track probe guard keys that were NOT already in the parent process so we never leak
-    // synthetic probe-guard variables into the persisted snapshot.
-    let mut probe_injected_keys = HashSet::new();
     for (k, v) in PROBE_GUARD_ENVS {
-        if std::env::var_os(k).is_none() {
-            probe_injected_keys.insert((*k).to_string());
-        }
         cmd.env(k, v);
-    }
-
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
     }
 
     let mut child = cmd
@@ -1143,8 +1466,10 @@ async fn probe_login_shell_env(
                     if remaining == 0 {
                         break;
                     }
-                    captured.extend_from_slice(&chunk[..n.min(remaining)]);
-                    if rfind_subslice(&captured, end_bytes).is_some() {
+                    let to_append = n.min(remaining);
+                    captured.extend_from_slice(&chunk[..to_append]);
+                    let window_start = captured.len().saturating_sub(to_append + end_bytes.len());
+                    if rfind_subslice(&captured[window_start..], end_bytes).is_some() {
                         break;
                     }
                 }
@@ -1158,13 +1483,11 @@ async fn probe_login_shell_env(
     let raw_output = match read_res {
         Ok(Ok(buf)) => buf,
         Ok(Err(err)) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            kill_probe_process_group_and_wait(&mut child).await;
             return Err(err);
         }
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            kill_probe_process_group_and_wait(&mut child).await;
             return Err(format!(
                 "login shell probe timed out after {}ms",
                 timeout.as_millis()
@@ -1173,20 +1496,19 @@ async fn probe_login_shell_env(
     };
 
     // Give the shell a short grace window to exit cleanly on its own before force-killing
-    // (covers rc scripts that spawned background jobs inheriting stdout).
+    // the entire process group (covers rc scripts that spawned background jobs inheriting stdout).
     if tokio::time::timeout(Duration::from_millis(100), child.wait())
         .await
         .is_err()
     {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        kill_probe_process_group_and_wait(&mut child).await;
     }
 
     let body = extract_marked_env_bytes(&raw_output, start_bytes, end_bytes)
         .ok_or_else(|| "login shell output missing snapshot markers".to_string())?;
 
     let parsed = parse_env_output(body);
-    Ok(filter_snapshot_env(parsed, &probe_injected_keys))
+    Ok(filter_snapshot_env(parsed, &HashSet::new()))
 }
 
 /// Extract the payload between `start_marker` and the last `end_marker` in `raw`.
@@ -1272,6 +1594,10 @@ fn is_valid_env_key(key: &str) -> bool {
             .any(|b| b == 0 || b == b'=' || b.is_ascii_whitespace())
 }
 
+fn is_probe_guard_env_key(key: &str) -> bool {
+    PROBE_GUARD_ENVS.iter().any(|(k, _)| *k == key)
+}
+
 /// Filter out volatile/ephemeral, probe-guard, and secret-bearing environment variables while
 /// preserving safe pointers like `SSH_AUTH_SOCK` and developer toolchain variables.
 pub fn filter_snapshot_env(
@@ -1286,14 +1612,16 @@ pub fn filter_snapshot_env(
         if value.len() > MAX_ENV_VALUE_BYTES {
             continue;
         }
-        if probe_injected_keys.contains(&key) {
+        if is_probe_guard_env_key(&key) || probe_injected_keys.contains(&key) {
             continue;
         }
         if is_volatile_env_key(&key) {
             continue;
         }
         if !is_safe_allowlisted_key(&key)
-            && (is_sensitive_env_key(&key) || contains_embedded_url_credentials(&value))
+            && (is_sensitive_env_key(&key)
+                || contains_embedded_url_credentials(&value)
+                || contains_inline_private_key(&value))
         {
             continue;
         }
@@ -1359,18 +1687,32 @@ pub fn is_sensitive_env_key(key: &str) -> bool {
         .any(|pair| SENSITIVE_SEGMENT_PAIRS_UPPER.contains(&(pair[0], pair[1])))
 }
 
-/// Detect credentials embedded directly in URLs (e.g. `https://user:pass@proxy:8080`).
+/// Detect credentials embedded in any URL occurrence within `value` (including `user:pass@host`,
+/// token-only `https://ghp_xxx@github.com/...`, and multi-URL variables).
 fn contains_embedded_url_credentials(value: &str) -> bool {
-    let Some(scheme_pos) = value.find("://") else {
-        return false;
-    };
-    let rest = &value[scheme_pos + 3..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let Some((userinfo, _host)) = authority.rsplit_once('@') else {
-        return false;
-    };
-    userinfo.contains(':')
+    let mut cursor = value;
+    while let Some(scheme_pos) = cursor.find("://") {
+        let rest = &cursor[scheme_pos + 3..];
+        let authority_end = rest
+            .find(|c: char| {
+                matches!(c, '/' | '?' | '#' | ',' | ';' | '"' | '\'') || c.is_ascii_whitespace()
+            })
+            .unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        if let Some((userinfo, host)) = authority.rsplit_once('@')
+            && !userinfo.is_empty()
+            && !host.is_empty()
+        {
+            return true;
+        }
+        cursor = rest;
+    }
+    false
+}
+
+/// Detect inline PEM/OpenSSH private keys serialized into environment variables.
+fn contains_inline_private_key(value: &str) -> bool {
+    value.contains("PRIVATE KEY-----")
 }
 
 #[cfg(test)]
@@ -1659,7 +2001,8 @@ mod tests {
             "/bin/zsh".to_string(),
             Duration::from_secs(1800),
             Duration::from_secs(3),
-        );
+        )
+        .with_rc_stat_throttle(Duration::ZERO);
 
         let initial_stamps = collect_rc_file_stamps(&home_dir);
         let initial_fp = compute_snapshot_fingerprint("/bin/zsh", &initial_stamps);
@@ -1963,6 +2306,224 @@ mod tests {
         assert!(timed_out_env.is_empty());
         assert_eq!(slow_cache.stats().probe_errors, 1);
         assert!(!slow_cache.stats().warm);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn filters_token_urls_multi_urls_pem_keys_and_all_probe_guard_envs() {
+        let mut raw = HashMap::new();
+        // Token-only URL credential
+        raw.insert(
+            "GIT_REMOTE_URL".into(),
+            "https://ghp_supersecret123@github.com/org/repo.git".into(),
+        );
+        // Multi-URL where only the second URL carries credentials
+        raw.insert(
+            "PROXY_LIST".into(),
+            "http://public.proxy:8080,https://tok_xyz@private.proxy:8443/path".into(),
+        );
+        raw.insert(
+            "MIRROR_URLS".into(),
+            "https://clean.example.com/a https://alice:secret@internal.example.com/b".into(),
+        );
+        // Inline PEM private key
+        raw.insert(
+            "DEPLOY_CERT".into(),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA...\n-----END OPENSSH PRIVATE KEY-----"
+                .into(),
+        );
+        raw.insert(
+            "TLS_BUNDLE".into(),
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----".into(),
+        );
+        // All PROBE_GUARD_ENVS must be stripped even with an empty probe_injected_keys set
+        for (k, v) in PROBE_GUARD_ENVS {
+            raw.insert((*k).to_string(), (*v).to_string());
+        }
+        // Safe URL with `@` in path (not userinfo) must be preserved
+        raw.insert(
+            "NPM_CONFIG_REGISTRY".into(),
+            "https://registry.npmjs.org/@scope/pkg".into(),
+        );
+
+        let filtered = filter_snapshot_env(raw, &HashSet::new());
+        for dropped in [
+            "GIT_REMOTE_URL",
+            "PROXY_LIST",
+            "MIRROR_URLS",
+            "DEPLOY_CERT",
+            "TLS_BUNDLE",
+        ] {
+            assert!(
+                !filtered.contains_key(dropped),
+                "expected sensitive value `{dropped}` to be stripped"
+            );
+        }
+        for (guard_key, _) in PROBE_GUARD_ENVS {
+            assert!(
+                !filtered.contains_key(*guard_key),
+                "expected probe guard env `{guard_key}` to always be stripped"
+            );
+        }
+        assert_eq!(
+            filtered.get("NPM_CONFIG_REGISTRY").map(String::as_str),
+            Some("https://registry.npmjs.org/@scope/pkg")
+        );
+    }
+
+    #[test]
+    fn subsecond_ttl_rc_stat_throttle_stats_warm_and_disk_guards() {
+        let root = unique_temp_dir("snap_p2");
+        let cache_dir = root.join("shell_snapshots");
+        let home_dir = root.join("home");
+        std::fs::create_dir_all(&home_dir).expect("mkdir home");
+        let zshrc = home_dir.join(".zshrc");
+        std::fs::write(&zshrc, "export A=1\n").expect("write .zshrc");
+
+        // Sub-second TTL should NOT immediately treat a fresh timestamp as expired.
+        let now = now_unix_secs();
+        assert!(is_timestamp_within_ttl(
+            now,
+            now,
+            Duration::from_millis(500)
+        ));
+        assert!(!is_timestamp_within_ttl(
+            now.saturating_sub(1),
+            now,
+            Duration::from_millis(500)
+        ));
+        assert!(!is_timestamp_within_ttl(now, now, Duration::ZERO));
+
+        // Throttled warm hit skips rc stat within window, respects invalidate, and stats().warm flips false on TTL expiry.
+        let cache = ShellSnapshotCache::with_config(
+            cache_dir.clone(),
+            home_dir.clone(),
+            "/bin/zsh".to_string(),
+            Duration::from_millis(80),
+            Duration::from_secs(3),
+        )
+        .with_rc_stat_throttle(Duration::from_secs(5));
+
+        let stamps = collect_rc_file_stamps(&home_dir);
+        let fp = compute_snapshot_fingerprint("/bin/zsh", &stamps);
+        let mut env = BTreeMap::new();
+        env.insert("PATH".into(), "/usr/bin:/bin".into());
+        cache
+            .save_to_disk_atomic(&PersistedShellSnapshot {
+                version: SNAPSHOT_SCHEMA_VERSION,
+                shell: "/bin/zsh".to_string(),
+                fingerprint: fp.clone(),
+                created_at_unix: now_unix_secs(),
+                rc_mtimes: stamps.clone(),
+                env,
+            })
+            .expect("save snap");
+
+        // Load from disk into memory
+        assert!(cache.resolve_env_cached().is_some());
+        assert!(cache.stats().warm);
+
+        // Mutate `.zshrc` mtime within throttle window -> warm memory hit still serves immediately
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&zshrc)
+            .expect("open .zshrc");
+        f.set_modified(SystemTime::now() + Duration::from_secs(30))
+            .expect("bump mtime");
+        drop(f);
+        assert!(cache.resolve_env_cached().is_some());
+
+        // Explicit invalidate immediately clears even within throttle window
+        cache.invalidate();
+        assert!(!cache.stats().warm);
+
+        // Oversized (>2 MiB) snapshot file is rejected safely without reading into memory
+        std::fs::create_dir_all(&cache_dir).expect("mkdir cache_dir");
+        let big_fp = "deadbeef00000000deadbeef00000000";
+        let big_file = cache_dir.join(format!("{big_fp}.json"));
+        std::fs::write(
+            &big_file,
+            vec![b' '; (MAX_SNAPSHOT_FILE_BYTES as usize) + 16],
+        )
+        .expect("write oversized snap");
+        assert!(
+            cache
+                .load_from_disk_if_valid(big_fp, "/bin/zsh", &stamps)
+                .is_none()
+        );
+
+        // Stale `.tmp` files older than 5 minutes are pruned while fresh `.tmp` files are kept
+        let stale_tmp = cache_dir.join(".snap-stale.tmp");
+        let fresh_tmp = cache_dir.join(".snap-fresh.tmp");
+        std::fs::write(&stale_tmp, b"partial").expect("write stale tmp");
+        std::fs::write(&fresh_tmp, b"inflight").expect("write fresh tmp");
+        let stale_f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale_tmp)
+            .expect("open stale tmp");
+        stale_f
+            .set_modified(SystemTime::now() - Duration::from_secs(600))
+            .expect("backdate stale tmp");
+        drop(stale_f);
+
+        prune_stale_disk_snapshots_in(&cache_dir, &fp, "/bin/zsh", Duration::from_secs(1800));
+        assert!(!stale_tmp.exists(), "stale .tmp artifact should be pruned");
+        assert!(fresh_tmp.exists(), "fresh .tmp artifact should be kept");
+
+        // stats().warm becomes false once in-memory entry expires
+        if let Ok(mut guard) = cache.memory.write() {
+            guard.entry = Some(CachedMemoryEntry {
+                shell: "/bin/zsh".to_string(),
+                raw_shell_env: None,
+                fingerprint: fp,
+                created_at_unix: now_unix_secs().saturating_sub(10),
+                created_at_instant: Some(Instant::now() - Duration::from_secs(10)),
+                last_rc_check_at: Instant::now(),
+                env: HashMap::from([("PATH".into(), "/usr/bin".into())]),
+            });
+        }
+        assert!(
+            !cache.stats().warm,
+            "stats().warm must report false once TTL has expired"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn skips_unsupported_non_posix_shells_cleanly() {
+        for sh in [
+            "/bin/csh",
+            "/usr/bin/tcsh",
+            "/opt/homebrew/bin/nu",
+            "/usr/local/bin/pwsh",
+            "pwsh.exe",
+        ] {
+            assert!(
+                is_unsupported_non_posix_shell(sh),
+                "expected `{sh}` to be treated as unsupported non-POSIX shell"
+            );
+        }
+        for sh in ["/bin/zsh", "/bin/bash", "/usr/bin/fish", "/bin/sh"] {
+            assert!(
+                !is_unsupported_non_posix_shell(sh),
+                "expected `{sh}` to be supported"
+            );
+        }
+
+        let root = unique_temp_dir("snap_nonposix");
+        let cache = ShellSnapshotCache::with_config(
+            root.join("shell_snapshots"),
+            root.join("home"),
+            "/usr/bin/tcsh".to_string(),
+            Duration::from_secs(1800),
+            Duration::from_secs(3),
+        );
+        let env = cache.resolve_env().await;
+        assert!(env.is_empty());
+        assert_eq!(cache.stats().probe_errors, 0);
+        assert!(!cache.stats().warm);
 
         let _ = std::fs::remove_dir_all(&root);
     }

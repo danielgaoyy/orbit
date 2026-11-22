@@ -181,23 +181,46 @@ pub fn find_provider_executable(kind: ProviderKind) -> Option<PathBuf> {
 }
 
 pub fn find_executable(binary_name: &str) -> Option<PathBuf> {
-    let mut search_dirs: Vec<PathBuf> = env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).collect())
-        .unwrap_or_default();
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
 
+    // Search cached login-shell PATH directories ahead of inherited PATH (consistent with `merge_paths`).
     for dir in shell_snapshot::cached_login_shell_path_dirs() {
         if !search_dirs.contains(&dir) {
             search_dirs.push(dir);
         }
     }
 
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        search_dirs.push(home.join(".local/bin"));
-        search_dirs.push(home.join(".npm-global/bin"));
-        search_dirs.push(home.join(".cargo/bin"));
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            if !dir.as_os_str().is_empty() && !search_dirs.contains(&dir) {
+                search_dirs.push(dir);
+            }
+        }
     }
-    search_dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    search_dirs.push(PathBuf::from("/usr/local/bin"));
+
+    if let Some(home) = env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+        .map(PathBuf::from)
+    {
+        for extra in [
+            home.join(".local/bin"),
+            home.join(".npm-global/bin"),
+            home.join(".cargo/bin"),
+        ] {
+            if !search_dirs.contains(&extra) {
+                search_dirs.push(extra);
+            }
+        }
+    }
+    for extra in [
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ] {
+        if !search_dirs.contains(&extra) {
+            search_dirs.push(extra);
+        }
+    }
 
     for dir in search_dirs {
         let candidate = dir.join(binary_name);

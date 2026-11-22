@@ -10,7 +10,8 @@
 //!   overlapping source/destination trees, and any symlink whose target escapes its allowed root.
 
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::process::{Command, Stdio};
 
 use anyhow::Context;
 
@@ -218,9 +219,9 @@ pub fn copy_dir_cow_within(
 
     // Prevent infinite recursion / self-overwrite when destination overlaps source.
     let resolved_dst = canonicalize_best_effort(dst)?;
-    if resolved_dst.starts_with(&canon_src) {
+    if resolved_dst.starts_with(&canon_src) || canon_src.starts_with(&resolved_dst) {
         anyhow::bail!(
-            "destination directory cannot be inside or equal to source directory: {} -> {}",
+            "destination directory cannot overlap with source directory: {} -> {}",
             canon_src.display(),
             dst.display()
         );
@@ -294,9 +295,9 @@ pub fn link_or_clone_dir(
     }
 
     let resolved_dst = canonicalize_best_effort(dst)?;
-    if resolved_dst.starts_with(&canon_src) {
+    if resolved_dst.starts_with(&canon_src) || canon_src.starts_with(&resolved_dst) {
         anyhow::bail!(
-            "destination cannot be inside or equal to source directory: {} -> {}",
+            "destination cannot overlap with source directory: {} -> {}",
             canon_src.display(),
             dst.display()
         );
@@ -345,6 +346,9 @@ fn copy_file_cow_validated(canon_src: &Path, dst: &Path) -> anyhow::Result<CopyM
         .arg("--")
         .arg(canon_src)
         .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     if let Ok(st) = status
         && st.success()
@@ -369,6 +373,9 @@ fn copy_file_cow_validated(canon_src: &Path, dst: &Path) -> anyhow::Result<CopyM
         .arg("--")
         .arg(canon_src)
         .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         && st.success()
     {
@@ -380,6 +387,9 @@ fn copy_file_cow_validated(canon_src: &Path, dst: &Path) -> anyhow::Result<CopyM
         .arg("--")
         .arg(canon_src)
         .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         && st.success()
     {
@@ -425,6 +435,9 @@ fn copy_dir_cow_validated(
         .arg("--")
         .arg(&cp_src)
         .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
     if let Ok(st) = status
         && st.success()
@@ -460,6 +473,9 @@ fn copy_dir_cow_validated(
         .arg("--")
         .arg(&cp_src)
         .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         && st.success()
     {
@@ -477,6 +493,9 @@ fn copy_dir_cow_validated(
         .arg("--")
         .arg(&cp_src)
         .arg(dst)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         && st.success()
     {
@@ -505,9 +524,6 @@ fn copy_dir_cow_validated(
 fn copy_dir_standard(src: &Path, dst: &Path, allowed_root: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("failed to create directory: {}", dst.display()))?;
-    if let Ok(meta) = std::fs::metadata(src) {
-        let _ = std::fs::set_permissions(dst, meta.permissions());
-    }
 
     let entries = std::fs::read_dir(src)
         .with_context(|| format!("failed to read directory: {}", src.display()))?;
@@ -555,6 +571,12 @@ fn copy_dir_standard(src: &Path, dst: &Path, allowed_root: &Path) -> anyhow::Res
                 )
             })?;
         }
+    }
+
+    // Apply directory permissions after copying entries so read-only (`0o555`) directories
+    // can be populated before their write bit is stripped.
+    if let Ok(meta) = std::fs::metadata(src) {
+        let _ = std::fs::set_permissions(dst, meta.permissions());
     }
     Ok(())
 }
@@ -662,7 +684,7 @@ pub(crate) fn resolve_symlink_target_safe(
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
             let canon_base = canonicalize_best_effort(base_dir)?;
-            lexical_normalize(&canon_base.join(&raw_target))
+            canonicalize_best_effort(&canon_base.join(&raw_target))?
         };
 
         if !next.starts_with(allowed_root) {
@@ -902,8 +924,9 @@ mod tests {
         assert!(copy_dir_cow(&root.join("src/../src"), &dst).is_err());
         assert!(copy_dir_cow(&src, &root.join("dst/../escape")).is_err());
 
-        // Reject destination inside source
+        // Reject destination inside source or source inside destination
         assert!(copy_dir_cow(&src, &src.join("nested_dst")).is_err());
+        assert!(copy_dir_cow(&src.join("sub"), &src).is_err());
 
         #[cfg(unix)]
         {
@@ -979,5 +1002,59 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_symlink_rejects_intermediate_escape_with_nonexistent_leaf() {
+        let root = temp_dir("inter_escape");
+        let src = root.join("src");
+        let outside_dir = root.join("outside_dir");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        std::fs::create_dir_all(&outside_dir).expect("mkdir outside_dir");
+
+        // `escape_dir -> outside_dir` and `sneaky -> escape_dir/nonexistent_leaf`
+        std::os::unix::fs::symlink(&outside_dir, src.join("escape_dir"))
+            .expect("create escape_dir symlink");
+        std::os::unix::fs::symlink("escape_dir/nonexistent_leaf", src.join("sneaky"))
+            .expect("create sneaky relative symlink");
+
+        let canon_src = std::fs::canonicalize(&src).expect("canon src");
+        assert!(
+            resolve_symlink_target_safe(&src.join("sneaky"), &canon_src).is_err(),
+            "intermediate escaping symlink followed by nonexistent leaf must be rejected"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_standard_handles_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("ro_dir");
+        let src = root.join("ro_src");
+        let dst = root.join("ro_dst");
+        std::fs::create_dir_all(&src).expect("mkdir ro_src");
+        std::fs::write(src.join("inside.txt"), "read-only-content").expect("write inside");
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod 0555 src");
+
+        let canon_src = std::fs::canonicalize(&src).expect("canon src");
+        let res = copy_dir_standard(&canon_src, &dst, &canon_src);
+
+        // Restore write bits before assertions/cleanup so teardown never leaves read-only dirs behind.
+        let dst_mode = std::fs::metadata(&dst)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777);
+        let copied_content = std::fs::read_to_string(dst.join("inside.txt")).ok();
+        let _ = std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&root);
+
+        res.expect("copy_dir_standard must succeed on 0o555 directory");
+        assert_eq!(copied_content.as_deref(), Some("read-only-content"));
+        assert_eq!(dst_mode, Some(0o555));
     }
 }

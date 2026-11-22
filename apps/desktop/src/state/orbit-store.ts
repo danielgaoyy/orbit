@@ -1300,6 +1300,31 @@ function omitRecordKeys<T>(
   return mutated ? next : record;
 }
 
+function collectRemotelyArchivedDraftScopes(
+  s: OrbitUiState,
+  details: Iterable<readonly [string, HostDetailView]>,
+  activeScopeKey: string | null,
+): Set<string> {
+  const keysToPrune = new Set<string>();
+  for (const [hostId, detail] of details) {
+    for (const ag of detail.agents) {
+      if (!ag.archived_at_rfc3339 || isAgentForegroundRunning(ag)) continue;
+      const scopeKey = threadScopeKey(hostId, ag.agent_id);
+      if (scopeKey === activeScopeKey) continue;
+      if (
+        scopeKey in s.composerDrafts ||
+        scopeKey in s.slashDirectives ||
+        scopeKey in s.pastedAttachments ||
+        scopeKey in s.diffQuotes ||
+        scopeKey in s.sideQuestionDrafts
+      ) {
+        keysToPrune.add(scopeKey);
+      }
+    }
+  }
+  return keysToPrune;
+}
+
 function resolveSettingsSectionTarget(
   s: OrbitUiState,
   section?: SettingsSectionTarget,
@@ -2275,6 +2300,16 @@ export const orbitActions = {
       const nextDraftProvider =
         avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider;
 
+      const activeScopeKey =
+        !nextDraft && activeHostId && nextAgentId
+          ? threadScopeKey(activeHostId, nextAgentId)
+          : null;
+      const remotelyArchivedDraftKeys = collectRemotelyArchivedDraftScopes(
+        s,
+        Object.entries(nextDetails),
+        activeScopeKey,
+      );
+
       return {
         ...s,
         fleet: snap,
@@ -2286,6 +2321,15 @@ export const orbitActions = {
         selectedWorkspaceCwd: nextCwd,
         isDraftNewSession: nextDraft,
         draftProvider: nextDraftProvider,
+        ...(remotelyArchivedDraftKeys.size > 0
+          ? {
+              composerDrafts: omitRecordKeys(s.composerDrafts, remotelyArchivedDraftKeys),
+              slashDirectives: omitRecordKeys(s.slashDirectives, remotelyArchivedDraftKeys),
+              pastedAttachments: omitRecordKeys(s.pastedAttachments, remotelyArchivedDraftKeys),
+              diffQuotes: omitRecordKeys(s.diffQuotes, remotelyArchivedDraftKeys),
+              sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, remotelyArchivedDraftKeys),
+            }
+          : {}),
       };
     }, true);
 
@@ -2464,6 +2508,16 @@ export const orbitActions = {
       const nextDraftProvider =
         avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider;
 
+      const activeScopeKey =
+        !nextDraft && s.selectedHostId && nextAgentId
+          ? threadScopeKey(s.selectedHostId, nextAgentId)
+          : null;
+      const remotelyArchivedDraftKeys = collectRemotelyArchivedDraftScopes(
+        s,
+        [[hostId, detail]],
+        activeScopeKey,
+      );
+
       return {
         ...s,
         ...(overview
@@ -2481,6 +2535,15 @@ export const orbitActions = {
         draftProvider: nextDraftProvider,
         terminalTabs: nextTabs,
         activeTerminalTabKey: nextActiveTab,
+        ...(remotelyArchivedDraftKeys.size > 0
+          ? {
+              composerDrafts: omitRecordKeys(s.composerDrafts, remotelyArchivedDraftKeys),
+              slashDirectives: omitRecordKeys(s.slashDirectives, remotelyArchivedDraftKeys),
+              pastedAttachments: omitRecordKeys(s.pastedAttachments, remotelyArchivedDraftKeys),
+              diffQuotes: omitRecordKeys(s.diffQuotes, remotelyArchivedDraftKeys),
+              sideQuestionDrafts: omitRecordKeys(s.sideQuestionDrafts, remotelyArchivedDraftKeys),
+            }
+          : {}),
       };
     });
 

@@ -4,8 +4,10 @@ import {
   DRAFTS_STORAGE_KEY,
   DRAFT_SCHEMA_VERSION,
   DRAFT_TTL_MS,
+  MAX_FUTURE_TIMESTAMP_SKEW_MS,
   MAX_TOTAL_DRAFT_BYTES,
   buildPersistedDraftPayload,
+  buildSerializedDraftPayload,
   createDraftPersistenceController,
   hasNonEmptyScopeDraft,
   parseAndValidatePersistedDrafts,
@@ -467,5 +469,243 @@ describe("draft-persistence", () => {
     });
     assert.deepEqual(ctrl.hydrate().composerDrafts, {});
     ctrl.dispose();
+  });
+
+  it("preserves original timestamps of LRU-evicted in-memory scopes to prevent LRU inversion on subsequent flushes", () => {
+    const storage = new MemoryStorage();
+    const slices = emptySlices();
+    let clock = 1_700_000_000_000;
+
+    // Budget big enough for 1 large draft (~190 B), too small for 2 (~350 B)
+    const controller = createDraftPersistenceController(() => slices, {
+      storage,
+      maxTotalBytes: 256,
+      maxEntryBytes: 220,
+      now: () => clock,
+      windowTarget: null,
+      documentTarget: null,
+    });
+
+    slices.composerDrafts["host::old"] = "o".repeat(120);
+    controller.markDirty("host::old");
+    clock += 5_000;
+    slices.composerDrafts["host::new"] = "n".repeat(120);
+    controller.markDirty("host::new");
+    controller.flushNow();
+
+    const persisted1 = JSON.parse(storage.getItem(DRAFTS_STORAGE_KEY) ?? "{}");
+    assert.equal(persisted1.drafts["host::old"], undefined);
+    assert.equal(persisted1.drafts["host::new"]?.text, "n".repeat(120));
+    // Original timestamp for still-in-memory evicted scope must remain intact
+    assert.equal(controller.exportUpdatedAtByScope()["host::old"], 1_700_000_000_000);
+
+    // Subsequent flush while host::old is still in memory must NOT re-stamp host::old
+    // with nowMs and invert LRU order against host::new
+    clock += 10_000;
+    slices.composerDrafts["host::new"] = "m".repeat(110);
+    controller.markDirty("host::new");
+    controller.flushNow();
+
+    const persisted2 = JSON.parse(storage.getItem(DRAFTS_STORAGE_KEY) ?? "{}");
+    assert.equal(persisted2.drafts["host::old"], undefined);
+    assert.equal(persisted2.drafts["host::new"]?.text, "m".repeat(110));
+    assert.equal(controller.exportUpdatedAtByScope()["host::old"], 1_700_000_000_000);
+
+    // Once host::old is genuinely cleared in memory, its timestamp is pruned on flush
+    delete slices.composerDrafts["host::old"];
+    controller.flushNow(true);
+    assert.equal(controller.exportUpdatedAtByScope()["host::old"], undefined);
+    controller.dispose();
+  });
+
+  it("does not destructively remove previously persisted drafts when setItem keeps throwing QuotaExceededError", () => {
+    const storage = new MemoryStorage();
+    const initialJson = JSON.stringify({
+      version: DRAFT_SCHEMA_VERSION,
+      drafts: {
+        "host::existing": { updatedAt: 1_700_000_000_000, text: "valid saved draft" },
+      },
+    });
+    storage.data.set(DRAFTS_STORAGE_KEY, initialJson);
+    // Simulate storage completely full: every setItem throws QuotaExceededError
+    storage.throwOnSetBytesLimit = 0;
+
+    const slices = emptySlices();
+    slices.composerDrafts["host::existing"] = "valid saved draft";
+    slices.composerDrafts["host::unsaved"] = "new draft that triggers quota error";
+
+    const controller = createDraftPersistenceController(() => slices, {
+      storage,
+      now: () => 1_700_000_005_000,
+      windowTarget: null,
+      documentTarget: null,
+    });
+    controller.markDirty(["host::existing", "host::unsaved"]);
+
+    assert.doesNotThrow(() => controller.flushNow());
+    assert.equal(storage.removeCalls, 0);
+    assert.equal(storage.getItem(DRAFTS_STORAGE_KEY), initialJson);
+    controller.dispose();
+  });
+
+  it("clamps future updatedAt timestamps beyond 60s skew on parse, build, and flush", () => {
+    const nowMs = 1_700_000_000_000;
+    const farFuture = nowMs + MAX_FUTURE_TIMESTAMP_SKEW_MS + 5_000_000;
+    const slightFuture = nowMs + 30_000;
+
+    // 1. parseAndValidatePersistedDrafts clamps far-future timestamps and flags cleanup
+    const raw = JSON.stringify({
+      version: DRAFT_SCHEMA_VERSION,
+      drafts: {
+        "host::skewed": { updatedAt: farFuture, text: "x".repeat(120) },
+        "host::slight": { updatedAt: slightFuture, text: "y".repeat(120) },
+      },
+    });
+    const parsedAll = parseAndValidatePersistedDrafts(raw, { nowMs });
+    assert.equal(parsedAll.updatedAtByScope["host::skewed"], nowMs);
+    assert.equal(parsedAll.updatedAtByScope["host::slight"], slightFuture);
+    assert.equal(parsedAll.prunedCount, 1);
+
+    // Under tight budget, clamped far-future draft (nowMs) is evicted before slightFuture
+    const parsedTight = parseAndValidatePersistedDrafts(raw, {
+      nowMs,
+      maxTotalBytes: 256,
+      maxEntryBytes: 220,
+    });
+    assert.equal(parsedTight.composerDrafts["host::skewed"], undefined);
+    assert.equal(parsedTight.composerDrafts["host::slight"], "y".repeat(120));
+
+    // 2. buildPersistedDraftPayload clamps far-future timestamps so they cannot pin LRU
+    const slices = emptySlices();
+    slices.composerDrafts["host::skewed"] = "a".repeat(120);
+    slices.composerDrafts["host::recent"] = "b".repeat(120);
+    const builtAll = buildPersistedDraftPayload(
+      slices,
+      { "host::skewed": farFuture, "host::recent": slightFuture },
+      { nowMs },
+    );
+    assert.equal(builtAll.drafts["host::skewed"]?.updatedAt, nowMs);
+    assert.equal(builtAll.drafts["host::recent"]?.updatedAt, slightFuture);
+
+    const builtTight = buildPersistedDraftPayload(
+      slices,
+      { "host::skewed": farFuture, "host::recent": slightFuture },
+      { nowMs, maxTotalBytes: 256, maxEntryBytes: 220 },
+    );
+    assert.equal(builtTight.drafts["host::skewed"], undefined);
+    assert.equal(builtTight.drafts["host::recent"]?.text, "b".repeat(120));
+
+    // 3. Controller flush normalizes skewed in-memory timestamps if system clock jumped backward
+    const storage = new MemoryStorage();
+    let clock = farFuture;
+    const ctrlSlices = emptySlices();
+    const ctrl = createDraftPersistenceController(() => ctrlSlices, {
+      storage,
+      now: () => clock,
+      windowTarget: null,
+      documentTarget: null,
+    });
+    ctrlSlices.composerDrafts["host::skewed"] = "before clock jump";
+    ctrl.markDirty("host::skewed");
+    // Clock jumps backward to nowMs before flush
+    clock = nowMs;
+    ctrl.flushNow();
+    assert.equal(ctrl.exportUpdatedAtByScope()["host::skewed"], nowMs);
+    ctrl.dispose();
+  });
+
+  it("serializes full payload in a single pass on flush and trims only needed excess bytes", () => {
+    const storage = new MemoryStorage();
+    const slices = emptySlices();
+    const nowMs = 1_700_000_000_000;
+    slices.composerDrafts["host::a"] = "draft alpha";
+    slices.composerDrafts["host::b"] = "draft beta";
+
+    const controller = createDraftPersistenceController(() => slices, {
+      storage,
+      now: () => nowMs,
+      windowTarget: null,
+      documentTarget: null,
+    });
+    controller.markDirty(["host::a", "host::b"]);
+
+    const origStringify = JSON.stringify;
+    let fullPayloadStringifies = 0;
+    JSON.stringify = ((value: unknown, ...rest: unknown[]) => {
+      if (
+        typeof value === "object" &&
+        value !== null &&
+        "version" in value &&
+        "drafts" in value
+      ) {
+        fullPayloadStringifies += 1;
+      }
+      return (origStringify as (...args: unknown[]) => string)(value, ...rest);
+    }) as typeof JSON.stringify;
+
+    try {
+      controller.flushNow();
+    } finally {
+      JSON.stringify = origStringify;
+    }
+
+    assert.equal(fullPayloadStringifies, 1);
+    assert.equal(storage.setCalls, 1);
+    const expected = buildSerializedDraftPayload(slices, controller.exportUpdatedAtByScope(), {
+      nowMs,
+    });
+    assert.equal(storage.getItem(DRAFTS_STORAGE_KEY), expected.json);
+    controller.dispose();
+
+    // Evicting many scopes avoids O(N^2) full-payload re-stringification
+    const manySlices = emptySlices();
+    const manyTimes: Record<string, number> = {};
+    for (let i = 0; i < 20; i++) {
+      const key = `host::s-${String(i).padStart(2, "0")}`;
+      manySlices.composerDrafts[key] = "z".repeat(80);
+      manyTimes[key] = nowMs + i * 1_000;
+    }
+    let evictionFullStringifies = 0;
+    JSON.stringify = ((value: unknown, ...rest: unknown[]) => {
+      if (
+        typeof value === "object" &&
+        value !== null &&
+        "version" in value &&
+        "drafts" in value
+      ) {
+        evictionFullStringifies += 1;
+      }
+      return (origStringify as (...args: unknown[]) => string)(value, ...rest);
+    }) as typeof JSON.stringify;
+    let evictedResult: ReturnType<typeof buildSerializedDraftPayload>;
+    try {
+      evictedResult = buildSerializedDraftPayload(manySlices, manyTimes, {
+        nowMs: nowMs + 30_000,
+        maxTotalBytes: 512,
+      });
+    } finally {
+      JSON.stringify = origStringify;
+    }
+    assert.ok(evictedResult.evictedKeys.length >= 15);
+    assert.ok(evictedResult.json !== null);
+    assert.ok(utf8ByteLength(evictedResult.json) <= 512);
+    assert.ok(
+      evictionFullStringifies <= 2,
+      `expected <= 2 full-payload stringifications, got ${evictionFullStringifies}`,
+    );
+
+    // Tight entry trimming removes only excess bytes rather than halving text
+    const tightSlices = emptySlices();
+    tightSlices.composerDrafts["host::tight"] = "a".repeat(220);
+    const tightPayload = buildPersistedDraftPayload(
+      tightSlices,
+      { "host::tight": nowMs },
+      { nowMs, maxTotalBytes: 512, maxEntryBytes: 256, maxTextBytes: 256 },
+    );
+    const trimmedText = tightPayload.drafts["host::tight"]?.text ?? "";
+    assert.ok(
+      trimmedText.length >= 190 && trimmedText.length < 220,
+      `expected tight trim preserving >= 190 chars (not halved to ~110), got ${trimmedText.length}`,
+    );
   });
 });

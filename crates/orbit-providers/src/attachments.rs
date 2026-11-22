@@ -325,14 +325,18 @@ fn decode_pdf_title_bytes(raw: &[u8]) -> Option<String> {
     }
     let decoded = if raw.len() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF {
         let units: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes(*c))
             .collect();
         String::from_utf16(&units).ok()?
     } else if raw.len() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE {
         let units: Vec<u16> = raw[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         String::from_utf16(&units).ok()?
     } else if !raw.contains(&0)
@@ -448,11 +452,13 @@ fn parse_pdf_title_at(data: &[u8], value_start: usize) -> Option<String> {
         if j >= data.len() || data[j] != b'>' || nibbles.is_empty() {
             return None;
         }
-        if nibbles.len() % 2 == 1 {
+        if !nibbles.len().is_multiple_of(2) {
             nibbles.push(0);
         }
         let raw: Vec<u8> = nibbles
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (pair[0] << 4) | pair[1])
             .collect();
         return decode_pdf_title_bytes(&raw);

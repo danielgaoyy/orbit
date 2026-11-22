@@ -279,7 +279,7 @@ fn sniff_iso_bmff(bytes: &[u8], ext_hint: Option<&str>) -> Option<SniffedMedia> 
     let mut has_video_compat = false;
     let mut has_qt_compat = false;
     if box_end >= 20 {
-        for chunk in bytes[16..box_end].chunks_exact(4) {
+        for chunk in bytes[16..box_end].as_chunks::<4>().0 {
             if is_iso_audio_brand(chunk) {
                 has_audio_compat = true;
             } else if chunk == b"qt  " {

@@ -1602,7 +1602,6 @@ mod tests {
         panic!("timed out waiting for in-process orbit shim socket");
     }
 
-    #[cfg(unix)]
     fn make_test_cfg(
         agent_id: &str,
         script: &Path,

@@ -22,7 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
-use crate::attachments::build_codex_input_items;
+use crate::attachments::build_codex_input_items_async;
 use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 
 /// Serialize concurrent `codex app-server` SQLite state runtime startups.
@@ -504,8 +504,11 @@ async fn run_codex_actor(
                                 prompt = format!("{ctx}\n\n{prompt}");
                             }
                         }
-                        let input_items =
-                            build_codex_input_items(&prompt, cfg.attachments_dir.as_deref());
+                        let input_items = build_codex_input_items_async(
+                            prompt.clone(),
+                            cfg.attachments_dir.clone(),
+                        )
+                        .await;
                         if let Some(ref active_nat_tid) = native_turn_id {
                             match behavior {
                                 ActiveTurnBehavior::Steer => {
@@ -841,7 +844,8 @@ async fn dispatch_codex_turn(
     shim: &orbit_shim::ShimClient,
     evt_tx: &mpsc::Sender<DriverEvent>,
 ) -> Result<(), ()> {
-    let input_items = build_codex_input_items(prompt, cfg.attachments_dir.as_deref());
+    let input_items =
+        build_codex_input_items_async(prompt.to_string(), cfg.attachments_dir.clone()).await;
     *client_turn_id = Some(turn_id.to_string());
     msg_accum.clear();
     thought_accum.clear();

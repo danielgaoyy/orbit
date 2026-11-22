@@ -11,7 +11,9 @@ import {
   FileLock2,
   FileTerminal,
   FileText,
+  Film,
   GitCompareArrows,
+  Music,
   SquareTerminal,
   Users,
   type LucideIcon,
@@ -117,7 +119,23 @@ export function resolveSemanticFileIcon(basename: string): LucideIcon {
     case "txt":
     case "rst":
     case "adoc":
+    case "pdf":
       return FileText;
+    case "mp4":
+    case "mov":
+    case "m4v":
+    case "webm":
+    case "mkv":
+      return Film;
+    case "mp3":
+    case "wav":
+    case "m4a":
+    case "aac":
+    case "ogg":
+    case "flac":
+    case "opus":
+    case "weba":
+      return Music;
     case "png":
     case "jpg":
     case "jpeg":

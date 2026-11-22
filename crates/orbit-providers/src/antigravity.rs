@@ -23,7 +23,7 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use crate::attachments::{build_agy_prompt_blocks, is_path_within_dir};
+use crate::attachments::{AcpPromptMediaCaps, build_acp_prompt_blocks_async, is_path_within_dir};
 use crate::driver::{
     DriverCommand, DriverEvent, ProviderSessionHandle, RpcId, SessionLaunchConfig,
 };
@@ -486,6 +486,7 @@ async fn run_agy_actor(
     let mut next_rpc_id: i64 = if is_reattached { 100_000 } else { 1 };
     let mut pending_rpcs: HashMap<String, oneshot::Sender<Result<Value, Value>>> = HashMap::new();
     let mut inject_handoff_on_next_prompt = false;
+    let mut prompt_media_caps = AcpPromptMediaCaps::antigravity();
     let mut recovered_missing_trajectory = false;
     let mut pending_handoff_context = cfg.fallback_handoff_context.clone();
 
@@ -550,6 +551,7 @@ async fn run_agy_actor(
                 return;
             }
         };
+        prompt_media_caps = AcpPromptMediaCaps::from_antigravity_initialize(&init_val);
 
         // 2. `session/fork`, `session/load`, or `session/new` with Orbit MCP servers (HTTP first, stdio fallback)
         let opened = if let Some(ref fork_sid) = cfg.fork_from_session_id {
@@ -986,6 +988,7 @@ async fn run_agy_actor(
                             &shim,
                             &session_id,
                             cfg.attachments_dir.as_deref(),
+                            prompt_media_caps,
                             &mut next_rpc_id,
                             &mut active_turn_id,
                             &mut active_prompt_rpc_key,
@@ -1353,6 +1356,7 @@ async fn run_agy_actor(
                                                         &shim,
                                                         &session_id,
                                                         cfg.attachments_dir.as_deref(),
+                                                        prompt_media_caps,
                                                         &mut next_rpc_id,
                                                         &mut active_turn_id,
                                                         &mut active_prompt_rpc_key,
@@ -1426,6 +1430,7 @@ async fn run_agy_actor(
                                             &shim,
                                             &session_id,
                                             cfg.attachments_dir.as_deref(),
+                                            prompt_media_caps,
                                             &mut next_rpc_id,
                                             &mut active_turn_id,
                                             &mut active_prompt_rpc_key,
@@ -1977,6 +1982,7 @@ async fn run_agy_actor(
                                     &shim,
                                     &session_id,
                                     cfg.attachments_dir.as_deref(),
+                                    prompt_media_caps,
                                     &mut next_rpc_id,
                                     &mut active_turn_id,
                                     &mut active_prompt_rpc_key,
@@ -2131,6 +2137,7 @@ async fn dispatch_agy_prompt(
     shim: &orbit_shim::ShimClient,
     session_id: &str,
     attachments_dir: Option<&Path>,
+    prompt_media_caps: AcpPromptMediaCaps,
     next_rpc_id: &mut i64,
     active_turn_id: &mut Option<String>,
     active_prompt_rpc_key: &mut Option<String>,
@@ -2161,7 +2168,12 @@ async fn dispatch_agy_prompt(
     let key = RpcId::Num(id).as_key();
     *active_prompt_rpc_key = Some(key);
 
-    let prompt_blocks = build_agy_prompt_blocks(&prompt, attachments_dir);
+    let prompt_blocks = build_acp_prompt_blocks_async(
+        prompt,
+        attachments_dir.map(Path::to_path_buf),
+        prompt_media_caps,
+    )
+    .await;
     let req = json!({
         "jsonrpc": "2.0",
         "id": id,

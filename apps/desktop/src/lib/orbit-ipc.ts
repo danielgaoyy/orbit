@@ -1260,7 +1260,7 @@ export interface WorkspaceFileView {
   path: string;
   resolved_path: string;
   language: string;
-  content_kind: "text" | "image" | "binary" | string;
+  content_kind: "text" | "image" | "pdf" | "audio" | "video" | "binary" | string;
   mime_type: string | null;
   content: string;
   size_bytes: number;
@@ -1696,6 +1696,9 @@ export interface SlashCommandView {
 
 export type ComposerContextInput =
   | { kind: "image"; path: string; filename: string }
+  | { kind: "pdf"; path: string; filename: string }
+  | { kind: "audio"; path: string; filename: string }
+  | { kind: "video"; path: string; filename: string }
   | { kind: "staged_file"; path: string; filename: string }
   | { kind: "workspace_file"; path: string }
   | { kind: "git_diff"; staged: boolean; label: string; diff_text?: string | null }
@@ -3307,6 +3310,17 @@ export const orbitIpc = {
       return;
     }
     await invoke<void>("open_external_browser_url", { url });
+  },
+
+  openLocalFileExternally: async (
+    hostId: string,
+    cwd: string,
+    path: string,
+  ): Promise<void> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to open local files externally");
+    }
+    await invoke<void>("open_local_file_externally", { hostId, cwd, path });
   },
 
   stageHostAttachmentBytes: async (

@@ -69,7 +69,10 @@ use uuid::Uuid;
 use crate::attachments::AttachmentStagingManager;
 use crate::connected_hosts::ConnectedHostsManager;
 use crate::finish_subscriptions::FinishSubscriptionManager;
-use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files, read_workspace_file};
+use crate::git::{
+    compute_git_diff, inspect_git_status, list_workspace_files,
+    read_workspace_file_with_attachments_dir,
+};
 use crate::idle_cleanup::IdleRuntimeCleanup;
 use crate::keep_awake::KeepAwakeManager;
 use crate::manager::{
@@ -794,7 +797,9 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(runtime): State<Arc<DaemonRuntime>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_direct_socket(socket, runtime))
+    ws.max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+        .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+        .on_upgrade(move |socket| handle_direct_socket(socket, runtime))
 }
 
 async fn handle_direct_socket(socket: WebSocket, runtime: Arc<DaemonRuntime>) {
@@ -1578,9 +1583,17 @@ async fn handle_wire_rpc(
         } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
+            let attachments_dir = runtime.attachments.attachments_dir().to_path_buf();
             tokio::spawn(async move {
                 let resolved_cwd = expand_host_path(&cwd);
-                let reply = match read_workspace_file(&resolved_cwd, &path, max_bytes).await {
+                let reply = match read_workspace_file_with_attachments_dir(
+                    &resolved_cwd,
+                    &path,
+                    max_bytes,
+                    Some(&attachments_dir),
+                )
+                .await
+                {
                     Ok(file_data) => WireMessage::WorkspaceFileContentResponse {
                         request_id,
                         cwd,
@@ -3854,5 +3867,66 @@ mod self_upgrade_tests {
             build_self_upgrade_restart_script(bin, Some(Path::new("/tmp/o home")), 7474, true);
         assert!(with_relay.contains("--home '/tmp/o home' daemon up --port 7474"));
         assert!(with_relay.contains("relay up >/dev/null 2>&1 || true"));
+    }
+
+    #[tokio::test]
+    async fn websocket_48mib_frame_limit_roundtrips_18mib_binary_payload() {
+        use axum::{Router, extract::ws::WebSocketUpgrade, routing::get};
+        use futures_util::{SinkExt, StreamExt};
+        use orbit_relay_transport::RelayConnector;
+
+        let app = Router::new().route(
+            "/ws",
+            get(|ws: WebSocketUpgrade| async move {
+                ws.max_frame_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+                    .max_message_size(orbit_protocol::MAX_WS_FRAME_BYTES)
+                    .on_upgrade(|mut socket| async move {
+                        if let Some(Ok(axum::extract::ws::Message::Binary(data))) =
+                            socket.recv().await
+                        {
+                            let _ = socket.send(axum::extract::ws::Message::Binary(data)).await;
+                        }
+                    })
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let connector = RelayConnector::connect(&format!("ws://127.0.0.1:{}", addr.port()))
+            .await
+            .expect("connect");
+        let mut client_ws = connector.open_ws("/ws").await.expect("connect ws");
+
+        // 18 MiB exceeds the default 16 MiB Axum/tungstenite frame cap and must round-trip cleanly.
+        let payload_len = 18 * 1024 * 1024;
+        let payload = vec![0x5Au8; payload_len];
+        client_ws
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                payload.into(),
+            ))
+            .await
+            .expect("send 18 MiB frame");
+
+        let reply = client_ws
+            .next()
+            .await
+            .expect("echo frame present")
+            .expect("echo frame ok");
+        match reply {
+            tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                assert_eq!(bytes.len(), payload_len);
+                assert_eq!(bytes[0], 0x5A);
+                assert_eq!(bytes[payload_len - 1], 0x5A);
+            }
+            other => panic!("expected binary echo frame, got {other:?}"),
+        }
+
+        server.abort();
     }
 }

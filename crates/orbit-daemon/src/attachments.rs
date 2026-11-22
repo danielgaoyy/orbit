@@ -54,6 +54,17 @@ impl AttachmentStagingManager {
         &self.attachments_dir
     }
 
+    /// Returns true if `path` canonicalizes to a regular file strictly contained inside `attachments_dir`.
+    pub fn is_staged_file(&self, path: &Path) -> bool {
+        let Ok(canon_dir) = fs::canonicalize(&self.attachments_dir) else {
+            return false;
+        };
+        let Ok(canon_file) = fs::canonicalize(path) else {
+            return false;
+        };
+        canon_file.is_file() && canon_file.starts_with(&canon_dir)
+    }
+
     pub async fn ingest_chunk(
         &self,
         upload_id: String,

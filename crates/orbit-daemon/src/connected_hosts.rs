@@ -20,8 +20,10 @@ use orbit_relay_transport::RelayConnector;
 use orbit_store::{OrbitStore, StoredConnectedHost};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::AbortHandle;
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message as TungMsg;
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{Message as TungMsg, protocol::WebSocketConfig},
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -610,7 +612,14 @@ async fn connect_direct_peer(
     mpsc::Sender<WireMessage>,
     mpsc::Receiver<WireMessage>,
 )> {
-    let (ws, _) = tokio::time::timeout(Duration::from_secs(2), connect_async(ws_url)).await??;
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    let (ws, _) = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect_async_with_config(ws_url, Some(ws_cfg), false),
+    )
+    .await??;
     let (mut sink, mut stream) = ws.split();
 
     let hello = WireMessage::Hello {

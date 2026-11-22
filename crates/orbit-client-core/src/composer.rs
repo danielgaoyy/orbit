@@ -630,6 +630,18 @@ pub enum ComposerContextInput {
         path: String,
         filename: String,
     },
+    Pdf {
+        path: String,
+        filename: String,
+    },
+    Audio {
+        path: String,
+        filename: String,
+    },
+    Video {
+        path: String,
+        filename: String,
+    },
     StagedFile {
         path: String,
         filename: String,
@@ -714,6 +726,24 @@ pub struct ComposedPromptView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast_mode_action: Option<FastModeSlashAction>,
     pub is_empty: bool,
+}
+
+fn inferred_staged_media_kind(filename: &str, path: &str) -> Option<&'static str> {
+    let candidate = if filename.trim().is_empty() {
+        path.trim()
+    } else {
+        filename.trim()
+    };
+    let ext = candidate.rsplit('.').next()?.to_ascii_lowercase();
+    if !candidate.contains('.') {
+        return None;
+    }
+    match ext.as_str() {
+        "pdf" => Some("pdf"),
+        "mp3" | "wav" | "m4a" | "aac" | "ogg" | "flac" | "opus" | "weba" => Some("audio"),
+        "mp4" | "mov" | "m4v" | "webm" | "mkv" => Some("video"),
+        _ => None,
+    }
 }
 
 fn clip_utf8_prefix(raw: &str, max_bytes: usize) -> &str {
@@ -883,6 +913,9 @@ pub fn compose_prompt(
     }
 
     let mut image_paths: Vec<String> = Vec::new();
+    let mut pdf_paths: Vec<String> = Vec::new();
+    let mut audio_paths: Vec<String> = Vec::new();
+    let mut video_paths: Vec<String> = Vec::new();
     let mut staged_file_paths: Vec<String> = Vec::new();
     let mut workspace_file_paths: Vec<String> = Vec::new();
     let mut context_blocks: Vec<String> = Vec::new();
@@ -898,7 +931,7 @@ pub fn compose_prompt(
                 });
                 image_paths.push(path.clone());
             }
-            ComposerContextInput::StagedFile { path, filename } => {
+            ComposerContextInput::Pdf { path, filename } => {
                 let lbl = if filename.trim().is_empty() {
                     basename_of_path(path)
                 } else {
@@ -906,11 +939,81 @@ pub fn compose_prompt(
                 };
                 let clean_path = path.trim();
                 badges.push(PromptBadge {
-                    kind: "file".into(),
+                    kind: "pdf".into(),
                     label: lbl,
                     path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
                 });
-                staged_file_paths.push(path.clone());
+                pdf_paths.push(path.clone());
+            }
+            ComposerContextInput::Audio { path, filename } => {
+                let lbl = if filename.trim().is_empty() {
+                    basename_of_path(path)
+                } else {
+                    filename.clone()
+                };
+                let clean_path = path.trim();
+                badges.push(PromptBadge {
+                    kind: "audio".into(),
+                    label: lbl,
+                    path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                });
+                audio_paths.push(path.clone());
+            }
+            ComposerContextInput::Video { path, filename } => {
+                let lbl = if filename.trim().is_empty() {
+                    basename_of_path(path)
+                } else {
+                    filename.clone()
+                };
+                let clean_path = path.trim();
+                badges.push(PromptBadge {
+                    kind: "video".into(),
+                    label: lbl,
+                    path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                });
+                video_paths.push(path.clone());
+            }
+            ComposerContextInput::StagedFile { path, filename } => {
+                let lbl = if filename.trim().is_empty() {
+                    basename_of_path(path)
+                } else {
+                    filename.clone()
+                };
+                let clean_path = path.trim();
+                match inferred_staged_media_kind(&lbl, path) {
+                    Some("pdf") => {
+                        badges.push(PromptBadge {
+                            kind: "pdf".into(),
+                            label: lbl,
+                            path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                        });
+                        pdf_paths.push(path.clone());
+                    }
+                    Some("audio") => {
+                        badges.push(PromptBadge {
+                            kind: "audio".into(),
+                            label: lbl,
+                            path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                        });
+                        audio_paths.push(path.clone());
+                    }
+                    Some("video") => {
+                        badges.push(PromptBadge {
+                            kind: "video".into(),
+                            label: lbl,
+                            path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                        });
+                        video_paths.push(path.clone());
+                    }
+                    _ => {
+                        badges.push(PromptBadge {
+                            kind: "file".into(),
+                            label: lbl,
+                            path: (!clean_path.is_empty()).then(|| clean_path.to_string()),
+                        });
+                        staged_file_paths.push(path.clone());
+                    }
+                }
             }
             ComposerContextInput::WorkspaceFile { path } => {
                 let base = basename_of_path(path);
@@ -1008,6 +1111,33 @@ pub fn compose_prompt(
             image_paths
                 .iter()
                 .map(|p| format!("Attached image file: `{p}`"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    if !pdf_paths.is_empty() {
+        ordered_blocks.push(
+            pdf_paths
+                .iter()
+                .map(|p| format!("Attached PDF file: `{p}`"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    if !audio_paths.is_empty() {
+        ordered_blocks.push(
+            audio_paths
+                .iter()
+                .map(|p| format!("Attached audio file: `{p}`"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    if !video_paths.is_empty() {
+        ordered_blocks.push(
+            video_paths
+                .iter()
+                .map(|p| format!("Attached video file: `{p}`"))
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
@@ -1702,5 +1832,66 @@ mod tests {
         assert_eq!(composed.fast_mode_action, Some(FastModeSlashAction::Enable));
         assert!(!composed.is_empty);
         assert!(composed.wire_prompt.is_empty());
+    }
+
+    #[test]
+    fn compose_prompt_emits_canonical_pdf_audio_video_lines_and_badges() {
+        let composed = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "Summarize these attachments".into(),
+                explicit_directive: None,
+                host_id: Some("h1".into()),
+                cwd: Some("/repo".into()),
+                contexts: vec![
+                    ComposerContextInput::Pdf {
+                        path: "/tmp/att/spec.pdf".into(),
+                        filename: "spec.pdf".into(),
+                    },
+                    ComposerContextInput::Audio {
+                        path: "/tmp/att/note.mp3".into(),
+                        filename: "note.mp3".into(),
+                    },
+                    ComposerContextInput::Video {
+                        path: "/tmp/att/demo.mp4".into(),
+                        filename: "demo.mp4".into(),
+                    },
+                    ComposerContextInput::StagedFile {
+                        path: "/tmp/att/clip.webm".into(),
+                        filename: "clip.webm".into(),
+                    },
+                ],
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+
+        assert!(
+            composed
+                .wire_prompt
+                .contains("Attached PDF file: `/tmp/att/spec.pdf`")
+        );
+        assert!(
+            composed
+                .wire_prompt
+                .contains("Attached audio file: `/tmp/att/note.mp3`")
+        );
+        assert!(
+            composed
+                .wire_prompt
+                .contains("Attached video file: `/tmp/att/demo.mp4`")
+        );
+        assert!(
+            composed
+                .wire_prompt
+                .contains("Attached video file: `/tmp/att/clip.webm`")
+        );
+        assert_eq!(composed.badges.len(), 4);
+        assert_eq!(composed.badges[0].kind, "pdf");
+        assert_eq!(composed.badges[1].kind, "audio");
+        assert_eq!(composed.badges[2].kind, "video");
+        assert_eq!(composed.badges[3].kind, "video");
     }
 }

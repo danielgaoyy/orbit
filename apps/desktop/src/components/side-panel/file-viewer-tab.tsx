@@ -23,6 +23,8 @@ import {
   MarkdownLinkProvider,
 } from "@/components/markdown-blocks";
 import { WorkspaceCodeEditor } from "@/components/side-panel/workspace-code-editor";
+import { MediaPlayer } from "@/components/viewers/media-player";
+import { PdfViewer } from "@/components/viewers/pdf-viewer";
 import { formatLineRangeLabel, normalizeLineRange } from "@/lib/file-links";
 import { useImeCompositionGuard } from "@/lib/ime";
 import { modSymbol } from "@/lib/keybindings";
@@ -264,6 +266,8 @@ export const FileViewerTab = memo(function FileViewerTab({
     requestAnimationFrame(() => findInputRef.current?.focus());
   };
 
+  const canFindInFile = !data || data.content_kind === "text";
+
   useEffect(() => {
     const onWindowKeyDown = (e: KeyboardEvent) => {
       const snap = orbitActions.getSnapshot();
@@ -272,12 +276,19 @@ export const FileViewerTab = memo(function FileViewerTab({
         snap.activeSidePanelTabId !== tab.id ||
         snap.terminalFocused ||
         snap.commandPaletteOpen ||
-        snap.quickOpenFilesOpen
+        snap.quickOpenFilesOpen ||
+        snap.mediaPreviewTarget !== null
       ) {
         return;
       }
-      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") {
-        if (isEditMode) return;
+      if (
+        canFindInFile &&
+        !isEditMode &&
+        (e.metaKey || e.ctrlKey) &&
+        !e.shiftKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "f"
+      ) {
         e.preventDefault();
         setFindOpen(true);
         if (isMarkdown) setMarkdownMode("source");
@@ -315,7 +326,7 @@ export const FileViewerTab = memo(function FileViewerTab({
     };
     window.addEventListener("keydown", onWindowKeyDown);
     return () => window.removeEventListener("keydown", onWindowKeyDown);
-  }, [findOpen, isMarkdown, isEditable, isEditMode, cKey, hostId, cwd, path, tab.id]);
+  }, [findOpen, isMarkdown, canFindInFile, isEditable, isEditMode, cKey, hostId, cwd, path, tab.id]);
 
   const stepMatch = (delta: number) => {
     if (matchLineNumbers.length === 0) return;
@@ -327,7 +338,7 @@ export const FileViewerTab = memo(function FileViewerTab({
       tabIndex={-1}
       className="orbit-stage-enter flex min-h-0 flex-1 flex-col overflow-hidden outline-none"
       onKeyDown={(e) => {
-        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f" && !isEditMode) {
+        if (canFindInFile && !isEditMode && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
           e.preventDefault();
           openFind();
         } else if (e.key === "Escape" && findOpen) {
@@ -634,7 +645,7 @@ export const FileViewerTab = memo(function FileViewerTab({
       )}
 
       {/* Collapsible Find-in-File Strip */}
-      {findOpen && !isEditMode && (
+      {findOpen && canFindInFile && !isEditMode && (
         <div className="border-border bg-elevated/70 flex h-[34px] shrink-0 items-center gap-1.5 border-b px-3">
           <Search className="text-muted-foreground h-[13px] w-[13px] shrink-0" />
           <input
@@ -721,6 +732,30 @@ export const FileViewerTab = memo(function FileViewerTab({
             className="border-border max-h-[75vh] max-w-full rounded-xl border object-contain shadow-xs"
           />
         </ScrollArea>
+      ) : data.content_kind === "pdf" ? (
+        <PdfViewer
+          filename={relPath}
+          path={path}
+          hostId={hostId}
+          cwd={cwd}
+          base64Content={data.content}
+          sizeBytes={data.size_bytes}
+          truncated={data.truncated}
+          hideHeaderTitle
+        />
+      ) : data.content_kind === "video" || data.content_kind === "audio" ? (
+        <MediaPlayer
+          kind={data.content_kind}
+          filename={relPath}
+          path={path}
+          hostId={hostId}
+          cwd={cwd}
+          base64Content={data.content}
+          mimeType={data.mime_type}
+          sizeBytes={data.size_bytes}
+          truncated={data.truncated}
+          hideHeaderTitle
+        />
       ) : data.content_kind === "binary" ? (
         <div className="text-muted-foreground flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
           <FileWarning className="h-5 w-5 opacity-60" />

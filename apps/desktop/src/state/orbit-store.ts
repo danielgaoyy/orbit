@@ -11,6 +11,12 @@ import {
   resolveUniqueWorkspaceFileSuffix,
 } from "@/lib/file-links";
 import {
+  defaultMimeForMedia,
+  detectRichMediaKind,
+  estimatePdfPageCount,
+  type RichMediaKind,
+} from "@/lib/media-utils";
+import {
   recordRecentSentTurnImages,
   seedPromptImagePreview,
   type SentImagePreviewMeta,
@@ -168,6 +174,18 @@ export interface DiffQuoteSnippet {
   code: string;
 }
 
+export interface MediaPreviewTarget {
+  kind: RichMediaKind;
+  filename: string;
+  path?: string | null;
+  hostId?: string | null;
+  cwd?: string | null;
+  localUrl?: string | null;
+  mimeType?: string | null;
+  sizeBytes?: number | null;
+  pdfPageCount?: number | null;
+}
+
 export type ContextMentionItem =
   | {
       id: string;
@@ -178,6 +196,10 @@ export type ContextMentionItem =
       stagedHostId?: string;
       localFile?: File;
       uploading?: boolean;
+      mediaKind?: RichMediaKind;
+      mimeType?: string;
+      pdfPageCount?: number | null;
+      previewUrl?: string;
     }
   | { id: string; kind: "git_diff"; staged: boolean; label: string }
   | { id: string; kind: "terminal_output"; label: string; lineCount: number; content: string }
@@ -509,6 +531,7 @@ export interface OrbitUiState {
     blocks: ExtractedCodeBlock[];
   } | null;
   handoffDialogTarget: WorktreeHandoffDialogTarget | null;
+  mediaPreviewTarget: MediaPreviewTarget | null;
   sshHosts: SshHostItem[];
   externalEditors: ExternalEditorInfo[];
   toastNotice: string | null;
@@ -875,6 +898,7 @@ const defaultInitialState: OrbitUiState = {
   exportDialogTarget: null,
   copyCodeBlocksTarget: null,
   handoffDialogTarget: null,
+  mediaPreviewTarget: null,
   sshHosts: [],
   externalEditors: [],
   toastNotice: null,
@@ -1464,6 +1488,7 @@ const inflightAttachmentUploads = new Map<string, Promise<void>>();
 
 function isLikelyTextFile(file: File, bytes: Uint8Array): boolean {
   if (file.size > 64 * 1024) return false;
+  if (detectRichMediaKind(file.name, file.type) !== null) return false;
   const mime = (file.type || "").toLowerCase();
   if (
     mime === "application/pdf" ||
@@ -1499,6 +1524,31 @@ function updateContextMentionItem(
 
 function isOfflineUploadError(errText: string): boolean {
   return /disconnected|reconnect|offline/i.test(errText);
+}
+
+function removeContextMentionInScope(scopeKey: string, id: string): void {
+  const removed = (state.contextItems[scopeKey] ?? []).find((c) => c.id === id);
+  if (
+    removed &&
+    (removed.kind === "image" || removed.kind === "file") &&
+    removed.previewUrl?.startsWith("blob:")
+  ) {
+    URL.revokeObjectURL(removed.previewUrl);
+  }
+  setState((s) => ({
+    ...s,
+    contextItems: {
+      ...s.contextItems,
+      [scopeKey]: (s.contextItems[scopeKey] ?? []).filter((c) => c.id !== id),
+    },
+    mediaPreviewTarget:
+      removed &&
+      (removed.kind === "image" || removed.kind === "file") &&
+      removed.previewUrl &&
+      s.mediaPreviewTarget?.localUrl === removed.previewUrl
+        ? null
+        : s.mediaPreviewTarget,
+  }));
 }
 
 async function uploadContextAttachmentToHost(
@@ -1555,7 +1605,7 @@ async function uploadContextAttachmentToHost(
       if (isOfflineUploadError(msg)) {
         notifyToast("Host is offline; attachment will upload when reconnected before sending");
       } else {
-        orbitActions.removeContextMention(itemId);
+        removeContextMentionInScope(scopeKey, itemId);
         notifyToast(`Attachment upload failed: ${msg}`);
       }
     } finally {
@@ -1565,6 +1615,20 @@ async function uploadContextAttachmentToHost(
 
   inflightAttachmentUploads.set(itemId, task);
   await task;
+}
+
+const MAX_FILE_CACHE_ENTRIES = 20;
+const MAX_FILE_CACHE_BYTES = 64 * 1024 * 1024;
+const fileLoadSeqByKey = new Map<string, number>();
+
+function bumpFileLoadSeq(cKey: string): number {
+  const next = (fileLoadSeqByKey.get(cKey) ?? 0) + 1;
+  fileLoadSeqByKey.set(cKey, next);
+  return next;
+}
+
+function estimateFileCacheEntryBytes(entry: FileViewCacheEntry): number {
+  return (entry.data?.content.length ?? 0) + 4096;
 }
 
 const localQueuedDraftExtras = new Map<
@@ -3259,6 +3323,30 @@ export const orbitActions = {
     }));
   },
 
+  openMediaPreview(target: MediaPreviewTarget): void {
+    setState((s) => ({ ...s, mediaPreviewTarget: target }));
+  },
+
+  closeMediaPreview(): void {
+    setState((s) => ({ ...s, mediaPreviewTarget: null }));
+  },
+
+  insertCitationIntoComposer(citation: string): void {
+    const clean = citation.trim();
+    if (!clean) return;
+    const key = composerScopeKey(state);
+    const current = state.composerDrafts[key] ?? "";
+    const sep = current.length === 0 || /\s$/.test(current) ? "" : " ";
+    const next = `${current}${sep}\`${clean}\` `;
+    setState((s) => ({
+      ...s,
+      composerDrafts: { ...s.composerDrafts, [key]: next },
+    }));
+    draftPersistence.markDirty(key);
+    notifyToast(`Cited ${clean}`);
+    orbitActions.focusComposer();
+  },
+
   quoteDiffLineToComposer(path: string, lineNumber: number | null, code: string): void {
     const key = composerScopeKey(state);
     const item: DiffQuoteSnippet = {
@@ -3346,18 +3434,7 @@ export const orbitActions = {
   },
 
   removeContextMention(id: string): void {
-    const key = composerScopeKey(state);
-    const removed = (state.contextItems[key] ?? []).find((c) => c.id === id);
-    if (removed && removed.kind === "image" && removed.previewUrl?.startsWith("blob:")) {
-      URL.revokeObjectURL(removed.previewUrl);
-    }
-    setState((s) => ({
-      ...s,
-      contextItems: {
-        ...s.contextItems,
-        [key]: (s.contextItems[key] ?? []).filter((c) => c.id !== id),
-      },
-    }));
+    removeContextMentionInScope(composerScopeKey(state), id);
   },
 
   registerInlineMention(target: InlineMentionTarget): void {
@@ -3461,6 +3538,34 @@ export const orbitActions = {
 
     const buf = await file.arrayBuffer();
     const rawBytes = new Uint8Array(buf);
+    const mediaKind = detectRichMediaKind(file.name, file.type);
+
+    if (mediaKind) {
+      const name = file.name || `attachment-${Date.now()}.${mediaKind === "pdf" ? "pdf" : mediaKind === "audio" ? "mp3" : "mp4"}`;
+      const id = `${mediaKind}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const mimeType = file.type || defaultMimeForMedia(name, mediaKind);
+      const previewUrl = URL.createObjectURL(file);
+      const pdfPageCount = mediaKind === "pdf" ? estimatePdfPageCount(rawBytes) : null;
+      orbitActions.addContextMention({
+        id,
+        kind: "file",
+        path: "",
+        filename: name,
+        sizeBytes: file.size,
+        localFile: file,
+        uploading: Boolean(hostId),
+        mediaKind,
+        mimeType,
+        pdfPageCount,
+        previewUrl,
+      });
+      if (hostId) {
+        await uploadContextAttachmentToHost(scopeKey, id, file, name, hostId, false);
+      } else {
+        notifyToast(`Select a host before sending to upload attached ${mediaKind.toUpperCase()}`);
+      }
+      return;
+    }
 
     // Text / code files <= 64 KiB without NUL bytes: inline into pastedAttachments
     if (isLikelyTextFile(file, rawBytes)) {
@@ -3660,14 +3765,26 @@ export const orbitActions = {
       switch (ctx.kind) {
         case "image":
           return { kind: "image", path: ctx.path, filename: ctx.filename };
-        case "file":
-          return ctx.stagedHostId
-            ? {
-                kind: "staged_file",
-                path: ctx.path,
-                filename: ctx.filename || ctx.path,
-              }
-            : { kind: "workspace_file", path: ctx.path };
+        case "file": {
+          if (ctx.stagedHostId) {
+            const fname = ctx.filename || ctx.path;
+            if (ctx.mediaKind === "pdf") {
+              return { kind: "pdf", path: ctx.path, filename: fname };
+            }
+            if (ctx.mediaKind === "audio") {
+              return { kind: "audio", path: ctx.path, filename: fname };
+            }
+            if (ctx.mediaKind === "video") {
+              return { kind: "video", path: ctx.path, filename: fname };
+            }
+            return {
+              kind: "staged_file",
+              path: ctx.path,
+              filename: fname,
+            };
+          }
+          return { kind: "workspace_file", path: ctx.path };
+        }
         case "git_diff":
           return {
             kind: "git_diff",
@@ -3776,12 +3893,14 @@ export const orbitActions = {
     const filePathQueueByLabel = new Map<string, string[]>();
     const sentImages: SentImagePreviewMeta[] = [];
     const targetAgentId = state.isDraftNewSession ? null : state.selectedAgentId;
+    const revokedLocalUrls = new Set<string>();
     for (const ctx of mergedContexts) {
       if (ctx.kind === "image") {
         if (ctx.path && ctx.previewUrl) {
           seedPromptImagePreview(hostId, ctx.path, ctx.previewUrl, true);
         } else if (ctx.previewUrl?.startsWith("blob:")) {
           URL.revokeObjectURL(ctx.previewUrl);
+          revokedLocalUrls.add(ctx.previewUrl);
         }
         sentImages.push({
           label: ctx.filename,
@@ -3793,11 +3912,17 @@ export const orbitActions = {
           if (queue) queue.push(ctx.path);
           else imagePathQueueByLabel.set(ctx.filename, [ctx.path]);
         }
-      } else if (ctx.kind === "file" && ctx.path) {
-        const label = ctx.filename || basenameFromPath(ctx.path);
-        const queue = filePathQueueByLabel.get(label);
-        if (queue) queue.push(ctx.path);
-        else filePathQueueByLabel.set(label, [ctx.path]);
+      } else if (ctx.kind === "file") {
+        if (ctx.previewUrl?.startsWith("blob:")) {
+          URL.revokeObjectURL(ctx.previewUrl);
+          revokedLocalUrls.add(ctx.previewUrl);
+        }
+        if (ctx.path) {
+          const label = ctx.filename || basenameFromPath(ctx.path);
+          const queue = filePathQueueByLabel.get(label);
+          if (queue) queue.push(ctx.path);
+          else filePathQueueByLabel.set(label, [ctx.path]);
+        }
       }
     }
     if (sentImages.length > 0) {
@@ -3808,7 +3933,12 @@ export const orbitActions = {
       if (b.kind === "image") {
         const fallbackPath = imagePathQueueByLabel.get(b.label)?.shift();
         if (fallbackPath) return { ...b, path: fallbackPath };
-      } else if (b.kind === "file") {
+      } else if (
+        b.kind === "file" ||
+        b.kind === "pdf" ||
+        b.kind === "audio" ||
+        b.kind === "video"
+      ) {
         const fallbackPath = filePathQueueByLabel.get(b.label)?.shift();
         if (fallbackPath) return { ...b, path: fallbackPath };
       }
@@ -3831,6 +3961,10 @@ export const orbitActions = {
         pastedAttachments: { ...s.pastedAttachments, [key]: [] },
         diffQuotes: { ...s.diffQuotes, [key]: [] },
         promptHistory: nextHistory,
+        mediaPreviewTarget:
+          s.mediaPreviewTarget?.localUrl && revokedLocalUrls.has(s.mediaPreviewTarget.localUrl)
+            ? null
+            : s.mediaPreviewTarget,
       }),
       true,
     );
@@ -4007,10 +4141,19 @@ export const orbitActions = {
           activeTurnBehavior: "steer",
         });
       } else if (supportsServerQueue) {
+        const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
+          if (ctx.kind === "file" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
+            return { ...ctx, previewUrl: undefined };
+          }
+          if (ctx.kind === "image" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
+            return { ...ctx, previewUrl: "" };
+          }
+          return ctx;
+        });
         const queueId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         rememberLocalQueuedDraftExtras(queueId, {
           slashDirective: effectiveDirective,
-          contexts: mergedContexts,
+          contexts: queuedContexts,
           pastes,
           quotes,
         });
@@ -4020,13 +4163,22 @@ export const orbitActions = {
           queueId,
         });
       } else {
+        const queuedContexts: ContextMentionItem[] = mergedContexts.map((ctx) => {
+          if (ctx.kind === "file" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
+            return { ...ctx, previewUrl: undefined };
+          }
+          if (ctx.kind === "image" && ctx.previewUrl && revokedLocalUrls.has(ctx.previewUrl)) {
+            return { ...ctx, previewUrl: "" };
+          }
+          return ctx;
+        });
         const queuedItem: QueuedPromptItem = {
           id: `q_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
           wirePrompt: assembledWirePrompt,
           displayText: cleanUserText,
           badges,
           slashDirective: effectiveDirective,
-          contexts: mergedContexts,
+          contexts: queuedContexts,
           pastes,
           quotes,
         };
@@ -4569,6 +4721,8 @@ export const orbitActions = {
           for (const [k, v] of Object.entries(s.fileViewCache)) {
             if (!k.startsWith(prefix)) {
               nextFileCache[k] = v;
+            } else {
+              bumpFileLoadSeq(k);
             }
           }
           for (const tab of s.sidePanelTabs) {
@@ -4803,7 +4957,10 @@ export const orbitActions = {
       (s) => {
         for (const tKey of deletedThreadKeys) {
           for (const ctx of s.contextItems[tKey] ?? []) {
-            if (ctx.kind === "image" && ctx.previewUrl?.startsWith("blob:")) {
+            if (
+              (ctx.kind === "image" || ctx.kind === "file") &&
+              ctx.previewUrl?.startsWith("blob:")
+            ) {
               URL.revokeObjectURL(ctx.previewUrl);
             }
           }
@@ -4884,7 +5041,10 @@ export const orbitActions = {
         delete nextInline[tKey];
         const nextContexts = { ...s.contextItems };
         for (const ctx of nextContexts[tKey] ?? []) {
-          if (ctx.kind === "image" && ctx.previewUrl?.startsWith("blob:")) {
+          if (
+            (ctx.kind === "image" || ctx.kind === "file") &&
+            ctx.previewUrl?.startsWith("blob:")
+          ) {
             URL.revokeObjectURL(ctx.previewUrl);
           }
         }
@@ -5407,6 +5567,7 @@ export const orbitActions = {
       const nextCache = { ...s.fileViewCache };
       for (const k of matchingKeys) {
         if (k !== activeFileKey && !s.fileEditorDrafts[k]?.dirty) {
+          bumpFileLoadSeq(k);
           delete nextCache[k];
         }
       }
@@ -5852,6 +6013,7 @@ export const orbitActions = {
       return;
     }
 
+    const loadSeq = bumpFileLoadSeq(cKey);
     setState((s) => ({
       ...s,
       fileViewCache: {
@@ -5862,9 +6024,14 @@ export const orbitActions = {
 
     try {
       const data = await orbitIpc.readWorkspaceFile(hostId, cwd, path);
+      if (fileLoadSeqByKey.get(cKey) !== loadSeq) {
+        return;
+      }
       setState((s) => {
-        // Maintain a bounded 20-entry LRU file cache, never evicting files with active editor drafts
-        const nextCache: Record<string, FileViewCacheEntry> = {};
+        // Maintain a bounded LRU file cache capped by BOTH 20 entries and ~64 MiB total memory
+        // (so repeated 25 MiB PDF/video previews never blow renderer RAM), while never evicting
+        // files with active editor drafts.
+        const nextEntry: FileViewCacheEntry = { status: "ready", data };
         const pinnedEntries: Array<[string, FileViewCacheEntry]> = [];
         const evictableEntries: Array<[string, FileViewCacheEntry]> = [];
         for (const [k, v] of Object.entries(s.fileViewCache)) {
@@ -5875,15 +6042,29 @@ export const orbitActions = {
             evictableEntries.push([k, v]);
           }
         }
+        let totalBytes = estimateFileCacheEntryBytes(nextEntry);
+        for (const [, v] of pinnedEntries) {
+          totalBytes += estimateFileCacheEntryBytes(v);
+        }
+        const maxEvictable = Math.max(0, MAX_FILE_CACHE_ENTRIES - 1 - pinnedEntries.length);
+        const keptReverse: Array<[string, FileViewCacheEntry]> = [];
+        for (let i = evictableEntries.length - 1; i >= 0; i -= 1) {
+          if (keptReverse.length >= maxEvictable) break;
+          const [k, v] = evictableEntries[i];
+          const entryBytes = estimateFileCacheEntryBytes(v);
+          if (totalBytes + entryBytes > MAX_FILE_CACHE_BYTES) continue;
+          totalBytes += entryBytes;
+          keptReverse.push([k, v]);
+        }
+        keptReverse.reverse();
+        const nextCache: Record<string, FileViewCacheEntry> = {};
         for (const [k, v] of pinnedEntries) {
           nextCache[k] = v;
         }
-        const startIdx = Math.max(0, evictableEntries.length - 19);
-        for (let i = startIdx; i < evictableEntries.length; i += 1) {
-          const [k, v] = evictableEntries[i];
+        for (const [k, v] of keptReverse) {
           nextCache[k] = v;
         }
-        nextCache[cKey] = { status: "ready", data };
+        nextCache[cKey] = nextEntry;
 
         // If this file is currently open in Edit mode with no unsaved changes, keep its draft synced with disk
         let nextDrafts = s.fileEditorDrafts;
@@ -5903,7 +6084,6 @@ export const orbitActions = {
             },
           };
         }
-
         return {
           ...s,
           fileViewCache: nextCache,
@@ -5911,6 +6091,9 @@ export const orbitActions = {
         };
       });
     } catch (err) {
+      if (fileLoadSeqByKey.get(cKey) !== loadSeq) {
+        return;
+      }
       setState((s) => ({
         ...s,
         fileViewCache: {

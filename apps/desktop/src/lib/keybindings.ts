@@ -77,6 +77,7 @@ export function useGlobalErgonomicKeybindings(): void {
         snap.exportDialogTarget !== null ||
         snap.copyCodeBlocksTarget !== null ||
         snap.handoffDialogTarget !== null ||
+        snap.mediaPreviewTarget !== null ||
         Boolean(document.querySelector('[data-slot="dialog-content"]'));
 
       if (isModalOverlayOpen) {
@@ -178,7 +179,8 @@ export function useGlobalErgonomicKeybindings(): void {
           !snap.relayDialogOpen &&
           !snap.exportDialogTarget &&
           !snap.copyCodeBlocksTarget &&
-          !snap.handoffDialogTarget
+          !snap.handoffDialogTarget &&
+          !snap.mediaPreviewTarget
         ) {
           e.preventDefault();
           orbitActions.cycleActiveMode();
@@ -262,7 +264,8 @@ export function useGlobalErgonomicKeybindings(): void {
         !snap.relayDialogOpen &&
         !snap.exportDialogTarget &&
         !snap.copyCodeBlocksTarget &&
-        !snap.handoffDialogTarget
+        !snap.handoffDialogTarget &&
+        !snap.mediaPreviewTarget
       ) {
         const now = Date.now();
         if (now - lastEscTimeRef.current < 420) {

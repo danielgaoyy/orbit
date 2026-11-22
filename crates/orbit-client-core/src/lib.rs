@@ -32,7 +32,10 @@ use orbit_relay_transport::connect_relay_ws;
 use orbit_store::{OrbitStore, StoreError};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 use uuid::Uuid;
 
 use crate::desktop_ops::{SshTunnelGuard, spawn_ssh_local_tunnel};
@@ -257,7 +260,10 @@ async fn connect_direct_with_host_id(
     replica: Option<Arc<OrbitStore>>,
     ssh_tunnel: Option<Arc<SshTunnelGuard>>,
 ) -> Result<HostSessionHandle, ClientCoreError> {
-    let (ws_stream, _) = connect_async(ws_url).await?;
+    let mut ws_cfg = WebSocketConfig::default();
+    ws_cfg.max_frame_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    ws_cfg.max_message_size = Some(orbit_protocol::MAX_WS_FRAME_BYTES);
+    let (ws_stream, _) = connect_async_with_config(ws_url, Some(ws_cfg), false).await?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let hello = WireMessage::Hello {

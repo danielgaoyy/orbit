@@ -48,8 +48,9 @@ use orbit_client_core::contract::{
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
     detect_installed_editors, discover_user_ssh_hosts, list_local_workspace_files,
-    open_external_url, open_in_external_editor, pick_local_directory, pick_local_save_file,
-    provision_relay_over_ssh, resolve_user_home, upgrade_remote_daemon_over_ssh,
+    open_external_url, open_in_external_editor, open_local_file_externally as open_local_file_os,
+    pick_local_directory, pick_local_save_file, provision_relay_over_ssh, resolve_user_home,
+    upgrade_remote_daemon_over_ssh,
 };
 use orbit_client_core::export::{
     ExportOptions, ExportedTranscript, ExtractedCodeBlock, write_file_atomically,
@@ -1851,6 +1852,23 @@ fn open_external_browser_url(url: String) -> Result<(), String> {
     open_external_url(parsed.as_str())
 }
 
+#[tauri::command]
+fn open_local_file_externally(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<(), String> {
+    if !state.core.is_local_host(&host_id) {
+        return Err("Only files on the local host can be opened externally".into());
+    }
+    let authorized_cwd = state
+        .core
+        .is_registered_local_cwd(&host_id, &cwd)
+        .then_some(cwd.as_str());
+    open_local_file_os(authorized_cwd, &path)
+}
+
 fn decode_percent_utf8(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -2503,6 +2521,7 @@ pub fn run() {
             parse_markdown_preview,
             open_browser_popout_window,
             open_external_browser_url,
+            open_local_file_externally,
             stage_host_attachment,
             stage_host_attachment_bytes,
             read_clipboard_images,

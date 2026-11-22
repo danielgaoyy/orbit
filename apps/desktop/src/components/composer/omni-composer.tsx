@@ -784,24 +784,22 @@ export const OmniComposer = memo(function OmniComposer({
   const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
     pasteHandledForCtrlVRef.current = true;
     const items = Array.from(e.clipboardData.items ?? []);
-    const imageFiles: File[] = [];
+    const pastedFiles: File[] = [];
     for (const it of items) {
-      if (it.kind === "file" && it.type.startsWith("image/")) {
+      if (it.kind === "file") {
         const f = it.getAsFile();
-        if (f) imageFiles.push(f);
+        if (f) pastedFiles.push(f);
       }
     }
-    if (imageFiles.length === 0) {
+    if (pastedFiles.length === 0) {
       for (const f of Array.from(e.clipboardData.files ?? [])) {
-        if (f.type.startsWith("image/")) {
-          imageFiles.push(f);
-        }
+        pastedFiles.push(f);
       }
     }
-    if (imageFiles.length > 0) {
+    if (pastedFiles.length > 0) {
       e.preventDefault();
-      for (const img of imageFiles) {
-        void orbitActions.stageAndAttachFile(img);
+      for (const file of pastedFiles) {
+        void orbitActions.stageAndAttachFile(file);
       }
       return;
     }
@@ -1204,7 +1202,7 @@ export const OmniComposer = memo(function OmniComposer({
           >
             {isDraggingOver && (
               <div className="bg-background/85 text-foreground pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[20px] text-[13px] font-medium backdrop-blur-[2px]">
-                Drop images or files to attach
+                Drop images, PDF, audio, video, or files to attach
               </div>
             )}
 

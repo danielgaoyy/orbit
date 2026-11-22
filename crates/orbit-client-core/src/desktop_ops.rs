@@ -1794,52 +1794,39 @@ fn local_detect_line_ending(text: &str) -> String {
     }
 }
 
-fn local_image_mime_for_path(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "ico" => Some("image/x-icon"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
-    }
+fn managed_attachment_root() -> Option<PathBuf> {
+    let orbit_home_dir = std::env::var_os("ORBIT_HOME")
+        .map(PathBuf::from)
+        .or_else(|| resolve_user_home().map(|h| h.join(".orbit")));
+    orbit_home_dir.map(|oh| oh.join("attachments"))
 }
 
-/// Local filesystem fallback when reading a workspace file on the current machine against an older daemon.
-pub fn read_local_workspace_file(
-    cwd: &str,
+fn resolve_allowed_local_file_path(
+    cwd: Option<&str>,
     raw_path: &str,
-    max_bytes: Option<u64>,
-) -> Result<LocalFileReadPayload, String> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-    use std::io::Read;
+    allow_agent_log_roots: bool,
+) -> Result<PathBuf, String> {
     use std::path::Component;
-
-    const LOCAL_IMAGE_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
 
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         return Err("File path cannot be empty".into());
     }
 
-    let orbit_home_dir = std::env::var_os("ORBIT_HOME")
-        .map(PathBuf::from)
-        .or_else(|| resolve_user_home().map(|h| h.join(".orbit")));
-
     let mut managed_artifact_roots: Vec<PathBuf> = Vec::new();
-    if let Some(oh) = orbit_home_dir.as_ref() {
-        managed_artifact_roots.push(oh.join("attachments"));
+    if let Some(att_root) = managed_attachment_root() {
+        managed_artifact_roots.push(att_root);
     }
-    if let Some(h) = resolve_user_home() {
-        managed_artifact_roots.push(h.join(".gemini").join("antigravity-cli").join("brain"));
-        managed_artifact_roots.push(h.join(".claude").join("projects"));
-    }
-    managed_artifact_roots.push(std::env::temp_dir().join("claude"));
-    let tmp_claude = PathBuf::from("/tmp/claude");
-    if !managed_artifact_roots.contains(&tmp_claude) {
-        managed_artifact_roots.push(tmp_claude);
+    if allow_agent_log_roots {
+        if let Some(h) = resolve_user_home() {
+            managed_artifact_roots.push(h.join(".gemini").join("antigravity-cli").join("brain"));
+            managed_artifact_roots.push(h.join(".claude").join("projects"));
+        }
+        managed_artifact_roots.push(std::env::temp_dir().join("claude"));
+        let tmp_claude = PathBuf::from("/tmp/claude");
+        if !managed_artifact_roots.contains(&tmp_claude) {
+            managed_artifact_roots.push(tmp_claude);
+        }
     }
 
     let is_in_managed_root = |canon: &Path| -> bool {
@@ -1864,49 +1851,77 @@ pub fn read_local_workspace_file(
         is_in_managed_root(&canon_cand).then_some(canon_cand)
     })();
 
-    let canonical = if let Some(att_path) = artifact_direct {
-        att_path
-    } else {
-        let resolved_cwd = if cwd.trim().is_empty() || cwd.trim() == "~" {
-            resolve_user_home().unwrap_or_else(|| PathBuf::from("."))
-        } else if let Some(rest) = cwd.trim().strip_prefix("~/") {
-            resolve_user_home()
-                .map(|h| h.join(rest))
-                .unwrap_or_else(|| PathBuf::from(cwd.trim()))
-        } else {
-            PathBuf::from(cwd.trim())
-        };
-        let canonical_cwd = fs::canonicalize(&resolved_cwd)
-            .map_err(|e| format!("Workspace directory unavailable: {e}"))?;
+    if let Some(att_path) = artifact_direct {
+        return Ok(att_path);
+    }
 
-        let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
-            resolve_user_home()
-                .map(|h| h.join(rest))
-                .ok_or_else(|| "Cannot resolve home directory".to_string())?
-        } else {
-            let p = Path::new(trimmed);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                if p.components()
-                    .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-                {
-                    return Err(format!("Path `{trimmed}` escapes the workspace directory"));
-                }
-                canonical_cwd.join(p)
-            }
-        };
-
-        let canon =
-            fs::canonicalize(&candidate).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
-        let allowed = canon.starts_with(&canonical_cwd) || is_in_managed_root(&canon);
-        if !allowed {
-            return Err(format!(
-                "Access denied: `{trimmed}` is outside the workspace directory"
-            ));
-        }
-        canon
+    let Some(raw_cwd) = cwd else {
+        return Err(format!(
+            "Access denied: `{trimmed}` is outside the allowed attachments directory"
+        ));
     };
+
+    let resolved_cwd = if raw_cwd.trim().is_empty() || raw_cwd.trim() == "~" {
+        if !allow_agent_log_roots {
+            return Err("Workspace directory is not registered for external opening".into());
+        }
+        resolve_user_home().unwrap_or_else(|| PathBuf::from("."))
+    } else if let Some(rest) = raw_cwd.trim().strip_prefix("~/") {
+        resolve_user_home()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(raw_cwd.trim()))
+    } else {
+        PathBuf::from(raw_cwd.trim())
+    };
+    let canonical_cwd = fs::canonicalize(&resolved_cwd)
+        .map_err(|e| format!("Workspace directory unavailable: {e}"))?;
+    if !allow_agent_log_roots && canonical_cwd.parent().is_none() {
+        return Err("Refusing to open external files from filesystem root".into());
+    }
+
+    let candidate = if let Some(rest) = trimmed.strip_prefix("~/") {
+        resolve_user_home()
+            .map(|h| h.join(rest))
+            .ok_or_else(|| "Cannot resolve home directory".to_string())?
+    } else {
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            if p.components()
+                .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+            {
+                return Err(format!("Path `{trimmed}` escapes the workspace directory"));
+            }
+            canonical_cwd.join(p)
+        }
+    };
+
+    let canon =
+        fs::canonicalize(&candidate).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
+    let allowed = canon.starts_with(&canonical_cwd) || is_in_managed_root(&canon);
+    if !allowed {
+        return Err(format!(
+            "Access denied: `{trimmed}` is outside the workspace directory"
+        ));
+    }
+    Ok(canon)
+}
+
+/// Local filesystem fallback when reading a workspace file on the current machine against an older daemon.
+pub fn read_local_workspace_file(
+    cwd: &str,
+    raw_path: &str,
+    max_bytes: Option<u64>,
+) -> Result<LocalFileReadPayload, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use std::io::Read;
+
+    const LOCAL_IMAGE_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+    const LOCAL_MEDIA_MAX_READ_BYTES: u64 = 25 * 1024 * 1024;
+
+    let trimmed = raw_path.trim();
+    let canonical = resolve_allowed_local_file_path(Some(cwd), trimmed, true)?;
 
     let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot read `{trimmed}`: {e}"))?;
     if !meta.is_file() {
@@ -1918,24 +1933,36 @@ pub fn read_local_workspace_file(
     // Local fallback serves read-only previews when no capable daemon session is connected;
     // never advertise `writable: true` if saving via daemon RPC would fail.
     let writable = false;
-    let is_image = local_image_mime_for_path(&canonical).is_some();
-    let cap = if is_image {
-        max_bytes
-            .unwrap_or(LOCAL_IMAGE_MAX_READ_BYTES)
-            .clamp(4096, LOCAL_IMAGE_MAX_READ_BYTES)
-    } else {
-        max_bytes
-            .unwrap_or(2 * 1024 * 1024)
-            .clamp(4096, 4 * 1024 * 1024)
-    };
     let resolved_path = canonical.to_string_lossy().to_string();
 
-    if let Some(mime) = local_image_mime_for_path(&canonical) {
+    let mut file =
+        fs::File::open(&canonical).map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
+    let mut header = Vec::with_capacity((size_bytes as usize).min(4096));
+    (&mut file)
+        .take(4096)
+        .read_to_end(&mut header)
+        .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
+
+    let filename_hint = canonical.file_name().and_then(|n| n.to_str());
+    if let Some(sniffed) =
+        orbit_protocol::media::sniff_media_or_viewer_image_mime(&header, filename_hint)
+    {
+        let cap = match sniffed.modality {
+            orbit_protocol::media::AttachmentModality::Image => max_bytes
+                .unwrap_or(LOCAL_IMAGE_MAX_READ_BYTES)
+                .clamp(4096, LOCAL_IMAGE_MAX_READ_BYTES),
+            orbit_protocol::media::AttachmentModality::Pdf
+            | orbit_protocol::media::AttachmentModality::Audio
+            | orbit_protocol::media::AttachmentModality::Video => max_bytes
+                .unwrap_or(LOCAL_MEDIA_MAX_READ_BYTES)
+                .clamp(4096, LOCAL_MEDIA_MAX_READ_BYTES),
+        };
+        let kind_str = sniffed.modality.as_str();
         if size_bytes > cap {
             return Ok(LocalFileReadPayload {
                 resolved_path,
-                content_kind: "binary".into(),
-                mime_type: Some(mime.into()),
+                content_kind: kind_str.into(),
+                mime_type: Some(sniffed.mime_type.into()),
                 content: String::new(),
                 size_bytes,
                 truncated: true,
@@ -1945,18 +1972,17 @@ pub fn read_local_workspace_file(
                 line_ending: None,
             });
         }
-        let img_file = fs::File::open(&canonical)
-            .map_err(|e| format!("Failed opening image `{trimmed}`: {e}"))?;
-        let mut bytes = Vec::with_capacity((size_bytes as usize).min(cap as usize));
-        img_file
-            .take(cap.saturating_add(1))
+        let mut bytes = header;
+        let remaining = cap.saturating_sub(bytes.len() as u64).saturating_add(1);
+        (&mut file)
+            .take(remaining)
             .read_to_end(&mut bytes)
-            .map_err(|e| format!("Failed reading image `{trimmed}`: {e}"))?;
+            .map_err(|e| format!("Failed reading media `{trimmed}`: {e}"))?;
         if (bytes.len() as u64) > cap {
             return Ok(LocalFileReadPayload {
                 resolved_path,
-                content_kind: "binary".into(),
-                mime_type: Some(mime.into()),
+                content_kind: kind_str.into(),
+                mime_type: Some(sniffed.mime_type.into()),
                 content: String::new(),
                 size_bytes: bytes.len() as u64,
                 truncated: true,
@@ -1969,8 +1995,8 @@ pub fn read_local_workspace_file(
         let etag = Some(local_sha256_hex(&bytes));
         return Ok(LocalFileReadPayload {
             resolved_path,
-            content_kind: "image".into(),
-            mime_type: Some(mime.into()),
+            content_kind: kind_str.into(),
+            mime_type: Some(sniffed.mime_type.into()),
             content: B64.encode(&bytes),
             size_bytes: bytes.len() as u64,
             truncated: false,
@@ -1981,12 +2007,17 @@ pub fn read_local_workspace_file(
         });
     }
 
-    let file =
-        fs::File::open(&canonical).map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
-    let mut buf = Vec::with_capacity((cap as usize).min(size_bytes as usize));
-    file.take(cap.saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
+    let cap = max_bytes
+        .unwrap_or(2 * 1024 * 1024)
+        .clamp(4096, 4 * 1024 * 1024);
+    let mut buf = header;
+    if (buf.len() as u64) <= cap {
+        let remaining = cap.saturating_sub(buf.len() as u64).saturating_add(1);
+        (&mut file)
+            .take(remaining)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
+    }
 
     let truncated = (buf.len() as u64) > cap || size_bytes > cap;
     if (buf.len() as u64) > cap {
@@ -2047,6 +2078,102 @@ pub fn read_local_workspace_file(
         writable,
         line_ending,
     })
+}
+
+fn is_safe_external_preview_extension(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "pdf"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "ico"
+            | "mp3"
+            | "wav"
+            | "m4a"
+            | "aac"
+            | "ogg"
+            | "flac"
+            | "opus"
+            | "weba"
+            | "mp4"
+            | "mov"
+            | "m4v"
+            | "webm"
+            | "mkv"
+    )
+}
+
+/// Validate that `raw_path` resides inside a registered `cwd` (or strictly inside
+/// `$ORBIT_HOME/attachments` when `cwd` is `None`), has an allowed preview extension, AND
+/// matches supported image/PDF/audio/video magic header bytes.
+pub fn validate_external_local_file(cwd: Option<&str>, raw_path: &str) -> Result<PathBuf, String> {
+    use std::io::Read;
+
+    let canonical = resolve_allowed_local_file_path(cwd, raw_path, false)?;
+    let meta = fs::metadata(&canonical).map_err(|e| format!("Cannot inspect file: {e}"))?;
+    if !meta.is_file() {
+        return Err("Target path is not a regular file".into());
+    }
+    if !is_safe_external_preview_extension(&canonical) {
+        return Err("Only PDF, image, audio, and video files can be opened externally".into());
+    }
+    let file = fs::File::open(&canonical).map_err(|e| format!("Cannot open file: {e}"))?;
+    let mut header = Vec::with_capacity(4096);
+    file.take(4096)
+        .read_to_end(&mut header)
+        .map_err(|e| format!("Cannot inspect file header: {e}"))?;
+    let filename_hint = canonical.file_name().and_then(|n| n.to_str());
+    if orbit_protocol::media::sniff_media_or_viewer_image_mime(&header, filename_hint).is_none() {
+        return Err(
+            "File content does not match an allowed PDF, image, audio, or video format".into(),
+        );
+    }
+    Ok(canonical)
+}
+
+/// Open an allowlisted local workspace/attachment media or PDF file in the OS default viewer
+/// without shell expansion. Strictly rejects unregistered roots, non-previewable/executable
+/// extensions, spoofed magic bytes, and escapes.
+pub fn open_local_file_externally(cwd: Option<&str>, raw_path: &str) -> Result<(), String> {
+    let canonical = validate_external_local_file(cwd, raw_path)?;
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("--")
+            .arg(&canonical)
+            .spawn()
+            .map_err(|e| format!("Failed to open file externally: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(&canonical)
+            .spawn()
+            .map_err(|e| format!("Failed to open file externally: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("rundll32")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(&canonical)
+            .spawn()
+            .map_err(|e| format!("Failed to open file externally: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = canonical;
+        Err("External file launch is unsupported on this platform".into())
+    }
 }
 
 fn validate_external_http_url(raw_url: &str) -> Result<&str, String> {
@@ -2189,6 +2316,78 @@ mod tests {
             sanitize_save_dialog_filename("...---"),
             "orbit-conversation.md"
         );
+    }
+
+    #[test]
+    fn validate_external_local_file_enforces_root_extension_and_magic_bytes() {
+        let dir =
+            std::env::temp_dir().join(format!("orbit_ext_open_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let cwd = dir.to_string_lossy().to_string();
+
+        let png_path = dir.join("ok.png");
+        fs::write(
+            &png_path,
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0],
+        )
+        .expect("png");
+
+        let pdf_path = dir.join("spec.pdf");
+        fs::write(
+            &pdf_path,
+            b"%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        )
+        .expect("pdf");
+
+        let weba_path = dir.join("clip.weba");
+        fs::write(&weba_path, [0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81]).expect("weba");
+
+        let spoofed_png = dir.join("fake.png");
+        fs::write(&spoofed_png, b"not actually a png image").expect("fake png");
+
+        let spoofed_pdf = dir.join("fake.pdf");
+        fs::write(&spoofed_pdf, b"#!/bin/sh\necho pwned\n").expect("fake pdf");
+
+        let script_path = dir.join("run.sh");
+        fs::write(&script_path, b"#!/bin/sh\necho hi\n").expect("sh");
+
+        let utf16_text = dir.join("notes.txt");
+        fs::write(&utf16_text, [0xFF, 0xFE, b'A', 0x00, b'B', 0x00]).expect("utf16");
+
+        // Valid magic-byte media inside registered cwd passes.
+        assert!(validate_external_local_file(Some(&cwd), "ok.png").is_ok());
+        assert!(validate_external_local_file(Some(&cwd), "spec.pdf").is_ok());
+        assert!(validate_external_local_file(Some(&cwd), "clip.weba").is_ok());
+
+        // Filesystem root `/` and unregistered `None` cwd are rejected for workspace files.
+        assert!(
+            validate_external_local_file(Some("/"), &pdf_path.to_string_lossy()).is_err(),
+            "filesystem root cwd must be rejected"
+        );
+        assert!(
+            validate_external_local_file(None, &pdf_path.to_string_lossy()).is_err(),
+            "unregistered cwd must restrict to attachments dir"
+        );
+        assert!(
+            validate_external_local_file(Some("~"), &pdf_path.to_string_lossy()).is_err(),
+            "tilde cwd must be rejected for external opening"
+        );
+
+        // Spoofed magic bytes and executable extensions are rejected.
+        assert!(validate_external_local_file(Some(&cwd), "fake.png").is_err());
+        assert!(validate_external_local_file(Some(&cwd), "fake.pdf").is_err());
+        assert!(validate_external_local_file(Some(&cwd), "run.sh").is_err());
+
+        // Local workspace reader must NOT classify spoofed `fake.png` as image or UTF-16LE as MP3.
+        let fake_payload =
+            read_local_workspace_file(&cwd, "fake.png", None).expect("read fake.png");
+        assert_eq!(fake_payload.content_kind, "text");
+
+        let utf16_payload =
+            read_local_workspace_file(&cwd, "notes.txt", None).expect("read utf16.txt");
+        assert_ne!(utf16_payload.content_kind, "audio");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

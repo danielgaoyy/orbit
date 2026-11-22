@@ -8,7 +8,6 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use orbit_protocol::{
     ActiveTurnBehavior, AgentStatus, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
     QuestionItem, ReasoningEffort, SessionMode, ThinkingOptionSpec, ToolCallDetail, ToolCallStatus,
@@ -21,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use crate::attachments::{CLAUDE_INLINE_IMAGE_MAX_BYTES, resolve_authorized_staged_images};
+use crate::attachments::build_pi_prompt_payload_async;
 use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 
 const BOOT_GET_STATE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -414,30 +413,19 @@ async fn boot_pi_get_state(
     }
 }
 
-fn build_pi_images_payload(prompt: &str, attachments_dir: Option<&Path>) -> Vec<Value> {
-    resolve_authorized_staged_images(prompt, attachments_dir, CLAUDE_INLINE_IMAGE_MAX_BYTES)
-        .into_iter()
-        .map(|img| {
-            json!({
-                "type": "image",
-                "data": B64.encode(&img.bytes),
-                "mimeType": img.mime_type,
-            })
-        })
-        .collect()
-}
-
-fn build_pi_prompt_command(
+async fn build_pi_prompt_command_async(
     cmd_id: &str,
     cmd_type: &str,
     prompt: &str,
     attachments_dir: Option<&Path>,
 ) -> String {
-    let images = build_pi_images_payload(prompt, attachments_dir);
+    let (enriched, images) =
+        build_pi_prompt_payload_async(prompt.to_string(), attachments_dir.map(Path::to_path_buf))
+            .await;
     let mut obj = json!({
         "id": cmd_id,
         "type": cmd_type,
-        "message": prompt,
+        "message": enriched,
     });
     if !images.is_empty() {
         obj["images"] = Value::Array(images);
@@ -867,12 +855,13 @@ async fn run_pi_actor(
                                 ActiveTurnBehavior::Steer => {
                                     let cmd_id = format!("pi_cmd_{next_cmd_id}");
                                     next_cmd_id += 1;
-                                    let line = build_pi_prompt_command(
+                                    let line = build_pi_prompt_command_async(
                                         &cmd_id,
                                         "steer",
                                         &effective_prompt,
                                         cfg.attachments_dir.as_deref(),
-                                    );
+                                    )
+                                    .await;
                                     if shim.write_stdin_line(line).await.is_err() {
                                         finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
                                             .await;
@@ -886,12 +875,13 @@ async fn run_pi_actor(
                                         cmd_id.clone(),
                                         (turn_id, effective_prompt.clone()),
                                     );
-                                    let line = build_pi_prompt_command(
+                                    let line = build_pi_prompt_command_async(
                                         &cmd_id,
                                         "follow_up",
                                         &effective_prompt,
                                         cfg.attachments_dir.as_deref(),
-                                    );
+                                    )
+                                    .await;
                                     if shim.write_stdin_line(line).await.is_err() {
                                         finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
                                             .await;
@@ -926,12 +916,13 @@ async fn run_pi_actor(
                             .await;
                         let cmd_id = format!("pi_cmd_{next_cmd_id}");
                         next_cmd_id += 1;
-                        let line = build_pi_prompt_command(
+                        let line = build_pi_prompt_command_async(
                             &cmd_id,
                             "prompt",
                             &effective_prompt,
                             cfg.attachments_dir.as_deref(),
-                        );
+                        )
+                        .await;
                         if shim.write_stdin_line(line).await.is_err() {
                             finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx).await;
                             break;
@@ -1290,12 +1281,13 @@ async fn run_pi_actor(
                                         .await;
                                     let cmd_id = format!("pi_cmd_{next_cmd_id}");
                                     next_cmd_id += 1;
-                                    let line = build_pi_prompt_command(
+                                    let line = build_pi_prompt_command_async(
                                         &cmd_id,
                                         "prompt",
                                         &next_prompt,
                                         cfg.attachments_dir.as_deref(),
-                                    );
+                                    )
+                                    .await;
                                     if shim.write_stdin_line(line).await.is_err() {
                                         finalize_and_emit_unexpected_exit(&mut seg_state, &evt_tx)
                                             .await;

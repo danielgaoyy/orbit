@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::acp_registry::{get_acp_agent_spec, is_blocked_acp_env_key, resolve_acp_agent_command};
-use crate::attachments::{build_agy_prompt_blocks, is_path_within_dir};
+use crate::attachments::{AcpPromptMediaCaps, build_acp_prompt_blocks_async, is_path_within_dir};
 use crate::driver::{
     DriverCommand, DriverEvent, ProviderSessionHandle, RpcId, SessionLaunchConfig,
 };
@@ -721,6 +721,7 @@ async fn run_acp_actor(
     let mut next_rpc_id: i64 = if is_reattached { 100_000 } else { 1 };
     let mut pending_rpcs: HashMap<String, oneshot::Sender<Result<Value, Value>>> = HashMap::new();
     let mut inject_handoff_on_next_prompt = false;
+    let mut prompt_media_caps = AcpPromptMediaCaps::default();
     let mut pending_handoff_context = cfg.fallback_handoff_context.clone();
     let mut pending_system_prompt = cfg
         .system_prompt_append
@@ -764,6 +765,7 @@ async fn run_acp_actor(
                 .pointer("/agentCapabilities/loadSession")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            prompt_media_caps = AcpPromptMediaCaps::from_acp_initialize(&init_res);
             let resume_target = if supports_load {
                 cfg.resume_session_id.as_deref()
             } else {
@@ -1006,6 +1008,7 @@ async fn run_acp_actor(
                             &shim,
                             &session_id,
                             cfg.attachments_dir.as_deref(),
+                            prompt_media_caps,
                             &mut next_rpc_id,
                             &mut active_turn_id,
                             &mut active_prompt_rpc_key,
@@ -1283,6 +1286,7 @@ async fn run_acp_actor(
                                                     &shim,
                                                     &session_id,
                                                     cfg.attachments_dir.as_deref(),
+                                                    prompt_media_caps,
                                                     &mut next_rpc_id,
                                                     &mut active_turn_id,
                                                     &mut active_prompt_rpc_key,
@@ -1313,6 +1317,7 @@ async fn run_acp_actor(
                                             &shim,
                                             &session_id,
                                             cfg.attachments_dir.as_deref(),
+                                            prompt_media_caps,
                                             &mut next_rpc_id,
                                             &mut active_turn_id,
                                             &mut active_prompt_rpc_key,
@@ -1429,6 +1434,7 @@ async fn dispatch_acp_prompt(
     shim: &orbit_shim::ShimClient,
     session_id: &str,
     attachments_dir: Option<&Path>,
+    prompt_media_caps: AcpPromptMediaCaps,
     next_rpc_id: &mut i64,
     active_turn_id: &mut Option<String>,
     active_prompt_rpc_key: &mut Option<String>,
@@ -1451,7 +1457,12 @@ async fn dispatch_acp_prompt(
     *next_rpc_id += 1;
     *active_prompt_rpc_key = Some(RpcId::Num(id).as_key());
 
-    let prompt_blocks = build_agy_prompt_blocks(&prompt, attachments_dir);
+    let prompt_blocks = build_acp_prompt_blocks_async(
+        prompt,
+        attachments_dir.map(Path::to_path_buf),
+        prompt_media_caps,
+    )
+    .await;
     let req = json!({
         "jsonrpc": "2.0",
         "id": id,

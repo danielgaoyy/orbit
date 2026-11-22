@@ -302,6 +302,8 @@ use crate::workspace_files::{
 const DEFAULT_MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 const HARD_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 const IMAGE_MAX_READ_BYTES: u64 = 8 * 1024 * 1024;
+const MEDIA_MAX_READ_BYTES: u64 = 25 * 1024 * 1024;
+const MEDIA_SNIFF_PROBE_BYTES: u64 = 4096;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceFilePayload {
@@ -317,27 +319,20 @@ pub struct WorkspaceFilePayload {
     pub line_ending: Option<String>,
 }
 
-fn image_mime_for_path(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "ico" => Some("image/x-icon"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
-    }
-}
-
-fn managed_artifact_roots() -> Vec<PathBuf> {
+fn managed_artifact_roots(extra_attachments_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    if let Some(extra) = extra_attachments_dir {
+        roots.push(extra.to_path_buf());
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let orbit_home = std::env::var_os("ORBIT_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|h| h.join(".orbit")));
     if let Some(oh) = orbit_home {
-        roots.push(oh.join("attachments"));
+        let att = oh.join("attachments");
+        if !roots.contains(&att) {
+            roots.push(att);
+        }
     }
     if let Some(h) = home {
         roots.push(h.join(".gemini").join("antigravity-cli").join("brain"));
@@ -357,6 +352,7 @@ fn managed_artifact_roots() -> Vec<PathBuf> {
 async fn resolve_managed_artifact_file_if_allowed(
     trimmed: &str,
     allow_managed_artifacts: bool,
+    extra_attachments_dir: Option<&Path>,
 ) -> Option<PathBuf> {
     if !allow_managed_artifacts {
         return None;
@@ -372,7 +368,7 @@ async fn resolve_managed_artifact_file_if_allowed(
     };
 
     let canonical = tokio::fs::canonicalize(&candidate).await.ok()?;
-    for root in managed_artifact_roots() {
+    for root in managed_artifact_roots(extra_attachments_dir) {
         if let Ok(canon_root) = tokio::fs::canonicalize(&root).await
             && canonical.starts_with(&canon_root)
         {
@@ -389,14 +385,19 @@ async fn resolve_contained_file_path(
     cwd: &Path,
     raw_path: &str,
     allow_managed_artifacts: bool,
+    extra_attachments_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
         return Err("File path cannot be empty".to_string());
     }
 
-    if let Some(artifact_path) =
-        resolve_managed_artifact_file_if_allowed(trimmed, allow_managed_artifacts).await
+    if let Some(artifact_path) = resolve_managed_artifact_file_if_allowed(
+        trimmed,
+        allow_managed_artifacts,
+        extra_attachments_dir,
+    )
+    .await
     {
         return Ok(artifact_path);
     }
@@ -432,7 +433,7 @@ async fn resolve_contained_file_path(
     }
 
     if allow_managed_artifacts {
-        for root in managed_artifact_roots() {
+        for root in managed_artifact_roots(extra_attachments_dir) {
             if let Ok(canon_root) = tokio::fs::canonicalize(&root).await
                 && canonical.starts_with(&canon_root)
             {
@@ -479,14 +480,26 @@ async fn compute_workspace_file_writable(
     true
 }
 
-/// Read a single workspace file safely on the host (UTF-8 source/text, raster image base64, or binary marker).
+/// Read a single workspace file safely on the host (UTF-8 source/text, raster image, PDF,
+/// audio, video base64, or binary marker).
 pub async fn read_workspace_file(
     cwd: &Path,
     raw_path: &str,
     max_bytes: Option<u64>,
 ) -> Result<WorkspaceFilePayload, String> {
+    read_workspace_file_with_attachments_dir(cwd, raw_path, max_bytes, None).await
+}
+
+/// Read a single workspace or staged attachment file safely on the host, strictly enforcing
+/// canonicalized containment inside `cwd` or managed artifact/attachment roots.
+pub async fn read_workspace_file_with_attachments_dir(
+    cwd: &Path,
+    raw_path: &str,
+    max_bytes: Option<u64>,
+    extra_attachments_dir: Option<&Path>,
+) -> Result<WorkspaceFilePayload, String> {
     let trimmed = raw_path.trim();
-    let canonical = resolve_contained_file_path(cwd, trimmed, true).await?;
+    let canonical = resolve_contained_file_path(cwd, trimmed, true, extra_attachments_dir).await?;
 
     let meta = tokio::fs::metadata(&canonical)
         .await
@@ -499,24 +512,42 @@ pub async fn read_workspace_file(
     let size_bytes = meta.len();
     let mtime_unix_ms = metadata_mtime_unix_ms(&meta);
     let writable = compute_workspace_file_writable(cwd, trimmed, &canonical, &meta).await;
-    let is_image = image_mime_for_path(&canonical).is_some();
-    let cap = if is_image {
-        max_bytes
-            .unwrap_or(IMAGE_MAX_READ_BYTES)
-            .clamp(4096, IMAGE_MAX_READ_BYTES)
-    } else {
-        max_bytes
-            .unwrap_or(DEFAULT_MAX_READ_BYTES)
-            .clamp(4096, HARD_MAX_READ_BYTES)
-    };
     let resolved_path = canonical.to_string_lossy().to_string();
 
-    if let Some(mime) = image_mime_for_path(&canonical) {
+    let mut file = tokio::fs::File::open(&canonical)
+        .await
+        .map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
+
+    // Read a bounded 4 KiB header first so images, PDF, audio, and video files are classified
+    // by magic bytes (never blindly by extension) without allocating tens of megabytes in memory.
+    let mut header_buf =
+        Vec::with_capacity((size_bytes as usize).min(MEDIA_SNIFF_PROBE_BYTES as usize));
+    (&mut file)
+        .take(MEDIA_SNIFF_PROBE_BYTES)
+        .read_to_end(&mut header_buf)
+        .await
+        .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
+
+    let filename_hint = canonical.file_name().and_then(|n| n.to_str());
+    if let Some(sniffed) =
+        orbit_protocol::media::sniff_media_or_viewer_image_mime(&header_buf, filename_hint)
+    {
+        let cap = match sniffed.modality {
+            orbit_protocol::media::AttachmentModality::Image => max_bytes
+                .unwrap_or(IMAGE_MAX_READ_BYTES)
+                .clamp(4096, IMAGE_MAX_READ_BYTES),
+            orbit_protocol::media::AttachmentModality::Pdf
+            | orbit_protocol::media::AttachmentModality::Audio
+            | orbit_protocol::media::AttachmentModality::Video => max_bytes
+                .unwrap_or(MEDIA_MAX_READ_BYTES)
+                .clamp(4096, MEDIA_MAX_READ_BYTES),
+        };
+        let kind_str = sniffed.modality.as_str().to_string();
         if size_bytes > cap {
             return Ok(WorkspaceFilePayload {
                 resolved_path,
-                content_kind: "binary".to_string(),
-                mime_type: Some(mime.to_string()),
+                content_kind: kind_str,
+                mime_type: Some(sniffed.mime_type.to_string()),
                 content: String::new(),
                 size_bytes,
                 truncated: true,
@@ -526,20 +557,18 @@ pub async fn read_workspace_file(
                 line_ending: None,
             });
         }
-        let mut img_file = tokio::fs::File::open(&canonical)
-            .await
-            .map_err(|e| format!("Failed opening image `{trimmed}`: {e}"))?;
-        let mut bytes = Vec::with_capacity((size_bytes as usize).min(cap as usize));
-        (&mut img_file)
-            .take(cap.saturating_add(1))
+        let mut bytes = header_buf;
+        let remaining_cap = cap.saturating_sub(bytes.len() as u64).saturating_add(1);
+        (&mut file)
+            .take(remaining_cap)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|e| format!("Failed reading image `{trimmed}`: {e}"))?;
+            .map_err(|e| format!("Failed reading media `{trimmed}`: {e}"))?;
         if (bytes.len() as u64) > cap {
             return Ok(WorkspaceFilePayload {
                 resolved_path,
-                content_kind: "binary".to_string(),
-                mime_type: Some(mime.to_string()),
+                content_kind: kind_str,
+                mime_type: Some(sniffed.mime_type.to_string()),
                 content: String::new(),
                 size_bytes: bytes.len() as u64,
                 truncated: true,
@@ -552,8 +581,8 @@ pub async fn read_workspace_file(
         let etag = Some(sha256_hex(&bytes));
         return Ok(WorkspaceFilePayload {
             resolved_path,
-            content_kind: "image".to_string(),
-            mime_type: Some(mime.to_string()),
+            content_kind: kind_str,
+            mime_type: Some(sniffed.mime_type.to_string()),
             content: B64.encode(&bytes),
             size_bytes: bytes.len() as u64,
             truncated: false,
@@ -564,17 +593,18 @@ pub async fn read_workspace_file(
         });
     }
 
-    let mut file = tokio::fs::File::open(&canonical)
-        .await
-        .map_err(|e| format!("Failed opening `{trimmed}`: {e}"))?;
-
-    let read_limit = (cap as usize).min(size_bytes as usize);
-    let mut buf = Vec::with_capacity(read_limit);
-    let mut limited = (&mut file).take(cap.saturating_add(1));
-    limited
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
+    let cap = max_bytes
+        .unwrap_or(DEFAULT_MAX_READ_BYTES)
+        .clamp(4096, HARD_MAX_READ_BYTES);
+    let mut buf = header_buf;
+    if (buf.len() as u64) <= cap {
+        let remaining = cap.saturating_sub(buf.len() as u64).saturating_add(1);
+        (&mut file)
+            .take(remaining)
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("Failed reading `{trimmed}`: {e}"))?;
+    }
 
     let truncated = (buf.len() as u64) > cap || size_bytes > cap;
     if (buf.len() as u64) > cap {
@@ -1117,9 +1147,10 @@ mod tests {
         assert_eq!(bin_res.content_kind, "binary");
         assert!(bin_res.content.is_empty());
 
-        // 3. Raster image base64
+        // 3. Raster image base64 (verified by PNG magic bytes, not extension alone)
         let img_path = dir.join("pixel.png");
-        tokio::fs::write(&img_path, &[0x89, b'P', b'N', b'G'])
+        let png_sig = b"\x89PNG\r\n\x1a\n";
+        tokio::fs::write(&img_path, png_sig)
             .await
             .expect("write png");
         let img_res = read_workspace_file(&dir, "pixel.png", None)
@@ -1127,7 +1158,27 @@ mod tests {
             .expect("read png");
         assert_eq!(img_res.content_kind, "image");
         assert_eq!(img_res.mime_type.as_deref(), Some("image/png"));
-        assert_eq!(img_res.content, B64.encode([0x89, b'P', b'N', b'G']));
+        assert_eq!(img_res.content, B64.encode(png_sig));
+
+        // Spoofed `.png` containing plain text MUST NOT be classified as image
+        let fake_png = dir.join("fake.png");
+        tokio::fs::write(&fake_png, "not actually a png")
+            .await
+            .expect("write fake png");
+        let fake_png_res = read_workspace_file(&dir, "fake.png", None)
+            .await
+            .expect("read fake png");
+        assert_eq!(fake_png_res.content_kind, "text");
+
+        // UTF-16LE BOM file MUST NOT be misclassified as audio/mpeg
+        let utf16_path = dir.join("utf16.txt");
+        tokio::fs::write(&utf16_path, &[0xFF, 0xFE, 0x41, 0x00, 0x42, 0x00])
+            .await
+            .expect("write utf16");
+        let utf16_res = read_workspace_file(&dir, "utf16.txt", None)
+            .await
+            .expect("read utf16");
+        assert_eq!(utf16_res.content_kind, "binary");
 
         // 4. Truncation guard
         let big_path = dir.join("big.txt");
@@ -1294,6 +1345,105 @@ mod tests {
         .await;
         assert_eq!(count, 0);
         assert!(outside.exists(), "outside file must never be deleted");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn read_workspace_file_classifies_pdf_audio_video_and_enforces_caps_and_allowlist() {
+        let root = std::env::temp_dir().join(format!("orbit_media_read_{}", Uuid::new_v4()));
+        let ws = root.join("workspace");
+        let att_dir = root.join("staged_attachments");
+        let outside = root.join("outside");
+        tokio::fs::create_dir_all(&ws).await.expect("mkdir ws");
+        tokio::fs::create_dir_all(&att_dir)
+            .await
+            .expect("mkdir att");
+        tokio::fs::create_dir_all(&outside)
+            .await
+            .expect("mkdir outside");
+
+        // 1. PDF inside workspace
+        let pdf_bytes = b"%PDF-1.7\n1 0 obj << /Type /Page >> endobj\n%%EOF\n";
+        tokio::fs::write(ws.join("spec.pdf"), pdf_bytes)
+            .await
+            .expect("write pdf");
+        let pdf_res = read_workspace_file(&ws, "spec.pdf", None)
+            .await
+            .expect("read pdf");
+        assert_eq!(pdf_res.content_kind, "pdf");
+        assert_eq!(pdf_res.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(pdf_res.content, B64.encode(pdf_bytes));
+        assert!(!pdf_res.truncated);
+
+        // 2. Audio (MP3 & WAV)
+        let mp3_bytes = b"ID3\x04\x00\x00\x00\x00\x00\x00voice-note";
+        tokio::fs::write(ws.join("memo.mp3"), mp3_bytes)
+            .await
+            .expect("write mp3");
+        let mp3_res = read_workspace_file(&ws, "memo.mp3", None)
+            .await
+            .expect("read mp3");
+        assert_eq!(mp3_res.content_kind, "audio");
+        assert_eq!(mp3_res.mime_type.as_deref(), Some("audio/mpeg"));
+        assert_eq!(mp3_res.content, B64.encode(mp3_bytes));
+
+        // 3. Video (MP4) staged in attachments_dir (outside workspace cwd, explicitly allowlisted)
+        let mp4_bytes = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00isomvideo";
+        let staged_video = att_dir.join("demo.mp4");
+        tokio::fs::write(&staged_video, mp4_bytes)
+            .await
+            .expect("write staged mp4");
+        let vid_res = read_workspace_file_with_attachments_dir(
+            &ws,
+            staged_video.to_str().unwrap_or(""),
+            None,
+            Some(&att_dir),
+        )
+        .await
+        .expect("read staged video");
+        assert_eq!(vid_res.content_kind, "video");
+        assert_eq!(vid_res.mime_type.as_deref(), Some("video/mp4"));
+        assert_eq!(vid_res.content, B64.encode(mp4_bytes));
+
+        // 4. Size cap enforcement returns media content_kind with truncated = true and empty body
+        let mut large_wav = b"RIFF\x00\x00\x00\x00WAVEfmt ".to_vec();
+        large_wav.resize(8192, 0x11);
+        tokio::fs::write(ws.join("big.wav"), &large_wav)
+            .await
+            .expect("write big wav");
+        let capped_res = read_workspace_file(&ws, "big.wav", Some(4096))
+            .await
+            .expect("read capped wav");
+        assert_eq!(capped_res.content_kind, "audio");
+        assert_eq!(capped_res.mime_type.as_deref(), Some("audio/wav"));
+        assert!(capped_res.truncated);
+        assert!(capped_res.content.is_empty());
+
+        // 5. Spoofed `.pdf` containing plain text is NOT classified as pdf
+        tokio::fs::write(ws.join("fake.pdf"), "plain text masquerading as pdf")
+            .await
+            .expect("write fake pdf");
+        let fake_res = read_workspace_file(&ws, "fake.pdf", None)
+            .await
+            .expect("read fake pdf");
+        assert_eq!(fake_res.content_kind, "text");
+
+        // 6. Outside PDF blocked even when extra_attachments_dir is configured
+        let secret_pdf = outside.join("secret.pdf");
+        tokio::fs::write(&secret_pdf, pdf_bytes)
+            .await
+            .expect("write outside pdf");
+        assert!(
+            read_workspace_file_with_attachments_dir(
+                &ws,
+                secret_pdf.to_str().unwrap_or(""),
+                None,
+                Some(&att_dir),
+            )
+            .await
+            .is_err()
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

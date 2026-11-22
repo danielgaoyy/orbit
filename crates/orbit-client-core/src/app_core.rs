@@ -446,7 +446,7 @@ pub struct WorkspaceFileView {
     pub path: String,
     pub resolved_path: String,
     pub language: String,
-    /// `"text"` | `"image"` | `"binary"`
+    /// `"text"` | `"image"` | `"pdf"` | `"audio"` | `"video"` | `"binary"`
     pub content_kind: String,
     pub mime_type: Option<String>,
     pub content: String,
@@ -8690,6 +8690,95 @@ impl OrbitAppCore {
             .unwrap_or(false)
     }
 
+    /// Verify that `cwd` resolves to (or inside) a registered workspace, agent `cwd`,
+    /// discovered project root, or sidebar project directory on the given local host.
+    /// Rejects unregistered roots, `"~"`, `$HOME`, and filesystem root `"/"`.
+    pub fn is_registered_local_cwd(&self, host_id: &str, cwd: &str) -> bool {
+        let trimmed = cwd.trim();
+        if trimmed.is_empty() || trimmed == "~" {
+            return false;
+        }
+        let resolve_dir = |raw: &str| -> Option<std::path::PathBuf> {
+            let t = raw.trim();
+            if t.is_empty() || t == "~" {
+                return None;
+            }
+            let expanded = if let Some(rest) = t.strip_prefix("~/") {
+                crate::desktop_ops::resolve_user_home()?.join(rest)
+            } else {
+                std::path::PathBuf::from(t)
+            };
+            let canon = std::fs::canonicalize(&expanded).ok()?;
+            if !canon.is_dir() || canon.parent().is_none() {
+                return None;
+            }
+            Some(canon)
+        };
+
+        let Some(canon_cwd) = resolve_dir(trimmed) else {
+            return false;
+        };
+        let canon_home =
+            crate::desktop_ops::resolve_user_home().and_then(|h| std::fs::canonicalize(h).ok());
+        if canon_home.as_ref().is_some_and(|home| canon_cwd == *home) {
+            return false;
+        }
+
+        let matches_registered_root = |raw: &str| -> bool {
+            let Some(canon_root) = resolve_dir(raw) else {
+                return false;
+            };
+            if canon_home.as_ref().is_some_and(|home| canon_root == *home) {
+                return false;
+            }
+            canon_cwd == canon_root || canon_cwd.starts_with(&canon_root)
+        };
+
+        if let Ok(hosts) = self.hosts.read() {
+            let Some(h) = hosts.get(host_id) else {
+                return false;
+            };
+            if !h.is_local {
+                return false;
+            }
+            if h.workspaces.iter().any(|ws| {
+                matches_registered_root(&ws.cwd)
+                    || ws
+                        .source_cwd
+                        .as_deref()
+                        .is_some_and(&matches_registered_root)
+                    || ws
+                        .project_root
+                        .as_deref()
+                        .is_some_and(&matches_registered_root)
+            }) {
+                return true;
+            }
+            if h.agents.values().any(|ag| matches_registered_root(&ag.cwd)) {
+                return true;
+            }
+            if h.discovered_projects
+                .iter()
+                .any(|proj| matches_registered_root(&proj.path))
+            {
+                return true;
+            }
+        } else {
+            return false;
+        }
+
+        if let Ok(projects) = self.projects.read() {
+            return projects.values().any(|proj| {
+                proj.host_id == host_id
+                    && proj
+                        .directories
+                        .iter()
+                        .any(|dir| matches_registered_root(dir))
+            });
+        }
+        false
+    }
+
     /// Rewind an agent conversation (and optionally restore workspace files) to strictly before `to_before_seq`.
     pub async fn rewind_agent_on_host(
         self: &Arc<Self>,
@@ -9330,8 +9419,8 @@ impl OrbitAppCore {
                 return;
             }
 
-            // Shorter wait on local hosts so older local daemons fall back cleanly to local fs read
-            let timeout_secs = if is_local { 3 } else { 15 };
+            // Generous timeout on remote hosts for up to 25 MiB multimodal media previews
+            let timeout_secs = if is_local { 8 } else { 45 };
             let raw_res = match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await
             {
                 Ok(Ok(Ok(raw))) => Ok(raw),
@@ -15476,5 +15565,68 @@ mod tests {
             2,
             "unknown/late filtered snapshot must not wipe other workspaces' cached artifacts"
         );
+    }
+
+    #[test]
+    fn is_registered_local_cwd_enforces_local_registered_roots() {
+        let core = OrbitAppCore::open_in_memory().expect("core");
+        let kp = orbit_crypto::HostIdentityKeypair::generate().expect("kp");
+        let offer = PairingOffer {
+            host_id: "host_local_cwd_test".into(),
+            hostname: "macbook".into(),
+            daemon_pubkey_b64: kp.public_key_b64,
+            direct_endpoints: Vec::new(),
+            relay_url: None,
+            pairing_secret: "sec".into(),
+        };
+        core.pair_host(&offer.to_qr_uri().expect("uri"))
+            .expect("pair");
+
+        let registered_dir =
+            std::env::temp_dir().join(format!("orbit_reg_cwd_{}", uuid::Uuid::new_v4()));
+        let nested_dir = registered_dir.join("packages").join("web");
+        let unregistered_dir =
+            std::env::temp_dir().join(format!("orbit_unreg_cwd_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&nested_dir).expect("mkdir nested");
+        std::fs::create_dir_all(&unregistered_dir).expect("mkdir unreg");
+
+        let reg_str = registered_dir.to_string_lossy().to_string();
+        let nested_str = nested_dir.to_string_lossy().to_string();
+        let unreg_str = unregistered_dir.to_string_lossy().to_string();
+
+        // Remote host (`is_local == false`) must always be rejected even when registered.
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut("host_local_cwd_test").expect("host");
+            h.is_local = false;
+            h.discovered_projects.push(DiscoveredProject {
+                path: reg_str.clone(),
+                name: "reg".into(),
+                git_branch: None,
+                is_git_repo: true,
+                last_modified_unix: 0,
+                nested_git_repos: Vec::new(),
+            });
+        }
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", &reg_str));
+
+        // Flip to local host: registered root + nested subdir pass; `/`, `~`, `$HOME`, and unregistered fail.
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            let h = hosts.get_mut("host_local_cwd_test").expect("host");
+            h.is_local = true;
+        }
+        assert!(core.is_registered_local_cwd("host_local_cwd_test", &reg_str));
+        assert!(core.is_registered_local_cwd("host_local_cwd_test", &nested_str));
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", "/"));
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", "~"));
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", ""));
+        assert!(!core.is_registered_local_cwd("host_local_cwd_test", &unreg_str));
+        if let Some(home) = crate::desktop_ops::resolve_user_home() {
+            assert!(!core.is_registered_local_cwd("host_local_cwd_test", &home.to_string_lossy()));
+        }
+
+        let _ = std::fs::remove_dir_all(&registered_dir);
+        let _ = std::fs::remove_dir_all(&unregistered_dir);
     }
 }

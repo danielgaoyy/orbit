@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::attachments::build_claude_content_blocks;
+use crate::attachments::build_claude_content_blocks_async;
 use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 
 enum ClaudeSessionStartMode<'a> {
@@ -510,10 +510,11 @@ async fn run_claude_actor(
                                     continue;
                                 }
                                 ActiveTurnBehavior::Steer => {
-                                    let content_blocks = build_claude_content_blocks(
-                                        &prompt,
-                                        cfg.attachments_dir.as_deref(),
-                                    );
+                                    let content_blocks = build_claude_content_blocks_async(
+                                        prompt.clone(),
+                                        cfg.attachments_dir.clone(),
+                                    )
+                                    .await;
                                     let user_frame = build_claude_user_frame(
                                         &session_id,
                                         content_blocks,
@@ -540,8 +541,11 @@ async fn run_claude_actor(
                             }))
                             .await;
 
-                        let content_blocks =
-                            build_claude_content_blocks(&prompt, cfg.attachments_dir.as_deref());
+                        let content_blocks = build_claude_content_blocks_async(
+                            prompt,
+                            cfg.attachments_dir.clone(),
+                        )
+                        .await;
                         let user_frame =
                             build_claude_user_frame(&session_id, content_blocks, false);
                         if shim.write_stdin_line(user_frame.to_string()).await.is_err() {
@@ -788,10 +792,11 @@ async fn run_claude_actor(
                                                             } else {
                                                                 orig_prompt
                                                             };
-                                                            let blocks = build_claude_content_blocks(
-                                                                &wire_prompt,
-                                                                cfg.attachments_dir.as_deref(),
-                                                            );
+                                                            let blocks = build_claude_content_blocks_async(
+                                                                wire_prompt,
+                                                                cfg.attachments_dir.clone(),
+                                                            )
+                                                            .await;
                                                             let frame = build_claude_user_frame(
                                                                 &session_id,
                                                                 blocks,
@@ -1437,10 +1442,11 @@ async fn run_claude_actor(
                                             turn_id: next_tid,
                                         }))
                                         .await;
-                                    let content_blocks = build_claude_content_blocks(
-                                        &next_prompt,
-                                        cfg.attachments_dir.as_deref(),
-                                    );
+                                    let content_blocks = build_claude_content_blocks_async(
+                                        next_prompt,
+                                        cfg.attachments_dir.clone(),
+                                    )
+                                    .await;
                                     let user_frame = json!({
                                         "type": "user",
                                         "session_id": session_id,

@@ -32,6 +32,7 @@ import {
   FileSearch,
   FileSymlink,
   FileText,
+  Film,
   FoldVertical,
   GitBranch,
   GitCompareArrows,
@@ -41,6 +42,7 @@ import {
   ListTodo,
   Loader2,
   MessageSquareText,
+  Music,
   Quote,
   RotateCcw,
   RotateCw,
@@ -69,6 +71,7 @@ import {
   isAgentForegroundRunning,
 } from "@/lib/orbit-ipc";
 import { resolveSemanticFileIcon } from "@/components/composer/mention-menu";
+import { detectRichMediaKind } from "@/lib/media-utils";
 import {
   classifySearchTool,
   describeToolStep,
@@ -1189,6 +1192,12 @@ function resolvePromptBadgeIcon(badge: PromptBadge): LucideIcon {
       return SquareTerminal;
     case "image":
       return FileImage;
+    case "pdf":
+      return FileText;
+    case "video":
+      return Film;
+    case "audio":
+      return Music;
     case "quote":
       return Quote;
     case "paste": {
@@ -1240,6 +1249,27 @@ function extractUserPromptPresentation(
     sanitized = true;
     const name = rawPath.split("/").pop() || rawPath;
     inferredBadges.push({ kind: "image", label: name, path: rawPath });
+    return "";
+  });
+
+  working = working.replace(/^Attached PDF file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
+    sanitized = true;
+    const name = rawPath.split("/").pop() || rawPath;
+    inferredBadges.push({ kind: "pdf", label: name, path: rawPath });
+    return "";
+  });
+
+  working = working.replace(/^Attached audio file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
+    sanitized = true;
+    const name = rawPath.split("/").pop() || rawPath;
+    inferredBadges.push({ kind: "audio", label: name, path: rawPath });
+    return "";
+  });
+
+  working = working.replace(/^Attached video file:\s*`([^`]+)`\s*$/gm, (_, rawPath: string) => {
+    sanitized = true;
+    const name = rawPath.split("/").pop() || rawPath;
+    inferredBadges.push({ kind: "video", label: name, path: rawPath });
     return "";
   });
 
@@ -1695,9 +1725,42 @@ const UserPromptBubble = memo(function UserPromptBubble({
               <div className="flex flex-wrap items-center gap-1.5 select-none">
                 {attachmentBadges.map((badge, idx) => {
                   const BadgeIcon = resolvePromptBadgeIcon(badge);
-                  const isMono = badge.kind === "file" || badge.kind === "quote";
+                  const mediaKind =
+                    badge.kind === "pdf" || badge.kind === "audio" || badge.kind === "video"
+                      ? badge.kind
+                      : badge.kind === "file"
+                        ? detectRichMediaKind(badge.path || badge.label)
+                        : null;
+                  const isMono =
+                    badge.kind === "file" || badge.kind === "quote" || mediaKind !== null;
                   const fileTarget = badge.path?.trim() || badge.label;
+                  const isClickableMediaBadge = mediaKind !== null && fileTarget.trim().length > 0;
                   const isClickableFileBadge = isMono && fileTarget.trim().length > 0;
+                  if (isClickableMediaBadge && mediaKind) {
+                    return (
+                      <button
+                        key={`${badge.kind}-${badge.label}-${idx}`}
+                        type="button"
+                        title={`Preview ${badge.label}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          orbitActions.openMediaPreview({
+                            kind: mediaKind,
+                            filename: badge.label,
+                            path: fileTarget,
+                            hostId,
+                            cwd: cwd || "~",
+                          });
+                        }}
+                        className="text-foreground/85 hover:text-foreground inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-black/[0.075] bg-black/[0.03] px-2 py-0.5 text-[12px] transition-colors hover:border-black/[0.14] hover:bg-black/[0.055] dark:border-white/[0.10] dark:bg-white/[0.055] dark:hover:border-white/[0.18] dark:hover:bg-white/[0.095]"
+                      >
+                        <BadgeIcon className="text-muted-foreground size-3.5 shrink-0 stroke-[1.75]" />
+                        <span className="font-mono leading-normal font-medium hover:underline">
+                          {badge.label}
+                        </span>
+                      </button>
+                    );
+                  }
                   if (isClickableFileBadge) {
                     return (
                       <button

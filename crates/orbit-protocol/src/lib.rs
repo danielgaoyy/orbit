@@ -3,10 +3,12 @@
 pub mod acp;
 pub mod artifacts;
 pub mod handoff;
+pub mod media;
 pub mod orchestration;
 pub use acp::*;
 pub use artifacts::*;
 pub use handoff::*;
+pub use media::*;
 pub use orchestration::*;
 
 use std::collections::HashMap;
@@ -990,7 +992,7 @@ pub enum WireMessage {
         cwd: String,
         path: String,
         resolved_path: String,
-        /// `"text"` | `"image"` | `"binary"`
+        /// `"text"` | `"image"` | `"pdf"` | `"audio"` | `"video"` | `"binary"`
         content_kind: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
@@ -1930,8 +1932,12 @@ pub enum ProtocolError {
     InvalidBinaryFrame,
 }
 
-/// Anti-bomb upper bound on a single decompressed Zstd `WireMessage` payload (32 MiB).
-pub const MAX_ZSTD_WIRE_DECODE_BYTES: usize = 32 * 1024 * 1024;
+/// Anti-bomb upper bound on a single decompressed Zstd `WireMessage` payload (40 MiB,
+/// accommodating up to 25 MiB base64-encoded media responses plus JSON envelope).
+pub const MAX_ZSTD_WIRE_DECODE_BYTES: usize = 40 * 1024 * 1024;
+/// WebSocket frame/message size cap shared across daemon, relay, client, and relay-transport
+/// endpoints (48 MiB, safely carrying 25 MiB base64/E2EE frames without tearing down sessions).
+pub const MAX_WS_FRAME_BYTES: usize = 48 * 1024 * 1024;
 /// Target uncompressed JSON byte budget per paginated timeline batch (`TimelineCatchup` / `AgentRewound`).
 pub const MAX_WIRE_TIMELINE_PAGE_BYTES: usize = 4 * 1024 * 1024;
 

@@ -165,8 +165,35 @@ async fn run_codex_actor(
             );
         }
 
-        let build_start_msg = |req_id: u64, resume_tid: Option<&str>| {
-            if let Some(tid) = resume_tid {
+        enum CodexThreadOpenMode<'a> {
+            Start,
+            Resume(&'a str),
+            Fork(&'a str),
+        }
+
+        let build_open_msg = |req_id: u64, open_mode: CodexThreadOpenMode<'_>| match open_mode {
+            CodexThreadOpenMode::Fork(tid) => {
+                let mut params = json!({
+                    "threadId": tid,
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "approvalPolicy": approval_policy,
+                    "sandbox": start_sandbox,
+                    "approvalsReviewer": "user",
+                    "ephemeral": false
+                });
+                if let Some(ref m) = cfg.model {
+                    params["model"] = Value::String(m.clone());
+                }
+                if !inner_config.is_empty() {
+                    params["config"] = Value::Object(inner_config.clone());
+                }
+                json!({
+                    "id": req_id,
+                    "method": "thread/fork",
+                    "params": params
+                })
+            }
+            CodexThreadOpenMode::Resume(tid) => {
                 let mut params = json!({
                     "threadId": tid,
                     "excludeTurns": true
@@ -179,7 +206,8 @@ async fn run_codex_actor(
                     "method": "thread/resume",
                     "params": params
                 })
-            } else {
+            }
+            CodexThreadOpenMode::Start => {
                 let mut params = json!({
                     "cwd": cfg.cwd.to_string_lossy(),
                     "approvalPolicy": approval_policy,
@@ -201,7 +229,15 @@ async fn run_codex_actor(
             }
         };
 
-        let start_msg = build_start_msg(thread_req_id, cfg.resume_session_id.as_deref());
+        let initial_open = if let Some(ref fork_tid) = cfg.fork_from_session_id {
+            CodexThreadOpenMode::Fork(fork_tid.as_str())
+        } else if let Some(ref resume_tid) = cfg.resume_session_id {
+            CodexThreadOpenMode::Resume(resume_tid.as_str())
+        } else {
+            CodexThreadOpenMode::Start
+        };
+
+        let start_msg = build_open_msg(thread_req_id, initial_open);
         if shim.write_stdin_line(start_msg.to_string()).await.is_err() {
             return;
         }
@@ -213,11 +249,42 @@ async fn run_codex_actor(
         )
         .await
         {
-            Ok(v) => v,
-            Err(first_err) if cfg.resume_session_id.is_some() => {
+            Ok(v)
+                if cfg.fork_from_session_id.is_none()
+                    || v.pointer("/thread/id")
+                        .and_then(|x| x.as_str())
+                        .is_some_and(|tid| {
+                            !tid.is_empty() && cfg.fork_from_session_id.as_deref() != Some(tid)
+                        }) =>
+            {
+                if cfg.fork_from_session_id.is_none()
+                    && cfg.resume_session_id.is_none()
+                    && cfg.fallback_handoff_context.is_some()
+                {
+                    inject_handoff_on_next_prompt = true;
+                }
+                v
+            }
+            first_outcome
+                if cfg.fork_from_session_id.is_some() || cfg.resume_session_id.is_some() =>
+            {
+                let first_err = match first_outcome {
+                    Err(e) => e,
+                    Ok(_) => "upstream thread/fork did not return a distinct thread id".to_string(),
+                };
+                let is_fork = cfg.fork_from_session_id.is_some();
+                if is_fork && cfg.native_fork_only {
+                    tracing::warn!(
+                        agent_id = %cfg.agent_id,
+                        error = %first_err,
+                        "Codex native thread/fork unavailable during eager fork; deferring fresh session until first prompt"
+                    );
+                    let _ = shim.kill().await;
+                    return;
+                }
                 let fallback_id = next_id;
                 next_id += 1;
-                let fallback_msg = build_start_msg(fallback_id, None);
+                let fallback_msg = build_open_msg(fallback_id, CodexThreadOpenMode::Start);
                 if shim
                     .write_stdin_line(fallback_msg.to_string())
                     .await
@@ -229,31 +296,40 @@ async fn run_codex_actor(
                     Ok(v) => {
                         inject_handoff_on_next_prompt = true;
                         let old_short: String = cfg
-                            .resume_session_id
+                            .fork_from_session_id
                             .as_deref()
+                            .or(cfg.resume_session_id.as_deref())
                             .unwrap_or_default()
                             .chars()
                             .take(8)
                             .collect();
+                        let notice_msg = if is_fork {
+                            format!(
+                                "Native Codex thread fork ({old_short}…) fell back to a fresh session with conversation context restored."
+                            )
+                        } else {
+                            format!(
+                                "Previous Codex session ({old_short}…) could not be resumed ({first_err}); started a fresh session with recent conversation context restored."
+                            )
+                        };
                         let _ = evt_tx
-                                    .send(DriverEvent::Notice {
-                                        level: "info".into(),
-                                        message: format!(
-                                            "Previous Codex session ({old_short}…) could not be resumed ({first_err}); started a fresh session with recent conversation context restored."
-                                        ),
-                                    })
-                                    .await;
+                            .send(DriverEvent::Notice {
+                                level: "info".into(),
+                                message: notice_msg,
+                            })
+                            .await;
                         v
                     }
                     Err(e) => {
+                        let op_label = if is_fork { "fork" } else { "resume" };
                         let _ = evt_tx
-                                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                                        message: format!(
-                                            "Codex thread resume failed ({first_err}); fresh thread start also failed: {e}"
-                                        ),
-                                        recoverable: false,
-                                    }))
-                                    .await;
+                            .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                message: format!(
+                                    "Codex thread {op_label} failed ({first_err}); fresh thread start also failed: {e}"
+                                ),
+                                recoverable: false,
+                            }))
+                            .await;
                         return;
                     }
                 }
@@ -267,16 +343,19 @@ async fn run_codex_actor(
                     .await;
                 return;
             }
+            Ok(v) => v,
         };
 
         let tid = thread_res
             .pointer("/thread/id")
             .and_then(|v| v.as_str())
-            .or(if inject_handoff_on_next_prompt {
-                None
-            } else {
-                cfg.resume_session_id.as_deref()
-            })
+            .or(
+                if inject_handoff_on_next_prompt || cfg.fork_from_session_id.is_some() {
+                    None
+                } else {
+                    cfg.resume_session_id.as_deref()
+                },
+            )
             .unwrap_or("unknown")
             .to_string();
         let model = thread_res

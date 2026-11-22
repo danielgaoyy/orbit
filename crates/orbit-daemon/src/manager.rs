@@ -9,13 +9,14 @@ use std::time::Duration;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, HostProjectEntry, HostSyncState,
-    KeepAwakeStatus, OrchestrationConfig, PendingPermissionSummary, PromptBadge, ProviderKind,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec,
-    SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
-    WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceScriptKind, WorkspaceScriptStatus,
-    WorkspaceSetupProgress, WorkspaceSetupStatus, WorkspaceSummary, WorktreeCreateMode,
+    ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, ForkTarget, HostProjectEntry,
+    HostSyncState, KeepAwakeStatus, OrchestrationConfig, PendingPermissionSummary, PromptBadge,
+    ProviderKind, ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort,
+    ScheduleSpec, SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
+    ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord,
+    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceScriptKind,
+    WorkspaceScriptStatus, WorkspaceSetupProgress, WorkspaceSetupStatus, WorkspaceSummary,
+    WorktreeCreateMode,
 };
 use orbit_providers::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, SessionLaunchConfig,
@@ -45,7 +46,8 @@ use crate::workspace_cluster::{allocate_unique_handle, evaluate_auto_cluster, sa
 use crate::workspace_runtime::{
     WorkspaceScriptRegistry, allocate_ephemeral_port, build_service_proxy_host,
     create_worktree_with_mode_pooled, load_workspace_manifest_with_fallback,
-    run_worktree_setup_hooks, teardown_and_remove_worktree,
+    run_worktree_setup_hooks, teardown_and_remove_worktree, validate_git_base_ref,
+    validate_git_branch_name,
 };
 use crate::worktree_pool::WorktreePool;
 
@@ -57,6 +59,20 @@ pub struct RewindAgentOutcome {
     pub restored_files: u32,
     pub restored_prompt: Option<String>,
     pub notice: Option<String>,
+}
+
+pub struct ForkAgentSpec {
+    pub source_agent_id: String,
+    pub up_to_seq: Option<u64>,
+    pub target: ForkTarget,
+    pub title: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForkAgentOutcome {
+    pub agent: AgentSummary,
+    pub workspace: Option<WorkspaceSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +182,9 @@ pub struct AgentOrchestrator {
     keep_awake: Arc<KeepAwakeManager>,
     pub worktree_pool: Arc<WorktreePool>,
     live_agents: RwLock<HashMap<String, LiveAgentEntry>>,
+    /// Per-agent mutex serializing driver startup (e.g. concurrent eager fork startup and
+    /// immediate `send_prompt`) so two shims never collide on `a_<agent_id>.sock`.
+    driver_start_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     agent_generations: RwLock<HashMap<String, u64>>,
     pending_questions: RwLock<HashMap<String, Vec<String>>>,
     live_terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
@@ -236,6 +255,7 @@ impl AgentOrchestrator {
             keep_awake,
             worktree_pool,
             live_agents: RwLock::new(HashMap::new()),
+            driver_start_locks: RwLock::new(HashMap::new()),
             agent_generations: RwLock::new(HashMap::new()),
             pending_questions: RwLock::new(HashMap::new()),
             live_terminals: RwLock::new(HashMap::new()),
@@ -452,7 +472,9 @@ impl AgentOrchestrator {
                 self.keep_awake
                     .notify_agent_status(&ag.agent_id, &ag.status);
                 if self
-                    .spawn_and_wire_driver(&ag, executable, resume_ref, true, launch_gen)
+                    .spawn_and_wire_driver(
+                        &ag, executable, resume_ref, None, false, None, true, launch_gen,
+                    )
                     .await
                     .is_ok()
                 {
@@ -1332,6 +1354,8 @@ impl AgentOrchestrator {
             handle: Some(allocated_handle.clone()),
             cluster_suggestion,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
         self.store.upsert_agent(&summary, None)?;
         self.keep_awake
@@ -1413,7 +1437,16 @@ impl AgentOrchestrator {
                 return;
             }
             match mgr
-                .spawn_and_wire_driver(&summary_bg, executable, None, false, launch_gen)
+                .spawn_and_wire_driver(
+                    &summary_bg,
+                    executable,
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    launch_gen,
+                )
                 .await
             {
                 Ok(cmd_tx) => {
@@ -1464,6 +1497,527 @@ impl AgentOrchestrator {
         });
 
         Ok(self.store.get_agent(&agent_id)?.unwrap_or(summary))
+    }
+
+    /// Fork/branch an existing conversation into a new session (either in the same directory
+    /// or inside a freshly provisioned git worktree), atomically cloning timeline history up to
+    /// `spec.up_to_seq` (inclusive, or the full timeline when `None`).
+    ///
+    /// - Full-tail forks (`up_to_seq` is `None` or `>= source.latest_seq`) attempt native upstream
+    ///   session forking (`--resume <sid> --fork-session` on Claude, `thread/fork` on Codex,
+    ///   `session/fork` when advertised on Antigravity) with graceful fallback to a fresh session
+    ///   seeded with compact handoff context built from the cloned events.
+    /// - Mid-thread forks (`up_to_seq < source.latest_seq`) ALWAYS start a fresh upstream session
+    ///   seeded strictly with handoff context built from the cloned prefix (`<= up_to_seq`) so
+    ///   post-fork turns from the parent never leak into the branch.
+    pub async fn fork_agent(
+        self: &Arc<Self>,
+        spec: ForkAgentSpec,
+    ) -> anyhow::Result<ForkAgentOutcome> {
+        // Preflight validations BEFORE creating any workspace/worktree or mutating SQLite
+        if let Some(seq) = spec.up_to_seq {
+            i64::try_from(seq).map_err(|_| anyhow::anyhow!("up_to_seq exceeds supported range"))?;
+        }
+
+        let source = self
+            .store
+            .get_agent(&spec.source_agent_id)?
+            .ok_or_else(|| anyhow::anyhow!("source agent `{}` not found", spec.source_agent_id))?;
+
+        let initial_prompt_text = spec
+            .initial_prompt
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+
+        let preflight_executable = if initial_prompt_text.is_some() {
+            Some(find_provider_executable(source.provider).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} binary (`{}`) not found on host PATH",
+                    source.provider.display_name(),
+                    source.provider.default_binary()
+                )
+            })?)
+        } else {
+            None
+        };
+
+        let source_ws = self.store.get_workspace(&source.workspace_id)?;
+
+        let explicit_title = spec
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let derived_title = explicit_title.clone().unwrap_or_else(|| {
+            let trimmed = source.title.trim();
+            let base = trimmed
+                .strip_suffix(" (fork)")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(if trimmed.is_empty() {
+                    "Session"
+                } else {
+                    trimmed
+                });
+            format!("{base} (fork)")
+        });
+
+        let (target_workspace_id, target_cwd, created_workspace, shared_curated_workspace) =
+            match spec.target {
+                ForkTarget::SameDirectory => {
+                    let reuse_source_ws = source_ws
+                        .as_ref()
+                        .is_some_and(|w| w.is_curated || w.is_worktree);
+                    if reuse_source_ws {
+                        let is_curated = source_ws.as_ref().is_some_and(|w| w.is_curated);
+                        (
+                            source.workspace_id.clone(),
+                            source.cwd.clone(),
+                            None,
+                            is_curated,
+                        )
+                    } else {
+                        // Standalone non-curated local thread: provision a dedicated non-curated
+                        // local workspace (matching `create_and_start_agent`) so archiving one
+                        // thread never archives the other.
+                        let project_root = source_ws
+                            .as_ref()
+                            .and_then(|w| w.project_root.clone())
+                            .or_else(|| Some(source.cwd.clone()));
+                        let new_ws = self
+                            .create_workspace_v2(CreateWorkspaceSpec {
+                                source_cwd: source.cwd.clone(),
+                                title: Some(derived_title.clone()),
+                                worktree_branch: None,
+                                base_ref: None,
+                                isolation: WorkspaceIsolation::Local,
+                                worktree_mode: WorktreeCreateMode::BranchOff,
+                                pr_number: None,
+                                parent_workspace_id: Some(source.workspace_id.clone()),
+                                background: source.background,
+                                project_root,
+                                mission_goal: None,
+                                allow_reuse_existing: false,
+                                is_curated: false,
+                            })
+                            .await?;
+                        (
+                            new_ws.workspace_id.clone(),
+                            new_ws.cwd.clone(),
+                            Some(new_ws),
+                            false,
+                        )
+                    }
+                }
+                ForkTarget::NewWorktree { branch, base_ref } => {
+                    let src_for_wt = source_ws
+                        .as_ref()
+                        .and_then(|w| w.source_cwd.as_deref())
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(&source.cwd);
+                    let expanded_src = crate::expand_host_path(src_for_wt);
+                    if resolve_git_scope(&expanded_src).await.is_none() {
+                        anyhow::bail!(
+                            "not_a_git_repo: `{}` is not a Git repository. Fork in the same directory instead.",
+                            expanded_src.display()
+                        );
+                    }
+                    let branch_name =
+                        match branch.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            Some(b) => validate_git_branch_name(&expanded_src, b).await?,
+                            None => {
+                                format!("orbit/fork-{}", &Uuid::new_v4().simple().to_string()[..6])
+                            }
+                        };
+                    let effective_base_ref =
+                        match base_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            Some(b) => Some(validate_git_base_ref(&expanded_src, b).await?),
+                            None => {
+                                // If forking an agent already running inside a worktree, default
+                                // `base_ref` to that worktree's branch so we branch from its commits
+                                // instead of the main checkout's HEAD.
+                                if let Some(ref ws) = source_ws
+                                    && ws.is_worktree
+                                    && let Some(ref wt_branch) = ws.git_branch
+                                    && !wt_branch.trim().is_empty()
+                                {
+                                    validate_git_base_ref(&expanded_src, wt_branch).await.ok()
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                    let project_root = source_ws
+                        .as_ref()
+                        .and_then(|w| w.project_root.clone())
+                        .or_else(|| Some(expanded_src.to_string_lossy().to_string()));
+                    let new_ws = self
+                        .create_workspace_v2(CreateWorkspaceSpec {
+                            source_cwd: expanded_src.to_string_lossy().to_string(),
+                            title: Some(derived_title.clone()),
+                            worktree_branch: Some(branch_name),
+                            base_ref: effective_base_ref,
+                            isolation: WorkspaceIsolation::Worktree,
+                            worktree_mode: WorktreeCreateMode::BranchOff,
+                            pr_number: None,
+                            parent_workspace_id: Some(source.workspace_id.clone()),
+                            background: source.background,
+                            project_root,
+                            mission_goal: None,
+                            allow_reuse_existing: false,
+                            is_curated: false,
+                        })
+                        .await?;
+                    (
+                        new_ws.workspace_id.clone(),
+                        new_ws.cwd.clone(),
+                        Some(new_ws),
+                        false,
+                    )
+                }
+            };
+
+        let now = Utc::now();
+        let new_agent_id = format!("ag_{}", Uuid::new_v4().simple());
+        let existing_peers = self
+            .store
+            .list_agents_filtered(Some(&target_workspace_id), false, false, None)
+            .unwrap_or_default();
+        let allocated_handle = allocate_unique_handle(
+            None,
+            source.provider,
+            None,
+            Some(&derived_title),
+            &existing_peers,
+        );
+
+        let mut labels = HashMap::new();
+        if explicit_title.is_some() {
+            labels.insert("orbit.title_locked".into(), "1".into());
+        }
+        if let Some(ref ws) = created_workspace
+            && ws.is_worktree
+        {
+            if let Some(ref br) = ws.git_branch {
+                labels.insert("orbit.worktree_branch".into(), br.clone());
+            }
+            if let Some(ref src) = ws.source_cwd {
+                labels.insert("orbit.worktree_source_cwd".into(), src.clone());
+            }
+        }
+
+        let has_initial_prompt = initial_prompt_text.is_some();
+
+        let initial_summary = AgentSummary {
+            agent_id: new_agent_id.clone(),
+            workspace_id: target_workspace_id.clone(),
+            cwd: target_cwd.clone(),
+            title: derived_title,
+            provider: source.provider,
+            model: source.model.clone(),
+            effort: source.effort,
+            mode: source.mode.clone(),
+            status: if has_initial_prompt {
+                AgentStatus::Initializing
+            } else {
+                AgentStatus::Idle
+            },
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: source.background,
+            auto_archive: source.auto_archive,
+            profile_id: source.profile_id.clone(),
+            labels,
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: Some(allocated_handle.clone()),
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: Some(source.agent_id.clone()),
+            forked_at_seq: None,
+        };
+
+        struct ForkInitialPromptEvent {
+            turn_id: String,
+            msg_id: String,
+            prompt_seq: u64,
+            event: TimelineEvent,
+        }
+        struct ForkDbSetup {
+            final_summary: AgentSummary,
+            handoff_context: Option<String>,
+            fork_from_session_id: Option<String>,
+            prompt_event: Option<ForkInitialPromptEvent>,
+        }
+
+        // Run all fallible DB writes inside a closure so any failure cleanly rolls back both
+        // the inserted agent row AND any newly provisioned workspace/worktree!
+        let setup_res: anyhow::Result<ForkDbSetup> = (|| {
+            self.store.upsert_agent(&initial_summary, None)?;
+
+            let source_extra_dirs = self
+                .store
+                .get_agent_extra_dirs(&source.agent_id)
+                .unwrap_or_default();
+            if !source_extra_dirs.is_empty() {
+                let _ = self
+                    .store
+                    .set_agent_extra_dirs(&new_agent_id, &source_extra_dirs);
+            }
+
+            let cloned = self.store.clone_timeline_events_up_to(
+                &source.agent_id,
+                &new_agent_id,
+                spec.up_to_seq,
+            )?;
+
+            // Build handoff context STRICTLY from the newly cloned timeline (never the source's tail!).
+            let handoff_context = self.build_handoff_context(&new_agent_id);
+
+            // Eliminate TOCTOU leak: native upstream session fork is ONLY eligible when the
+            // atomic transaction cloned the true full tail AND the re-fetched source agent is
+            // not currently foreground-busy.
+            let source_now = self.store.get_agent(&source.agent_id)?;
+            let can_native_fork = cloned.cloned_full_tail
+                && source_now
+                    .as_ref()
+                    .is_some_and(|s| !s.status.is_foreground_busy());
+            let fork_from_session_id = if can_native_fork {
+                self.store
+                    .get_persistence_ref(&source.agent_id)?
+                    .filter(|s| !s.trim().is_empty())
+            } else {
+                None
+            };
+
+            let prompt_event = if let Some(ref prompt_text) = initial_prompt_text {
+                let turn_id = format!("turn_{}", Uuid::new_v4().simple());
+                let msg_id = format!("u_{}", Uuid::new_v4().simple());
+                let ev = self.store.append_timeline_event(
+                    &new_agent_id,
+                    1,
+                    Some(&turn_id),
+                    TimelinePayload::UserPrompt {
+                        message_id: msg_id.clone(),
+                        text: prompt_text.clone(),
+                        badges: Vec::new(),
+                    },
+                )?;
+                let prompt_seq = ev.seq;
+                let _ = self
+                    .store
+                    .mark_agent_read_seq(&new_agent_id, Some(prompt_seq));
+                Some(ForkInitialPromptEvent {
+                    turn_id,
+                    msg_id,
+                    prompt_seq,
+                    event: ev,
+                })
+            } else {
+                None
+            };
+
+            let final_summary = self
+                .store
+                .get_agent(&new_agent_id)?
+                .unwrap_or_else(|| initial_summary.clone());
+
+            Ok(ForkDbSetup {
+                final_summary,
+                handoff_context,
+                fork_from_session_id,
+                prompt_event,
+            })
+        })();
+
+        let ForkDbSetup {
+            final_summary,
+            handoff_context,
+            fork_from_session_id,
+            prompt_event,
+        } = match setup_res {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = self.store.delete_agent(&new_agent_id);
+                if let Some(ref ws) = created_workspace {
+                    let _ = self.archive_workspace(&ws.workspace_id).await;
+                }
+                return Err(err);
+            }
+        };
+
+        // Emit PeerJoined when joining a curated multi-agent Mission Workspace
+        if shared_curated_workspace && !final_summary.background {
+            if let Ok(ws_ev) = self.store.append_workspace_event(
+                &target_workspace_id,
+                Some(&new_agent_id),
+                Some(&allocated_handle),
+                WorkspaceEventKind::PeerJoined,
+                &format!(
+                    "@{} ({}) forked into workspace",
+                    allocated_handle,
+                    final_summary.provider.display_name()
+                ),
+                None,
+            ) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceEventRecorded(ws_ev));
+            }
+            if let Ok(Some(refreshed_ws)) = self.store.get_workspace(&target_workspace_id) {
+                let _ = self
+                    .broadcast_tx
+                    .send(DaemonBroadcast::WorkspaceUpdated(refreshed_ws));
+            }
+        }
+
+        // Defer AgentUpdated broadcast until all fallible creation/cloning/prompt steps succeed
+        let _ = self
+            .broadcast_tx
+            .send(DaemonBroadcast::AgentUpdated(final_summary.clone()));
+
+        if let (
+            Some(prompt_text),
+            Some(executable),
+            Some(ForkInitialPromptEvent {
+                turn_id,
+                msg_id,
+                prompt_seq,
+                event: ev,
+            }),
+        ) = (initial_prompt_text, preflight_executable, prompt_event)
+        {
+            let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+            self.keep_awake
+                .notify_agent_status(&new_agent_id, &AgentStatus::Initializing);
+            let launch_gen = self.bump_generation(&new_agent_id).await;
+            let mgr = Arc::clone(self);
+            let summary_bg = final_summary.clone();
+            let ag_id_bg = new_agent_id.clone();
+            tokio::spawn(async move {
+                if mgr.current_generation(&ag_id_bg).await == launch_gen
+                    && let Some(tree_oid) =
+                        capture_git_tree_snapshot(Path::new(&summary_bg.cwd)).await
+                    && mgr.current_generation(&ag_id_bg).await == launch_gen
+                {
+                    let _ = mgr.store.save_turn_checkpoint(
+                        &ag_id_bg,
+                        prompt_seq,
+                        Some(&turn_id),
+                        &tree_oid,
+                    );
+                }
+                if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                    return;
+                }
+                match mgr
+                    .spawn_and_wire_driver(
+                        &summary_bg,
+                        executable,
+                        None,
+                        fork_from_session_id,
+                        false,
+                        handoff_context,
+                        false,
+                        launch_gen,
+                    )
+                    .await
+                {
+                    Ok(cmd_tx) => {
+                        if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                            let _ = cmd_tx.send(DriverCommand::Shutdown).await;
+                            return;
+                        }
+                        let sanitized = sanitize_human_prompt_for_wire(&prompt_text, &msg_id);
+                        let wire = mgr
+                            .augment_prompt_with_workspace_context(&ag_id_bg, sanitized)
+                            .await;
+                        let _ = cmd_tx
+                            .send(DriverCommand::SendPrompt {
+                                turn_id,
+                                prompt: wire,
+                                behavior: ActiveTurnBehavior::Steer,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                            return;
+                        }
+                        mgr.keep_awake.mark_agent_idle(&ag_id_bg);
+                        if let Ok(ev) = mgr.store.append_timeline_event(
+                            &ag_id_bg,
+                            1,
+                            None,
+                            TimelinePayload::StatusChanged {
+                                status: AgentStatus::Error {
+                                    message: e.to_string(),
+                                    recoverable: true,
+                                },
+                            },
+                        ) {
+                            let _ = mgr.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
+                        }
+                        let _ = mgr
+                            .store
+                            .set_agent_attention(&ag_id_bg, AttentionState::Error);
+                        if let Ok(Some(ag)) = mgr.store.get_agent(&ag_id_bg) {
+                            let _ = mgr.broadcast_tx.send(DaemonBroadcast::AgentUpdated(ag));
+                        }
+                    }
+                }
+            });
+        } else if fork_from_session_id.is_some()
+            && let Some(executable) = find_provider_executable(final_summary.provider)
+        {
+            // Eagerly snapshot the parent's upstream session for full-tail forks before the
+            // parent thread diverges with new turns. `native_fork_only = true` ensures that if
+            // upstream native fork fails or is unsupported, we NEVER persist a blank fallback
+            // session ID — letting the user's first prompt spawn fresh with `handoff_context`.
+            let launch_gen = self.bump_generation(&new_agent_id).await;
+            let mgr = Arc::clone(self);
+            let summary_bg = final_summary.clone();
+            let ag_id_bg = new_agent_id.clone();
+            tokio::spawn(async move {
+                if mgr.current_generation(&ag_id_bg).await != launch_gen {
+                    return;
+                }
+                if let Err(e) = mgr
+                    .spawn_and_wire_driver(
+                        &summary_bg,
+                        executable,
+                        None,
+                        fork_from_session_id,
+                        true,
+                        handoff_context,
+                        false,
+                        launch_gen,
+                    )
+                    .await
+                {
+                    warn!(
+                        agent_id = %ag_id_bg,
+                        error = %e,
+                        "eager native fork driver startup deferred; next user prompt will launch with handoff context"
+                    );
+                }
+            });
+        }
+
+        Ok(ForkAgentOutcome {
+            agent: final_summary,
+            workspace: created_workspace,
+        })
     }
 
     pub async fn send_prompt(
@@ -3079,10 +3633,31 @@ impl AgentOrchestrator {
         Ok(outcome)
     }
 
+    async fn agent_start_lock(&self, agent_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Some(lock) = self.driver_start_locks.read().await.get(agent_id) {
+            return Arc::clone(lock);
+        }
+        let mut guard = self.driver_start_locks.write().await;
+        Arc::clone(
+            guard
+                .entry(agent_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
     async fn get_or_resume_driver(
         self: &Arc<Self>,
         agent_id: &str,
     ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
+        if let Some(tx) = self.live_agent_tx(agent_id).await {
+            return Ok(tx);
+        }
+
+        let start_lock = self.agent_start_lock(agent_id).await;
+        let _start_guard = start_lock.lock().await;
+
+        // Re-check after acquiring the per-agent startup lock so concurrent eager-fork startup
+        // and user `send_prompt` share the same live shim without socket collision.
         if let Some(tx) = self.live_agent_tx(agent_id).await {
             return Ok(tx);
         }
@@ -3097,15 +3672,51 @@ impl AgentOrchestrator {
         })?;
         let launch_gen = self.bump_generation(agent_id).await;
 
-        self.spawn_and_wire_driver(&summary, executable, resume_ref, false, launch_gen)
-            .await
+        self.spawn_and_wire_driver_locked(
+            &summary, executable, resume_ref, None, false, None, false, launch_gen,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_and_wire_driver(
         self: &Arc<Self>,
         summary: &AgentSummary,
         executable: PathBuf,
         resume_session_id: Option<String>,
+        fork_from_session_id: Option<String>,
+        native_fork_only: bool,
+        explicit_handoff_context: Option<String>,
+        reattach_existing_shim: bool,
+        expected_gen: u64,
+    ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
+        let start_lock = self.agent_start_lock(&summary.agent_id).await;
+        let _start_guard = start_lock.lock().await;
+        if self.current_generation(&summary.agent_id).await != expected_gen {
+            anyhow::bail!("agent session was reset before startup");
+        }
+        self.spawn_and_wire_driver_locked(
+            summary,
+            executable,
+            resume_session_id,
+            fork_from_session_id,
+            native_fork_only,
+            explicit_handoff_context,
+            reattach_existing_shim,
+            expected_gen,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_and_wire_driver_locked(
+        self: &Arc<Self>,
+        summary: &AgentSummary,
+        executable: PathBuf,
+        resume_session_id: Option<String>,
+        fork_from_session_id: Option<String>,
+        native_fork_only: bool,
+        explicit_handoff_context: Option<String>,
         reattach_existing_shim: bool,
         expected_gen: u64,
     ) -> anyhow::Result<mpsc::Sender<DriverCommand>> {
@@ -3224,11 +3835,17 @@ impl AgentOrchestrator {
             .as_deref()
             .map(|tid| self.store.max_turn_segment_step(&summary.agent_id, tid))
             .unwrap_or(0);
-        let fallback_handoff_context = if !reattach_existing_shim && resume_session_id.is_some() {
-            self.build_handoff_context(&summary.agent_id)
-        } else {
-            None
-        };
+        let fallback_handoff_context = explicit_handoff_context.or_else(|| {
+            if !reattach_existing_shim
+                && (resume_session_id.is_some()
+                    || fork_from_session_id.is_some()
+                    || summary.latest_seq > 0)
+            {
+                self.build_handoff_context(&summary.agent_id)
+            } else {
+                None
+            }
+        });
 
         let handle = spawn_provider_session(SessionLaunchConfig {
             agent_id: summary.agent_id.clone(),
@@ -3243,6 +3860,8 @@ impl AgentOrchestrator {
             effort: summary.effort,
             mode: summary.mode.clone(),
             resume_session_id,
+            fork_from_session_id,
+            native_fork_only,
             mcp_spec,
             system_prompt_append: profile.and_then(|p| p.system_prompt_append),
             extra_env,
@@ -4348,5 +4967,457 @@ mod streaming_buffer_tests {
             StreamPushOutcome::Buffered => panic!("non-streaming event must flush immediately"),
         }
         assert!(buf.is_empty());
+    }
+
+    async fn setup_test_orchestrator(home_dir: &Path) -> (Arc<AgentOrchestrator>, Arc<OrbitStore>) {
+        std::fs::create_dir_all(home_dir).expect("mkdir home");
+        let store = Arc::new(OrbitStore::open_in_memory().expect("open mem store"));
+        let scripts = Arc::new(WorkspaceScriptRegistry::default());
+        let keep_awake = Arc::new(KeepAwakeManager::new(false));
+        let orch = AgentOrchestrator::new(
+            home_dir.to_path_buf(),
+            "host_test".into(),
+            "tok_test".into(),
+            Arc::new(RwLock::new(0)),
+            Arc::new(RwLock::new(OrchestrationConfig::default())),
+            Arc::clone(&store),
+            scripts,
+            keep_awake,
+        )
+        .await;
+        (orch, store)
+    }
+
+    fn seed_source_conversation(
+        store: &OrbitStore,
+        ws_id: &str,
+        cwd: &str,
+        agent_id: &str,
+        persistence_ref: Option<&str>,
+    ) -> (u64, u64, u64, u64) {
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: ws_id.into(),
+                title: "demo".into(),
+                cwd: cwd.into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: Some(cwd.into()),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("upsert ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: agent_id.into(),
+                    workspace_id: ws_id.into(),
+                    cwd: cwd.into(),
+                    title: "Refactor Auth".into(),
+                    provider: ProviderKind::ClaudeCode,
+                    model: Some("sonnet".into()),
+                    effort: Some(ReasoningEffort::High),
+                    mode: SessionMode::AcceptEdits,
+                    status: AgentStatus::Idle,
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    created_at: now,
+                    updated_at: now,
+                    archived_at: None,
+                    background: false,
+                    auto_archive: false,
+                    profile_id: Some("prof_1".into()),
+                    labels: HashMap::new(),
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    queued_prompts: Vec::new(),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: Some("lead".into()),
+                    cluster_suggestion: None,
+                    task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
+                },
+                persistence_ref,
+            )
+            .expect("upsert agent");
+
+        let s1 = store
+            .append_timeline_event(
+                agent_id,
+                1,
+                Some("t1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "Design token rotation for AuthService".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e1")
+            .seq;
+        let s2 = store
+            .append_timeline_event(
+                agent_id,
+                1,
+                Some("t1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "Use rotating refresh tokens stored hashed in SQLite.".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e2")
+            .seq;
+        let s3 = store
+            .append_timeline_event(
+                agent_id,
+                1,
+                Some("t2"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u2".into(),
+                    text: "POST_FORK_SECRET_PROMPT_XYZ switch to OAuth2 PKCE".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e3")
+            .seq;
+        let s4 = store
+            .append_timeline_event(
+                agent_id,
+                1,
+                Some("t2"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "POST_FORK_SECRET_REPLY_XYZ PKCE flow implemented.".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e4")
+            .seq;
+        (s1, s2, s3, s4)
+    }
+
+    #[tokio::test]
+    async fn fork_agent_same_dir_mid_thread_and_new_worktree_e2e() {
+        let tmp_root =
+            std::env::temp_dir().join(format!("orbit_fork_e2e_{}", Uuid::new_v4().simple()));
+        let home_dir = tmp_root.join("orbit_home");
+        let repo_dir = tmp_root.join("repo");
+        let non_git_dir = tmp_root.join("plain_dir");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        std::fs::create_dir_all(&non_git_dir).expect("mkdir plain");
+
+        // Initialize a real git repository for the NewWorktree fork test
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "Orbit Test"]);
+        run_git(&["config", "user.email", "test@orbit.local"]);
+        std::fs::write(repo_dir.join("README.md"), "# Orbit Fork Test\n").expect("write readme");
+        run_git(&["add", "README.md"]);
+        run_git(&["commit", "-m", "initial commit"]);
+
+        let (orch, store) = setup_test_orchestrator(&home_dir).await;
+        let repo_str = repo_dir.to_string_lossy().to_string();
+        let (_s1, s2, _s3, s4) =
+            seed_source_conversation(&store, "ws_repo", &repo_str, "ag_src", None);
+
+        // (a) Same-directory full fork from standalone non-curated workspace creates a dedicated
+        // isolated local workspace so archiving one thread never archives the other.
+        let full_out = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::SameDirectory,
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("same-dir full fork");
+        let full_ws = full_out
+            .workspace
+            .as_ref()
+            .expect("standalone same-dir fork must provision dedicated local workspace");
+        assert!(!full_ws.is_worktree);
+        assert!(!full_ws.is_curated);
+        assert_ne!(full_out.agent.workspace_id, "ws_repo");
+        assert_eq!(full_out.agent.workspace_id, full_ws.workspace_id);
+        assert_eq!(full_out.agent.cwd, repo_str);
+        assert_eq!(full_out.agent.title, "Refactor Auth (fork)");
+        assert!(
+            !full_out.agent.labels.contains_key("orbit.title_locked"),
+            "default derived fork title must remain unlocked"
+        );
+        assert_eq!(
+            full_out.agent.forked_from_agent_id.as_deref(),
+            Some("ag_src")
+        );
+        assert_eq!(full_out.agent.forked_at_seq, Some(s4));
+        assert_eq!(full_out.agent.provider, ProviderKind::ClaudeCode);
+        assert_eq!(full_out.agent.model.as_deref(), Some("sonnet"));
+        assert_eq!(full_out.agent.effort, Some(ReasoningEffort::High));
+        assert_eq!(full_out.agent.profile_id.as_deref(), Some("prof_1"));
+
+        let (full_events, _) = store
+            .fetch_timeline_since(&full_out.agent.agent_id, 0, 50)
+            .expect("fetch full");
+        assert_eq!(full_events.len(), 4);
+
+        // (a2) Same-directory fork inside a curated Mission Workspace reuses the workspace and
+        // emits a WorkspaceEventKind::PeerJoined event.
+        let mut curated_ws = store
+            .get_workspace("ws_repo")
+            .expect("get ws")
+            .expect("exists");
+        curated_ws.workspace_id = "ws_curated".into();
+        curated_ws.is_curated = true;
+        store.upsert_workspace(&curated_ws).expect("upsert curated");
+        let mut curated_ag = store.get_agent("ag_src").expect("get ag").expect("exists");
+        curated_ag.agent_id = "ag_curated_src".into();
+        curated_ag.workspace_id = "ws_curated".into();
+        store
+            .upsert_agent(&curated_ag, None)
+            .expect("upsert curated ag");
+        let curated_fork = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_curated_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::SameDirectory,
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("curated same-dir fork");
+        assert!(curated_fork.workspace.is_none());
+        assert_eq!(curated_fork.agent.workspace_id, "ws_curated");
+        let ws_events = store
+            .list_workspace_events("ws_curated", 20)
+            .expect("ws events");
+        assert!(
+            ws_events
+                .iter()
+                .any(|e| e.kind == WorkspaceEventKind::PeerJoined
+                    && e.agent_id.as_deref() == Some(curated_fork.agent.agent_id.as_str())),
+            "curated workspace fork must record PeerJoined event"
+        );
+
+        // (b) Mid-thread fork at `s2` (with source holding a persistence_ref!) must strictly
+        // truncate timeline AND handoff context and NEVER inherit parent persistence_ref.
+        store
+            .set_persistence_ref("ag_src", "parent_claude_sess_999")
+            .expect("set parent pref");
+        let mid_out = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: Some(s2),
+                target: ForkTarget::SameDirectory,
+                title: Some("Alt Auth Branch".into()),
+                initial_prompt: None,
+            })
+            .await
+            .expect("mid-thread fork");
+        assert_eq!(mid_out.agent.title, "Alt Auth Branch");
+        assert_eq!(
+            mid_out
+                .agent
+                .labels
+                .get("orbit.title_locked")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            mid_out.agent.forked_from_agent_id.as_deref(),
+            Some("ag_src")
+        );
+        assert_eq!(mid_out.agent.forked_at_seq, Some(s2));
+        assert_eq!(
+            store
+                .get_persistence_ref(&mid_out.agent.agent_id)
+                .expect("mid pref"),
+            None,
+            "mid-thread fork must not inherit parent persistence_ref"
+        );
+
+        let (mid_events, _) = store
+            .fetch_timeline_since(&mid_out.agent.agent_id, 0, 50)
+            .expect("fetch mid");
+        assert_eq!(mid_events.len(), 2);
+        let mid_handoff = orch
+            .build_handoff_context(&mid_out.agent.agent_id)
+            .expect("mid handoff");
+        assert!(mid_handoff.contains("Design token rotation for AuthService"));
+        assert!(mid_handoff.contains("rotating refresh tokens"));
+        assert!(
+            !mid_handoff.contains("POST_FORK_SECRET_PROMPT_XYZ"),
+            "post-fork prompt must never leak into handoff context"
+        );
+        assert!(
+            !mid_handoff.contains("POST_FORK_SECRET_REPLY_XYZ"),
+            "post-fork reply must never leak into handoff context"
+        );
+
+        // (c) Git flag / ref injection MUST be rejected upfront with zero leaked workspaces!
+        let ws_count_before = store.list_workspaces().expect("ws list").len();
+        let bad_branch_err = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: Some("-f".into()),
+                    base_ref: None,
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect_err("leading-dash branch must be rejected");
+        assert!(
+            bad_branch_err.to_string().contains("invalid_git_ref"),
+            "unexpected branch error: {bad_branch_err}"
+        );
+
+        let bad_base_err = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src".into(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: Some("orbit/fork-safe-name".into()),
+                    base_ref: Some("--detach".into()),
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect_err("leading-dash base_ref must be rejected");
+        assert!(
+            bad_base_err.to_string().contains("invalid_git_ref"),
+            "unexpected base_ref error: {bad_base_err}"
+        );
+        assert_eq!(
+            store.list_workspaces().expect("ws list").len(),
+            ws_count_before,
+            "rejected git ref forks must not leave leaked workspace rows"
+        );
+
+        // (d) NewWorktree fork creates a real git worktree via the accelerated path
+        let wt_src = seed_source_conversation(&store, "ws_repo", &repo_str, "ag_src_wt", None);
+        let wt_out = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_src_wt".into(),
+                up_to_seq: Some(wt_src.1),
+                target: ForkTarget::NewWorktree {
+                    branch: Some("orbit/fork-alt-auth".into()),
+                    base_ref: Some("main".into()),
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("new worktree fork");
+        let wt_ws = wt_out
+            .workspace
+            .as_ref()
+            .expect("worktree fork must return created workspace");
+        assert!(wt_ws.is_worktree);
+        assert_eq!(wt_ws.git_branch.as_deref(), Some("orbit/fork-alt-auth"));
+        assert_eq!(wt_out.agent.workspace_id, wt_ws.workspace_id);
+        assert_eq!(wt_out.agent.cwd, wt_ws.cwd);
+        assert_ne!(wt_out.agent.cwd, repo_str);
+        assert!(Path::new(&wt_ws.cwd).join("README.md").is_file());
+        assert_eq!(
+            wt_out.agent.forked_from_agent_id.as_deref(),
+            Some("ag_src_wt")
+        );
+        assert_eq!(wt_out.agent.forked_at_seq, Some(wt_src.1));
+
+        // (e) Forking an agent INSIDE a worktree into a second NewWorktree with `base_ref: None`
+        // must branch from the source worktree's branch (carrying its unique commit!), NOT main!
+        let wt_dir = PathBuf::from(&wt_ws.cwd);
+        std::fs::write(wt_dir.join("WT_ONLY.txt"), "from worktree branch\n")
+            .expect("write wt file");
+        let run_git_wt = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&wt_dir)
+                .output()
+                .expect("run git wt");
+            assert!(
+                out.status.success(),
+                "git {args:?} in wt failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git_wt(&["add", "WT_ONLY.txt"]);
+        run_git_wt(&["commit", "-m", "worktree branch commit"]);
+
+        let wt_child = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: wt_out.agent.agent_id.clone(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: Some("orbit/fork-from-wt".into()),
+                    base_ref: None,
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect("nested worktree fork");
+        let wt_child_ws = wt_child
+            .workspace
+            .as_ref()
+            .expect("nested worktree fork workspace");
+        assert!(
+            Path::new(&wt_child_ws.cwd).join("WT_ONLY.txt").is_file(),
+            "forking a worktree agent with base_ref=None must branch from the worktree's branch"
+        );
+
+        // Non-git directory returns clean not_a_git_repo error for NewWorktree
+        let plain_str = non_git_dir.to_string_lossy().to_string();
+        seed_source_conversation(&store, "ws_plain", &plain_str, "ag_plain", None);
+        let err = orch
+            .fork_agent(ForkAgentSpec {
+                source_agent_id: "ag_plain".into(),
+                up_to_seq: None,
+                target: ForkTarget::NewWorktree {
+                    branch: None,
+                    base_ref: None,
+                },
+                title: None,
+                initial_prompt: None,
+            })
+            .await
+            .expect_err("non-git worktree fork must fail cleanly");
+        assert!(
+            err.to_string().contains("not_a_git_repo"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

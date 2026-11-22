@@ -74,6 +74,22 @@ pub struct SlashCommandView {
 pub fn slash_commands(platform: ClientPlatform) -> Vec<SlashCommandView> {
     let all = vec![
         SlashCommandView {
+            id: "fork".into(),
+            command: "/fork".into(),
+            label: "Fork Conversation".into(),
+            description: "Branch chat here, or `/fork worktree` in a new git worktree".into(),
+            shortcut_key: None,
+            icon_key: "fork".into(),
+            keywords: vec![
+                "fork".into(),
+                "branch".into(),
+                "clone".into(),
+                "split".into(),
+                "worktree".into(),
+            ],
+            desktop_only: false,
+        },
+        SlashCommandView {
             id: "btw".into(),
             command: "/btw".into(),
             label: "Ask a Side Question".into(),
@@ -424,6 +440,68 @@ pub fn parse_leading_slash_directive(raw_text: &str) -> (Option<SlashDirective>,
     (None, trimmed.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedForkCommand {
+    pub worktree: bool,
+    pub branch: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+/// Parse `/fork`, `/fork worktree`, `/fork wt`, `/fork --worktree`, optionally followed by
+/// `--branch <name>` and/or an initial follow-up prompt.
+pub fn parse_leading_fork_command(raw_text: &str) -> Option<ParsedForkCommand> {
+    let trimmed = raw_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "/fork" {
+        return Some(ParsedForkCommand {
+            worktree: false,
+            branch: None,
+            initial_prompt: None,
+        });
+    }
+    if !lower.starts_with("/fork") {
+        return None;
+    }
+    let after = trimmed.get(5..)?;
+    if !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+
+    let mut rest = after.trim();
+    let mut worktree = false;
+    let mut branch: Option<String> = None;
+
+    // Consume leading `worktree` / `wt` / `--worktree` token if present
+    let first_tok = rest.split_whitespace().next().unwrap_or("");
+    let first_lower = first_tok.to_ascii_lowercase();
+    if matches!(first_lower.as_str(), "worktree" | "wt" | "--worktree") {
+        worktree = true;
+        rest = rest[first_tok.len()..].trim();
+    }
+
+    // Consume optional `--branch <name>` token
+    if let Some(after_flag) = rest
+        .strip_prefix("--branch")
+        .filter(|s| s.starts_with(char::is_whitespace))
+    {
+        let after_ws = after_flag.trim_start();
+        if let Some(br_tok) = after_ws.split_whitespace().next()
+            && !br_tok.is_empty()
+        {
+            worktree = true;
+            branch = Some(br_tok.to_string());
+            rest = after_ws[br_tok.len()..].trim();
+        }
+    }
+
+    let initial_prompt = (!rest.is_empty()).then(|| rest.to_string());
+    Some(ParsedForkCommand {
+        worktree,
+        branch,
+        initial_prompt,
+    })
+}
+
 pub fn parse_leading_btw_question(raw_text: &str) -> Option<String> {
     let trimmed = raw_text.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -581,6 +659,14 @@ pub struct ComposedPromptView {
     pub is_compact: bool,
     pub is_btw: bool,
     pub btw_question: Option<String>,
+    #[serde(default)]
+    pub is_fork: bool,
+    #[serde(default)]
+    pub fork_worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_prompt: Option<String>,
     pub is_empty: bool,
 }
 
@@ -602,6 +688,25 @@ pub fn compose_prompt(
 ) -> ComposedPromptView {
     let raw_trimmed = req.raw_text.trim();
     if req.explicit_directive.is_none()
+        && let Some(fork_cmd) = parse_leading_fork_command(raw_trimmed)
+    {
+        return ComposedPromptView {
+            wire_prompt: String::new(),
+            display_prompt: String::new(),
+            badges: Vec::new(),
+            effective_directive: None,
+            is_compact: false,
+            is_btw: false,
+            btw_question: None,
+            is_fork: true,
+            fork_worktree: fork_cmd.worktree,
+            fork_branch: fork_cmd.branch,
+            fork_prompt: fork_cmd.initial_prompt,
+            is_empty: false,
+        };
+    }
+
+    if req.explicit_directive.is_none()
         && let Some(btw_q) = parse_leading_btw_question(raw_trimmed)
     {
         return ComposedPromptView {
@@ -612,6 +717,10 @@ pub fn compose_prompt(
             is_compact: false,
             is_btw: true,
             btw_question: Some(btw_q),
+            is_fork: false,
+            fork_worktree: false,
+            fork_branch: None,
+            fork_prompt: None,
             is_empty: false,
         };
     }
@@ -654,6 +763,10 @@ pub fn compose_prompt(
             is_compact: true,
             is_btw: false,
             btw_question: None,
+            is_fork: false,
+            fork_worktree: false,
+            fork_branch: None,
+            fork_prompt: None,
             is_empty: false,
         };
     }
@@ -684,6 +797,10 @@ pub fn compose_prompt(
             is_compact: false,
             is_btw: false,
             btw_question: None,
+            is_fork: false,
+            fork_worktree: false,
+            fork_branch: None,
+            fork_prompt: None,
             is_empty: true,
         };
     }
@@ -913,6 +1030,10 @@ pub fn compose_prompt(
         is_compact: false,
         is_btw: false,
         btw_question: None,
+        is_fork: false,
+        fork_worktree: false,
+        fork_branch: None,
+        fork_prompt: None,
         is_empty: false,
     }
 }
@@ -1395,5 +1516,80 @@ mod tests {
             build_workflow_instruction(SlashDirective::OrbitAdvisor)
                 .contains("command=\"/orbit-advisor\"")
         );
+    }
+
+    #[test]
+    fn fork_slash_command_parses_same_dir_worktree_branch_and_prompt() {
+        let catalog = slash_commands(ClientPlatform::Desktop);
+        assert!(
+            catalog
+                .iter()
+                .any(|c| c.id == "fork" && c.command == "/fork")
+        );
+        assert!(!filter_slash_commands("fork", ClientPlatform::Ios).is_empty());
+
+        let same_dir = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::ClaudeCode,
+                raw_text: "  /fork  ".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert!(same_dir.is_fork);
+        assert!(!same_dir.fork_worktree);
+        assert!(same_dir.fork_branch.is_none());
+        assert!(same_dir.fork_prompt.is_none());
+        assert!(!same_dir.is_empty);
+
+        let wt = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::Codex,
+                raw_text: "/fork worktree --branch feat/alt Try implementing approach B".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert!(wt.is_fork);
+        assert!(wt.fork_worktree);
+        assert_eq!(wt.fork_branch.as_deref(), Some("feat/alt"));
+        assert_eq!(
+            wt.fork_prompt.as_deref(),
+            Some("Try implementing approach B")
+        );
+
+        let wt_only = compose_prompt(
+            &ComposePromptRequest {
+                provider: ProviderKind::Antigravity,
+                raw_text: "/fork worktree".into(),
+                explicit_directive: None,
+                host_id: None,
+                cwd: None,
+                contexts: Vec::new(),
+                quotes: Vec::new(),
+                pastes: Vec::new(),
+            },
+            None,
+            None,
+        );
+        assert!(wt_only.is_fork);
+        assert!(wt_only.fork_worktree);
+        assert!(wt_only.fork_branch.is_none());
+        assert!(wt_only.fork_prompt.is_none());
+
+        // Non-fork command prefix does not false-trigger
+        assert!(parse_leading_fork_command("/forking something").is_none());
     }
 }

@@ -310,6 +310,12 @@ fn build_acp_spawn_spec(
 pub async fn spawn_acp_provider_session(
     cfg: SessionLaunchConfig,
 ) -> Result<ProviderSessionHandle, String> {
+    if cfg.native_fork_only {
+        return Err(format!(
+            "{} eager native fork is deferred to handoff on first prompt",
+            cfg.provider.display_name()
+        ));
+    }
     let reattached = if cfg.reattach_existing_shim {
         connect_existing_shim_after(&cfg.shim_socket, cfg.shim_after_seq).await
     } else {
@@ -2606,6 +2612,8 @@ mod tests {
             effort: None,
             mode: SessionMode::Default,
             resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
             mcp_spec: Some(OrbitMcpLaunchSpec {
                 server_name: "orbit".into(),
                 http_url: "http://127.0.0.1:6868/mcp/agents".into(),

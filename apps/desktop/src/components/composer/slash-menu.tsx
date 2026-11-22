@@ -6,6 +6,7 @@ import {
   FoldVertical,
   FolderTree,
   GitCompareArrows,
+  GitFork,
   Globe,
   Layers,
   ListTodo,
@@ -30,6 +31,8 @@ import { cn } from "@/lib/utils";
 
 function resolveSlashCommandIcon(cmd: SlashCommandView): LucideIcon {
   switch (cmd.id || cmd.icon_key) {
+    case "fork":
+      return GitFork;
     case "btw":
       return MessageCircleQuestion;
     case "plan":

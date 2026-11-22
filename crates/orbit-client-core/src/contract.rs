@@ -3,11 +3,14 @@
 //! - Mobile UniFFI (`crates/orbit-ffi-uniffi`)
 //! - HarmonyOS N-API (`crates/orbit-ffi-ohos`)
 
-use orbit_protocol::{NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort, SessionMode};
+use orbit_protocol::{
+    ForkTarget, NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort, SessionMode,
+    WorkspaceSummary,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::HostRouteMode;
-pub use crate::app_core::AskSideQuestionRequest;
+pub use crate::app_core::{AgentCardView, AskSideQuestionRequest};
 pub use crate::diagram::{DiagramKind, DiagramTheme, RenderDiagramRequest, RenderDiagramView};
 pub use crate::export::{
     ExportAgentMeta, ExportFormat, ExportOptions, ExportedTranscript, ExtractedCodeBlock,
@@ -117,6 +120,27 @@ pub struct RewindAgentRequest {
     pub to_before_seq: u64,
     #[serde(default)]
     pub restore_files: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkAgentRequest {
+    pub host_id: String,
+    pub source_agent_id: String,
+    #[serde(default)]
+    pub up_to_seq: Option<u64>,
+    #[serde(default)]
+    pub target: ForkTarget,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkAgentResultView {
+    pub agent: AgentCardView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -685,6 +685,8 @@ export interface AgentCardView {
   cluster_suggestion?: WorkspaceClusterSuggestion | null;
   worktree_branch?: string | null;
   task_summary?: string | null;
+  forked_from_agent_id?: string | null;
+  forked_at_seq?: number | null;
   updated_at_rfc3339: string;
   is_pinned: boolean;
   seen_seq: number;
@@ -1044,6 +1046,24 @@ export interface RewindAgentResultView {
   restored_files: number;
   restored_prompt: string | null;
   notice: string | null;
+}
+
+export type ForkTarget =
+  | { kind: "same_directory" }
+  | { kind: "new_worktree"; branch?: string | null; base_ref?: string | null };
+
+export interface ForkAgentRequest {
+  host_id: string;
+  source_agent_id: string;
+  up_to_seq?: number | null;
+  target?: ForkTarget;
+  title?: string | null;
+  initial_prompt?: string | null;
+}
+
+export interface ForkAgentResultView {
+  agent: AgentCardView;
+  workspace?: WorkspaceSummary | null;
 }
 
 export interface GitFileEntry {
@@ -1524,6 +1544,10 @@ export interface ComposedPromptView {
   is_compact: boolean;
   is_btw: boolean;
   btw_question: string | null;
+  is_fork?: boolean;
+  fork_worktree?: boolean;
+  fork_branch?: string | null;
+  fork_prompt?: string | null;
   is_empty: boolean;
 }
 
@@ -1720,6 +1744,10 @@ export const orbitIpc = {
         is_compact: false,
         is_btw: false,
         btw_question: null,
+        is_fork: false,
+        fork_worktree: false,
+        fork_branch: null,
+        fork_prompt: null,
         is_empty: text.length === 0,
       };
     }
@@ -2590,6 +2618,12 @@ export const orbitIpc = {
       toBeforeSeq,
       restoreFiles,
     });
+  },
+  forkAgent: async (req: ForkAgentRequest): Promise<ForkAgentResultView> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Fork is unavailable outside the desktop runtime");
+    }
+    return invoke<ForkAgentResultView>("fork_agent", { req });
   },
   resolvePermission: async (
     hostId: string,

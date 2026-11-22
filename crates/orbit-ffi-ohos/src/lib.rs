@@ -19,8 +19,9 @@ use orbit_client_core::catalog::{
 };
 use orbit_client_core::composer::{ClientPlatform, ComposePromptRequest};
 use orbit_client_core::contract::{
-    AgentStageDeltaRequest, CreateSessionRequest, FleetSidebarRequest, MentionRankRequest,
-    ModelSelectionRequest, RenderDiagramRequest, SendPromptRequest, UpdateHostConfigRequest,
+    AgentStageDeltaRequest, CreateSessionRequest, FleetSidebarRequest, ForkAgentRequest,
+    MentionRankRequest, ModelSelectionRequest, RenderDiagramRequest, SendPromptRequest,
+    UpdateHostConfigRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, detect_diagram_kind as core_detect_diagram_kind,
@@ -883,6 +884,13 @@ impl OhosCoreFacade {
         serde_json::to_string(&res).map_err(|e| e.to_string())
     }
 
+    pub fn fork_agent_json(&self, req_json: &str) -> Result<String, String> {
+        let req: ForkAgentRequest =
+            serde_json::from_str(req_json).map_err(|e| format!("invalid ForkAgentRequest: {e}"))?;
+        let res = self.inner.fork_agent_blocking(req)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
     pub fn read_workspace_file_json(
         &self,
         host_id: &str,
@@ -1166,6 +1174,26 @@ mod ohos_napi {
                     self.to_before_seq,
                     self.restore_files,
                 )
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ForkAgentTask {
+        facade: OhosCoreFacade,
+        req_json: String,
+    }
+
+    impl Task for ForkAgentTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .fork_agent_json(&self.req_json)
                 .map_err(Error::from_reason)
         }
 
@@ -1937,6 +1965,14 @@ mod ohos_napi {
                 agent_id,
                 to_before_seq: to_before_seq.max(0) as u64,
                 restore_files,
+            })
+        }
+
+        #[napi]
+        pub fn fork_agent_json(&self, req_json: String) -> AsyncTask<ForkAgentTask> {
+            AsyncTask::new(ForkAgentTask {
+                facade: self.facade.clone(),
+                req_json,
             })
         }
 

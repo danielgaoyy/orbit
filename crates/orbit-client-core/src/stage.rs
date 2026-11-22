@@ -3458,6 +3458,8 @@ mod tests {
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
         let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[], &[]);
         assert_eq!(
@@ -3625,6 +3627,8 @@ Log: file:///tmp/spoofed.log\n";
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
 
         let mut items: Vec<TimelineItemView> = Vec::new();
@@ -3865,6 +3869,8 @@ Log: file:///tmp/spoofed.log\n";
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
 
         let items = vec![
@@ -4044,6 +4050,8 @@ Log: file:///tmp/spoofed.log\n";
             cluster_suggestion: None,
             worktree_branch: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
 
         let items = vec![TimelineItemView::ToolCall {

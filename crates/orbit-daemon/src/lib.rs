@@ -1617,6 +1617,41 @@ async fn handle_wire_rpc(
                 }
             }
         }
+        WireMessage::ForkAgent {
+            request_id,
+            source_agent_id,
+            up_to_seq,
+            target,
+            title,
+            initial_prompt,
+        } => match runtime
+            .orchestrator
+            .fork_agent(crate::manager::ForkAgentSpec {
+                source_agent_id,
+                up_to_seq,
+                target,
+                title,
+                initial_prompt,
+            })
+            .await
+        {
+            Ok(outcome) => {
+                subscribed_agents.insert(outcome.agent.agent_id.clone());
+                Some(WireMessage::AgentForked {
+                    request_id,
+                    agent: outcome.agent,
+                    workspace: outcome.workspace,
+                })
+            }
+            Err(e) => {
+                let err_code = if e.to_string().contains("not_a_git_repo") {
+                    "not_a_git_repo"
+                } else {
+                    "fork_agent_failed"
+                };
+                Some(rpc_err(request_id, err_code, e))
+            }
+        },
         WireMessage::SendPrompt {
             request_id,
             agent_id,

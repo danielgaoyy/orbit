@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, McpToolPolicy, ProviderKind, ReasoningEffort,
+    ActiveTurnBehavior, AgentMessageKind, ForkTarget, McpToolPolicy, ProviderKind, ReasoningEffort,
     ScheduleNewAgentConfig, ScheduleStatus, ScheduleTarget, SessionMode, TimelinePayload,
     ToolCallDetail, WireMessage, WorkspaceIsolation, WorktreeCreateMode,
 };
@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::DaemonRuntime;
-use crate::manager::{CreateAgentSpec, CreateWorkspaceSpec};
+use crate::manager::{CreateAgentSpec, CreateWorkspaceSpec, ForkAgentSpec};
 use crate::messaging::{AgentPromptSource, QueuedAgentMessage};
 
 #[derive(Debug, Clone)]
@@ -1627,6 +1627,82 @@ async fn execute_tool_inner(
             }))
         }
 
+        "fork_agent" => {
+            let source_agent_id = opt_str(args, "source_agent_id")
+                .or_else(|| opt_str(args, "agent_id"))
+                .or_else(|| caller_agent_id.map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing required string argument `source_agent_id`")
+                })?;
+            let up_to_seq = args.get("up_to_seq").and_then(|v| v.as_u64());
+            let worktree = args
+                .get("worktree")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let branch = opt_str(args, "branch");
+            let base_ref = opt_str(args, "base_ref");
+            let target = if worktree || branch.is_some() || base_ref.is_some() {
+                ForkTarget::NewWorktree { branch, base_ref }
+            } else {
+                ForkTarget::SameDirectory
+            };
+            let title = opt_str(args, "title");
+            let initial_prompt =
+                opt_str(args, "initial_prompt").or_else(|| opt_str(args, "prompt"));
+
+            let (agent, workspace) = if let Some(ref remote_host_id) = target_host {
+                let req_id = Uuid::new_v4();
+                match rt
+                    .connected_hosts
+                    .send_rpc(
+                        remote_host_id,
+                        req_id,
+                        WireMessage::ForkAgent {
+                            request_id: req_id,
+                            source_agent_id,
+                            up_to_seq,
+                            target,
+                            title,
+                            initial_prompt,
+                        },
+                        Duration::from_secs(30),
+                    )
+                    .await?
+                {
+                    WireMessage::AgentForked {
+                        agent, workspace, ..
+                    } => (agent, workspace),
+                    WireMessage::RpcError { message, .. } => {
+                        anyhow::bail!("remote host `{remote_host_id}` error: {message}");
+                    }
+                    _ => anyhow::bail!("unexpected remote reply to fork_agent"),
+                }
+            } else {
+                let outcome = rt
+                    .orchestrator
+                    .fork_agent(ForkAgentSpec {
+                        source_agent_id,
+                        up_to_seq,
+                        target,
+                        title,
+                        initial_prompt,
+                    })
+                    .await?;
+                (outcome.agent, outcome.workspace)
+            };
+
+            Ok(json!({
+                "ok": true,
+                "agent_id": agent.agent_id,
+                "workspace_id": agent.workspace_id,
+                "cwd": agent.cwd,
+                "forked_from_agent_id": agent.forked_from_agent_id,
+                "forked_at_seq": agent.forked_at_seq,
+                "agent": agent,
+                "workspace": workspace,
+            }))
+        }
+
         "move_agent_to_workspace" => {
             let agent_id = opt_str(args, "agent_id")
                 .or_else(|| caller_agent_id.map(ToOwned::to_owned))
@@ -1851,6 +1927,23 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "idempotency_key": { "type": "string" }
                 },
                 "required": ["initial_prompt"]
+            }),
+        },
+        ToolDefinition {
+            name: "fork_agent",
+            description: "Fork/branch an existing agent conversation into a new session (either in the same directory or inside a freshly created isolated git worktree), optionally truncating history at `up_to_seq`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source_agent_id": { "type": "string", "description": "Source agent ID to fork from (defaults to the calling agent)." },
+                    "up_to_seq": { "type": "integer", "description": "Optional timeline sequence upper bound (inclusive). Omit to fork the full conversation." },
+                    "worktree": { "type": "boolean", "description": "When true, creates a fresh isolated git worktree workspace for the branch." },
+                    "branch": { "type": "string", "description": "Optional git branch name when forking into a worktree." },
+                    "base_ref": { "type": "string", "description": "Optional git base ref when forking into a worktree." },
+                    "title": { "type": "string", "description": "Optional custom title for the forked conversation." },
+                    "initial_prompt": { "type": "string", "description": "Optional immediate follow-up prompt to dispatch on the forked branch." },
+                    "host_id": { "type": "string", "description": "Optional remote host ID from `list_hosts`." }
+                }
             }),
         },
         ToolDefinition {

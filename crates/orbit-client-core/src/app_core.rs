@@ -40,7 +40,7 @@ use crate::cloud_sync::{
     save_sync_meta_to_store, save_sync_prefs_to_store, stored_host_from_synced,
     unlock_remote_vault_with_passphrase,
 };
-pub use crate::contract::ConversationSearchHit;
+pub use crate::contract::{ConversationSearchHit, ForkAgentRequest, ForkAgentResultView};
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
 use crate::desktop_ops::{
@@ -221,6 +221,10 @@ pub struct AgentCardView {
     pub worktree_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_at_seq: Option<u64>,
 }
 
 pub struct CreateAgentRequest<'a> {
@@ -535,6 +539,7 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<SideQuestionStreamEvent>>,
     pending_rewinds:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<RewindAgentResultView, String>>>,
+    pending_forks: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ForkAgentResultView, String>>>,
     pending_daemon_upgrades: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<(), String>>>,
     pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
@@ -618,6 +623,7 @@ impl HostMemoryState {
             pending_file_reads: HashMap::new(),
             pending_side_questions: HashMap::new(),
             pending_rewinds: HashMap::new(),
+            pending_forks: HashMap::new(),
             pending_daemon_upgrades: HashMap::new(),
             pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
@@ -3596,6 +3602,7 @@ impl OrbitAppCore {
         let mut live_event_cursor: Option<(String, u64)> = None;
         let mut host_to_persist: Option<StoredHostProfile> = None;
         let mut rewound_to_persist: Option<(AgentSummary, Vec<TimelineEvent>, bool, bool)> = None;
+        let mut forked_to_persist: Option<(AgentSummary, Option<WorkspaceSummary>)> = None;
         let mut stale_replica_agents: Vec<(String, bool)> = Vec::new();
         let mut initial_seen_seeds: Vec<(String, u64)> = Vec::new();
         type ServerPrefSync = (String, u64, Option<(bool, i64)>);
@@ -3784,6 +3791,47 @@ impl OrbitAppCore {
                     state.last_created_agent_id = Some(ag_id.clone());
                     state.agents.insert(ag_id.clone(), agent);
                     auto_subscribe_agent = Some(ag_id.clone());
+                    notify_fleet = true;
+                    notify_host = true;
+                    push_notify_timeline(ag_id);
+                }
+                WireMessage::AgentForked {
+                    request_id,
+                    agent,
+                    workspace,
+                } => {
+                    let ag_id = agent.agent_id.clone();
+                    if let Some(ref ws) = workspace {
+                        state
+                            .workspaces
+                            .retain(|w| w.workspace_id != ws.workspace_id);
+                        state.workspaces.insert(0, ws.clone());
+                    }
+                    let agent_card = {
+                        let prefs_guard = self.thread_prefs.read().ok();
+                        let existing_pref = prefs_guard
+                            .as_ref()
+                            .and_then(|p| p.get(&(host_id.to_string(), ag_id.clone())));
+                        agent_to_card_view(&agent, existing_pref)
+                    };
+                    if agent.read_seq > 0 || agent.is_pinned {
+                        server_pref_syncs.push((
+                            ag_id.clone(),
+                            agent.read_seq,
+                            agent.is_pinned.then_some((true, agent.pinned_order)),
+                        ));
+                    }
+                    state.mark_stage_dirty(&ag_id, 0, true);
+                    state.last_created_agent_id = Some(ag_id.clone());
+                    state.agents.insert(ag_id.clone(), agent.clone());
+                    forked_to_persist = Some((agent, workspace.clone()));
+                    auto_subscribe_agent = Some(ag_id.clone());
+                    if let Some(tx) = state.pending_forks.remove(&request_id) {
+                        let _ = tx.send(Ok(ForkAgentResultView {
+                            agent: agent_card,
+                            workspace,
+                        }));
+                    }
                     notify_fleet = true;
                     notify_host = true;
                     push_notify_timeline(ag_id);
@@ -4403,6 +4451,10 @@ impl OrbitAppCore {
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_forks.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_daemon_upgrades.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
@@ -4582,6 +4634,12 @@ impl OrbitAppCore {
                 entry.seen_seq = rewound_latest_seq;
                 entry.updated_at_ms = now_ms;
             }
+        }
+        if let Some((ag, ws_opt)) = forked_to_persist {
+            if let Some(ref ws) = ws_opt {
+                let _ = self.store.upsert_single_replica_workspace(host_id, ws);
+            }
+            let _ = self.store.upsert_single_replica_agent(host_id, &ag);
         }
         if let Some((ag, evs, files_restored, is_complete)) = rewound_to_persist {
             let _ = self
@@ -5159,6 +5217,8 @@ impl OrbitAppCore {
                 handle: clean_handle.clone(),
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
                 timeline_epoch: 0,
                 created_at: now,
                 updated_at: now,
@@ -7623,6 +7683,99 @@ impl OrbitAppCore {
             .map_err(|_| "Rewind task terminated unexpectedly".to_string())?
     }
 
+    /// Fork/branch an existing conversation on `req.host_id` (same directory or fresh git worktree).
+    pub async fn fork_agent_on_host(
+        self: &Arc<Self>,
+        req: ForkAgentRequest,
+    ) -> Result<ForkAgentResultView, String> {
+        if req.source_agent_id.starts_with("opt_") {
+            return Err("Wait for the session to finish initializing before forking".into());
+        }
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to fork this session".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host_id = req.host_id.clone();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&owned_host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_forks.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before forking session".to_string()),
+                        None => Some(format!("host `{owned_host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::ForkAgent {
+                    request_id: req_id,
+                    source_agent_id: req.source_agent_id,
+                    up_to_seq: req.up_to_seq,
+                    target: req.target,
+                    title: req.title,
+                    initial_prompt: req.initial_prompt,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host_id)
+                {
+                    h.pending_forks.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send fork request: {e}")));
+                return;
+            }
+
+            let outcome = match tokio::time::timeout(Duration::from_secs(60), ack_rx).await {
+                Ok(Ok(Ok(view))) => Ok(view),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while forking session".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host_id)
+                    {
+                        h.pending_forks.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to fork session (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "Fork task terminated unexpectedly".to_string())?
+    }
+
     /// Upgrade a remote Orbit daemon directly over the existing E2EE WebSocket/Relay channel
     /// (works even without SSH access!).
     ///
@@ -8084,6 +8237,13 @@ impl OrbitAppCore {
             to_before_seq,
             restore_files,
         ))
+    }
+
+    pub fn fork_agent_blocking(
+        self: &Arc<Self>,
+        req: ForkAgentRequest,
+    ) -> Result<ForkAgentResultView, String> {
+        self.runtime.block_on(self.fork_agent_on_host(req))
     }
 
     pub fn read_workspace_file_blocking(
@@ -8956,6 +9116,9 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_rewinds.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_forks.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_git_repo_inspections.drain() {
@@ -10116,6 +10279,8 @@ fn agent_stage_meta_unchanged(prev: &AgentSummary, next: &AgentSummary) -> bool 
         && prev.pinned_order == next.pinned_order
         && prev.handle == next.handle
         && prev.task_summary == next.task_summary
+        && prev.forked_from_agent_id == next.forked_from_agent_id
+        && prev.forked_at_seq == next.forked_at_seq
         && prev.queued_prompts.len() == next.queued_prompts.len()
         && prev
             .queued_prompts
@@ -10194,6 +10359,8 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         cluster_suggestion: a.cluster_suggestion.clone(),
         worktree_branch,
         task_summary: a.task_summary.clone(),
+        forked_from_agent_id: a.forked_from_agent_id.clone(),
+        forked_at_seq: a.forked_at_seq,
     }
 }
 
@@ -10932,6 +11099,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -11046,6 +11215,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -11190,6 +11361,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -11365,6 +11538,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 2,
                     created_at: now,
                     updated_at: now,
@@ -11467,6 +11642,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -11512,6 +11689,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -11550,6 +11729,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -11733,6 +11914,8 @@ mod tests {
                 handle: None,
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
                 timeline_epoch: 1,
                 created_at: now,
                 updated_at: now,
@@ -11905,6 +12088,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: None,
@@ -11956,6 +12141,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: Some("ag_parent".into()),
@@ -12050,6 +12237,8 @@ mod tests {
             handle: None,
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
 
         let pref = ClientThreadPref {
@@ -12275,6 +12464,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                 },
             );
             hosts.insert("h_seen".into(), mem);
@@ -12356,6 +12547,8 @@ mod tests {
             handle: None,
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
         {
             let mut hosts = core.hosts.write().expect("hosts");
@@ -12462,6 +12655,8 @@ mod tests {
                         handle: None,
                         cluster_suggestion: None,
                         task_summary: None,
+                        forked_from_agent_id: None,
+                        forked_at_seq: None,
                     },
                 );
             }
@@ -12849,6 +13044,8 @@ mod tests {
                 handle: None,
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
                 queued_prompts: Vec::new(),
             },
         );
@@ -13054,6 +13251,8 @@ mod tests {
                 handle: None,
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
                 queued_prompts: Vec::new(),
             },
         );
@@ -13102,6 +13301,8 @@ mod tests {
                 handle: None,
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
                 queued_prompts: Vec::new(),
             },
         );
@@ -13258,6 +13459,143 @@ mod tests {
             core.search_messages("ghost_orphan_sentinel_token", 10)
                 .is_empty(),
             "orphaned host/agent FTS rows must never surface in search_messages"
+        );
+    }
+
+    #[test]
+    fn agent_forked_updates_host_state_and_projects_provenance_card() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        let host_id = "host_fork";
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts.insert(
+                host_id.into(),
+                HostMemoryState::new(SavedHostProfile {
+                    host_id: host_id.into(),
+                    hostname: "devbox".into(),
+                    custom_name: None,
+                    ssh_alias: None,
+                    route_mode: HostRouteMode::Auto,
+                    remote_daemon_port: 7474,
+                    custom_direct_endpoint: None,
+                    daemon_pubkey_b64: String::new(),
+                    direct_endpoints: vec![],
+                    relay_url: None,
+                    state: HostConnectionState::OnlineDirect,
+                }),
+            );
+        }
+
+        let req_id = Uuid::new_v4();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut hosts = core.hosts.write().expect("hosts");
+            hosts
+                .get_mut(host_id)
+                .expect("host")
+                .pending_forks
+                .insert(req_id, tx);
+        }
+
+        let forked_ws = WorkspaceSummary {
+            workspace_id: "ws_wt_fork".into(),
+            title: "Auth (fork)".into(),
+            cwd: "/tmp/wt/auth-fork".into(),
+            git_branch: Some("orbit/fork-auth".into()),
+            is_worktree: true,
+            updated_at: now,
+            source_cwd: Some("/repo/auth".into()),
+            base_ref: Some("main".into()),
+            parent_workspace_id: Some("ws_main".into()),
+            archived_at: None,
+            background: false,
+            setup_status: orbit_protocol::WorkspaceSetupStatus::Idle,
+            mission_goal: None,
+            project_root: Some("/repo/auth".into()),
+            board_revision: 0,
+            title_locked: false,
+            auto_clustered: false,
+            is_curated: false,
+        };
+        let forked_agent = AgentSummary {
+            agent_id: "ag_fork_child".into(),
+            workspace_id: "ws_wt_fork".into(),
+            cwd: "/tmp/wt/auth-fork".into(),
+            title: "Auth (fork)".into(),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("sonnet".into()),
+            effort: Some(ReasoningEffort::High),
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 12,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::from([("orbit.worktree_branch".into(), "orbit/fork-auth".into())]),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 12,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: Some("fork".into()),
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: Some("ag_parent_origin".into()),
+            forked_at_seq: Some(8),
+        };
+
+        core.handle_inbound_wire(
+            host_id,
+            WireMessage::AgentForked {
+                request_id: req_id,
+                agent: forked_agent,
+                workspace: Some(forked_ws),
+            },
+        );
+
+        let res = rx
+            .blocking_recv()
+            .expect("oneshot")
+            .expect("fork succeeded");
+        assert_eq!(res.agent.agent_id, "ag_fork_child");
+        assert_eq!(
+            res.agent.forked_from_agent_id.as_deref(),
+            Some("ag_parent_origin")
+        );
+        assert_eq!(res.agent.forked_at_seq, Some(8));
+        assert_eq!(
+            res.workspace.as_ref().map(|w| w.workspace_id.as_str()),
+            Some("ws_wt_fork")
+        );
+
+        let detail = core.host_detail(host_id).expect("detail");
+        assert_eq!(
+            detail.last_created_agent_id.as_deref(),
+            Some("ag_fork_child")
+        );
+        let card = detail
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "ag_fork_child")
+            .expect("projected card");
+        assert_eq!(
+            card.forked_from_agent_id.as_deref(),
+            Some("ag_parent_origin")
+        );
+        assert_eq!(card.forked_at_seq, Some(8));
+        assert!(
+            detail
+                .workspaces
+                .iter()
+                .any(|w| w.workspace_id == "ws_wt_fork")
         );
     }
 }

@@ -1115,6 +1115,8 @@ mod tests {
             handle: Some("lead".into()),
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         }
     }
 

@@ -38,9 +38,9 @@ use orbit_client_core::composer::{
     SlashCommandView,
 };
 use orbit_client_core::contract::{
-    BridgeInfoView, ConversationSearchHit, FleetSidebarRequest, GitReposInspectionView,
-    MentionRankRequest, ModelSelectionRequest, RenderDiagramRequest, RenderDiagramView,
-    SpawnWorkspacePeerRequest,
+    BridgeInfoView, ConversationSearchHit, FleetSidebarRequest, ForkAgentRequest,
+    ForkAgentResultView, GitReposInspectionView, MentionRankRequest, ModelSelectionRequest,
+    RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -1276,6 +1276,14 @@ async fn rewind_agent(
 }
 
 #[tauri::command]
+async fn fork_agent(
+    state: State<'_, DesktopAppState>,
+    req: ForkAgentRequest,
+) -> Result<ForkAgentResultView, String> {
+    state.core.fork_agent_on_host(req).await
+}
+
+#[tauri::command]
 fn resolve_permission(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -2224,6 +2232,7 @@ pub fn run() {
             get_provider_subagent_turns,
             refresh_pending_permissions,
             rewind_agent,
+            fork_agent,
             resolve_permission,
             answer_question,
             fetch_git_status,

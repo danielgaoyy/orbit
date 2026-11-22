@@ -46,6 +46,14 @@ pub struct SessionLaunchConfig {
     pub effort: Option<ReasoningEffort>,
     pub mode: SessionMode,
     pub resume_session_id: Option<String>,
+    /// Optional upstream session ID to natively fork from on startup (full-tail forks only).
+    /// When unsupported or evicted upstream, drivers fall back cleanly to a fresh session seeded
+    /// with `fallback_handoff_context` (unless `native_fork_only` is set).
+    pub fork_from_session_id: Option<String>,
+    /// When `true` and `fork_from_session_id` is `Some`, exit cleanly without emitting
+    /// `SessionInitialized` if native fork is unavailable or returns the parent session ID,
+    /// avoiding persisting a blank fallback session before the user sends a prompt.
+    pub native_fork_only: bool,
     pub mcp_spec: Option<OrbitMcpLaunchSpec>,
     pub system_prompt_append: Option<String>,
     pub extra_env: HashMap<String, String>,

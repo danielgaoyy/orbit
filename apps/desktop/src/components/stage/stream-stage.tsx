@@ -32,7 +32,9 @@ import {
   FileSymlink,
   FileText,
   FoldVertical,
+  GitBranch,
   GitCompareArrows,
+  GitFork,
   Globe,
   Layers,
   ListTodo,
@@ -51,6 +53,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  type AgentCardView,
   type DiffFileView,
   type DiffLineView,
   type InlineSpanView,
@@ -99,8 +102,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog-tabs";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/overlays";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { isImeKeyEvent } from "@/lib/ime";
+import { isAgentInGitRepo } from "@/lib/projects";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -1998,6 +2008,150 @@ function UndoActionButton({
   );
 }
 
+/**
+ * Restrained Fork icon button matching `CopyActionButton` / `UndoActionButton` (`13px` icon in `22×22px` hit target).
+ * Directly forks in place for non-git directories; opens a tiny 2-option popover when worktree branching is available.
+ */
+function ForkActionButton({
+  canUseWorktree,
+  onFork,
+  align = "start",
+  className,
+}: {
+  canUseWorktree: boolean;
+  onFork: (worktree: boolean) => void;
+  align?: "start" | "end";
+  className?: string;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  if (!canUseWorktree) {
+    return (
+      <HoverPillTooltip
+        label="Fork from here"
+        delay={240}
+        renderTrigger={(handlers) => (
+          <button
+            type="button"
+            aria-label="Fork from here"
+            onClick={() => onFork(false)}
+            {...handlers}
+            className={cn(
+              "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
+              className,
+            )}
+          >
+            <GitFork className="size-[13px] stroke-[1.8]" />
+          </button>
+        )}
+      />
+    );
+  }
+
+  return (
+    <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
+      <HoverPillTooltip
+        label={menuOpen ? "" : "Fork from here"}
+        delay={240}
+        renderTrigger={(handlers) => (
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="Fork from here"
+              {...handlers}
+              className={cn(
+                "text-muted-foreground hover:text-foreground hover:bg-accent/65 orbit-press relative inline-flex size-[22px] cursor-pointer items-center justify-center rounded-md",
+                menuOpen && "bg-accent/65 text-foreground",
+                className,
+              )}
+            >
+              <GitFork className="size-[13px] stroke-[1.8]" />
+            </button>
+          </DropdownMenuTrigger>
+        )}
+      />
+      <DropdownMenuContent
+        align={align}
+        sideOffset={6}
+        className="w-max min-w-[168px] rounded-[11px] p-1"
+      >
+        <DropdownMenuItem
+          onSelect={() => onFork(false)}
+          className="cursor-pointer rounded-[8px] px-2.5 py-1.5 text-[12.5px]"
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <GitFork className="text-muted-foreground size-[13px] shrink-0 stroke-[1.8]" />
+            <span>Fork here</span>
+          </span>
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={() => onFork(true)}
+          className="cursor-pointer rounded-[8px] px-2.5 py-1.5 text-[12.5px]"
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <GitBranch className="text-muted-foreground size-[13px] shrink-0 stroke-[1.8]" />
+            <span>Fork in new worktree</span>
+          </span>
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** Super subtle, restrained 1-line provenance chip at the top of a forked thread. */
+const ForkedFromBanner = memo(function ForkedFromBanner({
+  hostId,
+  agent,
+}: {
+  hostId: string;
+  agent: AgentCardView | null;
+}) {
+  const sourceId = agent?.forked_from_agent_id ?? null;
+  const parentAgent = useOrbitSelector((s) =>
+    sourceId
+      ? (s.hostDetails[hostId]?.agents.find((a) => a.agent_id === sourceId) ?? null)
+      : null,
+  );
+  const customTitle = useOrbitSelector((s) =>
+    sourceId ? s.threadCustomTitles[`${hostId}::${sourceId}`] : undefined,
+  );
+  const isLocallyArchived = useOrbitSelector((s) =>
+    sourceId ? Boolean(s.archivedThreads[`${hostId}::${sourceId}`]) : false,
+  );
+
+  if (!sourceId) return null;
+
+  const parentTitle =
+    customTitle?.trim() ||
+    parentAgent?.title?.trim() ||
+    (sourceId.length > 14 ? `${sourceId.slice(0, 12)}…` : sourceId);
+  const canJump = Boolean(
+    parentAgent && !parentAgent.archived_at_rfc3339 && !isLocallyArchived,
+  );
+
+  return (
+    <div className="mx-auto flex w-full max-w-[var(--orbit-stage-max-w,768px)] items-center pt-2 pb-0.5">
+      {canJump ? (
+        <button
+          type="button"
+          onClick={() => orbitActions.selectAgent(hostId, sourceId)}
+          className="text-muted-foreground/85 hover:text-foreground border-border/65 bg-muted/35 hover:bg-muted/65 inline-flex max-w-full cursor-pointer items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11.5px] leading-tight transition-colors"
+        >
+          <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-75" />
+          <span className="truncate">
+            Forked from <span className="text-foreground/85 font-medium">{parentTitle}</span>
+          </span>
+        </button>
+      ) : (
+        <span className="text-muted-foreground/75 border-border/55 bg-muted/25 inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11.5px] leading-tight">
+          <GitFork className="size-3 shrink-0 stroke-[1.75] opacity-65" />
+          <span className="truncate">Forked from {parentTitle}</span>
+        </span>
+      )}
+    </div>
+  );
+});
+
 interface RewindFileEntry {
   displayPath: string;
   basename: string;
@@ -2269,8 +2423,31 @@ const InlineLiveElapsed = memo(function InlineLiveElapsed({
   );
 });
 
+function resolveTurnForkSeq(turn: StageTurnView): number | null {
+  let maxSeq = 0;
+  const record = (seq: number | undefined | null) => {
+    if (typeof seq === "number" && seq > maxSeq) maxSeq = seq;
+  };
+  record(turn.anchor_seq);
+  record(turn.user_prompt?.seq);
+  record(turn.agent_message?.seq);
+  record(turn.terminal_reply?.seq);
+  record(turn.last_assistant_reply?.seq);
+  for (const item of turn.folded_steps) record(item.seq);
+  for (const item of turn.notices) record(item.seq);
+  for (const item of turn.compactions) record(item.seq);
+  for (const seg of turn.live_segments) {
+    if (seg.kind === "step_group") {
+      for (const item of seg.items) record(item.seq);
+    } else if (seg.kind === "assistant_message" || seg.kind === "notice") {
+      record(seg.item.seq);
+    }
+  }
+  return maxSeq > 0 ? maxSeq : null;
+}
+
 /**
- * Completed Turn Footer (`[Copy · 2m ago]`):
+ * Completed Turn Footer (`[Copy · Fork · 2m ago]`):
  * Hidden while a turn is active since live elapsed duration lives inline in `TurnActivityDisclosure`.
  */
 const TurnFooter = memo(function TurnFooter({
@@ -2278,17 +2455,26 @@ const TurnFooter = memo(function TurnFooter({
   timing,
   completedAtMs,
   replyText,
+  forkUpToSeq,
+  isLastTurn = false,
+  canForkWorktree = false,
+  onRequestFork,
 }: {
   isTurnActive: boolean;
   timing?: TurnTimingRecord;
   completedAtMs: number | null;
   replyText: string | null;
+  forkUpToSeq?: number | null;
+  isLastTurn?: boolean;
+  canForkWorktree?: boolean;
+  onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
 }) {
   const [copied, setCopied] = useState(false);
 
   const resolvedCompletedAtMs = timing?.completedAtMs ?? completedAtMs;
+  const showFork = Boolean(onRequestFork && (isLastTurn || (forkUpToSeq !== null && forkUpToSeq !== undefined && forkUpToSeq > 0)));
 
-  if (isTurnActive || (!replyText && resolvedCompletedAtMs === null)) {
+  if (isTurnActive || (!replyText && resolvedCompletedAtMs === null && !showFork)) {
     return null;
   }
 
@@ -2300,13 +2486,22 @@ const TurnFooter = memo(function TurnFooter({
   };
 
   return (
-    <div className="mt-0.5 flex h-[22px] items-center gap-1.5">
+    <div className="mt-0.5 flex h-[22px] items-center gap-1">
       {replyText && (
         <CopyActionButton
           copied={copied}
           label="Copy"
           onClick={() => void handleCopy()}
           className="-ml-1"
+        />
+      )}
+
+      {showFork && onRequestFork && (
+        <ForkActionButton
+          canUseWorktree={canForkWorktree}
+          align="start"
+          onFork={(worktree) => onRequestFork(isLastTurn ? null : (forkUpToSeq ?? null), worktree)}
+          className={replyText ? undefined : "-ml-1"}
         />
       )}
 
@@ -2444,6 +2639,7 @@ const EMPTY_WORK_COUNTS: WorkSummaryResultView["counts"] = {
 export const TurnStageSection = memo(function TurnStageSection({
   turn,
   isTurnActive,
+  isLastTurn = false,
   agentStatusLabel = null,
   hasLiveBackgroundTasks = false,
   isNetworkOffline,
@@ -2457,10 +2653,13 @@ export const TurnStageSection = memo(function TurnStageSection({
   getThinkingDurationMs,
   holdViewport,
   onRequestRewind,
+  onRequestFork,
+  canForkWorktree = false,
   onPreviewImage,
 }: {
   turn: StageTurnView;
   isTurnActive: boolean;
+  isLastTurn?: boolean;
   agentStatusLabel?: string | null;
   hasLiveBackgroundTasks?: boolean;
   isNetworkOffline: boolean;
@@ -2474,6 +2673,8 @@ export const TurnStageSection = memo(function TurnStageSection({
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
   onRequestRewind: (seq: number, promptText: string) => void;
+  onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
+  canForkWorktree?: boolean;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
   const rawSegments = turn.live_segments;
@@ -2537,6 +2738,7 @@ export const TurnStageSection = memo(function TurnStageSection({
     !isTurnActive && turn.last_assistant_reply?.item_type === "assistant_message"
       ? turn.last_assistant_reply.text
       : null;
+  const turnForkSeq = useMemo(() => resolveTurnForkSeq(turn), [turn]);
 
   return (
     <div
@@ -2743,6 +2945,10 @@ export const TurnStageSection = memo(function TurnStageSection({
               timing={timing}
               completedAtMs={turn.completed_at_ms}
               replyText={lastReplyText}
+              forkUpToSeq={turnForkSeq}
+              isLastTurn={isLastTurn}
+              canForkWorktree={canForkWorktree}
+              onRequestFork={onRequestFork}
             />
           </div>
         </div>
@@ -2752,6 +2958,7 @@ export const TurnStageSection = memo(function TurnStageSection({
 }, (prev, next) =>
   prev.turn === next.turn &&
   prev.isTurnActive === next.isTurnActive &&
+  prev.isLastTurn === next.isLastTurn &&
   prev.agentStatusLabel === next.agentStatusLabel &&
   prev.hasLiveBackgroundTasks === next.hasLiveBackgroundTasks &&
   prev.isNetworkOffline === next.isNetworkOffline &&
@@ -2764,7 +2971,9 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.timing?.durationMs === next.timing?.durationMs &&
   prev.timing?.workDurationMs === next.timing?.workDurationMs &&
   prev.timing?.completedAtMs === next.timing?.completedAtMs &&
-  prev.onRequestRewind === next.onRequestRewind,
+  prev.onRequestRewind === next.onRequestRewind &&
+  prev.onRequestFork === next.onRequestFork &&
+  prev.canForkWorktree === next.canForkWorktree,
 );
 
 function NewSessionLaunchpad() {
@@ -3117,6 +3326,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   getThinkingDurationMs,
   holdViewport,
   onRequestRewind,
+  onRequestFork,
+  canForkWorktree,
   onPreviewImage,
 }: {
   selectedHostId: string;
@@ -3141,6 +3352,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
   onRequestRewind: (seq: number, promptText: string) => void;
+  onRequestFork: (upToSeq: number | null, worktree: boolean) => void;
+  canForkWorktree: boolean;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
 }) {
   const widthBucket = stageMaxContentWidthPx ? Math.round(stageMaxContentWidthPx / 32) : 24;
@@ -3597,6 +3810,7 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
             <TurnStageSection
               turn={turn}
               isTurnActive={turnActive}
+              isLastTurn={isLast}
               agentStatusLabel={turnActive ? agentStatusLabel : null}
               hasLiveBackgroundTasks={turnActive && hasLiveBackgroundTasks}
               isNetworkOffline={isNetworkOffline}
@@ -3610,6 +3824,8 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               getThinkingDurationMs={getThinkingDurationMs}
               holdViewport={holdViewport}
               onRequestRewind={onRequestRewind}
+              onRequestFork={onRequestFork}
+              canForkWorktree={canForkWorktree}
               onPreviewImage={onPreviewImage}
             />
           </div>
@@ -3924,6 +4140,25 @@ export function StreamStage() {
       editedFiles: Array.from(byPath.values()),
     });
   }, []);
+
+  const handleRequestFork = useCallback(
+    (upToSeq: number | null, worktree: boolean) => {
+      if (!selectedHostId || !selectedAgentId) return;
+      void orbitActions.forkAgent({
+        hostId: selectedHostId,
+        sourceAgentId: selectedAgentId,
+        upToSeq,
+        worktree,
+      });
+    },
+    [selectedHostId, selectedAgentId],
+  );
+
+  const sidebarView = useOrbitSelector((s) => s.sidebarView);
+  const canForkWorktree = useMemo(
+    () => isAgentInGitRepo(selectedHostId, currentAgent, hostDetail, sidebarView),
+    [selectedHostId, currentAgent, hostDetail, sidebarView],
+  );
 
   const handleConfirmRewind = useCallback(
     async (restoreFiles: boolean) => {
@@ -4600,6 +4835,21 @@ export function StreamStage() {
         </div>
       )}
 
+      {/* Subtle 1-line provenance chip when viewing a forked conversation */}
+      {selectedHostId && currentAgent?.forked_from_agent_id && (
+        <div
+          style={{
+            paddingRight: `${24 + overviewReservePx}px`,
+            transition: overviewReserveTransition,
+          }}
+          className="shrink-0 pl-[24px]"
+        >
+          <div style={stagePushStyle}>
+            <ForkedFromBanner hostId={selectedHostId} agent={currentAgent} />
+          </div>
+        </div>
+      )}
+
       {/* 1. Unified Scrollable Conversation Viewport — scrollbar stays on far right edge */}
       <ScrollArea
         className="min-h-0 flex-1"
@@ -4657,6 +4907,8 @@ export function StreamStage() {
               getThinkingDurationMs={getThinkingDurationMs}
               holdViewport={holdViewport}
               onRequestRewind={handleRequestRewind}
+              onRequestFork={handleRequestFork}
+              canForkWorktree={canForkWorktree}
               onPreviewImage={setImagePreviewTarget}
             />
           )}

@@ -1,4 +1,9 @@
-import type { HostCardView } from "@/lib/orbit-ipc";
+import type {
+  AgentCardView,
+  FleetSidebarView,
+  HostCardView,
+  HostDetailView,
+} from "@/lib/orbit-ipc";
 
 export function basenameOfProjectPath(path: string): string {
   if (!path || path === "~") return "~";
@@ -14,6 +19,44 @@ export function normalizeProjectPath(path: string): string {
 
 export function formatTildeProjectPath(path: string): string {
   return normalizeProjectPath(path).replace(/^\/(?:Users|home)\/[^/]+/, "~");
+}
+
+/**
+ * Unified git-repo check shared across sidebar context menus and stage fork actions.
+ */
+export function isAgentInGitRepo(
+  hostId: string | null | undefined,
+  agent: AgentCardView | null | undefined,
+  hostDetail: HostDetailView | null | undefined,
+  sidebarView?: FleetSidebarView | null,
+): boolean {
+  if (!hostId || !agent) return false;
+  const activeWs =
+    hostDetail?.workspaces.find((w) => w.workspace_id === agent.workspace_id) ?? null;
+  if (activeWs?.git_branch || activeWs?.is_worktree) return true;
+
+  if (sidebarView) {
+    const proj = sidebarView.projects.find(
+      (p) =>
+        p.host_id === hostId &&
+        p.conversations.some((c) => c.agent.agent_id === agent.agent_id),
+    );
+    if (proj?.is_git_repo) return true;
+  }
+
+  const rawRoot = activeWs?.project_root || activeWs?.source_cwd || activeWs?.cwd || agent.cwd || "";
+  if (!rawRoot.trim()) return false;
+  const normRoot = normalizeProjectPath(rawRoot);
+  return Boolean(
+    hostDetail?.discovered_projects.some((p) => {
+      if (!p.is_git_repo) return false;
+      const normProj = normalizeProjectPath(p.path);
+      return (
+        normProj === normRoot ||
+        (normProj !== "/" && normProj !== "~" && normRoot.startsWith(`${normProj}/`))
+      );
+    }),
+  );
 }
 
 export interface FilterableProject {

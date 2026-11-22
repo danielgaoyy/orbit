@@ -440,6 +440,71 @@ async fn copy_worktree_includes_async(source_cwd: &Path, worktree_cwd: &Path) {
     }
 }
 
+fn check_git_ref_lexically_safe(raw: &str, label: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("invalid_git_ref: {label} cannot be empty");
+    }
+    if trimmed.starts_with('-') {
+        anyhow::bail!("invalid_git_ref: {label} `{trimmed}` cannot start with `-`");
+    }
+    if trimmed.ends_with('/') || trimmed.ends_with('.') || trimmed.ends_with(".lock") {
+        anyhow::bail!("invalid_git_ref: {label} `{trimmed}` has an invalid suffix");
+    }
+    if trimmed.contains("..")
+        || trimmed.contains("@{")
+        || trimmed.contains("//")
+        || trimmed.contains('\\')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        anyhow::bail!("invalid_git_ref: {label} `{trimmed}` contains forbidden characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a user/agent-supplied git branch name against option injection and `git check-ref-format`.
+pub async fn validate_git_branch_name(repo_cwd: &Path, raw: &str) -> anyhow::Result<String> {
+    let trimmed = check_git_ref_lexically_safe(raw, "branch")?;
+    if trimmed == "@"
+        || trimmed
+            .chars()
+            .any(|c| matches!(c, '~' | '^' | ':' | '?' | '*' | '['))
+    {
+        anyhow::bail!("invalid_git_ref: branch `{trimmed}` contains forbidden characters");
+    }
+    let out = git_cmd_clean(repo_cwd)
+        .args(["check-ref-format", "--branch", &trimmed])
+        .output()
+        .await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "invalid_git_ref: `{trimmed}` is not a valid git branch name ({})",
+            stderr.trim()
+        );
+    }
+    Ok(trimmed)
+}
+
+/// Validate a user/agent-supplied git base revision against option injection and verify it resolves
+/// to an existing commit via `git rev-parse --verify --end-of-options <base_ref>^{commit}`.
+pub async fn validate_git_base_ref(repo_cwd: &Path, raw: &str) -> anyhow::Result<String> {
+    let trimmed = check_git_ref_lexically_safe(raw, "base_ref")?;
+    let rev_spec = format!("{trimmed}^{{commit}}");
+    let out = git_cmd_clean(repo_cwd)
+        .args(["rev-parse", "--verify", "--end-of-options", &rev_spec])
+        .output()
+        .await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "invalid_git_ref: base_ref `{trimmed}` does not resolve to a valid commit ({})",
+            stderr.trim()
+        );
+    }
+    Ok(trimmed)
+}
+
 /// Create a git worktree supporting all 3 modes: `branch_off`, `checkout_branch`, `checkout_pr`.
 pub async fn create_worktree_with_mode(
     orbit_home: &Path,
@@ -488,18 +553,20 @@ pub async fn create_worktree_with_mode_pooled(
             )
             .await;
 
-            let branch = branch_name
-                .filter(|b| !b.trim().is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    format!(
-                        "orbit/task-{}",
-                        &uuid::Uuid::new_v4().simple().to_string()[..6]
-                    )
-                });
+            let branch = match branch_name.map(str::trim).filter(|b| !b.is_empty()) {
+                Some(b) => validate_git_branch_name(source_cwd, b).await?,
+                None => format!(
+                    "orbit/task-{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..6]
+                ),
+            };
+            let validated_base = match base_ref.map(str::trim).filter(|b| !b.is_empty()) {
+                Some(b) => Some(validate_git_base_ref(source_cwd, b).await?),
+                None => None,
+            };
             let target_dir = allocate_worktree_dir(orbit_home, repo_name, &branch);
             let claimed = if let Some(p) = pool {
-                p.try_claim_branch_off(source_cwd, &target_dir, &branch, base_ref)
+                p.try_claim_branch_off(source_cwd, &target_dir, &branch, validated_base.as_deref())
                     .await
                     .ok()
                     .flatten()
@@ -517,7 +584,7 @@ pub async fn create_worktree_with_mode_pooled(
                     .arg("-b")
                     .arg(&branch)
                     .arg(&target_dir);
-                if let Some(base) = base_ref.filter(|b| !b.trim().is_empty()) {
+                if let Some(ref base) = validated_base {
                     cmd.arg(base);
                 }
                 let out = cmd.output().await?;
@@ -534,12 +601,14 @@ pub async fn create_worktree_with_mode_pooled(
             Ok((target_dir, Some(branch)))
         }
         WorktreeCreateMode::CheckoutBranch => {
-            let branch = branch_name
-                .filter(|b| !b.trim().is_empty())
+            let raw_branch = branch_name
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("`branch` is required for checkout_branch mode"))?;
-            let target_dir = allocate_worktree_dir(orbit_home, repo_name, branch);
+            let branch = validate_git_branch_name(source_cwd, raw_branch).await?;
+            let target_dir = allocate_worktree_dir(orbit_home, repo_name, &branch);
             let claimed = if let Some(p) = pool {
-                p.try_claim_checkout_branch(source_cwd, &target_dir, branch)
+                p.try_claim_checkout_branch(source_cwd, &target_dir, &branch)
                     .await
                     .ok()
                     .flatten()
@@ -555,7 +624,7 @@ pub async fn create_worktree_with_mode_pooled(
                     .arg("worktree")
                     .arg("add")
                     .arg(&target_dir)
-                    .arg(branch)
+                    .arg(&branch)
                     .output()
                     .await?;
                 if !out.status.success() {
@@ -568,7 +637,7 @@ pub async fn create_worktree_with_mode_pooled(
             if let Some(p) = pool {
                 p.schedule_replenish(source_cwd.to_path_buf());
             }
-            Ok((target_dir, Some(branch.to_string())))
+            Ok((target_dir, Some(branch)))
         }
         WorktreeCreateMode::CheckoutPr => {
             let pr = pr_number

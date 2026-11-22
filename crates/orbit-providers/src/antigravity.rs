@@ -197,39 +197,72 @@ fn prepend_handoff_context(ctx: Option<String>, prompt: &str) -> String {
     format!("{ctx}\n\n{prompt}")
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AgySessionOpenMode<'a> {
+    New,
+    Load(&'a str),
+    Fork(&'a str),
+}
+
+fn agy_supports_session_fork(init_val: &Value) -> bool {
+    for ptr in [
+        "/agentCapabilities/sessionCapabilities/fork",
+        "/agentCapabilities/session/fork",
+        "/capabilities/session/fork",
+    ] {
+        if let Some(v) = init_val.pointer(ptr)
+            && (v.is_object() || v.as_bool() == Some(true))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn open_agy_session(
     cfg: &SessionLaunchConfig,
     shim: &mut orbit_shim::ShimClient,
     next_rpc_id: &mut i64,
     pending_rpcs: &mut HashMap<String, oneshot::Sender<Result<Value, Value>>>,
-    resume_id: Option<&str>,
+    open_mode: AgySessionOpenMode<'_>,
     requested_model: Option<&str>,
     requested_effort: Option<ReasoningEffort>,
     mode: &SessionMode,
 ) -> Result<OpenedAgySession, String> {
-    let is_resume = resume_id.is_some();
+    let drains_replay = matches!(
+        open_mode,
+        AgySessionOpenMode::Load(_) | AgySessionOpenMode::Fork(_)
+    );
     let open_session_with = |mcp_val: Value| {
-        let mut params = if let Some(sid) = resume_id {
-            json!({
-                "sessionId": sid,
-                "cwd": cfg.cwd.to_string_lossy(),
-                "mcpServers": mcp_val
-            })
-        } else {
-            json!({
-                "cwd": cfg.cwd.to_string_lossy(),
-                "mcpServers": mcp_val
-            })
+        let (method, mut params) = match open_mode {
+            AgySessionOpenMode::Fork(sid) => (
+                "session/fork",
+                json!({
+                    "sessionId": sid,
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "mcpServers": mcp_val
+                }),
+            ),
+            AgySessionOpenMode::Load(sid) => (
+                "session/load",
+                json!({
+                    "sessionId": sid,
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "mcpServers": mcp_val
+                }),
+            ),
+            AgySessionOpenMode::New => (
+                "session/new",
+                json!({
+                    "cwd": cfg.cwd.to_string_lossy(),
+                    "mcpServers": mcp_val
+                }),
+            ),
         };
         if let Some(meta) = build_agy_session_meta(cfg) {
             params["_meta"] = meta;
         }
-        let method = if is_resume {
-            "session/load"
-        } else {
-            "session/new"
-        };
         (method, params)
     };
 
@@ -254,8 +287,8 @@ async fn open_agy_session(
             Err(e) => return Err(e),
         };
 
-    // Drain replay notifications on `session/load` until 50ms of quiet
-    if is_resume {
+    // Drain replay notifications on `session/load` and `session/fork` until 50ms of quiet
+    if drains_replay {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while tokio::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(50), shim.rx.recv()).await {
@@ -269,10 +302,14 @@ async fn open_agy_session(
         }
     }
 
+    let fallback_sid = match open_mode {
+        AgySessionOpenMode::Load(sid) => Some(sid),
+        AgySessionOpenMode::Fork(_) | AgySessionOpenMode::New => None,
+    };
     let session_id = sess_val
         .get("sessionId")
         .and_then(|v| v.as_str())
-        .or(resume_id)
+        .or(fallback_sid)
         .unwrap_or("unknown")
         .to_string();
 
@@ -424,97 +461,188 @@ async fn run_agy_actor(
             }
         };
 
-        if wait_rpc_during_boot(&mut shim, &mut pending_rpcs, init_rx, &cfg.shim_seq_tracker)
-            .await
-            .is_err()
-        {
-            warn!(agent_id = %cfg.agent_id, "Antigravity ACP initialize failed");
-            let _ = evt_tx
-                .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                    message: "Antigravity ACP initialize failed".into(),
-                    recoverable: false,
-                }))
-                .await;
-            return;
-        }
-
-        // 2. `session/load` or `session/new` with Orbit MCP servers (HTTP first, stdio fallback)
-        let opened = match open_agy_session(
-            &cfg,
+        let init_val = match wait_rpc_during_boot(
             &mut shim,
-            &mut next_rpc_id,
             &mut pending_rpcs,
-            cfg.resume_session_id.as_deref(),
-            cfg.model.as_deref(),
-            cfg.effort,
-            &cfg.mode,
+            init_rx,
+            &cfg.shim_seq_tracker,
         )
         .await
         {
-            Ok(s) => s,
-            Err(first_err)
-                if cfg.resume_session_id.is_some()
-                    && is_agy_missing_trajectory_error(&first_err) =>
-            {
-                let old_short: String = cfg
-                    .resume_session_id
-                    .as_deref()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(8)
-                    .collect();
-                warn!(
-                    agent_id = %cfg.agent_id,
-                    old_session_id = ?cfg.resume_session_id,
-                    error = %first_err,
-                    "Antigravity session/load failed with missing trajectory; transparently creating fresh session"
-                );
-                match open_agy_session(
+            Ok(v) => v,
+            Err(_) => {
+                warn!(agent_id = %cfg.agent_id, "Antigravity ACP initialize failed");
+                let _ = evt_tx
+                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                        message: "Antigravity ACP initialize failed".into(),
+                        recoverable: false,
+                    }))
+                    .await;
+                return;
+            }
+        };
+
+        // 2. `session/fork`, `session/load`, or `session/new` with Orbit MCP servers (HTTP first, stdio fallback)
+        let opened = if let Some(ref fork_sid) = cfg.fork_from_session_id {
+            let native_attempt = if agy_supports_session_fork(&init_val) {
+                open_agy_session(
                     &cfg,
                     &mut shim,
                     &mut next_rpc_id,
                     &mut pending_rpcs,
-                    None,
+                    AgySessionOpenMode::Fork(fork_sid),
                     cfg.model.as_deref(),
                     cfg.effort,
                     &cfg.mode,
                 )
                 .await
+            } else {
+                Err("session/fork not advertised by Antigravity ACP".to_string())
+            };
+            match native_attempt {
+                Ok(s)
+                    if !s.session_id.is_empty()
+                        && s.session_id != "unknown"
+                        && s.session_id != *fork_sid =>
                 {
-                    Ok(fresh) => {
-                        inject_handoff_on_next_prompt = true;
-                        recovered_missing_trajectory = true;
-                        let _ = evt_tx
-                            .send(DriverEvent::Notice {
-                                level: "info".into(),
-                                message: format!(
-                                    "Previous Antigravity session ({old_short}…) was evicted from local cache; automatically started a fresh session with recent conversation context restored."
-                                ),
-                            })
-                            .await;
-                        fresh
-                    }
-                    Err(e) => {
-                        let _ = evt_tx
-                            .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                                message: format!(
-                                    "Antigravity session open failed: {first_err} (fresh session fallback: {e})"
-                                ),
-                                recoverable: false,
-                            }))
-                            .await;
+                    s
+                }
+                other => {
+                    let reason = match other {
+                        Err(e) => e,
+                        Ok(s) => format!(
+                            "session/fork returned non-distinct or empty sessionId `{}`",
+                            s.session_id
+                        ),
+                    };
+                    warn!(
+                        agent_id = %cfg.agent_id,
+                        source_session_id = %fork_sid,
+                        reason = %reason,
+                        native_fork_only = cfg.native_fork_only,
+                        "Antigravity native session/fork unavailable; falling back"
+                    );
+                    if cfg.native_fork_only {
+                        let _ = shim.kill().await;
                         return;
+                    }
+                    match open_agy_session(
+                        &cfg,
+                        &mut shim,
+                        &mut next_rpc_id,
+                        &mut pending_rpcs,
+                        AgySessionOpenMode::New,
+                        cfg.model.as_deref(),
+                        cfg.effort,
+                        &cfg.mode,
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            inject_handoff_on_next_prompt = true;
+                            fresh
+                        }
+                        Err(e) => {
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                    message: format!(
+                                        "Antigravity fork fresh session open failed: {e}"
+                                    ),
+                                    recoverable: false,
+                                }))
+                                .await;
+                            return;
+                        }
                     }
                 }
             }
-            Err(e) => {
-                let _ = evt_tx
-                    .send(DriverEvent::StatusChanged(AgentStatus::Error {
-                        message: format!("Antigravity session open failed: {e}"),
-                        recoverable: false,
-                    }))
-                    .await;
-                return;
+        } else {
+            let open_mode = match cfg.resume_session_id.as_deref() {
+                Some(sid) => AgySessionOpenMode::Load(sid),
+                None => AgySessionOpenMode::New,
+            };
+            match open_agy_session(
+                &cfg,
+                &mut shim,
+                &mut next_rpc_id,
+                &mut pending_rpcs,
+                open_mode,
+                cfg.model.as_deref(),
+                cfg.effort,
+                &cfg.mode,
+            )
+            .await
+            {
+                Ok(s) => {
+                    if cfg.resume_session_id.is_none() && cfg.fallback_handoff_context.is_some() {
+                        inject_handoff_on_next_prompt = true;
+                    }
+                    s
+                }
+                Err(first_err)
+                    if cfg.resume_session_id.is_some()
+                        && is_agy_missing_trajectory_error(&first_err) =>
+                {
+                    let old_short: String = cfg
+                        .resume_session_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(8)
+                        .collect();
+                    warn!(
+                        agent_id = %cfg.agent_id,
+                        old_session_id = ?cfg.resume_session_id,
+                        error = %first_err,
+                        "Antigravity session/load failed with missing trajectory; transparently creating fresh session"
+                    );
+                    match open_agy_session(
+                        &cfg,
+                        &mut shim,
+                        &mut next_rpc_id,
+                        &mut pending_rpcs,
+                        AgySessionOpenMode::New,
+                        cfg.model.as_deref(),
+                        cfg.effort,
+                        &cfg.mode,
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            inject_handoff_on_next_prompt = true;
+                            recovered_missing_trajectory = true;
+                            let _ = evt_tx
+                                .send(DriverEvent::Notice {
+                                    level: "info".into(),
+                                    message: format!(
+                                        "Previous Antigravity session ({old_short}…) was evicted from local cache; automatically started a fresh session with recent conversation context restored."
+                                    ),
+                                })
+                                .await;
+                            fresh
+                        }
+                        Err(e) => {
+                            let _ = evt_tx
+                                .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                                    message: format!(
+                                        "Antigravity session open failed: {first_err} (fresh session fallback: {e})"
+                                    ),
+                                    recoverable: false,
+                                }))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = evt_tx
+                        .send(DriverEvent::StatusChanged(AgentStatus::Error {
+                            message: format!("Antigravity session open failed: {e}"),
+                            recoverable: false,
+                        }))
+                        .await;
+                    return;
+                }
             }
         };
 
@@ -1080,7 +1208,7 @@ async fn run_agy_actor(
                                                 &mut shim,
                                                 &mut next_rpc_id,
                                                 &mut pending_rpcs,
-                                                None,
+                                                AgySessionOpenMode::New,
                                                 current_base_model.as_deref(),
                                                 active_effort,
                                                 &mode,
@@ -8333,6 +8461,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             effort: Some(ReasoningEffort::Xhigh),
             mode: SessionMode::FullAccess,
             resume_session_id: Some("f8c809f0-5617-41ca-b27f-63bd7019833f".into()),
+            fork_from_session_id: None,
+            native_fork_only: false,
             mcp_spec: None,
             system_prompt_append: None,
             extra_env: HashMap::new(),
@@ -8508,6 +8638,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             effort: Some(ReasoningEffort::High),
             mode: SessionMode::FullAccess,
             resume_session_id: Some("sess_live_reattach".into()),
+            fork_from_session_id: None,
+            native_fork_only: false,
             mcp_spec: None,
             system_prompt_append: None,
             extra_env: HashMap::new(),

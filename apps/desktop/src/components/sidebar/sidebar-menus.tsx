@@ -11,6 +11,7 @@ import {
   FolderOpen,
   FolderPlus,
   GitBranch,
+  GitFork,
   GitMerge,
   Hash,
   Inbox,
@@ -38,7 +39,7 @@ import {
   orbitIpc,
   semanticAgentTabLabel,
 } from "@/lib/orbit-ipc";
-import { isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
+import { isAgentInGitRepo, isLocalHostCard, normalizeProjectPath } from "@/lib/projects";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -133,6 +134,7 @@ export function SharedConversationMenu({
   const customTitle = useOrbitSelector((s) =>
     target ? s.threadCustomTitles[target.threadKey] : undefined,
   );
+  const sidebarView = useOrbitSelector((s) => s.sidebarView);
   if (!target) return null;
   const { threadKey, host, agent, isPinned, isUnread, anchor } = target;
   const effectiveTitle = customTitle || agent.title;
@@ -141,6 +143,7 @@ export function SharedConversationMenu({
   const isCuratedWs = Boolean(activeWs?.is_curated);
   const projectRoot = activeWs?.project_root || activeWs?.source_cwd || activeWs?.cwd || agent.cwd;
   const normRoot = normalizeProjectPath(projectRoot);
+  const isGitRepo = isAgentInGitRepo(host.host_id, agent, hostDetail, sidebarView);
   const otherWorkspaces = (hostDetail?.workspaces ?? [])
     .filter((w) => {
       if (!w.is_curated || w.workspace_id === agent.workspace_id || w.archived_at || w.background) {
@@ -253,6 +256,39 @@ export function SharedConversationMenu({
             <span>Open split</span>
           </span>
         </DropdownMenuItem>
+
+        <DropdownMenuItem
+          onSelect={() => {
+            void orbitActions.forkAgent({
+              hostId: host.host_id,
+              sourceAgentId: agent.agent_id,
+            });
+          }}
+          className={COMPACT_MENU_ITEM_CLASS}
+        >
+          <span className="flex items-center gap-2 whitespace-nowrap">
+            <GitFork className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+            <span>Fork</span>
+          </span>
+        </DropdownMenuItem>
+
+        {isGitRepo && (
+          <DropdownMenuItem
+            onSelect={() => {
+              void orbitActions.forkAgent({
+                hostId: host.host_id,
+                sourceAgentId: agent.agent_id,
+                worktree: true,
+              });
+            }}
+            className={COMPACT_MENU_ITEM_CLASS}
+          >
+            <span className="flex items-center gap-2 whitespace-nowrap">
+              <GitBranch className="text-muted-foreground h-[13.5px] w-[13.5px] shrink-0 stroke-[1.75]" />
+              <span>Fork in worktree</span>
+            </span>
+          </DropdownMenuItem>
+        )}
 
         <DropdownMenuSub>
           <DropdownMenuSubTrigger className={COMPACT_MENU_ITEM_CLASS}>

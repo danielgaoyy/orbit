@@ -1483,6 +1483,8 @@ function rememberLocalQueuedDraftExtras(
   }
 }
 
+const inFlightForks = new Set<string>();
+
 export const orbitActions = {
   async init(): Promise<void> {
     if (initialized) return;
@@ -3538,6 +3540,27 @@ export const orbitActions = {
       })),
     });
 
+    if (composed.is_fork) {
+      if (state.isDraftNewSession || !state.selectedAgentId) {
+        notifyToast("Start an active session first to fork");
+        return;
+      }
+      setState((s) => ({
+        ...s,
+        composerDrafts: { ...s.composerDrafts, [key]: "" },
+        slashDirectives: { ...s.slashDirectives, [key]: null },
+      }));
+      draftPersistence.flushNow();
+      void orbitActions.forkAgent({
+        hostId,
+        sourceAgentId: state.selectedAgentId,
+        worktree: Boolean(composed.fork_worktree),
+        branch: composed.fork_branch ?? undefined,
+        initialPrompt: composed.fork_prompt ?? undefined,
+      });
+      return;
+    }
+
     if (composed.is_btw) {
       setState((s) => ({
         ...s,
@@ -4396,6 +4419,65 @@ export const orbitActions = {
       const msg = err instanceof Error ? err.message : String(err);
       notifyToast(msg || "Failed to rewind conversation");
       return false;
+    }
+  },
+
+  async forkAgent(opts: {
+    hostId: string;
+    sourceAgentId: string;
+    upToSeq?: number | null;
+    worktree?: boolean;
+    branch?: string;
+    baseRef?: string;
+    title?: string;
+    initialPrompt?: string;
+  }): Promise<boolean> {
+    const dedupKey = `${opts.hostId}::${opts.sourceAgentId}`;
+    if (inFlightForks.has(dedupKey)) {
+      return false;
+    }
+    inFlightForks.add(dedupKey);
+    try {
+      const useWorktree = Boolean(
+        opts.worktree || opts.branch?.trim() || opts.baseRef?.trim(),
+      );
+      const res = await orbitIpc.forkAgent({
+        host_id: opts.hostId,
+        source_agent_id: opts.sourceAgentId,
+        up_to_seq: opts.upToSeq ?? null,
+        target: useWorktree
+          ? {
+              kind: "new_worktree",
+              branch: opts.branch?.trim() || null,
+              base_ref: opts.baseRef?.trim() || null,
+            }
+          : { kind: "same_directory" },
+        title: opts.title?.trim() || null,
+        initial_prompt: opts.initialPrompt?.trim() || null,
+      });
+
+      await orbitActions.reloadHostDetail(opts.hostId, true);
+      orbitActions.selectAgent(opts.hostId, res.agent.agent_id);
+
+      if (res.workspace?.is_worktree) {
+        const branchNote = res.workspace.git_branch
+          ? ` · ${res.workspace.git_branch}`
+          : "";
+        notifyToast(`Forked in new worktree${branchNote}`);
+      }
+
+      setTimeout(() => {
+        for (const fn of composerFocusListeners) {
+          fn();
+        }
+      }, 24);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      notifyToast(msg || "Failed to fork conversation");
+      return false;
+    } finally {
+      inFlightForks.delete(dedupKey);
     }
   },
 

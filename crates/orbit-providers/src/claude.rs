@@ -24,10 +24,148 @@ use uuid::Uuid;
 use crate::attachments::build_claude_content_blocks;
 use crate::driver::{DriverCommand, DriverEvent, ProviderSessionHandle, SessionLaunchConfig};
 
+enum ClaudeSessionStartMode<'a> {
+    Fresh(&'a str),
+    Resume(&'a str),
+    ForkFrom(&'a str),
+}
+
+fn build_claude_launch_args(
+    cfg: &SessionLaunchConfig,
+    start_mode: ClaudeSessionStartMode<'_>,
+) -> Vec<String> {
+    let perm_mode = claude_mode_flag(&cfg.mode);
+
+    let mut args = vec![
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--permission-prompt-tool".to_string(),
+        "stdio".to_string(),
+        "--include-partial-messages".to_string(),
+        "--permission-mode".to_string(),
+        perm_mode.to_string(),
+        "--allow-dangerously-skip-permissions".to_string(),
+    ];
+
+    match start_mode {
+        ClaudeSessionStartMode::ForkFrom(source_sid) => {
+            args.push(format!("--resume={source_sid}"));
+            args.push("--fork-session".to_string());
+        }
+        ClaudeSessionStartMode::Resume(resume_id) => {
+            args.push(format!("--resume={resume_id}"));
+        }
+        ClaudeSessionStartMode::Fresh(session_id) => {
+            args.push(format!("--session-id={session_id}"));
+        }
+    }
+
+    if let Some(ref m) = cfg.model {
+        args.push("--model".to_string());
+        args.push(m.clone());
+    }
+    for extra in &cfg.extra_dirs {
+        args.push("--add-dir".to_string());
+        args.push(extra.to_string_lossy().to_string());
+    }
+    if let Some(ref mcp) = cfg.mcp_spec {
+        let mcp_json = json!({
+            "mcpServers": {
+                mcp.server_name.clone(): {
+                    "type": "http",
+                    "url": mcp.http_url,
+                    "headers": {
+                        "Authorization": format!("Bearer {}", mcp.bearer_token)
+                    }
+                }
+            }
+        })
+        .to_string();
+        args.push("--mcp-config".to_string());
+        args.push(mcp_json);
+    }
+    if let Some(ref sys_append) = cfg.system_prompt_append
+        && !sys_append.trim().is_empty()
+    {
+        args.push("--append-system-prompt".to_string());
+        args.push(sys_append.clone());
+    }
+    args
+}
+
+async fn spawn_claude_shim_and_init(
+    cfg: &SessionLaunchConfig,
+    start_mode: ClaudeSessionStartMode<'_>,
+) -> Result<orbit_shim::ShimClient, String> {
+    let args = build_claude_launch_args(cfg, start_mode);
+
+    let mut env = cfg.extra_env.clone();
+    env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-ts".into());
+    env.insert(
+        "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".into(),
+        "true".into(),
+    );
+    env.insert("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into());
+    env.insert("NO_COLOR".into(), "1".into());
+    if let Some(eff) = cfg.effort {
+        let eff_str = match eff {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Xhigh => Some("xhigh"),
+            ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
+        };
+        if let Some(s) = eff_str {
+            env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), s.into());
+        }
+    }
+    crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
+
+    let spec = ShimSpawnSpec {
+        shim_id: format!("claude_{}", cfg.agent_id),
+        mode: ShimMode::Stdio,
+        program: cfg.executable.to_string_lossy().to_string(),
+        args,
+        cwd: cfg.cwd.clone(),
+        env,
+    };
+
+    let mut fresh = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
+        .await
+        .map_err(|e| format!("failed to spawn claude shim: {e}"))?;
+
+    // Send mandatory `initialize` control_request handshake
+    let init_req = json!({
+        "request_id": "init_1",
+        "type": "control_request",
+        "request": {
+            "subtype": "initialize",
+            "forwardSubagentText": true,
+            "perTaskStopAffordance": true
+        }
+    })
+    .to_string();
+
+    if let Err(e) = fresh.write_stdin_line(init_req).await {
+        let _ = fresh.kill().await;
+        return Err(format!("failed to write claude initialize: {e}"));
+    }
+
+    if let Err(e) = wait_claude_init_response(&mut fresh, &cfg.shim_seq_tracker).await {
+        let _ = fresh.kill().await;
+        return Err(e);
+    }
+    Ok(fresh)
+}
+
 pub async fn spawn_claude_session(
     cfg: SessionLaunchConfig,
 ) -> Result<ProviderSessionHandle, String> {
-    let preassigned_session_id = cfg
+    let mut preassigned_session_id = cfg
         .resume_session_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -38,116 +176,75 @@ pub async fn spawn_claude_session(
         None
     };
 
+    let mut forked_natively = false;
+    let mut inject_handoff_on_next_prompt = false;
+    let mut fork_fallback_notice: Option<String> = None;
+
     let (shim, is_reattached) = if let Some(existing) = reattached {
         (existing, true)
+    } else if let Some(ref fork_sid) = cfg.fork_from_session_id {
+        match spawn_claude_shim_and_init(&cfg, ClaudeSessionStartMode::ForkFrom(fork_sid)).await {
+            Ok(fresh) => {
+                forked_natively = true;
+                // Do not leak a fabricated random session_id before Claude's `system/init`
+                // confirms the newly allocated forked session ID.
+                preassigned_session_id.clear();
+                (fresh, false)
+            }
+            Err(first_err) if cfg.native_fork_only => {
+                return Err(format!(
+                    "Claude native fork failed ({first_err}); deferring fresh session until first prompt"
+                ));
+            }
+            Err(first_err) => {
+                let short_sid: String = fork_sid.chars().take(8).collect();
+                let fresh = spawn_claude_shim_and_init(
+                    &cfg,
+                    ClaudeSessionStartMode::Fresh(&preassigned_session_id),
+                )
+                .await
+                .map_err(|e| {
+                    format!("Claude native fork failed ({first_err}); fresh session fallback also failed: {e}")
+                })?;
+                inject_handoff_on_next_prompt = true;
+                fork_fallback_notice = Some(format!(
+                    "Native Claude session fork ({short_sid}…) fell back to a fresh session with conversation context restored."
+                ));
+                (fresh, false)
+            }
+        }
+    } else if let Some(ref resume_id) = cfg.resume_session_id {
+        match spawn_claude_shim_and_init(&cfg, ClaudeSessionStartMode::Resume(resume_id)).await {
+            Ok(fresh) => (fresh, false),
+            Err(first_err) if cfg.fallback_handoff_context.is_some() => {
+                let short_sid: String = resume_id.chars().take(8).collect();
+                let fresh_id = Uuid::new_v4().to_string();
+                let fresh = spawn_claude_shim_and_init(
+                    &cfg,
+                    ClaudeSessionStartMode::Fresh(&fresh_id),
+                )
+                .await
+                .map_err(|e| {
+                    format!("Claude resume failed ({first_err}); fresh session fallback also failed: {e}")
+                })?;
+                preassigned_session_id = fresh_id;
+                inject_handoff_on_next_prompt = true;
+                fork_fallback_notice = Some(format!(
+                    "Previous Claude session ({short_sid}…) could not be resumed; started a fresh session with recent conversation context restored."
+                ));
+                (fresh, false)
+            }
+            Err(e) => return Err(e),
+        }
     } else {
-        let perm_mode = claude_mode_flag(&cfg.mode);
-
-        let mut args = vec![
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-            "--input-format".to_string(),
-            "stream-json".to_string(),
-            "--permission-prompt-tool".to_string(),
-            "stdio".to_string(),
-            "--include-partial-messages".to_string(),
-            "--permission-mode".to_string(),
-            perm_mode.to_string(),
-            "--allow-dangerously-skip-permissions".to_string(),
-        ];
-
-        if let Some(ref resume_id) = cfg.resume_session_id {
-            args.push(format!("--resume={resume_id}"));
-        } else {
-            args.push(format!("--session-id={preassigned_session_id}"));
+        let fresh = spawn_claude_shim_and_init(
+            &cfg,
+            ClaudeSessionStartMode::Fresh(&preassigned_session_id),
+        )
+        .await?;
+        if cfg.fallback_handoff_context.is_some() {
+            inject_handoff_on_next_prompt = true;
         }
-
-        if let Some(ref m) = cfg.model {
-            args.push("--model".to_string());
-            args.push(m.clone());
-        }
-        for extra in &cfg.extra_dirs {
-            args.push("--add-dir".to_string());
-            args.push(extra.to_string_lossy().to_string());
-        }
-        if let Some(ref mcp) = cfg.mcp_spec {
-            let mcp_json = json!({
-                "mcpServers": {
-                    mcp.server_name.clone(): {
-                        "type": "http",
-                        "url": mcp.http_url,
-                        "headers": {
-                            "Authorization": format!("Bearer {}", mcp.bearer_token)
-                        }
-                    }
-                }
-            })
-            .to_string();
-            args.push("--mcp-config".to_string());
-            args.push(mcp_json);
-        }
-        if let Some(ref sys_append) = cfg.system_prompt_append
-            && !sys_append.trim().is_empty()
-        {
-            args.push("--append-system-prompt".to_string());
-            args.push(sys_append.clone());
-        }
-
-        let mut env = cfg.extra_env.clone();
-        env.insert("CLAUDE_CODE_ENTRYPOINT".into(), "sdk-ts".into());
-        env.insert(
-            "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".into(),
-            "true".into(),
-        );
-        env.insert("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS".into(), "1".into());
-        env.insert("NO_COLOR".into(), "1".into());
-        if let Some(eff) = cfg.effort {
-            let eff_str = match eff {
-                ReasoningEffort::Off => None,
-                ReasoningEffort::Low => Some("low"),
-                ReasoningEffort::Medium => Some("medium"),
-                ReasoningEffort::High => Some("high"),
-                ReasoningEffort::Xhigh => Some("xhigh"),
-                ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
-            };
-            if let Some(s) = eff_str {
-                env.insert("CLAUDE_CODE_EFFORT_LEVEL".into(), s.into());
-            }
-        }
-        crate::shell_snapshot::merge_cached_shell_env_into_map(&mut env);
-
-        let spec = ShimSpawnSpec {
-            shim_id: format!("claude_{}", cfg.agent_id),
-            mode: ShimMode::Stdio,
-            program: cfg.executable.to_string_lossy().to_string(),
-            args,
-            cwd: cfg.cwd.clone(),
-            env,
-        };
-
-        let mut fresh = spawn_detached_shim(&cfg.orbit_exe, &cfg.shim_socket, &spec)
-            .await
-            .map_err(|e| format!("failed to spawn claude shim: {e}"))?;
-
-        // Send mandatory `initialize` control_request handshake
-        let init_req = json!({
-            "request_id": "init_1",
-            "type": "control_request",
-            "request": {
-                "subtype": "initialize",
-                "forwardSubagentText": true,
-                "perTaskStopAffordance": true
-            }
-        })
-        .to_string();
-
-        fresh
-            .write_stdin_line(init_req)
-            .await
-            .map_err(|e| format!("failed to write claude initialize: {e}"))?;
-
-        wait_claude_init_response(&mut fresh, &cfg.shim_seq_tracker).await?;
         (fresh, false)
     };
 
@@ -159,6 +256,9 @@ pub async fn spawn_claude_session(
         preassigned_session_id,
         shim,
         is_reattached,
+        forked_natively,
+        inject_handoff_on_next_prompt,
+        fork_fallback_notice,
         cmd_rx,
         evt_tx,
     ));
@@ -175,25 +275,68 @@ struct PendingClaudePerm {
     question_texts: Vec<String>,
 }
 
+fn build_claude_user_frame(
+    session_id: &str,
+    content_blocks: Vec<Value>,
+    priority_next: bool,
+) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), Value::String("user".into()));
+    if !session_id.is_empty() {
+        obj.insert("session_id".into(), Value::String(session_id.to_string()));
+    }
+    obj.insert("parent_tool_use_id".into(), Value::Null);
+    obj.insert("uuid".into(), Value::String(Uuid::new_v4().to_string()));
+    if priority_next {
+        obj.insert("priority".into(), Value::String("next".into()));
+    }
+    obj.insert(
+        "message".into(),
+        json!({
+            "role": "user",
+            "content": content_blocks
+        }),
+    );
+    Value::Object(obj)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_claude_actor(
     cfg: SessionLaunchConfig,
     mut session_id: String,
     mut shim: orbit_shim::ShimClient,
     is_reattached: bool,
+    mut forked_natively: bool,
+    mut inject_handoff_on_next_prompt: bool,
+    fork_fallback_notice: Option<String>,
     mut cmd_rx: mpsc::Receiver<DriverCommand>,
     evt_tx: mpsc::Sender<DriverEvent>,
 ) {
-    let _ = evt_tx
-        .send(DriverEvent::SessionInitialized {
-            persistence_ref: session_id.clone(),
-            model: cfg.model.clone(),
-        })
-        .await;
+    let mut emitted_session_init = false;
+    if !forked_natively {
+        let _ = evt_tx
+            .send(DriverEvent::SessionInitialized {
+                persistence_ref: session_id.clone(),
+                model: cfg.model.clone(),
+            })
+            .await;
+        emitted_session_init = true;
+    }
+    if let Some(notice) = fork_fallback_notice {
+        let _ = evt_tx
+            .send(DriverEvent::Notice {
+                level: "info".into(),
+                message: notice,
+            })
+            .await;
+    }
     if !is_reattached {
         let _ = evt_tx
             .send(DriverEvent::StatusChanged(AgentStatus::Idle))
             .await;
     }
+    let mut pending_handoff_context = cfg.fallback_handoff_context.clone();
+    let mut pending_fork_first_prompt: Option<(String, String)> = None;
 
     let mut ctrl_seq: u64 = if is_reattached { 1000 } else { 2 };
     let mut active_turn_id: Option<String> = if is_reattached {
@@ -219,7 +362,16 @@ async fn run_claude_actor(
             maybe_cmd = cmd_rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break; };
                 match cmd {
-                    DriverCommand::SendPrompt { turn_id, prompt, behavior } => {
+                    DriverCommand::SendPrompt { turn_id, mut prompt, behavior } => {
+                        if inject_handoff_on_next_prompt {
+                            inject_handoff_on_next_prompt = false;
+                            if let Some(ctx) = pending_handoff_context.take()
+                                && !ctx.trim().is_empty()
+                                && !prompt.contains("[Prior Conversation Context in this Workspace]")
+                            {
+                                prompt = format!("{ctx}\n\n{prompt}");
+                            }
+                        }
                         if active_turn_id.is_some() {
                             match behavior {
                                 ActiveTurnBehavior::Queue => {
@@ -246,23 +398,21 @@ async fn run_claude_actor(
                                         &prompt,
                                         cfg.attachments_dir.as_deref(),
                                     );
-                                    let user_frame = json!({
-                                        "type": "user",
-                                        "session_id": session_id,
-                                        "parent_tool_use_id": null,
-                                        "uuid": Uuid::new_v4().to_string(),
-                                        "priority": "next",
-                                        "message": {
-                                            "role": "user",
-                                            "content": content_blocks
-                                        }
-                                    });
+                                    let user_frame = build_claude_user_frame(
+                                        &session_id,
+                                        content_blocks,
+                                        true,
+                                    );
                                     if shim.write_stdin_line(user_frame.to_string()).await.is_err() {
                                         break;
                                     }
                                     continue;
                                 }
                             }
+                        }
+
+                        if forked_natively && !emitted_session_init {
+                            pending_fork_first_prompt = Some((turn_id.clone(), prompt.clone()));
                         }
 
                         active_turn_id = Some(turn_id.clone());
@@ -276,16 +426,8 @@ async fn run_claude_actor(
 
                         let content_blocks =
                             build_claude_content_blocks(&prompt, cfg.attachments_dir.as_deref());
-                        let user_frame = json!({
-                            "type": "user",
-                            "session_id": session_id,
-                            "parent_tool_use_id": null,
-                            "uuid": Uuid::new_v4().to_string(),
-                            "message": {
-                                "role": "user",
-                                "content": content_blocks
-                            }
-                        });
+                        let user_frame =
+                            build_claude_user_frame(&session_id, content_blocks, false);
                         if shim.write_stdin_line(user_frame.to_string()).await.is_err() {
                             break;
                         }
@@ -463,19 +605,106 @@ async fn run_claude_actor(
                                     "init" => {
                                         if let Some(sid) = val.get("session_id").and_then(|v| v.as_str())
                                             && !sid.is_empty()
-                                            && sid != session_id
                                         {
-                                            session_id = sid.to_string();
-                                            let model = val
-                                                .get("model")
-                                                .and_then(|v| v.as_str())
-                                                .map(ToOwned::to_owned);
-                                            let _ = evt_tx
-                                                .send(DriverEvent::SessionInitialized {
-                                                    persistence_ref: session_id.clone(),
-                                                    model,
-                                                })
-                                                .await;
+                                            if forked_natively
+                                                && cfg.fork_from_session_id.as_deref() == Some(sid)
+                                            {
+                                                tracing::warn!(
+                                                    agent_id = %cfg.agent_id,
+                                                    parent_session_id = %sid,
+                                                    "Claude --fork-session returned parent session_id; killing shim to protect parent session"
+                                                );
+                                                let _ = shim.kill().await;
+                                                if cfg.native_fork_only {
+                                                    break;
+                                                }
+                                                let fresh_id = Uuid::new_v4().to_string();
+                                                match spawn_claude_shim_and_init(
+                                                    &cfg,
+                                                    ClaudeSessionStartMode::Fresh(&fresh_id),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(fresh_shim) => {
+                                                        shim = fresh_shim;
+                                                        forked_natively = false;
+                                                        session_id = fresh_id;
+                                                        emitted_session_init = true;
+                                                        inject_handoff_on_next_prompt = true;
+                                                        let _ = evt_tx
+                                                            .send(DriverEvent::SessionInitialized {
+                                                                persistence_ref: session_id.clone(),
+                                                                model: cfg.model.clone(),
+                                                            })
+                                                            .await;
+                                                        let _ = evt_tx
+                                                            .send(DriverEvent::Notice {
+                                                                level: "info".into(),
+                                                                message: "Native Claude session fork returned parent session ID; started a fresh session with conversation context restored.".into(),
+                                                            })
+                                                            .await;
+                                                        if let Some((_tid, orig_prompt)) =
+                                                            pending_fork_first_prompt.take()
+                                                        {
+                                                            inject_handoff_on_next_prompt = false;
+                                                            let wire_prompt = if let Some(ctx) =
+                                                                pending_handoff_context.take()
+                                                                && !ctx.trim().is_empty()
+                                                                && !orig_prompt.contains(
+                                                                    "[Prior Conversation Context in this Workspace]",
+                                                                )
+                                                            {
+                                                                format!("{ctx}\n\n{orig_prompt}")
+                                                            } else {
+                                                                orig_prompt
+                                                            };
+                                                            let blocks = build_claude_content_blocks(
+                                                                &wire_prompt,
+                                                                cfg.attachments_dir.as_deref(),
+                                                            );
+                                                            let frame = build_claude_user_frame(
+                                                                &session_id,
+                                                                blocks,
+                                                                false,
+                                                            );
+                                                            if shim
+                                                                .write_stdin_line(frame.to_string())
+                                                                .await
+                                                                .is_err()
+                                                            {
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = evt_tx
+                                                            .send(DriverEvent::StatusChanged(
+                                                                AgentStatus::Error {
+                                                                    message: format!(
+                                                                        "Claude native fork returned parent session ID; fresh session fallback failed: {e}"
+                                                                    ),
+                                                                    recoverable: true,
+                                                                },
+                                                            ))
+                                                            .await;
+                                                        break;
+                                                    }
+                                                }
+                                            } else if !emitted_session_init || sid != session_id {
+                                                session_id = sid.to_string();
+                                                emitted_session_init = true;
+                                                pending_fork_first_prompt = None;
+                                                let model = val
+                                                    .get("model")
+                                                    .and_then(|v| v.as_str())
+                                                    .map(ToOwned::to_owned);
+                                                let _ = evt_tx
+                                                    .send(DriverEvent::SessionInitialized {
+                                                        persistence_ref: session_id.clone(),
+                                                        model,
+                                                    })
+                                                    .await;
+                                            }
                                         }
                                     }
                                     "task_started" => {
@@ -1090,6 +1319,15 @@ async fn wait_claude_init_response(
                             && val.pointer("/response/request_id").and_then(|v| v.as_str())
                                 == Some("init_1")
                         {
+                            if val.pointer("/response/subtype").and_then(|v| v.as_str())
+                                == Some("error")
+                            {
+                                let err_msg = val
+                                    .pointer("/response/error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Claude Code initialize rejected");
+                                return Err(err_msg.to_string());
+                            }
                             return Ok(());
                         }
                     }
@@ -1788,4 +2026,140 @@ pub async fn probe_claude_models(executable: Option<&Path>) -> ProviderModelCata
     .flatten();
 
     build_claude_catalog_for_version(ver)
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    fn test_claude_cfg(fork_sid: Option<&str>, native_fork_only: bool) -> SessionLaunchConfig {
+        SessionLaunchConfig {
+            agent_id: "ag_claude_fork_test".into(),
+            provider: ProviderKind::ClaudeCode,
+            executable: PathBuf::from("/bin/true"),
+            orbit_exe: PathBuf::from("/bin/true"),
+            shim_socket: std::env::temp_dir().join("orbit_claude_unused.sock"),
+            cwd: std::env::temp_dir(),
+            extra_dirs: vec![],
+            attachments_dir: None,
+            model: Some("sonnet".into()),
+            effort: None,
+            mode: SessionMode::Default,
+            resume_session_id: None,
+            fork_from_session_id: fork_sid.map(ToOwned::to_owned),
+            native_fork_only,
+            mcp_spec: None,
+            system_prompt_append: None,
+            extra_env: HashMap::new(),
+            reattach_existing_shim: false,
+            shim_after_seq: None,
+            shim_seq_tracker: Arc::new(AtomicU64::new(0)),
+            persisted_active_turn_id: None,
+            persisted_turn_step_seq: 0,
+            fallback_handoff_context: Some(
+                "[Prior Conversation Context in this Workspace]\nUser: hi".into(),
+            ),
+            persisted_running_bg_tasks: vec![],
+            persisted_bg_wait: false,
+        }
+    }
+
+    #[test]
+    fn build_claude_launch_args_uses_equals_resume_and_fork_session() {
+        let cfg = test_claude_cfg(Some("parent-sess-123"), false);
+        let args =
+            build_claude_launch_args(&cfg, ClaudeSessionStartMode::ForkFrom("parent-sess-123"));
+        assert!(args.iter().any(|a| a == "--resume=parent-sess-123"));
+        assert!(args.iter().any(|a| a == "--fork-session"));
+        assert!(!args.iter().any(|a| a.starts_with("--session-id")));
+    }
+
+    #[test]
+    fn build_claude_user_frame_omits_empty_session_id() {
+        let frame_empty = build_claude_user_frame("", Vec::new(), false);
+        assert!(frame_empty.get("session_id").is_none());
+
+        let frame_set = build_claude_user_frame("forked-sess-456", Vec::new(), true);
+        assert_eq!(
+            frame_set.get("session_id").and_then(|v| v.as_str()),
+            Some("forked-sess-456")
+        );
+        assert_eq!(
+            frame_set.get("priority").and_then(|v| v.as_str()),
+            Some("next")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_fork_aborts_when_init_returns_parent_session_id() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::UnixListener;
+
+        let sock_path = std::env::temp_dir().join(format!(
+            "orbit_test_claude_fork_guard_{}.sock",
+            Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path).expect("bind mock claude shim");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let frames = [
+                ShimFrame::AttachAck { latest_seq: 0 },
+                ShimFrame::StdoutLine {
+                    seq: Some(1),
+                    line: json!({
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": "parent-sess-999",
+                        "model": "sonnet"
+                    })
+                    .to_string(),
+                },
+            ];
+            for f in frames {
+                let mut enc = serde_json::to_string(&f).expect("encode");
+                enc.push('\n');
+                let _ = stream.write_all(enc.as_bytes()).await;
+            }
+            let _ = stream.flush().await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let shim = orbit_shim::ShimClient::connect(&sock_path)
+            .await
+            .expect("connect");
+        let (_cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (evt_tx, mut evt_rx) = mpsc::channel(16);
+        let mut cfg = test_claude_cfg(Some("parent-sess-999"), true);
+        cfg.shim_socket = sock_path.clone();
+
+        let actor = tokio::spawn(run_claude_actor(
+            cfg,
+            String::new(),
+            shim,
+            false,
+            true,
+            false,
+            None,
+            cmd_rx,
+            evt_tx,
+        ));
+
+        let mut saw_session_init = false;
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(2), evt_rx.recv()).await {
+            if matches!(ev, DriverEvent::SessionInitialized { .. }) {
+                saw_session_init = true;
+            }
+        }
+        assert!(
+            !saw_session_init,
+            "Claude fork must NEVER emit SessionInitialized when init returns parent session_id"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        let _ = std::fs::remove_file(&sock_path);
+    }
 }

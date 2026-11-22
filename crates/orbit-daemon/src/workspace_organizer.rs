@@ -1682,6 +1682,8 @@ mod tests {
             handle: Some("claude".into()),
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
         store.upsert_agent(&agent, None).expect("upsert agent");
     }

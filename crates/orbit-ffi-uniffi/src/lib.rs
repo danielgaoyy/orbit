@@ -29,9 +29,10 @@ use orbit_client_core::composer::{
 };
 use orbit_client_core::contract::{
     AgentStageDeltaRequest, BridgeInfoView, ConversationSearchHit, CreateSessionRequest,
-    FleetSidebarRequest, GitReposInspectionView, MentionRankRequest, ModelSelectionRequest,
-    ReadWorkspaceFileRequest, RenderDiagramRequest, RenderDiagramView, RewindAgentRequest,
-    SendPromptRequest, SpawnWorkspacePeerRequest, UpdateHostConfigRequest,
+    FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView, GitReposInspectionView,
+    MentionRankRequest, ModelSelectionRequest, ReadWorkspaceFileRequest, RenderDiagramRequest,
+    RenderDiagramView, RewindAgentRequest, SendPromptRequest, SpawnWorkspacePeerRequest,
+    UpdateHostConfigRequest,
 };
 use orbit_client_core::diagram::{
     DiagramKind, DiagramTheme, detect_diagram_kind as core_detect_diagram_kind,
@@ -58,7 +59,7 @@ use orbit_client_core::stage::{
 };
 use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
-    AgentMessageKind, AttentionState, DirectoryEntry, DiscoveredProject, NestedGitRepo,
+    AgentMessageKind, AttentionState, DirectoryEntry, DiscoveredProject, ForkTarget, NestedGitRepo,
     PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
     ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
     ProviderSubagentStatus, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
@@ -1217,6 +1218,8 @@ pub struct FfiAgentCard {
     pub cluster_suggestion: Option<FfiWorkspaceClusterSuggestion>,
     pub worktree_branch: Option<String>,
     pub task_summary: Option<String>,
+    pub forked_from_agent_id: Option<String>,
+    pub forked_at_seq: Option<u64>,
     pub attention_label: Option<String>,
     pub latest_seq: u64,
     pub updated_at_rfc3339: String,
@@ -1256,6 +1259,8 @@ impl From<AgentCardView> for FfiAgentCard {
             cluster_suggestion: v.cluster_suggestion.map(Into::into),
             worktree_branch: v.worktree_branch,
             task_summary: v.task_summary,
+            forked_from_agent_id: v.forked_from_agent_id,
+            forked_at_seq: v.forked_at_seq,
             attention_label,
             latest_seq: v.latest_seq,
             updated_at_rfc3339: v.updated_at_rfc3339,
@@ -2953,6 +2958,21 @@ impl From<RewindAgentResultView> for FfiRewindAgentResult {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiForkAgentResult {
+    pub agent: FfiAgentCard,
+    pub workspace: Option<FfiWorkspaceSummary>,
+}
+
+impl From<ForkAgentResultView> for FfiForkAgentResult {
+    fn from(v: ForkAgentResultView) -> Self {
+        Self {
+            agent: v.agent.into(),
+            workspace: v.workspace.map(Into::into),
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiWorkspaceFile {
     pub host_id: String,
     pub cwd: String,
@@ -3366,6 +3386,10 @@ pub struct FfiComposedPrompt {
     pub is_compact: bool,
     pub is_btw: bool,
     pub btw_question: Option<String>,
+    pub is_fork: bool,
+    pub fork_worktree: bool,
+    pub fork_branch: Option<String>,
+    pub fork_prompt: Option<String>,
     pub is_empty: bool,
 }
 
@@ -3379,6 +3403,10 @@ impl From<ComposedPromptView> for FfiComposedPrompt {
             is_compact: v.is_compact,
             is_btw: v.is_btw,
             btw_question: v.btw_question,
+            is_fork: v.is_fork,
+            fork_worktree: v.fork_worktree,
+            fork_branch: v.fork_branch,
+            fork_prompt: v.fork_prompt,
             is_empty: v.is_empty,
         }
     }
@@ -3616,6 +3644,39 @@ impl From<FfiRewindAgentRequest> for RewindAgentRequest {
             agent_id: v.agent_id,
             to_before_seq: v.to_before_seq,
             restore_files: v.restore_files,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiForkAgentRequest {
+    pub host_id: String,
+    pub source_agent_id: String,
+    pub up_to_seq: Option<u64>,
+    pub worktree: bool,
+    pub branch: Option<String>,
+    pub base_ref: Option<String>,
+    pub title: Option<String>,
+    pub initial_prompt: Option<String>,
+}
+
+impl From<FfiForkAgentRequest> for ForkAgentRequest {
+    fn from(v: FfiForkAgentRequest) -> Self {
+        let target = if v.worktree || v.branch.is_some() || v.base_ref.is_some() {
+            ForkTarget::NewWorktree {
+                branch: v.branch,
+                base_ref: v.base_ref,
+            }
+        } else {
+            ForkTarget::SameDirectory
+        };
+        Self {
+            host_id: v.host_id,
+            source_agent_id: v.source_agent_id,
+            up_to_seq: v.up_to_seq,
+            target,
+            title: v.title,
+            initial_prompt: v.initial_prompt,
         }
     }
 }
@@ -4031,6 +4092,16 @@ impl OrbitMobileCore {
             req.to_before_seq,
             req.restore_files,
         )
+    }
+
+    pub fn fork_agent_request(
+        &self,
+        req: FfiForkAgentRequest,
+    ) -> Result<FfiForkAgentResult, FfiOrbitError> {
+        self.inner
+            .fork_agent_blocking(req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
     }
 
     pub fn read_workspace_file_request(

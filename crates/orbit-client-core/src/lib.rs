@@ -842,6 +842,21 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
                 let _ = store.upsert_agent(agent, None);
             }
         }
+        WireMessage::AgentForked {
+            agent, workspace, ..
+        } => {
+            if let Some(ws) = workspace {
+                let _ = store.upsert_workspace(ws);
+                if !host_id.is_empty() {
+                    let _ = store.upsert_single_replica_workspace(host_id, ws);
+                }
+            }
+            if !host_id.is_empty() {
+                let _ = store.upsert_single_replica_agent(host_id, agent);
+            } else {
+                let _ = store.upsert_agent(agent, None);
+            }
+        }
         WireMessage::AgentDeleted { agent_id } => {
             if !host_id.is_empty() {
                 let _ = store.delete_replica_agent(host_id, agent_id);

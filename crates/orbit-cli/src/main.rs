@@ -36,8 +36,8 @@ use uuid::Uuid;
 use crate::orchestration_cli::{
     AgentAction, CliBehavior, CliEffort, ConfigAction, HeartbeatAction, HostAction, PermitAction,
     ProfileAction, ScheduleAction, ScriptAction, SkillAction, TerminalAction, WorkspaceAction,
-    cmd_agent, cmd_config, cmd_heartbeat, cmd_host, cmd_inspect, cmd_permit, cmd_profile,
-    cmd_schedule, cmd_script, cmd_simple_agent_op, cmd_skill, cmd_terminal, cmd_wait,
+    cmd_agent, cmd_config, cmd_fork_agent, cmd_heartbeat, cmd_host, cmd_inspect, cmd_permit,
+    cmd_profile, cmd_schedule, cmd_script, cmd_simple_agent_op, cmd_skill, cmd_terminal, cmd_wait,
     cmd_workspace, resolve_server_url,
 };
 use crate::service::{
@@ -400,7 +400,24 @@ enum Commands {
     /// Read timeline history of an agent from an Orbit Daemon.
     Logs { agent_id: String },
 
-    /// Agent conversation utilities (`orbit agent export <agent_id>`).
+    /// Fork/branch an existing agent conversation in the same directory or into a new git worktree.
+    Fork {
+        agent_id: String,
+        #[arg(long = "at-seq")]
+        at_seq: Option<u64>,
+        #[arg(long)]
+        worktree: bool,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long = "base-ref")]
+        base_ref: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+    },
+
+    /// Agent conversation & lifecycle utilities (`orbit agent export|fork ...`).
     Agent {
         #[command(subcommand)]
         action: AgentAction,
@@ -1461,8 +1478,23 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
+        Commands::Fork {
+            agent_id,
+            at_seq,
+            worktree,
+            branch,
+            base_ref,
+            title,
+            prompt,
+        } => {
+            cmd_fork_agent(
+                &server, via_relay, json_mode, agent_id, at_seq, worktree, branch, base_ref, title,
+                prompt,
+            )
+            .await?;
+        }
         Commands::Agent { action } => {
-            cmd_agent(&server, via_relay, action).await?;
+            cmd_agent(&server, via_relay, json_mode, action).await?;
         }
         Commands::Workspace { action } => {
             cmd_workspace(&server, via_relay, json_mode, action).await?;

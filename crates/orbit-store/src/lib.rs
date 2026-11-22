@@ -19,7 +19,7 @@ use orbit_protocol::{
     ReasoningEffort, SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail,
     ToolCallStatus, WorkspaceClusterSuggestion, WorkspaceSetupStatus, WorkspaceSummary,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const WORKSPACE_SELECT_COLS: &str =
@@ -32,7 +32,17 @@ pub(crate) const AGENT_SELECT_COLS: &str =
     status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
     parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
     attention_state, last_activity_at, timeline_epoch, read_seq, is_pinned, pinned_order,
-    handle, cluster_suggestion_json, task_summary";
+    handle, cluster_suggestion_json, task_summary, forked_from_agent_id, forked_at_seq";
+
+/// Atomic result of [`OrbitStore::clone_timeline_events_up_to`], computed inside the same
+/// `IMMEDIATE` transaction as the copy so callers avoid TOCTOU races.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClonedTimelineOutcome {
+    pub new_latest_seq: u64,
+    pub copied_count: usize,
+    pub cloned_full_tail: bool,
+    pub effective_source_seq: Option<u64>,
+}
 
 /// Extra host configuration metadata persisted alongside `StoredHostProfile`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -386,6 +396,20 @@ impl OrbitStore {
             ",
         )?;
         search::migrate_fts5_schema(&mut conn)?;
+        // Idempotent provenance column migrations (NO `PRAGMA user_version` bump)
+        for (table, col, col_type) in [
+            ("agents", "forked_from_agent_id", "TEXT"),
+            ("agents", "forked_at_seq", "INTEGER"),
+            ("client_replica_agents", "forked_from_agent_id", "TEXT"),
+            ("client_replica_agents", "forked_at_seq", "INTEGER"),
+        ] {
+            if !table_has_column(&conn, table, col)? {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {col} {col_type}"),
+                    [],
+                )?;
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -485,6 +509,12 @@ impl OrbitStore {
             .map(serde_json::to_string)
             .transpose()?;
 
+        let forked_at_seq_i64 = agent
+            .forked_at_seq
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::InvalidArgument("forked_at_seq exceeds i64".into()))?;
+
         conn.execute(
             "
             INSERT INTO agents (
@@ -492,9 +522,10 @@ impl OrbitStore {
                 mode_json, status_json, parent_agent_id, parent_host_id, persistence_ref,
                 latest_seq, timeline_epoch, created_at, updated_at, archived_at, background, auto_archive,
                 profile_id, labels_json, attention_state, last_activity_at,
-                read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json, task_summary
+                read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json, task_summary,
+                forked_from_agent_id, forked_at_seq
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
             ON CONFLICT(agent_id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 title = excluded.title,
@@ -520,7 +551,9 @@ impl OrbitStore {
                 pinned_order = excluded.pinned_order,
                 handle = COALESCE(excluded.handle, agents.handle),
                 cluster_suggestion_json = excluded.cluster_suggestion_json,
-                task_summary = COALESCE(excluded.task_summary, agents.task_summary)
+                task_summary = COALESCE(excluded.task_summary, agents.task_summary),
+                forked_from_agent_id = COALESCE(excluded.forked_from_agent_id, agents.forked_from_agent_id),
+                forked_at_seq = COALESCE(excluded.forked_at_seq, agents.forked_at_seq)
             ",
             params![
                 agent.agent_id,
@@ -552,6 +585,8 @@ impl OrbitStore {
                 agent.handle,
                 cluster_suggestion_json,
                 agent.task_summary,
+                agent.forked_from_agent_id,
+                forked_at_seq_i64,
             ],
         )?;
         Ok(())
@@ -1690,10 +1725,18 @@ impl OrbitStore {
         )?;
         for ag in agents {
             let json = serde_json::to_string(ag)?;
+            let forked_at_i64 = ag.forked_at_seq.and_then(|s| i64::try_from(s).ok());
             tx.execute(
-                "INSERT INTO client_replica_agents (host_id, agent_id, payload_json)
-                 VALUES (?1, ?2, ?3)",
-                params![host_id, ag.agent_id, json],
+                "INSERT INTO client_replica_agents (
+                    host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    host_id,
+                    ag.agent_id,
+                    json,
+                    ag.forked_from_agent_id,
+                    forked_at_i64
+                ],
             )?;
         }
         tx.commit()?;
@@ -1707,11 +1750,22 @@ impl OrbitStore {
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let json = serde_json::to_string(ag)?;
+        let forked_at_i64 = ag.forked_at_seq.and_then(|s| i64::try_from(s).ok());
         conn.execute(
-            "INSERT INTO client_replica_agents (host_id, agent_id, payload_json)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(host_id, agent_id) DO UPDATE SET payload_json = excluded.payload_json",
-            params![host_id, ag.agent_id, json],
+            "INSERT INTO client_replica_agents (
+                host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(host_id, agent_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                forked_from_agent_id = excluded.forked_from_agent_id,
+                forked_at_seq = excluded.forked_at_seq",
+            params![
+                host_id,
+                ag.agent_id,
+                json,
+                ag.forked_from_agent_id,
+                forked_at_i64
+            ],
         )?;
         Ok(())
     }
@@ -2026,6 +2080,215 @@ impl OrbitStore {
             events: remaining,
             restored_prompt,
         }))
+    }
+
+    /// Result returned by [`OrbitStore::clone_timeline_events_up_to`].
+    ///
+    /// Computed atomically inside the same `IMMEDIATE` transaction as the copy so callers
+    /// never suffer a TOCTOU race deciding whether the full tail was cloned.
+    pub fn clone_timeline_events_up_to(
+        &self,
+        source_agent_id: &str,
+        target_agent_id: &str,
+        up_to_seq: Option<u64>,
+    ) -> Result<ClonedTimelineOutcome, StoreError> {
+        if source_agent_id == target_agent_id {
+            return Err(StoreError::InvalidArgument(
+                "source_agent_id and target_agent_id must be distinct".into(),
+            ));
+        }
+        let upper_i64 = up_to_seq
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::InvalidArgument("up_to_seq exceeds i64".into()))?;
+
+        struct RawClonedRow {
+            seq: u64,
+            epoch: u32,
+            turn_id: Option<String>,
+            timestamp: String,
+            payload: TimelinePayload,
+        }
+
+        let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let source_max_seq_i64: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM timeline_events WHERE agent_id = ?1",
+            params![source_agent_id],
+            |r| r.get(0),
+        )?;
+        let source_max_seq = u64::try_from(source_max_seq_i64).unwrap_or(0);
+        let cloned_full_tail = up_to_seq.is_none_or(|u| u >= source_max_seq);
+
+        let raw_rows: Vec<RawClonedRow> = {
+            let mut stmt = tx.prepare(
+                "SELECT seq, epoch, turn_id, timestamp, payload_json
+                 FROM timeline_events
+                 WHERE agent_id = ?1 AND (?2 IS NULL OR seq <= ?2)
+                 ORDER BY seq ASC",
+            )?;
+            let mapped = stmt.query_map(params![source_agent_id, upper_i64], |row| {
+                let seq_i64: i64 = row.get(0)?;
+                let epoch: u32 = row.get(1)?;
+                let turn_id: Option<String> = row.get(2)?;
+                let timestamp: String = row.get(3)?;
+                let payload_json: String = row.get(4)?;
+                Ok((seq_i64, epoch, turn_id, timestamp, payload_json))
+            })?;
+            let mut out = Vec::new();
+            for item in mapped {
+                let (seq_i64, epoch, turn_id, timestamp, payload_json) = item?;
+                let payload: TimelinePayload = serde_json::from_str(&payload_json)?;
+                out.push(RawClonedRow {
+                    seq: u64::try_from(seq_i64).unwrap_or(0),
+                    epoch,
+                    turn_id,
+                    timestamp,
+                    payload,
+                });
+            }
+            out
+        };
+
+        let effective_source_seq = raw_rows.last().map(|r| r.seq).filter(|&s| s > 0);
+
+        // Scan the selected prefix to normalize unfinished in-flight states cleanly:
+        // - Unresolved PermissionRequest / QuestionRequest rows are stripped.
+        // - ToolCall rows still Running at the end of the prefix are settled as Failed with
+        //   `background_task: None` so forked agents never hijack parent background tasks.
+        // - Streaming AssistantMessage rows are finalized (`streaming: false`) so they render
+        //   cleanly and are indexed in FTS5.
+        // - Trailing transient StatusChanged rows (Running/Initializing/AwaitingPermission/
+        //   AutonomousWakeup) are dropped.
+        let mut resolved_perm_ids = std::collections::HashSet::<String>::new();
+        let mut resolved_question_ids = std::collections::HashSet::<String>::new();
+        let mut final_tool_status = std::collections::HashMap::<String, ToolCallStatus>::new();
+        for r in &raw_rows {
+            match &r.payload {
+                TimelinePayload::PermissionResolved { request_id, .. } => {
+                    resolved_perm_ids.insert(request_id.clone());
+                }
+                TimelinePayload::QuestionResolved { request_id, .. } => {
+                    resolved_question_ids.insert(request_id.clone());
+                }
+                TimelinePayload::ToolCall {
+                    call_id, status, ..
+                } => {
+                    final_tool_status.insert(call_id.clone(), *status);
+                }
+                _ => {}
+            }
+        }
+
+        let mut normalized: Vec<RawClonedRow> = Vec::with_capacity(raw_rows.len());
+        for mut r in raw_rows {
+            match &mut r.payload {
+                TimelinePayload::PermissionRequest { request_id, .. }
+                    if !resolved_perm_ids.contains(request_id) =>
+                {
+                    continue;
+                }
+                TimelinePayload::QuestionRequest { request_id, .. }
+                    if !resolved_question_ids.contains(request_id) =>
+                {
+                    continue;
+                }
+                TimelinePayload::ToolCall {
+                    call_id,
+                    status,
+                    background_task,
+                    ..
+                } => {
+                    if *status == ToolCallStatus::Running
+                        && final_tool_status.get(call_id) == Some(&ToolCallStatus::Running)
+                    {
+                        *status = ToolCallStatus::Failed;
+                        *background_task = None;
+                    }
+                }
+                TimelinePayload::AssistantMessage { streaming, .. } if *streaming => {
+                    *streaming = false;
+                }
+                _ => {}
+            }
+            normalized.push(r);
+        }
+
+        while let Some(last) = normalized.last() {
+            let is_transient_status = matches!(
+                &last.payload,
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::Running { .. }
+                        | AgentStatus::Initializing
+                        | AgentStatus::AwaitingPermission { .. }
+                        | AgentStatus::AutonomousWakeup { .. }
+                }
+            );
+            if is_transient_status {
+                normalized.pop();
+            } else {
+                break;
+            }
+        }
+
+        let mut new_latest_seq_i64: i64 = 0;
+        let mut copied_count: usize = 0;
+
+        for row in normalized {
+            let payload_json = serde_json::to_string(&row.payload)?;
+            let eff_type = payload_event_type(&row.payload);
+            let eff_ckey = crate::coalesce_key(&row.payload);
+
+            {
+                let mut ins_stmt = tx.prepare_cached(
+                    "INSERT INTO timeline_events (
+                        epoch, agent_id, turn_id, timestamp, payload_json, event_type, coalesce_key
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?;
+                ins_stmt.execute(params![
+                    row.epoch,
+                    target_agent_id,
+                    row.turn_id,
+                    row.timestamp,
+                    payload_json,
+                    eff_type,
+                    eff_ckey.as_deref(),
+                ])?;
+            }
+            let new_seq_i64 = tx.last_insert_rowid();
+            search::sync_daemon_fts_upsert(&tx, new_seq_i64, target_agent_id, &row.payload)?;
+            new_latest_seq_i64 = new_seq_i64;
+            copied_count += 1;
+        }
+
+        let effective_source_seq_i64 = effective_source_seq
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::InvalidArgument("effective_source_seq exceeds i64".into()))?;
+        let now_str = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE agents
+             SET latest_seq = MAX(latest_seq, ?1),
+                 read_seq = MAX(read_seq, ?1),
+                 forked_at_seq = ?2,
+                 updated_at = ?3
+             WHERE agent_id = ?4",
+            params![
+                new_latest_seq_i64,
+                effective_source_seq_i64,
+                now_str,
+                target_agent_id
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(ClonedTimelineOutcome {
+            new_latest_seq: u64::try_from(new_latest_seq_i64).unwrap_or(0),
+            copied_count,
+            cloned_full_tail,
+            effective_source_seq,
+        })
     }
 
     pub fn get_persistence_ref(&self, agent_id: &str) -> Result<Option<String>, StoreError> {
@@ -2615,6 +2878,19 @@ pub(crate) fn map_workspace_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Wor
     })
 }
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummary> {
     let provider_str: String = row.get(4)?;
     let mode_str: String = row.get(6)?;
@@ -2637,6 +2913,12 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
     let handle: Option<String> = row.get(25).unwrap_or(None);
     let cluster_suggestion_opt: Option<String> = row.get(26).unwrap_or(None);
     let task_summary: Option<String> = row.get(27).unwrap_or(None);
+    let forked_from_agent_id: Option<String> = row.get(28).unwrap_or(None);
+    let forked_at_seq: Option<u64> = row
+        .get::<_, Option<i64>>(29)
+        .unwrap_or(None)
+        .filter(|&v| v >= 0)
+        .map(|v| v as u64);
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
@@ -2681,6 +2963,8 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         handle,
         cluster_suggestion,
         task_summary,
+        forked_from_agent_id,
+        forked_at_seq,
     })
 }
 
@@ -2824,6 +3108,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                 },
                 Some("session_abc"),
             )
@@ -2932,6 +3218,8 @@ mod tests {
             handle: None,
             cluster_suggestion: None,
             task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
         };
         store.upsert_agent(&parent, Some("ref_p")).expect("parent");
 
@@ -3139,6 +3427,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                 },
                 Some("prov_sess_1"),
             )
@@ -3301,6 +3591,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                 },
                 None,
             )
@@ -3395,6 +3687,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                 },
                 None,
             )
@@ -3619,6 +3913,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                 },
                 None,
             )
@@ -3766,6 +4062,8 @@ mod tests {
                     handle: None,
                     cluster_suggestion: None,
                     task_summary: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                 },
                 Some("sess_bg"),
             )
@@ -3928,6 +4226,8 @@ mod tests {
                     handle: None,
                     task_summary: None,
                     cluster_suggestion: None,
+                    forked_from_agent_id: None,
+                    forked_at_seq: None,
                     labels: Default::default(),
                     latest_seq: 0,
                     timeline_epoch: 0,
@@ -4040,5 +4340,444 @@ mod tests {
             &recent[1].payload,
             TimelinePayload::AssistantMessage { item_id, .. } if item_id == "opencode_msg_turn_acp_extra_99"
         ));
+    }
+
+    #[test]
+    fn clone_timeline_events_up_to_truncates_strictly_and_syncs_fts5() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_fk".into(),
+                title: "fork".into(),
+                cwd: "/tmp/fork".into(),
+                git_branch: Some("main".into()),
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let mk_ag = |id: &str, from: Option<&str>, at_seq: Option<u64>| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_fk".into(),
+            cwd: "/tmp/fork".into(),
+            title: format!("Title {id}"),
+            provider: ProviderKind::ClaudeCode,
+            model: Some("sonnet".into()),
+            effort: Some(ReasoningEffort::High),
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: from.map(ToOwned::to_owned),
+            forked_at_seq: at_seq,
+        };
+
+        store
+            .upsert_agent(&mk_ag("ag_src", None, None), Some("sess_src"))
+            .expect("src");
+
+        let e1 = store
+            .append_timeline_event(
+                "ag_src",
+                1,
+                Some("t1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "m1".into(),
+                    text: "AlphaTurnOneToken design question".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e1");
+        let e2 = store
+            .append_timeline_event(
+                "ag_src",
+                1,
+                Some("t1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a1".into(),
+                    text: "AlphaReplyOneToken detailed answer".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e2");
+        let _e3 = store
+            .append_timeline_event(
+                "ag_src",
+                1,
+                Some("t2"),
+                TimelinePayload::UserPrompt {
+                    message_id: "m2".into(),
+                    text: "SecretPostForkTurnTwoToken should never appear in prefix fork".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("e3");
+        let _e4 = store
+            .append_timeline_event(
+                "ag_src",
+                1,
+                Some("t2"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "a2".into(),
+                    text: "SecretPostForkReplyTwoToken also excluded".into(),
+                    streaming: false,
+                },
+            )
+            .expect("e4");
+
+        // 1. Mid-thread prefix fork strictly up to e2.seq
+        store
+            .upsert_agent(&mk_ag("ag_mid", Some("ag_src"), Some(e2.seq)), None)
+            .expect("mid");
+        let mid_res = store
+            .clone_timeline_events_up_to("ag_src", "ag_mid", Some(e2.seq))
+            .expect("clone mid");
+        assert_eq!(mid_res.copied_count, 2);
+        assert!(!mid_res.cloned_full_tail);
+        assert_eq!(mid_res.effective_source_seq, Some(e2.seq));
+        assert!(mid_res.new_latest_seq > e2.seq);
+        let mid_latest = mid_res.new_latest_seq;
+
+        let mid_agent = store.get_agent("ag_mid").expect("get").expect("exists");
+        assert_eq!(mid_agent.forked_from_agent_id.as_deref(), Some("ag_src"));
+        assert_eq!(mid_agent.forked_at_seq, Some(e2.seq));
+        assert_eq!(mid_agent.latest_seq, mid_latest);
+        assert_eq!(mid_agent.read_seq, mid_latest);
+
+        let (mid_events, has_more) = store.fetch_timeline_since("ag_mid", 0, 50).expect("fetch");
+        assert!(!has_more);
+        assert_eq!(mid_events.len(), 2);
+        assert!(mid_events[0].seq < mid_events[1].seq);
+        assert_eq!(mid_events[1].seq, mid_latest);
+        assert!(matches!(
+            &mid_events[0].payload,
+            TimelinePayload::UserPrompt { text, .. } if text.contains("AlphaTurnOneToken")
+        ));
+        assert!(matches!(
+            &mid_events[1].payload,
+            TimelinePayload::AssistantMessage { text, .. } if text.contains("AlphaReplyOneToken")
+        ));
+
+        // FTS5 sync: prefix tokens searchable on ag_mid, post-fork tokens strictly NOT in ag_mid
+        let alpha_hits = store
+            .search_daemon_messages("AlphaReplyOneToken", 20)
+            .expect("fts alpha");
+        assert!(alpha_hits.iter().any(|h| h.agent_id == "ag_src"));
+        assert!(alpha_hits.iter().any(|h| h.agent_id == "ag_mid"));
+
+        let post_hits = store
+            .search_daemon_messages("SecretPostForkTurnTwoToken", 20)
+            .expect("fts post");
+        assert!(post_hits.iter().any(|h| h.agent_id == "ag_src"));
+        assert!(!post_hits.iter().any(|h| h.agent_id == "ag_mid"));
+
+        // 2. Full fork (up_to_seq = None) copies all 4 events in exact order
+        store
+            .upsert_agent(&mk_ag("ag_full", Some("ag_src"), None), None)
+            .expect("full");
+        let full_res = store
+            .clone_timeline_events_up_to("ag_src", "ag_full", None)
+            .expect("clone full");
+        assert_eq!(full_res.copied_count, 4);
+        assert!(full_res.cloned_full_tail);
+        assert_eq!(full_res.effective_source_seq, Some(_e4.seq));
+        assert!(full_res.new_latest_seq > mid_latest);
+        let (full_events, _) = store.fetch_timeline_since("ag_full", 0, 50).expect("fetch");
+        assert_eq!(full_events.len(), 4);
+        for w in full_events.windows(2) {
+            assert!(w[0].seq < w[1].seq);
+        }
+
+        // Self-clone rejected cleanly
+        assert!(
+            store
+                .clone_timeline_events_up_to("ag_src", "ag_src", Some(e1.seq))
+                .is_err()
+        );
+
+        // Replica provenance roundtrip & column persistence
+        store
+            .upsert_single_replica_agent("host_1", &mid_agent)
+            .expect("replica upsert");
+        let rep = store.list_replica_agents("host_1").expect("replica list");
+        assert_eq!(rep.len(), 1);
+        assert_eq!(rep[0].forked_from_agent_id.as_deref(), Some("ag_src"));
+        assert_eq!(rep[0].forked_at_seq, Some(e2.seq));
+    }
+
+    #[test]
+    fn clone_timeline_events_up_to_normalizes_inflight_events_and_tracks_full_tail() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_norm".into(),
+                title: "norm".into(),
+                cwd: "/tmp/norm".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let mk_ag = |id: &str| AgentSummary {
+            agent_id: id.into(),
+            workspace_id: "ws_norm".into(),
+            cwd: "/tmp/norm".into(),
+            title: id.into(),
+            provider: ProviderKind::ClaudeCode,
+            model: None,
+            effort: None,
+            mode: SessionMode::Default,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+        };
+        store
+            .upsert_agent(&mk_ag("ag_live_src"), None)
+            .expect("src");
+        store
+            .upsert_agent(&mk_ag("ag_live_fork"), None)
+            .expect("fork");
+
+        // 1. UserPrompt
+        store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::UserPrompt {
+                    message_id: "u1".into(),
+                    text: "Run dev server and edit".into(),
+                    badges: Vec::new(),
+                },
+            )
+            .expect("prompt");
+        // 2. Open Running background ToolCall
+        store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::ToolCall {
+                    call_id: "call_bg_1".into(),
+                    status: ToolCallStatus::Running,
+                    detail: orbit_protocol::ToolCallDetail::Shell {
+                        command: "npm run dev".into(),
+                        cwd: None,
+                        exit_code: None,
+                        output_preview: None,
+                    },
+                    background_task: Some(orbit_protocol::BackgroundTaskInfo {
+                        task_id: Some("bg_99".into()),
+                        label: Some("dev server".into()),
+                        log_path: None,
+                    }),
+                },
+            )
+            .expect("bg tool");
+        // 3. Unresolved PermissionRequest
+        store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::PermissionRequest {
+                    request_id: "perm_open_1".into(),
+                    title: "Run rm -rf".into(),
+                    detail: orbit_protocol::ToolCallDetail::Generic {
+                        tool_name: "Bash".into(),
+                        arguments_json: "{\"command\":\"rm -rf\"}".into(),
+                    },
+                    allowed_decisions: vec!["allow".into(), "deny".into()],
+                },
+            )
+            .expect("perm req");
+        // 4. Streaming AssistantMessage (not yet finalized!)
+        store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "msg_stream_1".into(),
+                    text: "StreamingPartialTokenUnique42 in progress reply".into(),
+                    streaming: true,
+                },
+            )
+            .expect("streaming reply");
+        // 5. Trailing transient StatusChanged::Running
+        let last_ev = store
+            .append_timeline_event(
+                "ag_live_src",
+                1,
+                Some("t1"),
+                TimelinePayload::StatusChanged {
+                    status: AgentStatus::Running {
+                        turn_id: "t1".into(),
+                    },
+                },
+            )
+            .expect("running status");
+
+        // Oversized up_to_seq still reports cloned_full_tail = true and clamps effective_source_seq
+        let outcome = store
+            .clone_timeline_events_up_to("ag_live_src", "ag_live_fork", Some(last_ev.seq + 500))
+            .expect("clone inflight");
+        assert!(outcome.cloned_full_tail);
+        assert_eq!(outcome.effective_source_seq, Some(last_ev.seq));
+        // Unresolved PermissionRequest + trailing StatusChanged::Running were stripped -> 3 rows remain
+        assert_eq!(outcome.copied_count, 3);
+
+        let (events, _) = store
+            .fetch_timeline_since("ag_live_fork", 0, 50)
+            .expect("fetch normalized");
+        assert_eq!(events.len(), 3);
+
+        // Running background ToolCall was rewritten to Failed with background_task cleared
+        assert!(matches!(
+            &events[1].payload,
+            TimelinePayload::ToolCall {
+                call_id,
+                status: ToolCallStatus::Failed,
+                background_task: None,
+                ..
+            } if call_id == "call_bg_1"
+        ));
+        assert!(
+            store
+                .list_running_background_tool_calls("ag_live_fork")
+                .expect("bg list")
+                .is_empty(),
+            "forked agent must not inherit running background tool calls"
+        );
+
+        // Streaming reply was finalized (`streaming: false`) and indexed in FTS5!
+        assert!(matches!(
+            &events[2].payload,
+            TimelinePayload::AssistantMessage {
+                item_id,
+                streaming: false,
+                ..
+            } if item_id == "msg_stream_1"
+        ));
+        let fts_hits = store
+            .search_daemon_messages("StreamingPartialTokenUnique42", 10)
+            .expect("fts search finalized stream");
+        assert!(
+            fts_hits.iter().any(|h| h.agent_id == "ag_live_fork"),
+            "finalized streaming reply must be indexed in FTS5 for forked agent"
+        );
+
+        // Target agent's forked_at_seq was clamped to actual source max seq inside the transaction
+        let forked_ag = store
+            .get_agent("ag_live_fork")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(forked_ag.forked_at_seq, Some(last_ev.seq));
+    }
+
+    #[test]
+    fn idempotent_fork_column_migration_preserves_user_version() {
+        let dir = std::env::temp_dir().join(format!(
+            "orbit_store_fork_mig_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db_path = dir.join("orbit.db");
+
+        // Open once (applies all migrations), verify user_version is unchanged (6)
+        let store1 = OrbitStore::open(&db_path).expect("open 1");
+        let ver1: i64 = {
+            let conn = store1.conn.lock().expect("lock");
+            assert!(table_has_column(&conn, "agents", "forked_from_agent_id").expect("col"));
+            assert!(table_has_column(&conn, "agents", "forked_at_seq").expect("col"));
+            assert!(
+                table_has_column(&conn, "client_replica_agents", "forked_from_agent_id")
+                    .expect("col")
+            );
+            assert!(
+                table_has_column(&conn, "client_replica_agents", "forked_at_seq").expect("col")
+            );
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .expect("ver")
+        };
+        drop(store1);
+
+        // Re-open existing DB -> idempotent migration succeeds cleanly without bumping user_version
+        let store2 = OrbitStore::open(&db_path).expect("open 2");
+        let ver2: i64 = store2
+            .conn
+            .lock()
+            .expect("lock")
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("ver");
+        assert_eq!(ver1, ver2);
+        drop(store2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

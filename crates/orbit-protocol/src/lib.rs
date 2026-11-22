@@ -540,6 +540,26 @@ pub struct AgentSummary {
     /// Concise 1-line AI-generated (or user-edited) summary of what this conversation is currently doing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_summary: Option<String>,
+    /// Optional source agent ID when this conversation was branched/forked from another thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from_agent_id: Option<String>,
+    /// Optional source timeline sequence number at which this conversation forked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_at_seq: Option<u64>,
+}
+
+/// Destination workspace strategy when forking/branching an existing conversation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ForkTarget {
+    #[default]
+    SameDirectory,
+    NewWorktree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_ref: Option<String>,
+    },
 }
 
 /// Active detached PTY terminal summary.
@@ -989,6 +1009,25 @@ pub enum WireMessage {
     AgentCreated {
         request_id: Uuid,
         agent: AgentSummary,
+    },
+    /// Fork/branch an existing conversation into a new session (same directory or fresh git worktree).
+    ForkAgent {
+        request_id: Uuid,
+        source_agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        up_to_seq: Option<u64>,
+        #[serde(default)]
+        target: ForkTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_prompt: Option<String>,
+    },
+    AgentForked {
+        request_id: Uuid,
+        agent: AgentSummary,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<WorkspaceSummary>,
     },
     AgentUpdated {
         agent: AgentSummary,
@@ -2049,6 +2088,8 @@ mod tests {
                 handle: Some("lead".into()),
                 cluster_suggestion: None,
                 task_summary: None,
+                forked_from_agent_id: None,
+                forked_at_seq: None,
             },
             to_before_seq: 42,
             events: Vec::new(),
@@ -2123,5 +2164,164 @@ mod tests {
             assert_eq!(parsed, expected);
         }
         assert_eq!(ProviderKind::MistralVibe.fallback_binaries(), &["vibe"]);
+    }
+
+    #[test]
+    fn fork_agent_wire_roundtrip_and_legacy_compat() {
+        let req_id = Uuid::new_v4();
+        let req = WireMessage::ForkAgent {
+            request_id: req_id,
+            source_agent_id: "ag_source".into(),
+            up_to_seq: Some(15),
+            target: ForkTarget::NewWorktree {
+                branch: Some("orbit/fork-exp".into()),
+                base_ref: Some("main".into()),
+            },
+            title: Some("Experiment".into()),
+            initial_prompt: Some("Try approach B".into()),
+        };
+        let encoded = req.encode_zstd(3).expect("encode fork request");
+        match WireMessage::decode_zstd(&encoded).expect("decode fork request") {
+            WireMessage::ForkAgent {
+                request_id,
+                source_agent_id,
+                up_to_seq,
+                target,
+                title,
+                initial_prompt,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(source_agent_id, "ag_source");
+                assert_eq!(up_to_seq, Some(15));
+                assert_eq!(
+                    target,
+                    ForkTarget::NewWorktree {
+                        branch: Some("orbit/fork-exp".into()),
+                        base_ref: Some("main".into()),
+                    }
+                );
+                assert_eq!(title.as_deref(), Some("Experiment"));
+                assert_eq!(initial_prompt.as_deref(), Some("Try approach B"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Minimal legacy-style JSON without optional fields defaults to SameDirectory
+        let minimal_json = serde_json::json!({
+            "op": "fork_agent",
+            "request_id": req_id,
+            "source_agent_id": "ag_source"
+        });
+        match serde_json::from_value::<WireMessage>(minimal_json).expect("deserialize minimal fork")
+        {
+            WireMessage::ForkAgent {
+                up_to_seq,
+                target,
+                title,
+                initial_prompt,
+                ..
+            } => {
+                assert!(up_to_seq.is_none());
+                assert_eq!(target, ForkTarget::SameDirectory);
+                assert!(title.is_none());
+                assert!(initial_prompt.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let now = Utc::now();
+        let reply = WireMessage::AgentForked {
+            request_id: req_id,
+            agent: AgentSummary {
+                agent_id: "ag_forked".into(),
+                workspace_id: "ws_wt".into(),
+                cwd: "/tmp/wt".into(),
+                title: "Experiment".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: Some("sonnet".into()),
+                effort: Some(ReasoningEffort::High),
+                mode: SessionMode::AcceptEdits,
+                status: AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 15,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 15,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: Some("fork".into()),
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: Some("ag_source".into()),
+                forked_at_seq: Some(15),
+            },
+            workspace: Some(WorkspaceSummary {
+                workspace_id: "ws_wt".into(),
+                title: "Experiment".into(),
+                cwd: "/tmp/wt".into(),
+                git_branch: Some("orbit/fork-exp".into()),
+                is_worktree: true,
+                updated_at: now,
+                source_cwd: Some("/tmp/repo".into()),
+                base_ref: Some("main".into()),
+                parent_workspace_id: Some("ws_1".into()),
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: Some("/tmp/repo".into()),
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            }),
+        };
+        let encoded_reply = reply.encode_zstd(3).expect("encode fork reply");
+        match WireMessage::decode_zstd(&encoded_reply).expect("decode fork reply") {
+            WireMessage::AgentForked {
+                request_id,
+                agent,
+                workspace,
+            } => {
+                assert_eq!(request_id, req_id);
+                assert_eq!(agent.agent_id, "ag_forked");
+                assert_eq!(agent.forked_from_agent_id.as_deref(), Some("ag_source"));
+                assert_eq!(agent.forked_at_seq, Some(15));
+                assert_eq!(
+                    workspace.as_ref().map(|w| w.workspace_id.as_str()),
+                    Some("ws_wt")
+                );
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // Legacy AgentSummary JSON without fork provenance fields deserializes cleanly
+        let legacy_agent = serde_json::json!({
+            "agent_id": "ag_old",
+            "workspace_id": "ws_1",
+            "cwd": "/tmp/demo",
+            "title": "Old",
+            "provider": "codex",
+            "model": null,
+            "mode": "default",
+            "status": { "state": "idle" },
+            "parent_agent_id": null,
+            "latest_seq": 3,
+            "created_at": now,
+            "updated_at": now
+        });
+        let parsed: AgentSummary = serde_json::from_value(legacy_agent).expect("legacy agent");
+        assert!(parsed.forked_from_agent_id.is_none());
+        assert!(parsed.forked_at_seq.is_none());
     }
 }

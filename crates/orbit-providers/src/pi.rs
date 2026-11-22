@@ -148,6 +148,11 @@ fn build_pi_spawn_spec(cfg: &SessionLaunchConfig, include_resume: bool) -> ShimS
 }
 
 pub async fn spawn_pi_session(cfg: SessionLaunchConfig) -> Result<ProviderSessionHandle, String> {
+    if cfg.native_fork_only {
+        return Err(
+            "pi does not support native session fork; deferring to handoff on first prompt".into(),
+        );
+    }
     let reattached = if cfg.reattach_existing_shim {
         connect_existing_shim_after(&cfg.shim_socket, cfg.shim_after_seq).await
     } else {
@@ -1619,6 +1624,8 @@ mod tests {
             effort: Some(ReasoningEffort::High),
             mode: SessionMode::AcceptEdits,
             resume_session_id: None,
+            fork_from_session_id: None,
+            native_fork_only: false,
             mcp_spec: None,
             system_prompt_append: None,
             extra_env: HashMap::new(),

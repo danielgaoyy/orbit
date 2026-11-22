@@ -534,6 +534,16 @@ export const OmniComposer = memo(function OmniComposer({
     setMenuHighlightIdx(0);
 
     switch (cmd.id) {
+      case "fork":
+        if (!isDraft && hasCurrentAgent && selectedHostId && selectedAgentId) {
+          const nextText = stripped ? `/fork ${stripped}` : "/fork ";
+          orbitActions.setComposerDraft(nextText);
+          setCursorOffset(nextText.length);
+        } else {
+          orbitActions.showToast("Start an active session first to fork");
+          return;
+        }
+        break;
       case "btw":
         orbitActions.openSideQuestionTab();
         return;

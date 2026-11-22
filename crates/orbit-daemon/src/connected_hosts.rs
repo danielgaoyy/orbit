@@ -525,6 +525,7 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::WorkspaceFilesResponse { request_id, .. }
         | WireMessage::AgentsSnapshot { request_id, .. }
         | WireMessage::AgentCreated { request_id, .. }
+        | WireMessage::AgentForked { request_id, .. }
         | WireMessage::PendingPermissionsSnapshot { request_id, .. }
         | WireMessage::Ack { request_id }
         | WireMessage::TimelineCatchup { request_id, .. }
@@ -957,5 +958,49 @@ mod tests {
             compare_semver_triplet("0.8.0-rc.1", "0.7.9"),
             std::cmp::Ordering::Greater
         );
+    }
+
+    #[test]
+    fn extract_response_request_id_recognizes_agent_forked() {
+        let req_id = Uuid::new_v4();
+        let now = Utc::now();
+        let msg = WireMessage::AgentForked {
+            request_id: req_id,
+            agent: orbit_protocol::AgentSummary {
+                agent_id: "ag_fork".into(),
+                workspace_id: "ws_1".into(),
+                cwd: "/tmp/repo".into(),
+                title: "Forked".into(),
+                provider: orbit_protocol::ProviderKind::ClaudeCode,
+                model: None,
+                effort: None,
+                mode: orbit_protocol::SessionMode::Default,
+                status: orbit_protocol::AgentStatus::Idle,
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 2,
+                timeline_epoch: 0,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: orbit_protocol::AttentionState::None,
+                last_activity_at: Some(now),
+                queued_prompts: Vec::new(),
+                read_seq: 2,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                forked_from_agent_id: Some("ag_src".into()),
+                forked_at_seq: Some(2),
+            },
+            workspace: None,
+        };
+        assert_eq!(extract_response_request_id(&msg), Some(req_id));
     }
 }

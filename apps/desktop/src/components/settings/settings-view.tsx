@@ -9,6 +9,7 @@ import {
   Cpu,
   Keyboard,
   Palette,
+  Plug,
   Plus,
   Settings2,
   Wifi,
@@ -19,6 +20,7 @@ import { AppearanceSection } from "@/components/settings/appearance-section";
 import { ArchivedSection } from "@/components/settings/archived-section";
 import { CloudSyncSection } from "@/components/settings/cloud-sync-section";
 import { GeneralSection } from "@/components/settings/general-section";
+import { HostAcpSection } from "@/components/settings/host-acp-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
 import { HostConnectionSection } from "@/components/settings/host-connection-section";
 import { HostUsageSection } from "@/components/settings/host-usage-section";
@@ -70,6 +72,7 @@ const HOST_TABS: {
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   { id: "agents", label: "Agents", icon: Cpu },
+  { id: "acp", label: "ACP Agents", icon: Plug },
   { id: "usage", label: "Usage", icon: Activity },
   { id: "connection", label: "Connection", icon: Wifi },
 ];
@@ -82,7 +85,7 @@ function parseHostSection(
   if (lastColon <= 5) return null;
   const hostId = section.slice(5, lastColon);
   const tab = section.slice(lastColon + 1) as HostSettingsTab;
-  if (tab !== "agents" && tab !== "usage" && tab !== "connection") return null;
+  if (tab !== "agents" && tab !== "acp" && tab !== "usage" && tab !== "connection") return null;
   return { hostId, tab };
 }
 
@@ -480,6 +483,9 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
             {parsedHost && !resolvedHost && <AddHostSection />}
             {resolvedHost?.tab === "agents" && (
               <HostAgentsSection hostId={resolvedHost.hostId} />
+            )}
+            {resolvedHost?.tab === "acp" && (
+              <HostAcpSection key={resolvedHost.hostId} hostId={resolvedHost.hostId} />
             )}
             {resolvedHost?.tab === "usage" && (
               <HostUsageSection hostId={resolvedHost.hostId} />

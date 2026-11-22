@@ -14,13 +14,14 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_crypto::PairingOffer;
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary, AttentionState,
-    BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot,
-    HostProjectEntry, HostSyncState, KeepAwakeStatus, ModelOption, OrchestrationConfig,
-    OrchestrationSkillInfo, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge,
-    ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor,
-    ProviderSubagentEvent, QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord,
-    ScheduleSpec, ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
+    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
+    AgentProfile, AgentStatus, AgentSummary, AttentionState, BackgroundTaskInfo,
+    ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot, HostProjectEntry,
+    HostSyncState, KeepAwakeStatus, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
+    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
+    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
+    QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
     TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
     WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
     WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
@@ -227,6 +228,8 @@ pub struct AgentCardView {
     pub forked_from_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_at_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent_id: Option<String>,
 }
 
 pub struct CreateAgentRequest<'a> {
@@ -234,6 +237,7 @@ pub struct CreateAgentRequest<'a> {
     pub cwd: &'a str,
     pub extra_dirs: Vec<String>,
     pub provider: ProviderKind,
+    pub acp_agent_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<ReasoningEffort>,
     pub fast_mode: Option<bool>,
@@ -292,6 +296,8 @@ pub struct HostDetailView {
     pub workspace_organize_status: HashMap<String, WorkspaceOrganizeEvent>,
     #[serde(default)]
     pub host_sync_state: HostSyncState,
+    #[serde(default)]
+    pub acp_agents: Vec<AcpAgentAvailability>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +553,11 @@ struct HostMemoryState {
     pending_upgrade_terminals: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<String, String>>>,
     pending_git_repo_inspections:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
+    pending_acp_probes: HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AcpProbeResult, String>>>,
+    pending_acp_snapshots: HashMap<
+        Uuid,
+        tokio::sync::oneshot::Sender<Result<crate::contract::AcpRegistryRefreshView, String>>,
+    >,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -592,6 +603,7 @@ struct HostMemoryState {
     pending_permissions: Vec<PendingPermissionSummary>,
     provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
     provider_subagent_timelines: HashMap<(String, String), Vec<ProviderSubagentEvent>>,
+    acp_agents: Vec<AcpAgentAvailability>,
 }
 
 impl HostMemoryState {
@@ -630,6 +642,8 @@ impl HostMemoryState {
             pending_daemon_upgrades: HashMap::new(),
             pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
+            pending_acp_probes: HashMap::new(),
+            pending_acp_snapshots: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -675,6 +689,7 @@ impl HostMemoryState {
             pending_permissions: Vec::new(),
             provider_subagents: HashMap::new(),
             provider_subagent_timelines: HashMap::new(),
+            acp_agents: Vec::new(),
         }
     }
 
@@ -1254,6 +1269,7 @@ impl OrbitAppCore {
             workspace_events: state.workspace_events.clone(),
             workspace_organize_status: state.workspace_organize_status.clone(),
             host_sync_state: state.host_sync_state.clone(),
+            acp_agents: state.acp_agents.clone(),
         })
     }
 
@@ -2347,6 +2363,7 @@ impl OrbitAppCore {
             cwd: &req.cwd,
             extra_dirs: req.extra_dirs,
             provider: req.provider,
+            acp_agent_id: req.acp_agent_id,
             model: req.model,
             effort: req.effort,
             fast_mode: req.fast_mode,
@@ -3337,6 +3354,11 @@ impl OrbitAppCore {
                     })
                     .await;
                 let _ = handle
+                    .send_wire(WireMessage::ListAcpAgents {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListSchedules {
                         request_id: Uuid::new_v4(),
                         include_completed: true,
@@ -3944,6 +3966,37 @@ impl OrbitAppCore {
                     }
                     notify_host = true;
                 }
+                WireMessage::AcpAgentsSnapshot {
+                    request_id,
+                    agents,
+                    warning,
+                } => {
+                    let has_installed = agents.iter().any(|a| a.installed && a.spec.enabled);
+                    if has_installed && !state.available_providers.contains(&ProviderKind::Acp) {
+                        state.available_providers.push(ProviderKind::Acp);
+                        notify_fleet = true;
+                    } else if !has_installed
+                        && state.available_providers.contains(&ProviderKind::Acp)
+                    {
+                        state
+                            .available_providers
+                            .retain(|p| *p != ProviderKind::Acp);
+                        notify_fleet = true;
+                    }
+                    state.acp_agents = agents.clone();
+                    if let Some(tx) = state.pending_acp_snapshots.remove(&request_id) {
+                        let _ = tx.send(Ok(crate::contract::AcpRegistryRefreshView {
+                            agents,
+                            warning,
+                        }));
+                    }
+                    notify_host = true;
+                }
+                WireMessage::AcpAgentProbeResult { request_id, result } => {
+                    if let Some(tx) = state.pending_acp_probes.remove(&request_id) {
+                        let _ = tx.send(Ok(result));
+                    }
+                }
                 WireMessage::SchedulesSnapshot { schedules, .. } => {
                     state.schedules = schedules;
                     notify_host = true;
@@ -4468,6 +4521,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_git_repo_inspections.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_acp_probes.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_acp_snapshots.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -5022,6 +5083,12 @@ impl OrbitAppCore {
         );
         self.dispatch_wire(
             host_id,
+            WireMessage::ListAcpAgents {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
             WireMessage::ListSchedules {
                 request_id: Uuid::new_v4(),
                 include_completed: true,
@@ -5101,6 +5168,7 @@ impl OrbitAppCore {
             cwd,
             extra_dirs: Vec::new(),
             provider,
+            acp_agent_id: None,
             model: None,
             effort: None,
             fast_mode: None,
@@ -5133,6 +5201,7 @@ impl OrbitAppCore {
             cwd,
             extra_dirs,
             provider,
+            acp_agent_id: None,
             model,
             effort: None,
             fast_mode: None,
@@ -5169,6 +5238,10 @@ impl OrbitAppCore {
         let opt_id = format!("opt_{req_id}");
         let now = Utc::now();
         let clean_model = req.model.filter(|m| !m.trim().is_empty());
+        let clean_acp_agent_id = req
+            .acp_agent_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
         let clean_handle = req
             .handle
             .map(|h| h.trim().trim_start_matches('@').to_string())
@@ -5237,6 +5310,7 @@ impl OrbitAppCore {
                 task_summary: None,
                 forked_from_agent_id: None,
                 forked_at_seq: None,
+                acp_agent_id: clean_acp_agent_id.clone(),
                 timeline_epoch: 0,
                 created_at: now,
                 updated_at: now,
@@ -5306,6 +5380,7 @@ impl OrbitAppCore {
                 branch: clean_branch.filter(|b| *b != "auto").map(ToOwned::to_owned),
                 handle: clean_handle,
                 auto_cluster: req.auto_cluster,
+                acp_agent_id: clean_acp_agent_id,
             },
         );
 
@@ -5748,7 +5823,7 @@ impl OrbitAppCore {
         agent_id: &str,
         provider: ProviderKind,
     ) {
-        self.switch_agent_provider_with_config(host_id, agent_id, provider, None, None);
+        self.switch_agent_provider_with_config(host_id, agent_id, provider, None, None, None);
     }
 
     pub fn switch_agent_provider_with_config(
@@ -5758,9 +5833,17 @@ impl OrbitAppCore {
         provider: ProviderKind,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        acp_agent_id: Option<String>,
     ) {
         let req_id = Uuid::new_v4();
         let clean_model = model.filter(|m| !m.trim().is_empty());
+        let clean_acp_id = if provider == ProviderKind::Acp {
+            acp_agent_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
@@ -5768,6 +5851,7 @@ impl OrbitAppCore {
                 ag.provider = provider;
                 ag.model = clean_model.clone();
                 ag.effort = effort;
+                ag.acp_agent_id = clean_acp_id.clone();
             }
             h.mark_stage_meta_dirty(agent_id);
             if !agent_id.starts_with("opt_") {
@@ -5783,6 +5867,7 @@ impl OrbitAppCore {
                     provider,
                     model: clean_model,
                     effort,
+                    acp_agent_id: clean_acp_id,
                 },
             );
         }
@@ -6425,6 +6510,7 @@ impl OrbitAppCore {
                 cwd: &req.cwd,
                 extra_dirs: req.extra_dirs,
                 provider: req.provider,
+                acp_agent_id: req.acp_agent_id,
                 model: req.model,
                 effort: req.effort,
                 fast_mode: req.fast_mode,
@@ -6643,6 +6729,265 @@ impl OrbitAppCore {
             revision,
             host_id: host_id.to_string(),
         });
+    }
+
+    // --- Universal ACP Agent Registry & Live Probing ---
+
+    pub fn list_acp_agents(&self, host_id: &str) -> Vec<AcpAgentAvailability> {
+        self.hosts
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(host_id).map(|h| h.acp_agents.clone()))
+            .unwrap_or_default()
+    }
+
+    pub fn refresh_acp_agents(self: &Arc<Self>, host_id: &str) {
+        self.dispatch_wire_queued(
+            host_id,
+            WireMessage::ListAcpAgents {
+                request_id: Uuid::new_v4(),
+            },
+        );
+    }
+
+    async fn send_acp_snapshot_rpc(
+        self: &Arc<Self>,
+        host_id: &str,
+        make_msg: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        timeout_secs: u64,
+    ) -> Result<crate::contract::AcpRegistryRefreshView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_acp_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(make_msg(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_acp_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send ACP RPC: {e}")));
+                return;
+            }
+            let outcome =
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), ack_rx).await {
+                    Ok(Ok(Ok(view))) => Ok(view),
+                    Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                    Ok(Err(_)) => Err("Host disconnected while updating ACP registry".to_string()),
+                    Err(_) => {
+                        if let Ok(mut guard) = core.hosts.write()
+                            && let Some(h) = guard.get_mut(&owned_host)
+                        {
+                            h.pending_acp_snapshots.remove(&req_id);
+                        }
+                        Err("Timed out waiting for daemon ACP registry response".to_string())
+                    }
+                };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "ACP registry task cancelled".to_string())?
+    }
+
+    pub async fn upsert_custom_acp_agent_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        spec: AcpAgentSpec,
+    ) -> Result<Vec<AcpAgentAvailability>, String> {
+        self.send_acp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::UpsertCustomAcpAgent { request_id, spec },
+            10,
+        )
+        .await
+        .map(|v| v.agents)
+    }
+
+    pub fn upsert_custom_acp_agent_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        spec: AcpAgentSpec,
+    ) -> Result<Vec<AcpAgentAvailability>, String> {
+        self.runtime
+            .block_on(self.upsert_custom_acp_agent_async(host_id, spec))
+    }
+
+    pub async fn delete_custom_acp_agent_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<AcpAgentAvailability>, String> {
+        let owned_id = agent_id.to_string();
+        self.send_acp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::DeleteCustomAcpAgent {
+                request_id,
+                agent_id: owned_id,
+            },
+            10,
+        )
+        .await
+        .map(|v| v.agents)
+    }
+
+    pub fn delete_custom_acp_agent_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<Vec<AcpAgentAvailability>, String> {
+        self.runtime
+            .block_on(self.delete_custom_acp_agent_async(host_id, agent_id))
+    }
+
+    pub async fn refresh_acp_registry_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        registry_url: Option<String>,
+    ) -> Result<crate::contract::AcpRegistryRefreshView, String> {
+        self.send_acp_snapshot_rpc(
+            host_id,
+            move |request_id| WireMessage::RefreshAcpRegistry {
+                request_id,
+                registry_url,
+            },
+            20,
+        )
+        .await
+    }
+
+    pub fn refresh_acp_registry_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        registry_url: Option<String>,
+    ) -> Result<crate::contract::AcpRegistryRefreshView, String> {
+        self.runtime
+            .block_on(self.refresh_acp_registry_async(host_id, registry_url))
+    }
+
+    pub async fn test_acp_agent_async(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        cwd: Option<String>,
+    ) -> Result<AcpProbeResult, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected".into());
+        };
+
+        let core = Arc::clone(self);
+        let owned_host = host_id.to_string();
+        let owned_id = agent_id.to_string();
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let reg_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&owned_host) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_acp_probes.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected".to_string()),
+                    None => Some(format!("host `{owned_host}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = reg_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::TestAcpAgent {
+                    request_id: req_id,
+                    agent_id: owned_id,
+                    cwd,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&owned_host)
+                {
+                    h.pending_acp_probes.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send TestAcpAgent: {e}")));
+                return;
+            }
+            let outcome = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(Ok(res))) => Ok(res),
+                Ok(Ok(Err(rpc_err))) => Err(rpc_err),
+                Ok(Err(_)) => Err("Host disconnected while probing ACP agent".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&owned_host)
+                    {
+                        h.pending_acp_probes.remove(&req_id);
+                    }
+                    Err("Timed out waiting for ACP handshake probe".to_string())
+                }
+            };
+            let _ = res_tx.send(outcome);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "ACP probe task cancelled".to_string())?
+    }
+
+    pub fn test_acp_agent_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        agent_id: &str,
+        cwd: Option<String>,
+    ) -> Result<AcpProbeResult, String> {
+        self.runtime
+            .block_on(self.test_acp_agent_async(host_id, agent_id, cwd))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9194,6 +9539,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_git_repo_inspections.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_acp_probes.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_acp_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
     for (req_id, tx) in h.pending_side_questions.drain() {
         let _ = tx.send(SideQuestionStreamEvent::Done {
             request_id: req_id.to_string(),
@@ -10396,13 +10747,20 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         && (a.attention != AttentionState::None
             || (a.latest_seq > 0 && a.latest_seq > effective_seen_seq));
     let worktree_branch = a.labels.get("orbit.worktree_branch").cloned();
+    let provider_label = if a.provider == ProviderKind::Acp {
+        a.acp_agent_id
+            .clone()
+            .unwrap_or_else(|| a.provider.display_name().to_string())
+    } else {
+        a.provider.display_name().to_string()
+    };
     AgentCardView {
         agent_id: a.agent_id.clone(),
         workspace_id: a.workspace_id.clone(),
         cwd: a.cwd.clone(),
         title: a.title.clone(),
         provider: a.provider,
-        provider_label: a.provider.display_name().to_string(),
+        provider_label,
         model: a.model.clone(),
         effort: a.effort,
         fast_mode: a.fast_mode,
@@ -10433,6 +10791,7 @@ fn agent_to_card_view(a: &AgentSummary, pref: Option<&ClientThreadPref>) -> Agen
         task_summary: a.task_summary.clone(),
         forked_from_agent_id: a.forked_from_agent_id.clone(),
         forked_at_seq: a.forked_at_seq,
+        acp_agent_id: a.acp_agent_id.clone(),
     }
 }
 
@@ -10888,6 +11247,7 @@ mod tests {
             cwd: "/Users/jess/Code/orbit",
             extra_dirs: Vec::new(),
             provider: ProviderKind::ClaudeCode,
+            acp_agent_id: None,
             model: Some("claude-opus-5-5".into()),
             effort: Some(ReasoningEffort::High),
             fast_mode: None,
@@ -11175,6 +11535,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -11292,6 +11653,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -11439,6 +11801,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -11617,6 +11980,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 2,
                     created_at: now,
                     updated_at: now,
@@ -11722,6 +12086,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -11770,6 +12135,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 0,
                     created_at: now,
                     updated_at: now,
@@ -11811,6 +12177,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     created_at: now,
                     updated_at: now,
@@ -11997,6 +12364,7 @@ mod tests {
                 task_summary: None,
                 forked_from_agent_id: None,
                 forked_at_seq: None,
+                acp_agent_id: None,
                 timeline_epoch: 1,
                 created_at: now,
                 updated_at: now,
@@ -12172,6 +12540,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: None,
@@ -12226,6 +12595,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     timeline_epoch: 1,
                     archived_at: None,
                     parent_agent_id: Some("ag_parent".into()),
@@ -12323,6 +12693,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
 
         let pref = ClientThreadPref {
@@ -12551,6 +12922,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                 },
             );
             hosts.insert("h_seen".into(), mem);
@@ -12635,6 +13007,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
         {
             let mut hosts = core.hosts.write().expect("hosts");
@@ -12744,6 +13117,7 @@ mod tests {
                         task_summary: None,
                         forked_from_agent_id: None,
                         forked_at_seq: None,
+                        acp_agent_id: None,
                     },
                 );
             }
@@ -13134,6 +13508,7 @@ mod tests {
                 task_summary: None,
                 forked_from_agent_id: None,
                 forked_at_seq: None,
+                acp_agent_id: None,
                 queued_prompts: Vec::new(),
             },
         );
@@ -13342,6 +13717,7 @@ mod tests {
                 task_summary: None,
                 forked_from_agent_id: None,
                 forked_at_seq: None,
+                acp_agent_id: None,
                 queued_prompts: Vec::new(),
             },
         );
@@ -13393,6 +13769,7 @@ mod tests {
                 task_summary: None,
                 forked_from_agent_id: None,
                 forked_at_seq: None,
+                acp_agent_id: None,
                 queued_prompts: Vec::new(),
             },
         );
@@ -13641,6 +14018,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: Some("ag_parent_origin".into()),
             forked_at_seq: Some(8),
+            acp_agent_id: None,
         };
 
         core.handle_inbound_wire(
@@ -13734,6 +14112,7 @@ mod tests {
             cwd: "/repo",
             extra_dirs: Vec::new(),
             provider: ProviderKind::ClaudeCode,
+            acp_agent_id: None,
             model: Some("claude-opus-4-6".into()),
             effort: Some(ReasoningEffort::High),
             fast_mode: Some(false),

@@ -163,7 +163,10 @@ export function SharedConversationMenu({
     hostDetail?.host.available_providers.length
       ? hostDetail.host.available_providers
       : [agent.provider];
-  const altProvider = availableProviders.find((p) => p !== agent.provider) ?? agent.provider;
+  const directProviders = availableProviders.filter((p) => p !== "acp");
+  const altProvider =
+    directProviders.find((p) => p !== agent.provider) ??
+    (agent.provider !== "acp" ? agent.provider : (directProviders[0] ?? "claude_code"));
   const tabLabel = semanticAgentTabLabel(agent);
 
   return (

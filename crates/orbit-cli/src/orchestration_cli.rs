@@ -1203,6 +1203,7 @@ pub async fn cmd_schedule(
                 cwd,
                 workspace_id: None,
                 provider: provider.into(),
+                acp_agent_id: None,
                 model,
                 effort: None,
                 fast_mode: false,
@@ -1579,6 +1580,7 @@ pub async fn cmd_profile(
                 }),
                 name,
                 provider: ProviderKind::from(provider),
+                acp_agent_id: None,
                 model,
                 effort: effort.map(Into::into),
                 fast_mode: fast,
@@ -2270,6 +2272,7 @@ mod fork_rpc_tests {
                 task_summary: None,
                 forked_from_agent_id: Some("ag_src".into()),
                 forked_at_seq: Some(1),
+                acp_agent_id: None,
             },
             workspace: None,
         };

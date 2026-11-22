@@ -4,8 +4,8 @@
 //! - HarmonyOS N-API (`crates/orbit-ffi-ohos`)
 
 use orbit_protocol::{
-    ForkTarget, NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort, SessionMode,
-    WorkspaceSummary,
+    AcpAgentAvailability, ForkTarget, NestedGitRepo, PromptBadge, ProviderKind, ReasoningEffort,
+    SessionMode, WorkspaceSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +18,13 @@ pub use crate::export::{
 use crate::sidebar::{SidebarProjectSort, SidebarThreadFilter};
 
 pub const CLIENT_BRIDGE_PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpRegistryRefreshView {
+    pub agents: Vec<AcpAgentAvailability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgeInfoView {
@@ -59,6 +66,8 @@ pub struct CreateSessionRequest {
     #[serde(default)]
     pub extra_dirs: Vec<String>,
     pub provider: ProviderKind,
+    #[serde(default)]
+    pub acp_agent_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -209,6 +218,8 @@ pub struct SpawnWorkspacePeerRequest {
     #[serde(default)]
     pub extra_dirs: Vec<String>,
     pub provider: ProviderKind,
+    #[serde(default)]
+    pub acp_agent_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]

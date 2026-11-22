@@ -243,6 +243,7 @@ async fn execute_tool_inner(
                             branch: opt_str(args, "branch"),
                             handle: opt_str(args, "handle"),
                             auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
+                            acp_agent_id: opt_str(args, "acp_agent_id"),
                         },
                         Duration::from_secs(30),
                     )
@@ -302,6 +303,7 @@ async fn execute_tool_inner(
                             .map(|n| n as u32),
                         handle: opt_str(args, "handle"),
                         auto_cluster: args.get("auto_cluster").and_then(|v| v.as_bool()),
+                        acp_agent_id: opt_str(args, "acp_agent_id"),
                     })
                     .await;
                 match res {
@@ -1015,6 +1017,7 @@ async fn execute_tool_inner(
                 cwd,
                 workspace_id: opt_str(args, "workspace_id"),
                 provider,
+                acp_agent_id: opt_str(args, "acp_agent_id"),
                 model,
                 effort,
                 fast_mode: args
@@ -1621,6 +1624,7 @@ async fn execute_tool_inner(
                     pr_number: None,
                     handle,
                     auto_cluster: Some(false),
+                    acp_agent_id: opt_str(args, "acp_agent_id"),
                 })
                 .await?;
             if notify_on_finish && let Some(cid) = caller_agent_id {
@@ -1920,7 +1924,8 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`) or `provider/model` pair." },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`, `acp`) or `provider/model` pair." },
+                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
                     "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
@@ -2242,7 +2247,8 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                     "prompt": { "type": "string" },
                     "cwd": { "type": "string" },
                     "workspace_id": { "type": "string" },
-                    "provider": { "type": "string" },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `acp`)." },
+                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
                     "model": { "type": "string" },
                     "effort": { "type": "string" },
                     "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },
@@ -2488,7 +2494,8 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "handle": { "type": "string", "description": "Short peer handle (e.g. `reviewer`, `backend`, `tester`)." },
-                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`) or `provider/model`." },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`, `acp`) or `provider/model`." },
+                    "acp_agent_id": { "type": "string", "description": "ACP agent ID from the host ACP registry (required when `provider` is `acp`)." },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
                     "fast_mode": { "type": "boolean", "description": "Enable Fast output mode (lower latency, higher quota usage) when supported by the model." },

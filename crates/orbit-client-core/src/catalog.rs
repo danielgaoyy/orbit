@@ -711,6 +711,12 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                 ),
             ],
         },
+        ProviderKind::Acp => ProviderModelCatalog {
+            provider: ProviderKind::Acp,
+            configured_default_model: None,
+            configured_default_effort: None,
+            models: Vec::new(),
+        },
     }
 }
 
@@ -1215,7 +1221,12 @@ mod tests {
         assert_eq!(defaults[0].provider, ProviderKind::ClaudeCode);
         assert_eq!(defaults[1].provider, ProviderKind::Codex);
         assert_eq!(defaults[2].provider, ProviderKind::Antigravity);
-        assert!(defaults.iter().all(|c| !c.models.is_empty()));
+        assert!(
+            defaults
+                .iter()
+                .filter(|c| c.provider != ProviderKind::Acp)
+                .all(|c| !c.models.is_empty())
+        );
         assert_eq!(
             defaults[1].configured_default_model.as_deref(),
             Some("gpt-6.2-sol")

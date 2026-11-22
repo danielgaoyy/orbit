@@ -60,7 +60,8 @@ use orbit_client_core::stage::{
 };
 use orbit_client_core::{HostConnectionState, HostRouteMode};
 use orbit_protocol::{
-    AgentMessageKind, AttentionState, DirectoryEntry, DiscoveredProject, ForkTarget, NestedGitRepo,
+    AcpAgentAvailability, AcpAgentSource, AcpAgentSpec, AcpProbeResult, AgentMessageKind,
+    AttentionState, DirectoryEntry, DiscoveredProject, ForkTarget, NestedGitRepo,
     PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
     ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
     ProviderSubagentStatus, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
@@ -213,6 +214,7 @@ pub enum FfiProviderKind {
     Cline,
     MistralVibe,
     Augment,
+    Acp,
 }
 
 impl From<ProviderKind> for FfiProviderKind {
@@ -231,6 +233,7 @@ impl From<ProviderKind> for FfiProviderKind {
             ProviderKind::Cline => Self::Cline,
             ProviderKind::MistralVibe => Self::MistralVibe,
             ProviderKind::Augment => Self::Augment,
+            ProviderKind::Acp => Self::Acp,
         }
     }
 }
@@ -251,6 +254,131 @@ impl From<FfiProviderKind> for ProviderKind {
             FfiProviderKind::Cline => Self::Cline,
             FfiProviderKind::MistralVibe => Self::MistralVibe,
             FfiProviderKind::Augment => Self::Augment,
+            FfiProviderKind::Acp => Self::Acp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiAcpAgentSource {
+    BuiltinCatalog,
+    RemoteRegistry,
+    Custom,
+}
+
+impl From<AcpAgentSource> for FfiAcpAgentSource {
+    fn from(v: AcpAgentSource) -> Self {
+        match v {
+            AcpAgentSource::BuiltinCatalog => Self::BuiltinCatalog,
+            AcpAgentSource::RemoteRegistry => Self::RemoteRegistry,
+            AcpAgentSource::Custom => Self::Custom,
+        }
+    }
+}
+
+impl From<FfiAcpAgentSource> for AcpAgentSource {
+    fn from(v: FfiAcpAgentSource) -> Self {
+        match v {
+            FfiAcpAgentSource::BuiltinCatalog => Self::BuiltinCatalog,
+            FfiAcpAgentSource::RemoteRegistry => Self::RemoteRegistry,
+            FfiAcpAgentSource::Custom => Self::Custom,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcpAgentSpec {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub install_hint: Option<String>,
+    pub homepage: Option<String>,
+    pub version: Option<String>,
+    pub source: FfiAcpAgentSource,
+    pub enabled: bool,
+}
+
+impl From<AcpAgentSpec> for FfiAcpAgentSpec {
+    fn from(v: AcpAgentSpec) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            description: v.description,
+            command: v.command,
+            args: v.args,
+            env: v.env,
+            install_hint: v.install_hint,
+            homepage: v.homepage,
+            version: v.version,
+            source: v.source.into(),
+            enabled: v.enabled,
+        }
+    }
+}
+
+impl From<FfiAcpAgentSpec> for AcpAgentSpec {
+    fn from(v: FfiAcpAgentSpec) -> Self {
+        Self {
+            id: v.id,
+            name: v.name,
+            description: v.description,
+            command: v.command,
+            args: v.args,
+            env: v.env,
+            install_hint: v.install_hint,
+            homepage: v.homepage,
+            version: v.version,
+            source: v.source.into(),
+            enabled: v.enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcpAgentAvailability {
+    pub spec: FfiAcpAgentSpec,
+    pub installed: bool,
+    pub resolved_path: Option<String>,
+}
+
+impl From<AcpAgentAvailability> for FfiAcpAgentAvailability {
+    fn from(v: AcpAgentAvailability) -> Self {
+        Self {
+            spec: v.spec.into(),
+            installed: v.installed,
+            resolved_path: v.resolved_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcpProbeResult {
+    pub agent_id: String,
+    pub ok: bool,
+    pub protocol_version: Option<String>,
+    pub server_name: Option<String>,
+    pub server_version: Option<String>,
+    pub capabilities_summary: Vec<String>,
+    pub auth_methods: Vec<String>,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+impl From<AcpProbeResult> for FfiAcpProbeResult {
+    fn from(v: AcpProbeResult) -> Self {
+        Self {
+            agent_id: v.agent_id,
+            ok: v.ok,
+            protocol_version: v.protocol_version,
+            server_name: v.server_name,
+            server_version: v.server_version,
+            capabilities_summary: v.capabilities_summary,
+            auth_methods: v.auth_methods,
+            latency_ms: v.latency_ms,
+            error: v.error,
         }
     }
 }
@@ -1225,6 +1353,7 @@ pub struct FfiAgentCard {
     pub task_summary: Option<String>,
     pub forked_from_agent_id: Option<String>,
     pub forked_at_seq: Option<u64>,
+    pub acp_agent_id: Option<String>,
     pub attention_label: Option<String>,
     pub latest_seq: u64,
     pub updated_at_rfc3339: String,
@@ -1267,6 +1396,7 @@ impl From<AgentCardView> for FfiAgentCard {
             task_summary: v.task_summary,
             forked_from_agent_id: v.forked_from_agent_id,
             forked_at_seq: v.forked_at_seq,
+            acp_agent_id: v.acp_agent_id,
             attention_label,
             latest_seq: v.latest_seq,
             updated_at_rfc3339: v.updated_at_rfc3339,
@@ -1341,6 +1471,7 @@ pub struct FfiHostDetail {
     pub workspace_boards: HashMap<String, FfiWorkspaceBoardSnapshot>,
     pub workspace_events: HashMap<String, Vec<FfiWorkspaceEvent>>,
     pub workspace_organize_status: HashMap<String, FfiWorkspaceOrganizeStatus>,
+    pub acp_agents: Vec<FfiAcpAgentAvailability>,
 }
 
 impl From<HostDetailView> for FfiHostDetail {
@@ -1403,6 +1534,7 @@ impl From<HostDetailView> for FfiHostDetail {
                 .into_iter()
                 .map(|(k, val)| (k, val.into()))
                 .collect(),
+            acp_agents: v.acp_agents.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -3532,11 +3664,18 @@ impl From<ResolvedModelSelectionView> for FfiResolvedModelSelection {
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAcpRegistryRefreshResult {
+    pub agents: Vec<FfiAcpAgentAvailability>,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiCreateSessionRequest {
     pub host_id: String,
     pub cwd: String,
     pub extra_dirs: Vec<String>,
     pub provider: FfiProviderKind,
+    pub acp_agent_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
     pub fast_mode: Option<bool>,
@@ -3554,6 +3693,7 @@ impl From<FfiCreateSessionRequest> for CreateSessionRequest {
             cwd: v.cwd,
             extra_dirs: v.extra_dirs,
             provider: v.provider.into(),
+            acp_agent_id: v.acp_agent_id,
             model: v.model,
             effort: v.effort.map(Into::into),
             fast_mode: v.fast_mode,
@@ -3734,6 +3874,7 @@ pub struct FfiSpawnWorkspacePeerRequest {
     pub cwd: String,
     pub extra_dirs: Vec<String>,
     pub provider: FfiProviderKind,
+    pub acp_agent_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
     pub fast_mode: Option<bool>,
@@ -3752,6 +3893,7 @@ impl From<FfiSpawnWorkspacePeerRequest> for SpawnWorkspacePeerRequest {
             cwd: v.cwd,
             extra_dirs: v.extra_dirs,
             provider: v.provider.into(),
+            acp_agent_id: v.acp_agent_id,
             model: v.model,
             effort: v.effort.map(Into::into),
             fast_mode: v.fast_mode,
@@ -3774,6 +3916,7 @@ pub struct FfiCreateScheduleRequest {
     pub cwd: String,
     pub workspace_id: Option<String>,
     pub provider: FfiProviderKind,
+    pub acp_agent_id: Option<String>,
     pub model: Option<String>,
     pub effort: Option<FfiReasoningEffort>,
     pub fast_mode: bool,
@@ -4440,6 +4583,7 @@ impl OrbitMobileCore {
         cwd: String,
         extra_dirs: Vec<String>,
         provider: FfiProviderKind,
+        acp_agent_id: Option<String>,
         model: Option<String>,
         effort: Option<FfiReasoningEffort>,
         mode: FfiSessionMode,
@@ -4453,6 +4597,7 @@ impl OrbitMobileCore {
             cwd: &cwd,
             extra_dirs,
             provider: provider.into(),
+            acp_agent_id,
             model,
             effort: effort.map(Into::into),
             fast_mode: None,
@@ -4573,6 +4718,7 @@ impl OrbitMobileCore {
         provider: FfiProviderKind,
         model: Option<String>,
         effort: Option<FfiReasoningEffort>,
+        acp_agent_id: Option<String>,
     ) {
         self.inner.switch_agent_provider_with_config(
             &host_id,
@@ -4580,6 +4726,7 @@ impl OrbitMobileCore {
             provider.into(),
             model,
             effort.map(Into::into),
+            acp_agent_id,
         );
     }
 
@@ -5020,6 +5167,68 @@ impl OrbitMobileCore {
             .map(Into::into)
     }
 
+    // --- Universal ACP Agent Registry & Probing ---
+
+    pub fn list_acp_agents(&self, host_id: String) -> Vec<FfiAcpAgentAvailability> {
+        self.inner
+            .list_acp_agents(&host_id)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    pub fn refresh_acp_agents(&self, host_id: String) {
+        self.inner.refresh_acp_agents(&host_id);
+    }
+
+    pub fn upsert_custom_acp_agent(
+        &self,
+        host_id: String,
+        spec: FfiAcpAgentSpec,
+    ) -> Result<Vec<FfiAcpAgentAvailability>, FfiOrbitError> {
+        self.inner
+            .upsert_custom_acp_agent_blocking(&host_id, spec.into())
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn delete_custom_acp_agent(
+        &self,
+        host_id: String,
+        agent_id: String,
+    ) -> Result<Vec<FfiAcpAgentAvailability>, FfiOrbitError> {
+        self.inner
+            .delete_custom_acp_agent_blocking(&host_id, &agent_id)
+            .map(|list| list.into_iter().map(Into::into).collect())
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn test_acp_agent(
+        &self,
+        host_id: String,
+        agent_id: String,
+        cwd: Option<String>,
+    ) -> Result<FfiAcpProbeResult, FfiOrbitError> {
+        self.inner
+            .test_acp_agent_blocking(&host_id, &agent_id, cwd)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn refresh_acp_registry(
+        &self,
+        host_id: String,
+        registry_url: Option<String>,
+    ) -> Result<FfiAcpRegistryRefreshResult, FfiOrbitError> {
+        self.inner
+            .refresh_acp_registry_blocking(&host_id, registry_url)
+            .map(|view| FfiAcpRegistryRefreshResult {
+                agents: view.agents.into_iter().map(Into::into).collect(),
+                warning: view.warning,
+            })
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
     pub fn list_provider_subagents(&self, host_id: String, parent_agent_id: String) {
         self.inner
             .list_provider_subagents(&host_id, &parent_agent_id);
@@ -5053,6 +5262,7 @@ impl OrbitMobileCore {
             cwd: req.cwd,
             workspace_id: req.workspace_id,
             provider: req.provider.into(),
+            acp_agent_id: req.acp_agent_id,
             model: req.model,
             effort: req.effort.map(Into::into),
             fast_mode: req.fast_mode,
@@ -5436,6 +5646,7 @@ mod tests {
             cwd: "/Users/jess/Code/orbit".into(),
             extra_dirs: Vec::new(),
             provider: FfiProviderKind::ClaudeCode,
+            acp_agent_id: None,
             model: None,
             effort: None,
             fast_mode: None,

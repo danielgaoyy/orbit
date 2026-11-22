@@ -286,8 +286,18 @@ impl DaemonRuntime {
             orch_config.clone(),
         );
 
-        let discovered = discover_installed_providers();
-        let available_providers = discovered.into_iter().map(|d| d.kind).collect();
+        let home_for_probe = home_dir.to_path_buf();
+        let available_providers = tokio::task::spawn_blocking(move || {
+            let discovered = discover_installed_providers();
+            let mut providers: Vec<orbit_protocol::ProviderKind> =
+                discovered.into_iter().map(|d| d.kind).collect();
+            if orbit_providers::has_any_installed_acp_agent(&home_for_probe) {
+                providers.push(orbit_protocol::ProviderKind::Acp);
+            }
+            providers
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("provider discovery task failed: {e}"))?;
 
         let host_info = HostInfo {
             host_id,
@@ -1026,6 +1036,13 @@ async fn run_client_session_loop(
                     DaemonBroadcast::KeepAwakeStatusUpdated(status) => {
                         Some(WireMessage::KeepAwakeStatusUpdated { status })
                     }
+                    DaemonBroadcast::AcpAgentsUpdated(agents) => {
+                        Some(WireMessage::AcpAgentsSnapshot {
+                            request_id: Uuid::nil(),
+                            agents,
+                            warning: None,
+                        })
+                    }
                 };
                 if let Some(msg) = maybe_msg
                     && out_tx
@@ -1502,6 +1519,7 @@ async fn handle_wire_rpc(
             branch,
             handle,
             auto_cluster,
+            acp_agent_id,
         } => {
             let mut reserved_key: Option<String> = None;
             if let Some(ref idem) = idempotency_key
@@ -1511,6 +1529,7 @@ async fn handle_wire_rpc(
                     "cwd": cwd,
                     "title": title,
                     "provider": provider,
+                    "acp_agent_id": acp_agent_id,
                     "model": model,
                     "fast_mode": fast_mode,
                     "mode": mode,
@@ -1581,6 +1600,7 @@ async fn handle_wire_rpc(
                     pr_number: None,
                     handle,
                     auto_cluster,
+                    acp_agent_id,
                 })
                 .await
             {
@@ -1886,9 +1906,10 @@ async fn handle_wire_rpc(
             provider,
             model,
             effort,
+            acp_agent_id,
         } => match runtime
             .orchestrator
-            .switch_agent_provider(&agent_id, provider, model, effort)
+            .switch_agent_provider(&agent_id, provider, model, effort, acp_agent_id)
             .await
         {
             Ok(()) => Some(WireMessage::Ack { request_id }),
@@ -2383,6 +2404,132 @@ async fn handle_wire_rpc(
             Ok(()) => Some(WireMessage::Ack { request_id }),
             Err(e) => Some(rpc_err(request_id, "delete_profile_failed", e)),
         },
+
+        // Universal ACP Agent Registry & Live Probing
+        WireMessage::ListAcpAgents { request_id } => {
+            let home = runtime.home_dir.clone();
+            match tokio::task::spawn_blocking(move || orbit_providers::list_acp_agents(&home)).await
+            {
+                Ok(agents) => Some(WireMessage::AcpAgentsSnapshot {
+                    request_id,
+                    agents,
+                    warning: None,
+                }),
+                Err(e) => Some(rpc_err(request_id, "list_acp_agents_failed", e)),
+            }
+        }
+        WireMessage::UpsertCustomAcpAgent { request_id, spec } => {
+            let home = runtime.home_dir.clone();
+            match tokio::task::spawn_blocking(move || {
+                orbit_providers::upsert_custom_acp_agent(&home, spec)?;
+                Ok::<_, String>(orbit_providers::list_acp_agents(&home))
+            })
+            .await
+            {
+                Ok(Ok(agents)) => {
+                    let _ = runtime
+                        .orchestrator
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AcpAgentsUpdated(agents.clone()));
+                    Some(WireMessage::AcpAgentsSnapshot {
+                        request_id,
+                        agents,
+                        warning: None,
+                    })
+                }
+                Ok(Err(e)) => Some(rpc_err(request_id, "upsert_acp_agent_failed", e)),
+                Err(e) => Some(rpc_err(request_id, "upsert_acp_agent_failed", e)),
+            }
+        }
+        WireMessage::DeleteCustomAcpAgent {
+            request_id,
+            agent_id,
+        } => {
+            let home = runtime.home_dir.clone();
+            let id_for_task = agent_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                let removed = orbit_providers::delete_custom_acp_agent(&home, &id_for_task)?;
+                Ok::<_, String>((removed, orbit_providers::list_acp_agents(&home)))
+            })
+            .await
+            {
+                Ok(Ok((true, agents))) => {
+                    let _ = runtime
+                        .orchestrator
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AcpAgentsUpdated(agents.clone()));
+                    Some(WireMessage::AcpAgentsSnapshot {
+                        request_id,
+                        agents,
+                        warning: None,
+                    })
+                }
+                Ok(Ok((false, _))) => Some(rpc_err(
+                    request_id,
+                    "not_found",
+                    format!("custom ACP agent `{agent_id}` not found"),
+                )),
+                Ok(Err(e)) => Some(rpc_err(request_id, "delete_acp_agent_failed", e)),
+                Err(e) => Some(rpc_err(request_id, "delete_acp_agent_failed", e)),
+            }
+        }
+        WireMessage::TestAcpAgent {
+            request_id,
+            agent_id,
+            cwd,
+        } => {
+            let home = runtime.home_dir.clone();
+            let id_clone = agent_id.clone();
+            let spec_opt = tokio::task::spawn_blocking(move || {
+                orbit_providers::get_acp_agent_spec(&home, &id_clone)
+            })
+            .await
+            .ok()
+            .flatten();
+            let result = match spec_opt {
+                Some(spec) => {
+                    let cwd_path = cwd
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(expand_host_path);
+                    orbit_providers::probe_acp_agent(&spec, cwd_path.as_deref()).await
+                }
+                None => orbit_protocol::AcpProbeResult {
+                    agent_id,
+                    ok: false,
+                    protocol_version: None,
+                    server_name: None,
+                    server_version: None,
+                    capabilities_summary: Vec::new(),
+                    auth_methods: Vec::new(),
+                    latency_ms: 0,
+                    error: Some("ACP agent not found in registry on this host".to_string()),
+                },
+            };
+            Some(WireMessage::AcpAgentProbeResult { request_id, result })
+        }
+        WireMessage::RefreshAcpRegistry {
+            request_id,
+            registry_url,
+        } => {
+            match orbit_providers::refresh_acp_registry(&runtime.home_dir, registry_url.as_deref())
+                .await
+            {
+                Ok((agents, warning)) => {
+                    let _ = runtime
+                        .orchestrator
+                        .broadcast_tx
+                        .send(DaemonBroadcast::AcpAgentsUpdated(agents.clone()));
+                    Some(WireMessage::AcpAgentsSnapshot {
+                        request_id,
+                        agents,
+                        warning,
+                    })
+                }
+                Err(e) => Some(rpc_err(request_id, "refresh_acp_registry_failed", e)),
+            }
+        }
 
         // Schedules & Heartbeats
         WireMessage::ListSchedules {

@@ -42,6 +42,9 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
       );
       if (ag?.provider_label) return ag.provider_label;
     }
+    if (s.draftProvider === "acp") {
+      return s.draftAcpAgentId ?? formatProviderLabel("acp");
+    }
     return formatProviderLabel(s.draftProvider);
   });
 

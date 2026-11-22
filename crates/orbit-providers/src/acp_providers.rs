@@ -2637,6 +2637,8 @@ mod tests {
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
         }
     }
 

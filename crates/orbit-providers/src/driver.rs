@@ -75,6 +75,10 @@ pub struct SessionLaunchConfig {
     pub persisted_running_bg_tasks: Vec<PersistedBackgroundTask>,
     /// True when the persisted `AgentStatus` in SQLite was `AutonomousWakeup { source: "waiting:..." }`.
     pub persisted_bg_wait: bool,
+    /// Optional ACP registry agent ID when `provider == ProviderKind::Acp`.
+    pub acp_agent_id: Option<String>,
+    /// Optional pre-resolved `AcpAgentSpec` when `provider == ProviderKind::Acp`.
+    pub acp_spec: Option<orbit_protocol::AcpAgentSpec>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,7 +1,10 @@
 //! First-class native Rust drivers for 13 coding agent CLIs (Antigravity, Codex, Claude Code,
-//! OpenCode, Gemini CLI, Cursor Agent, GitHub Copilot, Goose, Pi, Kimi CLI, Cline, Mistral Vibe, Augment).
+//! OpenCode, Gemini CLI, Cursor Agent, GitHub Copilot, Goose, Pi, Kimi CLI, Cline, Mistral Vibe,
+//! Augment) plus Universal ACP (`acp_generic` + curated 34-agent ACP Registry).
 
+pub mod acp_generic;
 pub mod acp_providers;
+pub mod acp_registry;
 pub mod antigravity;
 pub mod attachments;
 pub mod claude;
@@ -77,6 +80,14 @@ pub(crate) fn build_compact_unified_diff(
     Some(rendered)
 }
 
+pub use acp_registry::{
+    ACP_PROBE_TIMEOUT, DEFAULT_ACP_REGISTRY_URL, MAX_REMOTE_REGISTRY_BYTES, PersistedAcpRegistry,
+    acp_registry_path, builtin_acp_catalog, delete_custom_acp_agent, get_acp_agent_spec,
+    has_any_installed_acp_agent, list_acp_agents, load_persisted_acp_registry, merged_acp_specs,
+    parse_remote_registry_json, probe_acp_agent, refresh_acp_registry, resolve_acp_agent_command,
+    save_persisted_acp_registry, upsert_custom_acp_agent, validate_acp_agent_spec,
+    validate_remote_registry_url,
+};
 pub use driver::{
     DriverCommand, DriverEvent, OrbitMcpLaunchSpec, PersistedBackgroundTask, ProviderSessionHandle,
     SessionLaunchConfig,
@@ -133,10 +144,11 @@ pub struct DiscoveredProvider {
 
 /// Probe `PATH` and standard user bin locations (`~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`)
 /// across Linux workstations, cloud Devboxes, and macOS (Mac mini) for all 13 native providers.
+/// (Generic `ProviderKind::Acp` agents are discovered dynamically via `acp_registry::list_acp_agents`.)
 pub fn discover_installed_providers() -> Vec<DiscoveredProvider> {
     let search_dirs = default_executable_search_dirs();
     let mut found = Vec::new();
-    for &kind in ProviderKind::all() {
+    for &kind in ProviderKind::native_all() {
         if let Some(path) = find_provider_executable_in(kind, &search_dirs) {
             found.push(DiscoveredProvider {
                 kind,
@@ -256,7 +268,7 @@ pub fn find_executable(binary_name: &str) -> Option<PathBuf> {
     find_executable_in_dirs(binary_name, &search_dirs)
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
@@ -292,6 +304,7 @@ pub async fn spawn_provider_session(
         | ProviderKind::Cline
         | ProviderKind::MistralVibe
         | ProviderKind::Augment => acp_providers::spawn_acp_provider_session(cfg).await,
+        ProviderKind::Acp => acp_generic::spawn_acp_session(cfg).await,
     }
 }
 
@@ -345,9 +358,12 @@ pub async fn fallback_all_provider_models() -> Vec<ProviderModelCatalog> {
     let claude = claude::fallback_claude_models();
     let agy = antigravity::fallback_antigravity_models();
     let mut out = vec![claude, codex, agy];
-    for &kind in ProviderKind::all() {
+    for &kind in ProviderKind::native_all() {
         match kind {
-            ProviderKind::ClaudeCode | ProviderKind::Codex | ProviderKind::Antigravity => {}
+            ProviderKind::ClaudeCode
+            | ProviderKind::Codex
+            | ProviderKind::Antigravity
+            | ProviderKind::Acp => {}
             ProviderKind::Pi => out.push(pi::fallback_pi_models()),
             other => out.push(acp_providers::fallback_acp_provider_models(other)),
         }
@@ -371,6 +387,7 @@ pub async fn probe_all_provider_models() -> Vec<ProviderModelCatalog> {
             ProviderKind::Antigravity => agy_path = Some(p.executable_path),
             ProviderKind::Codex => codex_path = Some(p.executable_path),
             ProviderKind::ClaudeCode => claude_path = Some(p.executable_path),
+            ProviderKind::Acp => {}
             other => extra_installed.push(other),
         }
     }
@@ -531,7 +548,7 @@ mod discovery_tests {
         ));
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
-        for &kind in ProviderKind::all() {
+        for &kind in ProviderKind::native_all() {
             let fake_bin = tmp.join(format!("fake_{}", kind.slug()));
             std::fs::write(&fake_bin, "#!/bin/sh\nexit 0\n").expect("write bin");
             std::fs::set_permissions(&fake_bin, std::fs::Permissions::from_mode(0o755))
@@ -546,7 +563,7 @@ mod discovery_tests {
 
         let discovered = discover_installed_providers();
         assert_eq!(discovered.len(), 13);
-        for &kind in ProviderKind::all() {
+        for &kind in ProviderKind::native_all() {
             let found = discovered
                 .iter()
                 .find(|d| d.kind == kind)
@@ -584,7 +601,7 @@ mod discovery_tests {
         };
 
         // Populate default binaries for all 13 providers except MistralVibe (give it fallback `vibe` first)
-        for &kind in ProviderKind::all() {
+        for &kind in ProviderKind::native_all() {
             if kind == ProviderKind::MistralVibe {
                 make_exec(&bin_dir.join("vibe"));
             } else {
@@ -595,7 +612,7 @@ mod discovery_tests {
         let search = vec![bin_dir.clone()];
 
         // 1. Every provider is discovered from PATH, and MistralVibe falls back to `vibe`
-        for &kind in ProviderKind::all() {
+        for &kind in ProviderKind::native_all() {
             let found = resolve_provider_executable_in(kind, None, &search)
                 .expect("should discover provider binary");
             if kind == ProviderKind::MistralVibe {
@@ -613,7 +630,7 @@ mod discovery_tests {
         );
 
         // 3. Env override path takes precedence over PATH for every single provider
-        for &kind in ProviderKind::all() {
+        for &kind in ProviderKind::native_all() {
             let custom = override_dir.join(format!("custom_{}", kind.slug()));
             make_exec(&custom);
             let custom_str = custom.to_string_lossy().to_string();
@@ -630,7 +647,7 @@ mod discovery_tests {
     async fn fallback_all_provider_models_covers_all_13_providers() {
         let catalogs = fallback_all_provider_models().await;
         assert_eq!(catalogs.len(), 13);
-        for &kind in ProviderKind::all() {
+        for &kind in ProviderKind::native_all() {
             let cat = catalogs
                 .iter()
                 .find(|c| c.provider == kind)

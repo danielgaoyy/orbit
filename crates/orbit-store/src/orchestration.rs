@@ -765,8 +765,9 @@ impl OrbitStore {
         conn.execute(
             "INSERT INTO agent_profiles (
                 profile_id, name, provider_json, model, effort_json, mode_json,
-                when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at, fast_mode
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at,
+                fast_mode, acp_agent_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(profile_id) DO UPDATE SET
                 name = excluded.name,
                 provider_json = excluded.provider_json,
@@ -777,7 +778,8 @@ impl OrbitStore {
                 system_prompt_append = excluded.system_prompt_append,
                 mcp_policy_json = excluded.mcp_policy_json,
                 updated_at = excluded.updated_at,
-                fast_mode = excluded.fast_mode",
+                fast_mode = excluded.fast_mode,
+                acp_agent_id = excluded.acp_agent_id",
             params![
                 profile.profile_id,
                 profile.name,
@@ -791,6 +793,7 @@ impl OrbitStore {
                 profile.created_at.to_rfc3339(),
                 profile.updated_at.to_rfc3339(),
                 i32::from(profile.fast_mode),
+                profile.acp_agent_id,
             ],
         )?;
         Ok(())
@@ -800,7 +803,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at, fast_mode
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at,
+                    fast_mode, acp_agent_id
              FROM agent_profiles ORDER BY name COLLATE NOCASE ASC",
         )?;
         let rows = stmt.query_map([], map_profile_row)?;
@@ -811,7 +815,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at, fast_mode
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at,
+                    fast_mode, acp_agent_id
              FROM agent_profiles WHERE profile_id = ?1",
             params![profile_id],
             map_profile_row,
@@ -824,7 +829,8 @@ impl OrbitStore {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         conn.query_row(
             "SELECT profile_id, name, provider_json, model, effort_json, mode_json,
-                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at, fast_mode
+                    when_to_use, system_prompt_append, mcp_policy_json, created_at, updated_at,
+                    fast_mode, acp_agent_id
              FROM agent_profiles WHERE LOWER(name) = LOWER(?1)",
             params![name],
             map_profile_row,
@@ -1356,11 +1362,13 @@ fn map_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentProfile> {
     let created_s: String = row.get(9)?;
     let updated_s: String = row.get(10)?;
     let fast_mode: bool = row.get::<_, i32>(11).unwrap_or(0) != 0;
+    let acp_agent_id: Option<String> = row.get(12).unwrap_or(None);
     Ok(AgentProfile {
         profile_id: row.get(0)?,
         name: row.get(1)?,
         provider: serde_json::from_str(&provider_s)
             .unwrap_or(orbit_protocol::ProviderKind::Antigravity),
+        acp_agent_id,
         model: row.get(3)?,
         effort: effort_opt
             .as_deref()

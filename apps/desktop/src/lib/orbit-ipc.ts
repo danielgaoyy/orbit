@@ -13,7 +13,8 @@ export type ProviderKind =
   | "kimi"
   | "cline"
   | "mistral_vibe"
-  | "augment";
+  | "augment"
+  | "acp";
 
 export interface ProviderMeta {
   readonly id: ProviderKind;
@@ -22,6 +23,7 @@ export interface ProviderMeta {
   readonly bin: string;
 }
 
+/** First-class native coding agent CLIs (generic ACP agents are discovered via HostAcpSection / acp_agents). */
 export const PROVIDER_LIST: readonly ProviderMeta[] = [
   { id: "claude_code", label: "Claude Code", shortLabel: "Claude", bin: "claude" },
   { id: "codex", label: "Codex", shortLabel: "Codex", bin: "codex" },
@@ -38,8 +40,15 @@ export const PROVIDER_LIST: readonly ProviderMeta[] = [
   { id: "augment", label: "Augment", shortLabel: "Augment", bin: "auggie" },
 ] as const;
 
+export const ACP_PROVIDER_META: ProviderMeta = {
+  id: "acp",
+  label: "ACP Agent",
+  shortLabel: "ACP",
+  bin: "acp",
+};
+
 export const PROVIDER_META: Record<ProviderKind, ProviderMeta> = Object.fromEntries(
-  PROVIDER_LIST.map((p) => [p.id, p]),
+  [...PROVIDER_LIST, ACP_PROVIDER_META].map((p) => [p.id, p]),
 ) as Record<ProviderKind, ProviderMeta>;
 
 export function formatProviderLabel(provider: ProviderKind | string): string {
@@ -54,6 +63,45 @@ export function formatProviderShortLabel(provider: ProviderKind | string): strin
     return PROVIDER_META[provider as ProviderKind].shortLabel;
   }
   return provider.replace(/_/g, " ");
+}
+
+export type AcpAgentSource = "builtin_catalog" | "remote_registry" | "custom";
+
+export interface AcpAgentSpec {
+  id: string;
+  name: string;
+  description: string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  install_hint?: string | null;
+  homepage?: string | null;
+  version?: string | null;
+  source: AcpAgentSource;
+  enabled: boolean;
+}
+
+export interface AcpAgentAvailability {
+  spec: AcpAgentSpec;
+  installed: boolean;
+  resolved_path?: string | null;
+}
+
+export interface AcpRegistryRefreshView {
+  agents: AcpAgentAvailability[];
+  warning?: string | null;
+}
+
+export interface AcpProbeResult {
+  agent_id: string;
+  ok: boolean;
+  protocol_version?: string | null;
+  server_name?: string | null;
+  server_version?: string | null;
+  capabilities_summary: string[];
+  auth_methods: string[];
+  latency_ms: number;
+  error?: string | null;
 }
 export type ReasoningEffort =
   | "off"
@@ -498,6 +546,7 @@ export interface AgentProfile {
   profile_id: string;
   name: string;
   provider: ProviderKind;
+  acp_agent_id?: string | null;
   model: string | null;
   effort: ReasoningEffort | null;
   fast_mode?: boolean;
@@ -667,6 +716,7 @@ export interface AgentCardView {
   title: string;
   provider: ProviderKind;
   provider_label: string;
+  acp_agent_id?: string | null;
   model: string | null;
   effort: ReasoningEffort | null;
   fast_mode?: boolean;
@@ -814,6 +864,7 @@ export interface HostDetailView {
   workspace_events?: Record<string, WorkspaceEventRecord[]>;
   workspace_organize_status?: Record<string, WorkspaceOrganizeEvent>;
   host_sync_state?: HostSyncState | null;
+  acp_agents?: AcpAgentAvailability[];
 }
 
 export interface InlineSpanView {
@@ -2040,6 +2091,7 @@ export const orbitIpc = {
     cwd: string;
     extraDirs?: string[];
     provider: ProviderKind;
+    acpAgentId?: string | null;
     model?: string | null;
     effort?: ReasoningEffort | null;
     fastMode?: boolean | null;
@@ -2056,6 +2108,7 @@ export const orbitIpc = {
     if (!isTauriRuntime()) return "";
     return invoke<string>("create_agent", {
       ...params,
+      acpAgentId: params.acpAgentId ?? null,
       model: params.model ?? null,
       effort: params.effort ?? null,
       fastMode: params.fastMode ?? null,
@@ -2181,6 +2234,7 @@ export const orbitIpc = {
     provider: ProviderKind,
     model: string | null = null,
     effort: ReasoningEffort | null = null,
+    acpAgentId: string | null = null,
   ): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("switch_agent_provider", {
@@ -2189,6 +2243,7 @@ export const orbitIpc = {
       provider,
       model,
       effort,
+      acpAgentId,
     });
   },
 
@@ -2483,6 +2538,65 @@ export const orbitIpc = {
   deleteProfile: async (hostId: string, profileId: string): Promise<void> => {
     if (!isTauriRuntime()) return;
     await invoke<void>("delete_profile", { hostId, profileId });
+  },
+
+  listAcpAgents: async (hostId: string): Promise<AcpAgentAvailability[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<AcpAgentAvailability[]>("list_acp_agents", { hostId });
+  },
+
+  refreshAcpAgents: async (hostId: string): Promise<void> => {
+    if (!isTauriRuntime()) return;
+    await invoke<void>("refresh_acp_agents", { hostId });
+  },
+
+  upsertCustomAcpAgent: async (
+    hostId: string,
+    spec: AcpAgentSpec,
+  ): Promise<AcpAgentAvailability[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<AcpAgentAvailability[]>("upsert_custom_acp_agent", { hostId, spec });
+  },
+
+  deleteCustomAcpAgent: async (
+    hostId: string,
+    agentId: string,
+  ): Promise<AcpAgentAvailability[]> => {
+    if (!isTauriRuntime()) return [];
+    return invoke<AcpAgentAvailability[]>("delete_custom_acp_agent", { hostId, agentId });
+  },
+
+  testAcpAgent: async (
+    hostId: string,
+    agentId: string,
+    cwd?: string | null,
+  ): Promise<AcpProbeResult> => {
+    if (!isTauriRuntime()) {
+      return {
+        agent_id: agentId,
+        ok: false,
+        capabilities_summary: [],
+        auth_methods: [],
+        latency_ms: 0,
+        error: "Desktop runtime unavailable",
+      };
+    }
+    return invoke<AcpProbeResult>("test_acp_agent", {
+      hostId,
+      agentId,
+      cwd: cwd ?? null,
+    });
+  },
+
+  refreshAcpRegistry: async (
+    hostId: string,
+    registryUrl?: string | null,
+  ): Promise<AcpRegistryRefreshView> => {
+    if (!isTauriRuntime()) return { agents: [], warning: null };
+    return invoke<AcpRegistryRefreshView>("refresh_acp_registry", {
+      hostId,
+      registryUrl: registryUrl ?? null,
+    });
   },
 
   createSchedule: async (params: {

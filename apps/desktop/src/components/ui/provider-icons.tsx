@@ -280,5 +280,30 @@ export const ProviderIcon = memo(function ProviderIcon({
           />
         </svg>
       );
+
+    case "acp":
+      return (
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+          className={cn("size-3.5 shrink-0 text-foreground/80", className)}
+        >
+          <path
+            d="M12 2.5L20.2 7.25V16.75L12 21.5L3.8 16.75V7.25L12 2.5Z"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinejoin="round"
+          />
+          <circle cx="12" cy="12" r="2.6" fill="currentColor" />
+          <path
+            d="M12 5.4V9.2M17.5 15.2L14.3 13.3M6.5 15.2L9.7 13.3"
+            stroke="currentColor"
+            strokeWidth="1.7"
+            strokeLinecap="round"
+          />
+        </svg>
+      );
   }
 });

@@ -38,9 +38,9 @@ use orbit_client_core::composer::{
     SlashCommandView,
 };
 use orbit_client_core::contract::{
-    BridgeInfoView, ConversationSearchHit, FleetSidebarRequest, ForkAgentRequest,
-    ForkAgentResultView, GitReposInspectionView, MentionRankRequest, ModelSelectionRequest,
-    RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
+    AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, FleetSidebarRequest,
+    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, MentionRankRequest,
+    ModelSelectionRequest, RenderDiagramRequest, RenderDiagramView, SpawnWorkspacePeerRequest,
 };
 use orbit_client_core::desktop_ops::{
     ExternalEditorInfo, ExternalEditorKind, SshHostItem, StagedAttachmentInfo,
@@ -55,10 +55,10 @@ use orbit_client_core::render::{RichBlockView, parse_markdown_blocks};
 use orbit_client_core::sidebar::FleetSidebarView;
 use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnView};
 use orbit_protocol::{
-    ActiveTurnBehavior, AgentProfile, OrchestrationConfig, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
-    ScheduleTarget, SessionMode, WorkspaceBoardSnapshot, WorkspaceEventRecord, WorkspaceIsolation,
-    WorktreeCreateMode,
+    AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
+    OrchestrationConfig, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderSubagentEvent,
+    ReasoningEffort, ScheduleRunRecord, ScheduleTarget, SessionMode, WorkspaceBoardSnapshot,
+    WorkspaceEventRecord, WorkspaceIsolation, WorktreeCreateMode,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
 use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
@@ -576,6 +576,7 @@ fn create_agent(
     cwd: String,
     extra_dirs: Option<Vec<String>>,
     provider: ProviderKind,
+    acp_agent_id: Option<String>,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
     fast_mode: Option<bool>,
@@ -595,6 +596,7 @@ fn create_agent(
             cwd: &cwd,
             extra_dirs: extra_dirs.unwrap_or_default(),
             provider,
+            acp_agent_id,
             model,
             effort,
             fast_mode,
@@ -738,10 +740,16 @@ fn switch_agent_provider(
     provider: ProviderKind,
     model: Option<String>,
     effort: Option<ReasoningEffort>,
+    acp_agent_id: Option<String>,
 ) {
-    state
-        .core
-        .switch_agent_provider_with_config(&host_id, &agent_id, provider, model, effort);
+    state.core.switch_agent_provider_with_config(
+        &host_id,
+        &agent_id,
+        provider,
+        model,
+        effort,
+        acp_agent_id,
+    );
 }
 
 #[tauri::command]
@@ -1070,6 +1078,65 @@ fn upsert_profile(state: State<'_, DesktopAppState>, host_id: String, profile: A
 #[tauri::command]
 fn delete_profile(state: State<'_, DesktopAppState>, host_id: String, profile_id: String) {
     state.core.delete_profile(&host_id, &profile_id);
+}
+
+#[tauri::command]
+fn list_acp_agents(state: State<'_, DesktopAppState>, host_id: String) -> Vec<AcpAgentAvailability> {
+    state.core.list_acp_agents(&host_id)
+}
+
+#[tauri::command]
+fn refresh_acp_agents(state: State<'_, DesktopAppState>, host_id: String) {
+    state.core.refresh_acp_agents(&host_id);
+}
+
+#[tauri::command]
+async fn upsert_custom_acp_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    spec: AcpAgentSpec,
+) -> Result<Vec<AcpAgentAvailability>, String> {
+    state
+        .core
+        .upsert_custom_acp_agent_async(&host_id, spec)
+        .await
+}
+
+#[tauri::command]
+async fn delete_custom_acp_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+) -> Result<Vec<AcpAgentAvailability>, String> {
+    state
+        .core
+        .delete_custom_acp_agent_async(&host_id, &agent_id)
+        .await
+}
+
+#[tauri::command]
+async fn test_acp_agent(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    agent_id: String,
+    cwd: Option<String>,
+) -> Result<AcpProbeResult, String> {
+    state
+        .core
+        .test_acp_agent_async(&host_id, &agent_id, cwd)
+        .await
+}
+
+#[tauri::command]
+async fn refresh_acp_registry(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    registry_url: Option<String>,
+) -> Result<AcpRegistryRefreshView, String> {
+    state
+        .core
+        .refresh_acp_registry_async(&host_id, registry_url)
+        .await
 }
 
 #[tauri::command]
@@ -2215,6 +2282,12 @@ pub fn run() {
             stop_workspace_script,
             upsert_profile,
             delete_profile,
+            list_acp_agents,
+            refresh_acp_agents,
+            upsert_custom_acp_agent,
+            delete_custom_acp_agent,
+            test_acp_agent,
+            refresh_acp_registry,
             create_schedule,
             update_schedule,
             pause_schedule,

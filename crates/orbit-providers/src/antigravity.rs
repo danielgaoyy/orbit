@@ -8617,6 +8617,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             ),
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
         };
 
         let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
@@ -8792,6 +8794,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
         };
 
         let actor = tokio::spawn(run_agy_actor(cfg, shim, true, cmd_rx, evt_tx));
@@ -8865,6 +8869,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
         };
 
         let env_off = build_agy_launch_env(&cfg);
@@ -9084,6 +9090,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
         };
 
         let actor = tokio::spawn(run_agy_actor(cfg, shim, false, cmd_rx, evt_tx));
@@ -9298,6 +9306,8 @@ Task logs are available at: file:///tmp/task-1295.log\n";
             fallback_handoff_context: None,
             persisted_running_bg_tasks: vec![],
             persisted_bg_wait: false,
+            acp_agent_id: None,
+            acp_spec: None,
         };
 
         let mut next_id = 1i64;

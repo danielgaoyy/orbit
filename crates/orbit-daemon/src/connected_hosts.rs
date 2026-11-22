@@ -33,11 +33,11 @@ const E2EE_FRAME_WIRE: u8 = 0x00;
 pub enum RemoteHostEvent {
     AgentUpdated {
         host_id: String,
-        agent: AgentSummary,
+        agent: Box<AgentSummary>,
     },
     TimelineLive {
         host_id: String,
-        event: TimelineEvent,
+        event: Box<TimelineEvent>,
     },
     HostDisconnected {
         host_id: String,
@@ -398,13 +398,13 @@ impl ConnectedHostsManager {
                                     WireMessage::AgentUpdated { agent } => {
                                         let _ = self.remote_events_tx.send(RemoteHostEvent::AgentUpdated {
                                             host_id: remote_host_id.clone(),
-                                            agent,
+                                            agent: Box::new(agent),
                                         });
                                     }
                                     WireMessage::TimelineLive { event } => {
                                         let _ = self.remote_events_tx.send(RemoteHostEvent::TimelineLive {
                                             host_id: remote_host_id.clone(),
-                                            event,
+                                            event: Box::new(event),
                                         });
                                     }
                                     _ => {}
@@ -999,6 +999,7 @@ mod tests {
                 task_summary: None,
                 forked_from_agent_id: Some("ag_src".into()),
                 forked_at_seq: Some(2),
+                acp_agent_id: None,
             },
             workspace: None,
         };

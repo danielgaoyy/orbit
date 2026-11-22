@@ -32,7 +32,7 @@ pub(crate) const AGENT_SELECT_COLS: &str =
     status_json, parent_agent_id, latest_seq, created_at, updated_at, effort_json,
     parent_host_id, archived_at, background, auto_archive, profile_id, labels_json,
     attention_state, last_activity_at, timeline_epoch, read_seq, is_pinned, pinned_order,
-    handle, cluster_suggestion_json, task_summary, forked_from_agent_id, forked_at_seq, fast_mode";
+    handle, cluster_suggestion_json, task_summary, forked_from_agent_id, forked_at_seq, fast_mode, acp_agent_id";
 
 /// Atomic result of [`OrbitStore::clone_timeline_events_up_to`], computed inside the same
 /// `IMMEDIATE` transaction as the copy so callers avoid TOCTOU races.
@@ -396,11 +396,12 @@ impl OrbitStore {
             ",
         )?;
         search::migrate_fts5_schema(&mut conn)?;
-        // Idempotent column migrations checked via `PRAGMA table_info` (NO `PRAGMA user_version` bump)
+        // Idempotent Wave 2 column migrations checked via `PRAGMA table_info` (NO `PRAGMA user_version` bump)
         for (table, col, col_type) in [
             ("agents", "forked_from_agent_id", "TEXT"),
             ("agents", "forked_at_seq", "INTEGER"),
             ("agents", "fast_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("agents", "acp_agent_id", "TEXT"),
             ("client_replica_agents", "forked_from_agent_id", "TEXT"),
             ("client_replica_agents", "forked_at_seq", "INTEGER"),
             (
@@ -408,9 +409,11 @@ impl OrbitStore {
                 "fast_mode",
                 "INTEGER NOT NULL DEFAULT 0",
             ),
+            ("client_replica_agents", "acp_agent_id", "TEXT"),
             ("agent_profiles", "fast_mode", "INTEGER NOT NULL DEFAULT 0"),
+            ("agent_profiles", "acp_agent_id", "TEXT"),
         ] {
-            ensure_column_exists(&conn, table, col, col_type)?;
+            ensure_table_column(&conn, table, col, col_type)?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -525,9 +528,9 @@ impl OrbitStore {
                 latest_seq, timeline_epoch, created_at, updated_at, archived_at, background, auto_archive,
                 profile_id, labels_json, attention_state, last_activity_at,
                 read_seq, is_pinned, pinned_order, handle, cluster_suggestion_json, task_summary,
-                forked_from_agent_id, forked_at_seq, fast_mode
+                forked_from_agent_id, forked_at_seq, fast_mode, acp_agent_id
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
             ON CONFLICT(agent_id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 title = excluded.title,
@@ -556,7 +559,8 @@ impl OrbitStore {
                 task_summary = COALESCE(excluded.task_summary, agents.task_summary),
                 forked_from_agent_id = COALESCE(excluded.forked_from_agent_id, agents.forked_from_agent_id),
                 forked_at_seq = COALESCE(excluded.forked_at_seq, agents.forked_at_seq),
-                fast_mode = excluded.fast_mode
+                fast_mode = excluded.fast_mode,
+                acp_agent_id = COALESCE(excluded.acp_agent_id, agents.acp_agent_id)
             ",
             params![
                 agent.agent_id,
@@ -591,6 +595,7 @@ impl OrbitStore {
                 agent.forked_from_agent_id,
                 forked_at_seq_i64,
                 i32::from(agent.fast_mode),
+                agent.acp_agent_id,
             ],
         )?;
         Ok(())
@@ -850,16 +855,25 @@ impl OrbitStore {
         model: Option<&str>,
         effort: Option<ReasoningEffort>,
         fast_mode: bool,
+        acp_agent_id: Option<&str>,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let provider_json = serde_json::to_string(&provider)?;
         let effort_json = effort.as_ref().map(serde_json::to_string).transpose()?;
         let status_json = serde_json::to_string(&AgentStatus::Idle)?;
+        let clean_acp_id = if provider == ProviderKind::Acp {
+            acp_agent_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        };
         conn.execute(
             "UPDATE agents
              SET provider_json = ?1, model = ?2, effort_json = ?3, fast_mode = ?4,
-                 persistence_ref = NULL, status_json = ?5, updated_at = ?6
-             WHERE agent_id = ?7",
+                 persistence_ref = NULL, status_json = ?5, updated_at = ?6, acp_agent_id = ?7
+             WHERE agent_id = ?8",
             params![
                 provider_json,
                 model,
@@ -867,6 +881,7 @@ impl OrbitStore {
                 i64::from(fast_mode),
                 status_json,
                 Utc::now().to_rfc3339(),
+                clean_acp_id,
                 agent_id
             ],
         )?;
@@ -921,8 +936,8 @@ impl OrbitStore {
     }
 
     /// Find the highest numeric segment suffix (`_N`) already persisted for an active turn across
-    /// all shim-backed providers (`agy_msg_`, `pi_msg_`, `{slug}_msg_`, and `_th_`) so a reattached
-    /// driver continues segment numbering cleanly without ID collisions.
+    /// all shim-backed providers (`agy_msg_`, `pi_msg_`, `acp_msg_`, `{slug}_msg_`, and `_th_`) so a
+    /// reattached driver continues segment numbering cleanly without ID collisions.
     pub fn max_turn_segment_step(&self, agent_id: &str, turn_id: &str) -> u64 {
         let Ok(conn) = self.conn.lock() else {
             return 0;
@@ -1752,8 +1767,8 @@ impl OrbitStore {
             let forked_at_i64 = ag.forked_at_seq.and_then(|s| i64::try_from(s).ok());
             tx.execute(
                 "INSERT INTO client_replica_agents (
-                    host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq, fast_mode
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq, fast_mode, acp_agent_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     host_id,
                     ag.agent_id,
@@ -1761,6 +1776,7 @@ impl OrbitStore {
                     ag.forked_from_agent_id,
                     forked_at_i64,
                     i32::from(ag.fast_mode),
+                    ag.acp_agent_id,
                 ],
             )?;
         }
@@ -1778,13 +1794,14 @@ impl OrbitStore {
         let forked_at_i64 = ag.forked_at_seq.and_then(|s| i64::try_from(s).ok());
         conn.execute(
             "INSERT INTO client_replica_agents (
-                host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq, fast_mode
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                host_id, agent_id, payload_json, forked_from_agent_id, forked_at_seq, fast_mode, acp_agent_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(host_id, agent_id) DO UPDATE SET
                 payload_json = excluded.payload_json,
                 forked_from_agent_id = excluded.forked_from_agent_id,
                 forked_at_seq = excluded.forked_at_seq,
-                fast_mode = excluded.fast_mode",
+                fast_mode = excluded.fast_mode,
+                acp_agent_id = excluded.acp_agent_id",
             params![
                 host_id,
                 ag.agent_id,
@@ -1792,6 +1809,7 @@ impl OrbitStore {
                 ag.forked_from_agent_id,
                 forked_at_i64,
                 i32::from(ag.fast_mode),
+                ag.acp_agent_id,
             ],
         )?;
         Ok(())
@@ -1820,17 +1838,24 @@ impl OrbitStore {
     pub fn list_replica_agents(&self, host_id: &str) -> Result<Vec<AgentSummary>, StoreError> {
         let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let mut stmt = conn.prepare(
-            "SELECT payload_json, fast_mode FROM client_replica_agents WHERE host_id = ?1",
+            "SELECT payload_json, fast_mode, acp_agent_id FROM client_replica_agents WHERE host_id = ?1",
         )?;
         let rows = stmt.query_map(params![host_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1).unwrap_or(0) != 0))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i32>(1).unwrap_or(0) != 0,
+                r.get::<_, Option<String>>(2).unwrap_or(None),
+            ))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (raw_json, fast_col) = r?;
+            let (raw_json, fast_col, col_acp_id) = r?;
             if let Ok(mut ag) = serde_json::from_str::<AgentSummary>(&raw_json) {
                 if fast_col {
                     ag.fast_mode = true;
+                }
+                if ag.acp_agent_id.is_none() {
+                    ag.acp_agent_id = col_acp_id;
                 }
                 out.push(ag);
             }
@@ -2780,21 +2805,6 @@ impl OrbitStore {
     }
 }
 
-fn ensure_column_exists(
-    conn: &Connection,
-    table: &'static str,
-    column: &'static str,
-    column_def: &'static str,
-) -> Result<(), StoreError> {
-    if !table_has_column(conn, table, column)? {
-        conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}"),
-            [],
-        )?;
-    }
-    Ok(())
-}
-
 fn query_coalesce_boundary_seq(
     tx: &rusqlite::Transaction<'_>,
     is_daemon_table: bool,
@@ -2933,7 +2943,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let name: String = row.get(1)?;
-        if name == column {
+        if name.eq_ignore_ascii_case(column) {
             return Ok(true);
         }
     }
@@ -2969,6 +2979,7 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         .filter(|&v| v >= 0)
         .map(|v| v as u64);
     let fast_mode: bool = row.get::<_, i32>(30).unwrap_or(0) != 0;
+    let acp_agent_id: Option<String> = row.get(31).unwrap_or(None);
 
     let provider: ProviderKind =
         serde_json::from_str(&provider_str).unwrap_or(ProviderKind::Antigravity);
@@ -3016,7 +3027,23 @@ pub(crate) fn map_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSu
         task_summary,
         forked_from_agent_id,
         forked_at_seq,
+        acp_agent_id,
     })
+}
+
+/// Idempotently add a nullable/defaulted column by inspecting `PRAGMA table_info(<table>)` first.
+/// Never bumps `PRAGMA user_version` so parallel feature branches merge cleanly in any order.
+pub(crate) fn ensure_table_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_def: &str,
+) -> Result<(), StoreError> {
+    if !table_has_column(conn, table, column)? {
+        let alter_sql = format!("ALTER TABLE {table} ADD COLUMN {column} {column_def}");
+        conn.execute(&alter_sql, [])?;
+    }
+    Ok(())
 }
 
 fn map_stored_queued_prompt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredQueuedPrompt> {
@@ -3162,6 +3189,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 Some("session_abc"),
             )
@@ -3273,6 +3301,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
         store.upsert_agent(&parent, Some("ref_p")).expect("parent");
 
@@ -3335,6 +3364,7 @@ mod tests {
             profile_id: "prof_rev".into(),
             name: "Independent Reviewer".into(),
             provider: ProviderKind::Codex,
+            acp_agent_id: None,
             model: Some("gpt-5.4".into()),
             effort: Some(ReasoningEffort::Xhigh),
             fast_mode: true,
@@ -3484,6 +3514,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 Some("prov_sess_1"),
             )
@@ -3649,6 +3680,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 None,
             )
@@ -3746,6 +3778,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 None,
             )
@@ -3973,6 +4006,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 None,
             )
@@ -4123,6 +4157,7 @@ mod tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 Some("sess_bg"),
             )
@@ -4288,6 +4323,7 @@ mod tests {
                     cluster_suggestion: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                     labels: Default::default(),
                     latest_seq: 0,
                     timeline_epoch: 0,
@@ -4337,7 +4373,7 @@ mod tests {
         assert_eq!(store.max_turn_segment_step("ag_cur", "turn_other"), 0);
 
         // Multi-provider segment tracking: `pi_msg_`, `opencode_msg_`, `gemini_cli_th_`,
-        // while ignoring unrelated turns that share a prefix (`turn_abc_extra`).
+        // `acp_th_`, `acp_msg_`, while ignoring unrelated turns that share a prefix.
         store
             .append_timeline_event(
                 "ag_cur",
@@ -4385,20 +4421,58 @@ mod tests {
                 },
             )
             .expect("append extra turn");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp_1"),
+                TimelinePayload::AssistantThinking {
+                    item_id: "acp_th_turn_acp_1_7".into(),
+                    text: "acp thought".into(),
+                },
+            )
+            .expect("append acp th");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp_1"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "acp_msg_turn_acp_1_19".into(),
+                    text: "acp reply".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append acp msg");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp_10"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "acp_msg_turn_acp_10_99".into(),
+                    text: "other turn".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append other acp turn");
 
         assert_eq!(store.max_turn_segment_step("ag_cur", "turn_pi"), 7);
         assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp"), 15);
         assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp_extra"), 99);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp_1"), 19);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp_10"), 99);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_abc"), 12);
 
         let recent = store.fetch_recent_timeline("ag_cur", 2).expect("recent");
         assert_eq!(recent.len(), 2);
         assert!(matches!(
             &recent[0].payload,
-            TimelinePayload::AssistantThinking { item_id, .. } if item_id == "gemini_cli_th_turn_acp_15"
+            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "acp_msg_turn_acp_1_19"
         ));
         assert!(matches!(
             &recent[1].payload,
-            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "opencode_msg_turn_acp_extra_99"
+            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "acp_msg_turn_acp_10_99"
         ));
     }
 
@@ -4462,6 +4536,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: from.map(ToOwned::to_owned),
             forked_at_seq: at_seq,
+            acp_agent_id: None,
         };
 
         store
@@ -4657,6 +4732,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
         store
             .upsert_agent(&mk_ag("ag_live_src"), None)
@@ -4994,6 +5070,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
         store.upsert_agent(&ag, None).expect("upsert agent");
         let loaded = store.get_agent("ag_fast").expect("get").expect("some");
@@ -5037,6 +5114,7 @@ mod tests {
             profile_id: "prof_fast".into(),
             name: "Fast Coder".into(),
             provider: ProviderKind::ClaudeCode,
+            acp_agent_id: None,
             model: Some("claude-opus-4-6".into()),
             effort: Some(ReasoningEffort::High),
             fast_mode: true,
@@ -5133,6 +5211,7 @@ mod tests {
             task_summary: Some("Working".into()),
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
         store
             .upsert_agent(&ag, Some("native_sess_atomic"))
@@ -5178,5 +5257,151 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acp_agent_id_roundtrip_agents_replica_and_profiles() {
+        let store = OrbitStore::open_in_memory().expect("open store");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_acp".into(),
+                title: "ACP Workspace".into(),
+                cwd: "/tmp/acp".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+
+        let acp_agent = AgentSummary {
+            agent_id: "ag_acp_1".into(),
+            workspace_id: "ws_acp".into(),
+            cwd: "/tmp/acp".into(),
+            title: "OpenCode ACP Session".into(),
+            provider: ProviderKind::Acp,
+            model: Some("default".into()),
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            status: AgentStatus::Idle,
+            parent_agent_id: None,
+            parent_host_id: None,
+            latest_seq: 0,
+            timeline_epoch: 0,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+            background: false,
+            auto_archive: false,
+            profile_id: None,
+            labels: HashMap::new(),
+            attention: AttentionState::None,
+            last_activity_at: Some(now),
+            queued_prompts: Vec::new(),
+            read_seq: 0,
+            is_pinned: false,
+            pinned_order: 0,
+            handle: None,
+            cluster_suggestion: None,
+            task_summary: None,
+            forked_from_agent_id: None,
+            forked_at_seq: None,
+            acp_agent_id: Some("opencode".into()),
+        };
+
+        store
+            .upsert_agent(&acp_agent, Some("acp_sess_1"))
+            .expect("upsert acp agent");
+        let loaded = store
+            .get_agent("ag_acp_1")
+            .expect("get acp agent")
+            .expect("exists");
+        assert_eq!(loaded.provider, ProviderKind::Acp);
+        assert_eq!(loaded.acp_agent_id.as_deref(), Some("opencode"));
+
+        // Verify client_replica_agents roundtrip (both batch and single upsert)
+        store
+            .upsert_replica_agents("host_1", std::slice::from_ref(&acp_agent))
+            .expect("upsert replica batch");
+        let replica_list = store.list_replica_agents("host_1").expect("list replica");
+        assert_eq!(replica_list.len(), 1);
+        assert_eq!(replica_list[0].provider, ProviderKind::Acp);
+        assert_eq!(replica_list[0].acp_agent_id.as_deref(), Some("opencode"));
+
+        let mut updated_replica = acp_agent.clone();
+        updated_replica.acp_agent_id = Some("gemini-cli".into());
+        store
+            .upsert_single_replica_agent("host_1", &updated_replica)
+            .expect("upsert single replica");
+        let replica_list2 = store.list_replica_agents("host_1").expect("list replica 2");
+        assert_eq!(replica_list2[0].acp_agent_id.as_deref(), Some("gemini-cli"));
+
+        // Verify switch_agent_provider updates acp_agent_id cleanly
+        store
+            .switch_agent_provider(
+                "ag_acp_1",
+                ProviderKind::Acp,
+                None,
+                None,
+                false,
+                Some("goose"),
+            )
+            .expect("switch to goose");
+        let switched = store
+            .get_agent("ag_acp_1")
+            .expect("get switched")
+            .expect("exists");
+        assert_eq!(switched.acp_agent_id.as_deref(), Some("goose"));
+
+        // Verify AgentProfile acp_agent_id roundtrip
+        let profile = orbit_protocol::AgentProfile {
+            profile_id: "prof_acp".into(),
+            name: "OpenCode Worker".into(),
+            provider: ProviderKind::Acp,
+            acp_agent_id: Some("opencode".into()),
+            model: None,
+            effort: None,
+            fast_mode: false,
+            mode: SessionMode::AcceptEdits,
+            when_to_use: "Use for OpenCode ACP tasks".into(),
+            system_prompt_append: None,
+            mcp_policy: orbit_protocol::McpToolPolicy::default(),
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_profile(&profile).expect("upsert acp profile");
+        let loaded_prof = store
+            .get_profile("prof_acp")
+            .expect("get profile")
+            .expect("exists");
+        assert_eq!(loaded_prof.provider, ProviderKind::Acp);
+        assert_eq!(loaded_prof.acp_agent_id.as_deref(), Some("opencode"));
+
+        // Ensure PRAGMA user_version remains untouched (v6 from FTS5) and ensure_table_column is idempotent
+        let conn = store.conn.lock().expect("lock");
+        let ver_before: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(ver_before, 6);
+        ensure_table_column(&conn, "agents", "acp_agent_id", "TEXT").expect("idempotent 1");
+        ensure_table_column(&conn, "client_replica_agents", "acp_agent_id", "TEXT")
+            .expect("idempotent 2");
+        let ver_after: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("user_version");
+        assert_eq!(ver_after, ver_before);
     }
 }

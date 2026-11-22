@@ -31,8 +31,8 @@ use orbit_client_core::export::ExportOptions;
 use orbit_client_core::sidebar::{SidebarProjectSort, SidebarThreadFilter};
 use orbit_client_core::stage::describe_tool_step;
 use orbit_protocol::{
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec, ReasoningEffort,
-    SessionMode,
+    AcpAgentSpec, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
+    ReasoningEffort, SessionMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -657,6 +657,7 @@ impl OhosCoreFacade {
         cwd: &str,
         extra_dirs_json: Option<&str>,
         provider_str: &str,
+        acp_agent_id: Option<&str>,
         model: Option<String>,
         effort_str: Option<&str>,
         mode_str: &str,
@@ -672,6 +673,7 @@ impl OhosCoreFacade {
             cwd,
             extra_dirs,
             provider: parse_provider_str(provider_str),
+            acp_agent_id: acp_agent_id.map(ToOwned::to_owned),
             model,
             effort: parse_effort_opt(effort_str),
             fast_mode: None,
@@ -777,6 +779,7 @@ impl OhosCoreFacade {
         provider_str: &str,
         model: Option<String>,
         effort_str: Option<&str>,
+        acp_agent_id: Option<String>,
     ) {
         self.inner.switch_agent_provider_with_config(
             host_id,
@@ -784,6 +787,7 @@ impl OhosCoreFacade {
             parse_provider_str(provider_str),
             model,
             parse_effort_opt(effort_str),
+            acp_agent_id,
         );
     }
 
@@ -1112,6 +1116,58 @@ impl OhosCoreFacade {
         self.inner
             .cloud_sync_update_preferences(patch)
             .map_err(|e| e.to_string())
+    }
+
+    // --- Universal ACP Agent Registry & Probing ---
+
+    pub fn list_acp_agents_json(&self, host_id: &str) -> Result<String, String> {
+        serde_json::to_string(&self.inner.list_acp_agents(host_id)).map_err(|e| e.to_string())
+    }
+
+    pub fn refresh_acp_agents(&self, host_id: &str) {
+        self.inner.refresh_acp_agents(host_id);
+    }
+
+    pub fn upsert_custom_acp_agent_json(
+        &self,
+        host_id: &str,
+        spec_json: &str,
+    ) -> Result<String, String> {
+        let spec: AcpAgentSpec = serde_json::from_str(spec_json).map_err(|e| e.to_string())?;
+        let agents = self.inner.upsert_custom_acp_agent_blocking(host_id, spec)?;
+        serde_json::to_string(&agents).map_err(|e| e.to_string())
+    }
+
+    pub fn delete_custom_acp_agent_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+    ) -> Result<String, String> {
+        let agents = self
+            .inner
+            .delete_custom_acp_agent_blocking(host_id, agent_id)?;
+        serde_json::to_string(&agents).map_err(|e| e.to_string())
+    }
+
+    pub fn test_acp_agent_json(
+        &self,
+        host_id: &str,
+        agent_id: &str,
+        cwd: Option<String>,
+    ) -> Result<String, String> {
+        let res = self.inner.test_acp_agent_blocking(host_id, agent_id, cwd)?;
+        serde_json::to_string(&res).map_err(|e| e.to_string())
+    }
+
+    pub fn refresh_acp_registry_json(
+        &self,
+        host_id: &str,
+        registry_url: Option<String>,
+    ) -> Result<String, String> {
+        let agents = self
+            .inner
+            .refresh_acp_registry_blocking(host_id, registry_url)?;
+        serde_json::to_string(&agents).map_err(|e| e.to_string())
     }
 }
 
@@ -1699,6 +1755,7 @@ mod ohos_napi {
             cwd: String,
             extra_dirs_json: Option<String>,
             provider: String,
+            acp_agent_id: Option<String>,
             model: Option<String>,
             effort: Option<String>,
             mode: String,
@@ -1713,6 +1770,7 @@ mod ohos_napi {
                     &cwd,
                     extra_dirs_json.as_deref(),
                     &provider,
+                    acp_agent_id.as_deref(),
                     model,
                     effort.as_deref(),
                     &mode,
@@ -1836,6 +1894,7 @@ mod ohos_napi {
             provider: String,
             model: Option<String>,
             effort: Option<String>,
+            acp_agent_id: Option<String>,
         ) {
             self.facade.switch_agent_provider(
                 &host_id,
@@ -1843,6 +1902,7 @@ mod ohos_napi {
                 &provider,
                 model,
                 effort.as_deref(),
+                acp_agent_id,
             );
         }
 
@@ -2196,6 +2256,7 @@ mod tests {
                 "/workspace/orbit",
                 Some(r#"["/workspace/shared"]"#),
                 "claude_code",
+                None,
                 Some("claude-opus-5-5".into()),
                 Some("high"),
                 "accept_edits",
@@ -2260,6 +2321,7 @@ mod tests {
                 "/repo/orbit",
                 None,
                 "claude_code",
+                None,
                 None,
                 None,
                 "default",

@@ -98,6 +98,7 @@ pub enum DaemonBroadcast {
     WorkspaceEventRecorded(WorkspaceEventRecord),
     WorkspaceOrganizeProgress(WorkspaceOrganizeEvent),
     KeepAwakeStatusUpdated(KeepAwakeStatus),
+    AcpAgentsUpdated(Vec<orbit_protocol::AcpAgentAvailability>),
 }
 
 struct LiveAgentEntry {
@@ -169,6 +170,7 @@ pub struct CreateAgentSpec {
     pub pr_number: Option<u32>,
     pub handle: Option<String>,
     pub auto_cluster: Option<bool>,
+    pub acp_agent_id: Option<String>,
 }
 
 pub struct AgentOrchestrator {
@@ -301,6 +303,57 @@ impl AgentOrchestrator {
         } else {
             None
         }
+    }
+
+    pub(crate) async fn resolve_launch_executable(
+        &self,
+        provider: ProviderKind,
+        acp_agent_id: Option<&str>,
+    ) -> anyhow::Result<(PathBuf, Option<orbit_protocol::AcpAgentSpec>)> {
+        let home_dir = self.home_dir.clone();
+        let acp_id = acp_agent_id.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || {
+            if provider == ProviderKind::Acp {
+                let id = acp_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("`acp_agent_id` is required when provider is `acp`")
+                    })?;
+                let spec = orbit_providers::get_acp_agent_spec(&home_dir, id).ok_or_else(|| {
+                    anyhow::anyhow!("ACP agent `{id}` not found in registry on this host")
+                })?;
+                if !spec.enabled {
+                    anyhow::bail!("ACP agent `{id}` is disabled on this host");
+                }
+                let exe =
+                    orbit_providers::resolve_acp_agent_command(&spec.command).ok_or_else(|| {
+                        let hint = spec
+                            .install_hint
+                            .as_deref()
+                            .map(|h| format!(" (install: `{h}`)"))
+                            .unwrap_or_default();
+                        anyhow::anyhow!(
+                            "ACP agent `{}` executable (`{}`) not found on host PATH{hint}",
+                            spec.name,
+                            spec.command
+                        )
+                    })?;
+                return Ok((exe, Some(spec)));
+            }
+
+            let exe = find_provider_executable(provider).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} binary (`{}`) not found on host PATH",
+                    provider.display_name(),
+                    provider.default_binary()
+                )
+            })?;
+            Ok((exe, None))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("executable resolution task failed: {e}"))?
     }
 
     pub(crate) async fn invalidate_roster_fingerprint(&self, agent_id: &str) {
@@ -469,7 +522,9 @@ impl AgentOrchestrator {
             let was_running = ag.status.is_foreground_busy();
 
             if surviving_sock.is_some()
-                && let Some(executable) = find_provider_executable(ag.provider)
+                && let Ok((executable, _)) = self
+                    .resolve_launch_executable(ag.provider, ag.acp_agent_id.as_deref())
+                    .await
             {
                 let resume_ref = self.store.get_persistence_ref(&ag.agent_id).ok().flatten();
                 let launch_gen = self.bump_generation(&ag.agent_id).await;
@@ -1091,6 +1146,14 @@ impl AgentOrchestrator {
             .as_ref()
             .map(|p| p.provider)
             .unwrap_or(spec.provider);
+        let acp_agent_id = if provider == ProviderKind::Acp {
+            spec.acp_agent_id
+                .or_else(|| profile.as_ref().and_then(|p| p.acp_agent_id.clone()))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         let model = spec
             .model
             .or_else(|| profile.as_ref().and_then(|p| p.model.clone()));
@@ -1123,13 +1186,9 @@ impl AgentOrchestrator {
             spec.mode
         };
 
-        let executable = find_provider_executable(provider).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} binary (`{}`) not found on host PATH",
-                provider.display_name(),
-                provider.default_binary()
-            )
-        })?;
+        let (executable, _acp_spec) = self
+            .resolve_launch_executable(provider, acp_agent_id.as_deref())
+            .await?;
 
         let human_seed = derive_human_seed(
             spec.initial_display_prompt.as_deref(),
@@ -1378,6 +1437,7 @@ impl AgentOrchestrator {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id,
         };
         self.store.upsert_agent(&summary, None)?;
         self.keep_awake
@@ -1552,13 +1612,10 @@ impl AgentOrchestrator {
             .filter(|p| !p.is_empty());
 
         let preflight_executable = if initial_prompt_text.is_some() {
-            Some(find_provider_executable(source.provider).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{} binary (`{}`) not found on host PATH",
-                    source.provider.display_name(),
-                    source.provider.default_binary()
-                )
-            })?)
+            let (exe, _) = self
+                .resolve_launch_executable(source.provider, source.acp_agent_id.as_deref())
+                .await?;
+            Some(exe)
         } else {
             None
         };
@@ -1768,6 +1825,7 @@ impl AgentOrchestrator {
             task_summary: None,
             forked_from_agent_id: Some(source.agent_id.clone()),
             forked_at_seq: None,
+            acp_agent_id: source.acp_agent_id.clone(),
         };
 
         struct ForkInitialPromptEvent {
@@ -2001,7 +2059,12 @@ impl AgentOrchestrator {
                 }
             });
         } else if fork_from_session_id.is_some()
-            && let Some(executable) = find_provider_executable(final_summary.provider)
+            && let Ok((executable, _)) = self
+                .resolve_launch_executable(
+                    final_summary.provider,
+                    final_summary.acp_agent_id.as_deref(),
+                )
+                .await
         {
             // Eagerly snapshot the parent's upstream session for full-tail forks before the
             // parent thread diverges with new turns. `native_fork_only = true` ensures that if
@@ -2650,14 +2713,11 @@ impl AgentOrchestrator {
         provider: ProviderKind,
         model: Option<String>,
         effort: Option<ReasoningEffort>,
+        acp_agent_id: Option<String>,
     ) -> anyhow::Result<()> {
-        let _ = find_provider_executable(provider).ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} CLI (`{}`) is not installed on this host",
-                provider.display_name(),
-                provider.default_binary()
-            )
-        })?;
+        let (_, acp_spec) = self
+            .resolve_launch_executable(provider, acp_agent_id.as_deref())
+            .await?;
 
         let prev_fast_mode = self
             .store
@@ -2690,15 +2750,20 @@ impl AgentOrchestrator {
             model.as_deref(),
             effort,
             next_fast_mode,
+            acp_agent_id.as_deref(),
         )?;
 
+        let switched_label = acp_spec
+            .as_ref()
+            .map(|s| s.name.as_str())
+            .unwrap_or_else(|| provider.display_name());
         if let Ok(ev) = self.store.append_timeline_event(
             agent_id,
             1,
             None,
             TimelinePayload::Notice {
                 level: "info".into(),
-                message: format!("已切换至 {} 接力当前对话", provider.display_name()),
+                message: format!("已切换至 {switched_label} 接力当前对话"),
             },
         ) {
             let _ = self.broadcast_tx.send(DaemonBroadcast::TimelineLive(ev));
@@ -3791,9 +3856,9 @@ impl AgentOrchestrator {
             .get_agent(agent_id)?
             .ok_or_else(|| anyhow::anyhow!("agent `{agent_id}` not found"))?;
         let resume_ref = self.store.get_persistence_ref(agent_id)?;
-        let executable = find_provider_executable(summary.provider).ok_or_else(|| {
-            anyhow::anyhow!("{} CLI not installed", summary.provider.display_name())
-        })?;
+        let (executable, _) = self
+            .resolve_launch_executable(summary.provider, summary.acp_agent_id.as_deref())
+            .await?;
         let launch_gen = self.bump_generation(agent_id).await;
 
         self.spawn_and_wire_driver_locked(
@@ -3971,6 +4036,15 @@ impl AgentOrchestrator {
             }
         });
 
+        let acp_spec = if summary.provider == ProviderKind::Acp {
+            summary
+                .acp_agent_id
+                .as_deref()
+                .and_then(|id| orbit_providers::get_acp_agent_spec(&self.home_dir, id))
+        } else {
+            None
+        };
+
         let handle = spawn_provider_session(SessionLaunchConfig {
             agent_id: summary.agent_id.clone(),
             provider: summary.provider,
@@ -3998,6 +4072,8 @@ impl AgentOrchestrator {
             fallback_handoff_context,
             persisted_running_bg_tasks,
             persisted_bg_wait,
+            acp_agent_id: summary.acp_agent_id.clone(),
+            acp_spec,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -5179,6 +5255,7 @@ mod streaming_buffer_tests {
                     task_summary: None,
                     forked_from_agent_id: None,
                     forked_at_seq: None,
+                    acp_agent_id: None,
                 },
                 persistence_ref,
             )
@@ -5629,6 +5706,7 @@ mod fast_mode_orchestrator_tests {
             pr_number: None,
             handle: None,
             auto_cluster: Some(false),
+            acp_agent_id: None,
         }
     }
 
@@ -5641,6 +5719,7 @@ mod fast_mode_orchestrator_tests {
                 profile_id: "prof_fast".into(),
                 name: "Fast Opus".into(),
                 provider: ProviderKind::ClaudeCode,
+                acp_agent_id: None,
                 model: Some("claude-opus-4-6".into()),
                 effort: Some(ReasoningEffort::High),
                 fast_mode: true,
@@ -5785,6 +5864,7 @@ mod fast_mode_orchestrator_tests {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
         store.upsert_agent(&ag, None).expect("seed agent");
 
@@ -5948,6 +6028,7 @@ mod fast_mode_orchestrator_tests {
             "ag_cap",
             ProviderKind::Codex,
             Some("gpt-oss-120b".into()),
+            None,
             None,
         )
         .await

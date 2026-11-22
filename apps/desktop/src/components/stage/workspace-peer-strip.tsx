@@ -40,8 +40,11 @@ function pickAlternateProvider(
   current: ProviderKind,
   available: ProviderKind[],
 ): ProviderKind {
-  const alt = available.find((p) => p !== current);
-  return alt ?? current;
+  const direct = available.filter((p) => p !== "acp");
+  const alt = direct.find((p) => p !== current);
+  if (alt) return alt;
+  if (current !== "acp") return current;
+  return direct[0] ?? "claude_code";
 }
 
 /**

@@ -180,6 +180,10 @@ pub async fn run_side_question(
             ProviderKind::Antigravity => {
                 run_agy_side_question(executable, cwd, effective_model, prompt, delta_tx).await
             }
+            ProviderKind::Acp => Err(
+                "Ephemeral side questions (/btw) are only supported on native Claude Code, Codex, and Antigravity sessions."
+                    .to_string(),
+            ),
             other => Err(format!(
                 "Side questions are not supported on {}",
                 other.display_name()
@@ -229,6 +233,9 @@ pub async fn run_ephemeral_text_prompt(
             }
             ProviderKind::Antigravity => {
                 run_agy_side_question(executable, safe_cwd, effective_model, prompt, delta_tx).await
+            }
+            ProviderKind::Acp => {
+                Err("Ephemeral text prompts are not supported on generic ACP agents.".to_string())
             }
             other => Err(format!(
                 "Ephemeral text prompts are not supported on {}",

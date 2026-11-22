@@ -1,6 +1,8 @@
 //! Core wire types, state machines, timeline events, git/worktree models, orchestration models, and binary terminal framing.
 
+pub mod acp;
 pub mod orchestration;
+pub use acp::*;
 pub use orchestration::*;
 
 use std::collections::HashMap;
@@ -15,7 +17,7 @@ fn wire_default_true() -> bool {
     true
 }
 
-/// First-class supported coding agent CLIs in Orbit.
+/// First-class supported coding agent CLIs in Orbit (native drivers + Universal ACP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -48,10 +50,11 @@ pub enum ProviderKind {
     MistralVibe,
     #[serde(alias = "auggie", alias = "augment_code", alias = "augment-code")]
     Augment,
+    Acp,
 }
 
 impl ProviderKind {
-    const ALL_PROVIDERS: [Self; 13] = [
+    const NATIVE_PROVIDERS: [Self; 13] = [
         Self::ClaudeCode,
         Self::Codex,
         Self::Antigravity,
@@ -67,7 +70,29 @@ impl ProviderKind {
         Self::Augment,
     ];
 
+    const ALL_PROVIDERS: [Self; 14] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Antigravity,
+        Self::OpenCode,
+        Self::GeminiCli,
+        Self::CursorAgent,
+        Self::Copilot,
+        Self::Goose,
+        Self::Pi,
+        Self::Kimi,
+        Self::Cline,
+        Self::MistralVibe,
+        Self::Augment,
+        Self::Acp,
+    ];
+
     /// All 13 first-class native coding agent providers in canonical display order.
+    pub const fn native_all() -> &'static [Self] {
+        &Self::NATIVE_PROVIDERS
+    }
+
+    /// All 14 coding agent providers (13 native + Universal ACP) in canonical display order.
     pub const fn all() -> &'static [Self] {
         &Self::ALL_PROVIDERS
     }
@@ -88,6 +113,7 @@ impl ProviderKind {
             Self::Cline => "cline",
             Self::MistralVibe => "mistral_vibe",
             Self::Augment => "augment",
+            Self::Acp => "acp",
         }
     }
 
@@ -109,6 +135,7 @@ impl ProviderKind {
                 Some(Self::MistralVibe)
             }
             "augment" | "auggie" | "augment_code" | "augment-code" => Some(Self::Augment),
+            "acp" => Some(Self::Acp),
             _ => None,
         }
     }
@@ -128,6 +155,7 @@ impl ProviderKind {
             Self::Cline => "cline",
             Self::MistralVibe => "vibe-acp",
             Self::Augment => "auggie",
+            Self::Acp => "acp",
         }
     }
 
@@ -154,6 +182,7 @@ impl ProviderKind {
             Self::Cline => "Cline",
             Self::MistralVibe => "Mistral Vibe",
             Self::Augment => "Augment",
+            Self::Acp => "ACP Agent",
         }
     }
 
@@ -172,6 +201,7 @@ impl ProviderKind {
             Self::Cline => "Cline",
             Self::MistralVibe => "Vibe",
             Self::Augment => "Augment",
+            Self::Acp => "ACP",
         }
     }
 
@@ -190,6 +220,7 @@ impl ProviderKind {
             Self::Cline => "ORBIT_CLINE_BIN",
             Self::MistralVibe => "ORBIT_VIBE_BIN",
             Self::Augment => "ORBIT_AUGGIE_BIN",
+            Self::Acp => "ORBIT_ACP_BIN",
         }
     }
 
@@ -208,6 +239,7 @@ impl ProviderKind {
             | Self::Cline
             | Self::MistralVibe
             | Self::Augment => "acp-stdio",
+            Self::Acp => "acp-generic-stdio",
         }
     }
 
@@ -550,6 +582,9 @@ pub struct AgentSummary {
     /// Optional source timeline sequence number at which this conversation forked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_at_seq: Option<u64>,
+    /// Optional ACP registry agent ID when `provider == ProviderKind::Acp` (e.g. `"opencode"`, `"gemini-cli"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_agent_id: Option<String>,
 }
 
 /// Destination workspace strategy when forking/branching an existing conversation.
@@ -1013,6 +1048,9 @@ pub enum WireMessage {
         /// `None` inherits the profile default; `Some(false)` explicitly disables fast mode.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fast_mode: Option<bool>,
+        /// Optional ACP registry agent ID when `provider == ProviderKind::Acp`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acp_agent_id: Option<String>,
     },
     AgentCreated {
         request_id: Uuid,
@@ -1119,6 +1157,8 @@ pub enum WireMessage {
         model: Option<String>,
         #[serde(default)]
         effort: Option<ReasoningEffort>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acp_agent_id: Option<String>,
     },
     ArchiveAgent {
         request_id: Uuid,
@@ -1665,6 +1705,40 @@ pub enum WireMessage {
         event: WorkspaceOrganizeEvent,
     },
 
+    // Universal ACP Agent Registry & Live Probing
+    ListAcpAgents {
+        request_id: Uuid,
+    },
+    AcpAgentsSnapshot {
+        request_id: Uuid,
+        agents: Vec<AcpAgentAvailability>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+    },
+    UpsertCustomAcpAgent {
+        request_id: Uuid,
+        spec: AcpAgentSpec,
+    },
+    DeleteCustomAcpAgent {
+        request_id: Uuid,
+        agent_id: String,
+    },
+    TestAcpAgent {
+        request_id: Uuid,
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    AcpAgentProbeResult {
+        request_id: Uuid,
+        result: AcpProbeResult,
+    },
+    RefreshAcpRegistry {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry_url: Option<String>,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -1824,6 +1898,7 @@ mod tests {
             handle: Some("lead".into()),
             auto_cluster: None,
             fast_mode: Some(true),
+            acp_agent_id: None,
         };
         let raw_json = serde_json::to_vec(&msg).expect("serialize");
         let compressed = msg.encode_zstd(3).expect("compress");
@@ -2107,6 +2182,7 @@ mod tests {
                 task_summary: None,
                 forked_from_agent_id: None,
                 forked_at_seq: None,
+                acp_agent_id: None,
             },
             to_before_seq: 42,
             events: Vec::new(),
@@ -2133,8 +2209,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_kind_all_13_metadata_slugs_and_serde_roundtrip() {
-        assert_eq!(ProviderKind::all().len(), 13);
+    fn provider_kind_all_14_metadata_slugs_and_serde_roundtrip() {
+        assert_eq!(ProviderKind::native_all().len(), 13);
+        assert_eq!(ProviderKind::all().len(), 14);
         let mut seen_slugs = std::collections::HashSet::new();
         let mut seen_env_keys = std::collections::HashSet::new();
         for &kind in ProviderKind::all() {
@@ -2172,6 +2249,7 @@ mod tests {
             ("vibe", ProviderKind::MistralVibe),
             ("vibe_acp", ProviderKind::MistralVibe),
             ("auggie", ProviderKind::Augment),
+            ("acp", ProviderKind::Acp),
         ];
         for (alias, expected) in aliases {
             assert_eq!(ProviderKind::from_slug(alias), Some(expected));
@@ -2282,6 +2360,7 @@ mod tests {
                 task_summary: None,
                 forked_from_agent_id: Some("ag_source".into()),
                 forked_at_seq: Some(15),
+                acp_agent_id: None,
             },
             workspace: Some(WorkspaceSummary {
                 workspace_id: "ws_wt".into(),
@@ -2451,5 +2530,83 @@ mod tests {
         }"#;
         let prof: AgentProfile = serde_json::from_str(legacy_profile_json).expect("legacy profile");
         assert!(!prof.fast_mode);
+    }
+
+    #[test]
+    fn acp_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let spec = AcpAgentSpec {
+            id: "opencode".into(),
+            name: "OpenCode".into(),
+            description: "Open-source terminal coding agent".into(),
+            command: "opencode".into(),
+            args: vec!["acp".into()],
+            env: HashMap::from([("OPENCODE_MODE".into(), "acp".into())]),
+            install_hint: Some("brew install opencode".into()),
+            homepage: Some("https://opencode.ai".into()),
+            version: Some("1.0.0".into()),
+            source: AcpAgentSource::Custom,
+            enabled: true,
+        };
+        let messages = vec![
+            WireMessage::ListAcpAgents { request_id: req_id },
+            WireMessage::AcpAgentsSnapshot {
+                request_id: req_id,
+                agents: vec![AcpAgentAvailability {
+                    spec: spec.clone(),
+                    installed: true,
+                    resolved_path: Some("/usr/local/bin/opencode".into()),
+                }],
+                warning: Some("offline fallback".into()),
+            },
+            WireMessage::UpsertCustomAcpAgent {
+                request_id: req_id,
+                spec: spec.clone(),
+            },
+            WireMessage::DeleteCustomAcpAgent {
+                request_id: req_id,
+                agent_id: "opencode".into(),
+            },
+            WireMessage::TestAcpAgent {
+                request_id: req_id,
+                agent_id: "opencode".into(),
+                cwd: Some("/workspace/orbit".into()),
+            },
+            WireMessage::AcpAgentProbeResult {
+                request_id: req_id,
+                result: AcpProbeResult {
+                    agent_id: "opencode".into(),
+                    ok: true,
+                    protocol_version: Some("1".into()),
+                    server_name: Some("opencode".into()),
+                    server_version: Some("1.2.3".into()),
+                    capabilities_summary: vec!["loadSession".into(), "mcp.http".into()],
+                    auth_methods: vec!["oauth".into()],
+                    latency_ms: 42,
+                    error: None,
+                },
+            },
+            WireMessage::RefreshAcpRegistry {
+                request_id: req_id,
+                registry_url: Some(
+                    "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json".into(),
+                ),
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode acp wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode acp wire msg");
+            let orig_json = serde_json::to_value(&msg).expect("orig json");
+            let dec_json = serde_json::to_value(&decoded).expect("dec json");
+            assert_eq!(orig_json, dec_json);
+        }
+
+        // Verify ProviderKind::Acp serde & display
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::Acp).expect("serialize provider"),
+            "\"acp\""
+        );
+        assert_eq!(ProviderKind::Acp.display_name(), "ACP Agent");
     }
 }

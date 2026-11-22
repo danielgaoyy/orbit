@@ -61,9 +61,11 @@ export const ComposerFastToggle = memo(function ComposerFastToggle({
     [availableProviders],
   );
   const resolvedDraftProvider: ProviderKind =
-    detectedProviders.length > 0 && !detectedProviders.some((p) => p.id === draftProvider)
-      ? detectedProviders[0].id
-      : draftProvider;
+    draftProvider === "acp"
+      ? "acp"
+      : detectedProviders.length > 0 && !detectedProviders.some((p) => p.id === draftProvider)
+        ? detectedProviders[0].id
+        : draftProvider;
 
   const isDraftMode = isDraft || activeAgentProvider === null;
   const activeProvider: ProviderKind =

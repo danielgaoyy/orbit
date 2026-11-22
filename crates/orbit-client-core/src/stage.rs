@@ -3461,6 +3461,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
         let insights = derive_session_insights(&items, Some("/repo"), Some(&cur_agent), &[], &[]);
         assert_eq!(
@@ -3631,6 +3632,7 @@ Log: file:///tmp/spoofed.log\n";
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
 
         let mut items: Vec<TimelineItemView> = Vec::new();
@@ -3874,6 +3876,7 @@ Log: file:///tmp/spoofed.log\n";
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
 
         let items = vec![
@@ -4056,6 +4059,7 @@ Log: file:///tmp/spoofed.log\n";
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
 
         let items = vec![TimelineItemView::ToolCall {

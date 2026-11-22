@@ -256,7 +256,7 @@ export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
-export type HostSettingsTab = "agents" | "usage" | "connection";
+export type HostSettingsTab = "agents" | "acp" | "usage" | "connection";
 export type SettingsSection =
   | "general"
   | "cloud_sync"
@@ -350,6 +350,7 @@ export interface OrbitUiState {
 
   // Draft new-session launch configuration
   draftProvider: ProviderKind;
+  draftAcpAgentId: string | null;
   draftModels: Partial<Record<ProviderKind, string | null>>;
   draftEffort: ReasoningEffort;
   draftFastMode: boolean;
@@ -507,6 +508,7 @@ interface PersistedPrefs {
   overviewCollapsedSections?: Partial<Record<OverviewSectionId, boolean>>;
   diffLayout?: DiffLayoutMode;
   draftProvider?: ProviderKind;
+  draftAcpAgentId?: string | null;
   draftModels?: Partial<Record<ProviderKind, string | null>>;
   draftEffort?: ReasoningEffort;
   draftFastMode?: boolean;
@@ -564,6 +566,7 @@ function writePrefsNow(snap: OrbitUiState): void {
       overviewCollapsedSections: snap.overviewCollapsedSections,
       diffLayout: snap.diffLayout,
       draftProvider: snap.draftProvider,
+      draftAcpAgentId: snap.draftAcpAgentId,
       draftModels: snap.draftModels,
       draftEffort: snap.draftEffort,
       draftFastMode: snap.draftFastMode,
@@ -698,8 +701,9 @@ const defaultInitialState: OrbitUiState = {
   pendingJumpTarget: null,
 
   draftProvider: initialPrefs.draftProvider ?? "codex",
+  draftAcpAgentId: initialPrefs.draftAcpAgentId ?? null,
   draftModels: {
-    ...Object.fromEntries(PROVIDER_LIST.map((p) => [p.id, null])),
+    ...Object.fromEntries([...PROVIDER_LIST.map((p) => p.id), "acp" as const].map((id) => [id, null])),
     ...(initialPrefs.draftModels ?? {}),
   },
   draftEffort: initialPrefs.draftEffort ?? "medium",
@@ -1221,6 +1225,22 @@ function notifyToast(msg: string, undo?: UndoArchiveEntry | null): void {
   toastTimer = setTimeout(() => {
     setState((s) => ({ ...s, toastNotice: null, lastArchivedUndo: null }));
   }, undo ? 6000 : 3000);
+}
+
+function resolveAvailableDraftProvider(
+  detail: HostDetailView | null | undefined,
+  current: ProviderKind,
+): ProviderKind {
+  if (!detail) return current;
+  const hasInstalledAcp = Boolean(
+    detail.acp_agents?.some((a) => a.installed && a.spec.enabled),
+  );
+  if (current === "acp" && hasInstalledAcp) return "acp";
+  const avail = detail.host.available_providers;
+  if (avail.includes(current)) return current;
+  if (avail.length > 0) return avail[0];
+  if (hasInstalledAcp) return "acp";
+  return current;
 }
 
 function syncAttentionIndicators(overview: FleetOverviewView, details: Record<string, HostDetailView>): void {
@@ -2323,9 +2343,7 @@ export const orbitActions = {
         activeDetail?.discovered_projects[0]?.path ||
         "~";
 
-      const avail = activeDetail?.host.available_providers ?? [];
-      const nextDraftProvider =
-        avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider;
+      const nextDraftProvider = resolveAvailableDraftProvider(activeDetail, s.draftProvider);
 
       const activeScopeKey =
         !nextDraft && activeHostId && nextAgentId
@@ -2530,10 +2548,10 @@ export const orbitActions = {
         }
       }
 
-      const avail =
-        s.selectedHostId === hostId ? detail.host.available_providers : [];
       const nextDraftProvider =
-        avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider;
+        s.selectedHostId === hostId
+          ? resolveAvailableDraftProvider(detail, s.draftProvider)
+          : s.draftProvider;
 
       const activeScopeKey =
         !nextDraft && s.selectedHostId && nextAgentId
@@ -2749,8 +2767,6 @@ export const orbitActions = {
       firstDiscovered?.path ??
       detail?.discovered_projects[0]?.path ??
       "~";
-    const avail = detail?.host.available_providers ?? [];
-
     setState(
       (s) => ({
         ...s,
@@ -2765,8 +2781,7 @@ export const orbitActions = {
         selectedDiffPath: null,
         draftWorktreeRepoPath: null,
         draftWorkspaceId: null,
-        draftProvider:
-          avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
+        draftProvider: resolveAvailableDraftProvider(detail, s.draftProvider),
       }),
     );
 
@@ -2886,11 +2901,7 @@ export const orbitActions = {
       detail?.discovered_projects[0]?.path ||
       "~";
 
-    const available = detail?.host.available_providers ?? [];
-    const nextProvider =
-      available.length > 0 && !available.includes(state.draftProvider)
-        ? available[0]
-        : state.draftProvider;
+    const nextProvider = resolveAvailableDraftProvider(detail, state.draftProvider);
     const draftKey = `draft::${targetHostId ?? "none"}`;
 
     setState((s) => ({
@@ -2969,7 +2980,6 @@ export const orbitActions = {
 
   selectProjectWorkspace(hostId: string, cwd: string): void {
     const detail = state.hostDetails[hostId];
-    const avail = detail?.host.available_providers ?? [];
     setState((s) => ({
       ...s,
       selectedHostId: hostId,
@@ -2978,8 +2988,7 @@ export const orbitActions = {
       selectedDiffPath: null,
       draftWorktreeRepoPath: null,
       draftWorkspaceId: null,
-      draftProvider:
-        avail.length > 0 && !avail.includes(s.draftProvider) ? avail[0] : s.draftProvider,
+      draftProvider: resolveAvailableDraftProvider(detail, s.draftProvider),
     }));
     orbitActions.refreshSidebarView();
     void orbitActions.ensureWorkspaceFiles(hostId, cwd);
@@ -2991,6 +3000,7 @@ export const orbitActions = {
 
   setDraftConfig(patch: {
     provider?: ProviderKind;
+    acpAgentId?: string | null;
     model?: string | null;
     effort?: ReasoningEffort;
     fastMode?: boolean;
@@ -3011,6 +3021,8 @@ export const orbitActions = {
         return {
           ...s,
           draftProvider: nextProvider,
+          draftAcpAgentId:
+            patch.acpAgentId !== undefined ? patch.acpAgentId : s.draftAcpAgentId,
           draftModels: nextModels,
           draftEffort: patch.effort ?? s.draftEffort,
           draftFastMode: patch.fastMode ?? s.draftFastMode,
@@ -3543,16 +3555,13 @@ export const orbitActions = {
     }
 
     const detailForCompose = state.hostDetails[hostId];
-    const installedForCompose = detailForCompose?.host.available_providers ?? [];
     const activeForCompose =
       !state.isDraftNewSession && state.selectedAgentId
         ? detailForCompose?.agents.find((a) => a.agent_id === state.selectedAgentId) ?? null
         : null;
     const providerForCompose: ProviderKind = activeForCompose
       ? activeForCompose.provider
-      : installedForCompose.length > 0 && !installedForCompose.includes(state.draftProvider)
-        ? installedForCompose[0]
-        : state.draftProvider;
+      : resolveAvailableDraftProvider(detailForCompose, state.draftProvider);
 
     const contextInputs: ComposerContextInput[] = mergedContexts.map((ctx) => {
       switch (ctx.kind) {
@@ -3737,14 +3746,24 @@ export const orbitActions = {
     if (state.isDraftNewSession || !state.selectedAgentId) {
       const hostDetailForCreate = state.hostDetails[hostId];
       const installedProviders = hostDetailForCreate?.host.available_providers ?? [];
-      if (hostDetailForCreate && installedProviders.length === 0) {
+      const installedAcpList = (hostDetailForCreate?.acp_agents ?? []).filter(
+        (a) => a.installed && a.spec.enabled,
+      );
+      if (hostDetailForCreate && installedProviders.length === 0 && installedAcpList.length === 0) {
         orbitActions.showToast("No installed Agent CLI detected on this host");
         return;
       }
-      const effectiveProvider =
-        installedProviders.length > 0 && !installedProviders.includes(state.draftProvider)
-          ? installedProviders[0]
-          : state.draftProvider;
+      const effectiveProvider = resolveAvailableDraftProvider(
+        hostDetailForCreate,
+        state.draftProvider,
+      );
+      const effectiveAcpAgentId =
+        effectiveProvider === "acp"
+          ? state.draftAcpAgentId &&
+            installedAcpList.some((a) => a.spec.id === state.draftAcpAgentId)
+            ? state.draftAcpAgentId
+            : (installedAcpList[0]?.spec.id ?? state.draftAcpAgentId)
+          : null;
 
       const branchSeed =
         cleanUserText ||
@@ -3825,16 +3844,22 @@ export const orbitActions = {
       const explicitDraftModel = state.draftModels[effectiveProvider] ?? null;
       const spec = resolveActiveModelSpec(cat, explicitDraftModel);
       const resolvedModel =
-        resolvedSel?.selected_model_id ?? explicitDraftModel ?? spec?.id ?? null;
+        effectiveProvider === "acp"
+          ? explicitDraftModel
+          : (resolvedSel?.selected_model_id ?? explicitDraftModel ?? spec?.id ?? null);
       const resolvedEffort =
-        resolvedSel?.selected_effort ??
-        resolveSupportedEffortForModel(
-          spec,
-          state.draftEffort,
-          cat.configured_default_effort,
-        );
+        effectiveProvider === "acp"
+          ? null
+          : (resolvedSel?.selected_effort ??
+            resolveSupportedEffortForModel(
+              spec,
+              state.draftEffort,
+              cat.configured_default_effort,
+            ));
       const supportsFast =
-        resolvedSel?.supports_fast_mode ?? Boolean(spec?.supports_fast_mode);
+        effectiveProvider === "acp"
+          ? false
+          : (resolvedSel?.supports_fast_mode ?? Boolean(spec?.supports_fast_mode));
 
       pendingDraftCreate = { hostId, optimisticAgentId: null, startedAt: Date.now() };
       let optimisticId: string | undefined;
@@ -3844,6 +3869,7 @@ export const orbitActions = {
           cwd: effectiveCwd,
           extraDirs: effectiveExtraDirs,
           provider: effectiveProvider,
+          acpAgentId: effectiveAcpAgentId,
           model: resolvedModel,
           effort: resolvedEffort,
           fastMode: Boolean(state.draftFastMode && supportsFast),
@@ -5863,7 +5889,10 @@ export const orbitActions = {
     const model = currentAgent?.model ?? state.draftModels[provider] ?? null;
     const cwd = currentAgent?.cwd || state.selectedWorkspaceCwd || "~";
     const providerLabel =
-      currentAgent?.provider_label ?? formatProviderLabel(provider);
+      currentAgent?.provider_label ??
+      (provider === "acp"
+        ? (state.draftAcpAgentId ?? formatProviderLabel("acp"))
+        : formatProviderLabel(provider));
 
     const gitReview = state.gitReviews[`${hostId}::${cwd}`] ?? null;
     const branchName =

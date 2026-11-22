@@ -1,3 +1,4 @@
+mod acp_cli;
 mod cloud_sync_cli;
 mod mcp_bridge;
 mod orchestration_cli;
@@ -33,6 +34,7 @@ use orbit_relay_transport::{is_ssh_relay_url, redact_relay_url};
 use orbit_shim::{ShimSpawnSpec, run_shim};
 use uuid::Uuid;
 
+use crate::acp_cli::{AcpAction, cmd_acp};
 use crate::orchestration_cli::{
     AgentAction, CliBehavior, CliEffort, ConfigAction, HeartbeatAction, HostAction, PermitAction,
     ProfileAction, ScheduleAction, ScriptAction, SkillAction, TerminalAction, WorkspaceAction,
@@ -106,6 +108,7 @@ pub enum CliProvider {
     MistralVibe,
     #[value(name = "augment", alias = "auggie", alias = "augment-code")]
     Augment,
+    Acp,
 }
 
 impl From<CliProvider> for ProviderKind {
@@ -124,6 +127,7 @@ impl From<CliProvider> for ProviderKind {
             CliProvider::Cline => ProviderKind::Cline,
             CliProvider::MistralVibe => ProviderKind::MistralVibe,
             CliProvider::Augment => ProviderKind::Augment,
+            CliProvider::Acp => ProviderKind::Acp,
         }
     }
 }
@@ -317,6 +321,9 @@ enum Commands {
     Run {
         #[arg(short, long, value_enum, default_value = "antigravity")]
         provider: CliProvider,
+        /// ACP registry agent ID when `--provider acp` is selected (e.g. `opencode`, `gemini-cli`, or custom ID).
+        #[arg(long)]
+        acp_agent: Option<String>,
         #[arg(short, long, value_enum, default_value = "accept-edits")]
         mode: CliMode,
         #[arg(long)]
@@ -489,6 +496,12 @@ enum Commands {
         action: SkillAction,
     },
 
+    /// Manage curated & custom Universal ACP coding agents (`orbit acp list | add | remove | test | refresh`).
+    Acp {
+        #[command(subcommand)]
+        action: AcpAction,
+    },
+
     /// Stdio-to-HTTP MCP 2025-03-26 JSON-RPC bridge connecting external MCP clients to the local Orbit Daemon.
     Mcp {
         #[arg(long)]
@@ -540,6 +553,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let home_dir = resolve_home(cli.home);
     let json_mode = cli.json;
     let via_relay = cli.via_relay;
+    let explicit_server = cli.server.clone();
     let server = resolve_server_url(&home_dir, cli.server);
 
     let is_mcp_stdio = matches!(cli.command, Commands::Mcp { .. });
@@ -1196,6 +1210,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
         Commands::Run {
             provider,
+            acp_agent,
             mode,
             model,
             effort,
@@ -1224,6 +1239,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .ok()
                 .filter(|s| !s.trim().is_empty());
             let effective_notify = notify_on_finish.or_else(|| env_caller.as_ref().map(|_| true));
+            let effective_provider = if acp_agent.is_some() {
+                ProviderKind::Acp
+            } else {
+                provider.into()
+            };
 
             let client = connect_cli_server(&server, via_relay).await?;
             let mut sub_rx = client.subscribe();
@@ -1236,7 +1256,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         cwd: target_cwd.to_string_lossy().to_string(),
                         extra_dirs: Vec::new(),
                         title,
-                        provider: provider.into(),
+                        provider: effective_provider,
                         model,
                         effort: effort.map(Into::into),
                         fast_mode: if no_fast {
@@ -1264,6 +1284,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         branch,
                         handle: None,
                         auto_cluster: None,
+                        acp_agent_id: acp_agent,
                     },
                     Duration::from_secs(45),
                     |w| {
@@ -1540,6 +1561,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Skill { action } => {
             cmd_skill(&server, via_relay, json_mode, action).await?;
+        }
+        Commands::Acp { action } => {
+            cmd_acp(
+                &home_dir,
+                explicit_server.as_deref(),
+                &server,
+                via_relay,
+                json_mode,
+                action,
+            )
+            .await?;
         }
         Commands::Mcp {
             caller_agent_id,

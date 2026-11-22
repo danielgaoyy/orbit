@@ -2242,6 +2242,7 @@ mod tests {
             task_summary: Some("Migrated multi-host schema".into()),
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         };
         store
             .upsert_single_replica_agent("host_workstation", &agent)

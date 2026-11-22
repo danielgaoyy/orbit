@@ -14,6 +14,7 @@ import {
   stripAgyEffortSuffix,
 } from "@/lib/model-catalog";
 import {
+  type AcpAgentAvailability,
   type AgentProfile,
   type ProviderKind,
   type ProviderModelCatalog,
@@ -34,6 +35,7 @@ import { cn } from "@/lib/utils";
 const EMPTY_PROVIDERS: readonly ProviderKind[] = [];
 const EMPTY_CATALOGS: readonly ProviderModelCatalog[] = [];
 const EMPTY_PROFILES: readonly AgentProfile[] = [];
+const EMPTY_ACP_AGENTS: readonly AcpAgentAvailability[] = [];
 
 /**
  * Isolated Agent + Model + Thinking Mode Selector (`[ProviderIcon Model Effort ▾]`).
@@ -51,6 +53,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
+  const draftAcpAgentId = useOrbitSelector((s) => s.draftAcpAgentId);
   const draftModels = useOrbitSelector((s) => s.draftModels);
   const draftEffort = useOrbitSelector((s) => s.draftEffort);
   const draftProfileId = useOrbitSelector((s) => s.draftProfileId);
@@ -59,6 +62,11 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
     s.selectedHostId
       ? (s.hostDetails[s.selectedHostId]?.profiles ?? EMPTY_PROFILES)
       : EMPTY_PROFILES,
+  );
+  const hostAcpAgents = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? (s.hostDetails[s.selectedHostId]?.acp_agents ?? EMPTY_ACP_AGENTS)
+      : EMPTY_ACP_AGENTS,
   );
 
   const availableProviders = useOrbitSelector((s) =>
@@ -77,6 +85,13 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
       (a) => a.agent_id === s.selectedAgentId,
     );
     return ag?.provider ?? null;
+  });
+  const activeAgentAcpId = useOrbitSelector((s) => {
+    if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return null;
+    const ag = s.hostDetails[s.selectedHostId]?.agents.find(
+      (a) => a.agent_id === s.selectedAgentId,
+    );
+    return ag?.acp_agent_id ?? null;
   });
   const activeAgentModel = useOrbitSelector((s) => {
     if (s.isDraftNewSession || !s.selectedHostId || !s.selectedAgentId) return null;
@@ -110,14 +125,39 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
     () => PROVIDERS.filter((p) => availableProviders.includes(p.id)),
     [availableProviders],
   );
+  const installedAcpAgents = useMemo(
+    () => hostAcpAgents.filter((a) => a.installed && a.spec.enabled),
+    [hostAcpAgents],
+  );
+  const hasInstalledAcp = installedAcpAgents.length > 0;
+
   const resolvedDraftProvider: ProviderKind =
-    detectedProviders.length > 0 && !detectedProviders.some((p) => p.id === draftProvider)
-      ? detectedProviders[0].id
-      : draftProvider;
+    draftProvider === "acp" && hasInstalledAcp
+      ? "acp"
+      : detectedProviders.length > 0 && !detectedProviders.some((p) => p.id === draftProvider)
+        ? detectedProviders[0].id
+        : detectedProviders.length === 0 && hasInstalledAcp
+          ? "acp"
+          : draftProvider;
 
   const canSwitchAgentEngine = isDraft || activeAgentProvider === null;
   const activeProvider: ProviderKind =
     !canSwitchAgentEngine && activeAgentProvider ? activeAgentProvider : resolvedDraftProvider;
+  const effectiveAcpAgentId: string | null =
+    activeProvider === "acp"
+      ? !canSwitchAgentEngine
+        ? activeAgentAcpId
+        : (draftAcpAgentId && installedAcpAgents.some((a) => a.spec.id === draftAcpAgentId)
+            ? draftAcpAgentId
+            : (installedAcpAgents[0]?.spec.id ?? draftAcpAgentId))
+      : null;
+  const activeAcpSpec = useMemo(
+    () =>
+      effectiveAcpAgentId
+        ? (hostAcpAgents.find((a) => a.spec.id === effectiveAcpAgentId)?.spec ?? null)
+        : null,
+    [hostAcpAgents, effectiveAcpAgentId],
+  );
 
   const catalogsArray = providerCatalogs as ProviderModelCatalog[];
   const activeCatalog = useMemo(
@@ -139,11 +179,14 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
   const rawDesiredEffort: ReasoningEffort | null = !canSwitchAgentEngine
     ? (activeAgentEffort ?? inferredAgyEffort ?? draftEffort)
     : draftEffort;
-  const effectiveActiveEffort: ReasoningEffort | null = resolveSupportedEffortForModel(
-    activeModelSpec,
-    rawDesiredEffort,
-    activeCatalog.configured_default_effort,
-  );
+  const effectiveActiveEffort: ReasoningEffort | null =
+    activeProvider === "acp"
+      ? null
+      : resolveSupportedEffortForModel(
+          activeModelSpec,
+          rawDesiredEffort,
+          activeCatalog.configured_default_effort,
+        );
 
   const handleSelectModelAndEffort = useCallback(
     (
@@ -177,11 +220,13 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
       : activeProvider
     : activeProvider;
   const effectiveBrowsedProvider: ProviderKind =
-    canSwitchAgentEngine &&
-    detectedProviders.length > 0 &&
-    !detectedProviders.some((p) => p.id === rawBrowsedProvider)
-      ? detectedProviders[0].id
-      : rawBrowsedProvider;
+    canSwitchAgentEngine && rawBrowsedProvider === "acp" && hasInstalledAcp
+      ? "acp"
+      : canSwitchAgentEngine &&
+          detectedProviders.length > 0 &&
+          !detectedProviders.some((p) => p.id === rawBrowsedProvider)
+        ? detectedProviders[0].id
+        : rawBrowsedProvider;
 
   const browsedCatalog = useMemo(
     () => getCatalogForProvider(catalogsArray, effectiveBrowsedProvider),
@@ -287,8 +332,14 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
     [canSwitchAgentEngine, draftProfileId, profiles],
   );
 
-  const showAgentRail = canSwitchAgentEngine && detectedProviders.length > 1;
-  const compactAgentRail = detectedProviders.length > 5;
+  const railProviderCount = detectedProviders.length + (hasInstalledAcp ? 1 : 0);
+  const showAgentRail = canSwitchAgentEngine && railProviderCount > 1;
+  const compactAgentRail = railProviderCount > 5;
+  const activeTriggerLabel = activeDraftProfile
+    ? activeDraftProfile.name
+    : activeProvider === "acp"
+      ? (activeAcpSpec?.name ?? effectiveAcpAgentId ?? "ACP Agent")
+      : formatCatalogModelLabel(activeCatalog, rawActiveModel);
 
   if (disabled) {
     return (
@@ -300,9 +351,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
       >
         <ProviderIcon provider={activeProvider} className="size-4 shrink-0" />
         <span className="text-foreground/88 truncate font-normal">
-          {activeDraftProfile
-            ? activeDraftProfile.name
-            : formatCatalogModelLabel(activeCatalog, rawActiveModel)}
+          {activeTriggerLabel}
         </span>
         {!activeDraftProfile && effectiveActiveEffort && (
           <span className="text-foreground/48 shrink-0 font-normal">
@@ -335,9 +384,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
         >
           <ProviderIcon provider={activeProvider} className="size-4" />
           <span className="text-foreground/88 truncate font-normal">
-            {activeDraftProfile
-              ? activeDraftProfile.name
-              : formatCatalogModelLabel(activeCatalog, rawActiveModel)}
+            {activeTriggerLabel}
           </span>
           {!activeDraftProfile && effectiveActiveEffort && (
             <span className="text-foreground/48 shrink-0 font-normal">
@@ -394,6 +441,40 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                   </SimpleTooltip>
                 );
               })}
+              {hasInstalledAcp && (
+                <>
+                  {detectedProviders.length > 0 && (
+                    <div className="bg-border/70 my-0.5 h-px w-5 shrink-0" />
+                  )}
+                  <SimpleTooltip label="ACP Agents" side="left">
+                    <button
+                      type="button"
+                      aria-label="ACP Agents"
+                      onClick={() => {
+                        setBrowsedProvider("acp");
+                        setHoveredModelKey(null);
+                        const fallbackId =
+                          draftAcpAgentId &&
+                          installedAcpAgents.some((a) => a.spec.id === draftAcpAgentId)
+                            ? draftAcpAgentId
+                            : (installedAcpAgents[0]?.spec.id ?? null);
+                        orbitActions.setDraftConfig({
+                          provider: "acp",
+                          acpAgentId: fallbackId,
+                        });
+                      }}
+                      className={cn(
+                        "flex size-[32px] shrink-0 cursor-pointer items-center justify-center rounded-[9px] transition-colors duration-150",
+                        effectiveBrowsedProvider === "acp"
+                          ? "bg-black/[0.07] dark:bg-white/[0.11]"
+                          : "opacity-85 hover:bg-black/[0.045] hover:opacity-100 dark:hover:bg-white/[0.06]",
+                      )}
+                    >
+                      <ProviderIcon provider="acp" className="size-[16px]" />
+                    </button>
+                  </SimpleTooltip>
+                </>
+              )}
             </div>
           )}
 
@@ -410,8 +491,10 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                 <ProviderIcon provider={effectiveBrowsedProvider} className="size-3.5" />
               )}
               <span className="truncate">
-                {PROVIDERS.find((p) => p.id === effectiveBrowsedProvider)?.label ??
-                  effectiveBrowsedProvider}
+                {effectiveBrowsedProvider === "acp"
+                  ? "ACP Agents"
+                  : (PROVIDERS.find((p) => p.id === effectiveBrowsedProvider)?.label ??
+                    effectiveBrowsedProvider)}
               </span>
             </div>
 
@@ -421,7 +504,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
               onViewportScroll={() => setHoveredModelKey(null)}
               viewportClassName="max-h-[min(448px,calc(var(--available-height,540px)-42px))] px-1.5"
             >
-              {canSwitchAgentEngine && profiles.length > 0 && (
+              {canSwitchAgentEngine && profiles.length > 0 && effectiveBrowsedProvider !== "acp" && (
                 <div className="border-border mb-1.5 space-y-0.5 border-b pb-1.5">
                   <div className="text-muted-foreground/75 flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-medium uppercase">
                     <Sparkles className="size-3" />
@@ -437,6 +520,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                         onClick={() => {
                           orbitActions.setDraftConfig({
                             provider: prof.provider,
+                            acpAgentId: prof.acp_agent_id ?? null,
                             model: prof.model,
                             ...(prof.effort ? { effort: prof.effort } : {}),
                             fastMode: Boolean(prof.fast_mode),
@@ -463,6 +547,79 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                 </div>
               )}
 
+              {effectiveBrowsedProvider === "acp" ? (
+                <div className="space-y-0.5">
+                  {canSwitchAgentEngine ? (
+                    <>
+                      {installedAcpAgents.map((item) => {
+                        const isSelectedAcp =
+                          activeProvider === "acp" && effectiveAcpAgentId === item.spec.id;
+                        return (
+                          <button
+                            key={item.spec.id}
+                            type="button"
+                            onMouseEnter={() => setHoveredModelKey(null)}
+                            onClick={() => {
+                              orbitActions.setDraftConfig({
+                                provider: "acp",
+                                acpAgentId: item.spec.id,
+                                model: null,
+                              });
+                              setModelPopoverOpen(false);
+                            }}
+                            className={cn(
+                              "flex h-[30px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 text-left transition-colors",
+                              isSelectedAcp
+                                ? "bg-black/[0.04] hover:bg-accent/70 dark:bg-white/[0.06]"
+                                : "hover:bg-accent/65",
+                            )}
+                          >
+                            <div className="flex min-w-0 items-center gap-1.5">
+                              <span
+                                className={cn(
+                                  "truncate text-[13px]",
+                                  isSelectedAcp
+                                    ? "text-foreground font-medium"
+                                    : "text-foreground/84 font-normal",
+                                )}
+                              >
+                                {item.spec.name}
+                              </span>
+                              {item.spec.source === "custom" && (
+                                <span className="text-muted-foreground/75 shrink-0 text-[10.5px]">
+                                  Custom
+                                </span>
+                              )}
+                            </div>
+                            {isSelectedAcp && (
+                              <Check className="text-foreground size-3.5 shrink-0 stroke-[1.9]" />
+                            )}
+                          </button>
+                        );
+                      })}
+                      {selectedHostId && (
+                        <div className="border-border/70 mt-1 border-t pt-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setModelPopoverOpen(false);
+                              orbitActions.openSettings(`host:${selectedHostId}:acp`);
+                            }}
+                            className="text-muted-foreground hover:text-foreground hover:bg-accent/65 flex h-[28px] w-full cursor-pointer items-center rounded-[8px] px-2.5 text-left text-[12px] transition-colors"
+                          >
+                            Manage ACP agents…
+                          </button>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="text-muted-foreground px-2.5 py-2 text-[12px]">
+                      {activeAcpSpec?.name ?? effectiveAcpAgentId ?? "ACP Agent"}
+                      {rawActiveModel ? ` · ${rawActiveModel}` : ""}
+                    </div>
+                  )}
+                </div>
+              ) : (
               <div className="space-y-0.5">
               {browsedRows.map((row) => {
                 const isModelActive =
@@ -530,6 +687,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                 );
               })}
               </div>
+              )}
             </ScrollArea>
 
             {/* Zero-Footprint Overlay Anchor for Level-2 Thinking Mode Flyout */}

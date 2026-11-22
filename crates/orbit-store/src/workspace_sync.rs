@@ -1118,6 +1118,7 @@ mod tests {
             task_summary: None,
             forked_from_agent_id: None,
             forked_at_seq: None,
+            acp_agent_id: None,
         }
     }
 

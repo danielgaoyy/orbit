@@ -54,7 +54,7 @@ function emptyCatalog(provider: ProviderKind): ProviderModelCatalog {
 }
 
 const FALLBACK_CATALOG_CACHE: Record<ProviderKind, ProviderModelCatalog> = Object.fromEntries(
-  PROVIDER_LIST.map((p) => [p.id, emptyCatalog(p.id)]),
+  [...PROVIDER_LIST.map((p) => p.id), "acp" as const].map((id) => [id, emptyCatalog(id)]),
 ) as Record<ProviderKind, ProviderModelCatalog>;
 
 export function seedFallbackProviderCatalogs(

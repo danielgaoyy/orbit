@@ -402,6 +402,14 @@ export interface OrchestrationConfig {
   resume_prompt: string;
   installed_skills: string[];
   auto_cluster_enabled?: boolean;
+  keep_awake_while_running?: boolean;
+}
+
+export interface KeepAwakeStatus {
+  enabled: boolean;
+  active: boolean;
+  active_agents: number;
+  backend: string;
 }
 
 export interface OrchestrationSkillInfo {
@@ -677,6 +685,7 @@ export interface HostDetailView {
   connected_hosts?: ConnectedHostSummary[];
   orchestration_config?: OrchestrationConfig;
   orchestration_skills?: OrchestrationSkillInfo[];
+  keep_awake_status?: KeepAwakeStatus | null;
   workspace_scripts?: Record<string, WorkspaceScriptInfo[]>;
   pending_permissions?: PendingPermissionSummary[];
   provider_subagents?: Record<string, ProviderSubagentDescriptor[]>;

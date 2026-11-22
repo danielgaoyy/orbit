@@ -313,6 +313,8 @@ pub enum ConfigAction {
         idle_timeout: Option<u64>,
         #[arg(long)]
         resume_on_startup: Option<bool>,
+        #[arg(long)]
+        keep_awake: Option<bool>,
     },
 }
 
@@ -363,6 +365,7 @@ async fn send_rpc(
             | WireMessage::ConnectedHostAdded { request_id, .. }
             | WireMessage::OrchestrationConfigSnapshot { request_id, .. }
             | WireMessage::OrchestrationSkillsSnapshot { request_id, .. }
+            | WireMessage::KeepAwakeStatusSnapshot { request_id, .. }
             | WireMessage::ProviderSubagentsSnapshot { request_id, .. } => *request_id == req_id,
             WireMessage::RpcError {
                 request_id: Some(r),
@@ -1788,6 +1791,7 @@ pub async fn cmd_config(
             idle_cleanup,
             idle_timeout,
             resume_on_startup,
+            keep_awake,
         } => {
             let get_id = Uuid::new_v4();
             let cur = match send_rpc(
@@ -1813,6 +1817,9 @@ pub async fn cmd_config(
             }
             if let Some(v) = resume_on_startup {
                 next.resume_on_startup = v;
+            }
+            if let Some(v) = keep_awake {
+                next.keep_awake_while_running = v;
             }
             let set_id = Uuid::new_v4();
             let resp = send_rpc(

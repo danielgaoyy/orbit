@@ -10,7 +10,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::Utc;
 use orbit_protocol::{
     ActiveTurnBehavior, AgentStatus, AgentSummary, AttentionState, HostProjectEntry, HostSyncState,
-    OrchestrationConfig, PendingPermissionSummary, PromptBadge, ProviderKind,
+    KeepAwakeStatus, OrchestrationConfig, PendingPermissionSummary, PromptBadge, ProviderKind,
     ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, ReasoningEffort, ScheduleSpec,
     SessionMode, TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus,
     WorkspaceBoardSnapshot, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
@@ -34,6 +34,7 @@ use crate::git::{
     capture_git_tree_snapshot, inspect_git_status, resolve_git_scope, restore_git_tree_snapshot,
     reverse_apply_file_edit_diffs,
 };
+use crate::keep_awake::KeepAwakeManager;
 use crate::messaging::{CoalescedDispatchBatch, sanitize_human_prompt_for_wire};
 use crate::workspace_board::{
     board_file_path, build_workspace_roster_context, default_board_template,
@@ -78,6 +79,7 @@ pub enum DaemonBroadcast {
     WorkspaceBoardUpdated(WorkspaceBoardSnapshot),
     WorkspaceEventRecorded(WorkspaceEventRecord),
     WorkspaceOrganizeProgress(WorkspaceOrganizeEvent),
+    KeepAwakeStatusUpdated(KeepAwakeStatus),
 }
 
 struct LiveAgentEntry {
@@ -159,6 +161,7 @@ pub struct AgentOrchestrator {
     orch_config: Arc<RwLock<OrchestrationConfig>>,
     store: Arc<OrbitStore>,
     pub scripts: Arc<WorkspaceScriptRegistry>,
+    keep_awake: Arc<KeepAwakeManager>,
     live_agents: RwLock<HashMap<String, LiveAgentEntry>>,
     agent_generations: RwLock<HashMap<String, u64>>,
     pending_questions: RwLock<HashMap<String, Vec<String>>>,
@@ -178,6 +181,7 @@ pub struct AgentOrchestrator {
 }
 
 impl AgentOrchestrator {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         home_dir: PathBuf,
         host_id: String,
@@ -186,6 +190,7 @@ impl AgentOrchestrator {
         orch_config: Arc<RwLock<OrchestrationConfig>>,
         store: Arc<OrbitStore>,
         scripts: Arc<WorkspaceScriptRegistry>,
+        keep_awake: Arc<KeepAwakeManager>,
     ) -> Arc<Self> {
         let orbit_exe = resolve_orbit_exe();
         let (broadcast_tx, _) = broadcast::channel(2048);
@@ -198,6 +203,7 @@ impl AgentOrchestrator {
             orch_config,
             store,
             scripts,
+            keep_awake,
             live_agents: RwLock::new(HashMap::new()),
             agent_generations: RwLock::new(HashMap::new()),
             pending_questions: RwLock::new(HashMap::new()),
@@ -211,16 +217,26 @@ impl AgentOrchestrator {
         })
     }
 
+    pub fn keep_awake(&self) -> &Arc<KeepAwakeManager> {
+        &self.keep_awake
+    }
+
     pub(crate) fn store(&self) -> &OrbitStore {
         &self.store
     }
 
     pub(crate) async fn try_acquire_organizer_lock(&self, key: &str) -> bool {
-        self.organizing_locks.write().await.insert(key.to_string())
+        let acquired = self.organizing_locks.write().await.insert(key.to_string());
+        if acquired {
+            self.keep_awake.mark_busy(format!("workflow:{key}"));
+        }
+        acquired
     }
 
     pub(crate) async fn release_organizer_lock(&self, key: &str) {
-        self.organizing_locks.write().await.remove(key);
+        if self.organizing_locks.write().await.remove(key) {
+            self.keep_awake.mark_idle(&format!("workflow:{key}"));
+        }
     }
 
     pub(crate) async fn invalidate_roster_fingerprint(&self, agent_id: &str) {
@@ -267,6 +283,7 @@ impl AgentOrchestrator {
             }
         }
         self.clear_pending_requests(agent_id).await;
+        self.keep_awake.mark_agent_idle(agent_id);
         next_gen
     }
 
@@ -380,6 +397,8 @@ impl AgentOrchestrator {
                     .is_ok()
                 {
                     info!(agent_id = %ag.agent_id, "Reattached surviving agent shim across daemon restart");
+                    self.keep_awake
+                        .notify_agent_status(&ag.agent_id, &ag.status);
                     continue;
                 }
             }
@@ -407,6 +426,7 @@ impl AgentOrchestrator {
                 let _ = self
                     .store
                     .update_agent_status(&ag.agent_id, &AgentStatus::Closed);
+                self.keep_awake.mark_agent_idle(&ag.agent_id);
                 if was_running && cfg.resume_on_startup && !ag.background {
                     let mgr = Arc::clone(self);
                     let ag_id = ag.agent_id.clone();
@@ -1167,6 +1187,8 @@ impl AgentOrchestrator {
             task_summary: None,
         };
         self.store.upsert_agent(&summary, None)?;
+        self.keep_awake
+            .notify_agent_status(&agent_id, &summary.status);
         if !extra_strs.is_empty() {
             let _ = self.store.set_agent_extra_dirs(&agent_id, &extra_strs);
         }
@@ -1270,6 +1292,7 @@ impl AgentOrchestrator {
                     if mgr.current_generation(&ag_id_bg).await != launch_gen {
                         return;
                     }
+                    mgr.keep_awake.mark_agent_idle(&ag_id_bg);
                     if let Ok(ev) = mgr.store.append_timeline_event(
                         &ag_id_bg,
                         1,
@@ -3177,6 +3200,7 @@ impl AgentOrchestrator {
             drop(live_guard);
             if mgr.current_generation(&ag_id).await == expected_gen {
                 mgr.clear_pending_requests(&ag_id).await;
+                mgr.keep_awake.mark_agent_idle(&ag_id);
             }
             done_notify_bg.notify_waiters();
         });
@@ -3258,6 +3282,7 @@ impl AgentOrchestrator {
         let mut should_mark_finished = false;
         let payload = match evt {
             DriverEvent::StatusChanged(status) => {
+                self.keep_awake.notify_agent_status(agent_id, &status);
                 let prev = self.store.get_agent(agent_id).ok().flatten();
                 let was_foreground_busy =
                     prev.as_ref().is_some_and(|a| a.status.is_foreground_busy());
@@ -3424,6 +3449,8 @@ impl AgentOrchestrator {
                     );
                 }
                 self.clear_pending_requests(agent_id).await;
+                self.keep_awake
+                    .notify_agent_status(agent_id, &AgentStatus::Closed);
                 should_check_auto_archive = true;
                 TimelinePayload::StatusChanged {
                     status: AgentStatus::Closed,

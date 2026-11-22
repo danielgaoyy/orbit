@@ -1214,6 +1214,18 @@ pub enum WireMessage {
         skill_ids: Vec<String>,
     },
 
+    // System Keep-Awake (OS Sleep Prevention)
+    GetKeepAwakeStatus {
+        request_id: Uuid,
+    },
+    KeepAwakeStatusSnapshot {
+        request_id: Uuid,
+        status: KeepAwakeStatus,
+    },
+    KeepAwakeStatusUpdated {
+        status: KeepAwakeStatus,
+    },
+
     // Provider-Native Subagent Observability
     ListProviderSubagents {
         request_id: Uuid,
@@ -1662,7 +1674,12 @@ mod tests {
         let cfg = OrchestrationConfig::default();
         assert!(cfg.mcp_inject_enabled);
         assert!(cfg.idle_cleanup_enabled);
+        assert!(cfg.keep_awake_while_running);
         assert_eq!(cfg.idle_timeout_secs, 3600);
+
+        let legacy_cfg: OrchestrationConfig =
+            serde_json::from_str("{}").expect("deserialize legacy empty OrchestrationConfig");
+        assert!(legacy_cfg.keep_awake_while_running);
     }
 
     #[test]

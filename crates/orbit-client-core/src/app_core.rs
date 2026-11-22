@@ -16,11 +16,11 @@ use orbit_crypto::PairingOffer;
 use orbit_protocol::{
     ActiveTurnBehavior, AgentMessageKind, AgentProfile, AgentStatus, AgentSummary, AttentionState,
     BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject, GitStatusSnapshot,
-    HostProjectEntry, HostSyncState, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
-    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
-    ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord, ScheduleSpec,
-    ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
+    HostProjectEntry, HostSyncState, KeepAwakeStatus, ModelOption, OrchestrationConfig,
+    OrchestrationSkillInfo, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge,
+    ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor,
+    ProviderSubagentEvent, QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord,
+    ScheduleSpec, ScheduleTarget, SessionMode, TerminalBinaryFrame, TerminalSummary, TimelineEvent,
     TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage, WorkspaceBoardSnapshot,
     WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
     WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
@@ -266,6 +266,8 @@ pub struct HostDetailView {
     pub orchestration_config: OrchestrationConfig,
     #[serde(default)]
     pub orchestration_skills: Vec<OrchestrationSkillInfo>,
+    #[serde(default)]
+    pub keep_awake_status: Option<KeepAwakeStatus>,
     #[serde(default)]
     pub workspace_scripts: HashMap<String, Vec<WorkspaceScriptInfo>>,
     #[serde(default)]
@@ -576,6 +578,7 @@ struct HostMemoryState {
     connected_hosts: Vec<ConnectedHostSummary>,
     orchestration_config: OrchestrationConfig,
     orchestration_skills: Vec<OrchestrationSkillInfo>,
+    keep_awake_status: Option<KeepAwakeStatus>,
     workspace_scripts: HashMap<String, Vec<WorkspaceScriptInfo>>,
     pending_permissions: Vec<PendingPermissionSummary>,
     provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
@@ -657,6 +660,7 @@ impl HostMemoryState {
             connected_hosts: Vec::new(),
             orchestration_config: OrchestrationConfig::default(),
             orchestration_skills: Vec::new(),
+            keep_awake_status: None,
             workspace_scripts: HashMap::new(),
             pending_permissions: Vec::new(),
             provider_subagents: HashMap::new(),
@@ -1181,6 +1185,7 @@ impl OrbitAppCore {
             connected_hosts: state.connected_hosts.clone(),
             orchestration_config: state.orchestration_config.clone(),
             orchestration_skills: state.orchestration_skills.clone(),
+            keep_awake_status: state.keep_awake_status.clone(),
             workspace_scripts: state.workspace_scripts.clone(),
             pending_permissions: state.pending_permissions.clone(),
             provider_subagents: state.provider_subagents.clone(),
@@ -3050,6 +3055,11 @@ impl OrbitAppCore {
                     })
                     .await;
                 let _ = handle
+                    .send_wire(WireMessage::GetKeepAwakeStatus {
+                        request_id: Uuid::new_v4(),
+                    })
+                    .await;
+                let _ = handle
                     .send_wire(WireMessage::ListOrchestrationSkills {
                         request_id: Uuid::new_v4(),
                     })
@@ -3647,6 +3657,12 @@ impl OrbitAppCore {
                 }
                 WireMessage::OrchestrationConfigSnapshot { config, .. } => {
                     state.orchestration_config = config;
+                    notify_host = true;
+                }
+                WireMessage::KeepAwakeStatusSnapshot { status, .. }
+                | WireMessage::KeepAwakeStatusUpdated { status } => {
+                    state.orchestration_config.keep_awake_while_running = status.enabled;
+                    state.keep_awake_status = Some(status);
                     notify_host = true;
                 }
                 WireMessage::OrchestrationSkillsSnapshot { skills, .. } => {
@@ -4666,6 +4682,12 @@ impl OrbitAppCore {
         self.dispatch_wire(
             host_id,
             WireMessage::GetOrchestrationConfig {
+                request_id: Uuid::new_v4(),
+            },
+        );
+        self.dispatch_wire(
+            host_id,
+            WireMessage::GetKeepAwakeStatus {
                 request_id: Uuid::new_v4(),
             },
         );
@@ -6432,6 +6454,12 @@ impl OrbitAppCore {
             && let Some(h) = guard.get_mut(host_id)
         {
             h.orchestration_config = config.clone();
+            if let Some(ref mut ka) = h.keep_awake_status {
+                ka.enabled = config.keep_awake_while_running;
+                if !ka.enabled {
+                    ka.active = false;
+                }
+            }
         }
         self.dispatch_wire_queued(
             host_id,

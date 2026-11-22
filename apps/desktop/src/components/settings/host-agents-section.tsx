@@ -14,6 +14,7 @@ import {
   SettingGroupLabel,
   SettingRow,
   SettingSectionHeader,
+  ToggleSwitch,
 } from "@/components/settings/settings-primitives";
 import {
   type AgentProfile,
@@ -40,6 +41,7 @@ const DEFAULT_ORCH_CONFIG: OrchestrationConfig = {
   resume_on_startup: false,
   resume_prompt: "Continue where you left off.",
   installed_skills: [],
+  keep_awake_while_running: true,
 };
 
 export function HostAgentsSection({ hostId }: { hostId: string }) {
@@ -74,6 +76,8 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
     hostDetail?.host.available_providers ?? hostCard?.available_providers ?? [];
   const catalogs = hostDetail?.provider_catalogs ?? [];
   const orchConfig = hostDetail?.orchestration_config ?? DEFAULT_ORCH_CONFIG;
+  const keepAwakeStatus = hostDetail?.keep_awake_status ?? null;
+  const keepAwakeEnabled = orchConfig.keep_awake_while_running ?? true;
   const profiles = hostDetail?.profiles ?? [];
   const skills = hostDetail?.orchestration_skills ?? [];
   const connectedHosts = hostDetail?.connected_hosts ?? [];
@@ -315,6 +319,38 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
               checked={orchConfig.resume_on_startup}
               onChange={(e) => void patchOrchConfig({ resume_on_startup: e.target.checked })}
               className="h-4 w-4 cursor-pointer"
+            />
+          </SettingRow>
+
+          <SettingRow
+            title={
+              <span className="inline-flex items-center gap-2">
+                <span>Keep awake while running</span>
+                {keepAwakeStatus?.active && (
+                  <span
+                    title={
+                      keepAwakeStatus.backend && keepAwakeStatus.backend !== "noop"
+                        ? `Preventing idle sleep via ${keepAwakeStatus.backend}`
+                        : "Preventing idle sleep"
+                    }
+                    className="inline-flex h-[20px] items-center gap-1.5 rounded-full border border-emerald-500/25 bg-emerald-500/10 px-2 text-[11px] font-medium text-emerald-600 dark:text-emerald-400"
+                  >
+                    <span className="h-[5px] w-[5px] rounded-full bg-emerald-500" />
+                    <span>
+                      Active
+                      {keepAwakeStatus.active_agents > 0
+                        ? ` · ${keepAwakeStatus.active_agents}`
+                        : ""}
+                    </span>
+                  </span>
+                )}
+              </span>
+            }
+            description="Prevent system sleep while agents are active."
+          >
+            <ToggleSwitch
+              checked={keepAwakeEnabled}
+              onChange={(next) => void patchOrchConfig({ keep_awake_while_running: next })}
             />
           </SettingRow>
         </SettingCard>

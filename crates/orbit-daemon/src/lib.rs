@@ -13,6 +13,7 @@ pub mod discovery;
 pub mod finish_subscriptions;
 pub mod git;
 pub mod idle_cleanup;
+pub mod keep_awake;
 pub mod manager;
 pub mod mcp;
 pub mod messaging;
@@ -65,6 +66,7 @@ use crate::connected_hosts::ConnectedHostsManager;
 use crate::finish_subscriptions::FinishSubscriptionManager;
 use crate::git::{compute_git_diff, inspect_git_status, list_workspace_files, read_workspace_file};
 use crate::idle_cleanup::IdleRuntimeCleanup;
+use crate::keep_awake::KeepAwakeManager;
 use crate::manager::{
     AgentOrchestrator, CreateAgentSpec, CreateWorkspaceSpec, DaemonBroadcast, PtyBroadcast,
 };
@@ -193,6 +195,7 @@ pub struct DaemonRuntime {
     pub connected_hosts: Arc<ConnectedHostsManager>,
     pub scheduler: Arc<ScheduleEngine>,
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
+    pub keep_awake: Arc<KeepAwakeManager>,
     provider_catalogs: RwLock<Option<Vec<ProviderModelCatalog>>>,
     catalog_refresh_lock: AsyncMutex<()>,
     upgrade_lock: AsyncMutex<()>,
@@ -228,11 +231,13 @@ impl DaemonRuntime {
         let listen_port = Arc::new(RwLock::new(
             persisted.listen_addr.map(|a| a.port()).unwrap_or(0),
         ));
+        let keep_awake_enabled = persisted.orchestration.keep_awake_while_running;
         let orch_config = Arc::new(RwLock::new(persisted.orchestration));
 
         let host_id = keypair.host_id()?;
         let store = Arc::new(OrbitStore::open(home_dir.join("orbit.db"))?);
         let scripts = WorkspaceScriptRegistry::new();
+        let keep_awake = Arc::new(KeepAwakeManager::new(keep_awake_enabled));
         let orchestrator = AgentOrchestrator::new(
             home_dir.to_path_buf(),
             host_id.clone(),
@@ -241,8 +246,13 @@ impl DaemonRuntime {
             orch_config.clone(),
             store.clone(),
             scripts,
+            keep_awake.clone(),
         )
         .await;
+        let ka_bcast_tx = orchestrator.broadcast_tx.clone();
+        keep_awake.set_on_status_change(move |status| {
+            let _ = ka_bcast_tx.send(DaemonBroadcast::KeepAwakeStatusUpdated(status));
+        });
         let attachments = Arc::new(AttachmentStagingManager::new(home_dir));
 
         let orch_for_dispatch = orchestrator.clone();
@@ -300,6 +310,7 @@ impl DaemonRuntime {
             connected_hosts,
             scheduler,
             idle_cleanup,
+            keep_awake,
             provider_catalogs: RwLock::new(None),
             catalog_refresh_lock: AsyncMutex::new(()),
             upgrade_lock: AsyncMutex::new(()),
@@ -511,6 +522,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         .with_graceful_shutdown(async move {
             wait_daemon_shutdown_signal().await;
             runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
+            runtime_shutdown.keep_awake.shutdown();
         })
         .await?;
     Ok(())
@@ -993,6 +1005,9 @@ async fn run_client_session_loop(
                     }
                     DaemonBroadcast::WorkspaceOrganizeProgress(event) => {
                         Some(WireMessage::WorkspaceOrganizeProgress { event })
+                    }
+                    DaemonBroadcast::KeepAwakeStatusUpdated(status) => {
+                        Some(WireMessage::KeepAwakeStatusUpdated { status })
                     }
                 };
                 if let Some(msg) = maybe_msg
@@ -2484,12 +2499,19 @@ async fn handle_wire_rpc(
         }
         WireMessage::UpdateOrchestrationConfig { request_id, config } => {
             *runtime.orch_config.write().await = config.clone();
+            runtime
+                .keep_awake
+                .set_enabled(config.keep_awake_while_running);
             let mut persisted = DaemonPersistedConfig::load(&runtime.home_dir);
             persisted.orchestration = config.clone();
             match persisted.save(&runtime.home_dir) {
                 Ok(()) => Some(WireMessage::OrchestrationConfigSnapshot { request_id, config }),
                 Err(e) => Some(rpc_err(request_id, "save_config_failed", e)),
             }
+        }
+        WireMessage::GetKeepAwakeStatus { request_id } => {
+            let status = runtime.keep_awake.status();
+            Some(WireMessage::KeepAwakeStatusSnapshot { request_id, status })
         }
         WireMessage::ListOrchestrationSkills { request_id } => {
             let user_home = resolve_user_home();
@@ -2634,7 +2656,10 @@ async fn handle_wire_rpc(
         } => {
             let tx = out_tx.clone();
             let zstd = *use_zstd;
+            let keep_awake = runtime.keep_awake.clone();
             let handle = tokio::spawn(async move {
+                let _keep_awake_lease =
+                    keep_awake.acquire_lease(format!("side_question:{request_id}"));
                 let resolved_cwd = expand_host_path(&cwd);
                 let (delta_tx, mut delta_rx) = mpsc::unbounded_channel::<String>();
                 let forward_tx = tx.clone();

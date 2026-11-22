@@ -266,6 +266,10 @@ impl ScheduleEngine {
         scheduled_tick: bool,
     ) -> ScheduleRunRecord {
         let run_id = format!("run_{}", &Uuid::new_v4().simple().to_string()[..10]);
+        let _keep_awake_lease = self
+            .orchestrator
+            .keep_awake()
+            .acquire_lease(format!("schedule:{run_id}"));
         let started_at = Utc::now();
         let mut run = ScheduleRunRecord {
             run_id: run_id.clone(),

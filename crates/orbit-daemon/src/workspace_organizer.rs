@@ -98,7 +98,12 @@ fn pick_organizer_providers(preferred: Option<ProviderKind>) -> Vec<ProviderKind
     }
 
     let mut order: Vec<ProviderKind> = Vec::with_capacity(4);
-    if let Some(p) = preferred {
+    if let Some(p) = preferred
+        && matches!(
+            p,
+            ProviderKind::ClaudeCode | ProviderKind::Antigravity | ProviderKind::Codex
+        )
+    {
         order.push(p);
     }
     for fallback in [

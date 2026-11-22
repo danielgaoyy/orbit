@@ -9,7 +9,7 @@ import {
   ConversationViewport,
 } from "@/components/conversation/conversation-viewport";
 import { MarkdownBlocksView } from "@/components/markdown-blocks";
-import type { SessionMode } from "@/lib/orbit-ipc";
+import { formatProviderLabel, type SessionMode } from "@/lib/orbit-ipc";
 import {
   type SideQuestionEntry,
   orbitActions,
@@ -42,11 +42,7 @@ export const SideQuestionTab = memo(function SideQuestionTab() {
       );
       if (ag?.provider_label) return ag.provider_label;
     }
-    return s.draftProvider === "claude_code"
-      ? "Claude Code"
-      : s.draftProvider === "antigravity"
-        ? "Antigravity"
-        : "Codex";
+    return formatProviderLabel(s.draftProvider);
   });
 
   const activeMode: SessionMode = useOrbitSelector((s) => {

@@ -1,6 +1,60 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
-export type ProviderKind = "antigravity" | "codex" | "claude_code";
+export type ProviderKind =
+  | "antigravity"
+  | "codex"
+  | "claude_code"
+  | "opencode"
+  | "gemini_cli"
+  | "cursor_agent"
+  | "copilot"
+  | "goose"
+  | "pi"
+  | "kimi"
+  | "cline"
+  | "mistral_vibe"
+  | "augment";
+
+export interface ProviderMeta {
+  readonly id: ProviderKind;
+  readonly label: string;
+  readonly shortLabel: string;
+  readonly bin: string;
+}
+
+export const PROVIDER_LIST: readonly ProviderMeta[] = [
+  { id: "claude_code", label: "Claude Code", shortLabel: "Claude", bin: "claude" },
+  { id: "codex", label: "Codex", shortLabel: "Codex", bin: "codex" },
+  { id: "antigravity", label: "Antigravity", shortLabel: "AGY", bin: "agy" },
+  { id: "opencode", label: "OpenCode", shortLabel: "OpenCode", bin: "opencode" },
+  { id: "gemini_cli", label: "Gemini CLI", shortLabel: "Gemini", bin: "gemini" },
+  { id: "cursor_agent", label: "Cursor Agent", shortLabel: "Cursor", bin: "cursor-agent" },
+  { id: "copilot", label: "GitHub Copilot", shortLabel: "Copilot", bin: "copilot" },
+  { id: "goose", label: "Goose", shortLabel: "Goose", bin: "goose" },
+  { id: "pi", label: "Pi", shortLabel: "Pi", bin: "pi" },
+  { id: "kimi", label: "Kimi CLI", shortLabel: "Kimi", bin: "kimi" },
+  { id: "cline", label: "Cline", shortLabel: "Cline", bin: "cline" },
+  { id: "mistral_vibe", label: "Mistral Vibe", shortLabel: "Vibe", bin: "vibe-acp" },
+  { id: "augment", label: "Augment", shortLabel: "Augment", bin: "auggie" },
+] as const;
+
+export const PROVIDER_META: Record<ProviderKind, ProviderMeta> = Object.fromEntries(
+  PROVIDER_LIST.map((p) => [p.id, p]),
+) as Record<ProviderKind, ProviderMeta>;
+
+export function formatProviderLabel(provider: ProviderKind | string): string {
+  if (Object.hasOwn(PROVIDER_META, provider)) {
+    return PROVIDER_META[provider as ProviderKind].label;
+  }
+  return provider.replace(/_/g, " ");
+}
+
+export function formatProviderShortLabel(provider: ProviderKind | string): string {
+  if (Object.hasOwn(PROVIDER_META, provider)) {
+    return PROVIDER_META[provider as ProviderKind].shortLabel;
+  }
+  return provider.replace(/_/g, " ");
+}
 export type ReasoningEffort =
   | "off"
   | "low"
@@ -316,6 +370,27 @@ const GENERIC_HARNESS_HANDLES = new Set([
   "claude-code",
   "claude_code",
   "antigravity",
+  "opencode",
+  "open_code",
+  "open-code",
+  "gemini",
+  "gemini_cli",
+  "gemini-cli",
+  "cursor",
+  "cursor_agent",
+  "cursor-agent",
+  "copilot",
+  "goose",
+  "pi",
+  "kimi",
+  "kimi_cli",
+  "kimi-cli",
+  "cline",
+  "vibe",
+  "mistral_vibe",
+  "mistral-vibe",
+  "augment",
+  "auggie",
   "agent",
   "assistant",
   "chat",

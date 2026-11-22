@@ -56,6 +56,14 @@ const AGY_STD_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::High,
 ];
 
+const PI_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::Off,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+];
+
 const AGY_XHIGH_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
@@ -363,17 +371,299 @@ pub fn fallback_provider_catalog(provider: ProviderKind) -> ProviderModelCatalog
                 ),
             ],
         },
+        ProviderKind::OpenCode => ProviderModelCatalog {
+            provider: ProviderKind::OpenCode,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "default",
+                    "OpenCode Default",
+                    "Active model configured in OpenCode",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "anthropic/claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via OpenCode",
+                    false,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "openai/gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via OpenCode",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
+        ProviderKind::GeminiCli => ProviderModelCatalog {
+            provider: ProviderKind::GeminiCli,
+            configured_default_model: Some("auto".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "auto",
+                    "Gemini Auto",
+                    "Default Gemini CLI model routing",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "gemini-2.5-pro",
+                    "Gemini 2.5 Pro",
+                    "Deep reasoning and multi-file edits",
+                    false,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "gemini-2.5-flash",
+                    "Gemini 2.5 Flash",
+                    "Fast interactive iteration",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
+        ProviderKind::CursorAgent => ProviderModelCatalog {
+            provider: ProviderKind::CursorAgent,
+            configured_default_model: Some("auto".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "auto",
+                    "Cursor Auto",
+                    "Automatic model selection in Cursor Agent",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "claude-4-sonnet",
+                    "Claude 4 Sonnet",
+                    "Anthropic Sonnet via Cursor",
+                    false,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via Cursor",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
+        ProviderKind::Copilot => ProviderModelCatalog {
+            provider: ProviderKind::Copilot,
+            configured_default_model: Some("claude-sonnet-4.5".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "claude-sonnet-4.5",
+                    "Claude Sonnet 4.5",
+                    "Default Copilot coding model",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via GitHub Copilot",
+                    false,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "gemini-2.5-pro",
+                    "Gemini 2.5 Pro",
+                    "Google Gemini via GitHub Copilot",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
+        ProviderKind::Goose => ProviderModelCatalog {
+            provider: ProviderKind::Goose,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "default",
+                    "Goose Default",
+                    "Active profile model configured in Goose",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via Goose",
+                    false,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via Goose",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
+        ProviderKind::Pi => ProviderModelCatalog {
+            provider: ProviderKind::Pi,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: Some(ReasoningEffort::Medium),
+            models: vec![
+                make_spec(
+                    "default",
+                    "Pi Default",
+                    "Active model configured in Pi CLI",
+                    true,
+                    Some(ReasoningEffort::Medium),
+                    PI_EFFORTS,
+                ),
+                make_spec(
+                    "anthropic/claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via Pi",
+                    false,
+                    Some(ReasoningEffort::Medium),
+                    PI_EFFORTS,
+                ),
+                make_spec(
+                    "openai/gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via Pi",
+                    false,
+                    Some(ReasoningEffort::Medium),
+                    PI_EFFORTS,
+                ),
+            ],
+        },
+        ProviderKind::Kimi => ProviderModelCatalog {
+            provider: ProviderKind::Kimi,
+            configured_default_model: Some("kimi-k2-thinking".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "kimi-k2-thinking",
+                    "Kimi K2 Thinking",
+                    "Long-horizon reasoning & agentic coding",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "kimi-k2",
+                    "Kimi K2",
+                    "Fast everyday software engineering",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
+        ProviderKind::Cline => ProviderModelCatalog {
+            provider: ProviderKind::Cline,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "default",
+                    "Cline Default",
+                    "Active model configured in Cline CLI",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via Cline",
+                    false,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "gpt-5",
+                    "GPT-5",
+                    "OpenAI flagship via Cline",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
+        ProviderKind::MistralVibe => ProviderModelCatalog {
+            provider: ProviderKind::MistralVibe,
+            configured_default_model: Some("devstral-latest".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "devstral-latest",
+                    "Devstral",
+                    "Mistral agentic software engineering model",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "mistral-large-latest",
+                    "Mistral Large",
+                    "General-purpose reasoning & coding",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
+        ProviderKind::Augment => ProviderModelCatalog {
+            provider: ProviderKind::Augment,
+            configured_default_model: Some("default".to_string()),
+            configured_default_effort: None,
+            models: vec![
+                make_spec(
+                    "default",
+                    "Augment Default",
+                    "Active model configured in Auggie",
+                    true,
+                    None,
+                    &[],
+                ),
+                make_spec(
+                    "claude-sonnet-4-5",
+                    "Claude Sonnet 4.5",
+                    "Anthropic Sonnet via Augment",
+                    false,
+                    None,
+                    &[],
+                ),
+            ],
+        },
     }
 }
 
 pub fn effective_provider_catalogs(live: &[ProviderModelCatalog]) -> Vec<ProviderModelCatalog> {
-    const ORDER: [ProviderKind; 3] = [
-        ProviderKind::ClaudeCode,
-        ProviderKind::Codex,
-        ProviderKind::Antigravity,
-    ];
-    ORDER
-        .into_iter()
+    ProviderKind::all()
+        .iter()
+        .copied()
         .map(|provider| {
             let mut cat = live
                 .iter()
@@ -583,6 +873,31 @@ pub fn sanitize_model_slug(raw: Option<&str>) -> Option<String> {
     }
 }
 
+/// Provider-aware sanitization: preserves any model explicitly listed in the selected provider's
+/// effective catalog and only filters legacy retired slugs on core providers (`Antigravity`,
+/// `Codex`, `ClaudeCode`) when absent from the catalog.
+pub fn sanitize_model_slug_for_provider(
+    provider: ProviderKind,
+    raw: Option<&str>,
+    catalog: Option<&ProviderModelCatalog>,
+) -> Option<String> {
+    let clean = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if let Some(cat) = catalog
+        && cat.models.iter().any(|m| m.id.eq_ignore_ascii_case(clean))
+    {
+        return Some(clean.to_string());
+    }
+    let is_legacy_core = matches!(
+        provider,
+        ProviderKind::Antigravity | ProviderKind::Codex | ProviderKind::ClaudeCode
+    );
+    if is_legacy_core && is_retired_model_slug(clean) {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedModelSelectionView {
     pub provider: ProviderKind,
@@ -606,7 +921,7 @@ pub fn resolve_model_selection(
         .cloned()
         .unwrap_or_else(|| fallback_provider_catalog(provider));
 
-    let clean_desired = sanitize_model_slug(desired_model);
+    let clean_desired = sanitize_model_slug_for_provider(provider, desired_model, Some(&catalog));
     let active_spec = resolve_active_model_spec(&catalog, clean_desired.as_deref());
     let selected_model_id = active_spec
         .map(|s| s.id.clone())
@@ -838,10 +1153,11 @@ mod tests {
     #[test]
     fn effective_catalogs_fallback_and_live_override() {
         let defaults = effective_provider_catalogs(&[]);
-        assert_eq!(defaults.len(), 3);
+        assert_eq!(defaults.len(), ProviderKind::all().len());
         assert_eq!(defaults[0].provider, ProviderKind::ClaudeCode);
         assert_eq!(defaults[1].provider, ProviderKind::Codex);
         assert_eq!(defaults[2].provider, ProviderKind::Antigravity);
+        assert!(defaults.iter().all(|c| !c.models.is_empty()));
         assert_eq!(
             defaults[1].configured_default_model.as_deref(),
             Some("gpt-6.2-sol")
@@ -1026,5 +1342,54 @@ mod tests {
         );
         assert_eq!(orch_res.selected_effort, None);
         assert!(orch_res.thinking_options.is_empty());
+
+        // Regression test (P0 #1): active models on new providers are never wiped by legacy core
+        // RETIRED_MODEL_SLUGS, while legacy Antigravity still resets retired `gemini-2.5-pro`.
+        let gemini_res = resolve_model_selection(
+            &catalogs,
+            ProviderKind::GeminiCli,
+            Some("gemini-2.5-pro"),
+            None,
+        );
+        assert_eq!(
+            gemini_res.selected_model_id.as_deref(),
+            Some("gemini-2.5-pro")
+        );
+        assert_eq!(gemini_res.selected_model_label, "Gemini 2.5 Pro");
+
+        let copilot_res = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Copilot,
+            Some("gemini-2.5-pro"),
+            None,
+        );
+        assert_eq!(
+            copilot_res.selected_model_id.as_deref(),
+            Some("gemini-2.5-pro")
+        );
+
+        for prov in [
+            ProviderKind::Cline,
+            ProviderKind::Goose,
+            ProviderKind::Augment,
+        ] {
+            let res = resolve_model_selection(&catalogs, prov, Some("claude-sonnet-4-5"), None);
+            assert_eq!(
+                res.selected_model_id.as_deref(),
+                Some("claude-sonnet-4-5"),
+                "active model claude-sonnet-4-5 must be preserved on {prov:?}"
+            );
+        }
+
+        let agy_retired = resolve_model_selection(
+            &catalogs,
+            ProviderKind::Antigravity,
+            Some("gemini-2.5-pro"),
+            None,
+        );
+        assert_eq!(
+            agy_retired.selected_model_id.as_deref(),
+            Some("gemini-4-carbon")
+        );
     }
 }

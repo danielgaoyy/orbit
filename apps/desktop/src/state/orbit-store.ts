@@ -49,6 +49,8 @@ import {
   type GitReviewView,
   type HostDetailView,
   type PromptBadge,
+  PROVIDER_LIST,
+  formatProviderLabel,
   type ProviderKind,
   type ReasoningEffort,
   type ReleaseUpdateInfo,
@@ -346,7 +348,7 @@ export interface OrbitUiState {
 
   // Draft new-session launch configuration
   draftProvider: ProviderKind;
-  draftModels: Record<ProviderKind, string | null>;
+  draftModels: Partial<Record<ProviderKind, string | null>>;
   draftEffort: ReasoningEffort;
   draftMode: SessionMode;
   draftProfileId: string | null;
@@ -686,9 +688,8 @@ const defaultInitialState: OrbitUiState = {
 
   draftProvider: initialPrefs.draftProvider ?? "codex",
   draftModels: {
-    claude_code: initialPrefs.draftModels?.claude_code ?? null,
-    codex: initialPrefs.draftModels?.codex ?? null,
-    antigravity: initialPrefs.draftModels?.antigravity ?? null,
+    ...Object.fromEntries(PROVIDER_LIST.map((p) => [p.id, null])),
+    ...(initialPrefs.draftModels ?? {}),
   },
   draftEffort: initialPrefs.draftEffort ?? "medium",
   draftMode:
@@ -1549,7 +1550,7 @@ export const orbitActions = {
       maybeAutoSyncOutdatedHosts();
 
       // Sanitize persisted draft models against Rust catalog & retired-slug table
-      const providers: ProviderKind[] = ["claude_code", "codex", "antigravity"];
+      const providers: ProviderKind[] = PROVIDER_LIST.map((p) => p.id);
       const sanitizedEntries = await Promise.all(
         providers.map(async (provider) => {
           const current = state.draftModels[provider] ?? null;
@@ -5578,12 +5579,7 @@ export const orbitActions = {
     const model = currentAgent?.model ?? state.draftModels[provider] ?? null;
     const cwd = currentAgent?.cwd || state.selectedWorkspaceCwd || "~";
     const providerLabel =
-      currentAgent?.provider_label ??
-      (provider === "claude_code"
-        ? "Claude Code"
-        : provider === "antigravity"
-          ? "Antigravity"
-          : "Codex");
+      currentAgent?.provider_label ?? formatProviderLabel(provider);
 
     const gitReview = state.gitReviews[`${hostId}::${cwd}`] ?? null;
     const branchName =

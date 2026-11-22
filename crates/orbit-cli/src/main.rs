@@ -51,7 +51,7 @@ use crate::ssh_config::{discover_ssh_hosts, provision_relay_via_ssh};
 #[command(
     name = "orbit",
     version,
-    about = "Ultra-fast Multi-Host AI Coding Agent Orchestrator (Antigravity, Codex, Claude Code)"
+    about = "Ultra-fast Multi-Host AI Coding Agent Orchestrator (13 Native Coding Agents)"
 )]
 struct Cli {
     /// Override Orbit state directory (defaults to `~/.orbit`).
@@ -78,9 +78,33 @@ struct Cli {
 pub enum CliProvider {
     #[value(alias = "agy")]
     Antigravity,
+    #[value(alias = "openai")]
     Codex,
-    #[value(alias = "claude")]
+    #[value(name = "claude_code", alias = "claude-code", alias = "claude")]
     ClaudeCode,
+    #[value(name = "opencode", alias = "open-code", alias = "open_code")]
+    OpenCode,
+    #[value(name = "gemini_cli", alias = "gemini-cli", alias = "gemini")]
+    GeminiCli,
+    #[value(name = "cursor_agent", alias = "cursor-agent", alias = "cursor")]
+    CursorAgent,
+    #[value(name = "copilot", alias = "github-copilot", alias = "github_copilot")]
+    Copilot,
+    Goose,
+    #[value(name = "pi", alias = "pi-coding-agent")]
+    Pi,
+    #[value(name = "kimi", alias = "kimi-cli", alias = "kimi_cli")]
+    Kimi,
+    Cline,
+    #[value(
+        name = "mistral_vibe",
+        alias = "mistral-vibe",
+        alias = "vibe",
+        alias = "vibe-acp"
+    )]
+    MistralVibe,
+    #[value(name = "augment", alias = "auggie", alias = "augment-code")]
+    Augment,
 }
 
 impl From<CliProvider> for ProviderKind {
@@ -89,6 +113,16 @@ impl From<CliProvider> for ProviderKind {
             CliProvider::Antigravity => ProviderKind::Antigravity,
             CliProvider::Codex => ProviderKind::Codex,
             CliProvider::ClaudeCode => ProviderKind::ClaudeCode,
+            CliProvider::OpenCode => ProviderKind::OpenCode,
+            CliProvider::GeminiCli => ProviderKind::GeminiCli,
+            CliProvider::CursorAgent => ProviderKind::CursorAgent,
+            CliProvider::Copilot => ProviderKind::Copilot,
+            CliProvider::Goose => ProviderKind::Goose,
+            CliProvider::Pi => ProviderKind::Pi,
+            CliProvider::Kimi => ProviderKind::Kimi,
+            CliProvider::Cline => ProviderKind::Cline,
+            CliProvider::MistralVibe => ProviderKind::MistralVibe,
+            CliProvider::Augment => ProviderKind::Augment,
         }
     }
 }
@@ -568,7 +602,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             } else {
                 for p in providers {
                     println!(
-                        "  [✓] {:<13} -> {} ({})",
+                        "  [✓] {:<15} -> {} ({})",
                         p.kind.display_name(),
                         p.executable_path.display(),
                         p.protocol_transport

@@ -1,8 +1,9 @@
-import type {
-  ProviderKind,
-  ProviderModelCatalog,
-  ProviderModelSpec,
-  ReasoningEffort,
+import {
+  PROVIDER_LIST,
+  type ProviderKind,
+  type ProviderModelCatalog,
+  type ProviderModelSpec,
+  type ReasoningEffort,
 } from "@/lib/orbit-ipc";
 
 export function formatEffortLabel(effort: ReasoningEffort): string {
@@ -43,26 +44,18 @@ export function defaultEffortDescription(effort: ReasoningEffort): string {
   }
 }
 
-const FALLBACK_CATALOG_CACHE: Record<ProviderKind, ProviderModelCatalog> = {
-  codex: {
-    provider: "codex",
+function emptyCatalog(provider: ProviderKind): ProviderModelCatalog {
+  return {
+    provider,
     configured_default_model: null,
     configured_default_effort: null,
     models: [],
-  },
-  claude_code: {
-    provider: "claude_code",
-    configured_default_model: null,
-    configured_default_effort: null,
-    models: [],
-  },
-  antigravity: {
-    provider: "antigravity",
-    configured_default_model: null,
-    configured_default_effort: null,
-    models: [],
-  },
-};
+  };
+}
+
+const FALLBACK_CATALOG_CACHE: Record<ProviderKind, ProviderModelCatalog> = Object.fromEntries(
+  PROVIDER_LIST.map((p) => [p.id, emptyCatalog(p.id)]),
+) as Record<ProviderKind, ProviderModelCatalog>;
 
 export function seedFallbackProviderCatalogs(
   catalogs: readonly ProviderModelCatalog[],
@@ -80,7 +73,7 @@ export function getCatalogForProvider(
   if (live && live.models.length > 0) {
     return live;
   }
-  return FALLBACK_CATALOG_CACHE[provider];
+  return FALLBACK_CATALOG_CACHE[provider] ?? emptyCatalog(provider);
 }
 
 export function stripAgyEffortSuffix(modelId: string): {

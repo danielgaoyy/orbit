@@ -603,7 +603,7 @@ pub fn compose_prompt(
                     format!("/compact {clean_user_text}")
                 }
             }
-            ProviderKind::Codex => {
+            _ => {
                 let instr = build_workflow_instruction(SlashDirective::Compact);
                 if clean_user_text.is_empty() {
                     instr.to_string()

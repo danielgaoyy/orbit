@@ -2036,11 +2036,11 @@ impl OrbitAppCore {
     }
 
     pub fn fallback_provider_catalogs(&self) -> Vec<ProviderModelCatalog> {
-        vec![
-            crate::catalog::fallback_provider_catalog(ProviderKind::Antigravity),
-            crate::catalog::fallback_provider_catalog(ProviderKind::Codex),
-            crate::catalog::fallback_provider_catalog(ProviderKind::ClaudeCode),
-        ]
+        ProviderKind::all()
+            .iter()
+            .copied()
+            .map(crate::catalog::fallback_provider_catalog)
+            .collect()
     }
 
     pub fn bridge_info(&self) -> crate::contract::BridgeInfoView {
@@ -10102,6 +10102,20 @@ fn default_client_models_map() -> HashMap<ProviderKind, Vec<ModelOption>> {
             },
         ],
     );
+    for &kind in ProviderKind::all() {
+        m.entry(kind).or_insert_with(|| {
+            crate::catalog::fallback_provider_catalog(kind)
+                .models
+                .into_iter()
+                .map(|spec| ModelOption {
+                    id: spec.id,
+                    label: spec.label,
+                    description: (!spec.description.is_empty()).then_some(spec.description),
+                    is_default: spec.is_default,
+                })
+                .collect()
+        });
+    }
     m
 }
 
@@ -10409,7 +10423,7 @@ mod tests {
         core.pair_host(&uri).expect("pair");
 
         let detail = core.host_detail("host_mobile").expect("detail");
-        assert_eq!(detail.provider_catalogs.len(), 3);
+        assert_eq!(detail.provider_catalogs.len(), ProviderKind::all().len());
 
         let opt_id = core.create_agent_with_config(CreateAgentRequest {
             host_id: "host_mobile",

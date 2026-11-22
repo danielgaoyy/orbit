@@ -195,6 +195,19 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
 
   const browsedRows = useMemo(() => {
     if (!modelPopoverOpen) return [];
+    const baseModels =
+      browsedCatalog.models.length > 0
+        ? browsedCatalog.models
+        : [
+            {
+              id: "default",
+              label: "Default",
+              description: "Provider default model",
+              is_default: true,
+              default_effort: null,
+              thinking_options: [],
+            },
+          ];
     return [
       ...(isCustomModelActiveOnBrowsed && rawActiveModel
         ? [
@@ -208,7 +221,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
             },
           ]
         : []),
-      ...browsedCatalog.models.map((m) => ({
+      ...baseModels.map((m) => ({
         key: m.id,
         id: m.id,
         label:
@@ -275,6 +288,7 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
   );
 
   const showAgentRail = canSwitchAgentEngine && detectedProviders.length > 1;
+  const compactAgentRail = detectedProviders.length > 5;
 
   if (disabled) {
     return (
@@ -343,11 +357,14 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
         className="w-auto overflow-visible border-0 bg-transparent p-0 !shadow-none"
       >
         <div className="flex items-start gap-1.5">
-          {/* Detached Top-Aligned Left Agent Icon Capsule — wraps icons tightly, zero empty vertical void */}
+          {/* Detached Top-Aligned Left Agent Icon Capsule — wraps installed providers tightly */}
           {showAgentRail && (
             <div
               onMouseEnter={() => setHoveredModelKey(null)}
-              className="bg-popover text-popover-foreground floating-surface flex max-h-[min(480px,calc(var(--available-height,540px)-8px))] flex-col items-center gap-1 overflow-y-auto rounded-[14px] border border-black/[0.09] p-1.5 dark:border-white/[0.10]"
+              className={cn(
+                "bg-popover text-popover-foreground floating-surface flex max-h-[min(420px,calc(var(--available-height,540px)-8px))] flex-col items-center overflow-y-auto rounded-[14px] border border-black/[0.09] dark:border-white/[0.10]",
+                compactAgentRail ? "gap-0.5 p-1" : "gap-1 p-1.5",
+              )}
             >
               {detectedProviders.map((p) => {
                 const isRailSelected = p.id === effectiveBrowsedProvider;
@@ -362,13 +379,17 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                         orbitActions.setDraftConfig({ provider: p.id });
                       }}
                       className={cn(
-                        "flex size-[32px] shrink-0 cursor-pointer items-center justify-center rounded-[9px] transition-colors duration-150",
+                        "flex shrink-0 cursor-pointer items-center justify-center rounded-[9px] transition-colors duration-150",
+                        compactAgentRail ? "size-[28px]" : "size-[32px]",
                         isRailSelected
                           ? "bg-black/[0.07] dark:bg-white/[0.11]"
                           : "opacity-85 hover:bg-black/[0.045] hover:opacity-100 dark:hover:bg-white/[0.06]",
                       )}
                     >
-                      <ProviderIcon provider={p.id} className="size-[16px]" />
+                      <ProviderIcon
+                        provider={p.id}
+                        className={compactAgentRail ? "size-[15px]" : "size-[16px]"}
+                      />
                     </button>
                   </SimpleTooltip>
                 );
@@ -520,7 +541,9 @@ export const ComposerModelPicker = memo(function ComposerModelPicker({
                     "pointer-events-auto absolute z-50",
                     submenuPos.flipLeft
                       ? showAgentRail
-                        ? "right-[calc(100%+52px)] pr-1.5"
+                        ? compactAgentRail
+                          ? "right-[calc(100%+44px)] pr-1.5"
+                          : "right-[calc(100%+52px)] pr-1.5"
                         : "right-full pr-1.5"
                       : "left-full pl-1.5",
                   )}

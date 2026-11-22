@@ -234,11 +234,7 @@ pub fn allocate_unique_handle(
             if taken.is_empty() {
                 "lead".to_string()
             } else {
-                match provider {
-                    ProviderKind::Antigravity => "agy".to_string(),
-                    ProviderKind::Codex => "codex".to_string(),
-                    ProviderKind::ClaudeCode => "claude".to_string(),
-                }
+                provider.short_label().to_ascii_lowercase()
             }
         });
 

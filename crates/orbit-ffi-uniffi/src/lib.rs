@@ -108,6 +108,16 @@ pub enum FfiProviderKind {
     Antigravity,
     Codex,
     ClaudeCode,
+    OpenCode,
+    GeminiCli,
+    CursorAgent,
+    Copilot,
+    Goose,
+    Pi,
+    Kimi,
+    Cline,
+    MistralVibe,
+    Augment,
 }
 
 impl From<ProviderKind> for FfiProviderKind {
@@ -116,6 +126,16 @@ impl From<ProviderKind> for FfiProviderKind {
             ProviderKind::Antigravity => Self::Antigravity,
             ProviderKind::Codex => Self::Codex,
             ProviderKind::ClaudeCode => Self::ClaudeCode,
+            ProviderKind::OpenCode => Self::OpenCode,
+            ProviderKind::GeminiCli => Self::GeminiCli,
+            ProviderKind::CursorAgent => Self::CursorAgent,
+            ProviderKind::Copilot => Self::Copilot,
+            ProviderKind::Goose => Self::Goose,
+            ProviderKind::Pi => Self::Pi,
+            ProviderKind::Kimi => Self::Kimi,
+            ProviderKind::Cline => Self::Cline,
+            ProviderKind::MistralVibe => Self::MistralVibe,
+            ProviderKind::Augment => Self::Augment,
         }
     }
 }
@@ -126,6 +146,16 @@ impl From<FfiProviderKind> for ProviderKind {
             FfiProviderKind::Antigravity => Self::Antigravity,
             FfiProviderKind::Codex => Self::Codex,
             FfiProviderKind::ClaudeCode => Self::ClaudeCode,
+            FfiProviderKind::OpenCode => Self::OpenCode,
+            FfiProviderKind::GeminiCli => Self::GeminiCli,
+            FfiProviderKind::CursorAgent => Self::CursorAgent,
+            FfiProviderKind::Copilot => Self::Copilot,
+            FfiProviderKind::Goose => Self::Goose,
+            FfiProviderKind::Pi => Self::Pi,
+            FfiProviderKind::Kimi => Self::Kimi,
+            FfiProviderKind::Cline => Self::Cline,
+            FfiProviderKind::MistralVibe => Self::MistralVibe,
+            FfiProviderKind::Augment => Self::Augment,
         }
     }
 }
@@ -3716,11 +3746,11 @@ pub fn fallback_provider_catalog(provider: FfiProviderKind) -> FfiProviderModelC
 
 #[uniffi::export]
 pub fn fallback_provider_catalogs() -> Vec<FfiProviderModelCatalog> {
-    vec![
-        core_fallback_provider_catalog(ProviderKind::Antigravity).into(),
-        core_fallback_provider_catalog(ProviderKind::Codex).into(),
-        core_fallback_provider_catalog(ProviderKind::ClaudeCode).into(),
-    ]
+    ProviderKind::all()
+        .iter()
+        .copied()
+        .map(|p| core_fallback_provider_catalog(p).into())
+        .collect()
 }
 
 #[uniffi::export]
@@ -5142,7 +5172,10 @@ mod tests {
             format_catalog_model_label(cat, Some("claude-opus-5-5".into())),
             "Opus 5.5"
         );
-        assert_eq!(core.fallback_provider_catalogs().len(), 3);
+        assert_eq!(
+            core.fallback_provider_catalogs().len(),
+            ProviderKind::all().len()
+        );
 
         let kp = orbit_crypto::HostIdentityKeypair::generate().expect("keypair");
         let offer = orbit_crypto::PairingOffer {

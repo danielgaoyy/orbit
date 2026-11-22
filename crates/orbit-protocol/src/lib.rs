@@ -15,30 +15,216 @@ fn wire_default_true() -> bool {
     true
 }
 
-/// First-class supported coding agent CLIs in Orbit Phase 1.
+/// First-class supported coding agent CLIs in Orbit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
+    #[serde(alias = "agy")]
     Antigravity,
+    #[serde(alias = "openai")]
     Codex,
+    #[serde(alias = "claude", alias = "claude-code")]
     ClaudeCode,
+    #[serde(rename = "opencode", alias = "open_code", alias = "open-code")]
+    OpenCode,
+    #[serde(alias = "gemini", alias = "gemini-cli")]
+    GeminiCli,
+    #[serde(alias = "cursor", alias = "cursor-agent")]
+    CursorAgent,
+    #[serde(alias = "github_copilot", alias = "github-copilot")]
+    Copilot,
+    Goose,
+    #[serde(alias = "pi-coding-agent", alias = "pi_coding_agent")]
+    Pi,
+    #[serde(alias = "kimi_cli", alias = "kimi-cli")]
+    Kimi,
+    Cline,
+    #[serde(
+        alias = "vibe",
+        alias = "vibe_acp",
+        alias = "vibe-acp",
+        alias = "mistral-vibe"
+    )]
+    MistralVibe,
+    #[serde(alias = "auggie", alias = "augment_code", alias = "augment-code")]
+    Augment,
 }
 
 impl ProviderKind {
-    pub fn default_binary(self) -> &'static str {
+    const ALL_PROVIDERS: [Self; 13] = [
+        Self::ClaudeCode,
+        Self::Codex,
+        Self::Antigravity,
+        Self::OpenCode,
+        Self::GeminiCli,
+        Self::CursorAgent,
+        Self::Copilot,
+        Self::Goose,
+        Self::Pi,
+        Self::Kimi,
+        Self::Cline,
+        Self::MistralVibe,
+        Self::Augment,
+    ];
+
+    /// All 13 first-class native coding agent providers in canonical display order.
+    pub const fn all() -> &'static [Self] {
+        &Self::ALL_PROVIDERS
+    }
+
+    /// Canonical wire/config slug matching serde serialization.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Antigravity => "antigravity",
+            Self::Codex => "codex",
+            Self::ClaudeCode => "claude_code",
+            Self::OpenCode => "opencode",
+            Self::GeminiCli => "gemini_cli",
+            Self::CursorAgent => "cursor_agent",
+            Self::Copilot => "copilot",
+            Self::Goose => "goose",
+            Self::Pi => "pi",
+            Self::Kimi => "kimi",
+            Self::Cline => "cline",
+            Self::MistralVibe => "mistral_vibe",
+            Self::Augment => "augment",
+        }
+    }
+
+    /// Parse a provider slug or common CLI alias (case-insensitive).
+    pub fn from_slug(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "antigravity" | "agy" => Some(Self::Antigravity),
+            "codex" | "openai" => Some(Self::Codex),
+            "claude_code" | "claude-code" | "claude" => Some(Self::ClaudeCode),
+            "opencode" | "open_code" | "open-code" => Some(Self::OpenCode),
+            "gemini_cli" | "gemini-cli" | "gemini" => Some(Self::GeminiCli),
+            "cursor_agent" | "cursor-agent" | "cursor" => Some(Self::CursorAgent),
+            "copilot" | "github_copilot" | "github-copilot" | "gh-copilot" => Some(Self::Copilot),
+            "goose" => Some(Self::Goose),
+            "pi" | "pi-coding-agent" | "pi_coding_agent" => Some(Self::Pi),
+            "kimi" | "kimi_cli" | "kimi-cli" => Some(Self::Kimi),
+            "cline" => Some(Self::Cline),
+            "mistral_vibe" | "mistral-vibe" | "vibe" | "vibe-acp" | "vibe_acp" => {
+                Some(Self::MistralVibe)
+            }
+            "augment" | "auggie" | "augment_code" | "augment-code" => Some(Self::Augment),
+            _ => None,
+        }
+    }
+
+    pub const fn default_binary(self) -> &'static str {
         match self {
             Self::Antigravity => "agy",
             Self::Codex => "codex",
             Self::ClaudeCode => "claude",
+            Self::OpenCode => "opencode",
+            Self::GeminiCli => "gemini",
+            Self::CursorAgent => "cursor-agent",
+            Self::Copilot => "copilot",
+            Self::Goose => "goose",
+            Self::Pi => "pi",
+            Self::Kimi => "kimi",
+            Self::Cline => "cline",
+            Self::MistralVibe => "vibe-acp",
+            Self::Augment => "auggie",
         }
     }
 
-    pub fn display_name(self) -> &'static str {
+    /// Alternate binary names checked during PATH discovery when `default_binary()` is absent.
+    pub const fn fallback_binaries(self) -> &'static [&'static str] {
+        match self {
+            Self::MistralVibe => &["vibe"],
+            _ => &[],
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
         match self {
             Self::Antigravity => "Antigravity",
             Self::Codex => "Codex",
             Self::ClaudeCode => "Claude Code",
+            Self::OpenCode => "OpenCode",
+            Self::GeminiCli => "Gemini CLI",
+            Self::CursorAgent => "Cursor Agent",
+            Self::Copilot => "GitHub Copilot",
+            Self::Goose => "Goose",
+            Self::Pi => "Pi",
+            Self::Kimi => "Kimi CLI",
+            Self::Cline => "Cline",
+            Self::MistralVibe => "Mistral Vibe",
+            Self::Augment => "Augment",
         }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Antigravity => "AGY",
+            Self::Codex => "Codex",
+            Self::ClaudeCode => "Claude",
+            Self::OpenCode => "OpenCode",
+            Self::GeminiCli => "Gemini",
+            Self::CursorAgent => "Cursor",
+            Self::Copilot => "Copilot",
+            Self::Goose => "Goose",
+            Self::Pi => "Pi",
+            Self::Kimi => "Kimi",
+            Self::Cline => "Cline",
+            Self::MistralVibe => "Vibe",
+            Self::Augment => "Augment",
+        }
+    }
+
+    pub const fn env_override_key(self) -> &'static str {
+        match self {
+            Self::Antigravity => "ORBIT_AGY_BIN",
+            Self::Codex => "ORBIT_CODEX_BIN",
+            Self::ClaudeCode => "ORBIT_CLAUDE_BIN",
+            Self::OpenCode => "ORBIT_OPENCODE_BIN",
+            Self::GeminiCli => "ORBIT_GEMINI_BIN",
+            Self::CursorAgent => "ORBIT_CURSOR_AGENT_BIN",
+            Self::Copilot => "ORBIT_COPILOT_BIN",
+            Self::Goose => "ORBIT_GOOSE_BIN",
+            Self::Pi => "ORBIT_PI_BIN",
+            Self::Kimi => "ORBIT_KIMI_BIN",
+            Self::Cline => "ORBIT_CLINE_BIN",
+            Self::MistralVibe => "ORBIT_VIBE_BIN",
+            Self::Augment => "ORBIT_AUGGIE_BIN",
+        }
+    }
+
+    pub const fn protocol_transport(self) -> &'static str {
+        match self {
+            Self::Antigravity => "acp-stdio + transcript",
+            Self::Codex => "app-server json-rpc",
+            Self::ClaudeCode => "stream-json control",
+            Self::Pi => "pi-rpc jsonl",
+            Self::OpenCode
+            | Self::GeminiCli
+            | Self::CursorAgent
+            | Self::Copilot
+            | Self::Goose
+            | Self::Kimi
+            | Self::Cline
+            | Self::MistralVibe
+            | Self::Augment => "acp-stdio",
+        }
+    }
+
+    /// Returns `true` for the 9 first-class ACP stdio providers powered by `acp_providers`.
+    pub const fn is_acp_stdio_provider(self) -> bool {
+        matches!(
+            self,
+            Self::OpenCode
+                | Self::GeminiCli
+                | Self::CursorAgent
+                | Self::Copilot
+                | Self::Goose
+                | Self::Kimi
+                | Self::Cline
+                | Self::MistralVibe
+                | Self::Augment
+        )
     }
 }
 
@@ -1886,5 +2072,56 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_kind_all_13_metadata_slugs_and_serde_roundtrip() {
+        assert_eq!(ProviderKind::all().len(), 13);
+        let mut seen_slugs = std::collections::HashSet::new();
+        let mut seen_env_keys = std::collections::HashSet::new();
+        for &kind in ProviderKind::all() {
+            assert!(
+                seen_slugs.insert(kind.slug()),
+                "duplicate slug for {kind:?}"
+            );
+            assert!(
+                seen_env_keys.insert(kind.env_override_key()),
+                "duplicate env key for {kind:?}"
+            );
+            assert!(!kind.default_binary().is_empty());
+            assert!(!kind.display_name().is_empty());
+            assert!(!kind.short_label().is_empty());
+            assert!(!kind.protocol_transport().is_empty());
+            assert_eq!(ProviderKind::from_slug(kind.slug()), Some(kind));
+
+            let serialized = serde_json::to_string(&kind).expect("serialize provider");
+            assert_eq!(serialized, format!("\"{}\"", kind.slug()));
+            let deserialized: ProviderKind =
+                serde_json::from_str(&serialized).expect("deserialize provider");
+            assert_eq!(deserialized, kind);
+        }
+
+        // Alias parsing & serde deserialization
+        let aliases = [
+            ("agy", ProviderKind::Antigravity),
+            ("claude", ProviderKind::ClaudeCode),
+            ("open_code", ProviderKind::OpenCode),
+            ("opencode", ProviderKind::OpenCode),
+            ("gemini", ProviderKind::GeminiCli),
+            ("cursor", ProviderKind::CursorAgent),
+            ("github_copilot", ProviderKind::Copilot),
+            ("kimi_cli", ProviderKind::Kimi),
+            ("vibe", ProviderKind::MistralVibe),
+            ("vibe_acp", ProviderKind::MistralVibe),
+            ("auggie", ProviderKind::Augment),
+        ];
+        for (alias, expected) in aliases {
+            assert_eq!(ProviderKind::from_slug(alias), Some(expected));
+            let wire = format!("\"{alias}\"");
+            let parsed: ProviderKind =
+                serde_json::from_str(&wire).expect("deserialize provider alias");
+            assert_eq!(parsed, expected);
+        }
+        assert_eq!(ProviderKind::MistralVibe.fallback_binaries(), &["vibe"]);
     }
 }

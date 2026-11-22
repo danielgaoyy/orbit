@@ -1,6 +1,8 @@
 import { useState } from "react";
 import {
   Check,
+  ChevronDown,
+  ChevronRight,
   Download,
   Link2,
   Plus,
@@ -17,6 +19,8 @@ import {
   ToggleSwitch,
 } from "@/components/settings/settings-primitives";
 import {
+  PROVIDER_LIST,
+  formatProviderShortLabel,
   type AgentProfile,
   type OrchestrationConfig,
   type ProviderKind,
@@ -27,12 +31,6 @@ import { isLocalHostCard } from "@/lib/projects";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
-
-const PROVIDERS: { id: ProviderKind; label: string; bin: string }[] = [
-  { id: "claude_code", label: "Claude Code", bin: "claude" },
-  { id: "codex", label: "Codex", bin: "codex" },
-  { id: "antigravity", label: "Antigravity", bin: "agy" },
-];
 
 const DEFAULT_ORCH_CONFIG: OrchestrationConfig = {
   mcp_inject_enabled: true,
@@ -52,6 +50,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
   const draftProvider = useOrbitSelector((s) => s.draftProvider);
 
   const [refreshingModels, setRefreshingModels] = useState(false);
+  const [showUninstalledProviders, setShowUninstalledProviders] = useState(false);
 
   const showHostBadge =
     Boolean(hostCard) &&
@@ -60,7 +59,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
   // New Profile form state
   const [addingProfile, setAddingProfile] = useState(false);
   const [profName, setProfName] = useState("");
-  const [profProvider, setProfProvider] = useState<ProviderKind>("claude_code");
+  const [profProvider, setProfProvider] = useState<ProviderKind | null>(null);
   const [profModel, setProfModel] = useState("");
   const [profMode, setProfMode] = useState<SessionMode>("accept_edits");
   const [profWhenToUse, setProfWhenToUse] = useState("");
@@ -74,6 +73,14 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
 
   const available =
     hostDetail?.host.available_providers ?? hostCard?.available_providers ?? [];
+  const installedProviders = PROVIDER_LIST.filter((p) => available.includes(p.id));
+  const uninstalledProviders = PROVIDER_LIST.filter((p) => !available.includes(p.id));
+  const effectiveProfProvider: ProviderKind =
+    profProvider ?? installedProviders[0]?.id ?? "claude_code";
+  const visibleProviders =
+    installedProviders.length === 0 || showUninstalledProviders
+      ? [...installedProviders, ...uninstalledProviders]
+      : installedProviders;
   const catalogs = hostDetail?.provider_catalogs ?? [];
   const orchConfig = hostDetail?.orchestration_config ?? DEFAULT_ORCH_CONFIG;
   const keepAwakeStatus = hostDetail?.keep_awake_status ?? null;
@@ -113,7 +120,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
     const profile: AgentProfile = {
       profile_id: "",
       name: profName.trim(),
-      provider: profProvider,
+      provider: effectiveProfProvider,
       model: profModel.trim() || null,
       effort: null,
       mode: profMode,
@@ -204,9 +211,11 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
 
       {/* 1. Installed CLIs */}
       <div className="space-y-2">
-        <SettingGroupLabel>Installed CLIs</SettingGroupLabel>
+        <SettingGroupLabel>
+          Installed CLIs ({installedProviders.length}/{PROVIDER_LIST.length})
+        </SettingGroupLabel>
         <SettingCard>
-          {PROVIDERS.map((p) => {
+          {visibleProviders.map((p) => {
             const detected = available.includes(p.id);
             const catalog = catalogs.find((c) => c.provider === p.id);
             const modelCount = catalog?.models.length ?? 0;
@@ -264,6 +273,25 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
               </SettingRow>
             );
           })}
+
+          {installedProviders.length > 0 && uninstalledProviders.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowUninstalledProviders((v) => !v)}
+              className="text-muted-foreground hover:text-foreground hover:bg-accent/40 flex w-full cursor-pointer items-center justify-between px-4 py-2.5 text-left text-[12px] transition-colors"
+            >
+              <span>
+                {showUninstalledProviders
+                  ? "Hide uninstalled CLIs"
+                  : `${uninstalledProviders.length} more supported CLIs (not installed)`}
+              </span>
+              {showUninstalledProviders ? (
+                <ChevronDown className="size-3.5 opacity-70" />
+              ) : (
+                <ChevronRight className="size-3.5 opacity-70" />
+              )}
+            </button>
+          )}
         </SettingCard>
       </div>
 
@@ -273,7 +301,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
         <SettingCard>
           <SettingRow
             title="Built-in Orbit MCP Orchestrator"
-            description="Auto-inject the local Streamable HTTP MCP server (/mcp/agents) into Claude, Codex, and Antigravity sessions so agents can delegate subagents, create worktrees, and schedule tasks."
+            description="Auto-inject the local Streamable HTTP MCP server (/mcp/agents) into supported agent sessions so agents can delegate subagents, create worktrees, and schedule tasks."
           >
             <ToggleSwitch
               checked={orchConfig.mcp_inject_enabled}
@@ -379,13 +407,34 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                 className="border-border bg-canvas rounded-lg border px-2.5 py-1.5 outline-none"
               />
               <select
-                value={profProvider}
+                value={effectiveProfProvider}
                 onChange={(e) => setProfProvider(e.target.value as ProviderKind)}
                 className="border-border bg-canvas rounded-lg border px-2 py-1.5"
               >
-                <option value="claude_code">Claude Code</option>
-                <option value="codex">Codex</option>
-                <option value="antigravity">Antigravity</option>
+                {installedProviders.length > 0 && uninstalledProviders.length > 0 ? (
+                  <>
+                    <optgroup label="Installed">
+                      {installedProviders.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="Other Supported">
+                      {uninstalledProviders.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  </>
+                ) : (
+                  PROVIDER_LIST.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.label}
+                    </option>
+                  ))
+                )}
               </select>
               <input
                 value={profModel}
@@ -593,7 +642,7 @@ export function HostAgentsSection({ hostId }: { hostId: string }) {
                 description={
                   peer.last_error
                     ? peer.last_error
-                    : `${peer.hostname ?? peer.host_id ?? "pending handshake"}${peer.available_providers.length > 0 ? ` · ${peer.available_providers.join(", ")}` : ""}`
+                    : `${peer.hostname ?? peer.host_id ?? "pending handshake"}${peer.available_providers.length > 0 ? ` · ${peer.available_providers.map((p) => formatProviderShortLabel(p)).join(", ")}` : ""}`
                 }
               >
                 <div className="flex items-center gap-2">

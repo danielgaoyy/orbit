@@ -20,6 +20,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  PROVIDER_LIST,
+  formatProviderLabel,
   type ProviderKind,
   type ScheduleRunRecord,
   type ScheduleSpec,
@@ -158,11 +160,10 @@ function deriveAutomationName(rawPrompt: string): string {
   return `${cut.trimEnd()}…`;
 }
 
-const PROVIDER_OPTIONS: SettingSelectOption<ProviderKind>[] = [
-  { value: "claude_code", label: "Claude Code" },
-  { value: "codex", label: "Codex" },
-  { value: "antigravity", label: "Antigravity" },
-];
+const PROVIDER_OPTIONS: SettingSelectOption<ProviderKind>[] = PROVIDER_LIST.map((p) => ({
+  value: p.id,
+  label: p.label,
+}));
 
 type SimpleSessionMode = "accept_edits" | "full_access" | "plan" | "default";
 
@@ -180,17 +181,6 @@ function shortWorkspaceName(cwd: string): string {
   const clean = cwd.replace(/\/+$/, "");
   const idx = clean.lastIndexOf("/");
   return idx >= 0 ? clean.slice(idx + 1) || "/" : clean;
-}
-
-function formatProviderLabel(provider: ProviderKind): string {
-  switch (provider) {
-    case "claude_code":
-      return "Claude Code";
-    case "codex":
-      return "Codex";
-    case "antigravity":
-      return "Antigravity";
-  }
 }
 
 function formatModeLabel(mode: SessionMode): string {
@@ -363,6 +353,19 @@ export function AutomationsView() {
     [allSchedules],
   );
   const profiles = hostDetail?.profiles ?? [];
+  const providerSelectOptions = useMemo<SettingSelectOption<ProviderKind>[]>(() => {
+    const installed = hostDetail?.host.available_providers ?? [];
+    if (installed.length === 0) return PROVIDER_OPTIONS;
+    const installedOpts = PROVIDER_LIST.filter((p) => installed.includes(p.id)).map((p) => ({
+      value: p.id,
+      label: p.label,
+    }));
+    const currentMissing = !installedOpts.some((o) => o.value === provider);
+    if (currentMissing) {
+      installedOpts.push({ value: provider, label: formatProviderLabel(provider) });
+    }
+    return installedOpts;
+  }, [hostDetail?.host.available_providers, provider]);
 
   const activeCount = useMemo(
     () => cronSchedules.filter((s) => s.status === "active").length,
@@ -1152,7 +1155,7 @@ export function AutomationsView() {
                           <span className="text-muted-foreground font-medium">Provider</span>
                           <SettingSelect
                             value={provider}
-                            options={PROVIDER_OPTIONS}
+                            options={providerSelectOptions}
                             onChange={setProvider}
                             triggerClassName="w-full h-[30px] min-w-0"
                             menuClassName="w-44"

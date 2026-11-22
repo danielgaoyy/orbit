@@ -35,11 +35,7 @@ use orbit_protocol::{
 use serde::{Deserialize, Serialize};
 
 fn parse_provider_str(raw: &str) -> ProviderKind {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "codex" => ProviderKind::Codex,
-        "claude_code" | "claude" => ProviderKind::ClaudeCode,
-        _ => ProviderKind::Antigravity,
-    }
+    ProviderKind::from_slug(raw).unwrap_or(ProviderKind::Antigravity)
 }
 
 fn parse_mode_str(raw: &str) -> SessionMode {

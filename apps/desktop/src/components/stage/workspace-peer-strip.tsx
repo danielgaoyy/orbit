@@ -15,6 +15,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  formatProviderShortLabel,
   type ProviderKind,
   type SessionMode,
   semanticAgentTabLabel,
@@ -32,14 +33,7 @@ import { orbitActions, threadScopeKey, useOrbitSelector } from "@/state/orbit-st
 import { cn } from "@/lib/utils";
 
 function providerShortName(provider: ProviderKind): string {
-  switch (provider) {
-    case "claude_code":
-      return "Claude";
-    case "codex":
-      return "Codex";
-    case "antigravity":
-      return "AGY";
-  }
+  return formatProviderShortLabel(provider);
 }
 
 function pickAlternateProvider(

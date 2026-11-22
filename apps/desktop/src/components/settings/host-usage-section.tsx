@@ -4,23 +4,14 @@ import {
   SettingCard,
   SettingSectionHeader,
 } from "@/components/settings/settings-primitives";
-import { orbitIpc } from "@/lib/orbit-ipc";
+import { formatProviderLabel, orbitIpc } from "@/lib/orbit-ipc";
 import { isLocalHostCard } from "@/lib/projects";
 import { ProviderIcon } from "@/components/ui/provider-icons";
 import { useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
 function formatProviderName(provider: string): string {
-  switch (provider) {
-    case "claude_code":
-      return "Claude Code";
-    case "codex":
-      return "Codex";
-    case "antigravity":
-      return "Antigravity";
-    default:
-      return provider.replace("_", " ");
-  }
+  return formatProviderLabel(provider);
 }
 
 function formatResetTime(resetsAt: string | null): string | null {

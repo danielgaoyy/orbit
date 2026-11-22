@@ -1173,7 +1173,10 @@ async fn execute_tool_inner(
         }
 
         "list_providers" => {
-            let installed = orbit_providers::discover_installed_providers();
+            let installed =
+                tokio::task::spawn_blocking(orbit_providers::discover_installed_providers)
+                    .await
+                    .unwrap_or_default();
             let list: Vec<Value> = installed
                 .into_iter()
                 .map(|p| {
@@ -1685,14 +1688,13 @@ fn parse_provider_and_model(raw: &str) -> anyhow::Result<(ProviderKind, Option<S
         ),
         None => (raw.trim(), None),
     };
-    let provider = match prov_part.to_ascii_lowercase().as_str() {
-        "claude" | "claude_code" | "claude-code" => ProviderKind::ClaudeCode,
-        "codex" | "openai" => ProviderKind::Codex,
-        "antigravity" | "agy" | "gemini" => ProviderKind::Antigravity,
-        other => anyhow::bail!(
-            "unsupported provider `{other}` (expected `claude_code`, `codex`, or `antigravity`, optionally as `provider/model`)"
-        ),
-    };
+    let provider = ProviderKind::from_slug(prov_part).ok_or_else(|| {
+        let supported: Vec<&str> = ProviderKind::all().iter().map(|p| p.slug()).collect();
+        anyhow::anyhow!(
+            "unsupported provider `{prov_part}` (expected one of: {}, optionally as `provider/model`)",
+            supported.join(", ")
+        )
+    })?;
     Ok((provider, model_part))
 }
 
@@ -1830,7 +1832,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`) or `provider/model` pair." },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`) or `provider/model` pair." },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
                     "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },
@@ -2378,7 +2380,7 @@ fn all_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "handle": { "type": "string", "description": "Short peer handle (e.g. `reviewer`, `backend`, `tester`)." },
-                    "provider": { "type": "string", "description": "`claude_code`, `codex`, `antigravity`, or `provider/model`." },
+                    "provider": { "type": "string", "description": "Provider ID (`claude_code`, `codex`, `antigravity`, `opencode`, `gemini_cli`, `cursor_agent`, `copilot`, `goose`, `pi`, `kimi`, `cline`, `mistral_vibe`, `augment`) or `provider/model`." },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["off", "low", "medium", "high", "xhigh", "max", "ultra"] },
                     "mode": { "type": "string", "enum": ["default", "plan", "accept_edits", "full_access"] },

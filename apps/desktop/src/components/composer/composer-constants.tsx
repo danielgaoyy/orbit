@@ -1,10 +1,11 @@
 import { Shield, ShieldCheck, ShieldOff } from "lucide-react";
 import { defaultEffortDescription, formatEffortLabel } from "@/lib/model-catalog";
-import type {
-  ProviderKind,
-  ReasoningEffort,
-  SessionMode,
-  ThinkingOptionSpec,
+import {
+  PROVIDER_LIST,
+  type ProviderKind,
+  type ReasoningEffort,
+  type SessionMode,
+  type ThinkingOptionSpec,
 } from "@/lib/orbit-ipc";
 import { cn } from "@/lib/utils";
 
@@ -24,11 +25,8 @@ export function conciseThinkingDescription(opt: ThinkingOptionSpec): string {
   return defaultEffortDescription(opt.effort);
 }
 
-export const PROVIDERS: { id: ProviderKind; label: string; shortLabel: string }[] = [
-  { id: "claude_code", label: "Claude Code", shortLabel: "Claude" },
-  { id: "codex", label: "Codex", shortLabel: "Codex" },
-  { id: "antigravity", label: "Antigravity", shortLabel: "Antigravity" },
-];
+export const PROVIDERS: readonly { id: ProviderKind; label: string; shortLabel: string }[] =
+  PROVIDER_LIST;
 
 export const PERMISSION_MODES: {
   id: Exclude<SessionMode, "plan" | { custom: string }>;

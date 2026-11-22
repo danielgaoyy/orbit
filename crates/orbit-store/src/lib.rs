@@ -861,14 +861,17 @@ impl OrbitStore {
         Ok(())
     }
 
-    /// Find the highest numeric segment suffix (`_N`) already persisted for an active Antigravity
-    /// turn so a reattached driver continues segment numbering cleanly without ID collisions.
+    /// Find the highest numeric segment suffix (`_N`) already persisted for an active turn across
+    /// all shim-backed providers (`agy_msg_`, `pi_msg_`, `{slug}_msg_`, and `_th_`) so a reattached
+    /// driver continues segment numbering cleanly without ID collisions.
     pub fn max_turn_segment_step(&self, agent_id: &str, turn_id: &str) -> u64 {
         let Ok(conn) = self.conn.lock() else {
             return 0;
         };
-        let pattern_msg = format!("item_id:agy_msg_{turn_id}_%");
-        let pattern_th = format!("item_id:agy_th_{turn_id}_%");
+        let pattern_msg = format!("item_id:%_msg_{turn_id}_%");
+        let pattern_th = format!("item_id:%_th_{turn_id}_%");
+        let msg_marker = format!("_msg_{turn_id}_");
+        let th_marker = format!("_th_{turn_id}_");
         let Ok(mut stmt) = conn.prepare(
             "SELECT coalesce_key FROM timeline_events
              WHERE agent_id = ?1 AND (coalesce_key LIKE ?2 OR coalesce_key LIKE ?3)",
@@ -880,8 +883,20 @@ impl OrbitStore {
             r.get::<_, String>(0)
         }) {
             for key in rows.flatten() {
-                if let Some(suffix) = key.rsplit('_').next()
-                    && let Ok(n) = suffix.parse::<u64>()
+                let Some(rest) = key.strip_prefix("item_id:") else {
+                    continue;
+                };
+                let suffix = rest
+                    .find(&msg_marker)
+                    .filter(|&i| i > 0)
+                    .map(|i| &rest[i + msg_marker.len()..])
+                    .or_else(|| {
+                        rest.find(&th_marker)
+                            .filter(|&i| i > 0)
+                            .map(|i| &rest[i + th_marker.len()..])
+                    });
+                if let Some(s) = suffix
+                    && let Ok(n) = s.parse::<u64>()
                 {
                     max_step = max_step.max(n);
                 }
@@ -3922,15 +3937,69 @@ mod tests {
         assert_eq!(store.max_turn_segment_step("ag_cur", "turn_abc"), 12);
         assert_eq!(store.max_turn_segment_step("ag_cur", "turn_other"), 0);
 
+        // Multi-provider segment tracking: `pi_msg_`, `opencode_msg_`, `gemini_cli_th_`,
+        // while ignoring unrelated turns that share a prefix (`turn_abc_extra`).
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_pi"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "pi_msg_turn_pi_7".into(),
+                    text: "pi chunk".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append pi msg");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "opencode_msg_turn_acp_9".into(),
+                    text: "opencode chunk".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append opencode msg");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp"),
+                TimelinePayload::AssistantThinking {
+                    item_id: "gemini_cli_th_turn_acp_15".into(),
+                    text: "gemini thought".into(),
+                },
+            )
+            .expect("append gemini th");
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_acp_extra"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "opencode_msg_turn_acp_extra_99".into(),
+                    text: "different turn".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append extra turn");
+
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_pi"), 7);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp"), 15);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_acp_extra"), 99);
+
         let recent = store.fetch_recent_timeline("ag_cur", 2).expect("recent");
         assert_eq!(recent.len(), 2);
         assert!(matches!(
             &recent[0].payload,
-            TimelinePayload::AssistantThinking { item_id, .. } if item_id == "agy_th_turn_abc_5"
+            TimelinePayload::AssistantThinking { item_id, .. } if item_id == "gemini_cli_th_turn_acp_15"
         ));
         assert!(matches!(
             &recent[1].payload,
-            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "agy_msg_turn_abc_12"
+            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "opencode_msg_turn_acp_extra_99"
         ));
     }
 }

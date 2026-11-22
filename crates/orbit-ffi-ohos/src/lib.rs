@@ -8,7 +8,7 @@ use std::sync::Arc;
 use orbit_client_core::HostRouteMode;
 use orbit_client_core::app_core::{
     AskSideQuestionRequest, ClientThreadPref, CoreEventSubscriber, CoreNotification,
-    CreateAgentRequest, OrbitAppCore, TimelineItemView,
+    CreateAgentRequest, OrbitAppCore, RegisterPushDeviceRequest, TimelineItemView,
 };
 use orbit_client_core::catalog::{
     default_effort_description as core_default_effort_description,
@@ -1572,6 +1572,35 @@ impl OhosCoreFacade {
         let run = block_on_core_rpc(self.inner.cancel_workflow_run_on_host(req))?;
         serde_json::to_string(&run).map_err(|e| e.to_string())
     }
+
+    // --- Native Mobile Background Push (APNs / FCM / HarmonyOS Push Kit) ---
+
+    pub fn register_push_device_json(
+        &self,
+        host_id: &str,
+        req_json: &str,
+    ) -> Result<String, String> {
+        let req: RegisterPushDeviceRequest =
+            serde_json::from_str(req_json).map_err(|e| e.to_string())?;
+        let snap = self.inner.register_push_device_blocking(host_id, req)?;
+        serde_json::to_string(&snap).map_err(|e| e.to_string())
+    }
+
+    pub fn unregister_push_device_json(
+        &self,
+        host_id: &str,
+        device_id: &str,
+    ) -> Result<String, String> {
+        let snap = self
+            .inner
+            .unregister_push_device_blocking(host_id, device_id)?;
+        serde_json::to_string(&snap).map_err(|e| e.to_string())
+    }
+
+    pub fn list_push_devices_json(&self, host_id: &str) -> Result<String, String> {
+        let snap = self.inner.list_push_devices_blocking(host_id)?;
+        serde_json::to_string(&snap).map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(target_env = "ohos")]
@@ -1595,6 +1624,68 @@ mod ohos_napi {
         filename: String,
         mime_type: Option<String>,
         bytes: Vec<u8>,
+    }
+
+    pub struct RegisterPushDeviceTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        req_json: String,
+    }
+
+    impl Task for RegisterPushDeviceTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .register_push_device_json(&self.host_id, &self.req_json)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct UnregisterPushDeviceTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+        device_id: String,
+    }
+
+    impl Task for UnregisterPushDeviceTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .unregister_push_device_json(&self.host_id, &self.device_id)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
+    }
+
+    pub struct ListPushDevicesTask {
+        facade: OhosCoreFacade,
+        host_id: String,
+    }
+
+    impl Task for ListPushDevicesTask {
+        type Output = String;
+        type JsValue = String;
+
+        fn compute(&mut self) -> Result<Self::Output> {
+            self.facade
+                .list_push_devices_json(&self.host_id)
+                .map_err(Error::from_reason)
+        }
+
+        fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+            Ok(output)
+        }
     }
 
     impl Task for StageAttachmentTask {
@@ -3473,6 +3564,40 @@ mod ohos_napi {
             AsyncTask::new(CancelWorkflowRunTask {
                 facade: self.facade.clone(),
                 req_json,
+            })
+        }
+
+        #[napi]
+        pub fn register_push_device_json(
+            &self,
+            host_id: String,
+            req_json: String,
+        ) -> AsyncTask<RegisterPushDeviceTask> {
+            AsyncTask::new(RegisterPushDeviceTask {
+                facade: self.facade.clone(),
+                host_id,
+                req_json,
+            })
+        }
+
+        #[napi]
+        pub fn unregister_push_device_json(
+            &self,
+            host_id: String,
+            device_id: String,
+        ) -> AsyncTask<UnregisterPushDeviceTask> {
+            AsyncTask::new(UnregisterPushDeviceTask {
+                facade: self.facade.clone(),
+                host_id,
+                device_id,
+            })
+        }
+
+        #[napi]
+        pub fn list_push_devices_json(&self, host_id: String) -> AsyncTask<ListPushDevicesTask> {
+            AsyncTask::new(ListPushDevicesTask {
+                facade: self.facade.clone(),
+                host_id,
             })
         }
     }

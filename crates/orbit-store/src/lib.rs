@@ -7,6 +7,7 @@ pub mod goals;
 pub mod guardian;
 pub mod im_channels;
 pub mod orchestration;
+pub mod push;
 pub mod search;
 pub mod timers;
 pub mod triggers;
@@ -19,6 +20,7 @@ pub use artifacts::{
 };
 pub use im_channels::StoredImChannel;
 pub use orchestration::*;
+pub use push::{StoredPushDevice, StoredPushPreferences};
 pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
 pub use triggers::{
     DEFAULT_RECENT_DELIVERIES_LIMIT, StoredEventTrigger, UpsertEventTriggerParams,
@@ -458,6 +460,7 @@ impl OrbitStore {
         triggers::migrate_event_triggers_schema(&conn)?;
         workflows::migrate_workflows_schema(&conn)?;
         im_channels::migrate_im_channels_schema(&conn)?;
+        push::migrate_push_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

@@ -13,6 +13,7 @@ pub mod lsp;
 pub mod mcp_servers;
 pub mod media;
 pub mod orchestration;
+pub mod push;
 pub mod rules;
 pub mod skills;
 pub mod timers;
@@ -32,6 +33,7 @@ pub use lsp::*;
 pub use mcp_servers::*;
 pub use media::*;
 pub use orchestration::*;
+pub use push::*;
 pub use rules::*;
 pub use skills::*;
 pub use timers::*;
@@ -2648,6 +2650,48 @@ pub enum WireMessage {
         detail: String,
     },
 
+    // Enhanced Desktop Notifications & Native Mobile Background Push (APNs / FCM / HarmonyOS Push Kit)
+    RegisterPushDevice {
+        request_id: Uuid,
+        device_id: String,
+        platform: PushPlatform,
+        device_name: String,
+        device_token: String,
+        #[serde(default)]
+        sandbox: bool,
+    },
+    UnregisterPushDevice {
+        request_id: Uuid,
+        device_id: String,
+    },
+    ListPushDevices {
+        request_id: Uuid,
+    },
+    UpdatePushPreferences {
+        request_id: Uuid,
+        preferences: PushPreferences,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gateway_auth_token: Option<String>,
+        #[serde(default = "wire_default_true")]
+        keep_existing_gateway_token: bool,
+    },
+    PushDevicesSnapshot {
+        request_id: Uuid,
+        devices: Vec<PushDeviceRecord>,
+        preferences: PushPreferences,
+    },
+    TestPushNotification {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_id: Option<String>,
+    },
+    PushTestResponse {
+        request_id: Uuid,
+        attempted: u32,
+        delivered: u32,
+        detail: String,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -4552,6 +4596,73 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode im_channels wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode im_channels wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn push_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let device = PushDeviceRecord {
+            device_id: "ios_1".into(),
+            platform: PushPlatform::Apns,
+            device_name: "Jess iPhone".into(),
+            masked_token: "••••abcdef".into(),
+            sandbox: false,
+            enabled: true,
+            last_delivered_at_ms: Some(1_760_000_005_000),
+            last_error: None,
+            registered_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_005_000,
+        };
+        let prefs = PushPreferences {
+            push_gateway_url: Some("https://push.orbit.example/v1/dispatch".into()),
+            has_gateway_auth_token: true,
+            ..PushPreferences::default()
+        };
+        let messages = vec![
+            WireMessage::RegisterPushDevice {
+                request_id: req_id,
+                device_id: "ios_1".into(),
+                platform: PushPlatform::Apns,
+                device_name: "Jess iPhone".into(),
+                device_token: "apns_token_123456abcdef".into(),
+                sandbox: false,
+            },
+            WireMessage::UnregisterPushDevice {
+                request_id: req_id,
+                device_id: "ios_1".into(),
+            },
+            WireMessage::ListPushDevices { request_id: req_id },
+            WireMessage::UpdatePushPreferences {
+                request_id: req_id,
+                preferences: prefs.clone(),
+                gateway_auth_token: Some("secret_token".into()),
+                keep_existing_gateway_token: false,
+            },
+            WireMessage::PushDevicesSnapshot {
+                request_id: req_id,
+                devices: vec![device],
+                preferences: prefs,
+            },
+            WireMessage::TestPushNotification {
+                request_id: req_id,
+                device_id: Some("ios_1".into()),
+            },
+            WireMessage::PushTestResponse {
+                request_id: req_id,
+                attempted: 1,
+                delivered: 1,
+                detail: "Delivered to 1/1 devices".into(),
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode push wire msg");
+            let decoded = WireMessage::decode_zstd(&encoded).expect("decode push wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

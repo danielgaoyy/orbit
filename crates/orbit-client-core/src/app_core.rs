@@ -26,13 +26,13 @@ use orbit_protocol::{
     MonitorWatchRecord, OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule,
     PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord,
-    ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
-    TerminalSummary, TimelineEvent, TimelinePayload, TimerCondition, ToolCallDetail,
-    ToolCallStatus, UsageInsightsSnapshot, WireMessage, WorkflowRunRecord, WorkspaceBoardSnapshot,
-    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation,
-    WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode,
-    WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem, QueuedPromptView,
+    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
+    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload,
+    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
+    WorkflowRunRecord, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind,
+    WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo,
+    WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -535,6 +535,66 @@ fn default_keep_existing_secrets() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushDevicesSnapshotView {
+    pub devices: Vec<PushDeviceRecord>,
+    pub preferences: PushPreferences,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushTestResultView {
+    pub attempted: u32,
+    pub delivered: u32,
+    pub detail: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RegisterPushDeviceRequest {
+    pub device_id: String,
+    pub platform: PushPlatform,
+    pub device_name: String,
+    pub device_token: String,
+    #[serde(default)]
+    pub sandbox: bool,
+}
+
+impl std::fmt::Debug for RegisterPushDeviceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterPushDeviceRequest")
+            .field("device_id", &self.device_id)
+            .field("platform", &self.platform)
+            .field("device_name", &self.device_name)
+            .field("device_token", &"[REDACTED]")
+            .field("sandbox", &self.sandbox)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UpdatePushPreferencesRequest {
+    pub preferences: PushPreferences,
+    #[serde(default)]
+    pub gateway_auth_token: Option<String>,
+    #[serde(default = "default_keep_existing_secrets")]
+    pub keep_existing_gateway_token: bool,
+}
+
+impl std::fmt::Debug for UpdatePushPreferencesRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdatePushPreferencesRequest")
+            .field("preferences", &self.preferences)
+            .field(
+                "gateway_auth_token",
+                &self.gateway_auth_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "keep_existing_gateway_token",
+                &self.keep_existing_gateway_token,
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTimelineView {
     pub revision: u64,
     pub host_id: String,
@@ -816,6 +876,10 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ImChannelsSnapshotView, String>>>,
     pending_im_channel_tests:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ImChannelTestResultView, String>>>,
+    pending_push_snapshots:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PushDevicesSnapshotView, String>>>,
+    pending_push_tests:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PushTestResultView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -959,6 +1023,8 @@ impl HostMemoryState {
             pending_workflow_lists: HashMap::new(),
             pending_im_channels: HashMap::new(),
             pending_im_channel_tests: HashMap::new(),
+            pending_push_snapshots: HashMap::new(),
+            pending_push_tests: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -5482,6 +5548,32 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(ImChannelTestResultView { ok, detail }));
                     }
                 }
+                WireMessage::PushDevicesSnapshot {
+                    request_id,
+                    devices,
+                    preferences,
+                } => {
+                    if let Some(tx) = state.pending_push_snapshots.remove(&request_id) {
+                        let _ = tx.send(Ok(PushDevicesSnapshotView {
+                            devices,
+                            preferences,
+                        }));
+                    }
+                }
+                WireMessage::PushTestResponse {
+                    request_id,
+                    attempted,
+                    delivered,
+                    detail,
+                } => {
+                    if let Some(tx) = state.pending_push_tests.remove(&request_id) {
+                        let _ = tx.send(Ok(PushTestResultView {
+                            attempted,
+                            delivered,
+                            detail,
+                        }));
+                    }
+                }
                 WireMessage::GoalRunsSnapshot { request_id, goals } => {
                     if let Some(tx) = state.pending_goal_lists.remove(&request_id) {
                         let _ = tx.send(Ok(goals.clone()));
@@ -5891,6 +5983,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_im_channel_tests.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_push_snapshots.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_push_tests.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -12611,6 +12711,257 @@ impl OrbitAppCore {
             .map_err(|_| format!("{op_label} task cancelled"))?
     }
 
+    /// List registered mobile push devices and push preferences on any connected host.
+    pub async fn list_push_devices_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_string(),
+            |request_id| WireMessage::ListPushDevices { request_id },
+            "load push notification settings",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Register or update a mobile push device token on any connected host.
+    pub async fn register_push_device_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        req: RegisterPushDeviceRequest,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::RegisterPushDevice {
+                request_id,
+                device_id: req.device_id,
+                platform: req.platform,
+                device_name: req.device_name,
+                device_token: req.device_token,
+                sandbox: req.sandbox,
+            },
+            "register push device",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Unregister a mobile push device on any connected host.
+    pub async fn unregister_push_device_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        device_id: String,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::UnregisterPushDevice {
+                request_id,
+                device_id,
+            },
+            "unregister push device",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Update push preferences and optional gateway auth token on any connected host.
+    pub async fn update_push_preferences_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        req: UpdatePushPreferencesRequest,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        self.dispatch_push_snapshot_rpc(
+            host_id.to_string(),
+            move |request_id| WireMessage::UpdatePushPreferences {
+                request_id,
+                preferences: req.preferences,
+                gateway_auth_token: req.gateway_auth_token,
+                keep_existing_gateway_token: req.keep_existing_gateway_token,
+            },
+            "update push preferences",
+            Duration::from_secs(15),
+        )
+        .await
+    }
+
+    /// Trigger a test push notification on any connected host.
+    pub async fn test_push_notification_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        device_id: Option<String>,
+    ) -> Result<PushTestResultView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to test push notification".to_string());
+        };
+
+        let host_id_owned = host_id.to_string();
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id_owned) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_push_tests.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some("Host disconnected before test push notification".to_string()),
+                    None => Some(format!("host `{host_id_owned}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session
+                .send_wire(WireMessage::TestPushNotification {
+                    request_id: req_id,
+                    device_id,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id_owned)
+                {
+                    h.pending_push_tests.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to send test push: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while sending test push".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id_owned)
+                    {
+                        h.pending_push_tests.remove(&req_id);
+                    }
+                    Err("Timed out waiting for daemon to send test push".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| "test push notification task cancelled".to_string())?
+    }
+
+    pub fn list_push_devices_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        self.runtime
+            .block_on(async move { core.list_push_devices_on_host(&host).await })
+    }
+
+    pub fn register_push_device_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        req: RegisterPushDeviceRequest,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        self.runtime
+            .block_on(async move { core.register_push_device_on_host(&host, req).await })
+    }
+
+    pub fn unregister_push_device_blocking(
+        self: &Arc<Self>,
+        host_id: &str,
+        device_id: &str,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        let core = Arc::clone(self);
+        let host = host_id.to_string();
+        let dev = device_id.to_string();
+        self.runtime
+            .block_on(async move { core.unregister_push_device_on_host(&host, dev).await })
+    }
+
+    async fn dispatch_push_snapshot_rpc(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+        timeout: Duration,
+    ) -> Result<PushDevicesSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            let register_err = match core.hosts.write() {
+                Ok(mut guard) => match guard.get_mut(&host_id) {
+                    Some(h) if h.session.is_some() => {
+                        h.pending_push_snapshots.insert(req_id, ack_tx);
+                        None
+                    }
+                    Some(_) => Some(format!("Host disconnected before {op_label}")),
+                    None => Some(format!("host `{host_id}` removed")),
+                },
+                Err(_) => Some("host state lock poisoned".to_string()),
+            };
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_push_snapshots.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+            let out = match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_push_snapshots.remove(&req_id);
+                    }
+                    Err(format!("Timed out waiting for daemon to {op_label}"))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
     /// List discovered and active LSP language servers for a workspace on any connected host.
     pub async fn list_lsp_servers_on_host(
         self: &Arc<Self>,
@@ -15814,6 +16165,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_im_channel_tests.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_push_snapshots.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_push_tests.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (req_id, tx) in h.pending_side_questions.drain() {

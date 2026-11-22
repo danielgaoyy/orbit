@@ -9,8 +9,8 @@ use orbit_client_core::app_core::{
     AgentCardView, AgentTimelineDeltaView, AgentTimelineView, AskSideQuestionRequest,
     ClientProjectView, ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest,
     DirectoryListingView, FleetOverviewView, GitReviewView, HostCardView, HostDetailView,
-    OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent, StagedAttachmentView,
-    TimelineItemView, WorkspaceFileView,
+    OrbitAppCore, PushDevicesSnapshotView, RegisterPushDeviceRequest, RewindAgentResultView,
+    SideQuestionStreamEvent, StagedAttachmentView, TimelineItemView, WorkspaceFileView,
 };
 use orbit_client_core::catalog::{
     ResolvedModelSelectionView, default_effort_description as core_default_effort_description,
@@ -68,13 +68,13 @@ use orbit_protocol::{
     DirectoryEntry, DiscoveredProject, ForkTarget, HandoffFileChange, NestedGitRepo,
     PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog, ProviderModelSpec,
     ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    ProviderSubagentStatus, QuestionItem, QuotaWindow, ReasoningEffort, ScheduleKind,
-    ScheduleNewAgentConfig, ScheduleRunRecord, ScheduleRunStatus, ScheduleSpec, ScheduleStatus,
-    ScheduleTarget, SessionMode, TerminalSummary, ThinkingOptionSpec, TimelinePayload,
-    ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
-    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceFileConflict, WorkspaceIsolation,
-    WorkspaceOrganizeEvent, WorkspaceOrganizePhase, WorkspaceSummary, WorktreeHandoffDirection,
-    WorktreeHandoffMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    ProviderSubagentStatus, PushDeviceRecord, PushPlatform, PushPreferences, QuestionItem,
+    QuotaWindow, ReasoningEffort, ScheduleKind, ScheduleNewAgentConfig, ScheduleRunRecord,
+    ScheduleRunStatus, ScheduleSpec, ScheduleStatus, ScheduleTarget, SessionMode, TerminalSummary,
+    ThinkingOptionSpec, TimelinePayload, ToolCallDetail, ToolCallStatus, WorkspaceBoardSnapshot,
+    WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord, WorkspaceFileConflict,
+    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceOrganizePhase, WorkspaceSummary,
+    WorktreeHandoffDirection, WorktreeHandoffMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
 };
 
 uniffi::setup_scaffolding!();
@@ -6037,6 +6037,169 @@ impl OrbitMobileCore {
             .map_err(|e| FfiOrbitError::Core {
                 detail: e.to_string(),
             })
+    }
+
+    // --- Native Mobile Background Push (APNs / FCM / HarmonyOS Push Kit) ---
+
+    pub fn register_push_device(
+        &self,
+        host_id: String,
+        req: FfiRegisterPushDeviceRequest,
+    ) -> Result<FfiPushDevicesSnapshot, FfiOrbitError> {
+        self.inner
+            .register_push_device_blocking(&host_id, req.into())
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn unregister_push_device(
+        &self,
+        host_id: String,
+        device_id: String,
+    ) -> Result<FfiPushDevicesSnapshot, FfiOrbitError> {
+        self.inner
+            .unregister_push_device_blocking(&host_id, &device_id)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+
+    pub fn list_push_devices(
+        &self,
+        host_id: String,
+    ) -> Result<FfiPushDevicesSnapshot, FfiOrbitError> {
+        self.inner
+            .list_push_devices_blocking(&host_id)
+            .map(Into::into)
+            .map_err(|detail| FfiOrbitError::Core { detail })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiPushPlatform {
+    Apns,
+    Fcm,
+    HarmonyPushKit,
+}
+
+impl From<PushPlatform> for FfiPushPlatform {
+    fn from(v: PushPlatform) -> Self {
+        match v {
+            PushPlatform::Apns => Self::Apns,
+            PushPlatform::Fcm => Self::Fcm,
+            PushPlatform::HarmonyPushKit => Self::HarmonyPushKit,
+        }
+    }
+}
+
+impl From<FfiPushPlatform> for PushPlatform {
+    fn from(v: FfiPushPlatform) -> Self {
+        match v {
+            FfiPushPlatform::Apns => Self::Apns,
+            FfiPushPlatform::Fcm => Self::Fcm,
+            FfiPushPlatform::HarmonyPushKit => Self::HarmonyPushKit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiRegisterPushDeviceRequest {
+    pub device_id: String,
+    pub platform: FfiPushPlatform,
+    pub device_name: String,
+    pub device_token: String,
+    pub sandbox: bool,
+}
+
+impl From<FfiRegisterPushDeviceRequest> for RegisterPushDeviceRequest {
+    fn from(v: FfiRegisterPushDeviceRequest) -> Self {
+        Self {
+            device_id: v.device_id,
+            platform: v.platform.into(),
+            device_name: v.device_name,
+            device_token: v.device_token,
+            sandbox: v.sandbox,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPushDeviceRecord {
+    pub device_id: String,
+    pub platform: FfiPushPlatform,
+    pub device_name: String,
+    pub masked_token: String,
+    pub sandbox: bool,
+    pub enabled: bool,
+    pub last_delivered_at_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub registered_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+impl From<PushDeviceRecord> for FfiPushDeviceRecord {
+    fn from(v: PushDeviceRecord) -> Self {
+        Self {
+            device_id: v.device_id,
+            platform: v.platform.into(),
+            device_name: v.device_name,
+            masked_token: v.masked_token,
+            sandbox: v.sandbox,
+            enabled: v.enabled,
+            last_delivered_at_ms: v.last_delivered_at_ms,
+            last_error: v.last_error,
+            registered_at_ms: v.registered_at_ms,
+            updated_at_ms: v.updated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPushPreferences {
+    pub enabled: bool,
+    pub notify_permission_required: bool,
+    pub notify_turn_completed: bool,
+    pub notify_agent_error: bool,
+    pub notify_goal_finished: bool,
+    pub notify_timer_fired: bool,
+    pub include_message_preview: bool,
+    pub quiet_hours_enabled: bool,
+    pub quiet_start_hour: u8,
+    pub quiet_end_hour: u8,
+    pub push_gateway_url: Option<String>,
+    pub has_gateway_auth_token: bool,
+}
+
+impl From<PushPreferences> for FfiPushPreferences {
+    fn from(v: PushPreferences) -> Self {
+        Self {
+            enabled: v.enabled,
+            notify_permission_required: v.notify_permission_required,
+            notify_turn_completed: v.notify_turn_completed,
+            notify_agent_error: v.notify_agent_error,
+            notify_goal_finished: v.notify_goal_finished,
+            notify_timer_fired: v.notify_timer_fired,
+            include_message_preview: v.include_message_preview,
+            quiet_hours_enabled: v.quiet_hours_enabled,
+            quiet_start_hour: v.quiet_start_hour,
+            quiet_end_hour: v.quiet_end_hour,
+            push_gateway_url: v.push_gateway_url,
+            has_gateway_auth_token: v.has_gateway_auth_token,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FfiPushDevicesSnapshot {
+    pub devices: Vec<FfiPushDeviceRecord>,
+    pub preferences: FfiPushPreferences,
+}
+
+impl From<PushDevicesSnapshotView> for FfiPushDevicesSnapshot {
+    fn from(v: PushDevicesSnapshotView) -> Self {
+        Self {
+            devices: v.devices.into_iter().map(Into::into).collect(),
+            preferences: v.preferences.into(),
+        }
     }
 }
 

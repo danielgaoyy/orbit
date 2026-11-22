@@ -239,4 +239,7 @@ export class OrbitHarmonyCore {
   stopMonitorWatchJson(reqJson: string): Promise<string>;
   listWorkflowRunsJson(hostId: string, includeCompleted: boolean): Promise<string>;
   cancelWorkflowRunJson(reqJson: string): Promise<string>;
+  registerPushDeviceJson(hostId: string, reqJson: string): Promise<string>;
+  unregisterPushDeviceJson(hostId: string, deviceId: string): Promise<string>;
+  listPushDevicesJson(hostId: string): Promise<string>;
 }

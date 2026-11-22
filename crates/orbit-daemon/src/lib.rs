@@ -27,6 +27,7 @@ pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
 pub mod messaging;
+pub mod push;
 pub mod rules;
 pub mod scheduler;
 pub mod skills;
@@ -104,6 +105,7 @@ use crate::manager::{
 use crate::messaging::{
     AgentMessageDelivery, AgentPromptSource, DEFAULT_COALESCE_WINDOW, QueuedAgentMessage,
 };
+use crate::push::PushManager;
 use crate::scheduler::ScheduleEngine;
 use crate::symbols::WorkspaceSymbolIndex;
 use crate::timers::ConditionalTimerEngine;
@@ -246,6 +248,7 @@ pub struct DaemonRuntime {
     pub browser: Arc<BrowserManager>,
     pub hooks: Arc<HooksEngine>,
     pub im_channels: Arc<ImChannelBridge>,
+    pub push: Arc<PushManager>,
     provider_catalogs: Arc<RwLock<Option<Vec<ProviderModelCatalog>>>>,
     pub mcp_probe_cache: Arc<RwLock<HashMap<String, orbit_protocol::McpProbeResult>>>,
     pub mcp_config_lock: Arc<AsyncMutex<()>>,
@@ -376,6 +379,13 @@ impl DaemonRuntime {
         let browser = BrowserManager::new(home_dir.to_path_buf());
         let im_channels =
             ImChannelBridge::new(store.clone(), orchestrator.clone(), listen_port.clone());
+        let host_display_name = hostname_string();
+        let push = PushManager::new(
+            store.clone(),
+            orchestrator.clone(),
+            host_id.clone(),
+            host_display_name.clone(),
+        );
 
         let home_for_probe = home_dir.to_path_buf();
         let available_providers = tokio::task::spawn_blocking(move || {
@@ -392,7 +402,7 @@ impl DaemonRuntime {
 
         let host_info = HostInfo {
             host_id,
-            hostname: hostname_string(),
+            hostname: host_display_name,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             public_key_b64: keypair.public_key_b64.clone(),
@@ -428,6 +438,7 @@ impl DaemonRuntime {
             browser,
             hooks,
             im_channels,
+            push,
             provider_catalogs,
             mcp_probe_cache: Arc::new(RwLock::new(HashMap::new())),
             mcp_config_lock: Arc::new(AsyncMutex::new(())),
@@ -455,6 +466,8 @@ impl DaemonRuntime {
         self.triggers.spawn_background_poller().await;
         // 3d. Start Bidirectional IM Channels bridge & NAT-friendly pollers
         self.im_channels.start().await;
+        // 3e. Start Native Mobile Background Push dispatcher (APNs / FCM / HarmonyOS Push Kit)
+        self.push.start().await;
         // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup, LSP & Browser Idle Reaper loops
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
@@ -696,6 +709,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             runtime_shutdown.triggers.shutdown().await;
             runtime_shutdown.workflows.shutdown_all().await;
             runtime_shutdown.im_channels.shutdown_all().await;
+            runtime_shutdown.push.shutdown_all().await;
             runtime_shutdown.lsp.shutdown_all().await;
             runtime_shutdown.browser.shutdown_all().await;
             runtime_shutdown.keep_awake.shutdown();
@@ -5364,6 +5378,127 @@ async fn handle_wire_rpc(
                     request_id,
                     ok,
                     detail,
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::ListPushDevices { request_id } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || push.list_snapshot()).await {
+                    Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                        request_id,
+                        devices: snap.devices,
+                        preferences: snap.preferences,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "list_push_devices_failed", e),
+                    Err(e) => rpc_err(request_id, "list_push_devices_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::RegisterPushDevice {
+            request_id,
+            device_id,
+            platform,
+            device_name,
+            device_token,
+            sandbox,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    push.register_device(device_id, platform, device_name, device_token, sandbox)
+                })
+                .await
+                {
+                    Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                        request_id,
+                        devices: snap.devices,
+                        preferences: snap.preferences,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "register_push_device_failed", e),
+                    Err(e) => rpc_err(request_id, "register_push_device_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UnregisterPushDevice {
+            request_id,
+            device_id,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply =
+                    match tokio::task::spawn_blocking(move || push.unregister_device(&device_id))
+                        .await
+                    {
+                        Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                            request_id,
+                            devices: snap.devices,
+                            preferences: snap.preferences,
+                        },
+                        Ok(Err(e)) => rpc_err(request_id, "unregister_push_device_failed", e),
+                        Err(e) => rpc_err(request_id, "unregister_push_device_failed", e),
+                    };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpdatePushPreferences {
+            request_id,
+            preferences,
+            gateway_auth_token,
+            keep_existing_gateway_token,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let reply = match tokio::task::spawn_blocking(move || {
+                    push.update_preferences(
+                        preferences,
+                        gateway_auth_token,
+                        keep_existing_gateway_token,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(snap)) => WireMessage::PushDevicesSnapshot {
+                        request_id,
+                        devices: snap.devices,
+                        preferences: snap.preferences,
+                    },
+                    Ok(Err(e)) => rpc_err(request_id, "update_push_preferences_failed", e),
+                    Err(e) => rpc_err(request_id, "update_push_preferences_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::TestPushNotification {
+            request_id,
+            device_id,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let push = Arc::clone(&runtime.push);
+            tokio::spawn(async move {
+                let res = push.test_push(device_id.as_deref()).await;
+                let reply = WireMessage::PushTestResponse {
+                    request_id,
+                    attempted: res.attempted,
+                    delivered: res.delivered,
+                    detail: res.detail,
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });

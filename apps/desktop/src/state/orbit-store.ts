@@ -107,6 +107,11 @@ import {
   type ImChannelTestResultView,
   type ImChannelsSnapshotView,
   type ImThreadBinding,
+  type PushDeviceRecord,
+  type PushDevicesSnapshotView,
+  type PushPreferences,
+  type PushTestResultView,
+  type UpdatePushPreferencesRequest,
   type UpsertImChannelRequest,
   type ProviderKind,
   type ReasoningEffort,
@@ -722,6 +727,17 @@ export interface OrbitUiState {
       error?: string | null;
     }
   >;
+  pushByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      devices: PushDeviceRecord[];
+      preferences: PushPreferences | null;
+      saving?: boolean;
+      testing?: boolean;
+      error?: string | null;
+    }
+  >;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -729,6 +745,12 @@ export interface OrbitUiState {
   enterToSend: boolean;
   notifyOnApproval: boolean;
   notifyOnTurnComplete: boolean;
+  notifyOnAgentError: boolean;
+  notifyOnGoalFinished: boolean;
+  notifySoundEnabled: boolean;
+  notifyQuietHoursEnabled: boolean;
+  notifyQuietStartHour: number;
+  notifyQuietEndHour: number;
   coalesceExploration: boolean;
   worktreeBranchPrefix: string;
   preferredEditor: ExternalEditorKind | null;
@@ -744,6 +766,12 @@ interface PersistedPrefs {
   enterToSend?: boolean;
   notifyOnApproval?: boolean;
   notifyOnTurnComplete?: boolean;
+  notifyOnAgentError?: boolean;
+  notifyOnGoalFinished?: boolean;
+  notifySoundEnabled?: boolean;
+  notifyQuietHoursEnabled?: boolean;
+  notifyQuietStartHour?: number;
+  notifyQuietEndHour?: number;
   coalesceExploration?: boolean;
   worktreeBranchPrefix?: string;
   preferredEditor?: ExternalEditorKind | null;
@@ -805,6 +833,12 @@ function writePrefsNow(snap: OrbitUiState): void {
       enterToSend: snap.enterToSend,
       notifyOnApproval: snap.notifyOnApproval,
       notifyOnTurnComplete: snap.notifyOnTurnComplete,
+      notifyOnAgentError: snap.notifyOnAgentError,
+      notifyOnGoalFinished: snap.notifyOnGoalFinished,
+      notifySoundEnabled: snap.notifySoundEnabled,
+      notifyQuietHoursEnabled: snap.notifyQuietHoursEnabled,
+      notifyQuietStartHour: snap.notifyQuietStartHour,
+      notifyQuietEndHour: snap.notifyQuietEndHour,
       coalesceExploration: snap.coalesceExploration,
       worktreeBranchPrefix: snap.worktreeBranchPrefix,
       preferredEditor: snap.preferredEditor,
@@ -1052,6 +1086,7 @@ const defaultInitialState: OrbitUiState = {
   guardianByHost: {},
   eventTriggersByHost: {},
   imChannelsByHost: {},
+  pushByHost: {},
 
   overviewDesktopOpenPref: initialPrefs.overviewDesktopOpenPref ?? true,
   overviewPopoverOpen: false,
@@ -1139,6 +1174,18 @@ const defaultInitialState: OrbitUiState = {
   enterToSend: initialPrefs.enterToSend ?? true,
   notifyOnApproval: initialPrefs.notifyOnApproval ?? true,
   notifyOnTurnComplete: initialPrefs.notifyOnTurnComplete ?? false,
+  notifyOnAgentError: initialPrefs.notifyOnAgentError ?? true,
+  notifyOnGoalFinished: initialPrefs.notifyOnGoalFinished ?? true,
+  notifySoundEnabled: initialPrefs.notifySoundEnabled ?? true,
+  notifyQuietHoursEnabled: initialPrefs.notifyQuietHoursEnabled ?? false,
+  notifyQuietStartHour:
+    typeof initialPrefs.notifyQuietStartHour === "number"
+      ? Math.min(23, Math.max(0, Math.round(initialPrefs.notifyQuietStartHour)))
+      : 23,
+  notifyQuietEndHour:
+    typeof initialPrefs.notifyQuietEndHour === "number"
+      ? Math.min(23, Math.max(0, Math.round(initialPrefs.notifyQuietEndHour)))
+      : 7,
   coalesceExploration: initialPrefs.coalesceExploration ?? true,
   worktreeBranchPrefix: initialPrefs.worktreeBranchPrefix ?? "auto",
   preferredEditor: initialPrefs.preferredEditor ?? null,
@@ -1758,6 +1805,87 @@ function subscribeCoreEvents(): Promise<void> {
 }
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const notifiedApprovalAgents = new Set<string>();
+const notifiedTerminalGoals = new Set<string>();
+const MAX_NOTIFIED_TERMINAL_GOALS = 512;
+const pushReqSeqByHost = new Map<string, number>();
+
+function trackNotifiedTerminalGoal(key: string): void {
+  if (notifiedTerminalGoals.size >= MAX_NOTIFIED_TERMINAL_GOALS) {
+    const oldest = notifiedTerminalGoals.values().next().value;
+    if (oldest !== undefined) {
+      notifiedTerminalGoals.delete(oldest);
+    }
+  }
+  notifiedTerminalGoals.add(key);
+}
+
+function isHourInQuietWindow(hour: number, startHour: number, endHour: number): boolean {
+  const h = ((Math.floor(hour) % 24) + 24) % 24;
+  const s = ((Math.floor(startHour) % 24) + 24) % 24;
+  const e = ((Math.floor(endHour) % 24) + 24) % 24;
+  if (s === e) return false;
+  if (s < e) return h >= s && h < e;
+  return h >= s || h < e;
+}
+
+function isInDesktopQuietHours(): boolean {
+  if (!state.notifyQuietHoursEnabled) return false;
+  return isHourInQuietWindow(
+    new Date().getHours(),
+    state.notifyQuietStartHour,
+    state.notifyQuietEndHour,
+  );
+}
+
+function isAgentErrorState(
+  ag: { status_label?: string; attention?: string } | null | undefined,
+): boolean {
+  if (!ag) return false;
+  return (
+    ag.attention === "error" ||
+    (typeof ag.status_label === "string" && ag.status_label.trim().toLowerCase() === "error")
+  );
+}
+
+function dispatchDesktopNotification(opts: {
+  title: string;
+  body: string;
+  hostId: string;
+  agentId?: string | null;
+  tag?: string;
+  forceEvenIfVisible?: boolean;
+}): boolean {
+  if (typeof window === "undefined" || !("Notification" in window)) return false;
+  if (Notification.permission !== "granted") return false;
+  if (!opts.forceEvenIfVisible) {
+    if (typeof document !== "undefined" && !document.hidden && document.hasFocus()) return false;
+    if (isInDesktopQuietHours()) return false;
+  }
+
+  try {
+    const notif = new Notification(opts.title, {
+      body: opts.body,
+      silent: !state.notifySoundEnabled,
+      tag: opts.tag,
+    });
+    notif.onclick = () => {
+      void orbitIpc.focusMainWindow().catch(() => undefined);
+      if (typeof window !== "undefined") {
+        window.focus();
+      }
+      orbitActions.closeSettings();
+      if (opts.hostId && opts.agentId) {
+        orbitActions.selectAgent(opts.hostId, opts.agentId);
+      } else if (opts.hostId) {
+        orbitActions.selectHost(opts.hostId);
+      }
+      notif.close();
+    };
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function notifyToast(msg: string, undo?: UndoArchiveEntry | null): void {
   if (toastTimer) clearTimeout(toastTimer);
@@ -1803,16 +1931,13 @@ function syncAttentionIndicators(overview: FleetOverviewView, details: Record<st
       if (ag.is_awaiting_permission) {
         if (!notifiedApprovalAgents.has(key)) {
           notifiedApprovalAgents.add(key);
-          if (
-            typeof document !== "undefined" &&
-            document.hidden &&
-            "Notification" in window &&
-            Notification.permission === "granted"
-          ) {
-            new Notification(`Orbit · ${detail.host.display_name}`, {
-              body: `${ag.title} requires your approval`,
-            });
-          }
+          dispatchDesktopNotification({
+            title: `Orbit · ${detail.host.display_name}`,
+            body: `${ag.title} requires your approval`,
+            hostId: detail.host.host_id,
+            agentId: ag.agent_id,
+            tag: `orbit-approval-${detail.host.host_id}-${ag.agent_id}`,
+          });
         }
       } else {
         notifiedApprovalAgents.delete(key);
@@ -3062,24 +3187,72 @@ export const orbitActions = {
       pendingDraftCreate = null;
     }
 
-    if (
-      state.notifyOnTurnComplete &&
-      typeof document !== "undefined" &&
-      document.hidden &&
-      "Notification" in window &&
-      Notification.permission === "granted"
-    ) {
-      for (const nextAg of detail.agents) {
-        const prevAg = prevAgents.find((p) => p.agent_id === nextAg.agent_id);
-        if (
-          isAgentForegroundRunning(prevAg) &&
-          !isAgentForegroundRunning(nextAg) &&
-          !nextAg.is_awaiting_permission
-        ) {
-          new Notification(`Orbit · ${detail.host.display_name}`, {
-            body: `Completed: ${nextAg.title}`,
-          });
-        }
+    for (const nextAg of detail.agents) {
+      const prevAg = prevAgents.find((p) => p.agent_id === nextAg.agent_id);
+      if (
+        state.notifyOnTurnComplete &&
+        isAgentForegroundRunning(prevAg) &&
+        !isAgentForegroundRunning(nextAg) &&
+        !nextAg.is_awaiting_permission &&
+        !isAgentErrorState(nextAg)
+      ) {
+        dispatchDesktopNotification({
+          title: `Orbit · ${detail.host.display_name}`,
+          body: `Completed: ${nextAg.title}`,
+          hostId,
+          agentId: nextAg.agent_id,
+          tag: `orbit-done-${hostId}-${nextAg.agent_id}`,
+        });
+      } else if (
+        state.notifyOnAgentError &&
+        prevAg !== undefined &&
+        !isAgentErrorState(prevAg) &&
+        isAgentErrorState(nextAg)
+      ) {
+        dispatchDesktopNotification({
+          title: `Orbit · ${detail.host.display_name}`,
+          body: `Agent error: ${nextAg.title}`,
+          hostId,
+          agentId: nextAg.agent_id,
+          tag: `orbit-error-${hostId}-${nextAg.agent_id}`,
+        });
+      }
+    }
+
+    const prevGoals = state.hostDetails[hostId]?.goal_runs ?? [];
+    const nextGoals = detail.goal_runs ?? [];
+    const liveGoalKeysForHost = new Set(nextGoals.map((g) => `${hostId}::${g.goal_id}`));
+    const hostGoalPrefix = `${hostId}::`;
+    for (const existingKey of Array.from(notifiedTerminalGoals)) {
+      if (existingKey.startsWith(hostGoalPrefix) && !liveGoalKeysForHost.has(existingKey)) {
+        notifiedTerminalGoals.delete(existingKey);
+      }
+    }
+    for (const nextGoal of nextGoals) {
+      const gKey = `${hostId}::${nextGoal.goal_id}`;
+      const isTerminal =
+        nextGoal.status === "succeeded" ||
+        nextGoal.status === "failed" ||
+        nextGoal.status === "canceled";
+      if (!isTerminal) {
+        notifiedTerminalGoals.delete(gKey);
+        continue;
+      }
+      const prevGoal = prevGoals.find((g) => g.goal_id === nextGoal.goal_id);
+      const wasActive =
+        prevGoal !== undefined &&
+        (prevGoal.status === "running" ||
+          prevGoal.status === "verifying" ||
+          prevGoal.status === "paused");
+      if (state.notifyOnGoalFinished && wasActive && !notifiedTerminalGoals.has(gKey)) {
+        trackNotifiedTerminalGoal(gKey);
+        dispatchDesktopNotification({
+          title: `Orbit · ${detail.host.display_name}`,
+          body: `Goal ${nextGoal.status}: ${nextGoal.objective}`,
+          hostId,
+          agentId: nextGoal.agent_id,
+          tag: `orbit-goal-${hostId}-${nextGoal.goal_id}`,
+        });
       }
     }
 
@@ -7390,6 +7563,232 @@ export const orbitActions = {
     }
   },
 
+  async loadPushDevices(hostId: string): Promise<PushDevicesSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (pushReqSeqByHost.get(hostId) ?? 0) + 1;
+    pushReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      pushByHost: {
+        ...s.pushByHost,
+        [hostId]: {
+          status: "loading",
+          devices: s.pushByHost[hostId]?.devices ?? [],
+          preferences: s.pushByHost[hostId]?.preferences ?? null,
+          saving: s.pushByHost[hostId]?.saving ?? false,
+          testing: s.pushByHost[hostId]?.testing ?? false,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.listPushDevices(hostId);
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: "ready",
+            devices: snap.devices,
+            preferences: snap.preferences,
+            saving: false,
+            testing: false,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: "error",
+            devices: s.pushByHost[hostId]?.devices ?? [],
+            preferences: s.pushByHost[hostId]?.preferences ?? null,
+            saving: false,
+            testing: false,
+            error: String(err),
+          },
+        },
+      }));
+      return null;
+    }
+  },
+
+  async updatePushPreferences(
+    hostId: string,
+    request: UpdatePushPreferencesRequest,
+  ): Promise<PushDevicesSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (pushReqSeqByHost.get(hostId) ?? 0) + 1;
+    pushReqSeqByHost.set(hostId, seq);
+    setState((s) => ({
+      ...s,
+      pushByHost: {
+        ...s.pushByHost,
+        [hostId]: {
+          status: s.pushByHost[hostId]?.status ?? "ready",
+          devices: s.pushByHost[hostId]?.devices ?? [],
+          preferences: s.pushByHost[hostId]?.preferences ?? null,
+          saving: true,
+          testing: s.pushByHost[hostId]?.testing ?? false,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const snap = await orbitIpc.updatePushPreferences(hostId, request);
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: "ready",
+            devices: snap.devices,
+            preferences: snap.preferences,
+            saving: false,
+            testing: false,
+            error: null,
+          },
+        },
+      }));
+      notifyToast("Push settings saved");
+      return snap;
+    } catch (err) {
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: s.pushByHost[hostId]?.status ?? "ready",
+            devices: s.pushByHost[hostId]?.devices ?? [],
+            preferences: s.pushByHost[hostId]?.preferences ?? null,
+            saving: false,
+            testing: false,
+            error: String(err),
+          },
+        },
+      }));
+      notifyToast(`Save push settings failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async unregisterPushDevice(
+    hostId: string,
+    deviceId: string,
+  ): Promise<PushDevicesSnapshotView | null> {
+    if (!hostId || !deviceId) return null;
+    const seq = (pushReqSeqByHost.get(hostId) ?? 0) + 1;
+    pushReqSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.unregisterPushDevice(hostId, deviceId);
+      if (pushReqSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: "ready",
+            devices: snap.devices,
+            preferences: snap.preferences,
+            saving: false,
+            testing: false,
+            error: null,
+          },
+        },
+      }));
+      notifyToast("Device removed");
+      return snap;
+    } catch (err) {
+      notifyToast(`Remove device failed: ${String(err)}`);
+      return null;
+    }
+  },
+
+  async testPushNotification(
+    hostId: string,
+    deviceId?: string | null,
+  ): Promise<PushTestResultView> {
+    if (!hostId) {
+      return { attempted: 0, delivered: 0, detail: "No host selected." };
+    }
+    setState((s) => ({
+      ...s,
+      pushByHost: {
+        ...s.pushByHost,
+        [hostId]: {
+          status: s.pushByHost[hostId]?.status ?? "ready",
+          devices: s.pushByHost[hostId]?.devices ?? [],
+          preferences: s.pushByHost[hostId]?.preferences ?? null,
+          saving: s.pushByHost[hostId]?.saving ?? false,
+          testing: true,
+          error: null,
+        },
+      },
+    }));
+    try {
+      const res = await orbitIpc.testPushNotification(hostId, deviceId ?? null);
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: s.pushByHost[hostId]?.status ?? "ready",
+            devices: s.pushByHost[hostId]?.devices ?? [],
+            preferences: s.pushByHost[hostId]?.preferences ?? null,
+            saving: s.pushByHost[hostId]?.saving ?? false,
+            testing: false,
+            error: s.pushByHost[hostId]?.error ?? null,
+          },
+        },
+      }));
+      notifyToast(res.detail);
+      void orbitActions.loadPushDevices(hostId);
+      return res;
+    } catch (err) {
+      const detail = String(err);
+      setState((s) => ({
+        ...s,
+        pushByHost: {
+          ...s.pushByHost,
+          [hostId]: {
+            status: s.pushByHost[hostId]?.status ?? "ready",
+            devices: s.pushByHost[hostId]?.devices ?? [],
+            preferences: s.pushByHost[hostId]?.preferences ?? null,
+            saving: false,
+            testing: false,
+            error: detail,
+          },
+        },
+      }));
+      notifyToast(`Test push failed: ${detail}`);
+      return { attempted: 0, delivered: 0, detail };
+    }
+  },
+
+  sendTestDesktopNotification(): boolean {
+    const hostId = state.selectedHostId ?? state.fleet.hosts[0]?.host_id ?? "";
+    const hostName =
+      state.fleet.hosts.find((h) => h.host_id === hostId)?.display_name ?? "Orbit";
+    const ok = dispatchDesktopNotification({
+      title: `Orbit · ${hostName}`,
+      body: "Click to focus Orbit and jump to your active session.",
+      hostId,
+      agentId: state.selectedAgentId,
+      tag: "orbit-desktop-test",
+      forceEvenIfVisible: true,
+    });
+    notifyToast(ok ? "Desktop test notification sent" : "Enable desktop notification permission first");
+    return ok;
+  },
+
   async loadLspServers(hostId: string, cwd: string): Promise<LspServerStatus[]> {
     if (!hostId || !cwd || cwd === "~") return [];
     const scopeKey = `${hostId}::${cwd}`;
@@ -9991,12 +10390,30 @@ export const orbitActions = {
   setNotificationPrefs(patch: {
     notifyOnApproval?: boolean;
     notifyOnTurnComplete?: boolean;
+    notifyOnAgentError?: boolean;
+    notifyOnGoalFinished?: boolean;
+    notifySoundEnabled?: boolean;
+    notifyQuietHoursEnabled?: boolean;
+    notifyQuietStartHour?: number;
+    notifyQuietEndHour?: number;
   }): void {
     setState(
       (s) => ({
         ...s,
         notifyOnApproval: patch.notifyOnApproval ?? s.notifyOnApproval,
         notifyOnTurnComplete: patch.notifyOnTurnComplete ?? s.notifyOnTurnComplete,
+        notifyOnAgentError: patch.notifyOnAgentError ?? s.notifyOnAgentError,
+        notifyOnGoalFinished: patch.notifyOnGoalFinished ?? s.notifyOnGoalFinished,
+        notifySoundEnabled: patch.notifySoundEnabled ?? s.notifySoundEnabled,
+        notifyQuietHoursEnabled: patch.notifyQuietHoursEnabled ?? s.notifyQuietHoursEnabled,
+        notifyQuietStartHour:
+          patch.notifyQuietStartHour !== undefined
+            ? Math.min(23, Math.max(0, Math.round(patch.notifyQuietStartHour)))
+            : s.notifyQuietStartHour,
+        notifyQuietEndHour:
+          patch.notifyQuietEndHour !== undefined
+            ? Math.min(23, Math.max(0, Math.round(patch.notifyQuietEndHour)))
+            : s.notifyQuietEndHour,
       }),
       true,
     );
@@ -10531,6 +10948,30 @@ export const orbitActions = {
             typeof prefs.notifyOnTurnComplete === "boolean"
               ? prefs.notifyOnTurnComplete
               : s.notifyOnTurnComplete,
+          notifyOnAgentError:
+            typeof prefs.notifyOnAgentError === "boolean"
+              ? prefs.notifyOnAgentError
+              : s.notifyOnAgentError,
+          notifyOnGoalFinished:
+            typeof prefs.notifyOnGoalFinished === "boolean"
+              ? prefs.notifyOnGoalFinished
+              : s.notifyOnGoalFinished,
+          notifySoundEnabled:
+            typeof prefs.notifySoundEnabled === "boolean"
+              ? prefs.notifySoundEnabled
+              : s.notifySoundEnabled,
+          notifyQuietHoursEnabled:
+            typeof prefs.notifyQuietHoursEnabled === "boolean"
+              ? prefs.notifyQuietHoursEnabled
+              : s.notifyQuietHoursEnabled,
+          notifyQuietStartHour:
+            typeof prefs.notifyQuietStartHour === "number"
+              ? Math.min(23, Math.max(0, Math.round(prefs.notifyQuietStartHour)))
+              : s.notifyQuietStartHour,
+          notifyQuietEndHour:
+            typeof prefs.notifyQuietEndHour === "number"
+              ? Math.min(23, Math.max(0, Math.round(prefs.notifyQuietEndHour)))
+              : s.notifyQuietEndHour,
           coalesceExploration:
             typeof prefs.coalesceExploration === "boolean"
               ? prefs.coalesceExploration
@@ -10687,6 +11128,12 @@ export const orbitActions = {
         enterToSend: state.enterToSend,
         notifyOnApproval: state.notifyOnApproval,
         notifyOnTurnComplete: state.notifyOnTurnComplete,
+        notifyOnAgentError: state.notifyOnAgentError,
+        notifyOnGoalFinished: state.notifyOnGoalFinished,
+        notifySoundEnabled: state.notifySoundEnabled,
+        notifyQuietHoursEnabled: state.notifyQuietHoursEnabled,
+        notifyQuietStartHour: state.notifyQuietStartHour,
+        notifyQuietEndHour: state.notifyQuietEndHour,
         coalesceExploration: state.coalesceExploration,
         worktreeBranchPrefix: state.worktreeBranchPrefix,
         draftUseWorktree: state.draftUseWorktree,

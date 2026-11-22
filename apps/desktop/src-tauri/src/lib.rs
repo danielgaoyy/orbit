@@ -28,8 +28,10 @@ use orbit_client_core::app_core::{
     ClientThreadPref, CoreEventSubscriber, CoreNotification, CreateAgentRequest, FleetOverviewView,
     GitReviewView, GuardianConfigSnapshotView, HostCardView, HostDetailView,
     ImChannelTestResultView, ImChannelsSnapshotView, ImportManagedSkillRequest,
-    ManagedSkillContentView, OrbitAppCore, RewindAgentResultView, SideQuestionStreamEvent,
-    SubscribeOptions, UpsertImChannelRequest, UpsertManagedSkillRequest, WorkspaceFileView,
+    ManagedSkillContentView, OrbitAppCore, PushDevicesSnapshotView, PushTestResultView,
+    RegisterPushDeviceRequest, RewindAgentResultView, SideQuestionStreamEvent, SubscribeOptions,
+    UpdatePushPreferencesRequest, UpsertImChannelRequest, UpsertManagedSkillRequest,
+    WorkspaceFileView,
 };
 use orbit_client_core::catalog::ResolvedModelSelectionView;
 use orbit_client_core::cloud_sync::{
@@ -82,7 +84,7 @@ use orbit_protocol::{
     WorktreeHandoffPreview,
 };
 use orbit_providers::{SideQuestionSpec, run_side_question};
-use tauri::{AppHandle, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
+use tauri::{AppHandle, Manager, State, Url, WebviewUrl, WebviewWindowBuilder, ipc::Channel};
 
 struct DesktopAppState {
     core: Arc<OrbitAppCore>,
@@ -2293,6 +2295,75 @@ async fn test_im_channel(
 }
 
 #[tauri::command]
+fn focus_main_window(app: AppHandle) -> Result<(), String> {
+    let win = app
+        .get_webview_window("main")
+        .or_else(|| app.webview_windows().into_values().next())
+        .ok_or_else(|| "main window not found".to_string())?;
+    let _ = win.unminimize();
+    let _ = win.show();
+    win.set_focus()
+        .map_err(|e| format!("failed to focus window: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_push_devices(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<PushDevicesSnapshotView, String> {
+    state.core.list_push_devices_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn register_push_device(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    request: RegisterPushDeviceRequest,
+) -> Result<PushDevicesSnapshotView, String> {
+    state
+        .core
+        .register_push_device_on_host(&host_id, request)
+        .await
+}
+
+#[tauri::command]
+async fn unregister_push_device(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    device_id: String,
+) -> Result<PushDevicesSnapshotView, String> {
+    state
+        .core
+        .unregister_push_device_on_host(&host_id, device_id)
+        .await
+}
+
+#[tauri::command]
+async fn update_push_preferences(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    request: UpdatePushPreferencesRequest,
+) -> Result<PushDevicesSnapshotView, String> {
+    state
+        .core
+        .update_push_preferences_on_host(&host_id, request)
+        .await
+}
+
+#[tauri::command]
+async fn test_push_notification(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    device_id: Option<String>,
+) -> Result<PushTestResultView, String> {
+    state
+        .core
+        .test_push_notification_on_host(&host_id, device_id)
+        .await
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn start_goal_run(
     state: State<'_, DesktopAppState>,
@@ -3484,6 +3555,12 @@ pub fn run() {
             upsert_im_channel,
             delete_im_channel,
             test_im_channel,
+            focus_main_window,
+            list_push_devices,
+            register_push_device,
+            unregister_push_device,
+            update_push_preferences,
+            test_push_notification,
             start_goal_run,
             list_goal_runs,
             control_goal_run,

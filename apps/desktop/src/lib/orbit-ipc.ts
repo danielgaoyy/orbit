@@ -313,6 +313,68 @@ export interface ImChannelTestResultView {
   detail: string;
 }
 
+export type PushPlatform = "apns" | "fcm" | "harmony_push_kit";
+
+export type PushEventKind =
+  | "permission_required"
+  | "turn_completed"
+  | "agent_error"
+  | "goal_finished"
+  | "timer_fired";
+
+export interface PushPreferences {
+  enabled: boolean;
+  notify_permission_required: boolean;
+  notify_turn_completed: boolean;
+  notify_agent_error: boolean;
+  notify_goal_finished: boolean;
+  notify_timer_fired: boolean;
+  include_message_preview: boolean;
+  quiet_hours_enabled: boolean;
+  quiet_start_hour: number;
+  quiet_end_hour: number;
+  push_gateway_url?: string | null;
+  has_gateway_auth_token: boolean;
+}
+
+export interface PushDeviceRecord {
+  device_id: string;
+  platform: PushPlatform;
+  device_name: string;
+  masked_token: string;
+  sandbox: boolean;
+  enabled: boolean;
+  last_delivered_at_ms?: number | null;
+  last_error?: string | null;
+  registered_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface PushDevicesSnapshotView {
+  devices: PushDeviceRecord[];
+  preferences: PushPreferences;
+}
+
+export interface PushTestResultView {
+  attempted: number;
+  delivered: number;
+  detail: string;
+}
+
+export interface RegisterPushDeviceRequest {
+  device_id: string;
+  platform: PushPlatform;
+  device_name: string;
+  device_token: string;
+  sandbox: boolean;
+}
+
+export interface UpdatePushPreferencesRequest {
+  preferences: PushPreferences;
+  gateway_auth_token?: string | null;
+  keep_existing_gateway_token: boolean;
+}
+
 export interface UpsertImChannelRequest {
   channel_id?: string | null;
   name: string;
@@ -5382,6 +5444,70 @@ export const orbitIpc = {
       runId,
       winnerStepId,
       applyToWorkspace,
+    });
+  },
+
+  // --- Enhanced Desktop Notifications & Native Mobile Background Push ---
+
+  focusMainWindow: async (): Promise<void> => {
+    if (!isTauriRuntime()) {
+      if (typeof window !== "undefined") window.focus();
+      return;
+    }
+    await invoke<void>("focus_main_window");
+  },
+
+  listPushDevices: async (hostId: string): Promise<PushDevicesSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return {
+        devices: [],
+        preferences: {
+          enabled: true,
+          notify_permission_required: true,
+          notify_turn_completed: true,
+          notify_agent_error: true,
+          notify_goal_finished: true,
+          notify_timer_fired: true,
+          include_message_preview: false,
+          quiet_hours_enabled: false,
+          quiet_start_hour: 23,
+          quiet_end_hour: 7,
+          push_gateway_url: null,
+          has_gateway_auth_token: false,
+        },
+      };
+    }
+    return invoke<PushDevicesSnapshotView>("list_push_devices", { hostId });
+  },
+
+  registerPushDevice: async (
+    hostId: string,
+    request: RegisterPushDeviceRequest,
+  ): Promise<PushDevicesSnapshotView> => {
+    return invoke<PushDevicesSnapshotView>("register_push_device", { hostId, request });
+  },
+
+  unregisterPushDevice: async (
+    hostId: string,
+    deviceId: string,
+  ): Promise<PushDevicesSnapshotView> => {
+    return invoke<PushDevicesSnapshotView>("unregister_push_device", { hostId, deviceId });
+  },
+
+  updatePushPreferences: async (
+    hostId: string,
+    request: UpdatePushPreferencesRequest,
+  ): Promise<PushDevicesSnapshotView> => {
+    return invoke<PushDevicesSnapshotView>("update_push_preferences", { hostId, request });
+  },
+
+  testPushNotification: async (
+    hostId: string,
+    deviceId?: string | null,
+  ): Promise<PushTestResultView> => {
+    return invoke<PushTestResultView>("test_push_notification", {
+      hostId,
+      deviceId: deviceId ?? null,
     });
   },
 };

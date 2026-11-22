@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Archive,
   Clock,
   FolderOpen,
   FolderPlus,
@@ -254,6 +255,14 @@ function CommandPaletteDialog() {
         shortcut: `${mod},`,
         icon: <Settings2 className="size-3.5" />,
         run: () => orbitActions.openSettings("general"),
+      },
+      {
+        id: "settings-archived",
+        section: "Settings & Fleet",
+        title: "Open Archived Conversations",
+        subtitle: "Search, restore, or permanently delete archived threads",
+        icon: <Archive className="size-3.5" />,
+        run: () => orbitActions.openSettings("archived"),
       },
       {
         id: "fleet-pair",

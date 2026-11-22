@@ -31,6 +31,11 @@ export interface SidebarConversationRowProps {
   nowMs: number;
   menuOpen: boolean;
   isRenaming: boolean;
+  rowRef?: (el: HTMLDivElement | null) => void;
+  isDragging?: boolean;
+  dropIndicator?: "before" | "after" | null;
+  onThreadPointerDown?: (e: React.PointerEvent<HTMLDivElement>) => void;
+  shouldSuppressClick?: () => boolean;
   onOpenMenu: (
     threadKey: string,
     host: HostCardView,
@@ -58,6 +63,11 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
   nowMs,
   menuOpen,
   isRenaming,
+  rowRef,
+  isDragging = false,
+  dropIndicator = null,
+  onThreadPointerDown,
+  shouldSuppressClick,
   onOpenMenu,
   onStartRename,
   onFinishRename,
@@ -101,17 +111,11 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
 
   return (
     <div
-      draggable={!isRenaming}
-      onDragStart={(e) => {
-        if (isRenaming) return;
-        e.dataTransfer.setData(
-          "application/x-orbit-agent",
-          JSON.stringify({ hostId: host.host_id, agentId: agent.agent_id }),
-        );
-        e.dataTransfer.effectAllowed = "move";
-      }}
+      ref={rowRef}
+      onPointerDown={isRenaming ? undefined : onThreadPointerDown}
       title={hoverTooltip}
       onClick={() => {
+        if (shouldSuppressClick?.()) return;
         if (!isRenaming) {
           orbitActions.selectAgent(host.host_id, agent.agent_id);
         }
@@ -127,8 +131,9 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
         });
       }}
       className={cn(
-        "group/item flex h-[30px] cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 transition-colors",
+        "group/item relative flex h-[30px] cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2 transition-colors",
         isChild && "ml-[24px] border-l border-black/[0.08] pl-2.5 dark:border-white/[0.10]",
+        isDragging && "opacity-45",
         selected
           ? "text-foreground bg-black/[0.06] font-medium dark:bg-white/[0.085]"
           : isUnread
@@ -136,6 +141,12 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
             : "text-foreground/76 hover:text-foreground hover:bg-black/[0.038] dark:hover:bg-white/[0.05]",
       )}
     >
+      {dropIndicator === "before" && (
+        <div className="bg-primary pointer-events-none absolute -top-[1px] right-1.5 left-1.5 z-20 h-[2px] rounded-full" />
+      )}
+      {dropIndicator === "after" && (
+        <div className="bg-primary pointer-events-none absolute right-1.5 -bottom-[1px] left-1.5 z-20 h-[2px] rounded-full" />
+      )}
       {/* Left `16×16` Status Gutter (`x = 24px` center) + Title (`x = 42px` left edge) */}
       <div className="flex min-w-0 flex-1 items-center gap-2.5">
         {!isChild ? (
@@ -219,6 +230,7 @@ export const SidebarConversationRow = memo(function SidebarConversationRow({
           )}
 
           <div
+            data-thread-action="true"
             className={cn(
               "items-center gap-0.5",
               menuOpen ? "inline-flex" : "hidden group-hover/item:inline-flex",

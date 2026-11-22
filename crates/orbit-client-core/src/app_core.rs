@@ -523,6 +523,7 @@ struct HostMemoryState {
     pending_outbox: Vec<WireMessage>,
     pending_queue_adds: HashMap<String, Vec<(Uuid, QueuedPromptView)>>,
     pending_queue_removals: HashMap<String, Vec<(Uuid, String)>>,
+    pending_queue_reorders: HashMap<String, (Uuid, Vec<String>)>,
     pending_attachment_acks:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<AttachmentStageAck, String>>>,
     pending_file_reads:
@@ -536,6 +537,7 @@ struct HostMemoryState {
     pending_git_repo_inspections:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<GitReposInspectionView, String>>>,
     rewound_agents: std::collections::HashSet<String>,
+    caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
     agent_req_by_req_id: HashMap<Uuid, String>,
     replaced_optimistic_agents: HashMap<String, String>,
@@ -607,6 +609,7 @@ impl HostMemoryState {
             pending_outbox: Vec::new(),
             pending_queue_adds: HashMap::new(),
             pending_queue_removals: HashMap::new(),
+            pending_queue_reorders: HashMap::new(),
             pending_attachment_acks: HashMap::new(),
             pending_file_reads: HashMap::new(),
             pending_side_questions: HashMap::new(),
@@ -615,6 +618,7 @@ impl HostMemoryState {
             pending_upgrade_terminals: HashMap::new(),
             pending_git_repo_inspections: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
+            caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
             agent_req_by_req_id: HashMap::new(),
             replaced_optimistic_agents: HashMap::new(),
@@ -2937,6 +2941,7 @@ impl OrbitAppCore {
             };
             h.last_error = None;
             h.session = None;
+            h.caught_up_agents.clear();
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
             }
@@ -2966,6 +2971,7 @@ impl OrbitAppCore {
                     h.session_gen = h.session_gen.wrapping_add(1);
                     let conn_gen = h.session_gen;
                     h.session = Some(handle.clone());
+                    h.caught_up_agents.clear();
 
                     let outbox = std::mem::take(&mut h.pending_outbox);
                     let resubs: Vec<(String, u64)> = h
@@ -2974,7 +2980,7 @@ impl OrbitAppCore {
                         .filter(|(aid, _)| !aid.starts_with("opt_"))
                         .map(|(aid, evs)| {
                             let max_seq = evs.iter().map(|e| e.seq).max().unwrap_or(0);
-                            (aid.clone(), max_seq)
+                            (aid.clone(), self.safe_catchup_since_seq(aid, max_seq))
                         })
                         .collect();
                     (outbox, resubs, conn_gen)
@@ -3218,10 +3224,12 @@ impl OrbitAppCore {
             h.profile.state = HostConnectionState::Disconnected;
             h.via_ssh_tunnel = false;
             h.session = None;
+            h.caught_up_agents.clear();
             if h.pending_outbox.is_empty() {
                 h.agent_req_by_req_id.clear();
                 h.pending_queue_adds.clear();
                 h.pending_queue_removals.clear();
+                h.pending_queue_reorders.clear();
             }
             fail_pending_host_requests(h, "Host disconnected before request completed");
             should_reconnect = true;
@@ -3407,6 +3415,7 @@ impl OrbitAppCore {
                         let seq_regressed = local_max_seq > 0 && a.latest_seq < local_max_seq;
                         if epoch_advanced || seq_regressed {
                             let had_mem = state.timelines.remove(&ag_id).is_some();
+                            state.caught_up_agents.remove(&ag_id);
                             state.stage_cache.remove(&ag_id);
                             state.mark_stage_dirty(&ag_id, 0, true);
                             state.rewound_agents.insert(ag_id.clone());
@@ -3510,6 +3519,7 @@ impl OrbitAppCore {
                     let seq_regressed = local_max_seq > 0 && agent.latest_seq < local_max_seq;
                     if epoch_advanced || seq_regressed {
                         let had_mem = state.timelines.remove(&ag_id).is_some();
+                        state.caught_up_agents.remove(&ag_id);
                         state.stage_cache.remove(&ag_id);
                         state.mark_stage_dirty(&ag_id, 0, true);
                         state.rewound_agents.insert(ag_id.clone());
@@ -3730,6 +3740,11 @@ impl OrbitAppCore {
                     let last_seq = ordered.last().map(|e| e.seq).unwrap_or(0);
                     let is_complete = last_seq >= agent.latest_seq;
                     state.timelines.insert(ag_id.clone(), ordered.clone());
+                    if is_complete {
+                        state.caught_up_agents.insert(ag_id.clone());
+                    } else {
+                        state.caught_up_agents.remove(&ag_id);
+                    }
                     state.stage_cache.remove(&ag_id);
                     state.mark_stage_dirty(&ag_id, 0, true);
                     state.rewound_agents.insert(ag_id.clone());
@@ -3763,7 +3778,7 @@ impl OrbitAppCore {
                     let min_incoming_seq = ordered.first().map(|e| e.seq);
                     let max_seq = ordered.last().map(|e| e.seq);
 
-                    let (is_backfill, min_dirty, min_aux_dirty, final_max) = {
+                    let (is_backfill, min_dirty, min_aux_dirty) = {
                         let list = state.timelines.entry(agent_id.clone()).or_default();
                         let existing_max_seq = list.iter().map(|e| e.seq).max().unwrap_or(0);
                         let is_backfill = min_incoming_seq
@@ -3790,8 +3805,7 @@ impl OrbitAppCore {
                             }
                             (min_d, any_aux)
                         };
-                        let final_max = list.iter().map(|e| e.seq).max().unwrap_or(0);
-                        (is_backfill, min_dirty, min_aux_dirty, final_max)
+                        (is_backfill, min_dirty, min_aux_dirty)
                     };
 
                     if is_backfill {
@@ -3802,9 +3816,13 @@ impl OrbitAppCore {
                     }
 
                     if has_more && let Some(next_since) = max_seq {
+                        state.caught_up_agents.remove(&agent_id);
                         continue_catchup = Some((agent_id.clone(), next_since));
                     } else {
-                        catchup_completed_cursor = Some((agent_id.clone(), final_max));
+                        state.caught_up_agents.insert(agent_id.clone());
+                        if let Some(catchup_max) = max_seq {
+                            catchup_completed_cursor = Some((agent_id.clone(), catchup_max));
+                        }
                     }
                     push_notify_timeline(agent_id);
                 }
@@ -3834,7 +3852,9 @@ impl OrbitAppCore {
                     if is_status_changed {
                         state.mark_stage_meta_dirty(&agent_id);
                     }
-                    if live_seq > 0 {
+                    // Only advance the persistent contiguous cursor once this connection has
+                    // completed TimelineCatchup for `agent_id`; never jump over an un-synced gap.
+                    if live_seq > 0 && state.caught_up_agents.contains(&agent_id) {
                         live_event_cursor = Some((agent_id.clone(), live_seq));
                     }
                     push_notify_timeline(agent_id);
@@ -4275,12 +4295,30 @@ impl OrbitAppCore {
         if let Some((ag_id, max_seq)) = catchup_completed_cursor
             && max_seq > 0
         {
-            let _ = self.store.set_replica_contiguous_seq(&ag_id, max_seq);
+            let advanced = self
+                .store
+                .advance_replica_contiguous_seq(&ag_id, max_seq, true)
+                .unwrap_or(false);
+            if !advanced
+                && let Ok(mut guard) = self.hosts.write()
+                && let Some(h) = guard.get_mut(host_id)
+            {
+                h.caught_up_agents.remove(&ag_id);
+            }
         }
         if let Some((ag_id, live_seq)) = live_event_cursor
-            && self.store.get_replica_contiguous_seq(&ag_id).unwrap_or(0) > 0
+            && live_seq > 0
         {
-            let _ = self.store.set_replica_contiguous_seq(&ag_id, live_seq);
+            let advanced = self
+                .store
+                .advance_replica_contiguous_seq(&ag_id, live_seq, true)
+                .unwrap_or(false);
+            if !advanced
+                && let Ok(mut guard) = self.hosts.write()
+                && let Some(h) = guard.get_mut(host_id)
+            {
+                h.caught_up_agents.remove(&ag_id);
+            }
         }
         for (stale_ag_id, should_resubscribe) in stale_replica_agents {
             let _ = self.store.replace_replica_timeline(&stale_ag_id, &[]);
@@ -4881,14 +4919,25 @@ impl OrbitAppCore {
         opt_id
     }
 
+    fn safe_catchup_since_seq(&self, agent_id: &str, mem_max_seq: u64) -> u64 {
+        let contiguous_seq = self.store.get_replica_contiguous_seq(agent_id).unwrap_or(0);
+        // Only perform incremental catchup when a contiguous replica cursor has been confirmed;
+        // otherwise start from `0` so any historical gap from a prior interrupted sync self-heals.
+        if contiguous_seq == 0 {
+            0
+        } else {
+            contiguous_seq.min(mem_max_seq)
+        }
+    }
+
     pub fn open_agent_timeline(self: &Arc<Self>, host_id: &str, agent_id: &str) {
         if agent_id.starts_with("opt_") {
             return;
         }
-        let contiguous_seq = self.store.get_replica_contiguous_seq(agent_id).unwrap_or(0);
         let mem_max_seq = if let Ok(mut guard) = self.hosts.write()
             && let Some(h) = guard.get_mut(host_id)
         {
+            h.caught_up_agents.remove(agent_id);
             self.hydrate_timeline_if_missing(h, agent_id);
             h.timelines
                 .get(agent_id)
@@ -4897,13 +4946,7 @@ impl OrbitAppCore {
         } else {
             0
         };
-        // Only perform incremental catchup when a contiguous replica cursor has been confirmed;
-        // otherwise start from `0` so any historical gap from a prior interrupted sync self-heals.
-        let since_seq = if contiguous_seq == 0 {
-            0
-        } else {
-            contiguous_seq.min(mem_max_seq)
-        };
+        let since_seq = self.safe_catchup_since_seq(agent_id, mem_max_seq);
         self.dispatch_wire_queued(
             host_id,
             WireMessage::SubscribeTimeline {
@@ -5171,6 +5214,8 @@ impl OrbitAppCore {
             remaining.sort_by_key(|q| q.created_at);
             reordered.extend(remaining);
             ag.queued_prompts = reordered;
+            h.pending_queue_reorders
+                .insert(agent_id.to_string(), (req_id, queue_ids.clone()));
             h.mark_stage_meta_dirty(agent_id);
         }
 
@@ -6854,9 +6899,12 @@ impl OrbitAppCore {
                         .filter(|(aid, _)| !aid.starts_with("opt_"))
                         .map(|(aid, evs)| {
                             let max_seq = evs.iter().map(|e| e.seq).max().unwrap_or(0);
-                            (aid.clone(), max_seq)
+                            (aid.clone(), self.safe_catchup_since_seq(aid, max_seq))
                         })
                         .collect();
+                    for (aid, _) in &resubs {
+                        h.caught_up_agents.remove(aid);
+                    }
                     connected.push((host_id.clone(), handle.clone(), resubs));
                 } else {
                     h.reconnect_attempt = 0;
@@ -8497,6 +8545,37 @@ fn reconcile_pending_queue_ops(state: &mut HostMemoryState, agent: &mut AgentSum
             state.pending_queue_removals.remove(ag_id);
         }
     }
+    if let Some((_, desired_ids)) = state.pending_queue_reorders.get(ag_id) {
+        let matches_desired = {
+            let mut desired_iter = desired_ids
+                .iter()
+                .filter(|id| agent.queued_prompts.iter().any(|q| q.queue_id == **id));
+            agent
+                .queued_prompts
+                .iter()
+                .all(|q| desired_iter.next().is_none_or(|want| q.queue_id == *want))
+        };
+        if matches_desired {
+            state.pending_queue_reorders.remove(ag_id);
+        } else if agent.queued_prompts.len() >= 2 {
+            let desired = desired_ids.clone();
+            let mut by_id: HashMap<String, QueuedPromptView> = agent
+                .queued_prompts
+                .drain(..)
+                .map(|q| (q.queue_id.clone(), q))
+                .collect();
+            let mut reordered = Vec::with_capacity(by_id.len());
+            for qid in &desired {
+                if let Some(item) = by_id.remove(qid) {
+                    reordered.push(item);
+                }
+            }
+            let mut remaining: Vec<_> = by_id.into_values().collect();
+            remaining.sort_by_key(|q| q.created_at);
+            reordered.extend(remaining);
+            agent.queued_prompts = reordered;
+        }
+    }
 }
 
 fn clear_pending_queue_op_by_req(
@@ -8543,6 +8622,9 @@ fn clear_pending_queue_op_by_req(
     for k in empty_rem_keys {
         state.pending_queue_removals.remove(&k);
     }
+    state
+        .pending_queue_reorders
+        .retain(|_, (rid, _)| *rid != req_id);
     changed
 }
 
@@ -12286,5 +12368,209 @@ mod tests {
         assert_eq!(sync_a.hosts_removed, 1);
         assert_eq!(device_a.fleet_overview().hosts.len(), 1);
         assert_eq!(device_a.fleet_overview().hosts[0].host_id, h1_id);
+    }
+
+    #[test]
+    fn live_event_before_catchup_never_jumps_contiguous_cursor_over_missing_user_prompt() {
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let now = Utc::now();
+        let mut mem = HostMemoryState::new(SavedHostProfile {
+            host_id: "h_gap".into(),
+            hostname: "gap-host".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 6868,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            state: HostConnectionState::OnlineDirect,
+        });
+        mem.agents.insert(
+            "ag_gap".into(),
+            AgentSummary {
+                agent_id: "ag_gap".into(),
+                workspace_id: "ws_1".into(),
+                cwd: "/repo".into(),
+                title: "Gap Test".into(),
+                provider: ProviderKind::Antigravity,
+                model: None,
+                effort: None,
+                mode: SessionMode::Default,
+                status: AgentStatus::Running {
+                    turn_id: "t2".into(),
+                },
+                parent_agent_id: None,
+                parent_host_id: None,
+                latest_seq: 12,
+                timeline_epoch: 1,
+                created_at: now,
+                updated_at: now,
+                archived_at: None,
+                background: false,
+                auto_archive: false,
+                profile_id: None,
+                labels: HashMap::new(),
+                attention: AttentionState::None,
+                last_activity_at: Some(now),
+                read_seq: 10,
+                is_pinned: false,
+                pinned_order: 0,
+                handle: None,
+                cluster_suggestion: None,
+                task_summary: None,
+                queued_prompts: Vec::new(),
+            },
+        );
+        core.hosts
+            .write()
+            .expect("lock")
+            .insert("h_gap".into(), mem);
+
+        // Prior turn already persisted up to seq 10 before client restart
+        let prev_reply = TimelineEvent {
+            seq: 10,
+            epoch: 1,
+            agent_id: "ag_gap".into(),
+            turn_id: Some("t1".into()),
+            timestamp: now,
+            payload: TimelinePayload::AssistantMessage {
+                item_id: "msg_prev".into(),
+                text: "Choose option A or B?".into(),
+                streaming: false,
+            },
+        };
+        core.store
+            .upsert_replica_timeline_event(&prev_reply)
+            .expect("persist prev");
+        core.store
+            .set_replica_contiguous_seq("ag_gap", 10)
+            .expect("set cursor 10");
+
+        // After restart (ag_gap NOT in caught_up_agents), TimelineLive seq 12 arrives before catchup
+        let live_tool = TimelineEvent {
+            seq: 12,
+            epoch: 1,
+            agent_id: "ag_gap".into(),
+            turn_id: Some("t2".into()),
+            timestamp: now,
+            payload: TimelinePayload::ToolCall {
+                call_id: "tc_1".into(),
+                status: ToolCallStatus::Completed,
+                detail: ToolCallDetail::FileRead {
+                    path: "/repo/a.rs".into(),
+                    start_line: None,
+                    end_line: None,
+                },
+                background_task: None,
+            },
+        };
+        core.store
+            .upsert_replica_timeline_event(&live_tool)
+            .expect("persist live 12");
+        core.handle_inbound_wire(
+            "h_gap",
+            WireMessage::TimelineLive {
+                event: live_tool.clone(),
+            },
+        );
+
+        // Contiguous cursor MUST remain at 10 (not jump to 12) so seq 11 UserPrompt is not skipped
+        assert_eq!(
+            core.store
+                .get_replica_contiguous_seq("ag_gap")
+                .expect("cursor"),
+            10
+        );
+        assert_eq!(core.safe_catchup_since_seq("ag_gap", 12), 10);
+
+        // Now TimelineCatchup arrives with the missing UserPrompt (seq 11) + ToolCall (seq 12)
+        let missing_prompt = TimelineEvent {
+            seq: 11,
+            epoch: 1,
+            agent_id: "ag_gap".into(),
+            turn_id: Some("t2".into()),
+            timestamp: now,
+            payload: TimelinePayload::UserPrompt {
+                message_id: "u_opt_a".into(),
+                text: "方案A".into(),
+                badges: Vec::new(),
+            },
+        };
+        let catchup_batch = vec![missing_prompt, live_tool];
+        core.store
+            .upsert_replica_timeline_events_batch(&catchup_batch)
+            .expect("persist catchup");
+        core.handle_inbound_wire(
+            "h_gap",
+            WireMessage::TimelineCatchup {
+                request_id: Uuid::new_v4(),
+                agent_id: "ag_gap".into(),
+                events: catchup_batch,
+                has_more: false,
+            },
+        );
+
+        assert_eq!(
+            core.store
+                .get_replica_contiguous_seq("ag_gap")
+                .expect("cursor 12"),
+            12
+        );
+        let stage = core.agent_stage("h_gap", "ag_gap");
+        assert!(stage.turns.iter().any(|t| matches!(
+            &t.user_prompt,
+            Some(TimelineItemView::UserPrompt { text, .. }) if text == "方案A"
+        )));
+
+        // Once caught up, a persisted live event (seq 13) advances contiguous_seq
+        let live_reply = TimelineEvent {
+            seq: 13,
+            epoch: 1,
+            agent_id: "ag_gap".into(),
+            turn_id: Some("t2".into()),
+            timestamp: now,
+            payload: TimelinePayload::AssistantMessage {
+                item_id: "msg_reply".into(),
+                text: "Done!".into(),
+                streaming: false,
+            },
+        };
+        core.store
+            .upsert_replica_timeline_event(&live_reply)
+            .expect("persist live 13");
+        core.handle_inbound_wire("h_gap", WireMessage::TimelineLive { event: live_reply });
+        assert_eq!(
+            core.store
+                .get_replica_contiguous_seq("ag_gap")
+                .expect("cursor 13"),
+            13
+        );
+
+        // If a live event fails to persist to SQLite (not present in client_replica_events),
+        // contiguous_seq resets to 0 instead of silently sealing a gap.
+        let unpersisted_live = TimelineEvent {
+            seq: 14,
+            epoch: 1,
+            agent_id: "ag_gap".into(),
+            turn_id: Some("t2".into()),
+            timestamp: now,
+            payload: TimelinePayload::StatusChanged {
+                status: AgentStatus::Idle,
+            },
+        };
+        core.handle_inbound_wire(
+            "h_gap",
+            WireMessage::TimelineLive {
+                event: unpersisted_live,
+            },
+        );
+        assert_eq!(
+            core.store
+                .get_replica_contiguous_seq("ag_gap")
+                .expect("cursor reset"),
+            0
+        );
     }
 }

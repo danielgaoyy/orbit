@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 import {
   Activity,
+  Archive,
   Bell,
   Check,
   ChevronsUpDown,
@@ -15,6 +16,7 @@ import {
 } from "lucide-react";
 import { AddHostSection } from "@/components/settings/add-host-section";
 import { AppearanceSection } from "@/components/settings/appearance-section";
+import { ArchivedSection } from "@/components/settings/archived-section";
 import { CloudSyncSection } from "@/components/settings/cloud-sync-section";
 import { GeneralSection } from "@/components/settings/general-section";
 import { HostAgentsSection } from "@/components/settings/host-agents-section";
@@ -41,6 +43,7 @@ import {
   type HostSettingsTab,
   type SettingsSection,
   orbitActions,
+  threadScopeKey,
   useOrbitSelector,
 } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
@@ -48,7 +51,7 @@ import { cn } from "@/lib/utils";
 const APP_SECTIONS: {
   id: Extract<
     SettingsSection,
-    "general" | "cloud_sync" | "appearance" | "shortcuts" | "notifications"
+    "general" | "cloud_sync" | "appearance" | "shortcuts" | "notifications" | "archived"
   >;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
@@ -58,6 +61,7 @@ const APP_SECTIONS: {
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
   { id: "notifications", label: "Notifications", icon: Bell },
+  { id: "archived", label: "Archived", icon: Archive },
 ];
 
 const HOST_TABS: {
@@ -106,11 +110,13 @@ function SettingsRailButton({
   label,
   icon: Icon,
   active,
+  badge,
   onClick,
 }: {
   label: string;
   icon: React.ComponentType<{ className?: string }>;
   active: boolean;
+  badge?: ReactNode;
   onClick: () => void;
 }) {
   return (
@@ -118,14 +124,17 @@ function SettingsRailButton({
       type="button"
       onClick={onClick}
       className={cn(
-        "flex h-[32px] w-full cursor-pointer items-center gap-2.5 rounded-[8px] px-2.5 text-left text-[13.5px] transition-colors",
+        "flex h-[32px] w-full cursor-pointer items-center justify-between gap-2 rounded-[8px] px-2.5 text-left text-[13.5px] transition-colors",
         active
           ? "bg-black/[0.06] text-foreground font-medium dark:bg-white/[0.085]"
           : "text-foreground/76 hover:bg-black/[0.04] hover:text-foreground dark:hover:bg-white/[0.05]",
       )}
     >
-      <Icon className="h-[15px] w-[15px] shrink-0 stroke-[1.75] opacity-80" />
-      <span className="truncate">{label}</span>
+      <span className="flex min-w-0 items-center gap-2.5">
+        <Icon className="h-[15px] w-[15px] shrink-0 stroke-[1.75] opacity-80" />
+        <span className="truncate">{label}</span>
+      </span>
+      {badge}
     </button>
   );
 }
@@ -158,7 +167,31 @@ function SettingsHostTabList({
 export function SettingsView({ closing = false }: { closing?: boolean }) {
   const section = useOrbitSelector((s) => s.settingsSection);
   const fleet = useOrbitSelector((s) => s.fleet);
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const archivedThreads = useOrbitSelector((s) => s.archivedThreads);
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
+
+  const archivedCount = useMemo(() => {
+    const seen = new Set<string>();
+    for (const [hostId, detail] of Object.entries(hostDetails)) {
+      for (const ag of detail.agents) {
+        if (ag.background) continue;
+        const tKey = threadScopeKey(hostId, ag.agent_id);
+        if (!ag.archived_at_rfc3339 && !archivedThreads[tKey]) continue;
+        seen.add(tKey);
+      }
+    }
+    return seen.size;
+  }, [hostDetails, archivedThreads]);
+
+  const renderAppSectionBadge = (id: (typeof APP_SECTIONS)[number]["id"]) => {
+    if (id !== "archived" || archivedCount === 0) return undefined;
+    return (
+      <span className="text-muted-foreground/75 shrink-0 text-[11.5px] tabular-nums">
+        {archivedCount}
+      </span>
+    );
+  };
 
   const parsedHost = useMemo(() => parseHostSection(section), [section]);
   const orderedHosts = useMemo(() => orderHostsLocalFirst(fleet.hosts), [fleet.hosts]);
@@ -266,6 +299,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                       label={item.label}
                       icon={item.icon}
                       active={section === item.id}
+                      badge={renderAppSectionBadge(item.id)}
                       onClick={() => orbitActions.setSettingsSection(item.id)}
                     />
                   ))}
@@ -289,6 +323,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                       label={item.label}
                       icon={item.icon}
                       active={section === item.id}
+                      badge={renderAppSectionBadge(item.id)}
                       onClick={() => orbitActions.setSettingsSection(item.id)}
                     />
                   ))}
@@ -321,6 +356,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
                         label={item.label}
                         icon={item.icon}
                         active={section === item.id}
+                        badge={renderAppSectionBadge(item.id)}
                         onClick={() => orbitActions.setSettingsSection(item.id)}
                       />
                     ))}
@@ -439,6 +475,7 @@ export function SettingsView({ closing = false }: { closing?: boolean }) {
             {section === "appearance" && <AppearanceSection />}
             {section === "shortcuts" && <ShortcutsSection />}
             {section === "notifications" && <NotificationsSection />}
+            {section === "archived" && <ArchivedSection />}
             {section === "add_host" && <AddHostSection />}
             {parsedHost && !resolvedHost && <AddHostSection />}
             {resolvedHost?.tab === "agents" && (

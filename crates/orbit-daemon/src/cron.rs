@@ -30,12 +30,18 @@ pub fn normalize_cron_expr(raw: &str) -> anyhow::Result<String> {
     let compiled = match lower.as_str() {
         "@hourly" | "hourly" => "0 * * * *".to_string(),
         "@daily" | "daily" => "0 9 * * *".to_string(),
+        "@weekdays" | "weekdays" => "0 9 * * 1-5".to_string(),
         "@weekly" | "weekly" => "0 9 * * 1".to_string(),
-        _ if lower.starts_with("daily ") => {
-            let hm = lower.trim_start_matches("daily ").trim();
+        _ if lower.starts_with("daily ") || lower.starts_with("weekdays ") => {
+            let (prefix, dow) = if lower.starts_with("weekdays ") {
+                ("weekdays ", "1-5")
+            } else {
+                ("daily ", "*")
+            };
+            let hm = lower.trim_start_matches(prefix).trim();
             let (h_s, m_s) = hm
                 .split_once(':')
-                .ok_or_else(|| anyhow::anyhow!("expected `daily HH:MM`, got `{raw}`"))?;
+                .ok_or_else(|| anyhow::anyhow!("expected `{}HH:MM`, got `{raw}`", prefix))?;
             let h: u32 = h_s
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid hour in `{raw}`"))?;
@@ -45,7 +51,7 @@ pub fn normalize_cron_expr(raw: &str) -> anyhow::Result<String> {
             if h > 23 || m > 59 {
                 anyhow::bail!("hour/minute out of range in `{raw}`");
             }
-            format!("{m} {h} * * *")
+            format!("{m} {h} * * {dow}")
         }
         _ if lower.ends_with('m')
             && lower[..lower.len() - 1].chars().all(|c| c.is_ascii_digit()) =>
@@ -260,6 +266,14 @@ mod tests {
         assert_eq!(
             normalize_cron_expr("daily 09:30").expect("daily"),
             "30 9 * * *"
+        );
+        assert_eq!(
+            normalize_cron_expr("weekdays").expect("weekdays"),
+            "0 9 * * 1-5"
+        );
+        assert_eq!(
+            normalize_cron_expr("weekdays 08:45").expect("weekdays time"),
+            "45 8 * * 1-5"
         );
 
         let sched = CronSchedule::parse("*/15 * * * *").expect("parse");

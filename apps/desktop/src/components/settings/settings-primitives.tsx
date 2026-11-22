@@ -90,7 +90,7 @@ export function SettingSelect<T extends string | number>({
           type="button"
           disabled={disabled}
           className={cn(
-            "border-border bg-background text-foreground hover:bg-accent/70 focus-visible:ring-foreground/20 inline-flex h-[30px] min-w-[144px] cursor-pointer items-center justify-between gap-2 rounded-lg border px-2.5 text-[12.5px] font-medium transition-colors outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45",
+            "border-border bg-background text-foreground hover:bg-accent/70 focus-visible:ring-foreground/20 flex h-[30px] min-w-[144px] cursor-pointer items-center justify-between gap-2 rounded-lg border px-2.5 text-[12.5px] font-medium transition-colors outline-none focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-45",
             triggerClassName,
           )}
         >

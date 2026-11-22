@@ -255,6 +255,7 @@ export type SettingsSection =
   | "appearance"
   | "shortcuts"
   | "notifications"
+  | "archived"
   | "add_host"
   | `host:${string}:${HostSettingsTab}`;
 export type SettingsSectionTarget = SettingsSection | "hosts" | "providers";
@@ -323,6 +324,7 @@ export function sideQuestionScopeKey(s: Pick<OrbitUiState, "selectedHostId" | "s
 export interface OrbitUiState {
   fleet: FleetOverviewView;
   fleetHydrated: boolean;
+  bootstrapError: string | null;
   hostDetails: Record<string, HostDetailView>;
   selectedHostId: string | null;
   selectedAgentId: string | null;
@@ -399,6 +401,7 @@ export interface OrbitUiState {
   threadCustomTitles: Record<string, string>;
   archivedThreads: Record<string, ArchivedThreadEntry>;
   archivedSubagents: Record<string, true>;
+  threadManualOrder: Record<string, string[]>;
   sidebarProjectSort: SidebarProjectSort;
   sidebarThreadFilter: SidebarThreadFilter;
 
@@ -469,8 +472,10 @@ interface PersistedPrefs {
   threadCustomTitles?: Record<string, string>;
   archivedThreads?: Record<string, ArchivedThreadEntry>;
   archivedSubagents?: Record<string, true>;
+  collapsedProjectIds?: Record<string, boolean>;
   collapsedInboxProjectIds?: Record<string, boolean>;
   seenAgentSeqs?: Record<string, number>;
+  threadManualOrder?: Record<string, string[]>;
   sidebarProjectSort?: SidebarProjectSort;
   sidebarThreadFilter?: SidebarThreadFilter;
   inspectorWidth?: number;
@@ -525,7 +530,9 @@ function writePrefsNow(snap: OrbitUiState): void {
       threadCustomTitles: snap.threadCustomTitles,
       archivedThreads: snap.archivedThreads,
       archivedSubagents: snap.archivedSubagents,
+      collapsedProjectIds: snap.collapsedProjectIds,
       collapsedInboxProjectIds: snap.collapsedInboxProjectIds,
+      threadManualOrder: snap.threadManualOrder,
       sidebarProjectSort: snap.sidebarProjectSort,
       sidebarThreadFilter: snap.sidebarThreadFilter,
       sidePanelWidth: snap.sidePanelWidth,
@@ -551,18 +558,21 @@ function scheduleSavePrefs(): void {
   if (savePrefsTimer !== null) return;
   savePrefsTimer = setTimeout(() => {
     savePrefsTimer = null;
+    if (disposed) return;
     if (savePrefsPending) {
       writePrefsNow(state);
     }
   }, 180);
 }
 
+const beforeUnloadListener = () => {
+  if (savePrefsPending) {
+    writePrefsNow(state);
+  }
+};
+
 if (typeof window !== "undefined") {
-  window.addEventListener("beforeunload", () => {
-    if (savePrefsPending) {
-      writePrefsNow(state);
-    }
-  });
+  window.addEventListener("beforeunload", beforeUnloadListener);
 }
 
 function detectSystemTheme(): ResolvedTheme {
@@ -601,15 +611,18 @@ if (typeof document !== "undefined") {
   }
 }
 
+let themeMediaQuery: MediaQueryList | null = null;
+let themeMediaListener: (() => void) | null = null;
 if (typeof window !== "undefined" && window.matchMedia) {
-  const mql = window.matchMedia("(prefers-color-scheme: dark)");
-  mql.addEventListener("change", () => {
+  themeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+  themeMediaListener = () => {
     if (state.theme === "system") {
       const nextResolved = detectSystemTheme();
       applyDocumentTheme(nextResolved);
       setState((s) => ({ ...s, resolvedTheme: nextResolved }));
     }
-  });
+  };
+  themeMediaQuery.addEventListener("change", themeMediaListener);
 }
 
 const THREAD_PREF_MIGRATION_KEY = "orbit.desktop.prefs.migrated_v2";
@@ -624,9 +637,26 @@ const initialIsCompactViewport =
 const initialIsTightForDualSidebars =
   typeof window !== "undefined" ? window.innerWidth < DUAL_SIDEBAR_YIELD_PX : false;
 
-let state: OrbitUiState = {
+interface OrbitStoreHmrData {
+  state?: OrbitUiState;
+  terminalChannels?: Map<string, TerminalStreamChannel>;
+  wasInitialized?: boolean;
+}
+
+const viteHot = (
+  import.meta as {
+    hot?: {
+      data: OrbitStoreHmrData;
+      dispose: (cb: (data: OrbitStoreHmrData) => void) => void;
+    };
+  }
+).hot;
+const hmrData = viteHot?.data;
+
+const defaultInitialState: OrbitUiState = {
   fleet: { revision: 0, total_pending_approvals: 0, hosts: [], projects: [] },
   fleetHydrated: false,
+  bootstrapError: null,
   hostDetails: {},
   selectedHostId: null,
   selectedAgentId: null,
@@ -709,13 +739,14 @@ let state: OrbitUiState = {
       ? initialPrefs.sidebarWidth
       : 256,
   collapsedHostIds: {},
-  collapsedProjectIds: {},
+  collapsedProjectIds: initialPrefs.collapsedProjectIds ?? {},
   collapsedWorkspaceIds: {},
   collapsedInboxProjectIds: initialPrefs.collapsedInboxProjectIds ?? {},
   hiddenProjectKeys: initialPrefs.hiddenProjectKeys ?? {},
   threadCustomTitles: initialPrefs.threadCustomTitles ?? {},
   archivedThreads: initialPrefs.archivedThreads ?? {},
   archivedSubagents: initialPrefs.archivedSubagents ?? {},
+  threadManualOrder: initialPrefs.threadManualOrder ?? {},
   sidebarProjectSort: initialPrefs.sidebarProjectSort ?? "recent",
   sidebarThreadFilter: initialPrefs.sidebarThreadFilter ?? "all",
 
@@ -773,6 +804,10 @@ let state: OrbitUiState = {
   terminalCursorStyle: initialPrefs.terminalCursorStyle ?? "bar",
   terminalScrollback: initialPrefs.terminalScrollback ?? 5000,
 };
+
+let state: OrbitUiState = hmrData?.state
+  ? { ...defaultInitialState, ...hmrData.state }
+  : defaultInitialState;
 
 const listeners = new Set<() => void>();
 const composerDraftListeners = new Set<() => void>();
@@ -939,21 +974,26 @@ interface TerminalStreamChannel {
   chunks: Uint8Array[];
   subs: Set<(bytes: Uint8Array) => void>;
 }
-const terminalChannels = new Map<string, TerminalStreamChannel>();
+const terminalChannels = hmrData?.terminalChannels ?? new Map<string, TerminalStreamChannel>();
+
+let disposed = false;
 
 function emitChange(): void {
+  if (disposed) return;
   for (const l of listeners) {
     l();
   }
 }
 
 function emitComposerDraftChange(): void {
+  if (disposed) return;
   for (const l of composerDraftListeners) {
     l();
   }
 }
 
 function setState(updater: (prev: OrbitUiState) => OrbitUiState, persist = false): void {
+  if (disposed) return;
   const prev = state;
   const next = updater(prev);
   if (next === prev) return;
@@ -975,6 +1015,92 @@ export function composerScopeKey(s: OrbitUiState): string {
 }
 
 let initialized = false;
+let autoInitScheduled = false;
+const BOOTSTRAP_TIMEOUT_MS = 6000;
+
+function withBootstrapTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out`));
+    }, BOOTSTRAP_TIMEOUT_MS);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+function subscribeCoreEvents(): Promise<void> {
+  return orbitIpc
+    .subscribe((ev: CoreNotification) => {
+      if (disposed) return;
+      if (ev.kind === "fleet_changed") {
+        scheduleCoalescedGate(fleetSyncGate, () => orbitActions.reloadFleetAndHosts(false));
+      } else if (ev.kind === "host_changed") {
+        let gate = hostSyncGates.get(ev.host_id);
+        if (!gate) {
+          gate = { inFlight: false, queued: false, rafId: null };
+          hostSyncGates.set(ev.host_id, gate);
+        }
+        const hostId = ev.host_id;
+        scheduleCoalescedGate(gate, () => orbitActions.reloadHostDetail(hostId, true));
+      } else if (ev.kind === "timeline_changed") {
+        // Stream live stage deltas for the actively viewed session and any open split-view peer tab.
+        const isMainStage =
+          !state.isDraftNewSession &&
+          ev.host_id === state.selectedHostId &&
+          ev.agent_id === state.selectedAgentId;
+        const isOpenPeerTab =
+          state.sidePanelOpen &&
+          state.sidePanelTabs.some(
+            (t) =>
+              t.kind === "peer" &&
+              t.hostId === ev.host_id &&
+              t.peerAgentId === ev.agent_id,
+          );
+        if (isMainStage || isOpenPeerTab) {
+          void orbitActions.pullStageDelta(ev.host_id, ev.agent_id);
+        }
+      } else if (ev.kind === "git_changed") {
+        if (ev.host_id === state.selectedHostId && ev.cwd === state.selectedWorkspaceCwd) {
+          const hostId = ev.host_id;
+          const cwd = ev.cwd;
+          if (gitChangedDebounceTimer !== null) {
+            window.clearTimeout(gitChangedDebounceTimer);
+          }
+          gitChangedDebounceTimer = window.setTimeout(() => {
+            gitChangedDebounceTimer = null;
+            if (disposed) return;
+            void orbitActions.loadGitReviewSnapshot(hostId, cwd, state.selectedDiffPath);
+            void orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
+            orbitActions.markOpenFilesStaleForWorkspace(hostId, cwd);
+          }, 150);
+        }
+      } else if (ev.kind === "terminal_changed") {
+        const chKey = `${ev.host_id}::${ev.slot}`;
+        let ch = terminalChannels.get(chKey);
+        if (!ch) {
+          ch = { chunks: [], subs: new Set() };
+          terminalChannels.set(chKey, ch);
+        }
+        const bytes = Uint8Array.from(ev.raw_bytes);
+        ch.chunks.push(bytes);
+        if (ch.chunks.length > 96) {
+          ch.chunks.splice(0, ch.chunks.length - 96);
+        }
+        for (const sub of ch.subs) {
+          sub(bytes);
+        }
+      }
+    })
+    .catch(() => undefined);
+}
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 const notifiedApprovalAgents = new Set<string>();
 
@@ -1337,72 +1463,44 @@ export const orbitActions = {
     })();
 
     // 3. Highest priority: subscribe to live core events and hydrate fleet/local host immediately
-    const subscribePromise = orbitIpc
-      .subscribe((ev: CoreNotification) => {
-        if (ev.kind === "fleet_changed") {
-          scheduleCoalescedGate(fleetSyncGate, () => orbitActions.reloadFleetAndHosts(false));
-        } else if (ev.kind === "host_changed") {
-          let gate = hostSyncGates.get(ev.host_id);
-          if (!gate) {
-            gate = { inFlight: false, queued: false, rafId: null };
-            hostSyncGates.set(ev.host_id, gate);
-          }
-          const hostId = ev.host_id;
-          scheduleCoalescedGate(gate, () => orbitActions.reloadHostDetail(hostId, true));
-        } else if (ev.kind === "timeline_changed") {
-          // Stream live stage deltas for the actively viewed session and any open split-view peer tab.
-          const isMainStage =
-            !state.isDraftNewSession &&
-            ev.host_id === state.selectedHostId &&
-            ev.agent_id === state.selectedAgentId;
-          const isOpenPeerTab =
-            state.sidePanelOpen &&
-            state.sidePanelTabs.some(
-              (t) =>
-                t.kind === "peer" &&
-                t.hostId === ev.host_id &&
-                t.peerAgentId === ev.agent_id,
-            );
-          if (isMainStage || isOpenPeerTab) {
-            void orbitActions.pullStageDelta(ev.host_id, ev.agent_id);
-          }
-        } else if (ev.kind === "git_changed") {
-          if (ev.host_id === state.selectedHostId && ev.cwd === state.selectedWorkspaceCwd) {
-            const hostId = ev.host_id;
-            const cwd = ev.cwd;
-            if (gitChangedDebounceTimer !== null) {
-              window.clearTimeout(gitChangedDebounceTimer);
-            }
-            gitChangedDebounceTimer = window.setTimeout(() => {
-              gitChangedDebounceTimer = null;
-              void orbitActions.loadGitReviewSnapshot(hostId, cwd, state.selectedDiffPath);
-              void orbitActions.ensureWorkspaceFiles(hostId, cwd, true);
-              orbitActions.markOpenFilesStaleForWorkspace(hostId, cwd);
-            }, 150);
-          }
-        } else if (ev.kind === "terminal_changed") {
-          const chKey = `${ev.host_id}::${ev.slot}`;
-          let ch = terminalChannels.get(chKey);
-          if (!ch) {
-            ch = { chunks: [], subs: new Set() };
-            terminalChannels.set(chKey, ch);
-          }
-          const bytes = Uint8Array.from(ev.raw_bytes);
-          ch.chunks.push(bytes);
-          if (ch.chunks.length > 96) {
-            ch.chunks.splice(0, ch.chunks.length - 96);
-          }
-          for (const sub of ch.subs) {
-            sub(bytes);
-          }
-        }
-      })
-      .catch(() => undefined);
+    const subscribePromise = subscribeCoreEvents();
 
     try {
-      await orbitActions.reloadFleetAndHosts(true);
-    } catch {
-      setState((s) => (s.fleetHydrated ? s : { ...s, fleetHydrated: true }));
+      await withBootstrapTimeout(
+        orbitActions.reloadFleetAndHosts(true),
+        "Workspace hydration",
+      );
+    } catch (err) {
+      setState((s) =>
+        s.fleetHydrated
+          ? s
+          : {
+              ...s,
+              bootstrapError: err instanceof Error ? err.message : String(err),
+            },
+      );
+    }
+    orbitActions.refreshSidebarView();
+    await subscribePromise;
+  },
+
+  async retryBootstrap(): Promise<void> {
+    setState((s) => ({ ...s, bootstrapError: null }));
+    const subscribePromise = subscribeCoreEvents();
+    try {
+      await withBootstrapTimeout(
+        orbitActions.reloadFleetAndHosts(true),
+        "Workspace hydration",
+      );
+    } catch (err) {
+      setState((s) =>
+        s.fleetHydrated
+          ? s
+          : {
+              ...s,
+              bootstrapError: err instanceof Error ? err.message : String(err),
+            },
+      );
     }
     orbitActions.refreshSidebarView();
     await subscribePromise;
@@ -2099,6 +2197,7 @@ export const orbitActions = {
         ...s,
         fleet: snap,
         fleetHydrated: true,
+        bootstrapError: null,
         hostDetails: nextDetails,
         selectedHostId: activeHostId,
         selectedAgentId: nextAgentId,
@@ -3690,10 +3789,41 @@ export const orbitActions = {
       const activeAgent = detail.agents.find((a) => a.agent_id === agentId);
       const current = activeAgent?.queued_prompts ?? [];
       if (fromIndex >= current.length || toIndex >= current.length) return;
-      const nextIds = current.map((q) => q.queue_id);
-      const [moved] = nextIds.splice(fromIndex, 1);
+      const nextQueued = current.slice();
+      const [moved] = nextQueued.splice(fromIndex, 1);
       if (!moved) return;
-      nextIds.splice(toIndex, 0, moved);
+      nextQueued.splice(toIndex, 0, moved);
+      const nextIds = nextQueued.map((q) => q.queue_id);
+      const tlKey = `${hostId}::${agentId}`;
+      setState((s) => {
+        const curDetail = s.hostDetails[hostId];
+        if (!curDetail) return s;
+        const nextAgents = curDetail.agents.map((ag) =>
+          ag.agent_id === agentId ? { ...ag, queued_prompts: nextQueued } : ag,
+        );
+        const curStage = s.stages[tlKey];
+        const nextStages =
+          curStage?.agent
+            ? {
+                ...s.stages,
+                [tlKey]: {
+                  ...curStage,
+                  agent: { ...curStage.agent, queued_prompts: nextQueued },
+                },
+              }
+            : s.stages;
+        return {
+          ...s,
+          hostDetails: {
+            ...s.hostDetails,
+            [hostId]: {
+              ...curDetail,
+              agents: nextAgents,
+            },
+          },
+          stages: nextStages,
+        };
+      });
       void orbitIpc.reorderQueuedPrompts(hostId, agentId, nextIds);
       return;
     }
@@ -4011,8 +4141,27 @@ export const orbitActions = {
     });
   },
 
-  restoreArchivedThread(hostId: string, agentId: string): void {
+  restoreArchivedThread(
+    hostId: string,
+    agentId: string,
+    options?: { open?: boolean },
+  ): void {
+    const shouldOpen = options?.open !== false;
     const tKey = threadScopeKey(hostId, agentId);
+    const targetAgent = state.hostDetails[hostId]?.agents.find((a) => a.agent_id === agentId);
+    const keysToUnhide = new Set<string>();
+    if (targetAgent?.cwd) {
+      keysToUnhide.add(projectPathScopeKey(hostId, targetAgent.cwd));
+      for (const proj of state.sidebarView?.projects ?? []) {
+        if (proj.host_id === hostId && matchesProjectDirectory(proj.directories, targetAgent.cwd)) {
+          keysToUnhide.add(projectPathScopeKey(hostId, proj.primary_cwd));
+          for (const dir of proj.directories) {
+            keysToUnhide.add(projectPathScopeKey(hostId, dir));
+          }
+        }
+      }
+    }
+
     setState(
       (s) => {
         const nextArchived = { ...s.archivedThreads };
@@ -4020,15 +4169,76 @@ export const orbitActions = {
         return {
           ...s,
           archivedThreads: nextArchived,
+          hiddenProjectKeys:
+            keysToUnhide.size > 0
+              ? omitRecordKeys(s.hiddenProjectKeys, keysToUnhide)
+              : s.hiddenProjectKeys,
           lastArchivedUndo: null,
+          ...(shouldOpen ? { activeView: "workspace" as const } : {}),
         };
       },
       true,
     );
     void orbitIpc.unarchiveAgent(hostId, agentId);
     orbitActions.refreshSidebarView();
-    orbitActions.selectAgent(hostId, agentId);
+    if (shouldOpen) {
+      orbitActions.selectAgent(hostId, agentId);
+    }
     notifyToast("Conversation restored");
+  },
+
+  async deleteArchivedThreadsBatch(
+    items: { hostId: string; agentId: string }[],
+  ): Promise<void> {
+    if (items.length === 0) return;
+    const deletedThreadKeys = new Set(items.map((it) => threadScopeKey(it.hostId, it.agentId)));
+
+    setState(
+      (s) => {
+        for (const tKey of deletedThreadKeys) {
+          for (const ctx of s.contextItems[tKey] ?? []) {
+            if (ctx.kind === "image" && ctx.previewUrl?.startsWith("blob:")) {
+              URL.revokeObjectURL(ctx.previewUrl);
+            }
+          }
+        }
+        return {
+          ...s,
+          archivedThreads: omitRecordKeys(s.archivedThreads, deletedThreadKeys),
+          threadCustomTitles: omitRecordKeys(s.threadCustomTitles, deletedThreadKeys),
+          stages: omitRecordKeys(s.stages, deletedThreadKeys),
+          composerDrafts: omitRecordKeys(s.composerDrafts, deletedThreadKeys),
+          slashDirectives: omitRecordKeys(s.slashDirectives, deletedThreadKeys),
+          inlineMentions: omitRecordKeys(s.inlineMentions, deletedThreadKeys),
+          contextItems: omitRecordKeys(s.contextItems, deletedThreadKeys),
+          pastedAttachments: omitRecordKeys(s.pastedAttachments, deletedThreadKeys),
+          diffQuotes: omitRecordKeys(s.diffQuotes, deletedThreadKeys),
+          queuedPrompts: omitRecordKeys(s.queuedPrompts, deletedThreadKeys),
+          sideQuestionsByScope: omitRecordKeys(s.sideQuestionsByScope, deletedThreadKeys),
+          rewoundSessions: omitRecordKeys(s.rewoundSessions, deletedThreadKeys),
+        };
+      },
+      true,
+    );
+
+    for (const tKey of deletedThreadKeys) {
+      lastReportedSeenSeq.delete(tKey);
+      stagePullGates.delete(tKey);
+    }
+
+    await Promise.allSettled(
+      items.map((it) => orbitIpc.deleteAgent(it.hostId, it.agentId)),
+    );
+    const affectedHosts = new Set(items.map((it) => it.hostId));
+    await Promise.allSettled(
+      Array.from(affectedHosts).map((hid) => orbitActions.reloadHostDetail(hid, false)),
+    );
+    orbitActions.refreshSidebarView();
+    notifyToast(
+      items.length === 1
+        ? "Deleted 1 archived conversation"
+        : `Deleted ${items.length} archived conversations`,
+    );
   },
 
   undoLastArchive(): void {
@@ -4123,6 +4333,25 @@ export const orbitActions = {
     orbitActions.refreshSidebarView();
   },
 
+  reorderThreads(scopeKey: string, orderedAgentIds: string[]): void {
+    if (!scopeKey || orderedAgentIds.length === 0) return;
+    const prevSort = state.sidebarProjectSort;
+    setState(
+      (s) => ({
+        ...s,
+        sidebarProjectSort: "manual",
+        threadManualOrder: {
+          ...s.threadManualOrder,
+          [scopeKey]: orderedAgentIds,
+        },
+      }),
+      true,
+    );
+    if (prevSort !== "manual") {
+      orbitActions.refreshSidebarView();
+    }
+  },
+
   toggleSidebar(): void {
     const isCompact = state.isCompactViewport;
     setState(
@@ -4201,13 +4430,53 @@ export const orbitActions = {
   },
 
   toggleProjectCollapsed(projectId: string): void {
-    setState((s) => ({
-      ...s,
-      collapsedProjectIds: {
-        ...s.collapsedProjectIds,
-        [projectId]: !s.collapsedProjectIds[projectId],
+    setState(
+      (s) => ({
+        ...s,
+        collapsedProjectIds: {
+          ...s.collapsedProjectIds,
+          [projectId]: !s.collapsedProjectIds[projectId],
+        },
+      }),
+      true,
+    );
+  },
+
+  setAllProjectsCollapsed(projectIds: string[], collapsed: boolean): void {
+    if (projectIds.length === 0) return;
+    setState(
+      (s) => {
+        const next = { ...s.collapsedProjectIds };
+        for (const id of projectIds) {
+          next[id] = collapsed;
+        }
+        return {
+          ...s,
+          collapsedProjectIds: next,
+        };
       },
-    }));
+      true,
+    );
+  },
+
+  async renameProject(project: SidebarProjectGroupView, nextName: string): Promise<void> {
+    const cleanName = nextName.trim();
+    if (!cleanName || cleanName === project.name) return;
+    try {
+      const directories =
+        project.directories.length > 0 ? project.directories : [project.primary_cwd];
+      await orbitIpc.upsertProject({
+        projectId: project.pinned_project_id ?? undefined,
+        hostId: project.host_id,
+        name: cleanName,
+        directories,
+      });
+      await orbitActions.reloadFleetOnly();
+      orbitActions.refreshSidebarView();
+      notifyToast(`Renamed project to "${cleanName}"`);
+    } catch (err) {
+      notifyToast(`Failed to rename project: ${String(err)}`);
+    }
   },
 
   async addProjectDirectory(hostId: string, dirPath: string, name?: string): Promise<void> {
@@ -6441,8 +6710,81 @@ registerOrbitLinkOpener({
   },
 });
 
+function ensureStoreInitialized(): void {
+  if (initialized || disposed || autoInitScheduled) return;
+  autoInitScheduled = true;
+  queueMicrotask(() => {
+    autoInitScheduled = false;
+    if (!initialized && !disposed) {
+      void orbitActions.init();
+    }
+  });
+}
+
+// Re-attach Rust event subscription immediately after a Vite HMR store reload so
+// preserved state stays live without waiting for React to remount `<App />`.
+if (hmrData?.wasInitialized) {
+  initialized = true;
+  queueMicrotask(() => {
+    if (disposed) return;
+    void subscribeCoreEvents();
+    void orbitActions.reloadFleetAndHosts(!state.fleetHydrated).catch(() => undefined);
+    orbitActions.refreshSidebarView();
+  });
+}
+
+if (viteHot) {
+  viteHot.dispose((data) => {
+    disposed = true;
+    data.state = state;
+    data.terminalChannels = terminalChannels;
+    data.wasInitialized = initialized;
+
+    if (themeMediaQuery && themeMediaListener) {
+      themeMediaQuery.removeEventListener("change", themeMediaListener);
+      themeMediaQuery = null;
+      themeMediaListener = null;
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("beforeunload", beforeUnloadListener);
+    }
+    if (savePrefsTimer !== null) {
+      clearTimeout(savePrefsTimer);
+      savePrefsTimer = null;
+    }
+    if (toastTimer) {
+      clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    if (gitChangedDebounceTimer !== null && typeof window !== "undefined") {
+      window.clearTimeout(gitChangedDebounceTimer);
+      gitChangedDebounceTimer = null;
+    }
+    for (const entry of pendingSeenTimers.values()) {
+      if (typeof window !== "undefined") {
+        window.clearTimeout(entry.timerId);
+      }
+    }
+    pendingSeenTimers.clear();
+
+    const cancelGate = (gate: SimpleSyncGate) => {
+      if (gate.rafId !== null && typeof window !== "undefined") {
+        window.cancelAnimationFrame(gate.rafId);
+        gate.rafId = null;
+      }
+      gate.queued = false;
+    };
+    cancelGate(fleetSyncGate);
+    cancelGate(sidebarSyncGate);
+    for (const gate of hostSyncGates.values()) {
+      cancelGate(gate);
+    }
+  });
+}
+
 function subscribeStore(onStoreChange: () => void): () => void {
   listeners.add(onStoreChange);
+  ensureStoreInitialized();
   return () => {
     listeners.delete(onStoreChange);
   };

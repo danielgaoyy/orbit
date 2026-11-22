@@ -640,14 +640,119 @@ struct StreamStageView: View {
         }
     }
 
+    private var isPathProjectQuery: Bool {
+        projectSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).contains("/")
+    }
+
     private var filteredLaunchpadProjects: [FfiLaunchpadProject] {
         let q = projectSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !q.isEmpty else { return store.launchpadProjects }
-        return store.launchpadProjects.filter { proj in
-            proj.name.lowercased().contains(q)
-                || proj.path.lowercased().contains(q)
-                || (proj.branch?.lowercased().contains(q) ?? false)
+
+        let tokens = q.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard !tokens.isEmpty else { return store.launchpadProjects }
+
+        let isPathMode = q.contains("/")
+
+        func isSegmentBoundary(_ text: String, at index: String.Index) -> Bool {
+            guard index > text.startIndex else { return true }
+            guard index < text.endIndex else { return false }
+            let prevIdx = text.index(before: index)
+            let prev = text[prevIdx]
+            if prev == "-" || prev == "_" || prev == "." || prev == "/" || prev == " " {
+                return true
+            }
+            let curr = text[index]
+            return prev.isLowercase && curr.isUppercase
         }
+
+        func scoreToken(_ originalText: String, tokenLower: String) -> Int? {
+            let lower = originalText.lowercased()
+            if lower == tokenLower { return 0 }
+            if lower.hasPrefix(tokenLower) { return 1 }
+
+            var searchStart = lower.startIndex
+            var firstMatch: String.Index?
+            while searchStart < lower.endIndex,
+                  let range = lower.range(of: tokenLower, range: searchStart..<lower.endIndex)
+            {
+                if firstMatch == nil { firstMatch = range.lowerBound }
+                let offset = lower.distance(from: lower.startIndex, to: range.lowerBound)
+                if let origIdx = originalText.index(
+                    originalText.startIndex,
+                    offsetBy: offset,
+                    limitedBy: originalText.endIndex
+                ), isSegmentBoundary(originalText, at: origIdx) {
+                    return 2
+                }
+                searchStart = lower.index(after: range.lowerBound)
+            }
+            return firstMatch != nil ? 3 : nil
+        }
+
+        func compactHomePath(_ rawPath: String) -> String {
+            let trimmed = rawPath.count > 1 ? rawPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")) : rawPath
+            let normalized = rawPath.hasPrefix("/") ? "/\(trimmed)" : trimmed
+            let parts = normalized.split(separator: "/", omittingEmptySubsequences: false)
+            if parts.count >= 3 && parts[0].isEmpty && (parts[1] == "Users" || parts[1] == "home") {
+                let rest = parts.dropFirst(3).joined(separator: "/")
+                return rest.isEmpty ? "~" : "~/\(rest)"
+            }
+            return normalized
+        }
+
+        func scoreProject(_ proj: FfiLaunchpadProject) -> Int? {
+            if isPathMode {
+                let tildePath = compactHomePath(proj.path)
+                var worst = 0
+                for token in tokens {
+                    let r1 = scoreToken(tildePath, tokenLower: token)
+                    let r2 = scoreToken(proj.path, tokenLower: token)
+                    guard let best = (r1 != nil && r2 != nil) ? min(r1!, r2!) : (r1 ?? r2) else {
+                        return nil
+                    }
+                    worst = max(worst, best)
+                }
+                return worst
+            }
+
+            if tokens.count == 1 {
+                return scoreToken(proj.name, tokenLower: tokens[0])
+            }
+
+            var worst = 0
+            for token in tokens {
+                guard let rank = scoreToken(proj.name, tokenLower: token) else {
+                    return nil
+                }
+                worst = max(worst, rank)
+            }
+            return worst + 1
+        }
+
+        return store.launchpadProjects.enumerated()
+            .compactMap { idx, proj -> (idx: Int, rank: Int, proj: FfiLaunchpadProject)? in
+                guard let rank = scoreProject(proj) else { return nil }
+                return (idx, rank, proj)
+            }
+            .sorted { lhs, rhs in
+                if lhs.rank != rhs.rank { return lhs.rank < rhs.rank }
+                return lhs.idx < rhs.idx
+            }
+            .map(\.proj)
+    }
+
+    private func compactParentDir(for path: String) -> String {
+        let trimmed = path.hasSuffix("/") && path.count > 1 ? String(path.dropLast()) : path
+        guard let slashIdx = trimmed.lastIndex(of: "/"), slashIdx > trimmed.startIndex else {
+            return trimmed
+        }
+        let parent = String(trimmed[..<slashIdx])
+        let parts = parent.split(separator: "/", omittingEmptySubsequences: false)
+        if parts.count >= 3 && parts[0].isEmpty && (parts[1] == "Users" || parts[1] == "home") {
+            let rest = parts.dropFirst(3).joined(separator: "/")
+            return rest.isEmpty ? "~" : "~/\(rest)"
+        }
+        return parent
     }
 
     private var projectPickerPopover: some View {
@@ -707,9 +812,10 @@ struct StreamStageView: View {
             } else {
                 ForEach(filteredLaunchpadProjects) { proj in
                     let isSelected = OrbitFormatters.arePathsEquivalent(proj.path, store.activeCwd)
+                    let subtitle = isPathProjectQuery ? compactParentDir(for: proj.path) : proj.branch
                     OrbitPopoverOptionRow(
                         title: proj.name,
-                        subtitle: proj.branch,
+                        subtitle: subtitle,
                         systemImage: "folder",
                         isSelected: isSelected
                     ) {
@@ -761,16 +867,17 @@ struct StreamStageView: View {
         let canWorktreeRoot = isActiveFolderGitRepo
         let nestedRepos = activeNestedGitRepos
 
+        let branch = store.activeGitBranch
+        let localSubtitle = branch.map { "Edit directly on \($0)" } ?? "Work directly in project folder"
+        let worktreeSubtitle = branch.map { "New branch from \($0)" } ?? "Isolated Git worktree for parallel tasks"
+
         return VStack(alignment: .leading, spacing: 6) {
-            OrbitPopoverSectionHeader(
-                title: "Execution",
-                trailing: store.activeGitBranch
-            )
+            OrbitPopoverSectionHeader(title: "Execution")
 
             VStack(alignment: .leading, spacing: 2) {
                 OrbitPopoverOptionRow(
                     title: "Local",
-                    subtitle: "Work directly in project folder",
+                    subtitle: localSubtitle,
                     systemImage: "laptopcomputer",
                     isSelected: !store.draftUseWorktree
                 ) {
@@ -782,7 +889,7 @@ struct StreamStageView: View {
                 if canWorktreeRoot {
                     OrbitPopoverOptionRow(
                         title: "Worktree",
-                        subtitle: "Isolated Git worktree for parallel tasks",
+                        subtitle: worktreeSubtitle,
                         systemImage: "arrow.triangle.branch",
                         isSelected: store.draftUseWorktree && store.draftWorktreeRepoPath == nil
                     ) {

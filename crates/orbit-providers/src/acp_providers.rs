@@ -2597,7 +2597,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let _ = orbit_shim::run_shim(&sock_bg, spec).await;
         });
-        for _ in 0..150 {
+        for _ in 0..400 {
             if sock_path.exists()
                 && let Ok(client) = ShimClient::connect(&sock_path).await
             {

@@ -535,6 +535,26 @@ fn resolve_home(override_home: Option<PathBuf>) -> PathBuf {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        // Windows MSVC defaults to a 1 MiB main thread stack (vs 8 MiB on macOS/Linux),
+        // which can overflow (`0xc00000fd`) in `clap::Parser` or large async futures in debug builds.
+        let handle = std::thread::Builder::new()
+            .name("orbit-main".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(main_impl)?;
+        match handle.join() {
+            Ok(res) => res,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        main_impl()
+    }
+}
+
+fn main_impl() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let rt = match &cli.command {
         Commands::Daemon { action: None, .. } | Commands::Relay { .. } => {
@@ -543,6 +563,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(4);
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(workers)
+                .thread_stack_size(8 * 1024 * 1024)
                 .enable_all()
                 .build()?
         }
@@ -550,7 +571,7 @@ fn main() -> anyhow::Result<()> {
             .enable_all()
             .build()?,
     };
-    rt.block_on(run_cli(cli))
+    rt.block_on(Box::pin(run_cli(cli)))
 }
 
 async fn run_cli(cli: Cli) -> anyhow::Result<()> {

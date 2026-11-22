@@ -45,7 +45,25 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
         })
         .await;
     });
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    let http = reqwest::Client::new();
+    let deadline_a = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut daemon_a_ready = false;
+    while tokio::time::Instant::now() < deadline_a {
+        if let Ok(resp) = http
+            .get(format!("http://{shared_addr}/healthz"))
+            .send()
+            .await
+            && resp.status().is_success()
+        {
+            daemon_a_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        daemon_a_ready,
+        "user A daemon must become ready on {shared_addr}"
+    );
 
     // 2. Start user B's daemon ALSO requesting the EXACT SAME `shared_addr`!
     //    `run_daemon` must automatically isolate user B onto a conflict-free port in `6868..=6999`
@@ -59,12 +77,20 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
         })
         .await;
     });
-    tokio::time::sleep(Duration::from_millis(180)).await;
-
-    let persisted_b = DaemonPersistedConfig::load(&home_b);
-    let isolated_addr_b = persisted_b
-        .listen_addr
-        .expect("user B must persist its auto-isolated listen_addr");
+    let deadline_b = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut isolated_addr_b = None;
+    while tokio::time::Instant::now() < deadline_b {
+        if let Some(addr) = DaemonPersistedConfig::load(&home_b).listen_addr
+            && let Ok(resp) = http.get(format!("http://{addr}/healthz")).send().await
+            && resp.status().is_success()
+        {
+            isolated_addr_b = Some(addr);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let isolated_addr_b =
+        isolated_addr_b.expect("user B must persist its auto-isolated listen_addr");
     assert_ne!(
         isolated_addr_b.port(),
         shared_addr.port(),
@@ -72,7 +98,6 @@ async fn same_machine_multi_user_daemons_auto_isolate_ports_and_block_cross_talk
     );
 
     // Verify `/healthz` returns distinct cryptographic `host_id`s for user A and user B!
-    let http = reqwest::Client::new();
     let hz_a: serde_json::Value = http
         .get(format!("http://{shared_addr}/healthz"))
         .send()

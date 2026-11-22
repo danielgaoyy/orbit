@@ -178,16 +178,21 @@ async fn full_stack_e2ee_relay_allowlist_git_and_pty_integration() {
         other => panic!("unexpected terminal response: {other:?}"),
     };
 
+    let pty_cmd: Vec<u8> = if cfg!(windows) {
+        b"echo ORBIT_E2EE_PTY_OK\r\n".to_vec()
+    } else {
+        b"printf 'ORBIT_E2EE_PTY_OK\\n'\n".to_vec()
+    };
     session
         .send_terminal(TerminalBinaryFrame::Input {
             slot,
-            data: b"printf 'ORBIT_E2EE_PTY_OK\\n'\n".to_vec(),
+            data: pty_cmd,
         })
         .await
         .expect("send pty input");
 
     let mut collected = String::new();
-    let pty_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let pty_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < pty_deadline {
         if let Ok(Ok(ev)) =
             tokio::time::timeout(Duration::from_millis(250), term_events.recv()).await

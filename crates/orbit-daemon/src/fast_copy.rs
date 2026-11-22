@@ -800,9 +800,9 @@ mod tests {
         );
 
         // Overwriting an existing destination file also succeeds.
-        let method2 = copy_file_cow(&src, &dst).expect("overwrite copy_file_cow");
+        let _method2 = copy_file_cow(&src, &dst).expect("overwrite copy_file_cow");
         #[cfg(target_os = "macos")]
-        assert_eq!(method2, CopyMethod::ApfsClone);
+        assert_eq!(_method2, CopyMethod::ApfsClone);
         assert_eq!(
             std::fs::read_to_string(&dst).expect("read dst again"),
             "hello cow world"
@@ -955,10 +955,10 @@ mod tests {
 
         // ReferenceLink mode
         let linked = root.join("fork_a/artifacts");
-        let outcome =
+        let _outcome =
             link_or_clone_dir(&src, &linked, DirShareMode::ReferenceLink).expect("reflink");
         #[cfg(unix)]
-        assert_eq!(outcome, LinkOrCloneOutcome::Symlinked);
+        assert_eq!(_outcome, LinkOrCloneOutcome::Symlinked);
         assert_eq!(
             std::fs::read_to_string(linked.join("report.bin")).expect("read linked"),
             "artifact-v1"

@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Check, Copy } from "lucide-react";
+import { ArrowUpRight, Check, Copy } from "lucide-react";
 import { DiagramBlock } from "@/components/diagram-block";
 import { InlineMathSpan, MathBlockView } from "@/components/math-block";
 import { adaptTokenColor } from "@/lib/code-highlight";
@@ -22,6 +22,11 @@ import {
   detectDiagramKind,
 } from "@/lib/orbit-ipc";
 import { openOrbitLink, parseOrbitLinkTarget } from "@/lib/file-links";
+import {
+  type ResolvedSubagentItem,
+  type SubagentNameMatcher,
+  buildSubagentNameMatcher,
+} from "@/lib/subagents";
 import { usePacedRichBlocks } from "@/lib/text-reveal";
 import { cn } from "@/lib/utils";
 
@@ -32,6 +37,9 @@ export interface MarkdownLinkContextValue {
   cwd?: string;
   baseFilePath?: string;
   onAnchor?: (fragment: string) => void;
+  subagents?: readonly ResolvedSubagentItem[];
+  subagentMatcher?: SubagentNameMatcher | null;
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }
 
 const MarkdownLinkContext = createContext<MarkdownLinkContextValue>({});
@@ -51,11 +59,30 @@ export function MarkdownLinkProvider({
   cwd,
   baseFilePath,
   onAnchor,
+  subagents,
+  subagentMatcher: precompiledMatcher,
+  onOpenSubagent,
   children,
 }: MarkdownLinkContextValue & { children: ReactNode }) {
+  const resolvedMatcher = useMemo(
+    () => {
+      if (!onOpenSubagent) return null;
+      if (precompiledMatcher !== undefined) return precompiledMatcher;
+      return buildSubagentNameMatcher(subagents);
+    },
+    [precompiledMatcher, subagents, onOpenSubagent],
+  );
   const value = useMemo<MarkdownLinkContextValue>(
-    () => ({ hostId, cwd, baseFilePath, onAnchor }),
-    [hostId, cwd, baseFilePath, onAnchor],
+    () => ({
+      hostId,
+      cwd,
+      baseFilePath,
+      onAnchor,
+      subagents,
+      subagentMatcher: resolvedMatcher,
+      onOpenSubagent,
+    }),
+    [hostId, cwd, baseFilePath, onAnchor, subagents, resolvedMatcher, onOpenSubagent],
   );
   return <MarkdownLinkContext.Provider value={value}>{children}</MarkdownLinkContext.Provider>;
 }
@@ -208,6 +235,32 @@ const InlineSpans = memo(
           }
 
           if (span.inline_code) {
+            const matchedSubagent =
+              linkCtx.subagentMatcher && linkCtx.onOpenSubagent
+                ? linkCtx.subagentMatcher.matchExact(span.text)
+                : null;
+            if (matchedSubagent && linkCtx.onOpenSubagent) {
+              const onOpen = linkCtx.onOpenSubagent;
+              return (
+                <button
+                  key={idx}
+                  type="button"
+                  title="Open subagent details"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onOpen(matchedSubagent);
+                  }}
+                  className={cn(
+                    "group/salink text-foreground/92 hover:text-foreground inline cursor-pointer items-baseline rounded-[5px] bg-black/[0.055] px-1.5 py-[1.5px] font-mono text-[13px] underline decoration-foreground/25 decoration-dotted underline-offset-2 transition-colors hover:bg-black/[0.085] hover:decoration-foreground/75 [overflow-wrap:anywhere] dark:bg-white/[0.09] dark:hover:bg-white/[0.14]",
+                    className,
+                  )}
+                >
+                  <span>{span.text}</span>
+                  <ArrowUpRight className="ml-[2px] inline-block size-[11px] -translate-y-[0.5px] opacity-45 transition-opacity group-hover/salink:opacity-90" />
+                </button>
+              );
+            }
             return (
               <code
                 key={idx}
@@ -216,6 +269,37 @@ const InlineSpans = memo(
                 {span.text}
               </code>
             );
+          }
+
+          if (linkCtx.subagentMatcher && linkCtx.onOpenSubagent) {
+            const segments = linkCtx.subagentMatcher.splitText(span.text);
+            if (segments.length > 1 || segments[0]?.kind === "subagent") {
+              const onOpen = linkCtx.onOpenSubagent;
+              return (
+                <span key={idx} className={className || undefined}>
+                  {segments.map((seg, segIdx) =>
+                    seg.kind === "subagent" ? (
+                      <button
+                        key={segIdx}
+                        type="button"
+                        title="Open subagent details"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onOpen(seg.subagent);
+                        }}
+                        className="group/salink text-foreground/95 decoration-foreground/30 hover:decoration-foreground/80 hover:text-foreground inline cursor-pointer items-baseline rounded-[3px] underline decoration-dotted underline-offset-2 transition-colors"
+                      >
+                        <span>{seg.text}</span>
+                        <ArrowUpRight className="ml-[2px] inline-block size-[11px] -translate-y-[0.5px] opacity-40 transition-opacity group-hover/salink:opacity-90" />
+                      </button>
+                    ) : (
+                      <span key={segIdx}>{seg.text}</span>
+                    ),
+                  )}
+                </span>
+              );
+            }
           }
 
           return (

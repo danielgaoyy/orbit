@@ -1,8 +1,75 @@
-import { memo, useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type MutableRefObject,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { ArrowDown, Check, ChevronDown, ChevronUp, Copy } from "lucide-react";
 import { MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
+
+/**
+ * Anchor-preserving viewport hold matching `StreamStage`:
+ * Keeps a clicked disclosure trigger or prompt bubble stationary when expanding/collapsing,
+ * pauses `stickToBottomRef` during the toggle so live streaming never yanks the viewport away,
+ * and smoothly nudges newly expanded details near the bottom edge into view.
+ */
+export function useViewportAnchorHold(
+  viewportRef: RefObject<HTMLDivElement | null>,
+  stickToBottomRef?: MutableRefObject<boolean>,
+) {
+  return useCallback(
+    (triggerEl: HTMLElement | null, apply: () => void, edge: "top" | "bottom" = "top") => {
+      const scroller = viewportRef.current;
+      if (!scroller || !triggerEl) {
+        apply();
+        return;
+      }
+      const beforeRect = triggerEl.getBoundingClientRect();
+      const beforeAnchor = edge === "bottom" ? beforeRect.bottom : beforeRect.top;
+      const wasPinnedBottom = stickToBottomRef?.current ?? false;
+      if (stickToBottomRef) {
+        stickToBottomRef.current = false;
+      }
+
+      apply();
+
+      window.requestAnimationFrame(() => {
+        const curScroller = viewportRef.current;
+        if (!curScroller || !triggerEl.isConnected) return;
+        const afterRect = triggerEl.getBoundingClientRect();
+        const afterAnchor = edge === "bottom" ? afterRect.bottom : afterRect.top;
+        const delta = afterAnchor - beforeAnchor;
+        if (Math.abs(delta) > 1) {
+          curScroller.scrollTop += delta;
+        }
+        const parentWrapper = triggerEl.parentElement;
+        if (parentWrapper) {
+          const wrapperRect = parentWrapper.getBoundingClientRect();
+          const scrollerRect = curScroller.getBoundingClientRect();
+          const overflowBelow = wrapperRect.bottom - scrollerRect.bottom;
+          if (overflowBelow > 8 && wrapperRect.height < scrollerRect.height * 0.75) {
+            curScroller.scrollBy({
+              top: Math.min(overflowBelow + 12, 220),
+              behavior: "smooth",
+            });
+          }
+        }
+        if (wasPinnedBottom && stickToBottomRef) {
+          const dist =
+            curScroller.scrollHeight - curScroller.scrollTop - curScroller.clientHeight;
+          stickToBottomRef.current = dist < 48;
+        }
+      });
+    },
+    [viewportRef, stickToBottomRef],
+  );
+}
 
 /**
  * Shared sticky-bottom conversation viewport used across side panels (`/btw` Side Question,
@@ -14,6 +81,8 @@ export const ConversationViewport = memo(function ConversationViewport({
   cwd,
   contentVersion,
   resetKey,
+  viewportRef: externalViewportRef,
+  stickToBottomRef: externalStickToBottomRef,
   className,
   viewportClassName,
   contentClassName,
@@ -23,13 +92,17 @@ export const ConversationViewport = memo(function ConversationViewport({
   cwd?: string | null;
   contentVersion: string | number;
   resetKey?: string;
+  viewportRef?: MutableRefObject<HTMLDivElement | null>;
+  stickToBottomRef?: MutableRefObject<boolean>;
   className?: string;
   viewportClassName?: string;
   contentClassName?: string;
   children: ReactNode;
 }) {
-  const viewportRef = useRef<HTMLDivElement | null>(null);
-  const stickToBottomRef = useRef(true);
+  const internalViewportRef = useRef<HTMLDivElement | null>(null);
+  const viewportRef = externalViewportRef ?? internalViewportRef;
+  const internalStickToBottomRef = useRef(true);
+  const stickToBottomRef = externalStickToBottomRef ?? internalStickToBottomRef;
   const [showJumpLatest, setShowJumpLatest] = useState(false);
 
   const checkNearBottom = useCallback((el: HTMLDivElement): boolean => {

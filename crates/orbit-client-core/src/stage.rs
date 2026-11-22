@@ -1486,6 +1486,31 @@ pub fn collect_stage_auxiliary_state(
     )
 }
 
+/// Settles any leftover running tool calls or streaming assistant messages in a timeline slice
+/// belonging to an already-finished session/subagent so turn projection never keeps phantom
+/// `has_active_item = true` or shimmering `Running…` step summaries.
+pub fn settle_timeline_items_for_finished_session(
+    items: &mut [TimelineItemView],
+    terminal_status: ToolCallStatus,
+) {
+    for item in items.iter_mut() {
+        match item {
+            TimelineItemView::ToolCall {
+                status,
+                step_descriptor,
+                ..
+            } if *status == ToolCallStatus::Running => {
+                *status = terminal_status;
+                *step_descriptor = None;
+            }
+            TimelineItemView::AssistantMessage { streaming, .. } if *streaming => {
+                *streaming = false;
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn process_timeline_for_stage(
     items: &[TimelineItemView],
     cwd: Option<&str>,

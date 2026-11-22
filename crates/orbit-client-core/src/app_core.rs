@@ -645,6 +645,8 @@ struct HostMemoryState {
     pending_permissions: Vec<PendingPermissionSummary>,
     provider_subagents: HashMap<String, Vec<ProviderSubagentDescriptor>>,
     provider_subagent_timelines: HashMap<(String, String), Vec<ProviderSubagentEvent>>,
+    provider_subagent_access_order: VecDeque<(String, String)>,
+    active_provider_subagent: Option<(String, String)>,
     acp_agents: Vec<AcpAgentAvailability>,
     artifacts: Vec<ArtifactSummary>,
 }
@@ -741,6 +743,8 @@ impl HostMemoryState {
             pending_permissions: Vec::new(),
             provider_subagents: HashMap::new(),
             provider_subagent_timelines: HashMap::new(),
+            provider_subagent_access_order: VecDeque::new(),
+            active_provider_subagent: None,
             acp_agents: Vec::new(),
             artifacts: Vec::new(),
         }
@@ -790,6 +794,88 @@ impl HostMemoryState {
                     | AgentStatus::AwaitingPermission { .. }
             )
         })
+    }
+
+    fn touch_provider_subagent_lru(&mut self, key: &(String, String)) {
+        if let Some(pos) = self
+            .provider_subagent_access_order
+            .iter()
+            .position(|k| k == key)
+        {
+            self.provider_subagent_access_order.remove(pos);
+        }
+        self.provider_subagent_access_order.push_back(key.clone());
+    }
+
+    fn is_provider_subagent_running(&self, parent_agent_id: &str, subagent_id: &str) -> bool {
+        self.provider_subagents
+            .get(parent_agent_id)
+            .is_some_and(|list| {
+                list.iter().any(|ps| {
+                    ps.subagent_id == subagent_id
+                        && ps.status == orbit_protocol::ProviderSubagentStatus::Running
+                })
+            })
+    }
+
+    fn enforce_provider_subagent_timeline_bounds(&mut self, keep_key: Option<&(String, String)>) {
+        const MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST: usize = 8;
+
+        // Drop stale access-order entries no longer present in the map.
+        self.provider_subagent_access_order
+            .retain(|k| self.provider_subagent_timelines.contains_key(k));
+
+        if self.provider_subagent_timelines.len() <= MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST {
+            return;
+        }
+
+        // First evict oldest finished entries tracked in LRU order.
+        let mut idx = 0;
+        while self.provider_subagent_timelines.len() > MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST
+            && idx < self.provider_subagent_access_order.len()
+        {
+            let candidate = self.provider_subagent_access_order[idx].clone();
+            let is_pinned = keep_key.is_some_and(|k| k == &candidate)
+                || self
+                    .active_provider_subagent
+                    .as_ref()
+                    .is_some_and(|active| active == &candidate);
+            if is_pinned || self.is_provider_subagent_running(&candidate.0, &candidate.1) {
+                idx += 1;
+                continue;
+            }
+            self.provider_subagent_access_order.remove(idx);
+            self.provider_subagent_timelines.remove(&candidate);
+        }
+
+        // Fallback: evict any untracked finished keys (e.g. inserted directly without LRU touch).
+        if self.provider_subagent_timelines.len() > MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST {
+            let extra: Vec<(String, String)> = self
+                .provider_subagent_timelines
+                .keys()
+                .filter(|k| {
+                    !keep_key.is_some_and(|keep| keep == *k)
+                        && !self
+                            .active_provider_subagent
+                            .as_ref()
+                            .is_some_and(|active| active == *k)
+                        && !self.is_provider_subagent_running(&k.0, &k.1)
+                        && !self.provider_subagent_access_order.contains(*k)
+                })
+                .cloned()
+                .collect();
+            let mut to_remove = self
+                .provider_subagent_timelines
+                .len()
+                .saturating_sub(MAX_PROVIDER_SUBAGENT_TIMELINES_PER_HOST);
+            for k in extra {
+                if to_remove == 0 {
+                    break;
+                }
+                self.provider_subagent_timelines.remove(&k);
+                to_remove -= 1;
+            }
+        }
     }
 
     fn enforce_memory_cache_bounds(&mut self, keep_agent_id: &str) {
@@ -845,6 +931,7 @@ impl HostMemoryState {
         if self.streaming_markdown_cache.len() > MAX_STREAMING_MARKDOWN_CACHE_ENTRIES {
             self.streaming_markdown_cache.clear();
         }
+        self.enforce_provider_subagent_timeline_bounds(None);
     }
 
     fn emulator_slot_mut(&mut self, slot: u8) -> &mut TerminalGridEmulator {
@@ -4246,10 +4333,13 @@ impl OrbitAppCore {
                     state.mark_stage_meta_dirty(&parent_agent_id);
                     push_notify_timeline(parent_agent_id.clone());
                     state.provider_subagents.insert(parent_agent_id, subagents);
+                    state.enforce_provider_subagent_timeline_bounds(None);
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentUpdated { subagent } => {
                     let parent_id = subagent.parent_agent_id.clone();
+                    let finished =
+                        subagent.status != orbit_protocol::ProviderSubagentStatus::Running;
                     let list = state
                         .provider_subagents
                         .entry(parent_id.clone())
@@ -4262,6 +4352,9 @@ impl OrbitAppCore {
                     } else {
                         list.push(subagent);
                     }
+                    if finished {
+                        state.enforce_provider_subagent_timeline_bounds(None);
+                    }
                     state.mark_stage_meta_dirty(&parent_id);
                     push_notify_timeline(parent_id);
                     notify_host = true;
@@ -4273,7 +4366,10 @@ impl OrbitAppCore {
                     ..
                 } => {
                     let key = (parent_agent_id, subagent_id);
-                    let list = state.provider_subagent_timelines.entry(key).or_default();
+                    let list = state
+                        .provider_subagent_timelines
+                        .entry(key.clone())
+                        .or_default();
                     for ev in events {
                         if let Some(slot) = list.iter_mut().find(|e| e.seq == ev.seq) {
                             *slot = ev;
@@ -4282,16 +4378,23 @@ impl OrbitAppCore {
                         }
                     }
                     list.sort_by_key(|e| e.seq);
+                    state.touch_provider_subagent_lru(&key);
+                    state.enforce_provider_subagent_timeline_bounds(Some(&key));
                     notify_host = true;
                 }
                 WireMessage::ProviderSubagentTimelineLive { event } => {
                     let key = (event.parent_agent_id.clone(), event.subagent_id.clone());
-                    let list = state.provider_subagent_timelines.entry(key).or_default();
+                    let list = state
+                        .provider_subagent_timelines
+                        .entry(key.clone())
+                        .or_default();
                     if let Some(slot) = list.iter_mut().find(|e| e.seq == event.seq) {
                         *slot = event;
                     } else {
                         list.push(event);
                     }
+                    state.touch_provider_subagent_lru(&key);
+                    state.enforce_provider_subagent_timeline_bounds(Some(&key));
                     notify_host = true;
                 }
                 WireMessage::AgentRewound {
@@ -7954,14 +8057,20 @@ impl OrbitAppCore {
         parent_agent_id: &str,
         subagent_id: &str,
     ) {
+        let key = (parent_agent_id.to_string(), subagent_id.to_string());
         let since_seq = self
             .hosts
-            .read()
+            .write()
             .ok()
-            .and_then(|g| {
-                g.get(host_id)?
+            .and_then(|mut g| {
+                let host_state = g.get_mut(host_id)?;
+                host_state.active_provider_subagent = Some(key.clone());
+                if host_state.provider_subagent_timelines.contains_key(&key) {
+                    host_state.touch_provider_subagent_lru(&key);
+                }
+                host_state
                     .provider_subagent_timelines
-                    .get(&(parent_agent_id.to_string(), subagent_id.to_string()))
+                    .get(&key)
                     .and_then(|list| list.iter().map(|e| e.seq).max())
             })
             .unwrap_or(0);
@@ -8014,11 +8123,16 @@ impl OrbitAppCore {
             .agents
             .get(parent_agent_id)
             .map(|a| a.cwd.clone());
+        let key = (parent_agent_id.to_string(), subagent_id.to_string());
         let raw_events = host_state
             .provider_subagent_timelines
-            .get(&(parent_agent_id.to_string(), subagent_id.to_string()))
+            .get(&key)
             .cloned()
             .unwrap_or_default();
+        if !raw_events.is_empty() {
+            host_state.touch_provider_subagent_lru(&key);
+            host_state.enforce_provider_subagent_timeline_bounds(Some(&key));
+        }
         let descriptor = host_state
             .provider_subagents
             .get(parent_agent_id)
@@ -8101,6 +8215,20 @@ impl OrbitAppCore {
                 &mut host_state.streaming_markdown_cache,
             ) {
                 items.push(item);
+            }
+        }
+
+        if let Some(d) = descriptor.as_ref() {
+            let terminal_status = match d.status {
+                orbit_protocol::ProviderSubagentStatus::Running => None,
+                orbit_protocol::ProviderSubagentStatus::Completed => {
+                    Some(ToolCallStatus::Completed)
+                }
+                orbit_protocol::ProviderSubagentStatus::Failed
+                | orbit_protocol::ProviderSubagentStatus::Canceled => Some(ToolCallStatus::Failed),
+            };
+            if let Some(status) = terminal_status {
+                stage::settle_timeline_items_for_finished_session(&mut items, status);
             }
         }
 
@@ -14098,6 +14226,346 @@ mod tests {
         assert_eq!(turns[0].work_counts.read_file_count, 1);
         assert!(turns[0].terminal_reply.is_some());
         assert!(!turns[0].live_segments.is_empty());
+    }
+
+    #[test]
+    fn provider_subagent_turns_settles_active_items_when_subagent_completed() {
+        let now = Utc::now();
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_sub_settled".into(),
+                hostname: "sub-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.provider_subagents.insert(
+                "ag_parent".into(),
+                vec![orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "ps_done".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Finished Worker".into(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Completed,
+                    created_at: now,
+                    updated_at: now,
+                }],
+            );
+            mem.provider_subagent_timelines.insert(
+                ("ag_parent".into(), "ps_done".into()),
+                vec![
+                    ProviderSubagentEvent {
+                        seq: 1,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: "ps_done".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::ToolCall {
+                            call_id: "tc_open".into(),
+                            status: ToolCallStatus::Running,
+                            detail: ToolCallDetail::FileRead {
+                                path: "/repo/src/lib.rs".into(),
+                                start_line: None,
+                                end_line: None,
+                            },
+                            background_task: None,
+                        },
+                    },
+                    ProviderSubagentEvent {
+                        seq: 2,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: "ps_done".into(),
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: "msg_streaming".into(),
+                            text: "Final summary text.".into(),
+                            streaming: true,
+                        },
+                    },
+                ],
+            );
+            core.hosts
+                .write()
+                .expect("hosts write lock")
+                .insert("h_sub_settled".into(), mem);
+        }
+
+        let turns = core.provider_subagent_turns(
+            "h_sub_settled",
+            "ag_parent",
+            "ps_done",
+            Some("Check lib.rs"),
+        );
+        assert_eq!(turns.len(), 1);
+        assert!(
+            !turns[0].has_active_item,
+            "completed provider subagent must settle leftover active items"
+        );
+        assert!(turns[0].terminal_reply.is_some());
+        for seg in &turns[0].live_segments {
+            if let stage::TurnLiveSegmentView::StepGroup {
+                has_running_step, ..
+            } = seg
+            {
+                assert!(!has_running_step);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_subagent_timelines_evicts_oldest_finished_while_pinning_running() {
+        let now = Utc::now();
+        let mut mem = HostMemoryState::new(SavedHostProfile {
+            host_id: "h_sub_lru".into(),
+            hostname: "lru-box".into(),
+            custom_name: None,
+            ssh_alias: None,
+            route_mode: HostRouteMode::Auto,
+            remote_daemon_port: 7474,
+            custom_direct_endpoint: None,
+            daemon_pubkey_b64: "pk".into(),
+            direct_endpoints: vec![],
+            relay_url: None,
+            state: HostConnectionState::OnlineDirect,
+        });
+
+        let mut descriptors = Vec::new();
+        for idx in 0..12 {
+            let sub_id = format!("ps_{idx}");
+            let status = if idx == 0 || idx == 1 {
+                orbit_protocol::ProviderSubagentStatus::Running
+            } else {
+                orbit_protocol::ProviderSubagentStatus::Completed
+            };
+            descriptors.push(orbit_protocol::ProviderSubagentDescriptor {
+                subagent_id: sub_id.clone(),
+                parent_agent_id: "ag_parent".into(),
+                parent_subagent_id: None,
+                title: format!("Worker {idx}"),
+                subtitle: None,
+                status,
+                created_at: now,
+                updated_at: now,
+            });
+            let key = ("ag_parent".to_string(), sub_id.clone());
+            mem.provider_subagent_timelines.insert(
+                key.clone(),
+                vec![ProviderSubagentEvent {
+                    seq: 1,
+                    parent_agent_id: "ag_parent".into(),
+                    subagent_id: sub_id,
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: format!("msg_{idx}"),
+                        text: format!("Output {idx}"),
+                        streaming: false,
+                    },
+                }],
+            );
+            mem.touch_provider_subagent_lru(&key);
+        }
+        mem.provider_subagents
+            .insert("ag_parent".into(), descriptors);
+
+        // Touch finished `ps_2` so it becomes most recently accessed and must survive eviction.
+        let touched = ("ag_parent".to_string(), "ps_2".to_string());
+        mem.touch_provider_subagent_lru(&touched);
+        mem.enforce_provider_subagent_timeline_bounds(Some(&touched));
+
+        assert_eq!(mem.provider_subagent_timelines.len(), 8);
+        // Running subagents `ps_0` and `ps_1` stay pinned despite being oldest.
+        assert!(
+            mem.provider_subagent_timelines
+                .contains_key(&("ag_parent".into(), "ps_0".into()))
+        );
+        assert!(
+            mem.provider_subagent_timelines
+                .contains_key(&("ag_parent".into(), "ps_1".into()))
+        );
+        // Recently touched finished `ps_2` stays cached.
+        assert!(mem.provider_subagent_timelines.contains_key(&touched));
+        // Oldest untouched finished entries (`ps_3`..=`ps_6`) were evicted.
+        for evicted_idx in 3..=6 {
+            assert!(
+                !mem.provider_subagent_timelines
+                    .contains_key(&("ag_parent".into(), format!("ps_{evicted_idx}"))),
+                "expected ps_{evicted_idx} to be evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_subagent_active_open_tab_is_pinned_against_lru_eviction() {
+        let now = Utc::now();
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        let open_key = ("ag_parent".to_string(), "ps_open".to_string());
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_sub_pin".into(),
+                hostname: "pin-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.provider_subagents.insert(
+                "ag_parent".into(),
+                vec![orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "ps_open".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Inspected Finished Subagent".into(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Completed,
+                    created_at: now,
+                    updated_at: now,
+                }],
+            );
+            mem.provider_subagent_timelines.insert(
+                open_key.clone(),
+                vec![ProviderSubagentEvent {
+                    seq: 1,
+                    parent_agent_id: "ag_parent".into(),
+                    subagent_id: "ps_open".into(),
+                    timestamp: now,
+                    payload: TimelinePayload::AssistantMessage {
+                        item_id: "msg_open".into(),
+                        text: "Pinned transcript".into(),
+                        streaming: false,
+                    },
+                }],
+            );
+            mem.touch_provider_subagent_lru(&open_key);
+            core.hosts
+                .write()
+                .expect("hosts write lock")
+                .insert("h_sub_pin".into(), mem);
+        }
+
+        // Mark `ps_open` as the actively open subagent tab via `open_provider_subagent_timeline`.
+        core.open_provider_subagent_timeline("h_sub_pin", "ag_parent", "ps_open");
+
+        // Stream 10 other finished subagents while `ps_open` stays open in the side panel.
+        {
+            let mut hosts = core.hosts.write().expect("hosts write lock");
+            let mem = hosts.get_mut("h_sub_pin").expect("host exists");
+            for idx in 0..10 {
+                let sub_id = format!("ps_other_{idx}");
+                mem.provider_subagents
+                    .entry("ag_parent".into())
+                    .or_default()
+                    .push(orbit_protocol::ProviderSubagentDescriptor {
+                        subagent_id: sub_id.clone(),
+                        parent_agent_id: "ag_parent".into(),
+                        parent_subagent_id: None,
+                        title: format!("Other {idx}"),
+                        subtitle: None,
+                        status: orbit_protocol::ProviderSubagentStatus::Completed,
+                        created_at: now,
+                        updated_at: now,
+                    });
+                let key = ("ag_parent".to_string(), sub_id.clone());
+                mem.provider_subagent_timelines.insert(
+                    key.clone(),
+                    vec![ProviderSubagentEvent {
+                        seq: 1,
+                        parent_agent_id: "ag_parent".into(),
+                        subagent_id: sub_id,
+                        timestamp: now,
+                        payload: TimelinePayload::AssistantMessage {
+                            item_id: format!("msg_other_{idx}"),
+                            text: format!("Other output {idx}"),
+                            streaming: false,
+                        },
+                    }],
+                );
+                mem.touch_provider_subagent_lru(&key);
+                mem.enforce_provider_subagent_timeline_bounds(Some(&key));
+            }
+
+            assert_eq!(mem.provider_subagent_timelines.len(), 8);
+            assert!(
+                mem.provider_subagent_timelines.contains_key(&open_key),
+                "actively open finished subagent must remain pinned against LRU eviction"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_subagent_turns_settles_failed_subagent_running_tool_as_failed() {
+        let now = Utc::now();
+        let core = OrbitAppCore::open_in_memory().expect("open core");
+        {
+            let mut mem = HostMemoryState::new(SavedHostProfile {
+                host_id: "h_sub_failed".into(),
+                hostname: "fail-box".into(),
+                custom_name: None,
+                ssh_alias: None,
+                route_mode: HostRouteMode::Auto,
+                remote_daemon_port: 7474,
+                custom_direct_endpoint: None,
+                daemon_pubkey_b64: "pk".into(),
+                direct_endpoints: vec![],
+                relay_url: None,
+                state: HostConnectionState::OnlineDirect,
+            });
+            mem.provider_subagents.insert(
+                "ag_parent".into(),
+                vec![orbit_protocol::ProviderSubagentDescriptor {
+                    subagent_id: "ps_fail".into(),
+                    parent_agent_id: "ag_parent".into(),
+                    parent_subagent_id: None,
+                    title: "Failing Worker".into(),
+                    subtitle: None,
+                    status: orbit_protocol::ProviderSubagentStatus::Failed,
+                    created_at: now,
+                    updated_at: now,
+                }],
+            );
+            mem.provider_subagent_timelines.insert(
+                ("ag_parent".into(), "ps_fail".into()),
+                vec![ProviderSubagentEvent {
+                    seq: 1,
+                    parent_agent_id: "ag_parent".into(),
+                    subagent_id: "ps_fail".into(),
+                    timestamp: now,
+                    payload: TimelinePayload::ToolCall {
+                        call_id: "tc_stuck".into(),
+                        status: ToolCallStatus::Running,
+                        detail: ToolCallDetail::Shell {
+                            command: "cargo test".into(),
+                            cwd: None,
+                            exit_code: None,
+                            output_preview: None,
+                        },
+                        background_task: None,
+                    },
+                }],
+            );
+            core.hosts
+                .write()
+                .expect("hosts write lock")
+                .insert("h_sub_failed".into(), mem);
+        }
+
+        let turns =
+            core.provider_subagent_turns("h_sub_failed", "ag_parent", "ps_fail", Some("Run tests"));
+        assert_eq!(turns.len(), 1);
+        assert!(!turns[0].has_active_item);
+        assert!(turns[0].has_error);
+        assert_eq!(turns[0].work_counts.failed_count, 1);
     }
 
     #[test]

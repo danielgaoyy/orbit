@@ -381,7 +381,7 @@ async fn connect_direct_with_host_id(
             match msg {
                 Message::Text(txt) => match serde_json::from_str::<WireMessage>(&txt) {
                     Ok(wire) => {
-                        sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
+                        sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
                         let _ = events_in.send(ClientInboundEvent::Wire(wire));
                     }
                     Err(err) => {
@@ -392,7 +392,7 @@ async fn connect_direct_with_host_id(
                     if bin[0] == DIRECT_BIN_ZSTD_WIRE {
                         match WireMessage::decode_zstd(&bin[1..]) {
                             Ok(wire) => {
-                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
+                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
                                 let _ = events_in.send(ClientInboundEvent::Wire(wire));
                             }
                             Err(err) => {
@@ -546,7 +546,7 @@ async fn connect_via_relay_with_host_id(
                     match plain[0] {
                         E2EE_FRAME_WIRE => match WireMessage::decode_zstd(&plain[1..]) {
                             Ok(wire) => {
-                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire);
+                                sync_to_replica(&owned_host_id, replica.as_deref(), &wire).await;
                                 let _ = events_in.send(ClientInboundEvent::Wire(wire));
                             }
                             Err(err) => {
@@ -815,7 +815,26 @@ pub async fn connect_smart(
     }
 }
 
-fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage) {
+async fn retry_replica_write<F>(mut op: F) -> Result<(), orbit_store::StoreError>
+where
+    F: FnMut() -> Result<(), orbit_store::StoreError>,
+{
+    const BACKOFF_MS: [u64; 2] = [25, 75];
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err) if err.is_busy() && attempt < BACKOFF_MS.len() => {
+                let delay = Duration::from_millis(BACKOFF_MS[attempt]);
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage) {
     let Some(store) = store else { return };
     match msg {
         WireMessage::WorkspacesSnapshot { workspaces, .. } => {
@@ -872,7 +891,11 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
         WireMessage::TimelineCatchup {
             agent_id, events, ..
         } => {
-            if let Err(err) = store.upsert_replica_timeline_events_batch_for_host(host_id, events) {
+            if let Err(err) = retry_replica_write(|| {
+                store.upsert_replica_timeline_events_batch_for_host(host_id, events)
+            })
+            .await
+            {
                 tracing::warn!(
                     host_id = %host_id,
                     agent_id = %agent_id,
@@ -883,7 +906,10 @@ fn sync_to_replica(host_id: &str, store: Option<&OrbitStore>, msg: &WireMessage)
             }
         }
         WireMessage::TimelineLive { event } => {
-            if let Err(err) = store.upsert_replica_timeline_event_for_host(host_id, event) {
+            if let Err(err) =
+                retry_replica_write(|| store.upsert_replica_timeline_event_for_host(host_id, event))
+                    .await
+            {
                 tracing::warn!(
                     host_id = %host_id,
                     agent_id = %event.agent_id,

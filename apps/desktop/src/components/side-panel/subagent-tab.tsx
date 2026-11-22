@@ -1,29 +1,20 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowUpRight } from "lucide-react";
 import {
-  AlertCircle,
-  Archive,
-  ArrowUpRight,
-  CircleCheck,
-  MoreHorizontal,
-  Unlink,
-} from "lucide-react";
-import { ConversationViewport } from "@/components/conversation/conversation-viewport";
-import { TurnStageSection } from "@/components/stage/stream-stage";
+  ConversationViewport,
+  useViewportAnchorHold,
+} from "@/components/conversation/conversation-viewport";
+import {
+  PromptImageLightbox,
+  type PromptImagePreviewTarget,
+  TurnStageSection,
+} from "@/components/stage/stream-stage";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/overlays";
 import { type StageTurnView, orbitIpc } from "@/lib/orbit-ipc";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
-import { cn } from "@/lib/utils";
 
-const NOOP_HOLD_VIEWPORT = (_el?: HTMLElement | null) => {};
 const NOOP_THINKING_DURATION = () => null;
 const NOOP_REWIND = () => {};
-const NOOP_PREVIEW_IMAGE = () => {};
 
 function buildFallbackPromptTurn(callId: string, text: string): StageTurnView {
   return {
@@ -161,10 +152,20 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
 
   const resolvedPrompt = tab.subagentPrompt || providerSubagent?.subtitle || "";
   const [providerTurns, setProviderTurns] = useState<StageTurnView[]>([]);
+  const providerTurnsRef = useRef<StageTurnView[]>(providerTurns);
+  providerTurnsRef.current = providerTurns;
+  const refetchMissGuardRef = useRef<string | null>(null);
   const lastFingerprintRef = useRef<string>("");
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef<boolean>(true);
+  const holdViewport = useViewportAnchorHold(viewportRef, stickToBottomRef);
+  const [imagePreviewTarget, setImagePreviewTarget] =
+    useState<PromptImagePreviewTarget | null>(null);
+  const handleCloseImagePreview = useCallback(() => setImagePreviewTarget(null), []);
 
   // Ensure daemon hydrates & subscribes the provider subagent timeline on open or reconnect
   useEffect(() => {
+    refetchMissGuardRef.current = null;
     if (!parentHostId || !parentAgentId || !tab.providerSubagentId) return;
     void orbitIpc.openProviderSubagentTimeline(parentHostId, parentAgentId, tab.providerSubagentId);
   }, [parentHostId, parentAgentId, tab.providerSubagentId]);
@@ -178,7 +179,16 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       return;
     }
     const subId = tab.providerSubagentId;
+    const subKey = `${parentHostId}::${parentAgentId}::${subId}`;
     let cancelled = false;
+    const hasSubstantiveContent = (turns: StageTurnView[]): boolean =>
+      turns.some(
+        (t) =>
+          t.live_segments.length > 0 ||
+          t.folded_steps.length > 0 ||
+          t.terminal_reply !== null ||
+          t.notices.length > 0,
+      );
     const syncTurns = async () => {
       try {
         const turns = await orbitIpc.getProviderSubagentTurns(
@@ -188,8 +198,20 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           resolvedPrompt,
         );
         if (cancelled) return;
+        const incomingHasContent = hasSubstantiveContent(turns);
+        if (incomingHasContent) {
+          refetchMissGuardRef.current = null;
+        } else if (hasSubstantiveContent(providerTurnsRef.current)) {
+          // Guard against transient cache miss / eviction wiping an actively viewed transcript:
+          // trigger one automatic re-subscribe recovery and preserve existing rendered turns.
+          if (refetchMissGuardRef.current !== subKey) {
+            refetchMissGuardRef.current = subKey;
+            void orbitIpc.openProviderSubagentTimeline(parentHostId, parentAgentId, subId);
+          }
+          return;
+        }
         const lastTurn = turns[turns.length - 1];
-        const fp = `${turns.length}:${lastTurn?.key ?? ""}:${lastTurn?.live_segments.length ?? 0}:${lastTurn?.folded_steps.length ?? 0}:${lastTurn?.work_counts.total_steps ?? 0}:${Boolean(lastTurn?.terminal_reply)}:${lastTurn?.completed_at_ms ?? 0}`;
+        const fp = `${turns.length}:${lastTurn?.key ?? ""}:${lastTurn?.live_segments.length ?? 0}:${lastTurn?.folded_steps.length ?? 0}:${lastTurn?.work_counts.total_steps ?? 0}:${Boolean(lastTurn?.terminal_reply)}:${Boolean(lastTurn?.has_active_item)}:${lastTurn?.completed_at_ms ?? 0}`;
         if (fp !== lastFingerprintRef.current || turns.length !== providerTurns.length) {
           lastFingerprintRef.current = fp;
           setProviderTurns(turns);
@@ -236,123 +258,41 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   const effectiveAgentId = tab.childAgentId ?? tab.providerSubagentId ?? parentAgentId ?? "";
   const effectiveHostId = isManaged ? (hostId ?? "") : (parentHostId ?? "");
 
-  const canArchiveNative = Boolean(!isManaged && parentHostId && parentAgentId);
-  const resolvedTitle = tab.subagentRole || tab.title || "Subagent";
   const viewportResetKey = `${tab.id}:${tab.childAgentId ?? tab.providerSubagentId ?? tab.subagentCallId ?? ""}`;
 
-  // Keep the header minimal: tab title already names the subagent, so only render a restrained
-  // context strip when the user can manage the thread or when active/error status needs signaling.
-  const showContextBar = Boolean(
-    isManaged ||
-      canArchiveNative ||
-      status === "running" ||
-      status === "failed" ||
-      status === "denied" ||
-      remoteHostName,
-  );
+  // Status & Archive already live in Overview; render a minimal 1-line bar ONLY when an approval
+  // decision is needed or to quietly identify a cross-host subagent. Zero header bar otherwise.
+  const needsApproval = Boolean(isManaged && hostId && tab.childAgentId && status === "awaiting_permission");
+  const showInlineContextBar = needsApproval || Boolean(remoteHostName);
 
   return (
     <div className="orbit-stage-enter bg-canvas flex min-h-0 flex-1 flex-col overflow-hidden">
-      {showContextBar && (
-        <div className="flex h-[32px] shrink-0 items-center justify-between gap-2 border-b border-black/[0.055] px-3.5 dark:border-white/[0.06]">
-          <div className="flex min-w-0 items-center gap-2 text-[12px]">
-            {status === "awaiting_permission" ? (
+      {showInlineContextBar && (
+        <div className="flex h-[30px] shrink-0 items-center justify-between gap-2 border-b border-black/[0.055] px-3.5 text-[12px] dark:border-white/[0.06]">
+          <div className="flex min-w-0 items-center gap-2">
+            {needsApproval && (
               <span className="inline-flex items-center gap-1.5 font-medium text-amber-600/90 dark:text-amber-400/90">
                 <span className="size-[6px] rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
                 <span>Approval required</span>
               </span>
-            ) : status === "running" ? (
-              <span className="text-muted-foreground inline-flex items-center gap-1.5">
-                <OrbitSpinner size={12.5} className="text-foreground/70" />
-                <span>Running</span>
-              </span>
-            ) : status === "failed" || status === "denied" ? (
-              <span className="inline-flex items-center gap-1.5 text-rose-600/90 dark:text-rose-400/90">
-                <AlertCircle className="size-[13px]" />
-                <span className="capitalize">{status}</span>
-              </span>
-            ) : (
-              <span className="text-muted-foreground inline-flex items-center gap-1.5">
-                <CircleCheck className="size-[13px] text-emerald-600/85 dark:text-emerald-400/85" />
-                <span>Completed</span>
-              </span>
             )}
-
             {remoteHostName && (
-              <span className="text-muted-foreground/65 truncate text-[11.5px]">
-                · {remoteHostName}
+              <span className="text-muted-foreground/75 inline-flex max-w-[180px] items-center truncate rounded-full bg-black/[0.04] px-2 py-0.5 text-[11px] leading-none dark:bg-white/[0.07]">
+                {remoteHostName}
               </span>
             )}
           </div>
 
-          {(isManaged && hostId && tab.childAgentId) || canArchiveNative ? (
-            <div className="flex shrink-0 items-center gap-0.5">
-              {isManaged && hostId && tab.childAgentId && (
-                <button
-                  type="button"
-                  onClick={handleOpenThread}
-                  className={cn(
-                    "inline-flex h-[24px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11.5px] font-medium transition-colors",
-                    status === "awaiting_permission"
-                      ? "text-amber-700 hover:bg-amber-500/12 dark:text-amber-300"
-                      : "text-muted-foreground hover:text-foreground hover:bg-accent",
-                  )}
-                >
-                  <span>{status === "awaiting_permission" ? "Review" : "Open thread"}</span>
-                  <ArrowUpRight className="size-[12px]" />
-                </button>
-              )}
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label="Subagent actions"
-                    className="text-muted-foreground hover:text-foreground hover:bg-accent inline-flex size-[24px] shrink-0 cursor-pointer items-center justify-center rounded-[6px] transition-colors"
-                  >
-                    <MoreHorizontal className="size-[13.5px]" />
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" side="bottom" sideOffset={4} className="min-w-[164px]">
-                  {isManaged && hostId && tab.childAgentId && (
-                    <DropdownMenuItem
-                      onSelect={() => {
-                        void orbitActions.detachAgent(hostId, tab.childAgentId!);
-                      }}
-                    >
-                      <span className="flex items-center gap-2">
-                        <Unlink className="text-muted-foreground size-[13.5px]" />
-                        <span>Detach to thread</span>
-                      </span>
-                    </DropdownMenuItem>
-                  )}
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      if (isManaged && hostId && tab.childAgentId) {
-                        orbitActions.archiveThread(hostId, tab.childAgentId);
-                      } else if (parentHostId && parentAgentId) {
-                        orbitActions.archiveSubagent(parentHostId, parentAgentId, {
-                          id:
-                            tab.subagentCallId ||
-                            tab.providerSubagentId ||
-                            tab.childAgentId ||
-                            tab.id,
-                          providerSubagentId: tab.providerSubagentId ?? null,
-                          childAgentId: tab.childAgentId ?? null,
-                          role: resolvedTitle,
-                        });
-                      }
-                      orbitActions.closeSidePanelTab(tab.id);
-                    }}
-                  >
-                    <span className="flex items-center gap-2">
-                      <Archive className="text-muted-foreground size-[13.5px]" />
-                      <span>Archive</span>
-                    </span>
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          ) : null}
+          {needsApproval && (
+            <button
+              type="button"
+              onClick={handleOpenThread}
+              className="inline-flex h-[22px] shrink-0 cursor-pointer items-center gap-1 rounded-[6px] px-2 text-[11.5px] font-medium text-amber-700 transition-colors hover:bg-amber-500/12 dark:text-amber-300"
+            >
+              <span>Review</span>
+              <ArrowUpRight className="size-[12px]" />
+            </button>
+          )}
         </div>
       )}
 
@@ -362,6 +302,8 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
         cwd={cwd}
         resetKey={viewportResetKey}
         contentVersion={contentVersion}
+        viewportRef={viewportRef}
+        stickToBottomRef={stickToBottomRef}
         viewportClassName="px-6 pt-6 pb-11"
       >
         <div className="orbit-stage-enter mx-auto w-full min-w-0 max-w-[768px]">
@@ -369,8 +311,7 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
             <div className="space-y-[32px]">
               {displayTurns.map((turn, idx) => {
                 const isLastTurn = idx === displayTurns.length - 1;
-                const isTurnActive =
-                  isLastTurn && (status === "running" || turn.has_active_item);
+                const isTurnActive = isLastTurn && status === "running";
                 const liveLabel = isLastTurn
                   ? isManaged
                     ? (childAgent?.status_label ?? null)
@@ -391,9 +332,9 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                     agentId={effectiveAgentId}
                     thinkingSignature=""
                     getThinkingDurationMs={NOOP_THINKING_DURATION}
-                    holdViewport={NOOP_HOLD_VIEWPORT}
+                    holdViewport={holdViewport}
                     onRequestRewind={NOOP_REWIND}
-                    onPreviewImage={NOOP_PREVIEW_IMAGE}
+                    onPreviewImage={setImagePreviewTarget}
                   />
                 );
               })}
@@ -410,6 +351,11 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           )}
         </div>
       </ConversationViewport>
+
+      <PromptImageLightbox
+        target={imagePreviewTarget}
+        onClose={handleCloseImagePreview}
+      />
     </div>
   );
 });

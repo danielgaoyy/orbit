@@ -127,6 +127,23 @@ pub enum StoreError {
     LockPoisoned,
 }
 
+impl StoreError {
+    /// Returns `true` when this error is a transient SQLite lock/busy contention error.
+    pub fn is_busy(&self) -> bool {
+        match self {
+            Self::Sqlite(rusqlite::Error::SqliteFailure(err, _)) => matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ),
+            Self::Sqlite(err) => {
+                let msg = err.to_string().to_ascii_lowercase();
+                msg.contains("database is locked") || msg.contains("database table is locked")
+            }
+            _ => false,
+        }
+    }
+}
+
 pub struct OrbitStore {
     conn: Mutex<Connection>,
 }
@@ -143,12 +160,12 @@ impl OrbitStore {
     }
 
     fn init_connection(mut conn: Connection) -> Result<Self, StoreError> {
+        conn.busy_timeout(std::time::Duration::from_millis(4000))?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = 5000;
             PRAGMA wal_autocheckpoint = 1000;
             PRAGMA journal_size_limit = 16777216;
             PRAGMA cache_size = -16000;
@@ -1284,7 +1301,7 @@ impl OrbitStore {
         let seq_i64 = i64::try_from(ev.seq)
             .map_err(|_| StoreError::InvalidArgument("sequence number exceeds i64".into()))?;
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let resolved_host = search::resolve_replica_host_id(&tx, host_id, &ev.agent_id);
         let payload_json = serde_json::to_string(&ev.payload)?;
         let ts_str = ev.timestamp.to_rfc3339();
@@ -1375,7 +1392,7 @@ impl OrbitStore {
             return Ok(());
         }
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut host_cache: HashMap<String, String> = HashMap::new();
         for ev in events {
             let seq_i64 = i64::try_from(ev.seq)
@@ -1557,7 +1574,7 @@ impl OrbitStore {
         events: &[TimelineEvent],
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let resolved_host = search::resolve_replica_host_id(&tx, host_id, agent_id);
         search::delete_replica_fts_for_agent(&tx, agent_id)?;
         tx.execute(
@@ -1687,7 +1704,7 @@ impl OrbitStore {
         workspaces: &[WorkspaceSummary],
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM client_replica_workspaces WHERE host_id = ?1",
             params![host_id],
@@ -1743,7 +1760,7 @@ impl OrbitStore {
         agents: &[AgentSummary],
     ) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing_ids: Vec<String> = {
             let mut stmt =
                 tx.prepare_cached("SELECT agent_id FROM client_replica_agents WHERE host_id = ?1")?;
@@ -1823,7 +1840,7 @@ impl OrbitStore {
 
     pub fn delete_replica_agent(&self, host_id: &str, agent_id: &str) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         search::delete_replica_fts_for_agent(&tx, agent_id)?;
         tx.execute(
             "DELETE FROM client_replica_events WHERE agent_id = ?1",
@@ -2475,7 +2492,7 @@ impl OrbitStore {
 
     pub fn delete_client_host(&self, host_id: &str) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         search::delete_replica_fts_and_events_for_host(&tx, host_id)?;
         tx.execute(
             "DELETE FROM client_hosts WHERE host_id = ?1",
@@ -2503,7 +2520,7 @@ impl OrbitStore {
 
     pub fn clear_host_replica(&self, host_id: &str) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         search::delete_replica_fts_and_events_for_host(&tx, host_id)?;
         tx.execute(
             "DELETE FROM client_replica_workspaces WHERE host_id = ?1",

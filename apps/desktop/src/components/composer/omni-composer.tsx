@@ -1064,6 +1064,10 @@ export const OmniComposer = memo(function OmniComposer({
                 }
               }
 
+              const visibleBadges = qItem.badges.slice(0, 2);
+              const hiddenBadgeCount = Math.max(0, qItem.badges.length - visibleBadges.length);
+              const hasDisplayText = Boolean(qItem.displayText?.trim());
+
               return (
                 <div
                   key={qItem.id}
@@ -1077,7 +1081,7 @@ export const OmniComposer = memo(function OmniComposer({
                       : undefined
                   }
                   className={cn(
-                    "group/qrow flex h-[28px] items-center justify-between gap-2 rounded-[8px] px-2 select-none",
+                    "group/qrow flex h-[28px] min-w-0 items-center justify-between gap-2 overflow-hidden rounded-[8px] px-2 select-none",
                     isDragged
                       ? "bg-elevated/95 ring-border/75 relative z-10 cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.08)] ring-1 dark:shadow-[0_4px_14px_rgba(0,0,0,0.34)]"
                       : cn(
@@ -1088,7 +1092,7 @@ export const OmniComposer = memo(function OmniComposer({
                         ),
                   )}
                 >
-                  <div className="flex min-w-0 flex-1 items-center gap-2">
+                  <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
                     {canDrag ? (
                       <>
                         <CornerDownRight
@@ -1107,16 +1111,33 @@ export const OmniComposer = memo(function OmniComposer({
                     ) : (
                       <CornerDownRight className="text-muted-foreground/60 size-3.5 shrink-0 stroke-[1.8]" />
                     )}
-                    {qItem.badges.map((b, bIdx) => (
+                    {visibleBadges.map((b, bIdx) => (
                       <span
                         key={`${b.kind}-${bIdx}`}
-                        className="bg-muted text-foreground/80 shrink-0 rounded px-1.5 py-0.5 font-mono text-[11px]"
+                        title={b.label}
+                        className={cn(
+                          "bg-muted text-foreground/80 min-w-0 shrink truncate rounded px-1.5 py-0.5 font-mono text-[11px]",
+                          hasDisplayText ? "max-w-[110px]" : "max-w-[160px]",
+                        )}
                       >
                         {b.label}
                       </span>
                     ))}
+                    {hiddenBadgeCount > 0 && (
+                      <span
+                        title={qItem.badges.map((b) => b.label).join(", ")}
+                        className="bg-muted text-muted-foreground shrink-0 rounded px-1.5 py-0.5 font-mono text-[10.5px]"
+                      >
+                        +{hiddenBadgeCount}
+                      </span>
+                    )}
                     {qItem.displayText && (
-                      <span className="text-foreground/86 truncate">{qItem.displayText}</span>
+                      <span
+                        title={qItem.displayText}
+                        className="text-foreground/86 min-w-[64px] flex-1 truncate"
+                      >
+                        {qItem.displayText}
+                      </span>
                     )}
                   </div>
                   <div

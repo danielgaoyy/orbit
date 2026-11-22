@@ -824,6 +824,7 @@ async fn run_agy_actor(
                 )
                 .await;
             }
+            BgTaskDelta::SubagentMessaged { .. } => {}
         }
     }
     let now_utc = Utc::now();
@@ -1610,9 +1611,14 @@ async fn run_agy_actor(
                     idle_poll_tick = 0;
                 }
 
-                // Poll native Antigravity subagent transcripts for read-only Subagents Track timelines
+                // Poll native Antigravity subagent transcripts for read-only Subagents Track timelines.
+                // Non-Running subagents are checked cheaply via `has_unconsumed_growth()` so resumed
+                // subagents (e.g. via `send_message` or after reconnect/compaction) self-heal back to
+                // `Running` and stream follow-up turns automatically.
                 for (sub_id, (desc, sub_mon)) in subagent_monitors.iter_mut() {
-                    if desc.status != ProviderSubagentStatus::Running {
+                    if desc.status != ProviderSubagentStatus::Running
+                        && !sub_mon.has_unconsumed_growth()
+                    {
                         continue;
                     }
                     poll_agy_subagent_monitor(sub_id, desc, sub_mon, &evt_tx).await;
@@ -1733,6 +1739,15 @@ async fn run_agy_actor(
                                             &evt_tx,
                                         )
                                         .await;
+                                    } else if let Some(recipient_id) =
+                                        extract_send_message_recipient_from_detail(&emit_detail)
+                                    {
+                                        resume_agy_subagent_monitor(
+                                            &recipient_id,
+                                            &mut subagent_monitors,
+                                            &evt_tx,
+                                        )
+                                        .await;
                                     }
                                     tool_cache.insert(canon_id.clone(), emit_detail.clone());
                                     let _ = evt_tx
@@ -1761,6 +1776,15 @@ async fn run_agy_actor(
                                 )
                                 .await;
                             }
+                            WakeupStep::SubagentMessaged { subagent_id } => {
+                                resume_agy_subagent_monitor(
+                                    &subagent_id,
+                                    &mut subagent_monitors,
+                                    &evt_tx,
+                                )
+                                .await;
+                            }
+                            WakeupStep::UserMessage { .. } => {}
                             WakeupStep::Notice { level, message } => {
                                 if level != "info" {
                                     warn!(
@@ -2127,6 +2151,9 @@ async fn apply_foreground_bg_deltas(
                     evt_tx,
                 )
                 .await;
+            }
+            BgTaskDelta::SubagentMessaged { subagent_id } => {
+                resume_agy_subagent_monitor(&subagent_id, subagent_monitors, evt_tx).await;
             }
         }
     }
@@ -2515,6 +2542,26 @@ async fn handle_acp_session_update(
                     evt_tx,
                 )
                 .await;
+            } else if let Some(recipient_id) = extract_send_message_recipient_from_detail(&detail)
+                .or_else(|| {
+                    let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                    if is_send_message_tool_name(title) {
+                        transcript_arg_str(
+                            update.get("rawInput"),
+                            &[
+                                "Recipient",
+                                "recipient",
+                                "conversationId",
+                                "conversation_id",
+                                "agent_id",
+                            ],
+                        )
+                    } else {
+                        None
+                    }
+                })
+            {
+                resume_agy_subagent_monitor(&recipient_id, subagent_monitors, evt_tx).await;
             }
             tool_cache.insert(call_id.clone(), detail.clone());
             let _ = evt_tx
@@ -2531,6 +2578,95 @@ async fn handle_acp_session_update(
     }
 }
 
+fn extract_system_message_content(raw: &str) -> Option<String> {
+    let idx = raw.find("content=")?;
+    let body = raw[idx + "content=".len()..]
+        .trim_end()
+        .trim_end_matches("</SYSTEM_MESSAGE>")
+        .trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
+fn is_send_message_tool_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    let without_run = trimmed
+        .strip_prefix("Run ")
+        .or_else(|| trimmed.strip_prefix("run "))
+        .unwrap_or(trimmed);
+    let first_tok = without_run.split_whitespace().next().unwrap_or("");
+    let leaf = first_tok
+        .rsplit([':', '/', '.'])
+        .next()
+        .unwrap_or(first_tok)
+        .rsplit("__")
+        .next()
+        .unwrap_or(first_tok);
+    leaf.eq_ignore_ascii_case("send_message") || leaf.eq_ignore_ascii_case("sendmessage")
+}
+
+fn extract_send_message_recipient_from_detail(detail: &ToolCallDetail) -> Option<String> {
+    let ToolCallDetail::Generic {
+        tool_name,
+        arguments_json,
+    } = detail
+    else {
+        return None;
+    };
+    if !is_send_message_tool_name(tool_name) {
+        return None;
+    }
+    let parsed: Value = serde_json::from_str(arguments_json).ok()?;
+    transcript_arg_str(
+        Some(&parsed),
+        &[
+            "Recipient",
+            "recipient",
+            "conversationId",
+            "conversation_id",
+            "agent_id",
+        ],
+    )
+}
+
+async fn resume_agy_subagent_monitor(
+    recipient_id: &str,
+    subagent_monitors: &mut HashMap<String, (ProviderSubagentDescriptor, AgyTranscriptMonitor)>,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    let clean_id = recipient_id.trim();
+    if clean_id.is_empty() {
+        return;
+    }
+    let Some((desc, sub_mon)) = subagent_monitors.get_mut(clean_id) else {
+        return;
+    };
+    sub_mon.in_wakeup = true;
+    if desc.status != ProviderSubagentStatus::Running {
+        desc.status = ProviderSubagentStatus::Running;
+        desc.updated_at = Utc::now();
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .await;
+    }
+}
+
+async fn ensure_subagent_running(
+    desc: &mut ProviderSubagentDescriptor,
+    evt_tx: &mpsc::Sender<DriverEvent>,
+) {
+    if desc.status != ProviderSubagentStatus::Running {
+        desc.status = ProviderSubagentStatus::Running;
+        desc.updated_at = Utc::now();
+        let _ = evt_tx
+            .send(DriverEvent::ProviderSubagentUpsert(desc.clone()))
+            .await;
+    }
+}
+
 async fn poll_agy_subagent_monitor(
     sub_id: &str,
     desc: &mut ProviderSubagentDescriptor,
@@ -2539,7 +2675,24 @@ async fn poll_agy_subagent_monitor(
 ) {
     for wake_ev in sub_mon.poll_post_turn_wakeup() {
         match wake_ev {
+            WakeupStep::Started { .. } => {
+                ensure_subagent_running(desc, evt_tx).await;
+            }
+            WakeupStep::UserMessage { id, text } => {
+                ensure_subagent_running(desc, evt_tx).await;
+                let _ = evt_tx
+                    .send(DriverEvent::ProviderSubagentTimeline {
+                        subagent_id: sub_id.to_string(),
+                        payload: TimelinePayload::UserPrompt {
+                            message_id: id,
+                            text,
+                            badges: Vec::new(),
+                        },
+                    })
+                    .await;
+            }
             WakeupStep::Thinking { id, text } => {
+                ensure_subagent_running(desc, evt_tx).await;
                 let _ = evt_tx
                     .send(DriverEvent::ProviderSubagentTimeline {
                         subagent_id: sub_id.to_string(),
@@ -2548,6 +2701,7 @@ async fn poll_agy_subagent_monitor(
                     .await;
             }
             WakeupStep::Message { id, text } => {
+                ensure_subagent_running(desc, evt_tx).await;
                 let _ = evt_tx
                     .send(DriverEvent::ProviderSubagentTimeline {
                         subagent_id: sub_id.to_string(),
@@ -2564,6 +2718,7 @@ async fn poll_agy_subagent_monitor(
                 status,
                 detail,
             } => {
+                ensure_subagent_running(desc, evt_tx).await;
                 let _ = evt_tx
                     .send(DriverEvent::ProviderSubagentTimeline {
                         subagent_id: sub_id.to_string(),
@@ -2599,10 +2754,10 @@ async fn poll_agy_subagent_monitor(
                     })
                     .await;
             }
-            WakeupStep::Started { .. }
-            | WakeupStep::BackgroundTaskStarted { .. }
+            WakeupStep::BackgroundTaskStarted { .. }
             | WakeupStep::BackgroundTaskCompleted { .. }
-            | WakeupStep::SubagentSpawned { .. } => {}
+            | WakeupStep::SubagentSpawned { .. }
+            | WakeupStep::SubagentMessaged { .. } => {}
         }
     }
 }
@@ -2694,10 +2849,21 @@ async fn register_agy_subagent_monitor(
                     desc.subtitle = Some(message);
                     desc.updated_at = Utc::now();
                 }
-                WakeupStep::Started { .. }
-                | WakeupStep::BackgroundTaskStarted { .. }
+                WakeupStep::Started { .. } => {
+                    desc.status = ProviderSubagentStatus::Running;
+                    desc.updated_at = Utc::now();
+                }
+                WakeupStep::UserMessage { id, text } => {
+                    initial_timeline.push(TimelinePayload::UserPrompt {
+                        message_id: id,
+                        text,
+                        badges: Vec::new(),
+                    });
+                }
+                WakeupStep::BackgroundTaskStarted { .. }
                 | WakeupStep::BackgroundTaskCompleted { .. }
-                | WakeupStep::SubagentSpawned { .. } => {}
+                | WakeupStep::SubagentSpawned { .. }
+                | WakeupStep::SubagentMessaged { .. } => {}
             }
         }
         let _ = evt_tx
@@ -3411,6 +3577,10 @@ enum WakeupStep {
     Started {
         source: String,
     },
+    UserMessage {
+        id: String,
+        text: String,
+    },
     Thinking {
         id: String,
         text: String,
@@ -3439,6 +3609,9 @@ enum WakeupStep {
         subagent_id: String,
         role: String,
         prompt_preview: String,
+    },
+    SubagentMessaged {
+        subagent_id: String,
     },
     Notice {
         level: String,
@@ -3489,6 +3662,9 @@ enum BgTaskDelta {
         subagent_id: String,
         role: String,
         prompt_preview: String,
+    },
+    SubagentMessaged {
+        subagent_id: String,
     },
 }
 
@@ -5187,6 +5363,17 @@ impl AgyTranscriptMonitor {
         }
     }
 
+    /// Cheap `stat()` probe used to detect follow-up activity on previously settled subagents.
+    fn has_unconsumed_growth(&self) -> bool {
+        let Some(path) = self.active_path() else {
+            return false;
+        };
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        meta.len() != self.byte_offset
+    }
+
     fn sync_silent(&mut self) {
         let _ = self.sync_silent_with_bg_tasks();
     }
@@ -5491,6 +5678,28 @@ impl AgyTranscriptMonitor {
                         let task_id = transcript_arg_str(args, &["TaskId", "task_id"]);
                         self.pending_silent_tools
                             .push_back(PendingTranscriptToolMeta::ManageTask { action, task_id });
+                    } else if is_send_message_tool_name(tname) {
+                        if let Some(recipient_id) = transcript_arg_str(
+                            args,
+                            &[
+                                "Recipient",
+                                "recipient",
+                                "conversationId",
+                                "conversation_id",
+                                "agent_id",
+                            ],
+                        ) {
+                            bg_deltas.push(BgTaskDelta::SubagentMessaged {
+                                subagent_id: recipient_id.clone(),
+                            });
+                            if !silent {
+                                out.push(WakeupStep::SubagentMessaged {
+                                    subagent_id: recipient_id,
+                                });
+                            }
+                        }
+                        self.pending_silent_tools
+                            .push_back(PendingTranscriptToolMeta::Other);
                     } else {
                         self.pending_silent_tools
                             .push_back(PendingTranscriptToolMeta::Other);
@@ -5716,17 +5925,34 @@ impl AgyTranscriptMonitor {
                     self.last_error_at = None;
                     self.last_error_message = None;
                     self.last_in_progress_heartbeat = Some(Instant::now());
-                    if !self.always_active {
-                        out.push(WakeupStep::Started {
-                            source: "background_task".into(),
+                    out.push(WakeupStep::Started {
+                        source: if self.always_active {
+                            "message".into()
+                        } else {
+                            "background_task".into()
+                        },
+                    });
+                    if self.always_active
+                        && step_idx > 0
+                        && let Some(msg_text) = extract_system_message_content(content)
+                    {
+                        out.push(WakeupStep::UserMessage {
+                            id: format!("sub_msg_{step_idx}"),
+                            text: msg_text,
                         });
                     }
                 }
             } else if self.always_active && step_type == "USER_INPUT" {
+                let was_idle = !self.in_wakeup;
                 self.in_wakeup = true;
                 self.consecutive_errors = 0;
                 self.last_error_at = None;
                 self.last_error_message = None;
+                if was_idle {
+                    out.push(WakeupStep::Started {
+                        source: "user_input".into(),
+                    });
+                }
             } else if step_type == "ERROR_MESSAGE" {
                 let err_msg = step
                     .get("error")
@@ -9346,5 +9572,203 @@ Task logs are available at: file:///tmp/task-1295.log\n";
 
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn resumed_agy_subagent_transitions_back_to_running_and_settles_on_follow_up_turn() {
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "orbit_agy_subagent_resume_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let logs_dir = tmp.join(".system_generated/logs");
+        std::fs::create_dir_all(&logs_dir).expect("create logs dir");
+        let transcript = logs_dir.join("transcript.jsonl");
+
+        // Turn 1: initial prompt + settled final assistant reply.
+        {
+            let mut f = std::fs::File::create(&transcript).expect("create transcript");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "content": "Initial audit task"
+                })
+            )
+            .expect("write step 0");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "Initial audit complete."
+                })
+            )
+            .expect("write step 1");
+        }
+
+        let now = Utc::now();
+        let sub_id = "sub_resume_1";
+        let mut desc = ProviderSubagentDescriptor {
+            subagent_id: sub_id.into(),
+            parent_agent_id: "ag_parent".into(),
+            parent_subagent_id: None,
+            title: "Code Reviewer".into(),
+            subtitle: None,
+            status: ProviderSubagentStatus::Running,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut sub_mon = AgyTranscriptMonitor::from_brain_dir_subagent(tmp.clone(), sub_id);
+        let (tx, mut rx) = mpsc::channel(64);
+
+        // Poll Turn 1 -> settles to Completed.
+        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
+        assert_eq!(desc.status, ProviderSubagentStatus::Completed);
+        assert!(!sub_mon.has_unconsumed_growth());
+        while rx.try_recv().is_ok() {}
+
+        // Turn 2 arrives via parent `send_message`: new SYSTEM_MESSAGE + active tool call.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open transcript for append");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 2,
+                    "type": "SYSTEM_MESSAGE",
+                    "status": "DONE",
+                    "content": "[Message] sender=ag_parent content=Please fix the P0 finding."
+                })
+            )
+            .expect("write step 2");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "thinking": "Inspecting the P0 finding now.",
+                    "tool_calls": [
+                        {
+                            "name": "read_file",
+                            "args": { "Path": "/repo/src/lib.rs" }
+                        }
+                    ]
+                })
+            )
+            .expect("write step 3");
+        }
+
+        // Self-healing fallback detects growth on the previously Completed subagent.
+        assert!(sub_mon.has_unconsumed_growth());
+        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
+        assert_eq!(desc.status, ProviderSubagentStatus::Running);
+
+        let mut saw_running_upsert = false;
+        let mut saw_turn2_thinking = false;
+        let mut saw_turn2_tool = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                DriverEvent::ProviderSubagentUpsert(d)
+                    if d.status == ProviderSubagentStatus::Running =>
+                {
+                    assert!(
+                        !saw_turn2_thinking && !saw_turn2_tool,
+                        "Running upsert must precede follow-up turn timeline events"
+                    );
+                    saw_running_upsert = true;
+                }
+                DriverEvent::ProviderSubagentTimeline {
+                    payload: TimelinePayload::AssistantThinking { text, .. },
+                    ..
+                } if text.contains("P0 finding") => {
+                    saw_turn2_thinking = true;
+                }
+                DriverEvent::ProviderSubagentTimeline {
+                    payload: TimelinePayload::ToolCall { .. },
+                    ..
+                } => {
+                    saw_turn2_tool = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_running_upsert);
+        assert!(saw_turn2_thinking);
+        assert!(saw_turn2_tool);
+
+        // Turn 2 finishes: tool completes + final assistant reply settles back to Completed.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("open transcript for settle");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "file contents"
+                })
+            )
+            .expect("write step 4");
+            writeln!(
+                f,
+                "{}",
+                json!({
+                    "step_index": 5,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "P0 fixed and verified."
+                })
+            )
+            .expect("write step 5");
+        }
+
+        poll_agy_subagent_monitor(sub_id, &mut desc, &mut sub_mon, &tx).await;
+        assert_eq!(desc.status, ProviderSubagentStatus::Completed);
+
+        let mut saw_turn2_reply = false;
+        let mut saw_completed_upsert = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                DriverEvent::ProviderSubagentTimeline {
+                    payload: TimelinePayload::AssistantMessage { text, .. },
+                    ..
+                } if text.contains("P0 fixed and verified.") => {
+                    saw_turn2_reply = true;
+                }
+                DriverEvent::ProviderSubagentUpsert(d)
+                    if d.status == ProviderSubagentStatus::Completed =>
+                {
+                    saw_completed_upsert = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_turn2_reply);
+        assert!(saw_completed_upsert);
+
+        // Also verify explicit parent `send_message` resume flips Completed -> Running immediately.
+        let mut monitors = HashMap::new();
+        monitors.insert(sub_id.to_string(), (desc, sub_mon));
+        resume_agy_subagent_monitor(sub_id, &mut monitors, &tx).await;
+        assert_eq!(monitors[sub_id].0.status, ProviderSubagentStatus::Running);
+        assert!(monitors[sub_id].1.in_wakeup);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

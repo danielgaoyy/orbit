@@ -210,6 +210,7 @@ interface StageOverviewContentProps {
   insights: SessionInsightsView;
   sessionTurnDiffs: readonly DiffFileView[];
   currentAgent: AgentCardView | null;
+  cardMaxHeightExpr: string;
 }
 
 const StageOverviewBody = memo(function StageOverviewBody({
@@ -219,6 +220,7 @@ const StageOverviewBody = memo(function StageOverviewBody({
   insights: baseInsights,
   sessionTurnDiffs,
   currentAgent,
+  cardMaxHeightExpr,
 }: StageOverviewContentProps) {
   const collapsedSections = useOrbitSelector((s) => s.overviewCollapsedSections);
   const archivedSubagents = useOrbitSelector((s) => s.archivedSubagents);
@@ -329,6 +331,29 @@ const StageOverviewBody = memo(function StageOverviewBody({
 
   const [showAllSubagents, setShowAllSubagents] = useState(false);
   const [showAllTasks, setShowAllTasks] = useState(false);
+  const layer1Ref = useRef<HTMLDivElement | null>(null);
+  const [layer1HeightPx, setLayer1HeightPx] = useState(144);
+
+  useLayoutEffect(() => {
+    const el = layer1Ref.current;
+    if (!el) return;
+    const syncHeight = () => {
+      const next = Math.ceil(el.getBoundingClientRect().height);
+      if (next > 0) {
+        setLayer1HeightPx((prev) => (prev === next ? prev : next));
+      }
+    };
+    syncHeight();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(syncHeight);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [showGroupNotesRow]);
+
+  useEffect(() => {
+    setShowAllSubagents(false);
+    setShowAllTasks(false);
+  }, [agentId]);
 
   const orderedSubagents = useMemo(
     () =>
@@ -362,8 +387,12 @@ const StageOverviewBody = memo(function StageOverviewBody({
     [orderedSubagents],
   );
 
+  // Show up to 4 subagents when active work exists (filling with latest finished if active < 4),
+  // or up to 3 most recent finished subagents when idle.
   const defaultVisibleSubagentCount =
-    activeSubagentCount > 0 ? Math.min(activeSubagentCount, 4) : 1;
+    activeSubagentCount > 0
+      ? Math.min(orderedSubagents.length, 4)
+      : Math.min(orderedSubagents.length, 3);
   const visibleSubagents = showAllSubagents
     ? orderedSubagents
     : orderedSubagents.slice(0, defaultVisibleSubagentCount);
@@ -391,13 +420,19 @@ const StageOverviewBody = memo(function StageOverviewBody({
     return [...running, ...rest];
   }, [backgroundTasks]);
 
-  const visibleTasks = showAllTasks ? orderedTasks : orderedTasks.slice(0, 1);
+  const runningTaskCount = orderedTasks.filter((t) => t.status === "running").length;
+  const defaultVisibleTaskCount =
+    runningTaskCount > 0 ? Math.min(Math.max(runningTaskCount, 2), 3) : 2;
+  const visibleTasks = showAllTasks
+    ? orderedTasks
+    : orderedTasks.slice(0, defaultVisibleTaskCount);
   const hiddenTaskCount = Math.max(0, orderedTasks.length - visibleTasks.length);
+  const hasSecondarySections = orderedSubagents.length > 0 || backgroundTasks.length > 0;
 
   return (
-    <div className="flex min-h-0 max-h-full flex-1 flex-col overflow-y-auto select-none">
-      {/* Layer 1: Primary Overview Shortcuts */}
-      <div className="px-2.5 pt-2.5 pb-2">
+    <>
+      {/* Layer 1: Primary Overview Shortcuts (pinned non-scrolling header block) */}
+      <div ref={layer1Ref} className="shrink-0 px-2.5 pt-2.5 pb-2 select-none">
         <div className="flex h-[24px] items-center px-2 pb-0.5">
           <span className="text-muted-foreground text-[12px] font-medium">Overview</span>
         </div>
@@ -481,8 +516,14 @@ const StageOverviewBody = memo(function StageOverviewBody({
         </div>
       </div>
 
-      {/* Layer 2: Subagents (single unified list: resting minimalist, hover actions for managed & native) */}
-      {orderedSubagents.length > 0 && (
+      {/* Single outer scroll container for secondary sections (dynamically bounded by measured Layer 1 height) */}
+      {hasSecondarySections && (
+        <div
+          style={{ maxHeight: `calc(${cardMaxHeightExpr} - ${layer1HeightPx}px)` }}
+          className="min-h-0 flex-1 overflow-y-auto overscroll-contain select-none"
+        >
+          {/* Layer 2: Subagents (single unified list: resting minimalist, hover actions for managed & native) */}
+          {orderedSubagents.length > 0 && (
         <OverviewLayerSection
           id="subagents"
           label="Subagents"
@@ -534,7 +575,8 @@ const StageOverviewBody = memo(function StageOverviewBody({
             ) : undefined
           }
         >
-          {visibleSubagents.map((sa) => {
+          <div className="space-y-0.5">
+            {visibleSubagents.map((sa) => {
             const isMenuOpen = openSubagentMenuKey === sa.key;
             const showCrossProvider = Boolean(
               sa.isManaged &&
@@ -701,8 +743,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
               </div>
             );
           })}
+          </div>
           {orderedSubagents.length > defaultVisibleSubagentCount && (
-            <div className="pt-0.5 pl-2">
+            <div
+              className={cn(
+                "pt-0.5 pl-2",
+                showAllSubagents &&
+                  "bg-elevated/95 sticky bottom-0 z-[1] -mx-2.5 mt-1 border-t border-black/[0.045] px-4 py-1 backdrop-blur-[4px] dark:border-white/[0.055]",
+              )}
+            >
               <button
                 type="button"
                 onClick={() => setShowAllSubagents((v) => !v)}
@@ -725,7 +774,8 @@ const StageOverviewBody = memo(function StageOverviewBody({
           isRunning={hasRunningBgTask}
           runningTone="emerald"
         >
-          {visibleTasks.map((task) => {
+          <div className="space-y-0.5">
+            {visibleTasks.map((task) => {
             const cleanPreview = cleanBackgroundOutputPreview(task.output_preview);
             const hasDetails = Boolean(task.command || cleanPreview || task.log_path);
             const isExpanded = Boolean(expandedTasks[task.id]);
@@ -883,8 +933,15 @@ const StageOverviewBody = memo(function StageOverviewBody({
               </div>
             );
           })}
-          {orderedTasks.length > 1 && (
-            <div className="pt-0.5 pl-2">
+          </div>
+          {orderedTasks.length > defaultVisibleTaskCount && (
+            <div
+              className={cn(
+                "pt-0.5 pl-2",
+                showAllTasks &&
+                  "bg-elevated/95 sticky bottom-0 z-[1] -mx-2.5 mt-1 border-t border-black/[0.045] px-4 py-1 backdrop-blur-[4px] dark:border-white/[0.055]",
+              )}
+            >
               <button
                 type="button"
                 onClick={() => setShowAllTasks((v) => !v)}
@@ -896,7 +953,9 @@ const StageOverviewBody = memo(function StageOverviewBody({
           )}
         </OverviewLayerSection>
       )}
-    </div>
+        </div>
+      )}
+    </>
   );
 });
 
@@ -929,6 +988,7 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
   const popoverOpen = useOrbitSelector((s) => s.overviewPopoverOpen);
   const popoverRef = useRef<HTMLDivElement | null>(null);
   const [dockedTopPx, setDockedTopPx] = useState(52);
+  const [stageHeightPx, setStageHeightPx] = useState(640);
   const {
     dockedOverviewMounted,
     dockedOverviewVisualOpen,
@@ -940,25 +1000,30 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     const el = stageContainerRef?.current;
     if (!el) return;
     let rafId = 0;
-    const syncTop = () => {
-      const nextTop = Math.round(el.getBoundingClientRect().top) + 12;
+    const syncRect = () => {
+      const rect = el.getBoundingClientRect();
+      const nextTop = Math.round(rect.top) + 12;
+      const nextHeight = Math.round(rect.height);
       setDockedTopPx((prev) => (prev === nextTop ? prev : nextTop));
+      if (nextHeight > 0) {
+        setStageHeightPx((prev) => (prev === nextHeight ? prev : nextHeight));
+      }
     };
-    const scheduleSyncTop = () => {
+    const scheduleSyncRect = () => {
       if (rafId) return;
       rafId = window.requestAnimationFrame(() => {
         rafId = 0;
-        syncTop();
+        syncRect();
       });
     };
-    syncTop();
-    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleSyncTop) : null;
+    syncRect();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleSyncRect) : null;
     ro?.observe(el);
     return () => {
       ro?.disconnect();
       if (rafId) window.cancelAnimationFrame(rafId);
     };
-  }, [stageContainerRef, dockedOverviewMounted]);
+  }, [stageContainerRef, dockedOverviewMounted, popoverOpen]);
 
   const isPopoverVisible = !canDock && popoverOpen;
   const [popoverMounted, setPopoverMounted] = useState(isPopoverVisible);
@@ -1019,6 +1084,10 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
     }
   }, [canDock, popoverOpen]);
 
+  const dockedCardMaxHeightExpr = `min(calc(100vh - ${dockedTopPx + 84}px), 600px)`;
+  const popoverMaxHeightPx = Math.min(540, Math.max(240, stageHeightPx - 24));
+  const popoverCardMaxHeightExpr = `${popoverMaxHeightPx}px`;
+
   return (
     <>
       {/* 1. Spacious Stage: Viewport-Anchored Top-Right Card (pure GPU coordinated, zero settle flash) */}
@@ -1038,8 +1107,8 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
           )}
         >
           <Card
-            style={{ maxHeight: `calc(100vh - ${dockedTopPx + 12}px)` }}
-            className="overview-card-surface flex h-fit w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0"
+            style={{ maxHeight: dockedCardMaxHeightExpr }}
+            className="overview-card-surface flex w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0"
           >
             <StageOverviewBody
               hostId={hostId}
@@ -1048,6 +1117,7 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
               insights={insights}
               sessionTurnDiffs={sessionTurnDiffs}
               currentAgent={currentAgent}
+              cardMaxHeightExpr={dockedCardMaxHeightExpr}
             />
           </Card>
         </aside>
@@ -1060,6 +1130,7 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
           role="dialog"
           aria-label="Session overview"
           inert={!popoverVisualOpen}
+          style={{ maxHeight: popoverCardMaxHeightExpr }}
           className={cn(
             "absolute top-3 right-4 z-30 w-[312px] max-w-[calc(100%-32px)] origin-top-right will-change-[transform,opacity]",
             popoverVisualOpen
@@ -1067,7 +1138,10 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
               : "pointer-events-none translate-x-1 -translate-y-1.5 scale-[0.97] opacity-0 transition-[opacity,transform] duration-[145ms] ease-[var(--ease-exit)]",
           )}
         >
-          <Card className="overview-card-surface floating-surface flex h-fit max-h-[min(560px,calc(100%-24px))] w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0">
+          <Card
+            style={{ maxHeight: popoverCardMaxHeightExpr }}
+            className="overview-card-surface floating-surface flex w-full flex-col gap-0 overflow-hidden rounded-[14px] p-0"
+          >
             <StageOverviewBody
               hostId={hostId}
               agentId={agentId}
@@ -1075,6 +1149,7 @@ export const StageOverviewPanel = memo(function StageOverviewPanel({
               insights={insights}
               sessionTurnDiffs={sessionTurnDiffs}
               currentAgent={currentAgent}
+              cardMaxHeightExpr={popoverCardMaxHeightExpr}
             />
           </Card>
         </div>

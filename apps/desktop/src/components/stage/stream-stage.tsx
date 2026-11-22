@@ -21,6 +21,8 @@ import {
 import {
   AlertTriangle,
   ArrowDown,
+  ArrowRight,
+  ArrowUpRight,
   Blocks,
   Check,
   ChevronRight,
@@ -117,6 +119,14 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { isImeKeyEvent } from "@/lib/ime";
 import { isAgentInGitRepo } from "@/lib/projects";
+import {
+  type ResolvedSubagentItem,
+  type SubagentNameMatcher,
+  areResolvedSubagentsEqual,
+  buildSubagentNameMatcher,
+  resolveSessionSubagents,
+  resolveToolCallSubagent,
+} from "@/lib/subagents";
 import { orbitActions, useOrbitSelector } from "@/state/orbit-store";
 import { cn } from "@/lib/utils";
 
@@ -452,20 +462,30 @@ function stableStepItemKey(item: TimelineItemView, idx: number): string {
  * - Pure-CSS `group-hover` swap between semantic icon and `ChevronRight` (0 React hover re-renders during scroll).
  * - Active thinking/tool step sweeps a calm linear-gradient text shimmer.
  */
+const EMPTY_SUBAGENTS: readonly ResolvedSubagentItem[] = [];
+
 const StepItemRow = memo(function StepItemRow({
   item,
+  hostId,
+  agentId,
   cwd,
   holdViewport,
   isActivelyThinking = false,
   thoughtDurationMs = null,
   autoExpandError = false,
+  sessionSubagents,
+  onOpenSubagent,
 }: {
   item: TimelineItemView;
+  hostId?: string;
+  agentId?: string;
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
   isActivelyThinking?: boolean;
   thoughtDurationMs?: number | null;
   autoExpandError?: boolean;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   const defaultOpen =
     autoExpandError &&
@@ -657,7 +677,31 @@ const StepItemRow = memo(function StepItemRow({
   const canOpenFileInDiff =
     Boolean(openFilePath) && (desc.kind === "file_edit" || desc.kind === "file_create");
   const canOpenFileDirect = Boolean(openFilePath) && desc.kind === "file_read";
-  const isSubagentStep = item.detail.kind === "subagent";
+  const resolvedSubagentMatch = resolveToolCallSubagent(
+    item,
+    sessionSubagents ?? EMPTY_SUBAGENTS,
+    hostId,
+  );
+  const isSubagentStep = item.detail.kind === "subagent" || resolvedSubagentMatch !== null;
+  const handleOpenResolvedSubagent = () => {
+    if (!resolvedSubagentMatch) return;
+    if (onOpenSubagent) {
+      onOpenSubagent(resolvedSubagentMatch.subagent);
+      return;
+    }
+    const sa = resolvedSubagentMatch.subagent;
+    orbitActions.openSubagentTab({
+      callId: sa.callId,
+      role: sa.title,
+      promptPreview: sa.promptPreview,
+      childAgentId: sa.childAgentId,
+      childHostId: sa.childHostId || undefined,
+      providerSubagentId: sa.providerSubagentId,
+      parentAgentId: agentId || undefined,
+    });
+  };
+  const displayTarget =
+    desc.target || (resolvedSubagentMatch ? resolvedSubagentMatch.subagent.title : "");
   const readStartLine = item.detail.kind === "file_read" ? item.detail.start_line : null;
   const readEndLine = item.detail.kind === "file_read" ? item.detail.end_line : null;
   const canOpenTargetDirectly = Boolean(
@@ -740,14 +784,31 @@ const StepItemRow = memo(function StepItemRow({
             {desc.verb}
           </span>
 
-          {desc.target &&
-            (canOpenTargetDirectly ? (
+          {displayTarget &&
+            (resolvedSubagentMatch ? (
+              <button
+                type="button"
+                title="Open subagent details"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleOpenResolvedSubagent();
+                }}
+                className={cn(
+                  "min-w-0 cursor-pointer truncate text-left text-[12.5px] font-medium hover:underline underline-offset-2",
+                  desc.isRunning
+                    ? "agent-text-shimmer"
+                    : "text-foreground/82 group-hover/tool:text-foreground",
+                )}
+              >
+                {displayTarget}
+              </button>
+            ) : canOpenTargetDirectly ? (
               <button
                 type="button"
                 title={
                   canOpenFileInDiff
-                    ? `Open ${desc.target} diff`
-                    : `Open ${desc.target} in Side Panel`
+                    ? `Open ${displayTarget} diff`
+                    : `Open ${displayTarget} in Side Panel`
                 }
                 onClick={(e) => {
                   e.stopPropagation();
@@ -760,7 +821,7 @@ const StepItemRow = memo(function StepItemRow({
                     : "text-muted-foreground group-hover/tool:text-foreground/70 hover:text-foreground",
                 )}
               >
-                {desc.target}
+                {displayTarget}
               </button>
             ) : (
               <span
@@ -771,7 +832,7 @@ const StepItemRow = memo(function StepItemRow({
                     : "text-muted-foreground group-hover/tool:text-foreground/70",
                 )}
               >
-                {desc.target}
+                {displayTarget}
               </span>
             ))}
 
@@ -848,23 +909,17 @@ const StepItemRow = memo(function StepItemRow({
             </button>
           )}
 
-          {item.detail.kind === "subagent" && (
+          {resolvedSubagentMatch && (
             <button
               type="button"
-              title="Inspect Subagent in Side Panel"
+              title="Open subagent details"
               onClick={(e) => {
                 e.stopPropagation();
-                if (item.detail.kind !== "subagent") return;
-                orbitActions.openSubagentTab({
-                  callId: item.call_id,
-                  role: item.detail.role || "Subagent",
-                  promptPreview: item.detail.prompt_preview || "",
-                  childAgentId: item.detail.child_agent_id,
-                });
+                handleOpenResolvedSubagent();
               }}
               className="text-muted-foreground hover:text-foreground cursor-pointer rounded p-0.5 opacity-0 transition-opacity group-hover/tool:opacity-100"
             >
-              <FileSymlink className="size-3.5" />
+              <ArrowUpRight className="size-3.5" />
             </button>
           )}
         </div>
@@ -935,6 +990,7 @@ const StepItemRow = memo(function StepItemRow({
 /** Vertical step connector rail for expanded turn activity steps. */
 const StepTimelineRail = memo(function StepTimelineRail({
   items,
+  hostId,
   cwd,
   holdViewport,
   indented = false,
@@ -943,8 +999,11 @@ const StepTimelineRail = memo(function StepTimelineRail({
   agentId,
   thinkingSignature: _thinkingSignature,
   getThinkingDurationMs,
+  sessionSubagents,
+  onOpenSubagent,
 }: {
   items: TimelineItemView[];
+  hostId?: string;
   cwd: string;
   holdViewport: ViewportAnchorHoldFn;
   indented?: boolean;
@@ -953,6 +1012,8 @@ const StepTimelineRail = memo(function StepTimelineRail({
   agentId: string;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   if (items.length === 0) return null;
 
@@ -977,6 +1038,8 @@ const StepTimelineRail = memo(function StepTimelineRail({
           <StepItemRow
             key={stableStepItemKey(sub, i)}
             item={sub}
+            hostId={hostId}
+            agentId={agentId}
             cwd={cwd}
             holdViewport={holdViewport}
             isActivelyThinking={
@@ -984,9 +1047,89 @@ const StepTimelineRail = memo(function StepTimelineRail({
             }
             thoughtDurationMs={thoughtDurationMs}
             autoExpandError={autoExpandErrors}
+            sessionSubagents={sessionSubagents}
+            onOpenSubagent={onOpenSubagent}
           />
         );
       })}
+    </div>
+  );
+});
+
+/**
+ * Quiet single-line flex-wrap row of clickable subagent pills rendered directly beneath
+ * a `TurnActivityDisclosure` summary whenever a step group dispatches or messages subagents.
+ */
+const SubagentCallChips = memo(function SubagentCallChips({
+  items,
+  hostId,
+  agentId,
+  sessionSubagents,
+  onOpenSubagent,
+}: {
+  items: TimelineItemView[];
+  hostId?: string;
+  agentId?: string;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
+}) {
+  const chips = useMemo(() => {
+    const byKey = new Map<string, { subagent: ResolvedSubagentItem; action: "dispatch" | "message" }>();
+    for (const it of items) {
+      if (it.item_type !== "tool_call") continue;
+      const resolved = resolveToolCallSubagent(it, sessionSubagents ?? EMPTY_SUBAGENTS, hostId);
+      if (!resolved) continue;
+      const existing = byKey.get(resolved.subagent.key);
+      if (!existing || (existing.action === "message" && resolved.action === "dispatch")) {
+        byKey.set(resolved.subagent.key, resolved);
+      }
+    }
+    return Array.from(byKey.values());
+  }, [items, sessionSubagents, hostId]);
+
+  if (chips.length === 0) return null;
+
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+      {chips.map(({ subagent, action }) => (
+        <button
+          key={subagent.key}
+          type="button"
+          title={subagent.promptPreview || `Open ${subagent.title}`}
+          onClick={() => {
+            if (onOpenSubagent) {
+              onOpenSubagent(subagent);
+            } else {
+              orbitActions.openSubagentTab({
+                callId: subagent.callId,
+                role: subagent.title,
+                promptPreview: subagent.promptPreview,
+                childAgentId: subagent.childAgentId,
+                childHostId: subagent.childHostId || undefined,
+                providerSubagentId: subagent.providerSubagentId,
+                parentAgentId: agentId || undefined,
+              });
+            }
+          }}
+          className="group/sachip text-foreground/82 hover:text-foreground inline-flex h-[24px] max-w-[260px] cursor-pointer items-center gap-1.5 rounded-full border border-black/[0.07] bg-black/[0.02] px-2.5 text-[12px] leading-none transition-colors hover:border-black/[0.14] hover:bg-black/[0.045] dark:border-white/[0.09] dark:bg-white/[0.03] dark:hover:border-white/[0.16] dark:hover:bg-white/[0.06]"
+        >
+          <span className="flex size-3 shrink-0 items-center justify-center">
+            {action === "message" ? (
+              <ArrowRight className="text-muted-foreground/85 size-3 stroke-[1.9]" />
+            ) : subagent.status === "awaiting_permission" ? (
+              <span className="size-[6px] rounded-full bg-amber-500 shadow-[0_0_0_2px_rgba(245,158,11,0.18)]" />
+            ) : subagent.status === "running" ? (
+              <OrbitSpinner size={11} className="text-foreground/70" />
+            ) : subagent.status === "failed" ? (
+              <AlertTriangle className="size-3 text-rose-500" />
+            ) : (
+              <Check className="size-3 stroke-[2.2] text-emerald-600/85 dark:text-emerald-400/85" />
+            )}
+          </span>
+          <span className="min-w-0 truncate font-medium">{subagent.title}</span>
+          <ArrowUpRight className="text-muted-foreground/55 group-hover/sachip:text-foreground/85 size-3 shrink-0 opacity-45 transition-opacity group-hover/sachip:opacity-100" />
+        </button>
+      ))}
     </div>
   );
 });
@@ -1013,11 +1156,14 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   isNetworkOffline = false,
   isBackgroundWait = false,
   settledDurationMs,
+  hostId,
   cwd,
   agentId,
   thinkingSignature,
   getThinkingDurationMs,
   holdViewport,
+  sessionSubagents,
+  onOpenSubagent,
 }: {
   items: TimelineItemView[];
   isWorkActive: boolean;
@@ -1033,11 +1179,14 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
   isNetworkOffline?: boolean;
   isBackgroundWait?: boolean;
   settledDurationMs: number | null;
+  hostId?: string;
   cwd: string;
   agentId: string;
   thinkingSignature: string;
   getThinkingDurationMs: ThinkingDurationLookupFn;
   holdViewport: ViewportAnchorHoldFn;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
   const foldBtnRef = useRef<HTMLButtonElement | null>(null);
@@ -1151,10 +1300,19 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
         />
       </button>
 
+      <SubagentCallChips
+        items={items}
+        hostId={hostId}
+        agentId={agentId}
+        sessionSubagents={sessionSubagents}
+        onOpenSubagent={onOpenSubagent}
+      />
+
       {isExpanded && (
         <div className="orbit-stage-enter">
           <StepTimelineRail
             items={items}
+            hostId={hostId}
             cwd={cwd}
             holdViewport={holdViewport}
             indented
@@ -1165,6 +1323,8 @@ const TurnActivityDisclosure = memo(function TurnActivityDisclosure({
             agentId={agentId}
             thinkingSignature={thinkingSignature}
             getThinkingDurationMs={getThinkingDurationMs}
+            sessionSubagents={sessionSubagents}
+            onOpenSubagent={onOpenSubagent}
           />
         </div>
       )}
@@ -1349,7 +1509,7 @@ function extractUserPromptPresentation(
   return res;
 }
 
-interface PromptImagePreviewTarget {
+export interface PromptImagePreviewTarget {
   url: string;
   label: string;
   path: string | null;
@@ -1483,7 +1643,7 @@ const PromptImageThumbnail = memo(function PromptImageThumbnail({
   );
 });
 
-const PromptImageLightbox = memo(function PromptImageLightbox({
+export const PromptImageLightbox = memo(function PromptImageLightbox({
   target,
   onClose,
 }: {
@@ -2855,6 +3015,9 @@ export const TurnStageSection = memo(function TurnStageSection({
   onRequestFork,
   canForkWorktree = false,
   onPreviewImage,
+  sessionSubagents,
+  sessionSubagentMatcher,
+  onOpenSubagent,
 }: {
   turn: StageTurnView;
   isTurnActive: boolean;
@@ -2875,6 +3038,9 @@ export const TurnStageSection = memo(function TurnStageSection({
   onRequestFork?: (upToSeq: number | null, worktree: boolean) => void;
   canForkWorktree?: boolean;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
+  sessionSubagents?: readonly ResolvedSubagentItem[];
+  sessionSubagentMatcher?: SubagentNameMatcher | null;
+  onOpenSubagent?: (subagent: ResolvedSubagentItem) => void;
 }) {
   const rawSegments = turn.live_segments;
   const hostArtifacts = useOrbitSelector(
@@ -3023,7 +3189,13 @@ export const TurnStageSection = memo(function TurnStageSection({
                   : [];
                 return (
                   <div key={seg.key} className="space-y-2">
-                    <MarkdownLinkProvider cwd={cwd}>
+                    <MarkdownLinkProvider
+                      hostId={hostId}
+                      cwd={cwd}
+                      subagents={sessionSubagents}
+                      subagentMatcher={sessionSubagentMatcher}
+                      onOpenSubagent={onOpenSubagent}
+                    >
                       <MarkdownBlocksView
                         blocks={seg.item.blocks}
                         streaming={seg.item.streaming}
@@ -3104,11 +3276,14 @@ export const TurnStageSection = memo(function TurnStageSection({
                   isNetworkOffline={isNetworkOffline}
                   isBackgroundWait={isBackgroundWait}
                   settledDurationMs={groupSettledDurationMs}
+                  hostId={hostId}
                   cwd={cwd}
                   agentId={agentId}
                   thinkingSignature={_thinkingSignature}
                   getThinkingDurationMs={getThinkingDurationMs}
                   holdViewport={holdViewport}
+                  sessionSubagents={sessionSubagents}
+                  onOpenSubagent={onOpenSubagent}
                 />
               );
             })}
@@ -3190,6 +3365,7 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.isNetworkOffline === next.isNetworkOffline &&
   prev.animatePromptEntrance === next.animatePromptEntrance &&
   prev.autoFoldCompleted === next.autoFoldCompleted &&
+  prev.hostId === next.hostId &&
   prev.cwd === next.cwd &&
   prev.agentId === next.agentId &&
   prev.thinkingSignature === next.thinkingSignature &&
@@ -3199,7 +3375,10 @@ export const TurnStageSection = memo(function TurnStageSection({
   prev.timing?.completedAtMs === next.timing?.completedAtMs &&
   prev.onRequestRewind === next.onRequestRewind &&
   prev.onRequestFork === next.onRequestFork &&
-  prev.canForkWorktree === next.canForkWorktree,
+  prev.canForkWorktree === next.canForkWorktree &&
+  prev.sessionSubagents === next.sessionSubagents &&
+  prev.sessionSubagentMatcher === next.sessionSubagentMatcher &&
+  prev.onOpenSubagent === next.onOpenSubagent,
 );
 
 function NewSessionLaunchpad() {
@@ -3557,6 +3736,9 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   onRequestFork,
   canForkWorktree,
   onPreviewImage,
+  sessionSubagents,
+  sessionSubagentMatcher,
+  onOpenSubagent,
 }: {
   selectedHostId: string;
   selectedAgentId: string;
@@ -3583,6 +3765,9 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
   onRequestFork: (upToSeq: number | null, worktree: boolean) => void;
   canForkWorktree: boolean;
   onPreviewImage: (img: PromptImagePreviewTarget) => void;
+  sessionSubagents: readonly ResolvedSubagentItem[];
+  sessionSubagentMatcher: SubagentNameMatcher | null;
+  onOpenSubagent: (subagent: ResolvedSubagentItem) => void;
 }) {
   const widthBucket = stageMaxContentWidthPx ? Math.round(stageMaxContentWidthPx / 32) : 24;
   const selectionTurnsRef = useRef<number[]>([]);
@@ -4055,6 +4240,9 @@ const VirtualizedTurnList = memo(function VirtualizedTurnList({
               onRequestFork={onRequestFork}
               canForkWorktree={canForkWorktree}
               onPreviewImage={onPreviewImage}
+              sessionSubagents={sessionSubagents}
+              sessionSubagentMatcher={sessionSubagentMatcher}
+              onOpenSubagent={onOpenSubagent}
             />
           </div>
         );
@@ -4095,9 +4283,9 @@ export function StreamStage() {
     isResizing,
     onStageTransitionEnd,
   } = useWorkspaceMotion();
-  const hostDetail = useOrbitSelector((s) =>
-    s.selectedHostId ? (s.hostDetails[s.selectedHostId] ?? null) : null,
-  );
+  const hostDetails = useOrbitSelector((s) => s.hostDetails);
+  const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
+  const hostDetail = selectedHostId ? (hostDetails[selectedHostId] ?? null) : null;
   const stageView = useOrbitSelector((s) =>
     s.selectedHostId && s.selectedAgentId
       ? (s.stages[`${s.selectedHostId}::${s.selectedAgentId}`] ?? null)
@@ -4183,6 +4371,47 @@ export function StreamStage() {
   );
   const sessionTurnDiffs = stageView?.session_turn_diffs ?? EMPTY_DIFF_FILES;
   const stageInsights = stageView?.insights ?? EMPTY_INSIGHTS;
+
+  const sessionSubagentsRef = useRef<readonly ResolvedSubagentItem[]>(EMPTY_SUBAGENTS);
+  const sessionSubagents = useMemo(() => {
+    const resolved = resolveSessionSubagents({
+      hostId: selectedHostId,
+      agentId: selectedAgentId,
+      insightsSubagents: stageInsights.subagents,
+      hostDetails,
+      fleetHosts,
+    });
+    const next = resolved.length === 0 ? EMPTY_SUBAGENTS : resolved;
+    if (areResolvedSubagentsEqual(sessionSubagentsRef.current, next)) {
+      return sessionSubagentsRef.current;
+    }
+    sessionSubagentsRef.current = next;
+    return next;
+  }, [selectedHostId, selectedAgentId, stageInsights.subagents, hostDetails, fleetHosts]);
+
+  const sessionSubagentMatcher = useMemo(
+    () => buildSubagentNameMatcher(sessionSubagents),
+    [sessionSubagents],
+  );
+
+  const handleOpenSubagent = useCallback(
+    (sa: ResolvedSubagentItem) => {
+      if (sa.status === "awaiting_permission" && sa.isManaged && sa.childAgentId) {
+        orbitActions.selectAgent(sa.childHostId, sa.childAgentId);
+        return;
+      }
+      orbitActions.openSubagentTab({
+        callId: sa.callId,
+        role: sa.title,
+        promptPreview: sa.promptPreview,
+        childAgentId: sa.childAgentId,
+        childHostId: sa.childHostId || undefined,
+        providerSubagentId: sa.providerSubagentId,
+        parentAgentId: selectedAgentId,
+      });
+    },
+    [selectedAgentId],
+  );
 
   const latestTurn = stageTurns[stageTurns.length - 1] ?? null;
   // Single source of truth: trust authoritative backend `currentAgent.is_running` (which covers
@@ -5138,6 +5367,9 @@ export function StreamStage() {
               onRequestFork={handleRequestFork}
               canForkWorktree={canForkWorktree}
               onPreviewImage={setImagePreviewTarget}
+              sessionSubagents={sessionSubagents}
+              sessionSubagentMatcher={sessionSubagentMatcher}
+              onOpenSubagent={handleOpenSubagent}
             />
           )}
         </div>

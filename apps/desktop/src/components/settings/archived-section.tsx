@@ -358,6 +358,7 @@ export function ArchivedSection() {
                           <div className="flex shrink-0 items-center gap-1.5">
                             <button
                               type="button"
+                              onMouseDown={(e) => e.preventDefault()}
                               onClick={() => {
                                 setConfirmDeleteKey(null);
                                 orbitActions.restoreArchivedThread(

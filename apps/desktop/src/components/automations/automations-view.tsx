@@ -120,11 +120,21 @@ function normalizePresetShorthand(expr: string): string {
   const clean = expr.trim().toLowerCase();
   if (clean === "hourly" || clean === "@hourly" || clean === "1h") return "0 * * * *";
   if (clean === "30m") return "*/30 * * * *";
-  if (clean === "daily" || clean === "@daily" || clean === "daily 09:00" || clean === "daily 9:00") {
-    return "0 9 * * *";
-  }
-  if (clean === "weekdays 09:00" || clean === "weekdays 9:00") return "0 9 * * 1-5";
+  if (clean === "daily" || clean === "@daily") return "0 9 * * *";
+  if (clean === "weekdays" || clean === "@weekdays") return "0 9 * * 1-5";
   if (clean === "weekly" || clean === "@weekly") return "0 9 * * 1";
+  const dailyMatch = /^daily\s+(\d{1,2}):(\d{2})$/.exec(clean);
+  if (dailyMatch) {
+    const h = Number(dailyMatch[1]);
+    const m = Number(dailyMatch[2]);
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59) return `${m} ${h} * * *`;
+  }
+  const weekdaysMatch = /^weekdays\s+(\d{1,2}):(\d{2})$/.exec(clean);
+  if (weekdaysMatch) {
+    const h = Number(weekdaysMatch[1]);
+    const m = Number(weekdaysMatch[2]);
+    if (h >= 0 && h <= 23 && m >= 0 && m <= 59) return `${m} ${h} * * 1-5`;
+  }
   return expr.trim();
 }
 
@@ -553,6 +563,7 @@ export function AutomationsView() {
       orbitActions.showToast("Fill in schedule and prompt");
       return;
     }
+    const normalizedCronExpr = normalizePresetShorthand(effectiveCronExpr);
     const resolvedName = name.trim() || deriveAutomationName(prompt);
     setSubmitting(true);
     try {
@@ -561,7 +572,7 @@ export function AutomationsView() {
           hostId: selectedHostId,
           scheduleId: editingSchedule.schedule_id,
           name: resolvedName,
-          cronExpr: effectiveCronExpr,
+          cronExpr: normalizedCronExpr,
           prompt: prompt.trim(),
           archiveOnFinish,
         });
@@ -574,7 +585,7 @@ export function AutomationsView() {
         await orbitIpc.createSchedule({
           hostId: selectedHostId,
           name: resolvedName,
-          cronExpr: effectiveCronExpr,
+          cronExpr: normalizedCronExpr,
           prompt: prompt.trim(),
           target: {
             type: "new_agent",

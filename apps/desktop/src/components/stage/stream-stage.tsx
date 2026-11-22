@@ -1853,16 +1853,16 @@ function HoverPillTooltip({
       setShiftX(0);
       return;
     }
-    const rect = tooltipRef.current.getBoundingClientRect();
+    const half = tooltipRef.current.getBoundingClientRect().width / 2;
     const pad = 8;
     const vw = window.innerWidth;
-    let delta = 0;
-    if (rect.right > vw - pad) {
-      delta = vw - pad - rect.right;
-    } else if (rect.left < pad) {
-      delta = pad - rect.left;
+    let nextShift = 0;
+    if (anchorPos.x + half > vw - pad) {
+      nextShift = vw - pad - (anchorPos.x + half);
+    } else if (anchorPos.x - half < pad) {
+      nextShift = pad - (anchorPos.x - half);
     }
-    setShiftX(delta);
+    setShiftX(nextShift);
   }, [anchorPos, label]);
 
   const scheduleShow = useCallback(

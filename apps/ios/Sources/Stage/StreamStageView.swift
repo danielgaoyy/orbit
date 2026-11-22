@@ -655,6 +655,7 @@ struct StreamStageView: View {
 
         func isSegmentBoundary(_ text: String, at index: String.Index) -> Bool {
             guard index > text.startIndex else { return true }
+            guard index < text.endIndex else { return false }
             let prevIdx = text.index(before: index)
             let prev = text[prevIdx]
             if prev == "-" || prev == "_" || prev == "." || prev == "/" || prev == " " {
@@ -692,7 +693,7 @@ struct StreamStageView: View {
             let trimmed = rawPath.count > 1 ? rawPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")) : rawPath
             let normalized = rawPath.hasPrefix("/") ? "/\(trimmed)" : trimmed
             let parts = normalized.split(separator: "/", omittingEmptySubsequences: false)
-            if parts.count >= 3 && (parts[1] == "Users" || parts[1] == "home") {
+            if parts.count >= 3 && parts[0].isEmpty && (parts[1] == "Users" || parts[1] == "home") {
                 let rest = parts.dropFirst(3).joined(separator: "/")
                 return rest.isEmpty ? "~" : "~/\(rest)"
             }
@@ -747,7 +748,7 @@ struct StreamStageView: View {
         }
         let parent = String(trimmed[..<slashIdx])
         let parts = parent.split(separator: "/", omittingEmptySubsequences: false)
-        if parts.count >= 3 && (parts[1] == "Users" || parts[1] == "home") {
+        if parts.count >= 3 && parts[0].isEmpty && (parts[1] == "Users" || parts[1] == "home") {
             let rest = parts.dropFirst(3).joined(separator: "/")
             return rest.isEmpty ? "~" : "~/\(rest)"
         }

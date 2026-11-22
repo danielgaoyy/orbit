@@ -558,18 +558,21 @@ function scheduleSavePrefs(): void {
   if (savePrefsTimer !== null) return;
   savePrefsTimer = setTimeout(() => {
     savePrefsTimer = null;
+    if (disposed) return;
     if (savePrefsPending) {
       writePrefsNow(state);
     }
   }, 180);
 }
 
+const beforeUnloadListener = () => {
+  if (savePrefsPending) {
+    writePrefsNow(state);
+  }
+};
+
 if (typeof window !== "undefined") {
-  window.addEventListener("beforeunload", () => {
-    if (savePrefsPending) {
-      writePrefsNow(state);
-    }
-  });
+  window.addEventListener("beforeunload", beforeUnloadListener);
 }
 
 function detectSystemTheme(): ResolvedTheme {
@@ -6741,6 +6744,13 @@ if (viteHot) {
       themeMediaQuery.removeEventListener("change", themeMediaListener);
       themeMediaQuery = null;
       themeMediaListener = null;
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("beforeunload", beforeUnloadListener);
+    }
+    if (savePrefsTimer !== null) {
+      clearTimeout(savePrefsTimer);
+      savePrefsTimer = null;
     }
     if (toastTimer) {
       clearTimeout(toastTimer);

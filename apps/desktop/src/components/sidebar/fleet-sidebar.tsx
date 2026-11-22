@@ -309,7 +309,12 @@ export const FleetSidebar = memo(function FleetSidebar() {
             if (entry.scopeKey === source.scopeKey) {
               sameScopeEntries.push({ entry, rect });
             }
-            if (ev.clientY >= rect.top - 4 && ev.clientY <= rect.bottom + 4) {
+            if (
+              ev.clientX >= rect.left - 12 &&
+              ev.clientX <= rect.right + 24 &&
+              ev.clientY >= rect.top - 4 &&
+              ev.clientY <= rect.bottom + 4
+            ) {
               if (entry.agentId !== source.agentId) {
                 best = {
                   kind: "thread",
@@ -328,7 +333,10 @@ export const FleetSidebar = memo(function FleetSidebar() {
             sameScopeEntries.sort((a, b) => a.rect.top - b.rect.top);
             const first = sameScopeEntries[0];
             const last = sameScopeEntries[sameScopeEntries.length - 1];
+            const inHorizontalBounds =
+              ev.clientX >= first.rect.left - 12 && ev.clientX <= first.rect.right + 24;
             if (
+              inHorizontalBounds &&
               ev.clientY < first.rect.top &&
               ev.clientY >= first.rect.top - 28 &&
               first.entry.agentId !== source.agentId
@@ -341,6 +349,7 @@ export const FleetSidebar = memo(function FleetSidebar() {
                 position: "before",
               };
             } else if (
+              inHorizontalBounds &&
               ev.clientY > last.rect.bottom &&
               ev.clientY <= last.rect.bottom + 28 &&
               last.entry.agentId !== source.agentId
@@ -399,10 +408,11 @@ export const FleetSidebar = memo(function FleetSidebar() {
         }
       };
 
-      const finish = () => {
+      const finish = (commit: boolean) => {
         window.removeEventListener("pointermove", onMove);
-        window.removeEventListener("pointerup", finish);
-        window.removeEventListener("pointercancel", finish);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onCancel);
+        window.removeEventListener("keydown", onKeyDown);
         threadDragCleanupRef.current = null;
         document.body.style.cursor = "";
 
@@ -411,42 +421,44 @@ export const FleetSidebar = memo(function FleetSidebar() {
           setThreadDropIndicator(null);
           setDragOverDropId(null);
 
-          if (currentTarget?.kind === "thread") {
-            const fullIds = scopeAgentIdsRef.current.get(currentTarget.scopeKey) ?? [];
-            const orderedIds = fullIds.filter((id) => id !== source.agentId);
-            let toIdx = orderedIds.indexOf(currentTarget.targetAgentId);
-            if (toIdx >= 0) {
-              if (currentTarget.position === "after") toIdx += 1;
-              orderedIds.splice(toIdx, 0, source.agentId);
-            } else {
-              orderedIds.unshift(source.agentId);
-            }
-
-            if (source.workspaceId !== currentTarget.workspaceId) {
-              if (currentTarget.workspaceId) {
-                void orbitActions.moveAgentToWorkspace(
-                  source.hostId,
-                  source.agentId,
-                  currentTarget.workspaceId,
-                );
+          if (commit) {
+            if (currentTarget?.kind === "thread") {
+              const fullIds = scopeAgentIdsRef.current.get(currentTarget.scopeKey) ?? [];
+              const orderedIds = fullIds.filter((id) => id !== source.agentId);
+              let toIdx = orderedIds.indexOf(currentTarget.targetAgentId);
+              if (toIdx >= 0) {
+                if (currentTarget.position === "after") toIdx += 1;
+                orderedIds.splice(toIdx, 0, source.agentId);
               } else {
-                void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
-                  makeUnclassified: true,
-                });
+                orderedIds.unshift(source.agentId);
               }
-            }
 
-            orbitActions.reorderThreads(currentTarget.scopeKey, orderedIds);
-          } else if (currentTarget?.kind === "group") {
-            void orbitActions.moveAgentToWorkspace(
-              source.hostId,
-              source.agentId,
-              currentTarget.workspaceId,
-            );
-          } else if (currentTarget?.kind === "inbox") {
-            void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
-              makeUnclassified: true,
-            });
+              if (source.workspaceId !== currentTarget.workspaceId) {
+                if (currentTarget.workspaceId) {
+                  void orbitActions.moveAgentToWorkspace(
+                    source.hostId,
+                    source.agentId,
+                    currentTarget.workspaceId,
+                  );
+                } else {
+                  void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
+                    makeUnclassified: true,
+                  });
+                }
+              }
+
+              orbitActions.reorderThreads(currentTarget.scopeKey, orderedIds);
+            } else if (currentTarget?.kind === "group") {
+              void orbitActions.moveAgentToWorkspace(
+                source.hostId,
+                source.agentId,
+                currentTarget.workspaceId,
+              );
+            } else if (currentTarget?.kind === "inbox") {
+              void orbitActions.moveAgentToWorkspace(source.hostId, source.agentId, null, {
+                makeUnclassified: true,
+              });
+            }
           }
 
           window.setTimeout(() => {
@@ -455,11 +467,18 @@ export const FleetSidebar = memo(function FleetSidebar() {
         }
       };
 
+      const onPointerUp = () => finish(true);
+      const onCancel = () => finish(false);
+      const onKeyDown = (ev: KeyboardEvent) => {
+        if (ev.key === "Escape") finish(false);
+      };
+
       threadDragCleanupRef.current?.();
-      threadDragCleanupRef.current = finish;
+      threadDragCleanupRef.current = onCancel;
       window.addEventListener("pointermove", onMove);
-      window.addEventListener("pointerup", finish);
-      window.addEventListener("pointercancel", finish);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onCancel);
+      window.addEventListener("keydown", onKeyDown);
     },
     [],
   );
@@ -1105,17 +1124,18 @@ export const FleetSidebar = memo(function FleetSidebar() {
                     setDropIndicator(best);
                   };
 
-                  const finish = () => {
+                  const finish = (commit: boolean) => {
                     window.removeEventListener("pointermove", onMove);
-                    window.removeEventListener("pointerup", finish);
-                    window.removeEventListener("pointercancel", finish);
+                    window.removeEventListener("pointerup", onPointerUp);
+                    window.removeEventListener("pointercancel", onCancel);
+                    window.removeEventListener("keydown", onKeyDown);
                     dragCleanupRef.current = null;
                     document.body.style.cursor = "";
 
                     if (activeDrag) {
                       setDraggingProjectId(null);
                       setDropIndicator(null);
-                      if (currentDrop && currentDrop.targetId !== proj.id) {
+                      if (commit && currentDrop && currentDrop.targetId !== proj.id) {
                         const ordered = displayProjects.map((d) => d.project);
                         const fromIdx = ordered.findIndex((p) => p.id === proj.id);
                         const [moved] = ordered.splice(fromIdx, 1);
@@ -1138,11 +1158,18 @@ export const FleetSidebar = memo(function FleetSidebar() {
                     }
                   };
 
+                  const onPointerUp = () => finish(true);
+                  const onCancel = () => finish(false);
+                  const onKeyDown = (ev: KeyboardEvent) => {
+                    if (ev.key === "Escape") finish(false);
+                  };
+
                   dragCleanupRef.current?.();
-                  dragCleanupRef.current = finish;
+                  dragCleanupRef.current = onCancel;
                   window.addEventListener("pointermove", onMove);
-                  window.addEventListener("pointerup", finish);
-                  window.addEventListener("pointercancel", finish);
+                  window.addEventListener("pointerup", onPointerUp);
+                  window.addEventListener("pointercancel", onCancel);
+                  window.addEventListener("keydown", onKeyDown);
                 };
 
                 const hasCollapsedApproval =

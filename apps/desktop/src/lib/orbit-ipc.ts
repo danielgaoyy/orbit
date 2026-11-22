@@ -2402,6 +2402,88 @@ export interface LifecycleHooksSnapshotView {
   project_hooks_trusted: boolean;
 }
 
+export type TriggerSourceKind = "github" | "slack" | "linear" | "generic_webhook";
+
+export type TriggerDispatchTarget =
+  | {
+      type: "existing_agent";
+      agent_id: string;
+    }
+  | {
+      type: "spawn_workspace_agent";
+      cwd: string;
+      provider: ProviderKind;
+      model?: string | null;
+      mode: SessionMode;
+    };
+
+export interface GitHubPollConfig {
+  repo: string;
+  poll_interval_secs: number;
+  watch_prs: boolean;
+  watch_issues: boolean;
+  watch_ci_failures: boolean;
+  has_token: boolean;
+}
+
+export interface EventTriggerRecord {
+  trigger_id: string;
+  name: string;
+  source: TriggerSourceKind;
+  event_filters: string[];
+  prompt_template: string;
+  target: TriggerDispatchTarget;
+  webhook_path: string;
+  has_secret: boolean;
+  masked_secret?: string | null;
+  github_poll?: GitHubPollConfig | null;
+  enabled: boolean;
+  trigger_count: number;
+  last_triggered_at_ms?: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface EventTriggerDelivery {
+  delivery_id: string;
+  trigger_id: string;
+  source: TriggerSourceKind;
+  event_type: string;
+  status:
+    | "dispatched"
+    | "filtered"
+    | "rejected_signature"
+    | "rate_limited"
+    | "duplicate"
+    | "error"
+    | string;
+  summary: string;
+  dispatched_agent_id?: string | null;
+  received_at_ms: number;
+}
+
+export interface EventTriggersSnapshotView {
+  triggers: EventTriggerRecord[];
+  recent_deliveries: EventTriggerDelivery[];
+  base_webhook_url: string;
+}
+
+export interface UpsertEventTriggerRequest {
+  host_id: string;
+  trigger_id?: string | null;
+  name: string;
+  source: TriggerSourceKind;
+  event_filters: string[];
+  prompt_template: string;
+  target: TriggerDispatchTarget;
+  secret?: string | null;
+  keep_existing_secret: boolean;
+  github_poll?: GitHubPollConfig | null;
+  github_token?: string | null;
+  keep_existing_token: boolean;
+  enabled: boolean;
+}
+
 export const orbitIpc = {
   async subscribe(onNotification: (ev: CoreNotification) => void): Promise<void> {
     if (!isTauriRuntime()) return;
@@ -4829,6 +4911,52 @@ export const orbitIpc = {
     return invoke<MonitorWatchRecord>("stop_monitor_watch", {
       hostId,
       monitorId,
+    });
+  },
+
+  listEventTriggers: async (hostId: string): Promise<EventTriggersSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { triggers: [], recent_deliveries: [], base_webhook_url: "http://127.0.0.1:6868" };
+    }
+    return invoke<EventTriggersSnapshotView>("list_event_triggers", { hostId });
+  },
+
+  upsertEventTrigger: async (
+    req: UpsertEventTriggerRequest,
+  ): Promise<EventTriggersSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { triggers: [], recent_deliveries: [], base_webhook_url: "http://127.0.0.1:6868" };
+    }
+    return invoke<EventTriggersSnapshotView>("upsert_event_trigger", { req });
+  },
+
+  deleteEventTrigger: async (
+    hostId: string,
+    triggerId: string,
+  ): Promise<EventTriggersSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return { triggers: [], recent_deliveries: [], base_webhook_url: "http://127.0.0.1:6868" };
+    }
+    return invoke<EventTriggersSnapshotView>("delete_event_trigger", {
+      hostId,
+      triggerId,
+    });
+  },
+
+  testEventTrigger: async (
+    hostId: string,
+    triggerId: string,
+    sampleEventType: string,
+    samplePayload: Record<string, unknown>,
+  ): Promise<EventTriggerDelivery> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Trigger testing requires the Orbit desktop runtime");
+    }
+    return invoke<EventTriggerDelivery>("test_event_trigger", {
+      hostId,
+      triggerId,
+      sampleEventType,
+      samplePayload,
     });
   },
 };

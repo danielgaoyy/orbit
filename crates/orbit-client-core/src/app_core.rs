@@ -17,20 +17,21 @@ use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentMessageKind,
     AgentProfile, AgentStatus, AgentSummary, ArtifactDetail, ArtifactSummary, AttentionState,
     BackgroundTaskInfo, ConditionalTimerRecord, ConditionalTimerState, ConnectedHostSummary,
-    ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, ExternalMcpServerRecord,
-    GitStatusSnapshot, GoalRunRecord, GuardianAssessment, GuardianAuditEntry, GuardianPolicyConfig,
-    HookExecutionRecord, HookScope, HostProjectEntry, HostSyncState, KeepAwakeStatus,
-    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
-    ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord, OrchestrationConfig,
-    OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef,
-    PromptBadge, ProviderKind, ProviderModelCatalog, ProviderQuotaSnapshot,
-    ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem, QueuedPromptView,
-    ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec, ScheduleTarget, SessionMode,
-    SkillWriteScope, TerminalBinaryFrame, TerminalSummary, TimelineEvent, TimelinePayload,
-    TimerCondition, ToolCallDetail, ToolCallStatus, UsageInsightsSnapshot, WireMessage,
-    WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
-    WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
-    WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
+    ContextOccupancyBreakdown, DirectoryEntry, DiscoveredProject, EventTriggerDelivery,
+    ExternalMcpServerRecord, GitStatusSnapshot, GoalRunRecord, GuardianAssessment,
+    GuardianAuditEntry, GuardianPolicyConfig, HookExecutionRecord, HookScope, HostProjectEntry,
+    HostSyncState, KeepAwakeStatus, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus,
+    LspSymbolInfo, ManagedSkillRecord, McpProbeResult, ModelOption, MonitorWatchRecord,
+    OrchestrationConfig, OrchestrationSkillInfo, PathScopedRule, PendingPermissionSummary,
+    PermissionCheckpointRef, PromptBadge, ProviderKind, ProviderModelCatalog,
+    ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent, QuestionItem,
+    QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord, ScheduleSpec,
+    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
+    TimelineEvent, TimelinePayload, TimerCondition, ToolCallDetail, ToolCallStatus,
+    UsageInsightsSnapshot, WireMessage, WorkspaceBoardSnapshot, WorkspaceClusterSuggestion,
+    WorkspaceEventKind, WorkspaceEventRecord, WorkspaceIsolation, WorkspaceOrganizeEvent,
+    WorkspaceScriptInfo, WorkspaceSummary, WorktreeCreateMode, WorktreeHandoffOutcome,
+    WorktreeHandoffPreview,
 };
 pub use orbit_store::ClientThreadPref;
 use orbit_store::{OrbitStore, StoredClientProject, StoredHostMeta, StoredHostProfile};
@@ -49,15 +50,15 @@ use crate::cloud_sync::{
 };
 pub use crate::contract::{
     ControlGoalRunRequest, ConversationSearchHit, CreateWorkspaceEntryRequest,
-    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
-    ForkAgentRequest, ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
-    InstructionFilesSnapshotView, LifecycleHooksSnapshotView, ListInstructionFilesRequest,
-    MatchPathRulesRequest, MatchedPathRulesView, PathRulesSnapshotView,
-    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
-    SaveInstructionFileRequest, StartGoalRunRequest, StartMonitorWatchRequest,
-    StopMonitorWatchRequest, UpsertArtifactRequest, UpsertExternalMcpServerRequest,
-    UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
-    WriteWorkspaceFileRequest,
+    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, EventTriggersSnapshotView,
+    ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
+    InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
+    LifecycleHooksSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
+    MatchedPathRulesView, PathRulesSnapshotView, PreviewWorktreeHandoffRequest,
+    ReadInstructionFileRequest, RenameWorkspaceEntryRequest, SaveInstructionFileRequest,
+    StartGoalRunRequest, StartMonitorWatchRequest, StopMonitorWatchRequest, UpsertArtifactRequest,
+    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
 
@@ -721,6 +722,10 @@ struct HostMemoryState {
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<MonitorWatchRecord, String>>>,
     pending_monitor_lists:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<Vec<MonitorWatchRecord>, String>>>,
+    pending_event_triggers:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<EventTriggersSnapshotView, String>>>,
+    pending_event_trigger_tests:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<EventTriggerDelivery, String>>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -854,6 +859,8 @@ impl HostMemoryState {
             pending_goal_lists: HashMap::new(),
             pending_monitor_updates: HashMap::new(),
             pending_monitor_lists: HashMap::new(),
+            pending_event_triggers: HashMap::new(),
+            pending_event_trigger_tests: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -5285,6 +5292,28 @@ impl OrbitAppCore {
                         let _ = tx.send(Ok(record));
                     }
                 }
+                WireMessage::EventTriggersSnapshot {
+                    request_id,
+                    triggers,
+                    recent_deliveries,
+                    base_webhook_url,
+                } => {
+                    if let Some(tx) = state.pending_event_triggers.remove(&request_id) {
+                        let _ = tx.send(Ok(EventTriggersSnapshotView {
+                            triggers,
+                            recent_deliveries,
+                            base_webhook_url,
+                        }));
+                    }
+                }
+                WireMessage::EventTriggerTestResponse {
+                    request_id,
+                    delivery,
+                } => {
+                    if let Some(tx) = state.pending_event_trigger_tests.remove(&request_id) {
+                        let _ = tx.send(Ok(delivery));
+                    }
+                }
                 WireMessage::ConditionalTimerCreated { request_id, timer } => {
                     upsert_conditional_timer_record(&mut state.conditional_timers, timer.clone());
                     if let Some(tx) = state.pending_timer_creates.remove(&request_id) {
@@ -5599,6 +5628,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_lifecycle_hook_tests.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_event_triggers.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_event_trigger_tests.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -11409,6 +11446,232 @@ impl OrbitAppCore {
             .map_err(|_| "test lifecycle hook task cancelled".to_string())?
     }
 
+    async fn dispatch_event_triggers_snapshot_on_host<F>(
+        self: &Arc<Self>,
+        host_id: String,
+        build_msg: F,
+        op_label: &'static str,
+    ) -> Result<EventTriggersSnapshotView, String>
+    where
+        F: FnOnce(Uuid) -> WireMessage + Send + 'static,
+    {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_event_triggers.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session.send_wire(build_msg(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_event_triggers.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while waiting to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_event_triggers.remove(&req_id);
+                    }
+                    Err(format!(
+                        "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                    ))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn list_event_triggers_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+    ) -> Result<EventTriggersSnapshotView, String> {
+        self.dispatch_event_triggers_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::ListEventTriggers { request_id },
+            "list event triggers",
+        )
+        .await
+    }
+
+    pub async fn upsert_event_trigger_on_host(
+        self: &Arc<Self>,
+        req: UpsertEventTriggerRequest,
+    ) -> Result<EventTriggersSnapshotView, String> {
+        let host_id = req.host_id;
+        self.dispatch_event_triggers_snapshot_on_host(
+            host_id,
+            move |request_id| WireMessage::UpsertEventTrigger {
+                request_id,
+                trigger_id: req.trigger_id,
+                name: req.name,
+                source: req.source,
+                event_filters: req.event_filters,
+                prompt_template: req.prompt_template,
+                target: req.target,
+                secret: req.secret,
+                keep_existing_secret: req.keep_existing_secret,
+                github_poll: req.github_poll,
+                github_token: req.github_token,
+                keep_existing_token: req.keep_existing_token,
+                enabled: req.enabled,
+            },
+            "save event trigger",
+        )
+        .await
+    }
+
+    pub async fn delete_event_trigger_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        trigger_id: String,
+    ) -> Result<EventTriggersSnapshotView, String> {
+        self.dispatch_event_triggers_snapshot_on_host(
+            host_id.to_string(),
+            move |request_id| WireMessage::DeleteEventTrigger {
+                request_id,
+                trigger_id,
+            },
+            "delete event trigger",
+        )
+        .await
+    }
+
+    pub async fn test_event_trigger_on_host(
+        self: &Arc<Self>,
+        host_id: &str,
+        trigger_id: String,
+        sample_event_type: String,
+        sample_payload: serde_json::Value,
+    ) -> Result<EventTriggerDelivery, String> {
+        let host_id = host_id.to_string();
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?
+                .session
+                .clone()
+        };
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to test event trigger".to_string());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_event_trigger_tests.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before test event trigger".to_string()),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session
+                .send_wire(WireMessage::TestEventTrigger {
+                    request_id: req_id,
+                    trigger_id,
+                    sample_event_type,
+                    sample_payload,
+                })
+                .await
+            {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_event_trigger_tests.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to test event trigger: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(20), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => {
+                    Err("Host disconnected while waiting for event trigger test".to_string())
+                }
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_event_trigger_tests.remove(&req_id);
+                    }
+                    Err("Timed out waiting for event trigger test result".to_string())
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "test event trigger task cancelled".to_string())?
+    }
+
     pub async fn list_path_rules_on_host(
         self: &Arc<Self>,
         host_id: String,
@@ -14526,6 +14789,12 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_monitor_updates.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_event_triggers.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_event_trigger_tests.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
     for (_, tx) in h.pending_monitor_lists.drain() {

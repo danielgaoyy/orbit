@@ -14,6 +14,7 @@ pub mod orchestration;
 pub mod rules;
 pub mod skills;
 pub mod timers;
+pub mod triggers;
 pub mod usage;
 pub use acp::*;
 pub use artifacts::*;
@@ -29,6 +30,7 @@ pub use orchestration::*;
 pub use rules::*;
 pub use skills::*;
 pub use timers::*;
+pub use triggers::*;
 pub use usage::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -2415,6 +2417,56 @@ pub enum WireMessage {
         monitor: MonitorWatchRecord,
     },
 
+    // --- External Event Triggers (GitHub, Slack, Linear, Generic Webhook + GitHub PR Polling) ---
+    ListEventTriggers {
+        request_id: Uuid,
+    },
+    EventTriggersSnapshot {
+        request_id: Uuid,
+        triggers: Vec<EventTriggerRecord>,
+        #[serde(default)]
+        recent_deliveries: Vec<EventTriggerDelivery>,
+        #[serde(default)]
+        base_webhook_url: String,
+    },
+    UpsertEventTrigger {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_id: Option<String>,
+        name: String,
+        source: TriggerSourceKind,
+        #[serde(default)]
+        event_filters: Vec<String>,
+        prompt_template: String,
+        target: TriggerDispatchTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
+        #[serde(default)]
+        keep_existing_secret: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github_poll: Option<GitHubPollConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        github_token: Option<String>,
+        #[serde(default)]
+        keep_existing_token: bool,
+        enabled: bool,
+    },
+    DeleteEventTrigger {
+        request_id: Uuid,
+        trigger_id: String,
+    },
+    TestEventTrigger {
+        request_id: Uuid,
+        trigger_id: String,
+        sample_event_type: String,
+        #[serde(default)]
+        sample_payload: serde_json::Value,
+    },
+    EventTriggerTestResponse {
+        request_id: Uuid,
+        delivery: EventTriggerDelivery,
+    },
+
     RpcError {
         request_id: Option<Uuid>,
         code: String,
@@ -4006,6 +4058,105 @@ mod tests {
         for msg in messages {
             let encoded = msg.encode_zstd(3).expect("encode goal/monitor wire msg");
             let decoded = WireMessage::decode_zstd(&encoded).expect("decode goal/monitor wire msg");
+            assert_eq!(
+                serde_json::to_value(&msg).expect("orig"),
+                serde_json::to_value(&decoded).expect("decoded")
+            );
+        }
+    }
+
+    #[test]
+    fn event_triggers_wire_messages_roundtrip() {
+        let req_id = Uuid::new_v4();
+        let poll = GitHubPollConfig {
+            repo: "octocat/orbit".into(),
+            poll_interval_secs: 120,
+            watch_prs: true,
+            watch_issues: true,
+            watch_ci_failures: false,
+            has_token: true,
+        };
+        let trigger = EventTriggerRecord {
+            trigger_id: "trg_abc12345".into(),
+            name: "PR Auto-Review".into(),
+            source: TriggerSourceKind::GitHub,
+            event_filters: vec![
+                "pull_request.opened".into(),
+                "pull_request.synchronize".into(),
+            ],
+            prompt_template: "Review {{title}} at {{url}} by {{actor}}".into(),
+            target: TriggerDispatchTarget::SpawnWorkspaceAgent {
+                cwd: "/workspace/orbit".into(),
+                provider: ProviderKind::ClaudeCode,
+                model: Some("claude-sonnet-4-5".into()),
+                mode: SessionMode::AcceptEdits,
+            },
+            webhook_path: "/webhooks/trg_abc12345".into(),
+            has_secret: true,
+            masked_secret: Some("••••".into()),
+            github_poll: Some(poll.clone()),
+            enabled: true,
+            trigger_count: 3,
+            last_triggered_at_ms: Some(1_760_000_005_000),
+            created_at_ms: 1_760_000_000_000,
+            updated_at_ms: 1_760_000_005_000,
+        };
+        let delivery = EventTriggerDelivery {
+            delivery_id: "del_xyz".into(),
+            trigger_id: "trg_abc12345".into(),
+            source: TriggerSourceKind::GitHub,
+            event_type: "pull_request.opened".into(),
+            status: "dispatched".into(),
+            summary: "Dispatched to agent ag_1".into(),
+            dispatched_agent_id: Some("ag_1".into()),
+            received_at_ms: 1_760_000_005_000,
+        };
+
+        let messages = vec![
+            WireMessage::ListEventTriggers { request_id: req_id },
+            WireMessage::EventTriggersSnapshot {
+                request_id: req_id,
+                triggers: vec![trigger],
+                recent_deliveries: vec![delivery.clone()],
+                base_webhook_url: "http://127.0.0.1:6868".into(),
+            },
+            WireMessage::UpsertEventTrigger {
+                request_id: req_id,
+                trigger_id: Some("trg_abc12345".into()),
+                name: "PR Auto-Review".into(),
+                source: TriggerSourceKind::GitHub,
+                event_filters: vec!["pull_request.opened".into()],
+                prompt_template: "Review {{title}}".into(),
+                target: TriggerDispatchTarget::ExistingAgent {
+                    agent_id: "ag_main".into(),
+                },
+                secret: None,
+                keep_existing_secret: true,
+                github_poll: Some(poll),
+                github_token: None,
+                keep_existing_token: true,
+                enabled: true,
+            },
+            WireMessage::DeleteEventTrigger {
+                request_id: req_id,
+                trigger_id: "trg_abc12345".into(),
+            },
+            WireMessage::TestEventTrigger {
+                request_id: req_id,
+                trigger_id: "trg_abc12345".into(),
+                sample_event_type: "pull_request.opened".into(),
+                sample_payload: serde_json::json!({ "title": "Fix bug" }),
+            },
+            WireMessage::EventTriggerTestResponse {
+                request_id: req_id,
+                delivery,
+            },
+        ];
+
+        for msg in messages {
+            let encoded = msg.encode_zstd(3).expect("encode event trigger wire msg");
+            let decoded =
+                WireMessage::decode_zstd(&encoded).expect("decode event trigger wire msg");
             assert_eq!(
                 serde_json::to_value(&msg).expect("orig"),
                 serde_json::to_value(&decoded).expect("decoded")

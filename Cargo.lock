@@ -2213,6 +2213,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vt100",
+ "zeroize",
 ]
 
 [[package]]

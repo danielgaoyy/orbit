@@ -69,7 +69,11 @@ import {
   type ExternalEditorInfo,
   type ExternalEditorKind,
   type ExternalMcpServerRecord,
+  type EventTriggerDelivery,
+  type EventTriggerRecord,
+  type EventTriggersSnapshotView,
   type ExtractedCodeBlock,
+  type UpsertEventTriggerRequest,
   type FleetOverviewView,
   type FleetSidebarView,
   type HookExecutionRecord,
@@ -667,6 +671,17 @@ export interface OrbitUiState {
       error?: string | null;
     }
   >;
+  // External Event Triggers (GitHub, Slack, Linear, Generic Webhook + GitHub PR Polling)
+  eventTriggersByHost: Record<
+    string,
+    {
+      status: "idle" | "loading" | "ready" | "error";
+      triggers: EventTriggerRecord[];
+      recentDeliveries: EventTriggerDelivery[];
+      baseWebhookUrl: string;
+      error?: string | null;
+    }
+  >;
 
   // User ergonomic & ADE preferences
   theme: ThemeMode;
@@ -994,6 +1009,7 @@ const defaultInitialState: OrbitUiState = {
   lspDiagnosticsByFile: {},
   lifecycleHooksByScope: {},
   guardianByHost: {},
+  eventTriggersByHost: {},
 
   overviewDesktopOpenPref: initialPrefs.overviewDesktopOpenPref ?? true,
   overviewPopoverOpen: false,
@@ -7585,6 +7601,178 @@ export const orbitActions = {
     }
   },
 
+  async loadEventTriggers(hostId: string): Promise<EventTriggersSnapshotView | null> {
+    if (!hostId) return null;
+    const seq = (eventTriggersSeqByHost.get(hostId) ?? 0) + 1;
+    eventTriggersSeqByHost.set(hostId, seq);
+    setState((s) => {
+      const prev = s.eventTriggersByHost[hostId];
+      return {
+        ...s,
+        eventTriggersByHost: {
+          ...s.eventTriggersByHost,
+          [hostId]: {
+            status: "loading",
+            triggers: prev?.triggers ?? [],
+            recentDeliveries: prev?.recentDeliveries ?? [],
+            baseWebhookUrl: prev?.baseWebhookUrl ?? "http://127.0.0.1:6868",
+            error: null,
+          },
+        },
+      };
+    });
+    try {
+      const snap = await orbitIpc.listEventTriggers(hostId);
+      if (eventTriggersSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => ({
+        ...s,
+        eventTriggersByHost: {
+          ...s.eventTriggersByHost,
+          [hostId]: {
+            status: "ready",
+            triggers: snap.triggers,
+            recentDeliveries: snap.recent_deliveries,
+            baseWebhookUrl: snap.base_webhook_url,
+            error: null,
+          },
+        },
+      }));
+      return snap;
+    } catch (err) {
+      if (eventTriggersSeqByHost.get(hostId) !== seq) return null;
+      setState((s) => {
+        const prev = s.eventTriggersByHost[hostId];
+        return {
+          ...s,
+          eventTriggersByHost: {
+            ...s.eventTriggersByHost,
+            [hostId]: {
+              status: "error",
+              triggers: prev?.triggers ?? [],
+              recentDeliveries: prev?.recentDeliveries ?? [],
+              baseWebhookUrl: prev?.baseWebhookUrl ?? "http://127.0.0.1:6868",
+              error: String(err),
+            },
+          },
+        };
+      });
+      return null;
+    }
+  },
+
+  async upsertEventTrigger(
+    req: UpsertEventTriggerRequest,
+  ): Promise<EventTriggersSnapshotView> {
+    const hostId = req.host_id;
+    const seq = (eventTriggersSeqByHost.get(hostId) ?? 0) + 1;
+    eventTriggersSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.upsertEventTrigger(req);
+      if (eventTriggersSeqByHost.get(hostId) === seq) {
+        setState((s) => ({
+          ...s,
+          eventTriggersByHost: {
+            ...s.eventTriggersByHost,
+            [hostId]: {
+              status: "ready",
+              triggers: snap.triggers,
+              recentDeliveries: snap.recent_deliveries,
+              baseWebhookUrl: snap.base_webhook_url,
+              error: null,
+            },
+          },
+        }));
+      }
+      return snap;
+    } catch (err) {
+      notifyToast(`Trigger save failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async deleteEventTrigger(
+    hostId: string,
+    triggerId: string,
+  ): Promise<EventTriggersSnapshotView> {
+    const seq = (eventTriggersSeqByHost.get(hostId) ?? 0) + 1;
+    eventTriggersSeqByHost.set(hostId, seq);
+    try {
+      const snap = await orbitIpc.deleteEventTrigger(hostId, triggerId);
+      if (eventTriggersSeqByHost.get(hostId) === seq) {
+        setState((s) => ({
+          ...s,
+          eventTriggersByHost: {
+            ...s.eventTriggersByHost,
+            [hostId]: {
+              status: "ready",
+              triggers: snap.triggers,
+              recentDeliveries: snap.recent_deliveries,
+              baseWebhookUrl: snap.base_webhook_url,
+              error: null,
+            },
+          },
+        }));
+      }
+      notifyToast("Trigger deleted");
+      return snap;
+    } catch (err) {
+      notifyToast(`Trigger delete failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
+  async testEventTrigger(
+    hostId: string,
+    triggerId: string,
+    sampleEventType: string,
+    samplePayload: Record<string, unknown>,
+  ): Promise<EventTriggerDelivery> {
+    try {
+      const delivery = await orbitIpc.testEventTrigger(
+        hostId,
+        triggerId,
+        sampleEventType,
+        samplePayload,
+      );
+      setState((s) => {
+        const prev = s.eventTriggersByHost[hostId];
+        if (!prev) return s;
+        const nextDeliveries = [
+          delivery,
+          ...prev.recentDeliveries.filter((d) => d.delivery_id !== delivery.delivery_id),
+        ].slice(0, 50);
+        const nextTriggers =
+          delivery.status === "dispatched"
+            ? prev.triggers.map((t) =>
+                t.trigger_id === triggerId
+                  ? {
+                      ...t,
+                      trigger_count: t.trigger_count + 1,
+                      last_triggered_at_ms: delivery.received_at_ms,
+                    }
+                  : t,
+              )
+            : prev.triggers;
+        return {
+          ...s,
+          eventTriggersByHost: {
+            ...s.eventTriggersByHost,
+            [hostId]: {
+              ...prev,
+              triggers: nextTriggers,
+              recentDeliveries: nextDeliveries,
+            },
+          },
+        };
+      });
+      notifyToast(`${delivery.event_type}: ${delivery.status} · ${delivery.summary}`);
+      return delivery;
+    } catch (err) {
+      notifyToast(`Trigger test failed: ${String(err)}`);
+      throw err;
+    }
+  },
+
   async loadFileDiagnostics(
     hostId: string,
     cwd: string,
@@ -9951,6 +10139,7 @@ let nextLspGotoSeq = 0;
 const lspDiagSeqByKey = new Map<string, number>();
 const lspServersSeqByKey = new Map<string, number>();
 const lifecycleHooksSeqByKey = new Map<string, number>();
+const eventTriggersSeqByHost = new Map<string, number>();
 const guardianReqSeqByHost = new Map<string, number>();
 
 function upsertLruRecord<T>(

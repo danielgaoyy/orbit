@@ -40,16 +40,17 @@ use orbit_client_core::composer::{
 };
 use orbit_client_core::contract::{
     AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, CreateWorkspaceEntryRequest,
-    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
-    FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView, GitReposInspectionView,
-    InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
-    ListInstructionFilesRequest, MatchPathRulesRequest, MatchedPathRulesView, MentionRankRequest,
-    ModelSelectionRequest, PathRulesSnapshotView, PreviewWorktreeHandoffRequest,
-    ReadInstructionFileRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest,
-    RenderDiagramView, SaveInstructionFileRequest, SearchWorkspaceSymbolsRequest,
-    SpawnWorkspacePeerRequest, UpsertArtifactRequest, UpsertExternalMcpServerRequest,
-    UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
-    WorkspaceSymbolsView, WriteWorkspaceFileRequest,
+    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, EventTriggersSnapshotView,
+    ExecuteWorktreeHandoffRequest, FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView,
+    GitReposInspectionView, InstructionFileContentView, InstructionFileSavedView,
+    InstructionFilesSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
+    MatchedPathRulesView, MentionRankRequest, ModelSelectionRequest, PathRulesSnapshotView,
+    PreviewWorktreeHandoffRequest, ReadInstructionFileRequest, RenameWorkspaceEntryRequest,
+    RenderDiagramRequest, RenderDiagramView, SaveInstructionFileRequest,
+    SearchWorkspaceSymbolsRequest, SpawnWorkspacePeerRequest, UpsertArtifactRequest,
+    UpsertEventTriggerRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WorkspaceSymbolsView,
+    WriteWorkspaceFileRequest,
 };
 use orbit_client_core::app_core::LifecycleHooksSnapshotView;
 use orbit_client_core::desktop_ops::{
@@ -70,8 +71,8 @@ use orbit_client_core::stage::{AgentStageDeltaView, AgentStageView, StageTurnVie
 use orbit_protocol::{
     AcpAgentAvailability, AcpAgentSpec, AcpProbeResult, ActiveTurnBehavior, AgentProfile,
     ArtifactDetail, ArtifactSummary, ConditionalTimerRecord, ContextOccupancyBreakdown,
-    ExternalMcpServerRecord, GuardianPolicyConfig, HookExecutionRecord, HookScope,
-    LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
+    EventTriggerDelivery, ExternalMcpServerRecord, GuardianPolicyConfig, HookExecutionRecord,
+    HookScope, LifecycleHookRule, LspDiagnostic, LspLocation, LspServerStatus, LspSymbolInfo,
     ManagedSkillRecord, McpProbeResult, OrchestrationConfig, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderSubagentEvent, ReasoningEffort, ScheduleRunRecord,
     ScheduleTarget, SessionMode, SkillWriteScope, TimerCondition, UsageInsightsSnapshot,
@@ -2186,6 +2187,48 @@ async fn test_lifecycle_hook(
 }
 
 #[tauri::command]
+async fn list_event_triggers(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+) -> Result<EventTriggersSnapshotView, String> {
+    state.core.list_event_triggers_on_host(&host_id).await
+}
+
+#[tauri::command]
+async fn upsert_event_trigger(
+    state: State<'_, DesktopAppState>,
+    req: UpsertEventTriggerRequest,
+) -> Result<EventTriggersSnapshotView, String> {
+    state.core.upsert_event_trigger_on_host(req).await
+}
+
+#[tauri::command]
+async fn delete_event_trigger(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    trigger_id: String,
+) -> Result<EventTriggersSnapshotView, String> {
+    state
+        .core
+        .delete_event_trigger_on_host(&host_id, trigger_id)
+        .await
+}
+
+#[tauri::command]
+async fn test_event_trigger(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    trigger_id: String,
+    sample_event_type: String,
+    sample_payload: serde_json::Value,
+) -> Result<EventTriggerDelivery, String> {
+    state
+        .core
+        .test_event_trigger_on_host(&host_id, trigger_id, sample_event_type, sample_payload)
+        .await
+}
+
+#[tauri::command]
 async fn get_guardian_config(
     state: State<'_, DesktopAppState>,
     host_id: String,
@@ -3195,6 +3238,10 @@ pub fn run() {
             start_monitor_watch,
             list_monitor_watches,
             stop_monitor_watch,
+            list_event_triggers,
+            upsert_event_trigger,
+            delete_event_trigger,
+            test_event_trigger,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

@@ -32,6 +32,7 @@ pub mod skills_manager;
 pub mod symbols;
 pub mod timers;
 pub mod tools;
+pub mod triggers;
 pub mod usage;
 pub mod workspace_board;
 pub mod workspace_cluster;
@@ -51,7 +52,7 @@ use axum::{
     Router,
     body::Body,
     extract::{
-        State,
+        DefaultBodyLimit, State,
         ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade},
     },
     http::{Request, StatusCode},
@@ -101,6 +102,7 @@ use crate::messaging::{
 use crate::scheduler::ScheduleEngine;
 use crate::symbols::WorkspaceSymbolIndex;
 use crate::timers::ConditionalTimerEngine;
+use crate::triggers::{EventTriggerEngine, UpsertTriggerRequest};
 use crate::workspace_files::{
     canonicalize_workspace_root, create_workspace_entry, delete_workspace_entry,
     rename_workspace_entry, write_workspace_file,
@@ -229,6 +231,7 @@ pub struct DaemonRuntime {
     pub idle_cleanup: Arc<IdleRuntimeCleanup>,
     pub keep_awake: Arc<KeepAwakeManager>,
     pub goals: Arc<GoalMonitorEngine>,
+    pub triggers: Arc<EventTriggerEngine>,
     pub symbol_index: Arc<WorkspaceSymbolIndex>,
     pub lsp: Arc<LspManager>,
     pub hooks: Arc<HooksEngine>,
@@ -343,6 +346,13 @@ impl DaemonRuntime {
             delivery.clone(),
             keep_awake.clone(),
         );
+        let triggers = EventTriggerEngine::new(
+            store.clone(),
+            orchestrator.clone(),
+            delivery.clone(),
+            listen_port.clone(),
+            home_dir,
+        );
         let idle_cleanup = IdleRuntimeCleanup::new(
             store.clone(),
             orchestrator.clone(),
@@ -394,6 +404,7 @@ impl DaemonRuntime {
             idle_cleanup,
             keep_awake,
             goals,
+            triggers,
             symbol_index: Arc::new(WorkspaceSymbolIndex::with_external_provider(Arc::new(
                 crate::lsp::LspExternalSymbolProvider::new(Arc::clone(&lsp)),
             ))),
@@ -421,6 +432,8 @@ impl DaemonRuntime {
         self.conditional_timers.start_recovery().await;
         // 3b. Recover active autonomous Goals & streaming Monitor watches
         self.goals.start_recovery().await;
+        // 3c. Start GitHub PR/Issue/CI polling fallback loop for enabled event triggers
+        self.triggers.spawn_background_poller().await;
         // 4. Start Cron/Heartbeat scheduler, Idle Runtime Cleanup & LSP Idle Reaper loops
         drop(self.scheduler.spawn_background());
         drop(self.idle_cleanup.spawn_background());
@@ -521,6 +534,12 @@ fn build_http_router(runtime: Arc<DaemonRuntime>) -> Router {
         .route("/healthz", get(healthz_handler))
         .route("/ws", get(ws_handler))
         .route("/mcp/agents", post(crate::mcp::mcp_agents_handler))
+        .route(
+            "/webhooks/{trigger_id}",
+            post(crate::triggers::webhook_ingress_handler).layer(DefaultBodyLimit::max(
+                crate::triggers::MAX_WEBHOOK_BODY_BYTES,
+            )),
+        )
         .fallback(service_reverse_proxy_fallback)
         .with_state(runtime)
 }
@@ -630,6 +649,7 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
             runtime_shutdown.orchestrator.shutdown_worktree_pool().await;
             runtime_shutdown.conditional_timers.shutdown().await;
             runtime_shutdown.goals.shutdown_all().await;
+            runtime_shutdown.triggers.shutdown().await;
             runtime_shutdown.lsp.shutdown_all().await;
             runtime_shutdown.keep_awake.shutdown();
         })
@@ -4156,6 +4176,117 @@ async fn handle_wire_rpc(
                         Err(e) => rpc_err(request_id, "test_lifecycle_hook_failed", e),
                     },
                     Err(e) => rpc_err(request_id, "test_lifecycle_hook_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
+        // External Event Triggers (GitHub, Slack, Linear, Generic Webhook + GitHub PR Polling)
+        WireMessage::ListEventTriggers { request_id } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let triggers = Arc::clone(&runtime.triggers);
+            tokio::spawn(async move {
+                let reply = match triggers.list_snapshot().await {
+                    Ok(snap) => WireMessage::EventTriggersSnapshot {
+                        request_id,
+                        triggers: snap.triggers,
+                        recent_deliveries: snap.recent_deliveries,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "list_event_triggers_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertEventTrigger {
+            request_id,
+            trigger_id,
+            name,
+            source,
+            event_filters,
+            prompt_template,
+            target,
+            secret,
+            keep_existing_secret,
+            github_poll,
+            github_token,
+            keep_existing_token,
+            enabled,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let triggers = Arc::clone(&runtime.triggers);
+            tokio::spawn(async move {
+                let req = UpsertTriggerRequest {
+                    trigger_id,
+                    name,
+                    source,
+                    event_filters,
+                    prompt_template,
+                    target,
+                    secret,
+                    keep_existing_secret,
+                    github_poll,
+                    github_token,
+                    keep_existing_token,
+                    enabled,
+                };
+                let reply = match triggers.upsert_trigger(req).await {
+                    Ok(snap) => WireMessage::EventTriggersSnapshot {
+                        request_id,
+                        triggers: snap.triggers,
+                        recent_deliveries: snap.recent_deliveries,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "upsert_event_trigger_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeleteEventTrigger {
+            request_id,
+            trigger_id,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let triggers = Arc::clone(&runtime.triggers);
+            tokio::spawn(async move {
+                let reply = match triggers.delete_trigger(&trigger_id).await {
+                    Ok(snap) => WireMessage::EventTriggersSnapshot {
+                        request_id,
+                        triggers: snap.triggers,
+                        recent_deliveries: snap.recent_deliveries,
+                        base_webhook_url: snap.base_webhook_url,
+                    },
+                    Err(e) => rpc_err(request_id, "delete_event_trigger_failed", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::TestEventTrigger {
+            request_id,
+            trigger_id,
+            sample_event_type,
+            sample_payload,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let triggers = Arc::clone(&runtime.triggers);
+            tokio::spawn(async move {
+                let reply = match triggers
+                    .test_trigger(&trigger_id, &sample_event_type, sample_payload)
+                    .await
+                {
+                    Ok(delivery) => WireMessage::EventTriggerTestResponse {
+                        request_id,
+                        delivery,
+                    },
+                    Err(e) => rpc_err(request_id, "test_event_trigger_failed", e),
                 };
                 let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
             });

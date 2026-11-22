@@ -58,6 +58,7 @@ import {
   type SettingSelectOption,
 } from "@/components/settings/settings-primitives";
 import { type SlashDirective, orbitActions, useOrbitSelector } from "@/state/orbit-store";
+import { EventTriggersSection } from "@/components/automations/event-triggers-section";
 import { cn } from "@/lib/utils";
 
 interface AutomationTemplate {
@@ -1073,6 +1074,16 @@ export function AutomationsView() {
             ))}
           </div>
         )}
+
+        {/* External Event Triggers (GitHub, Slack, Linear, Generic Webhooks + PR Polling) */}
+        <EventTriggersSection
+          hostId={selectedHostId}
+          availableProviders={hostDetail?.host.available_providers ?? []}
+          activeAgents={activeAgentChoices}
+          hostProjects={hostProjects}
+          defaultCwd={effectiveProjectPath}
+          defaultProvider={draftProvider}
+        />
 
         {/* One-Shot Conditional Timers — Active countdowns & recent history */}
         <div className="space-y-2">

@@ -543,3 +543,34 @@ pub struct StopMonitorWatchRequest {
     pub host_id: String,
     pub monitor_id: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventTriggersSnapshotView {
+    pub triggers: Vec<orbit_protocol::EventTriggerRecord>,
+    pub recent_deliveries: Vec<orbit_protocol::EventTriggerDelivery>,
+    pub base_webhook_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertEventTriggerRequest {
+    pub host_id: String,
+    #[serde(default)]
+    pub trigger_id: Option<String>,
+    pub name: String,
+    pub source: orbit_protocol::TriggerSourceKind,
+    #[serde(default)]
+    pub event_filters: Vec<String>,
+    pub prompt_template: String,
+    pub target: orbit_protocol::TriggerDispatchTarget,
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub keep_existing_secret: bool,
+    #[serde(default)]
+    pub github_poll: Option<orbit_protocol::GitHubPollConfig>,
+    #[serde(default)]
+    pub github_token: Option<String>,
+    #[serde(default)]
+    pub keep_existing_token: bool,
+    pub enabled: bool,
+}

@@ -8,6 +8,7 @@ pub mod guardian;
 pub mod orchestration;
 pub mod search;
 pub mod timers;
+pub mod triggers;
 pub mod usage;
 pub mod workspace_sync;
 pub use artifacts::{
@@ -16,6 +17,10 @@ pub use artifacts::{
 };
 pub use orchestration::*;
 pub use search::{FtsBackfillProgress, MessageSearchHit, build_fts5_match_query};
+pub use triggers::{
+    DEFAULT_RECENT_DELIVERIES_LIMIT, StoredEventTrigger, UpsertEventTriggerParams,
+    mask_trigger_secret,
+};
 pub use usage::{QUOTA_SAMPLES_RETENTION_MS, QuotaSampleRecord, USAGE_LEDGER_RETENTION_MS};
 pub use workspace_sync::{AgentContextSnippet, SemanticIdentityOptions};
 
@@ -447,6 +452,7 @@ impl OrbitStore {
         timers::migrate_conditional_timers_schema(&conn)?;
         guardian::migrate_guardian_schema(&conn)?;
         goals::migrate_goals_schema(&conn)?;
+        triggers::migrate_event_triggers_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

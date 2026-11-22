@@ -2118,7 +2118,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "orbit-cli"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-client-core"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2172,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-crypto"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2",
@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-daemon"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2215,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-ffi-ohos"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "napi-build-ohos",
  "napi-derive-ohos",
@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-ffi-uniffi"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "orbit-client-core",
  "orbit-crypto",
@@ -2241,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-protocol"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "chrono",
  "serde",
@@ -2253,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-providers"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2271,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-relay"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-relay-transport"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-shim"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "base64 0.22.1",
  "portable-pty",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-store"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "chrono",
  "orbit-protocol",

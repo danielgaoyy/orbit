@@ -2404,7 +2404,7 @@ mod tests {
             cache_dir.clone(),
             home_dir.clone(),
             "/bin/zsh".to_string(),
-            Duration::from_millis(80),
+            Duration::from_secs(5),
             Duration::from_secs(3),
         )
         .with_rc_stat_throttle(Duration::from_secs(5));

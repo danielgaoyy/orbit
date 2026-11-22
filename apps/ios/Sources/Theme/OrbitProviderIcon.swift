@@ -106,6 +106,15 @@ public struct OrbitProviderIcon: View {
                     ]
                 )
                 cg.restoreGState()
+
+            default:
+                cg.saveGState()
+                let accent = OrbitPalette.light.providerAccent(provider)
+                cg.setFillColor(UIColor(accent).cgColor)
+                cg.fillEllipse(in: CGRect(x: 3, y: 3, width: 18, height: 18))
+                cg.setFillColor(UIColor.white.withAlphaComponent(0.92).cgColor)
+                cg.fillEllipse(in: CGRect(x: 8.5, y: 8.5, width: 7, height: 7))
+                cg.restoreGState()
             }
         }
         .withRenderingMode(.alwaysOriginal)
@@ -216,6 +225,17 @@ public struct OrbitProviderIcon: View {
                         )
                     )
                 }
+
+            default:
+                let accent = OrbitPalette.light.providerAccent(provider)
+                context.fill(
+                    Path(ellipseIn: CGRect(x: 3, y: 3, width: 18, height: 18)),
+                    with: .color(accent)
+                )
+                context.fill(
+                    Path(ellipseIn: CGRect(x: 8.5, y: 8.5, width: 7, height: 7)),
+                    with: .color(Color.white.opacity(0.92))
+                )
             }
         }
         .frame(width: size, height: size)

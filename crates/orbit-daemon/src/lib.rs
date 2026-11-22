@@ -505,9 +505,45 @@ pub async fn run_daemon(config: DaemonConfig) -> anyhow::Result<()> {
         });
     }
 
+    let runtime_shutdown = runtime.clone();
     let app = build_http_router(runtime);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            wait_daemon_shutdown_signal().await;
+            runtime_shutdown.orchestrator.flush_all_shim_cursors().await;
+        })
+        .await?;
     Ok(())
+}
+
+async fn wait_daemon_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        let mut sigint = signal(SignalKind::interrupt()).ok();
+        match (sigterm.as_mut(), sigint.as_mut()) {
+            (Some(t), Some(i)) => {
+                tokio::select! {
+                    _ = t.recv() => {}
+                    _ = i.recv() => {}
+                }
+            }
+            (Some(t), None) => {
+                let _ = t.recv().await;
+            }
+            (None, Some(i)) => {
+                let _ = i.recv().await;
+            }
+            (None, None) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Spawn an embedded Daemon on a dynamic local port (ideal for integration tests & local attach).
@@ -2950,6 +2986,10 @@ impl DaemonRuntime {
             port,
             restart_relay,
         );
+
+        // Persist exact shim frame cursors before launching the hot-restart script so reattached
+        // shims resume strictly after the last consumed frame with zero history replay.
+        self.orchestrator.flush_all_shim_cursors().await;
 
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", &restart_script])

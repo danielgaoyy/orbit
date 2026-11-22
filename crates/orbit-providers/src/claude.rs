@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -12,7 +13,9 @@ use orbit_protocol::{
     QuestionItem, QuotaWindow, ReasoningEffort, SessionMode, ThinkingOptionSpec, TimelinePayload,
     ToolCallDetail, ToolCallStatus,
 };
-use orbit_shim::{ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim, spawn_detached_shim};
+use orbit_shim::{
+    ShimFrame, ShimMode, ShimSpawnSpec, connect_existing_shim_after, spawn_detached_shim,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -29,10 +32,14 @@ pub async fn spawn_claude_session(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    let shim = if cfg.reattach_existing_shim
-        && let Some(existing) = connect_existing_shim(&cfg.shim_socket).await
-    {
-        existing
+    let reattached = if cfg.reattach_existing_shim {
+        connect_existing_shim_after(&cfg.shim_socket, cfg.shim_after_seq).await
+    } else {
+        None
+    };
+
+    let (shim, is_reattached) = if let Some(existing) = reattached {
+        (existing, true)
     } else {
         let perm_mode = claude_mode_flag(&cfg.mode);
 
@@ -139,8 +146,8 @@ pub async fn spawn_claude_session(
             .await
             .map_err(|e| format!("failed to write claude initialize: {e}"))?;
 
-        wait_claude_init_response(&mut fresh).await?;
-        fresh
+        wait_claude_init_response(&mut fresh, &cfg.shim_seq_tracker).await?;
+        (fresh, false)
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<DriverCommand>(64);
@@ -150,6 +157,7 @@ pub async fn spawn_claude_session(
         cfg,
         preassigned_session_id,
         shim,
+        is_reattached,
         cmd_rx,
         evt_tx,
     ));
@@ -170,6 +178,7 @@ async fn run_claude_actor(
     cfg: SessionLaunchConfig,
     mut session_id: String,
     mut shim: orbit_shim::ShimClient,
+    is_reattached: bool,
     mut cmd_rx: mpsc::Receiver<DriverCommand>,
     evt_tx: mpsc::Sender<DriverEvent>,
 ) {
@@ -179,12 +188,18 @@ async fn run_claude_actor(
             model: cfg.model.clone(),
         })
         .await;
-    let _ = evt_tx
-        .send(DriverEvent::StatusChanged(AgentStatus::Idle))
-        .await;
+    if !is_reattached {
+        let _ = evt_tx
+            .send(DriverEvent::StatusChanged(AgentStatus::Idle))
+            .await;
+    }
 
-    let mut ctrl_seq: u64 = 2;
-    let mut active_turn_id: Option<String> = None;
+    let mut ctrl_seq: u64 = if is_reattached { 1000 } else { 2 };
+    let mut active_turn_id: Option<String> = if is_reattached {
+        cfg.persisted_active_turn_id.clone()
+    } else {
+        None
+    };
     let mut active_msg_id: String = "claude_msg_0".into();
     let mut streamed_blocks: HashMap<u64, (String, String)> = HashMap::new(); // index -> (kind, accum)
     let mut emitted_text_in_turn = false;
@@ -431,8 +446,11 @@ async fn run_claude_actor(
 
             maybe_frame = shim.rx.recv() => {
                 let Some(frame) = maybe_frame else { break; };
+                if let Some(seq) = frame.seq() {
+                    cfg.shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);
+                }
                 match frame {
-                    ShimFrame::StdoutLine { line } => {
+                    ShimFrame::StdoutLine { line, .. } => {
                         let Ok(val) = serde_json::from_str::<Value>(&line) else { continue; };
                         let Some(frame_type) = val.get("type").and_then(|v| v.as_str()) else {
                             continue;
@@ -1047,7 +1065,10 @@ async fn run_claude_actor(
     }
 }
 
-async fn wait_claude_init_response(shim: &mut orbit_shim::ShimClient) -> Result<(), String> {
+async fn wait_claude_init_response(
+    shim: &mut orbit_shim::ShimClient,
+    shim_seq_tracker: &std::sync::atomic::AtomicU64,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1055,21 +1076,28 @@ async fn wait_claude_init_response(shim: &mut orbit_shim::ShimClient) -> Result<
             return Err("Claude Code control_request initialize timed out".into());
         }
         match tokio::time::timeout(rem, shim.rx.recv()).await {
-            Ok(Some(ShimFrame::StdoutLine { line })) => {
-                let Ok(val) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if val.get("type").and_then(|v| v.as_str()) == Some("control_response")
-                    && val.pointer("/response/request_id").and_then(|v| v.as_str())
-                        == Some("init_1")
-                {
-                    return Ok(());
+            Ok(Some(frame)) => {
+                if let Some(seq) = frame.seq() {
+                    shim_seq_tracker.fetch_max(seq, Ordering::Relaxed);
+                }
+                match frame {
+                    ShimFrame::StdoutLine { line, .. } => {
+                        let Ok(val) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        if val.get("type").and_then(|v| v.as_str()) == Some("control_response")
+                            && val.pointer("/response/request_id").and_then(|v| v.as_str())
+                                == Some("init_1")
+                        {
+                            return Ok(());
+                        }
+                    }
+                    ShimFrame::Exited { code } => {
+                        return Err(format!("claude exited early during init ({code:?})"));
+                    }
+                    _ => {}
                 }
             }
-            Ok(Some(ShimFrame::Exited { code })) => {
-                return Err(format!("claude exited early during init ({code:?})"));
-            }
-            Ok(Some(_)) => {}
             _ => return Err("claude shim closed during init".into()),
         }
     }

@@ -19,11 +19,11 @@ use orbit_protocol::{
     BackgroundTaskInfo, ConnectedHostSummary, DirectoryEntry, DiscoveredProject,
     ExternalMcpServerRecord, GitStatusSnapshot, HostProjectEntry, HostSyncState, KeepAwakeStatus,
     ManagedSkillRecord, McpProbeResult, ModelOption, OrchestrationConfig, OrchestrationSkillInfo,
-    PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
+    PathScopedRule, PendingPermissionSummary, PermissionCheckpointRef, PromptBadge, ProviderKind,
     ProviderModelCatalog, ProviderQuotaSnapshot, ProviderSubagentDescriptor, ProviderSubagentEvent,
-    QuestionItem, QueuedPromptView, ReasoningEffort, ScheduleRunRecord, ScheduleSpec,
-    ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame, TerminalSummary,
-    TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
+    QuestionItem, QueuedPromptView, ReasoningEffort, RuleTriggerMode, ScheduleRunRecord,
+    ScheduleSpec, ScheduleTarget, SessionMode, SkillWriteScope, TerminalBinaryFrame,
+    TerminalSummary, TimelineEvent, TimelinePayload, ToolCallDetail, ToolCallStatus, WireMessage,
     WorkspaceBoardSnapshot, WorkspaceClusterSuggestion, WorkspaceEventKind, WorkspaceEventRecord,
     WorkspaceIsolation, WorkspaceOrganizeEvent, WorkspaceScriptInfo, WorkspaceSummary,
     WorktreeCreateMode, WorktreeHandoffOutcome, WorktreeHandoffPreview,
@@ -44,12 +44,14 @@ use crate::cloud_sync::{
     unlock_remote_vault_with_passphrase,
 };
 pub use crate::contract::{
-    ConversationSearchHit, CreateWorkspaceEntryRequest, DeleteWorkspaceEntryRequest,
-    ExecuteWorktreeHandoffRequest, ForkAgentRequest, ForkAgentResultView,
-    InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
-    ListInstructionFilesRequest, PreviewWorktreeHandoffRequest, ReadInstructionFileRequest,
-    RenameWorkspaceEntryRequest, SaveInstructionFileRequest, UpsertArtifactRequest,
-    UpsertExternalMcpServerRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    ConversationSearchHit, CreateWorkspaceEntryRequest, DeletePathRuleRequest,
+    DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, ForkAgentRequest,
+    ForkAgentResultView, InstructionFileContentView, InstructionFileSavedView,
+    InstructionFilesSnapshotView, ListInstructionFilesRequest, MatchPathRulesRequest,
+    MatchedPathRulesView, PathRulesSnapshotView, PreviewWorktreeHandoffRequest,
+    ReadInstructionFileRequest, RenameWorkspaceEntryRequest, SaveInstructionFileRequest,
+    UpsertArtifactRequest, UpsertExternalMcpServerRequest, UpsertPathRuleRequest,
+    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
     WriteWorkspaceFileRequest,
 };
 use crate::contract::{GitReposInspectionView, SpawnWorkspacePeerRequest};
@@ -662,6 +664,11 @@ struct HostMemoryState {
     active_managed_skills_cwd: Option<String>,
     pending_managed_skill_reads:
         HashMap<Uuid, tokio::sync::oneshot::Sender<Result<ManagedSkillContentView, String>>>,
+    pending_path_rules:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<PathRulesSnapshotView, String>>>,
+    pending_path_rule_matches:
+        HashMap<Uuid, tokio::sync::oneshot::Sender<Result<MatchedPathRulesView, String>>>,
+    path_rules_by_cwd: HashMap<String, Vec<PathScopedRule>>,
     rewound_agents: std::collections::HashSet<String>,
     caught_up_agents: std::collections::HashSet<String>,
     optimistic_by_req_id: HashMap<Uuid, String>,
@@ -772,6 +779,9 @@ impl HostMemoryState {
             background_managed_skills_reqs: HashSet::new(),
             active_managed_skills_cwd: None,
             pending_managed_skill_reads: HashMap::new(),
+            pending_path_rules: HashMap::new(),
+            pending_path_rule_matches: HashMap::new(),
+            path_rules_by_cwd: HashMap::new(),
             rewound_agents: std::collections::HashSet::new(),
             caught_up_agents: std::collections::HashSet::new(),
             optimistic_by_req_id: HashMap::new(),
@@ -2678,7 +2688,7 @@ impl OrbitAppCore {
         req: &crate::contract::MentionRankRequest,
     ) -> Vec<crate::composer::MentionCandidateView> {
         let files = self.workspace_files(&req.host_id, &req.cwd);
-        let (git_files, workspace_peers) = self
+        let (git_files, workspace_peers, path_rules) = self
             .hosts
             .read()
             .ok()
@@ -2728,15 +2738,42 @@ impl OrbitAppCore {
                         .collect(),
                     _ => Vec::new(),
                 };
-                Some((gfiles, peers))
+                let rules: Vec<crate::composer::PathRuleMentionInput> = h
+                    .path_rules_by_cwd
+                    .get(&req.cwd)
+                    .or_else(|| {
+                        h.path_rules_by_cwd
+                            .iter()
+                            .find(|(k, _)| cwd_paths_equivalent(k, &req.cwd))
+                            .map(|(_, v)| v)
+                    })
+                    .map(|list| {
+                        list.iter()
+                            .filter(|r| r.enabled)
+                            .map(|r| crate::composer::PathRuleMentionInput {
+                                name: r.name.clone(),
+                                description: r.description.clone(),
+                                relative_path: r.relative_path.clone(),
+                                trigger_label: match r.trigger_mode {
+                                    RuleTriggerMode::Always => "Always".into(),
+                                    RuleTriggerMode::GlobAutoAttach => "Glob".into(),
+                                    RuleTriggerMode::AgentDecided => "Agent".into(),
+                                    RuleTriggerMode::Manual => "Manual".into(),
+                                },
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some((gfiles, peers, rules))
             })
             .unwrap_or_default();
 
-        crate::composer::rank_mention_candidates_with_peers(
+        crate::composer::rank_mention_candidates_with_peers_and_rules(
             &req.query,
             &files,
             &git_files,
             &workspace_peers,
+            &path_rules,
             req.limit,
         )
     }
@@ -5029,6 +5066,47 @@ impl OrbitAppCore {
                         }));
                     }
                 }
+                WireMessage::PathRulesSnapshot {
+                    request_id,
+                    cwd,
+                    rules,
+                    total_always_tokens,
+                    token_budget_warning,
+                } => {
+                    if !state.path_rules_by_cwd.contains_key(&cwd)
+                        && state.path_rules_by_cwd.len() >= 24
+                        && let Some(evict_key) = state.path_rules_by_cwd.keys().next().cloned()
+                    {
+                        state.path_rules_by_cwd.remove(&evict_key);
+                    }
+                    state.path_rules_by_cwd.insert(cwd.clone(), rules.clone());
+                    if let Some(tx) = state.pending_path_rules.remove(&request_id) {
+                        let _ = tx.send(Ok(PathRulesSnapshotView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            rules,
+                            total_always_tokens,
+                            token_budget_warning,
+                        }));
+                    }
+                }
+                WireMessage::MatchedPathRulesResponse {
+                    request_id,
+                    cwd,
+                    matched,
+                    injected_markdown,
+                    total_tokens,
+                } => {
+                    if let Some(tx) = state.pending_path_rule_matches.remove(&request_id) {
+                        let _ = tx.send(Ok(MatchedPathRulesView {
+                            host_id: state.profile.host_id.clone(),
+                            cwd,
+                            matched,
+                            injected_markdown,
+                            total_tokens,
+                        }));
+                    }
+                }
                 WireMessage::SideQuestionDelta {
                     request_id,
                     text_delta,
@@ -5208,6 +5286,14 @@ impl OrbitAppCore {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
                         && let Some(tx) = state.pending_artifact_upserts.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_path_rules.remove(&req_id)
+                    {
+                        let _ = tx.send(Err(formatted_err));
+                    } else if let Some(req_id) = request_id
+                        && let Some(tx) = state.pending_path_rule_matches.remove(&req_id)
                     {
                         let _ = tx.send(Err(formatted_err));
                     } else if let Some(req_id) = request_id
@@ -10674,6 +10760,224 @@ impl OrbitAppCore {
             .map_err(|_| "file write task cancelled".to_string())?
     }
 
+    async fn dispatch_path_rules_snapshot_on_host(
+        self: &Arc<Self>,
+        host_id: String,
+        build_wire: impl FnOnce(Uuid) -> WireMessage + Send + 'static,
+        op_label: &'static str,
+    ) -> Result<PathRulesSnapshotView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&host_id)
+                .ok_or_else(|| format!("host `{host_id}` not found"))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err(format!("Host is disconnected; reconnect to {op_label}"));
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_path_rules.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some(format!("Host disconnected before {op_label}")),
+                        None => Some(format!("host `{host_id}` removed")),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            if let Err(e) = session.send_wire(build_wire(req_id)).await {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&host_id)
+                {
+                    h.pending_path_rules.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to {op_label}: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(format!("Host disconnected while trying to {op_label}")),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&host_id)
+                    {
+                        h.pending_path_rules.remove(&req_id);
+                    }
+                    Err(format!(
+                        "Timed out waiting for daemon to {op_label} (ensure orbit daemon is up to date)"
+                    ))
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| format!("{op_label} task cancelled"))?
+    }
+
+    pub async fn list_path_rules_on_host(
+        self: &Arc<Self>,
+        host_id: String,
+        cwd: String,
+    ) -> Result<PathRulesSnapshotView, String> {
+        self.dispatch_path_rules_snapshot_on_host(
+            host_id,
+            move |request_id| WireMessage::ListPathRules { request_id, cwd },
+            "list path rules",
+        )
+        .await
+    }
+
+    pub async fn upsert_path_rule_on_host(
+        self: &Arc<Self>,
+        req: UpsertPathRuleRequest,
+    ) -> Result<PathRulesSnapshotView, String> {
+        self.dispatch_path_rules_snapshot_on_host(
+            req.host_id,
+            move |request_id| WireMessage::UpsertPathRule {
+                request_id,
+                cwd: req.cwd,
+                scope: req.scope,
+                name: req.name,
+                description: req.description,
+                trigger_mode: req.trigger_mode,
+                globs: req.globs,
+                enabled: req.enabled,
+                body: req.body,
+                expected_etag: req.expected_etag,
+            },
+            "save path rule",
+        )
+        .await
+    }
+
+    pub async fn delete_path_rule_on_host(
+        self: &Arc<Self>,
+        req: DeletePathRuleRequest,
+    ) -> Result<PathRulesSnapshotView, String> {
+        self.dispatch_path_rules_snapshot_on_host(
+            req.host_id,
+            move |request_id| WireMessage::DeletePathRule {
+                request_id,
+                cwd: req.cwd,
+                path: req.path,
+            },
+            "delete path rule",
+        )
+        .await
+    }
+
+    pub async fn match_path_rules_on_host(
+        self: &Arc<Self>,
+        req: MatchPathRulesRequest,
+    ) -> Result<MatchedPathRulesView, String> {
+        let session = {
+            let guard = self
+                .hosts
+                .read()
+                .map_err(|_| "host state lock poisoned".to_string())?;
+            let h = guard
+                .get(&req.host_id)
+                .ok_or_else(|| format!("host `{}` not found", req.host_id))?;
+            h.session.clone()
+        };
+
+        let Some(session) = session else {
+            return Err("Host is disconnected; reconnect to match path rules".into());
+        };
+
+        let core = Arc::clone(self);
+        let (res_tx, res_rx) = tokio::sync::oneshot::channel();
+
+        self.runtime.spawn(async move {
+            let req_id = Uuid::new_v4();
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+
+            let register_err = {
+                match core.hosts.write() {
+                    Ok(mut guard) => match guard.get_mut(&req.host_id) {
+                        Some(h) if h.session.is_some() => {
+                            h.pending_path_rule_matches.insert(req_id, ack_tx);
+                            None
+                        }
+                        Some(_) => Some("Host disconnected before matching path rules".to_string()),
+                        None => Some(format!("host `{}` removed", req.host_id)),
+                    },
+                    Err(_) => Some("host state lock poisoned".to_string()),
+                }
+            };
+
+            if let Some(err) = register_err {
+                let _ = res_tx.send(Err(err));
+                return;
+            }
+
+            let send_res = session
+                .send_wire(WireMessage::MatchPathRules {
+                    request_id: req_id,
+                    cwd: req.cwd,
+                    active_paths: req.active_paths,
+                    manual_rule_names: req.manual_rule_names,
+                })
+                .await;
+
+            if let Err(e) = send_res {
+                if let Ok(mut guard) = core.hosts.write()
+                    && let Some(h) = guard.get_mut(&req.host_id)
+                {
+                    h.pending_path_rule_matches.remove(&req_id);
+                }
+                let _ = res_tx.send(Err(format!("failed to match path rules: {e}")));
+                return;
+            }
+
+            let out = match tokio::time::timeout(Duration::from_secs(15), ack_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err("Host disconnected while matching path rules".to_string()),
+                Err(_) => {
+                    if let Ok(mut guard) = core.hosts.write()
+                        && let Some(h) = guard.get_mut(&req.host_id)
+                    {
+                        h.pending_path_rule_matches.remove(&req_id);
+                    }
+                    Err(
+                        "Timed out waiting for daemon to match path rules (ensure orbit daemon is up to date)"
+                            .to_string(),
+                    )
+                }
+            };
+            let _ = res_tx.send(out);
+        });
+
+        res_rx
+            .await
+            .map_err(|_| "match path rules task cancelled".to_string())?
+    }
+
     async fn dispatch_workspace_entry_mutation_on_host(
         self: &Arc<Self>,
         host_id: String,
@@ -12260,6 +12564,13 @@ fn fail_pending_host_requests(h: &mut HostMemoryState, reason: &str) {
     for (_, tx) in h.pending_managed_skill_reads.drain() {
         let _ = tx.send(Err(reason.to_string()));
     }
+    for (_, tx) in h.pending_path_rules.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    for (_, tx) in h.pending_path_rule_matches.drain() {
+        let _ = tx.send(Err(reason.to_string()));
+    }
+    h.path_rules_by_cwd.clear();
     for (req_id, tx) in h.pending_side_questions.drain() {
         let _ = tx.send(SideQuestionStreamEvent::Done {
             request_id: req_id.to_string(),

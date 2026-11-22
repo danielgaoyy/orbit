@@ -1447,6 +1447,65 @@ export interface InstructionFileSavedView {
   approx_tokens: number;
 }
 
+export type RuleTriggerMode = "always" | "glob_auto_attach" | "agent_decided" | "manual";
+
+export type RuleScope =
+  | "user_global"
+  | "project_orbit"
+  | "project_claude"
+  | "project_cursor";
+
+export interface PathScopedRule {
+  id: string;
+  name: string;
+  description: string;
+  scope: RuleScope;
+  path: string;
+  relative_path: string;
+  trigger_mode: RuleTriggerMode;
+  globs: string[];
+  enabled: boolean;
+  body: string;
+  approx_tokens: number;
+  etag: string;
+}
+
+export interface MatchedRuleSummary {
+  id: string;
+  name: string;
+  trigger_mode: RuleTriggerMode;
+  matched_globs: string[];
+  approx_tokens: number;
+}
+
+export interface PathRulesSnapshotView {
+  host_id: string;
+  cwd: string;
+  rules: PathScopedRule[];
+  total_always_tokens: number;
+  token_budget_warning: boolean;
+}
+
+export interface UpsertPathRuleParams {
+  hostId: string;
+  cwd: string;
+  scope: RuleScope;
+  name: string;
+  description: string;
+  triggerMode: RuleTriggerMode;
+  globs: string[];
+  enabled: boolean;
+  body: string;
+  expectedEtag?: string | null;
+}
+
+export interface MatchedPathRulesView {
+  host_id: string;
+  cwd: string;
+  matched: MatchedRuleSummary[];
+  injected_markdown: string;
+  total_tokens: number;
+}
 export type DiagramKind = "mermaid" | "svg" | "graphviz";
 export type DiagramTheme = "light" | "dark";
 
@@ -3664,6 +3723,74 @@ export const orbitIpc = {
     });
   },
 
+  listPathRules: async (hostId: string, cwd: string): Promise<PathRulesSnapshotView> => {
+    if (!isTauriRuntime()) {
+      return {
+        host_id: hostId,
+        cwd,
+        rules: [],
+        total_always_tokens: 0,
+        token_budget_warning: false,
+      };
+    }
+    return invoke<PathRulesSnapshotView>("list_path_rules", { hostId, cwd });
+  },
+
+  upsertPathRule: async (params: UpsertPathRuleParams): Promise<PathRulesSnapshotView> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to save path rules.");
+    }
+    return invoke<PathRulesSnapshotView>("upsert_path_rule", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      scope: params.scope,
+      name: params.name,
+      description: params.description,
+      triggerMode: params.triggerMode,
+      globs: params.globs,
+      enabled: params.enabled,
+      body: params.body,
+      expectedEtag: params.expectedEtag ?? null,
+    });
+  },
+
+  deletePathRule: async (params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+  }): Promise<PathRulesSnapshotView> => {
+    if (!isTauriRuntime()) {
+      throw new Error("Desktop runtime required to delete path rules.");
+    }
+    return invoke<PathRulesSnapshotView>("delete_path_rule", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      path: params.path,
+    });
+  },
+
+  matchPathRules: async (params: {
+    hostId: string;
+    cwd: string;
+    activePaths: string[];
+    manualRuleNames: string[];
+  }): Promise<MatchedPathRulesView> => {
+    if (!isTauriRuntime()) {
+      return {
+        host_id: params.hostId,
+        cwd: params.cwd,
+        matched: [],
+        injected_markdown: "",
+        total_tokens: 0,
+      };
+    }
+    return invoke<MatchedPathRulesView>("match_path_rules", {
+      hostId: params.hostId,
+      cwd: params.cwd,
+      activePaths: params.activePaths,
+      manualRuleNames: params.manualRuleNames,
+    });
+  },
   highlightWorkspaceCode: async (
     language: string,
     content: string,

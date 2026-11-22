@@ -446,3 +446,56 @@ pub struct UpsertExternalMcpServerRequest {
     #[serde(default = "default_include_committed_true")]
     pub enabled: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathRulesSnapshotView {
+    pub host_id: String,
+    pub cwd: String,
+    pub rules: Vec<orbit_protocol::PathScopedRule>,
+    pub total_always_tokens: u32,
+    pub token_budget_warning: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertPathRuleRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub scope: orbit_protocol::RuleScope,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub trigger_mode: orbit_protocol::RuleTriggerMode,
+    #[serde(default)]
+    pub globs: Vec<String>,
+    #[serde(default = "default_include_committed_true")]
+    pub enabled: bool,
+    pub body: String,
+    #[serde(default)]
+    pub expected_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletePathRuleRequest {
+    pub host_id: String,
+    pub cwd: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchPathRulesRequest {
+    pub host_id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub active_paths: Vec<String>,
+    #[serde(default)]
+    pub manual_rule_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchedPathRulesView {
+    pub host_id: String,
+    pub cwd: String,
+    pub matched: Vec<orbit_protocol::MatchedRuleSummary>,
+    pub injected_markdown: String,
+    pub total_tokens: u32,
+}

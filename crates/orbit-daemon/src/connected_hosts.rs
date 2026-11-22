@@ -562,7 +562,9 @@ fn extract_response_request_id(msg: &WireMessage) -> Option<Uuid> {
         | WireMessage::InstructionFileContentResponse { request_id, .. }
         | WireMessage::InstructionFileSavedResponse { request_id, .. }
         | WireMessage::ExternalMcpServersSnapshot { request_id, .. }
-        | WireMessage::ExternalMcpProbeResponse { request_id, .. } => Some(*request_id),
+        | WireMessage::ExternalMcpProbeResponse { request_id, .. }
+        | WireMessage::PathRulesSnapshot { request_id, .. }
+        | WireMessage::MatchedPathRulesResponse { request_id, .. } => Some(*request_id),
         WireMessage::QuotaReport { request_id, .. }
         | WireMessage::ArtifactUpdated { request_id, .. }
         | WireMessage::ArtifactDeleted { request_id, .. }

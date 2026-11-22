@@ -138,6 +138,11 @@ export const OmniComposer = memo(function OmniComposer({
   const selectedHostId = useOrbitSelector((s) => s.selectedHostId);
   const selectedAgentId = useOrbitSelector((s) => s.selectedAgentId);
   const selectedCwd = useOrbitSelector((s) => s.selectedWorkspaceCwd);
+  const activePathRules = useOrbitSelector((s) =>
+    s.selectedHostId
+      ? s.pathRulesByScope[`${s.selectedHostId}::${s.selectedWorkspaceCwd || "~"}`]
+      : undefined,
+  );
   const isDraft = useOrbitSelector((s) => s.isDraftNewSession);
   const draftMode = useOrbitSelector((s) => s.draftMode);
   const enterToSend = useOrbitSelector((s) => s.enterToSend);
@@ -407,11 +412,15 @@ export const OmniComposer = memo(function OmniComposer({
     !isDraft && activeAgentMode ? activeAgentMode : draftMode,
   );
 
-  // Warm workspace file list lazily so `@` mentions feel instantaneous
+  // Warm workspace file list and path-scoped rules lazily so `@` and `@rule:` mentions feel instantaneous
   useEffect(() => {
-    if (!selectedHostId || !selectedCwd || selectedCwd === "~") return;
+    if (!selectedHostId) return;
+    const effectiveCwd = selectedCwd || "~";
     const timer = window.setTimeout(() => {
-      void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
+      if (selectedCwd && selectedCwd !== "~") {
+        void orbitActions.ensureWorkspaceFiles(selectedHostId, selectedCwd);
+      }
+      void orbitActions.refreshPathRules(selectedHostId, effectiveCwd);
     }, 180);
     return () => window.clearTimeout(timer);
   }, [selectedHostId, selectedCwd]);
@@ -568,6 +577,7 @@ export const OmniComposer = memo(function OmniComposer({
     selectedCwd,
     workspaceFiles,
     gitFiles,
+    activePathRules,
     activeWorkspaceId,
     isDraft,
     selectedAgentId,
@@ -847,6 +857,9 @@ export const OmniComposer = memo(function OmniComposer({
       });
       insertInlineToken(token);
     } else if (candidate.kind === "workspace_peer") {
+      const token = candidate.token_label || candidate.title;
+      insertInlineToken(token);
+    } else if (candidate.kind === "path_rule") {
       const token = candidate.token_label || candidate.title;
       insertInlineToken(token);
     } else if (candidate.kind === "terminal_output") {

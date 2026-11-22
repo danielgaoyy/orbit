@@ -1484,13 +1484,21 @@ pub struct WorkspacePeerMentionInput {
     pub status_label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathRuleMentionInput {
+    pub name: String,
+    pub description: String,
+    pub relative_path: String,
+    pub trigger_label: String,
+}
+
 pub fn rank_mention_candidates(
     query: &str,
     workspace_files: &[String],
     git_files: &[(String, String)],
     limit: usize,
 ) -> Vec<MentionCandidateView> {
-    rank_mention_candidates_with_peers(query, workspace_files, git_files, &[], limit)
+    rank_mention_candidates_with_peers_and_rules(query, workspace_files, git_files, &[], &[], limit)
 }
 
 pub fn rank_mention_candidates_with_peers(
@@ -1500,9 +1508,82 @@ pub fn rank_mention_candidates_with_peers(
     workspace_peers: &[WorkspacePeerMentionInput],
     limit: usize,
 ) -> Vec<MentionCandidateView> {
+    rank_mention_candidates_with_peers_and_rules(
+        query,
+        workspace_files,
+        git_files,
+        workspace_peers,
+        &[],
+        limit,
+    )
+}
+
+pub fn rank_mention_candidates_with_peers_and_rules(
+    query: &str,
+    workspace_files: &[String],
+    git_files: &[(String, String)],
+    workspace_peers: &[WorkspacePeerMentionInput],
+    path_rules: &[PathRuleMentionInput],
+    limit: usize,
+) -> Vec<MentionCandidateView> {
     let max_items = if limit == 0 { 40 } else { limit.min(200) };
     let q = query.trim().to_ascii_lowercase();
     let mut out: Vec<MentionCandidateView> = Vec::new();
+
+    if !path_rules.is_empty() {
+        let rule_query = q.strip_prefix("rule:");
+        let mut rule_candidates: Vec<MentionCandidateView> = Vec::new();
+        for rule in path_rules {
+            let name_lower = rule.name.to_ascii_lowercase();
+            let desc_lower = rule.description.to_ascii_lowercase();
+            let full_slug = format!("rule:{name_lower}");
+            let score = if let Some(rq) = rule_query {
+                if rq.is_empty() {
+                    1030
+                } else if name_lower == rq {
+                    1060
+                } else if name_lower.starts_with(rq) {
+                    1045
+                } else if name_lower.contains(rq) || desc_lower.contains(rq) {
+                    1025
+                } else {
+                    -1
+                }
+            } else if q.is_empty() {
+                -1
+            } else if "rule:".starts_with(&q) || full_slug.starts_with(&q) {
+                1015
+            } else if name_lower == q {
+                950
+            } else if name_lower.starts_with(&q) {
+                940
+            } else if full_slug.contains(&q) {
+                930
+            } else {
+                -1
+            };
+            if score >= 0 {
+                let token = format!("@rule:{}", rule.name);
+                let subtitle = if !rule.description.trim().is_empty() {
+                    rule.description.trim().to_string()
+                } else {
+                    format!("{} · {}", rule.trigger_label, rule.relative_path)
+                };
+                rule_candidates.push(MentionCandidateView {
+                    key: format!("rule::{}", rule.relative_path),
+                    kind: "path_rule".into(),
+                    token_label: token.clone(),
+                    title: token,
+                    subtitle,
+                    file_path: rule.relative_path.clone(),
+                    git_status: rule.trigger_label.clone(),
+                    score,
+                });
+            }
+        }
+        rule_candidates.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
+        out.extend(rule_candidates);
+    }
 
     if !workspace_peers.is_empty() {
         let mut peer_candidates: Vec<MentionCandidateView> = Vec::new();

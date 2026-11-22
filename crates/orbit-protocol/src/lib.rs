@@ -7,6 +7,7 @@ pub mod instructions;
 pub mod mcp_servers;
 pub mod media;
 pub mod orchestration;
+pub mod rules;
 pub mod skills;
 pub use acp::*;
 pub use artifacts::*;
@@ -15,6 +16,7 @@ pub use instructions::*;
 pub use mcp_servers::*;
 pub use media::*;
 pub use orchestration::*;
+pub use rules::*;
 pub use skills::*;
 
 use std::collections::{BTreeMap, HashMap};
@@ -2097,6 +2099,60 @@ pub enum WireMessage {
         request_id: Uuid,
         server_id: String,
         result: McpProbeResult,
+    },
+
+    // Path-Scoped Glob Rules (.orbit/rules/*.md, .claude/rules/*.md, .cursor/rules/*.mdc)
+    ListPathRules {
+        request_id: Uuid,
+        cwd: String,
+    },
+    PathRulesSnapshot {
+        request_id: Uuid,
+        cwd: String,
+        rules: Vec<PathScopedRule>,
+        #[serde(default)]
+        total_always_tokens: u32,
+        #[serde(default)]
+        token_budget_warning: bool,
+    },
+    UpsertPathRule {
+        request_id: Uuid,
+        cwd: String,
+        scope: RuleScope,
+        name: String,
+        #[serde(default)]
+        description: String,
+        trigger_mode: RuleTriggerMode,
+        #[serde(default)]
+        globs: Vec<String>,
+        #[serde(default = "wire_default_true")]
+        enabled: bool,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_etag: Option<String>,
+    },
+    DeletePathRule {
+        request_id: Uuid,
+        cwd: String,
+        path: String,
+    },
+    MatchPathRules {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default)]
+        active_paths: Vec<String>,
+        #[serde(default)]
+        manual_rule_names: Vec<String>,
+    },
+    MatchedPathRulesResponse {
+        request_id: Uuid,
+        cwd: String,
+        #[serde(default)]
+        matched: Vec<MatchedRuleSummary>,
+        #[serde(default)]
+        injected_markdown: String,
+        #[serde(default)]
+        total_tokens: u32,
     },
 
     RpcError {

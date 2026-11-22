@@ -186,14 +186,24 @@ fn compact_snippet(raw: Option<&str>, max_chars: usize) -> String {
 }
 
 fn strip_orbit_workspace_xml(raw: &str) -> &str {
-    let trimmed = raw.trim_start();
-    if trimmed.starts_with("<orbit-workspace")
-        && let Some(end_idx) = trimmed.find("</orbit-workspace>")
-    {
-        let after = &trimmed[end_idx + "</orbit-workspace>".len()..];
-        return after.trim_start();
+    let mut cur = raw;
+    loop {
+        let trimmed = cur.trim_start();
+        if trimmed.starts_with("<orbit-workspace")
+            && let Some(end_idx) = trimmed.find("</orbit-workspace>")
+        {
+            cur = trimmed[end_idx + "</orbit-workspace>".len()..].trim_start();
+            continue;
+        }
+        if trimmed.starts_with("<WORKSPACE_RULES>")
+            && let Some(end_idx) = trimmed.find("</WORKSPACE_RULES>")
+        {
+            cur = trimmed[end_idx + "</WORKSPACE_RULES>".len()..].trim_start();
+            continue;
+        }
+        break;
     }
-    raw
+    cur
 }
 
 fn truncate_chars(raw: &str, max_chars: usize) -> String {
@@ -1890,8 +1900,13 @@ mod tests {
         }
         assert!(mgr.try_acquire_organizer_lock("sum:test_raii").is_some());
 
-        // 7. strip_orbit_workspace_xml only strips leading `<orbit-workspace...>` wrapper
+        // 7. strip_orbit_workspace_xml strips leading `<orbit-workspace>` and `<WORKSPACE_RULES>` wrappers
         let prose_mention = "Please inspect </orbit-workspace> parser edge case";
         assert_eq!(strip_orbit_workspace_xml(prose_mention), prose_mention);
+        let wrapped = "<orbit-workspace id=\"ws_1\">meta</orbit-workspace>\n\n<WORKSPACE_RULES>\n### Rule: rust\nNo unwrap\n</WORKSPACE_RULES>\n\nFix login bug";
+        assert_eq!(strip_orbit_workspace_xml(wrapped), "Fix login bug");
+        let rules_first =
+            "<WORKSPACE_RULES>\n### Rule: a\nBody\n</WORKSPACE_RULES>\n\nRefactor auth";
+        assert_eq!(strip_orbit_workspace_xml(rules_first), "Refactor auth");
     }
 }

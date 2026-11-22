@@ -1739,6 +1739,7 @@ impl AgentOrchestrator {
         let launch_gen = self.bump_generation(&agent_id).await;
 
         let initial_prompt = spec.initial_prompt;
+        let initial_rule_badges = spec.initial_badges.clone();
         // Persist the initial user prompt IMMEDIATELY (`< 1ms`) so `AgentCreated` returns right away
         // and the user sees their clean message + badges at 0ms without blocking the socket!
         let initial_turn = if !initial_prompt.trim().is_empty() {
@@ -1803,8 +1804,16 @@ impl AgentOrchestrator {
                     }
                     if let Some((turn_id, _)) = initial_turn {
                         let sanitized = sanitize_human_prompt_for_wire(&initial_prompt, &turn_id);
+                        let with_rules = mgr
+                            .augment_prompt_with_path_rules(
+                                &ag_id_bg,
+                                &initial_rule_badges,
+                                &sanitized,
+                                sanitized.clone(),
+                            )
+                            .await;
                         let wire = mgr
-                            .augment_prompt_with_workspace_context(&ag_id_bg, sanitized)
+                            .augment_prompt_with_workspace_context(&ag_id_bg, with_rules)
                             .await;
                         let _ = cmd_tx
                             .send(DriverCommand::SendPrompt {
@@ -2285,8 +2294,16 @@ impl AgentOrchestrator {
                             return;
                         }
                         let sanitized = sanitize_human_prompt_for_wire(&prompt_text, &msg_id);
+                        let with_rules = mgr
+                            .augment_prompt_with_path_rules(
+                                &ag_id_bg,
+                                &[],
+                                &sanitized,
+                                sanitized.clone(),
+                            )
+                            .await;
                         let wire = mgr
-                            .augment_prompt_with_workspace_context(&ag_id_bg, sanitized)
+                            .augment_prompt_with_workspace_context(&ag_id_bg, with_rules)
                             .await;
                         let _ = cmd_tx
                             .send(DriverCommand::SendPrompt {
@@ -2661,6 +2678,7 @@ impl AgentOrchestrator {
         let turn_id = format!("turn_{}", Uuid::new_v4().simple());
         let msg_id = message_id.unwrap_or_else(|| format!("u_{}", Uuid::new_v4().simple()));
         let visible_text = display_prompt.unwrap_or_else(|| prompt.clone());
+        let rule_badges = badges.clone();
         let ev = self.store.append_timeline_event(
             agent_id,
             1,
@@ -2691,10 +2709,13 @@ impl AgentOrchestrator {
         }
         let with_handoff = match handoff_context {
             Some(ctx) => format!("{ctx}\n\n[Latest User Request]\n{sanitized}"),
-            None => sanitized,
+            None => sanitized.clone(),
         };
+        let with_rules = self
+            .augment_prompt_with_path_rules(agent_id, &rule_badges, &sanitized, with_handoff)
+            .await;
         let wire_prompt = self
-            .augment_prompt_with_workspace_context(agent_id, with_handoff)
+            .augment_prompt_with_workspace_context(agent_id, with_rules)
             .await;
 
         cmd_tx
@@ -3739,6 +3760,60 @@ impl AgentOrchestrator {
         Ok(peers
             .into_iter()
             .find(|a| a.title.to_ascii_lowercase().contains(&lower)))
+    }
+
+    /// Match workspace/user path-scoped glob rules against mentioned/edited paths and `@rule:` tokens,
+    /// prepending `<WORKSPACE_RULES>` cleanly when non-empty and leaving the prompt untouched otherwise.
+    /// `signal_source` is strictly the current turn's user prompt (never historical handoff turns).
+    async fn augment_prompt_with_path_rules(
+        &self,
+        agent_id: &str,
+        badges: &[PromptBadge],
+        signal_source: &str,
+        prompt: String,
+    ) -> String {
+        if prompt.trim_start().starts_with("<WORKSPACE_RULES>") {
+            return prompt;
+        }
+        let Ok(Some(agent)) = self.store.get_agent(agent_id) else {
+            return prompt;
+        };
+        if agent.background {
+            return prompt;
+        }
+        let edited_paths: Vec<String> = self
+            .store
+            .list_workspace_events(&agent.workspace_id, 24)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|ev| ev.kind == WorkspaceEventKind::FileEdited)
+            .filter_map(|ev| ev.file_path)
+            .collect();
+        let (active_paths, manual_rules) = crate::rules::extract_prompt_rule_signals(
+            signal_source,
+            badges,
+            &agent.cwd,
+            &edited_paths,
+        );
+
+        let home_dir = self.home_dir.clone();
+        let cwd = PathBuf::from(&agent.cwd);
+        let matched = tokio::task::spawn_blocking(move || {
+            crate::rules::match_rules_for_workspace(
+                &home_dir,
+                Some(&cwd),
+                &active_paths,
+                &manual_rules,
+            )
+        })
+        .await
+        .unwrap_or_default();
+
+        if matched.injected_markdown.is_empty() {
+            prompt
+        } else {
+            format!("{}\n\n{prompt}", matched.injected_markdown)
+        }
     }
 
     /// Prepend a deduplicated `<orbit-workspace>` live awareness block (peers + shared board +

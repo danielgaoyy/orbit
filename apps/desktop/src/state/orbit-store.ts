@@ -58,6 +58,9 @@ import {
   type CloudSyncStatusView,
   type ComposerContextInput,
   type CoreNotification,
+  type MatchedPathRulesView,
+  type PathRulesSnapshotView,
+  type UpsertPathRuleParams,
   type ExternalEditorInfo,
   type ExternalEditorKind,
   type ExternalMcpServerRecord,
@@ -372,7 +375,7 @@ export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveViewMode = "workspace" | "settings";
 export type WorkspacePanelMode = "conversation" | "automations";
-export type HostSettingsTab = "agents" | "skills" | "acp" | "mcp" | "usage" | "connection";
+export type HostSettingsTab = "agents" | "skills" | "acp" | "mcp" | "rules" | "usage" | "connection";
 export type SettingsSection =
   | "general"
   | "instructions"
@@ -595,6 +598,7 @@ export interface OrbitUiState {
 
   // Zero-Server E2EE Cloud Sync (GitHub Device Flow + Secret Gist)
   cloudSyncStatus: CloudSyncStatusView | null;
+  pathRulesByScope: Record<string, PathRulesSnapshotView>;
   cloudSyncBusy: boolean;
   cloudSyncError: string | null;
   cloudSyncDeviceFlow: GitHubDeviceFlowStartView | null;
@@ -998,6 +1002,7 @@ const defaultInitialState: OrbitUiState = {
   },
 
   cloudSyncStatus: null,
+  pathRulesByScope: {},
   cloudSyncBusy: false,
   cloudSyncError: null,
   cloudSyncDeviceFlow: null,
@@ -1802,6 +1807,7 @@ function resolveSettingsSectionTarget(
 
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const inflightAttachmentUploads = new Map<string, Promise<void>>();
+const pathRulesReqSeqByScope = new Map<string, number>();
 
 function isLikelyTextFile(file: File, bytes: Uint8Array): boolean {
   if (file.size > 64 * 1024) return false;
@@ -8203,6 +8209,75 @@ export const orbitActions = {
       };
     });
     return result;
+  },
+
+  async refreshPathRules(hostId: string, cwd: string): Promise<PathRulesSnapshotView | null> {
+    if (!hostId || !cwd) return null;
+    const scopeKey = `${hostId}::${cwd}`;
+    const reqSeq = (pathRulesReqSeqByScope.get(scopeKey) ?? 0) + 1;
+    pathRulesReqSeqByScope.set(scopeKey, reqSeq);
+    try {
+      const snap = await orbitIpc.listPathRules(hostId, cwd);
+      if (pathRulesReqSeqByScope.get(scopeKey) === reqSeq) {
+        setState((s) => ({
+          ...s,
+          pathRulesByScope: {
+            ...s.pathRulesByScope,
+            [scopeKey]: snap,
+          },
+        }));
+      }
+      return snap;
+    } catch {
+      return null;
+    }
+  },
+
+  async upsertPathRule(params: UpsertPathRuleParams): Promise<PathRulesSnapshotView> {
+    const scopeKey = `${params.hostId}::${params.cwd}`;
+    const reqSeq = (pathRulesReqSeqByScope.get(scopeKey) ?? 0) + 1;
+    pathRulesReqSeqByScope.set(scopeKey, reqSeq);
+    const snap = await orbitIpc.upsertPathRule(params);
+    if (pathRulesReqSeqByScope.get(scopeKey) === reqSeq) {
+      setState((s) => ({
+        ...s,
+        pathRulesByScope: {
+          ...s.pathRulesByScope,
+          [scopeKey]: snap,
+        },
+      }));
+    }
+    return snap;
+  },
+
+  async deletePathRule(params: {
+    hostId: string;
+    cwd: string;
+    path: string;
+  }): Promise<PathRulesSnapshotView> {
+    const scopeKey = `${params.hostId}::${params.cwd}`;
+    const reqSeq = (pathRulesReqSeqByScope.get(scopeKey) ?? 0) + 1;
+    pathRulesReqSeqByScope.set(scopeKey, reqSeq);
+    const snap = await orbitIpc.deletePathRule(params);
+    if (pathRulesReqSeqByScope.get(scopeKey) === reqSeq) {
+      setState((s) => ({
+        ...s,
+        pathRulesByScope: {
+          ...s.pathRulesByScope,
+          [scopeKey]: snap,
+        },
+      }));
+    }
+    return snap;
+  },
+
+  async matchPathRules(params: {
+    hostId: string;
+    cwd: string;
+    activePaths: string[];
+    manualRuleNames: string[];
+  }): Promise<MatchedPathRulesView> {
+    return orbitIpc.matchPathRules(params);
   },
 
   setCommandPaletteOpen(open: boolean): void {

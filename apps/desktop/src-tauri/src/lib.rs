@@ -40,14 +40,16 @@ use orbit_client_core::composer::{
 };
 use orbit_client_core::contract::{
     AcpRegistryRefreshView, BridgeInfoView, ConversationSearchHit, CreateWorkspaceEntryRequest,
-    DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest, FleetSidebarRequest,
-    ForkAgentRequest, ForkAgentResultView, GitReposInspectionView, InstructionFileContentView,
-    InstructionFileSavedView, InstructionFilesSnapshotView, ListInstructionFilesRequest,
-    MentionRankRequest, ModelSelectionRequest, PreviewWorktreeHandoffRequest,
+    DeletePathRuleRequest, DeleteWorkspaceEntryRequest, ExecuteWorktreeHandoffRequest,
+    FleetSidebarRequest, ForkAgentRequest, ForkAgentResultView, GitReposInspectionView,
+    InstructionFileContentView, InstructionFileSavedView, InstructionFilesSnapshotView,
+    ListInstructionFilesRequest, MatchPathRulesRequest, MatchedPathRulesView, MentionRankRequest,
+    ModelSelectionRequest, PathRulesSnapshotView, PreviewWorktreeHandoffRequest,
     ReadInstructionFileRequest, RenameWorkspaceEntryRequest, RenderDiagramRequest,
     RenderDiagramView, SaveInstructionFileRequest, SearchWorkspaceSymbolsRequest,
     SpawnWorkspacePeerRequest, UpsertArtifactRequest, UpsertExternalMcpServerRequest,
-    WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView, WorkspaceSymbolsView,
+    UpsertPathRuleRequest, WorkspaceEntryMutationResultView, WorkspaceFileWriteResultView,
+    WorkspaceSymbolsView,
     WriteWorkspaceFileRequest,
 };
 use orbit_client_core::desktop_ops::{
@@ -1903,6 +1905,79 @@ async fn save_instruction_file(
 }
 
 #[tauri::command]
+async fn list_path_rules(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+) -> Result<PathRulesSnapshotView, String> {
+    state.core.list_path_rules_on_host(host_id, cwd).await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn upsert_path_rule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    scope: orbit_protocol::RuleScope,
+    name: String,
+    description: String,
+    trigger_mode: orbit_protocol::RuleTriggerMode,
+    globs: Vec<String>,
+    enabled: bool,
+    body: String,
+    expected_etag: Option<String>,
+) -> Result<PathRulesSnapshotView, String> {
+    state
+        .core
+        .upsert_path_rule_on_host(UpsertPathRuleRequest {
+            host_id,
+            cwd,
+            scope,
+            name,
+            description,
+            trigger_mode,
+            globs,
+            enabled,
+            body,
+            expected_etag,
+        })
+        .await
+}
+
+#[tauri::command]
+async fn delete_path_rule(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    path: String,
+) -> Result<PathRulesSnapshotView, String> {
+    state
+        .core
+        .delete_path_rule_on_host(DeletePathRuleRequest { host_id, cwd, path })
+        .await
+}
+
+#[tauri::command]
+async fn match_path_rules(
+    state: State<'_, DesktopAppState>,
+    host_id: String,
+    cwd: String,
+    active_paths: Vec<String>,
+    manual_rule_names: Vec<String>,
+) -> Result<MatchedPathRulesView, String> {
+    state
+        .core
+        .match_path_rules_on_host(MatchPathRulesRequest {
+            host_id,
+            cwd,
+            active_paths,
+            manual_rule_names,
+        })
+        .await
+}
+
+#[tauri::command]
 async fn highlight_workspace_code(
     language: String,
     content: String,
@@ -2761,6 +2836,10 @@ pub fn run() {
             list_instruction_files,
             read_instruction_file,
             save_instruction_file,
+            list_path_rules,
+            upsert_path_rule,
+            delete_path_rule,
+            match_path_rules,
             highlight_workspace_code,
             ask_side_question,
             render_diagram,

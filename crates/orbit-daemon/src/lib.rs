@@ -21,6 +21,7 @@ pub mod manager;
 pub mod mcp;
 pub mod mcp_servers;
 pub mod messaging;
+pub mod rules;
 pub mod scheduler;
 pub mod skills;
 pub mod skills_manager;
@@ -3375,6 +3376,163 @@ async fn handle_wire_rpc(
             None
         }
 
+        // Path-Scoped Glob Rules (.orbit/rules/*.md, .claude/rules/*.md, .cursor/rules/*.mdc)
+        WireMessage::ListPathRules { request_id, cwd } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let home_dir = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let auth_res = authorize_path_rules_cwd(&store, &cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match tokio::task::spawn_blocking(move || {
+                        crate::rules::discover_path_rules(&home_dir, authorized_cwd.as_deref())
+                    })
+                    .await
+                    {
+                        Ok(snap) => WireMessage::PathRulesSnapshot {
+                            request_id,
+                            cwd,
+                            rules: snap.rules,
+                            total_always_tokens: snap.total_always_tokens,
+                            token_budget_warning: snap.token_budget_warning,
+                        },
+                        Err(e) => rpc_err(request_id, "list_path_rules_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "list_path_rules_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::UpsertPathRule {
+            request_id,
+            cwd,
+            scope,
+            name,
+            description,
+            trigger_mode,
+            globs,
+            enabled,
+            body,
+            expected_etag,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let home_dir = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let auth_res = authorize_path_rules_cwd(&store, &cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => {
+                        let spec = crate::rules::UpsertRuleSpec {
+                            scope,
+                            name,
+                            description,
+                            trigger_mode,
+                            globs,
+                            enabled,
+                            body,
+                            expected_etag,
+                        };
+                        match tokio::task::spawn_blocking(move || {
+                            crate::rules::upsert_path_rule(
+                                &home_dir,
+                                authorized_cwd.as_deref(),
+                                &spec,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(snap)) => WireMessage::PathRulesSnapshot {
+                                request_id,
+                                cwd,
+                                rules: snap.rules,
+                                total_always_tokens: snap.total_always_tokens,
+                                token_budget_warning: snap.token_budget_warning,
+                            },
+                            Ok(Err(e)) => rpc_err(request_id, "upsert_path_rule_failed", e),
+                            Err(e) => rpc_err(request_id, "upsert_path_rule_failed", e),
+                        }
+                    }
+                    Err(e) => rpc_err(request_id, "upsert_path_rule_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::DeletePathRule {
+            request_id,
+            cwd,
+            path,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let home_dir = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let auth_res = authorize_path_rules_cwd(&store, &cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match tokio::task::spawn_blocking(move || {
+                        crate::rules::delete_path_rule(&home_dir, authorized_cwd.as_deref(), &path)
+                    })
+                    .await
+                    {
+                        Ok(Ok(snap)) => WireMessage::PathRulesSnapshot {
+                            request_id,
+                            cwd,
+                            rules: snap.rules,
+                            total_always_tokens: snap.total_always_tokens,
+                            token_budget_warning: snap.token_budget_warning,
+                        },
+                        Ok(Err(e)) => rpc_err(request_id, "delete_path_rule_failed", e),
+                        Err(e) => rpc_err(request_id, "delete_path_rule_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "delete_path_rule_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+        WireMessage::MatchPathRules {
+            request_id,
+            cwd,
+            active_paths,
+            manual_rule_names,
+        } => {
+            let tx = out_tx.clone();
+            let zstd = *use_zstd;
+            let home_dir = runtime.home_dir.clone();
+            let store = runtime.store.clone();
+            tokio::spawn(async move {
+                let auth_res = authorize_path_rules_cwd(&store, &cwd).await;
+                let reply = match auth_res {
+                    Ok(authorized_cwd) => match tokio::task::spawn_blocking(move || {
+                        crate::rules::match_rules_for_workspace(
+                            &home_dir,
+                            authorized_cwd.as_deref(),
+                            &active_paths,
+                            &manual_rule_names,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(res) => WireMessage::MatchedPathRulesResponse {
+                            request_id,
+                            cwd,
+                            matched: res.matched,
+                            injected_markdown: res.injected_markdown,
+                            total_tokens: res.total_tokens,
+                        },
+                        Err(e) => rpc_err(request_id, "match_path_rules_failed", e),
+                    },
+                    Err(e) => rpc_err(request_id, "match_path_rules_denied", e),
+                };
+                let _ = tx.send(SessionFrame::Wire { msg: reply, zstd }).await;
+            });
+            None
+        }
+
         // Schedules & Heartbeats
         WireMessage::ListSchedules {
             request_id,
@@ -4363,6 +4521,23 @@ async fn authorize_optional_skills_cwd(
     Ok(Some(canonical.to_string_lossy().to_string()))
 }
 
+/// Authorize `cwd` for Path Rules RPCs:
+/// - Empty or `"~"` maps to `Ok(None)` (`UserGlobal`-only `~/.orbit/rules/*.md`).
+/// - Any other path MUST pass `authorize_workspace_mutation_cwd` BEFORE any filesystem access.
+async fn authorize_path_rules_cwd(
+    store: &Arc<OrbitStore>,
+    raw_cwd: &str,
+) -> Result<Option<PathBuf>, String> {
+    let trimmed = raw_cwd.trim();
+    if trimmed.is_empty() || trimmed == "~" {
+        return Ok(None);
+    }
+    let resolved = expand_host_path(trimmed);
+    authorize_workspace_mutation_cwd(store, &resolved)
+        .await
+        .map(Some)
+}
+
 /// Verify that a workspace mutation `cwd` is strictly contained within (equals or is a
 /// subdirectory of) a registered workspace, agent `cwd`, synced host project directory, or
 /// discovered project root on this host — preventing mutations in arbitrary host directories
@@ -4582,6 +4757,46 @@ mod self_upgrade_tests {
                 .await
                 .is_err()
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn authorize_path_rules_cwd_maps_global_and_rejects_unregistered_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "orbit-auth-rules-cwd-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let registered = root.join("registered");
+        let unregistered = root.join("unregistered");
+        std::fs::create_dir_all(&registered).expect("mkdir registered");
+        std::fs::create_dir_all(&unregistered).expect("mkdir unregistered");
+        let store = Arc::new(OrbitStore::open(root.join("orbit.db")).expect("open store"));
+        store
+            .upsert_host_project(&orbit_protocol::HostProjectEntry {
+                project_id: "proj_r".into(),
+                name: "Project R".into(),
+                directories: vec![registered.to_string_lossy().to_string()],
+                sort_order: 0,
+                hidden: false,
+                updated_at_ms: 1,
+            })
+            .expect("upsert project");
+
+        assert_eq!(authorize_path_rules_cwd(&store, "").await, Ok(None));
+        assert_eq!(authorize_path_rules_cwd(&store, "~").await, Ok(None));
+        assert!(
+            authorize_path_rules_cwd(&store, &registered.to_string_lossy())
+                .await
+                .expect("registered cwd allowed")
+                .is_some()
+        );
+        assert!(
+            authorize_path_rules_cwd(&store, &unregistered.to_string_lossy())
+                .await
+                .is_err()
+        );
+        assert!(authorize_path_rules_cwd(&store, "/").await.is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }

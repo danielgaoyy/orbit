@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import {
   AtSign,
+  BookOpen,
   Database,
   File,
   FileCode2,
@@ -296,6 +297,40 @@ export function MentionMenu({
                     {item.git_status}
                   </span>
                 )}
+              </button>
+            );
+          }
+
+          if (item.kind === "path_rule") {
+            return (
+              <button
+                key={item.key}
+                type="button"
+                data-mention-idx={idx}
+                onMouseEnter={() => onHoverIndex(idx)}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  onSelect(item);
+                }}
+                className={cn(
+                  "flex w-full cursor-pointer items-center justify-between gap-3 rounded-[9px] px-2.5 py-1.5 text-left transition-colors",
+                  active
+                    ? "bg-accent text-accent-foreground"
+                    : "text-foreground/90 hover:bg-accent/60",
+                )}
+              >
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <BookOpen className={iconClass} />
+                  <span className="shrink-0 font-mono text-[13px] font-medium">
+                    {item.title}
+                  </span>
+                  <span className="text-muted-foreground truncate text-[12px]">
+                    {item.subtitle}
+                  </span>
+                </div>
+                <span className="bg-muted text-muted-foreground shrink-0 rounded-[4px] px-1.5 py-0.5 text-[10.5px] font-medium dark:bg-white/[0.09]">
+                  {item.git_status || "Rule"}
+                </span>
               </button>
             );
           }

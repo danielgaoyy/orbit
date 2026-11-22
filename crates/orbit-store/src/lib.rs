@@ -820,6 +820,113 @@ impl OrbitStore {
         Ok(())
     }
 
+    pub fn get_agent_shim_cursor(&self, agent_id: &str) -> Option<u64> {
+        let key = format!("shim_cursor:{agent_id}");
+        let conn = self.conn.lock().ok()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT value_json FROM host_kv WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        raw.and_then(|s| serde_json::from_str::<u64>(&s).ok())
+    }
+
+    pub fn set_agent_shim_cursor(&self, agent_id: &str, seq: u64) -> Result<(), StoreError> {
+        let key = format!("shim_cursor:{agent_id}");
+        let val = serde_json::to_string(&seq)?;
+        let now_ms = Utc::now().timestamp_millis();
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute(
+            "INSERT INTO host_kv (key, value_json, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at_ms = excluded.updated_at_ms",
+            params![key, val, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_agent_shim_cursor(&self, agent_id: &str) -> Result<(), StoreError> {
+        let key = format!("shim_cursor:{agent_id}");
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        conn.execute("DELETE FROM host_kv WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Find the highest numeric segment suffix (`_N`) already persisted for an active Antigravity
+    /// turn so a reattached driver continues segment numbering cleanly without ID collisions.
+    pub fn max_turn_segment_step(&self, agent_id: &str, turn_id: &str) -> u64 {
+        let Ok(conn) = self.conn.lock() else {
+            return 0;
+        };
+        let pattern_msg = format!("item_id:agy_msg_{turn_id}_%");
+        let pattern_th = format!("item_id:agy_th_{turn_id}_%");
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT coalesce_key FROM timeline_events
+             WHERE agent_id = ?1 AND (coalesce_key LIKE ?2 OR coalesce_key LIKE ?3)",
+        ) else {
+            return 0;
+        };
+        let mut max_step = 0u64;
+        if let Ok(rows) = stmt.query_map(params![agent_id, pattern_msg, pattern_th], |r| {
+            r.get::<_, String>(0)
+        }) {
+            for key in rows.flatten() {
+                if let Some(suffix) = key.rsplit('_').next()
+                    && let Ok(n) = suffix.parse::<u64>()
+                {
+                    max_step = max_step.max(n);
+                }
+            }
+        }
+        max_step
+    }
+
+    /// Fetch the most recent `limit` timeline events for an agent in chronological (`seq ASC`) order.
+    pub fn fetch_recent_timeline(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TimelineEvent>, StoreError> {
+        let conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, epoch, agent_id, turn_id, timestamp, payload_json
+             FROM timeline_events
+             WHERE agent_id = ?1
+             ORDER BY seq DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![agent_id, limit as i64], |row| {
+            let seq = row.get::<_, i64>(0)? as u64;
+            let epoch = row.get::<_, u32>(1)?;
+            let ag_id: String = row.get(2)?;
+            let turn_id: Option<String> = row.get(3)?;
+            let ts_str: String = row.get(4)?;
+            let payload_str: String = row.get(5)?;
+            Ok((seq, epoch, ag_id, turn_id, ts_str, payload_str))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (seq, epoch, ag_id, turn_id, ts_str, payload_str) = row?;
+            let payload: TimelinePayload = serde_json::from_str(&payload_str)?;
+            events.push(TimelineEvent {
+                seq,
+                epoch,
+                agent_id: ag_id,
+                turn_id,
+                timestamp: parse_ts(&ts_str),
+                payload,
+            });
+        }
+        events.reverse();
+        Ok(events)
+    }
+
     pub fn delete_agent(&self, agent_id: &str) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().map_err(|_| StoreError::LockPoisoned)?;
         let tx = conn.transaction()?;
@@ -3529,6 +3636,120 @@ mod tests {
                 status: ToolCallStatus::Running,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn shim_cursor_max_turn_segment_step_and_recent_timeline() {
+        let store = OrbitStore::open_in_memory().expect("open");
+        let now = Utc::now();
+        store
+            .upsert_workspace(&WorkspaceSummary {
+                workspace_id: "ws_cur".into(),
+                title: "cur".into(),
+                cwd: "/tmp".into(),
+                git_branch: None,
+                is_worktree: false,
+                updated_at: now,
+                source_cwd: None,
+                base_ref: None,
+                parent_workspace_id: None,
+                archived_at: None,
+                background: false,
+                setup_status: WorkspaceSetupStatus::Idle,
+                mission_goal: None,
+                project_root: None,
+                board_revision: 0,
+                title_locked: false,
+                auto_clustered: false,
+                is_curated: false,
+            })
+            .expect("ws");
+        store
+            .upsert_agent(
+                &AgentSummary {
+                    agent_id: "ag_cur".into(),
+                    workspace_id: "ws_cur".into(),
+                    cwd: "/tmp".into(),
+                    title: "Cursor test".into(),
+                    provider: ProviderKind::Antigravity,
+                    model: None,
+                    effort: None,
+                    mode: SessionMode::FullAccess,
+                    status: AgentStatus::Running {
+                        turn_id: "turn_abc".into(),
+                    },
+                    parent_agent_id: None,
+                    parent_host_id: None,
+                    profile_id: None,
+                    background: false,
+                    auto_archive: false,
+                    archived_at: None,
+                    attention: AttentionState::None,
+                    last_activity_at: Some(now),
+                    read_seq: 0,
+                    is_pinned: false,
+                    pinned_order: 0,
+                    handle: None,
+                    task_summary: None,
+                    cluster_suggestion: None,
+                    labels: Default::default(),
+                    latest_seq: 0,
+                    timeline_epoch: 0,
+                    queued_prompts: vec![],
+                    created_at: now,
+                    updated_at: now,
+                },
+                None,
+            )
+            .expect("upsert");
+
+        assert_eq!(store.get_agent_shim_cursor("ag_cur"), None);
+        store.set_agent_shim_cursor("ag_cur", 42).expect("set");
+        assert_eq!(store.get_agent_shim_cursor("ag_cur"), Some(42));
+        store.set_agent_shim_cursor("ag_cur", 128).expect("update");
+        assert_eq!(store.get_agent_shim_cursor("ag_cur"), Some(128));
+        store.clear_agent_shim_cursor("ag_cur").expect("clear");
+        assert_eq!(store.get_agent_shim_cursor("ag_cur"), None);
+
+        for i in 1..=5 {
+            store
+                .append_timeline_event(
+                    "ag_cur",
+                    0,
+                    Some("turn_abc"),
+                    TimelinePayload::AssistantThinking {
+                        item_id: format!("agy_th_turn_abc_{i}"),
+                        text: format!("thought {i}"),
+                    },
+                )
+                .expect("append");
+        }
+        store
+            .append_timeline_event(
+                "ag_cur",
+                0,
+                Some("turn_abc"),
+                TimelinePayload::AssistantMessage {
+                    item_id: "agy_msg_turn_abc_12".into(),
+                    text: "latest message".into(),
+                    streaming: false,
+                },
+            )
+            .expect("append msg");
+
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_abc"), 12);
+        assert_eq!(store.max_turn_segment_step("ag_cur", "turn_other"), 0);
+
+        let recent = store.fetch_recent_timeline("ag_cur", 2).expect("recent");
+        assert_eq!(recent.len(), 2);
+        assert!(matches!(
+            &recent[0].payload,
+            TimelinePayload::AssistantThinking { item_id, .. } if item_id == "agy_th_turn_abc_5"
+        ));
+        assert!(matches!(
+            &recent[1].payload,
+            TimelinePayload::AssistantMessage { item_id, .. } if item_id == "agy_msg_turn_abc_12"
         ));
     }
 }

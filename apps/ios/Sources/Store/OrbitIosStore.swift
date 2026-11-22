@@ -1049,13 +1049,18 @@ public final class OrbitIosStore: ObservableObject {
         hostId: String,
         agentId: String,
         seq: UInt64,
+        force: Bool = false,
         refreshSidebarAfter: Bool = true
     ) {
         let key = "\(hostId)::\(agentId)"
-        if let lastSeq = lastMarkedSeenSeqByAgent[key], lastSeq >= seq {
+        guard OrbitAgentLogic.shouldDispatchMarkAgentSeen(
+            lastMarkedSeq: lastMarkedSeenSeqByAgent[key],
+            nextSeq: seq,
+            force: force
+        ) else {
             return
         }
-        lastMarkedSeenSeqByAgent[key] = seq
+        lastMarkedSeenSeqByAgent[key] = max(lastMarkedSeenSeqByAgent[key] ?? 0, seq)
         core?.markAgentSeen(hostId: hostId, agentId: agentId, seq: seq)
         if refreshSidebarAfter {
             refreshSidebar()
@@ -1815,6 +1820,12 @@ public final class OrbitIosStore: ObservableObject {
             }
         }
 
+        // Invalidate cached seen-seq whenever the host reports an agent as unread
+        // (e.g. AttentionState::Finished / Error / ManualUnread synced from another device).
+        for agent in detail.agents where agent.isUnread {
+            lastMarkedSeenSeqByAgent.removeValue(forKey: "\(hostId)::\(agent.agentId)")
+        }
+
         // Evaluate running -> settled transitions for background sessions with queued prompts
         for agent in detail.agents where !(hostId == selectedHostId && agent.agentId == selectedAgentId) {
             let busy = agent.isForegroundRunning || agent.isAwaitingPermission
@@ -1831,7 +1842,13 @@ public final class OrbitIosStore: ObservableObject {
         // Advance active thread's seen cursor if currently viewing it
         if let currentAid = selectedAgentId, !isDraftNewSession,
            let ag = detail.agents.first(where: { $0.agentId == currentAid }) {
-            markAgentSeen(hostId: hostId, agentId: currentAid, seq: ag.latestSeq, refreshSidebarAfter: false)
+            markAgentSeen(
+                hostId: hostId,
+                agentId: currentAid,
+                seq: ag.latestSeq,
+                force: ag.isUnread,
+                refreshSidebarAfter: false
+            )
         }
 
         // Seamlessly migrate optimistic agent ID when daemon assigns permanent ID
@@ -1967,7 +1984,21 @@ public final class OrbitIosStore: ObservableObject {
                     core?.fetchWorkspaceBoard(hostId: hostId, workspaceId: card.workspaceId)
                 }
             }
-            markAgentSeen(hostId: hostId, agentId: agentId, seq: max(card.latestSeq, agentStage?.latestSeq ?? 0))
+            markAgentSeen(
+                hostId: hostId,
+                agentId: agentId,
+                seq: max(card.latestSeq, agentStage?.latestSeq ?? 0),
+                force: true,
+                refreshSidebarAfter: false
+            )
+        } else {
+            markAgentSeen(
+                hostId: hostId,
+                agentId: agentId,
+                seq: agentStage?.latestSeq ?? 0,
+                force: true,
+                refreshSidebarAfter: false
+            )
         }
         if agentChanged {
             restoreComposerDraftForCurrentScope()
@@ -2059,6 +2090,7 @@ public final class OrbitIosStore: ObservableObject {
                     hostId: hostId,
                     agentId: agentId,
                     seq: max(card.latestSeq, stage.latestSeq),
+                    force: card.isUnread,
                     refreshSidebarAfter: !card.isForegroundRunning
                 )
             }

@@ -617,6 +617,19 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
         let decoded = try JSONDecoder().decode(OrbitCloudSyncUiPreferences.self, from: data)
         try checkEqual(decoded, prefs)
     }
+
+    func testMarkAgentSeenDeduplicationAndForceClearOnUnread() throws {
+        // First time viewing a thread always dispatches
+        try checkTrue(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: nil, nextSeq: 0, force: false))
+        try checkTrue(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: nil, nextSeq: 42, force: false))
+        // Quiet streaming cursor advances dispatch only when seq strictly increases
+        try checkFalse(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: 42, nextSeq: 42, force: false))
+        try checkFalse(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: 42, nextSeq: 40, force: false))
+        try checkTrue(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: 42, nextSeq: 43, force: false))
+        // Explicit open or unread/attention clear MUST dispatch even when seq did not increase or is 0
+        try checkTrue(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: 42, nextSeq: 42, force: true))
+        try checkTrue(OrbitAgentLogic.shouldDispatchMarkAgentSeen(lastMarkedSeq: 42, nextSeq: 0, force: true))
+    }
 }
 
 #if ORBIT_CLI_TEST_RUNNER
@@ -636,6 +649,8 @@ enum OrbitLogicCliMain {
             ("testMarkdownASCIIBoxTableFalsePositiveGuard", suite.testMarkdownASCIIBoxTableFalsePositiveGuard),
             ("testAgentGenericHarnessHandleDetection", suite.testAgentGenericHarnessHandleDetection),
             ("testAgentForegroundRunningVsBackgroundWaiting", suite.testAgentForegroundRunningVsBackgroundWaiting),
+            ("testWakeupFilteringAndSettledStepGroupDisclosure", suite.testWakeupFilteringAndSettledStepGroupDisclosure),
+            ("testMarkAgentSeenDeduplicationAndForceClearOnUnread", suite.testMarkAgentSeenDeduplicationAndForceClearOnUnread),
             ("testAgentProviderSwitchGuard", suite.testAgentProviderSwitchGuard),
             ("testAgentModelDeduplicationAcrossAliasesAndDots", suite.testAgentModelDeduplicationAcrossAliasesAndDots),
             ("testAgentStageScopeAndDismissedVersionKeys", suite.testAgentStageScopeAndDismissedVersionKeys),

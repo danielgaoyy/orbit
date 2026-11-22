@@ -446,6 +446,19 @@ public enum OrbitAgentLogic {
         return hasRunningStep || (isLastVisibleSegment && !isTrailingFailedGroup)
     }
 
+    /// Single source of truth for whether a `markAgentSeen` RPC should be dispatched.
+    /// When `force` is true (e.g. explicitly opening a thread or clearing `AttentionState::Finished` / `ManualUnread`),
+    /// always dispatch even if `nextSeq <= lastMarkedSeq` or `nextSeq == 0`.
+    public static func shouldDispatchMarkAgentSeen(
+        lastMarkedSeq: UInt64?,
+        nextSeq: UInt64,
+        force: Bool
+    ) -> Bool {
+        if force { return true }
+        guard let prev = lastMarkedSeq else { return true }
+        return nextSeq > prev
+    }
+
     /// Provider switching is permitted only for brand-new drafts (no bound `selectedAgentId`)
     /// or when the active agent record is present and explicitly supports provider switching.
     public static func canSwitchProvider(

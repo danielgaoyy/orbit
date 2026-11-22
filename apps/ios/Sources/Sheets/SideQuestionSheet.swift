@@ -171,26 +171,14 @@ struct SideQuestionPanel: View {
 
             OrbitHairline()
 
-            if let err = entry.error, !err.isEmpty {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(palette.danger)
-                    Text(err)
-                        .font(OrbitTypography.meta(.regular))
-                        .foregroundStyle(palette.danger)
-                }
-            } else if entry.answer.isEmpty && entry.isStreaming {
-                HStack(spacing: 8) {
-                    OrbitSpinnerRingView(color: palette.accentSky, size: 12)
-                    Text("Thinking…")
-                        .font(OrbitTypography.meta(.regular))
-                        .foregroundStyle(palette.fgMuted)
-                }
-                .padding(.vertical, 4)
-            } else {
+            if !entry.answer.isEmpty {
                 let blocks = parseMarkdownPreview(markdown: entry.answer, streaming: entry.isStreaming)
-                RichMarkdownView(blocks: blocks, fallbackText: entry.answer)
+                RichMarkdownView(
+                    blocks: blocks,
+                    fallbackText: entry.answer,
+                    isStreaming: entry.isStreaming,
+                    workspaceCwd: store.activeCwd
+                )
 
                 if entry.isStreaming {
                     HStack(spacing: 6) {
@@ -199,6 +187,25 @@ struct SideQuestionPanel: View {
                             .font(OrbitTypography.meta(.regular))
                             .foregroundStyle(palette.fgMuted)
                     }
+                }
+            } else if entry.isStreaming && entry.error == nil {
+                HStack(spacing: 8) {
+                    OrbitSpinnerRingView(color: palette.accentSky, size: 12)
+                    Text("Thinking…")
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.fgMuted)
+                }
+                .padding(.vertical, 4)
+            }
+
+            if let err = entry.error, !err.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.danger)
+                    Text(err)
+                        .font(OrbitTypography.meta(.regular))
+                        .foregroundStyle(palette.danger)
                 }
             }
 

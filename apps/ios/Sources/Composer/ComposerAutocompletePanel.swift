@@ -17,7 +17,7 @@ struct ComposerSlashCommandPanel: View {
                 onSelect(cmd)
             } label: {
                 HStack(spacing: 10) {
-                    Image(systemName: OrbitSlashDirective.iconName(forSlashCommandId: cmd.id))
+                    Image(systemName: OrbitComposerLogic.iconName(forSlashCommandId: cmd.id))
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(palette.fgSecondary)
                         .frame(width: 22, alignment: .center)
@@ -95,11 +95,10 @@ struct ComposerMentionPanel: View {
     }
 
     private func iconName(for item: FfiMentionCandidate) -> String {
-        switch item.kind {
-        case "peer":
-            return "at"
-        case "all":
-            return "person.3"
+        if OrbitComposerLogic.isPeerMentionCandidate(kind: item.kind, key: item.key) {
+            return OrbitComposerLogic.isAllPeerMention(key: item.key, handle: item.title) ? "person.3" : "at"
+        }
+        switch item.kind.lowercased() {
         case "staged":
             return "arrow.left.arrow.right"
         case "git_diff":

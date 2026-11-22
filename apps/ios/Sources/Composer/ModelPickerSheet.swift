@@ -35,7 +35,11 @@ struct ModelPickerPopoverView: View {
     }
 
     private var canSwitchAgentEngine: Bool {
-        store.isDraftNewSession || store.activeAgent == nil
+        OrbitAgentLogic.canSwitchProvider(
+            selectedAgentId: store.selectedAgentId,
+            activeAgentExists: store.activeAgent != nil,
+            supportsProviderSwitch: false
+        )
     }
 
     private var showAgentSwitcher: Bool {
@@ -56,23 +60,30 @@ struct ModelPickerPopoverView: View {
 
     private var browsedRows: [ModelPickerRowData] {
         var rows: [ModelPickerRowData] = []
+        var seenDedupeKeys: Set<String> = []
         let catalogModels = catalog.models
+        let providerKey = "\(effectiveBrowsedProvider)"
 
         if effectiveBrowsedProvider == store.selectedProvider,
            let rawModel = store.selectedModel,
            !rawModel.isEmpty,
            !catalogModels.contains(where: { $0.id.caseInsensitiveCompare(rawModel) == .orderedSame }) {
-            rows.append(
-                ModelPickerRowData(
-                    id: rawModel,
-                    label: formatCatalogModelLabel(catalog: catalog, rawModelId: rawModel),
-                    defaultEffort: .medium,
-                    thinkingOptions: Self.defaultCustomThinkingOptions
+            let key = OrbitAgentLogic.modelDedupeKey(providerId: providerKey, rawModelId: rawModel)
+            if seenDedupeKeys.insert(key).inserted {
+                rows.append(
+                    ModelPickerRowData(
+                        id: rawModel,
+                        label: formatCatalogModelLabel(catalog: catalog, rawModelId: rawModel),
+                        defaultEffort: .medium,
+                        thinkingOptions: Self.defaultCustomThinkingOptions
+                    )
                 )
-            )
+            }
         }
 
         for spec in catalogModels {
+            let key = OrbitAgentLogic.modelDedupeKey(providerId: providerKey, rawModelId: spec.id)
+            guard seenDedupeKeys.insert(key).inserted else { continue }
             let cleanLabel: String
             if effectiveBrowsedProvider == .claudeCode,
                spec.label.lowercased().hasPrefix("claude ") {

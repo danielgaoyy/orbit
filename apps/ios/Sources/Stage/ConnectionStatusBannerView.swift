@@ -16,7 +16,7 @@ struct ConnectionStatusBannerView: View {
 
     private var shouldShowVersionBanner: Bool {
         guard let host = activeHost else { return false }
-        guard !store.dismissedVersionMismatchHosts.contains(host.hostId) else { return false }
+        guard !store.isVersionMismatchDismissed(for: host) else { return false }
         return store.isHostProtocolBehind(host) || store.isHostDaemonOutdated(host)
     }
 
@@ -40,6 +40,23 @@ struct ConnectionStatusBannerView: View {
                     subtitle: up.statusMessage ?? "Downloading and restarting daemon…"
                 ) {
                     EmptyView()
+                }
+            } else if let host = activeHost, let upErr = upgradeState?.error, !upErr.isEmpty {
+                bannerRow(
+                    tint: palette.danger,
+                    icon: "exclamationmark.triangle",
+                    title: "Daemon update failed",
+                    subtitle: upErr
+                ) {
+                    Button {
+                        store.hostUpgradeStates.removeValue(forKey: host.hostId)
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.fgMuted)
+                            .frame(width: 24, height: 24)
+                    }
+                    .buttonStyle(.plain)
                 }
             } else if let host = activeHost, host.connectionState == .disconnected {
                 bannerRow(
@@ -118,23 +135,6 @@ struct ConnectionStatusBannerView: View {
                         .buttonStyle(.plain)
                         .accessibilityLabel("Dismiss Update Banner")
                     }
-                }
-            } else if let host = activeHost, let upErr = upgradeState?.error, !upErr.isEmpty {
-                bannerRow(
-                    tint: palette.danger,
-                    icon: "exclamationmark.triangle",
-                    title: "Daemon update failed",
-                    subtitle: upErr
-                ) {
-                    Button {
-                        store.hostUpgradeStates.removeValue(forKey: host.hostId)
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 10.5, weight: .semibold))
-                            .foregroundStyle(palette.fgMuted)
-                            .frame(width: 24, height: 24)
-                    }
-                    .buttonStyle(.plain)
                 }
             }
         }

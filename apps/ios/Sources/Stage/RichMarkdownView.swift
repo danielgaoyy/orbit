@@ -9,7 +9,9 @@ struct OrbitSelectableTextView: UIViewRepresentable {
     var maxLines: Int = 0
     var isDarkAppearance: Bool = false
     var linkColor: UIColor = .systemBlue
+    var workspaceCwd: String? = nil
     var onQuoteSelection: ((String) -> Void)? = nil
+    var onOpenFileLink: ((OrbitPathLogic.FileTarget) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -44,13 +46,16 @@ struct OrbitSelectableTextView: UIViewRepresentable {
     @available(iOS 16.0, *)
     func sizeThatFits(_ proposal: ProposedViewSize, uiView: UITextView, context: Context) -> CGSize? {
         context.coordinator.parent = self
-        syncContentIfNeeded(on: uiView, coordinator: context.coordinator)
 
         if let proposedWidth = proposal.width {
             let safeProposed = max(1, proposedWidth)
             if stretchesToProposedWidth {
-                let fitted = uiView.sizeThatFits(CGSize(width: safeProposed, height: .greatestFiniteMagnitude))
-                return CGSize(width: safeProposed, height: max(1, ceil(fitted.height)))
+                let measured = attributedText.boundingRect(
+                    with: CGSize(width: safeProposed, height: .greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading],
+                    context: nil
+                )
+                return CGSize(width: safeProposed, height: max(1, ceil(measured.height) + 4))
             } else {
                 let measured = attributedText.boundingRect(
                     with: CGSize(width: safeProposed, height: .greatestFiniteMagnitude),
@@ -58,12 +63,20 @@ struct OrbitSelectableTextView: UIViewRepresentable {
                     context: nil
                 )
                 let tightWidth = min(safeProposed, max(1, ceil(measured.width) + 2))
-                let fitted = uiView.sizeThatFits(CGSize(width: tightWidth, height: .greatestFiniteMagnitude))
-                return CGSize(width: tightWidth, height: max(1, ceil(fitted.height)))
+                let tightMeasured = attributedText.boundingRect(
+                    with: CGSize(width: tightWidth, height: .greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading],
+                    context: nil
+                )
+                return CGSize(width: tightWidth, height: max(1, ceil(tightMeasured.height) + 4))
             }
         } else {
-            let fitted = uiView.sizeThatFits(CGSize(width: CGFloat.greatestFiniteMagnitude, height: .greatestFiniteMagnitude))
-            return CGSize(width: max(1, ceil(fitted.width) + 2), height: max(1, ceil(fitted.height)))
+            let measured = attributedText.boundingRect(
+                with: CGSize(width: CGFloat.greatestFiniteMagnitude, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil
+            )
+            return CGSize(width: max(1, ceil(measured.width) + 2), height: max(1, ceil(measured.height) + 4))
         }
     }
 
@@ -127,6 +140,27 @@ struct OrbitSelectableTextView: UIViewRepresentable {
             actions.insert(quoteAction, at: min(1, actions.count))
             return UIMenu(children: actions)
         }
+
+        func textView(
+            _ textView: UITextView,
+            shouldInteractWith URL: URL,
+            in characterRange: NSRange,
+            interaction: UITextItemInteraction
+        ) -> Bool {
+            switch OrbitMarkdownLinkLogic.parseLink(URL.absoluteString, workspaceCwd: parent.workspaceCwd) {
+            case let .filePath(target):
+                parent.onOpenFileLink?(target)
+                return false
+            case let .externalWeb(externalUrl):
+                UIApplication.shared.open(externalUrl)
+                return false
+            case let .mailto(mailtoUrl):
+                UIApplication.shared.open(mailtoUrl)
+                return false
+            case .anchor, .unknown:
+                return true
+            }
+        }
     }
 }
 
@@ -153,7 +187,10 @@ private enum MarkdownRenderSegment {
 struct RichMarkdownView: View {
     let blocks: [FfiRichBlock]
     var fallbackText: String = ""
+    var isStreaming: Bool = false
+    var workspaceCwd: String? = nil
     var onQuoteSelection: ((String) -> Void)? = nil
+    var onOpenFileLink: ((OrbitPathLogic.FileTarget) -> Void)? = nil
 
     @Environment(\.orbitPalette) private var palette
 
@@ -199,14 +236,24 @@ struct RichMarkdownView: View {
 
             let block = blocks[idx]
             switch block {
-            case .heading, .paragraph:
+            case .heading:
+                flushProseBuffer()
                 proseBuffer.append(block)
+                flushProseBuffer()
+            case .paragraph:
+                proseBuffer.append(block)
+                if proseBuffer.count >= 3 {
+                    flushProseBuffer()
+                }
             case let .listItem(_, _, checked, spans):
                 if let checked = checked {
                     flushProseBuffer()
                     out.append(.checkListItem(checked: checked, spans: spans))
                 } else {
                     proseBuffer.append(block)
+                    if proseBuffer.count >= 4 {
+                        flushProseBuffer()
+                    }
                 }
             case let .blockQuote(spans):
                 flushProseBuffer()
@@ -256,7 +303,9 @@ struct RichMarkdownView: View {
                 stretchesToProposedWidth: true,
                 isDarkAppearance: palette.isDark,
                 linkColor: UIColor(palette.primary),
-                onQuoteSelection: onQuoteSelection
+                workspaceCwd: workspaceCwd,
+                onQuoteSelection: onQuoteSelection,
+                onOpenFileLink: onOpenFileLink
             )
 
         case let .checkListItem(checked, spans):
@@ -274,7 +323,9 @@ struct RichMarkdownView: View {
                     stretchesToProposedWidth: true,
                     isDarkAppearance: palette.isDark,
                     linkColor: UIColor(palette.primary),
-                    onQuoteSelection: onQuoteSelection
+                    workspaceCwd: workspaceCwd,
+                    onQuoteSelection: onQuoteSelection,
+                    onOpenFileLink: onOpenFileLink
                 )
             }
 
@@ -293,7 +344,9 @@ struct RichMarkdownView: View {
                     stretchesToProposedWidth: true,
                     isDarkAppearance: palette.isDark,
                     linkColor: UIColor(palette.primary),
-                    onQuoteSelection: onQuoteSelection
+                    workspaceCwd: workspaceCwd,
+                    onQuoteSelection: onQuoteSelection,
+                    onOpenFileLink: onOpenFileLink
                 )
             }
             .padding(.vertical, 2)
@@ -308,7 +361,8 @@ struct RichMarkdownView: View {
                     kind: diagramKind,
                     language: language,
                     rawCode: rawCode,
-                    lines: lines
+                    lines: lines,
+                    isStreaming: isStreaming
                 )
             } else {
                 CodeBlockView(language: language, rawCode: rawCode, lines: lines)
@@ -329,6 +383,10 @@ struct RichMarkdownView: View {
     private func extractDelimitedTableCells(from block: FfiRichBlock) -> [[FfiInlineSpan]]? {
         guard case let .paragraph(spans) = block else { return nil }
         let fullText = spans.map(\.text).joined()
+        let lines = fullText.components(separatedBy: .newlines)
+        if OrbitMarkdownLinkLogic.isASCIIBoxTableFalsePositive(lines) {
+            return nil
+        }
         guard fullText.contains("│") else { return nil }
 
         var cells: [[FfiInlineSpan]] = []
@@ -425,6 +483,7 @@ struct RichMarkdownView: View {
         while i < lines.count {
             if i + 1 < lines.count,
                lines[i].contains("|"),
+               !OrbitMarkdownLinkLogic.isASCIIBoxTableFalsePositive([lines[i], lines[i + 1]]),
                isPipeSeparatorRow(lines[i + 1]) {
                 flushTextBuffer()
                 let headers = splitPipeRow(lines[i])

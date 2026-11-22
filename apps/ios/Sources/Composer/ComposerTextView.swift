@@ -5,6 +5,8 @@ import UIKit
 /// so an active inline slash directive (e.g. `/plan`) can be removed directly from the keyboard.
 final class OrbitComposerUITextView: UITextView {
     var onBackspaceAtStart: (() -> Bool)?
+    var onPasteImage: ((UIImage) -> Void)?
+    var onLargeTextPaste: ((String) -> Void)?
 
     override func deleteBackward() {
         if selectedRange.location == 0,
@@ -14,6 +16,19 @@ final class OrbitComposerUITextView: UITextView {
             return
         }
         super.deleteBackward()
+    }
+
+    override func paste(_ sender: Any?) {
+        let pb = UIPasteboard.general
+        if let image = pb.image, pb.string == nil {
+            onPasteImage?(image)
+            return
+        }
+        if let pastedString = pb.string, OrbitComposerLogic.isLargeTextPaste(pastedString) {
+            onLargeTextPaste?(pastedString)
+            return
+        }
+        super.paste(sender)
     }
 }
 
@@ -29,6 +44,8 @@ struct ComposerTextView: UIViewRepresentable {
     let textColor: UIColor
     let tintColor: UIColor
     let onBackspaceAtStart: () -> Bool
+    var onPasteImage: ((UIImage) -> Void)? = nil
+    var onLargeTextPaste: ((String) -> Void)? = nil
 
     static let bodyFont: UIFont = .systemFont(ofSize: 15, weight: .regular)
     static let lineSpacing: CGFloat = 4
@@ -79,6 +96,8 @@ struct ComposerTextView: UIViewRepresentable {
             view.attributedText = NSAttributedString(string: text, attributes: attrs)
         }
         view.onBackspaceAtStart = onBackspaceAtStart
+        view.onPasteImage = onPasteImage
+        view.onLargeTextPaste = onLargeTextPaste
         context.coordinator.lastAppliedIndent = firstLineHeadIndent
         context.coordinator.lastAppliedColor = textColor
         context.coordinator.lastFocusNonce = focusNonce
@@ -88,16 +107,25 @@ struct ComposerTextView: UIViewRepresentable {
     func updateUIView(_ uiView: OrbitComposerUITextView, context: Context) {
         context.coordinator.parent = self
         uiView.onBackspaceAtStart = onBackspaceAtStart
+        uiView.onPasteImage = onPasteImage
+        uiView.onLargeTextPaste = onLargeTextPaste
         uiView.tintColor = tintColor
 
         if focusNonce != context.coordinator.lastFocusNonce {
             context.coordinator.lastFocusNonce = focusNonce
-            DispatchQueue.main.async {
-                uiView.becomeFirstResponder()
+            if uiView.window != nil && !uiView.isFirstResponder {
+                DispatchQueue.main.async {
+                    if uiView.window != nil && !uiView.isFirstResponder {
+                        uiView.becomeFirstResponder()
+                    }
+                }
             }
-        } else if !isFocused && uiView.isFirstResponder {
+        } else if !isFocused && context.coordinator.lastKnownFocused == true && uiView.isFirstResponder && uiView.markedTextRange == nil {
+            context.coordinator.lastKnownFocused = false
             DispatchQueue.main.async {
-                uiView.resignFirstResponder()
+                if !self.isFocused && uiView.isFirstResponder && uiView.markedTextRange == nil {
+                    uiView.resignFirstResponder()
+                }
             }
         }
 
@@ -108,9 +136,13 @@ struct ComposerTextView: UIViewRepresentable {
         let indentChanged = abs(context.coordinator.lastAppliedIndent - firstLineHeadIndent) > 0.25
         let colorChanged = context.coordinator.lastAppliedColor != textColor
 
+        let attrs = Self.makeTypingAttributes(indent: firstLineHeadIndent, textColor: textColor)
+        if text.isEmpty && (textChanged || indentChanged || colorChanged) {
+            uiView.typingAttributes = attrs
+        }
+
         guard textChanged || indentChanged || colorChanged else { return }
 
-        let attrs = Self.makeTypingAttributes(indent: firstLineHeadIndent, textColor: textColor)
         context.coordinator.isUpdatingProgrammatically = true
         defer { context.coordinator.isUpdatingProgrammatically = false }
 
@@ -131,7 +163,19 @@ struct ComposerTextView: UIViewRepresentable {
 
         context.coordinator.lastAppliedIndent = firstLineHeadIndent
         context.coordinator.lastAppliedColor = textColor
+        updateScrollEnabledIfNeeded(uiView)
         uiView.invalidateIntrinsicContentSize()
+    }
+
+    private func updateScrollEnabledIfNeeded(_ uiView: OrbitComposerUITextView) {
+        let width = uiView.bounds.width
+        guard width > 0 else { return }
+        let maxHeight = ceil((Self.bodyFont.lineHeight + Self.lineSpacing) * 6) + 6
+        let contentHeight = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude)).height
+        let needsScroll = contentHeight > maxHeight + 1
+        if uiView.isScrollEnabled != needsScroll {
+            uiView.isScrollEnabled = needsScroll
+        }
     }
 
     func sizeThatFits(
@@ -142,16 +186,18 @@ struct ComposerTextView: UIViewRepresentable {
         let width = proposal.width ?? uiView.bounds.width
         guard width > 0 else { return nil }
 
-        let wasScrollEnabled = uiView.isScrollEnabled
-        if wasScrollEnabled {
-            uiView.isScrollEnabled = false
-        }
-        let fitting = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
         let minHeight = ceil(Self.bodyFont.lineHeight) + 4
         let maxHeight = ceil((Self.bodyFont.lineHeight + Self.lineSpacing) * 6) + 6
-        let needsScroll = fitting.height > maxHeight + 1
-        if uiView.isScrollEnabled != needsScroll {
-            uiView.isScrollEnabled = needsScroll
+        let fitting: CGSize
+        if !uiView.isScrollEnabled {
+            fitting = uiView.sizeThatFits(CGSize(width: width, height: .greatestFiniteMagnitude))
+        } else {
+            let measured = uiView.attributedText?.boundingRect(
+                with: CGSize(width: width, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                context: nil
+            ).size ?? CGSize(width: width, height: minHeight)
+            fitting = CGSize(width: width, height: measured.height + 4)
         }
         let clamped = min(max(fitting.height, minHeight), maxHeight)
         return CGSize(width: width, height: clamped)
@@ -159,8 +205,11 @@ struct ComposerTextView: UIViewRepresentable {
 
     private static func stringOffset(fromUtf16Location utf16Loc: Int, in string: String) -> Int {
         let clamped = min(max(0, utf16Loc), string.utf16.count)
-        let utf16Idx = string.utf16.index(string.utf16.startIndex, offsetBy: clamped)
-        if let valid = utf16Idx.samePosition(in: string) {
+        var idx = string.utf16.index(string.utf16.startIndex, offsetBy: clamped)
+        while idx > string.utf16.startIndex && idx.samePosition(in: string) == nil {
+            idx = string.utf16.index(before: idx)
+        }
+        if let valid = idx.samePosition(in: string) {
             return string.distance(from: string.startIndex, to: valid)
         }
         return string.count
@@ -177,6 +226,7 @@ struct ComposerTextView: UIViewRepresentable {
         var lastAppliedIndent: CGFloat = 0
         var lastAppliedColor: UIColor = .label
         var lastFocusNonce: Int = 0
+        var lastKnownFocused: Bool = false
         var isUpdatingProgrammatically: Bool = false
 
         init(_ parent: ComposerTextView) {
@@ -184,6 +234,7 @@ struct ComposerTextView: UIViewRepresentable {
         }
 
         func textViewDidBeginEditing(_ textView: UITextView) {
+            lastKnownFocused = true
             DispatchQueue.main.async {
                 if !self.parent.isFocused {
                     self.parent.isFocused = true
@@ -192,6 +243,7 @@ struct ComposerTextView: UIViewRepresentable {
         }
 
         func textViewDidEndEditing(_ textView: UITextView) {
+            lastKnownFocused = false
             DispatchQueue.main.async {
                 if self.parent.isFocused {
                     self.parent.isFocused = false
@@ -201,7 +253,17 @@ struct ComposerTextView: UIViewRepresentable {
 
         func textViewDidChange(_ textView: UITextView) {
             guard !isUpdatingProgrammatically else { return }
+            if textView.markedTextRange != nil {
+                return
+            }
             let nextText = textView.text ?? ""
+            if nextText.isEmpty {
+                let attrs = ComposerTextView.makeTypingAttributes(
+                    indent: parent.firstLineHeadIndent,
+                    textColor: parent.textColor
+                )
+                textView.typingAttributes = attrs
+            }
             let nextOffset = ComposerTextView.stringOffset(
                 fromUtf16Location: textView.selectedRange.location,
                 in: nextText
@@ -212,7 +274,12 @@ struct ComposerTextView: UIViewRepresentable {
             if parent.cursorOffset != nextOffset {
                 parent.cursorOffset = nextOffset
             }
-            textView.invalidateIntrinsicContentSize()
+            DispatchQueue.main.async {
+                if let tv = textView as? OrbitComposerUITextView {
+                    self.parent.updateScrollEnabledIfNeeded(tv)
+                }
+                textView.invalidateIntrinsicContentSize()
+            }
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {

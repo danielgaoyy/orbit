@@ -52,7 +52,7 @@ jobs:
         run: |
           brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
           ./apps/ios/scripts/build-rust-xcframework.sh
-          sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER: .*/PRODUCT_BUNDLE_IDENTIFIER: ${TARGET_BUNDLE_ID}/g" apps/ios/project.yml
+          sed -i '' "s/PRODUCT_BUNDLE_IDENTIFIER: dev\.orbit\.app$/PRODUCT_BUNDLE_IDENTIFIER: ${TARGET_BUNDLE_ID}/g" apps/ios/project.yml
           cd apps/ios && xcodegen generate
 
       - name: Provision Apple Signing & Upload Archive to TestFlight

@@ -17,6 +17,8 @@ struct OmniComposerView: View {
     @State private var isCameraPickerPresented: Bool = false
     @State private var isFileImporterPresented: Bool = false
     @State private var isPermissionPickerPresented: Bool = false
+    @State private var cachedSlashCommands: [FfiSlashCommand] = []
+    @State private var cachedMentionCandidates: [FfiMentionCandidate] = []
 
     private var hasHomeIndicatorInset: Bool {
         guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
@@ -30,7 +32,7 @@ struct OmniComposerView: View {
         if isSoftwareKeyboardVisible {
             return OrbitSpacing.sm
         }
-        return hasHomeIndicatorInset ? -14 : 10
+        return hasHomeIndicatorInset ? 2 : 10
     }
 
     private func updateSoftwareKeyboardVisibility(from notification: Notification) {
@@ -58,7 +60,7 @@ struct OmniComposerView: View {
     }
 
     private var isRunningWithDraft: Bool {
-        store.isActiveAgentRunning && store.canSubmitComposer && store.selectedAgentId != nil
+        store.isActiveAgentTurnBusy && store.canSubmitComposer && store.selectedAgentId != nil
     }
 
     private var showPrimaryStopButton: Bool {
@@ -87,57 +89,59 @@ struct OmniComposerView: View {
         let candidates: [FfiMentionCandidate]
     }
 
-    private var clampedCursorIndex: String.Index {
+    private var clampedCursorUtf16: Int {
         let text = store.composerText
         let safeOffset = min(max(0, cursorOffset), text.count)
-        return text.index(text.startIndex, offsetBy: safeOffset)
+        let idx = text.index(text.startIndex, offsetBy: safeOffset)
+        return text.utf16.distance(from: text.utf16.startIndex, to: idx)
+    }
+
+    private var rawActiveTrigger: OrbitComposerTrigger? {
+        OrbitComposerLogic.findActiveTrigger(in: store.composerText, cursorUtf16Offset: clampedCursorUtf16)
     }
 
     private var activeSlashTrigger: SlashTriggerMatch? {
-        let text = store.composerText
-        let endIdx = clampedCursorIndex
-        guard endIdx > text.startIndex else { return nil }
-        let before = text[..<endIdx]
-        let tokenStart = before.lastIndex(where: { $0.isWhitespace })
-            .map { before.index(after: $0) }
-            ?? before.startIndex
-        guard tokenStart < endIdx else { return nil }
-        let token = text[tokenStart..<endIdx]
-        guard token.hasPrefix("/") else { return nil }
-        let query = String(token.dropFirst())
-        guard query.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") }) else {
+        guard let trig = rawActiveTrigger, trig.kind == .slash,
+              !cachedSlashCommands.isEmpty,
+              let range = Range(NSRange(location: trig.rangeLocationUtf16, length: trig.rangeLengthUtf16), in: store.composerText) else {
             return nil
         }
-        let commands = store.filterSlashCommands(query: query)
-        guard !commands.isEmpty else { return nil }
-        return SlashTriggerMatch(
-            tokenRange: tokenStart..<endIdx,
-            query: query,
-            commands: commands
-        )
+        return SlashTriggerMatch(tokenRange: range, query: trig.query, commands: cachedSlashCommands)
     }
 
     private var activeMentionTrigger: MentionTriggerMatch? {
-        guard activeSlashTrigger == nil else { return nil }
-        let text = store.composerText
-        let endIdx = clampedCursorIndex
-        guard endIdx > text.startIndex else { return nil }
-        let before = text[..<endIdx]
-        let tokenStart = before.lastIndex(where: { $0.isWhitespace })
-            .map { before.index(after: $0) }
-            ?? before.startIndex
-        guard tokenStart < endIdx else { return nil }
-        let token = text[tokenStart..<endIdx]
-        guard token.hasPrefix("@") else { return nil }
-        let query = String(token.dropFirst())
-        guard !query.contains("@") else { return nil }
-        let candidates = store.rankMentionCandidates(query: query, limit: 11)
-        guard !candidates.isEmpty else { return nil }
-        return MentionTriggerMatch(
-            tokenRange: tokenStart..<endIdx,
-            query: query,
-            candidates: candidates
-        )
+        guard let trig = rawActiveTrigger, trig.kind == .mention,
+              !cachedMentionCandidates.isEmpty,
+              let range = Range(NSRange(location: trig.rangeLocationUtf16, length: trig.rangeLengthUtf16), in: store.composerText) else {
+            return nil
+        }
+        return MentionTriggerMatch(tokenRange: range, query: trig.query, candidates: cachedMentionCandidates)
+    }
+
+    private func refreshAutocompleteCache() {
+        guard let trig = rawActiveTrigger else {
+            if !cachedSlashCommands.isEmpty { cachedSlashCommands = [] }
+            if !cachedMentionCandidates.isEmpty { cachedMentionCandidates = [] }
+            return
+        }
+        switch trig.kind {
+        case .slash:
+            cachedMentionCandidates = []
+            guard trig.query.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") }) else {
+                cachedSlashCommands = []
+                return
+            }
+            cachedSlashCommands = store.filterSlashCommands(query: trig.query)
+        case .mention:
+            cachedSlashCommands = []
+            if store.workspaceFilesList.isEmpty {
+                store.refreshWorkspaceFiles()
+            }
+            if store.gitReview == nil {
+                store.refreshGitReview()
+            }
+            cachedMentionCandidates = store.rankMentionCandidates(query: trig.query, limit: 11)
+        }
     }
 
     var body: some View {
@@ -200,23 +204,17 @@ struct OmniComposerView: View {
         }
         .onAppear {
             cursorOffset = store.composerText.count
-            if activeMentionTrigger != nil && store.workspaceFilesList.isEmpty {
-                store.refreshWorkspaceFiles()
-            }
+            refreshAutocompleteCache()
         }
         .onChange(of: store.composerText) { newText in
             if !isComposerFocused || cursorOffset > newText.count {
                 cursorOffset = newText.count
             }
             promoteTrailingSpaceSlashDirectiveIfNeeded(in: newText)
-            if activeMentionTrigger != nil {
-                if store.workspaceFilesList.isEmpty {
-                    store.refreshWorkspaceFiles()
-                }
-                if store.gitReview == nil {
-                    store.refreshGitReview()
-                }
-            }
+            refreshAutocompleteCache()
+        }
+        .onChange(of: cursorOffset) { _ in
+            refreshAutocompleteCache()
         }
     }
 
@@ -286,9 +284,9 @@ struct OmniComposerView: View {
             if let dir = OrbitSlashDirective(rawValue: cmd.id) {
                 store.applyQuickWorkflow(dir)
             }
-        case "ask":
+        case "ask", "supervised":
             store.applySessionMode(.default)
-        case "edits":
+        case "edits", "auto":
             store.applySessionMode(.acceptEdits)
         case "full":
             store.applySessionMode(.fullAccess)
@@ -349,7 +347,7 @@ struct OmniComposerView: View {
             let token = candidate.tokenLabel.isEmpty ? "@staged-diff" : candidate.tokenLabel
             store.registerInlineMention(token: token, item: .gitDiff(staged: true, label: candidate.title))
             insertInlineToken(token)
-        case "peer", "all":
+        case "peer", "all", "workspace_peer":
             let token = candidate.tokenLabel.isEmpty ? "@\(candidate.title)" : candidate.tokenLabel
             insertInlineToken(token)
         case "terminal":
@@ -372,12 +370,13 @@ struct OmniComposerView: View {
     // MARK: - Queued Prompts Tray
 
     private var queuedPromptsTray: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(store.activeQueuedPrompts.enumerated()), id: \.element.id) { idx, item in
+        let queuedList = store.activeQueuedPrompts
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(queuedList.enumerated()), id: \.element.id) { idx, item in
                 if idx > 0 {
                     OrbitHairline()
                 }
-                HStack(spacing: OrbitSpacing.sm) {
+                HStack(spacing: OrbitSpacing.xs) {
                     Image(systemName: "text.append")
                         .font(OrbitTypography.iconMicro)
                         .foregroundStyle(palette.primary)
@@ -399,6 +398,37 @@ struct OmniComposerView: View {
 
                     Spacer(minLength: OrbitSpacing.xs)
 
+                    if queuedList.count > 1 {
+                        Menu {
+                            if idx > 0 {
+                                Button {
+                                    store.reorderQueuedPrompts(fromIndex: idx, toOffset: idx - 1)
+                                } label: {
+                                    Label("Move Up", systemImage: "arrow.up")
+                                }
+                            }
+                            if idx + 1 < queuedList.count {
+                                Button {
+                                    store.reorderQueuedPrompts(fromIndex: idx, toOffset: idx + 2)
+                                } label: {
+                                    Label("Move Down", systemImage: "arrow.down")
+                                }
+                                Button {
+                                    store.mergeQueuedPromptWithNext(item)
+                                } label: {
+                                    Label("Merge with Next", systemImage: "arrow.triangle.merge")
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                                .font(.system(size: 13.5, weight: .medium))
+                                .foregroundStyle(palette.fgMuted)
+                                .frame(width: 28, height: OrbitSpacing.hitTarget)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Queue Options")
+                    }
+
                     Button {
                         store.editQueuedPrompt(item)
                         isComposerFocused = true
@@ -407,7 +437,7 @@ struct OmniComposerView: View {
                             .font(OrbitTypography.meta(.medium))
                             .foregroundStyle(palette.fgSecondary)
                             .padding(.horizontal, OrbitSpacing.sm)
-                            .frame(minWidth: OrbitSpacing.hitTarget, minHeight: OrbitSpacing.hitTarget)
+                            .frame(minWidth: 40, minHeight: OrbitSpacing.hitTarget)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -481,6 +511,19 @@ struct OmniComposerView: View {
                         store.slashDirective = nil
                         store.hapticLight()
                         return true
+                    },
+                    onPasteImage: { image in
+                        handleCapturedPhoto(image)
+                    },
+                    onLargeTextPaste: { pastedText in
+                        let data = Data(pastedText.utf8)
+                        store.attachFile(
+                            filename: "pasted-snippet.txt",
+                            mimeType: "text/plain",
+                            data: data,
+                            isImageHint: false
+                        )
+                        store.showToast("Attached large paste as snippet")
                     }
                 )
 
@@ -823,24 +866,48 @@ struct OmniComposerView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: OrbitSpacing.xs) {
                 ForEach(store.attachedContexts) { ctx in
+                    let uploadState = store.composerUploadStates[ctx.id]
+                    let failedMsg: String? = {
+                        if case let .failed(msg)? = uploadState { return msg }
+                        return nil
+                    }()
                     switch ctx {
                     case let .stagedImage(_, filename, _, previewData, _, isUploading):
                         imageThumbnailChip(
                             filename: filename,
                             previewData: previewData,
-                            isUploading: isUploading
-                        ) {
-                            store.removeContextItem(ctx)
-                        }
+                            isUploading: isUploading,
+                            failedError: failedMsg,
+                            onRetry: {
+                                store.retryAttachmentUpload(contextId: ctx.id)
+                            },
+                            onRemove: {
+                                store.removeContextItem(ctx)
+                            }
+                        )
                     case let .stagedFile(_, filename, _, sizeBytes, isUploading):
                         removableChip(
-                            icon: ctx.icon,
+                            icon: failedMsg != nil ? "exclamationmark.triangle" : ctx.icon,
                             label: filename,
-                            detail: OrbitAttachmentNormalizer.formatByteCount(sizeBytes),
-                            isAccent: false,
+                            detail: failedMsg != nil ? "Retry" : OrbitAttachmentNormalizer.formatByteCount(sizeBytes),
+                            isAccent: failedMsg != nil,
                             isLoading: isUploading
                         ) {
-                            store.removeContextItem(ctx)
+                            if failedMsg != nil {
+                                store.retryAttachmentUpload(contextId: ctx.id)
+                            } else {
+                                store.removeContextItem(ctx)
+                            }
+                        }
+                        .contextMenu {
+                            if failedMsg != nil {
+                                Button("Retry Upload") {
+                                    store.retryAttachmentUpload(contextId: ctx.id)
+                                }
+                            }
+                            Button("Remove", role: .destructive) {
+                                store.removeContextItem(ctx)
+                            }
                         }
                     case let .inlineFile(_, filename, _, lineCount, _):
                         removableChip(
@@ -882,6 +949,8 @@ struct OmniComposerView: View {
         filename: String,
         previewData: Data,
         isUploading: Bool,
+        failedError: String? = nil,
+        onRetry: (() -> Void)? = nil,
         onRemove: @escaping () -> Void
     ) -> some View {
         ZStack(alignment: .topTrailing) {
@@ -909,6 +978,20 @@ struct OmniComposerView: View {
                             .tint(.white)
                             .controlSize(.small)
                     }
+                } else if failedError != nil {
+                    Button {
+                        onRetry?()
+                    } label: {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(palette.danger.opacity(0.55))
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Retry uploading \(filename)")
                 }
             }
             .overlay(

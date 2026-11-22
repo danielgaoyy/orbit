@@ -34,24 +34,67 @@ struct FleetDrawerView: View {
 
     // MARK: - Rust-Authoritative Sidebar Projection
 
+    private struct ScopedConvRow: Identifiable {
+        let id: String
+        let conv: FfiSidebarConversation
+        let projectName: String?
+    }
+
+    private func hostDisplayName(for hostId: String) -> String? {
+        store.hosts.first(where: { $0.hostId == hostId })?.displayName
+    }
+
+    private var allOrderedProjects: [FfiSidebarProjectGroup] {
+        let all = store.sidebarView?.projects ?? []
+        guard let activeHost = store.selectedHostId else { return all }
+        return all.sorted { lhs, rhs in
+            if (lhs.hostId == activeHost) != (rhs.hostId == activeHost) {
+                return lhs.hostId == activeHost
+            }
+            return false
+        }
+    }
+
     private var hostProjects: [FfiSidebarProjectGroup] {
         guard let hostId = store.selectedHostId else { return [] }
         return (store.sidebarView?.projects ?? []).filter { $0.hostId == hostId }
     }
 
-    private var needsAttentionItems: [(conv: FfiSidebarConversation, projectName: String)] {
-        guard let hostId = store.selectedHostId else { return [] }
-        return (store.sidebarView?.needsAttention ?? [])
-            .filter { $0.hostId == hostId && !isHiddenSameHostSubagent($0.agent) }
-            .map { conv in
-                (conv: conv, projectName: projectDisplayName(forCwd: conv.agent.cwd))
+    private var needsAttentionItems: [ScopedConvRow] {
+        let activeHost = store.selectedHostId
+        let list = (store.sidebarView?.needsAttention ?? [])
+            .filter { !isHiddenSameHostSubagent($0.agent) || $0.agent.isAwaitingPermission }
+            .sorted { lhs, rhs in
+                if (lhs.hostId == activeHost) != (rhs.hostId == activeHost) {
+                    return lhs.hostId == activeHost
+                }
+                return false
             }
+        return list.map { conv in
+            ScopedConvRow(
+                id: OrbitSidebarLogic.scopedRowId(section: "attention", hostId: conv.hostId, agentId: conv.agent.agentId),
+                conv: conv,
+                projectName: projectDisplayName(forCwd: conv.agent.cwd)
+            )
+        }
     }
 
-    private var pinnedItems: [FfiSidebarConversation] {
-        guard let hostId = store.selectedHostId else { return [] }
-        return (store.sidebarView?.pinnedConversations ?? []).filter {
-            $0.hostId == hostId && !isHiddenSameHostSubagent($0.agent)
+    private var pinnedItems: [ScopedConvRow] {
+        let activeHost = store.selectedHostId
+        let list = (store.sidebarView?.pinnedConversations ?? [])
+            .filter { !isHiddenSameHostSubagent($0.agent) }
+            .sorted { lhs, rhs in
+                if (lhs.hostId == activeHost) != (rhs.hostId == activeHost) {
+                    return lhs.hostId == activeHost
+                }
+                return false
+            }
+        return list.map { conv in
+            ScopedConvRow(
+                id: OrbitSidebarLogic.scopedRowId(section: "pinned", hostId: conv.hostId, agentId: conv.agent.agentId),
+                conv: conv,
+                projectName: projectDisplayName(forCwd: conv.agent.cwd)
+            )
         }
     }
 
@@ -64,25 +107,73 @@ struct FleetDrawerView: View {
     }
 
     private var archivedCount: Int {
-        store.currentHostDetail?.archivedAgents.count ?? 0
+        store.allArchivedAgentsAcrossHosts.count
     }
 
     private var displayProjects: [FfiSidebarProjectGroup] {
-        hostProjects
+        allOrderedProjects
     }
 
     // MARK: - Search Mode Matches
 
-    private var searchMatchedConversations: [(conv: FfiSidebarConversation, projectName: String)] {
+    private var searchMatchedConversations: [ScopedConvRow] {
         guard !trimmedSearchQuery.isEmpty else { return [] }
         var seen = Set<String>()
-        var results: [(conv: FfiSidebarConversation, projectName: String)] = []
-        for conv in pinnedItems where seen.insert(conv.agent.agentId).inserted {
-            results.append((conv: conv, projectName: projectDisplayName(forCwd: conv.agent.cwd)))
+        var results: [ScopedConvRow] = []
+
+        func matches(_ conv: FfiSidebarConversation, projectName: String?, groupTitle: String?) -> Bool {
+            OrbitSidebarLogic.matchesSearch(
+                query: trimmedSearchQuery,
+                fields: [
+                    conv.agent.title,
+                    conv.agent.taskSummary,
+                    conv.agent.cwd,
+                    conv.agent.handle,
+                    projectName,
+                    groupTitle,
+                    hostDisplayName(for: conv.hostId)
+                ]
+            )
         }
-        for grp in hostProjects {
-            for conv in grp.conversations where seen.insert(conv.agent.agentId).inserted {
-                results.append((conv: conv, projectName: grp.name))
+
+        for row in pinnedItems {
+            let key = "\(row.conv.hostId)::\(row.conv.agent.agentId)"
+            if matches(row.conv, projectName: row.projectName, groupTitle: nil), seen.insert(key).inserted {
+                results.append(
+                    ScopedConvRow(
+                        id: OrbitSidebarLogic.scopedRowId(section: "search", hostId: row.conv.hostId, agentId: row.conv.agent.agentId),
+                        conv: row.conv,
+                        projectName: row.projectName
+                    )
+                )
+            }
+        }
+        for grp in allOrderedProjects {
+            for ws in grp.workspaces {
+                for conv in ws.conversations where !isHiddenSameHostSubagent(conv.agent) {
+                    let key = "\(conv.hostId)::\(conv.agent.agentId)"
+                    if matches(conv, projectName: grp.name, groupTitle: ws.title), seen.insert(key).inserted {
+                        results.append(
+                            ScopedConvRow(
+                                id: OrbitSidebarLogic.scopedRowId(section: "search", hostId: conv.hostId, agentId: conv.agent.agentId),
+                                conv: conv,
+                                projectName: grp.name
+                            )
+                        )
+                    }
+                }
+            }
+            for conv in grp.conversations + grp.unclassifiedConversations where !isHiddenSameHostSubagent(conv.agent) {
+                let key = "\(conv.hostId)::\(conv.agent.agentId)"
+                if matches(conv, projectName: grp.name, groupTitle: nil), seen.insert(key).inserted {
+                    results.append(
+                        ScopedConvRow(
+                            id: OrbitSidebarLogic.scopedRowId(section: "search", hostId: conv.hostId, agentId: conv.agent.agentId),
+                            conv: conv,
+                            projectName: grp.name
+                        )
+                    )
+                }
             }
         }
         return results
@@ -94,7 +185,7 @@ struct FleetDrawerView: View {
         var results: [(id: String, name: String, cwd: String, branch: String?)] = []
         var seenCwds: Set<String> = []
 
-        for proj in hostProjects {
+        for proj in allOrderedProjects {
             let matched = proj.name.localizedCaseInsensitiveContains(q)
                 || proj.primaryCwd.localizedCaseInsensitiveContains(q)
                 || (proj.gitBranch?.localizedCaseInsensitiveContains(q) ?? false)
@@ -303,7 +394,7 @@ struct FleetDrawerView: View {
         } else {
             if !searchMatchedConversations.isEmpty {
                 sectionHeaderRow("Conversations")
-                ForEach(searchMatchedConversations, id: \.conv.id) { entry in
+                ForEach(searchMatchedConversations) { entry in
                     sessionRow(
                         conv: entry.conv,
                         trailingTag: entry.projectName
@@ -363,8 +454,8 @@ struct FleetDrawerView: View {
                 accentColor: palette.warning,
                 topPadding: 6
             )
-            ForEach(needsAttentionItems, id: \.conv.id) { item in
-                attentionRow(agent: item.conv.agent, projectName: item.projectName)
+            ForEach(needsAttentionItems) { item in
+                attentionRow(conv: item.conv, projectName: item.projectName ?? "Session")
             }
         }
 
@@ -374,8 +465,8 @@ struct FleetDrawerView: View {
                 "Pinned",
                 topPadding: needsAttentionItems.isEmpty ? 6 : 14
             )
-            ForEach(pinnedItems) { conv in
-                sessionRow(conv: conv, project: projectForCwd(conv.agent.cwd))
+            ForEach(pinnedItems) { row in
+                sessionRow(conv: row.conv, project: projectForCwd(row.conv.agent.cwd))
             }
         }
 
@@ -411,7 +502,7 @@ struct FleetDrawerView: View {
         } else {
             ForEach(Array(displayProjects.enumerated()), id: \.element.id) { projIdx, project in
                 let isCollapsed = store.collapsedProjectIds.contains(project.id)
-                let hostId = store.selectedHostId ?? ""
+                let hostId = project.hostId
                 let curatedWorkspaces = project.workspaces.filter { $0.isCurated || $0.isMultiAgent }
                 let visibleUnclassified = (curatedWorkspaces.isEmpty ? project.conversations : project.unclassifiedConversations)
                     .filter { !isHiddenSameHostSubagent($0.agent) }
@@ -444,15 +535,27 @@ struct FleetDrawerView: View {
                             if wsConvs.isEmpty {
                                 emptyWorkspacePlaceholderRow(workspace: ws, project: project)
                             } else {
-                                ForEach(wsConvs) { conv in
-                                    sessionRow(conv: conv, project: project, isInsideWorkspace: true)
+                                let scopedWsRows = wsConvs.map {
+                                    ScopedConvRow(
+                                        id: OrbitSidebarLogic.scopedRowId(
+                                            section: "ws",
+                                            hostId: $0.hostId,
+                                            agentId: $0.agent.agentId,
+                                            containerId: ws.workspaceId
+                                        ),
+                                        conv: $0,
+                                        projectName: nil
+                                    )
+                                }
+                                ForEach(scopedWsRows) { row in
+                                    sessionRow(conv: row.conv, project: project, isInsideWorkspace: true)
                                 }
                             }
                         }
                     }
 
-                    // Unclassified (`待归类`) Inbox or Flat Conversations
-                    if !visibleUnclassified.isEmpty {
+                    // Unclassified (`Unassigned`) Inbox or Flat Conversations
+                    if OrbitSidebarLogic.shouldShowLegacyInbox(itemCount: visibleUnclassified.count) {
                         if !curatedWorkspaces.isEmpty {
                             let inboxCollapsed = store.isInboxCollapsed(for: project)
                             unclassifiedInboxHeaderRow(
@@ -496,9 +599,21 @@ struct FleetDrawerView: View {
         let sliced = isExpandedAll
             ? conversations
             : Array(conversations.prefix(Self.maxVisibleConversationsPerProject))
+        let scopedSliced = sliced.map {
+            ScopedConvRow(
+                id: OrbitSidebarLogic.scopedRowId(
+                    section: "project",
+                    hostId: $0.hostId,
+                    agentId: $0.agent.agentId,
+                    containerId: project.id
+                ),
+                conv: $0,
+                projectName: nil
+            )
+        }
 
-        ForEach(sliced) { conv in
-            sessionRow(conv: conv, project: project, isInsideWorkspace: indented)
+        ForEach(scopedSliced) { row in
+            sessionRow(conv: row.conv, project: project, isInsideWorkspace: indented)
         }
 
         if hiddenCount > 0 {
@@ -675,10 +790,10 @@ struct FleetDrawerView: View {
                 Label("Add Workspace Peer", systemImage: "person.badge.plus")
             }
 
-            if let hid = store.selectedHostId {
+            if !project.hostId.isEmpty {
                 Button {
                     store.renameTarget = .workspace(
-                        hostId: hid,
+                        hostId: project.hostId,
                         workspaceId: workspace.workspaceId,
                         currentTitle: workspace.title
                     )
@@ -773,7 +888,7 @@ struct FleetDrawerView: View {
                         .font(.system(size: 11.5, weight: .medium))
                         .foregroundStyle(palette.fgMuted)
 
-                    Text("待归类 (\(count))")
+                    Text("Unassigned (\(count))")
                         .font(OrbitTypography.meta(.medium))
                         .foregroundStyle(palette.fgMuted)
 
@@ -795,7 +910,7 @@ struct FleetDrawerView: View {
                 HStack(spacing: 3) {
                     Image(systemName: "sparkles")
                         .font(.system(size: 10.5, weight: .semibold))
-                    Text("AI 归类")
+                    Text("AI Organize")
                         .font(.system(size: 11, weight: .medium))
                 }
                 .foregroundStyle(palette.accentViolet)
@@ -1062,9 +1177,21 @@ struct FleetDrawerView: View {
 
             if let pinnedId = project.pinnedProjectId {
                 Button {
+                    store.renameTarget = .project(projectId: pinnedId, currentName: project.name)
+                } label: {
+                    Label("Rename Project", systemImage: "pencil")
+                }
+
+                Button {
                     store.unpinProject(pinnedId)
                 } label: {
                     Label("Unpin Project", systemImage: "pin.slash")
+                }
+
+                Button(role: .destructive) {
+                    store.deleteProject(pinnedId)
+                } label: {
+                    Label("Remove Project", systemImage: "trash")
                 }
             } else {
                 Button {
@@ -1107,10 +1234,11 @@ struct FleetDrawerView: View {
 
     // MARK: - Single-Line Rows (Attention / Conversation / Show More)
 
-    private func attentionRow(agent: FfiAgentCard, projectName: String) -> some View {
-        let isSelected = !store.isDraftNewSession && store.selectedAgentId == agent.agentId
+    private func attentionRow(conv: FfiSidebarConversation, projectName: String) -> some View {
+        let agent = conv.agent
+        let isSelected = !store.isDraftNewSession && store.selectedHostId == conv.hostId && store.selectedAgentId == agent.agentId
         return Button {
-            store.selectAgent(agent.agentId)
+            store.selectAgent(hostId: conv.hostId, agentId: agent.agentId)
         } label: {
             HStack(spacing: 10) {
                 Circle()
@@ -1124,6 +1252,16 @@ struct FleetDrawerView: View {
                     .lineLimit(1)
 
                 Spacer(minLength: OrbitSpacing.xs)
+
+                if store.hosts.count > 1, let hostName = hostDisplayName(for: conv.hostId), conv.hostId != store.selectedHostId {
+                    Text(hostName)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(palette.fgMuted)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(softSurfaceFill, in: Capsule())
+                        .lineLimit(1)
+                }
 
                 Text(projectName)
                     .font(OrbitTypography.meta(.regular))
@@ -1154,7 +1292,7 @@ struct FleetDrawerView: View {
         let hostId = conv.hostId
         let agent = conv.agent
         let isWorktree = conv.isWorktree
-        let isSelected = !store.isDraftNewSession && store.selectedAgentId == agent.agentId
+        let isSelected = !store.isDraftNewSession && store.selectedHostId == hostId && store.selectedAgentId == agent.agentId
         let isPinned = conv.isPinned || store.isThreadPinned(hostId: hostId, agentId: agent.agentId)
         let isUnread = conv.isUnread && !isSelected && !agent.isRunning
         let titleWeight: Font.Weight = (isSelected || isUnread) ? .medium : .regular
@@ -1174,7 +1312,7 @@ struct FleetDrawerView: View {
         let effectiveProjectRoot = project?.primaryCwd ?? agent.cwd
 
         return Button {
-            store.selectAgent(agent.agentId)
+            store.selectAgent(hostId: hostId, agentId: agent.agentId)
         } label: {
             HStack(spacing: 10) {
                 sessionStatusGutter(agent: agent, isUnread: isUnread, isWorktree: isWorktree)
@@ -1192,6 +1330,16 @@ struct FleetDrawerView: View {
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
                         .background(palette.accentViolet.opacity(0.12), in: Capsule())
+                        .lineLimit(1)
+                }
+
+                if store.hosts.count > 1, let hostName = hostDisplayName(for: hostId), hostId != store.selectedHostId {
+                    Text(hostName)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(palette.fgMuted)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(softSurfaceFill, in: Capsule())
                         .lineLimit(1)
                 }
 
@@ -1234,7 +1382,7 @@ struct FleetDrawerView: View {
                         autoApply: true
                     )
                 } label: {
-                    Label("AI 归类此会话", systemImage: "sparkles")
+                    Label("AI Classify Session", systemImage: "sparkles")
                 }
 
                 Button {
@@ -1275,7 +1423,7 @@ struct FleetDrawerView: View {
                             makeUnclassified: true
                         )
                     } label: {
-                        Label("移回待归类", systemImage: "tray")
+                        Label("Move to Unassigned", systemImage: "tray")
                     }
                 } label: {
                     Label("Move to Workspace", systemImage: "folder.badge.gearshape")
@@ -1289,7 +1437,13 @@ struct FleetDrawerView: View {
                     Label(isPinned ? "Unpin" : "Pin", systemImage: isPinned ? "pin.slash" : "pin")
                 }
 
-                if !isUnread && !isSelected {
+                if isUnread {
+                    Button {
+                        store.markAgentRead(hostId: hostId, agentId: agent.agentId)
+                    } label: {
+                        Label("Mark Read", systemImage: "envelope.open")
+                    }
+                } else if !isSelected {
                     Button {
                         store.markAgentUnread(hostId: hostId, agentId: agent.agentId)
                     } label: {
@@ -1311,6 +1465,12 @@ struct FleetDrawerView: View {
             }
 
             Button {
+                store.copyThreadTranscript(hostId: hostId, agentId: agent.agentId)
+            } label: {
+                Label("Copy Transcript", systemImage: "doc.on.doc")
+            }
+
+            Button {
                 store.copyPathToClipboard(agent.cwd)
             } label: {
                 Label("Copy Path", systemImage: "square.on.square")
@@ -1324,10 +1484,18 @@ struct FleetDrawerView: View {
                 Label("Copy Thread ID", systemImage: "number")
             }
 
+            if !agent.workspaceId.isEmpty || agent.parentAgentId != nil {
+                Button {
+                    store.detachAgent(agent.agentId, hostId: hostId)
+                } label: {
+                    Label("Detach Session", systemImage: "arrow.up.right.square")
+                }
+            }
+
             Divider()
 
             Button(role: .destructive) {
-                store.archiveSession(agent.agentId)
+                store.archiveSession(agent.agentId, hostId: hostId)
             } label: {
                 Label {
                     Text("Archive")
@@ -1338,10 +1506,16 @@ struct FleetDrawerView: View {
                 }
             }
             .tint(nil)
-        }
-        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+
             Button(role: .destructive) {
-                store.archiveSession(agent.agentId)
+                store.deleteAgentPermanently(agent.agentId, hostId: hostId)
+            } label: {
+                Label("Delete Permanently", systemImage: "trash")
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(role: .destructive) {
+                store.archiveSession(agent.agentId, hostId: hostId)
             } label: {
                 Label("Archive", systemImage: "archivebox")
             }
@@ -1468,9 +1642,7 @@ struct FleetDrawerView: View {
                             if isCompactOverlay {
                                 store.isDrawerOpen = false
                             }
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-                                store.activeSheet = .qrPair
-                            }
+                            store.presentSheetSafely(.qrPair)
                         },
                         onConnectLocalHost: {
                             isHostPickerPresented = false

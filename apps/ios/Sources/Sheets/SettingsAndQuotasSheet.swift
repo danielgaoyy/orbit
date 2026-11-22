@@ -28,7 +28,7 @@ struct SettingsAndQuotasSheet: View {
     }
 
     private var appVersionLabel: String {
-        let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1"
+        let short = store.appShortVersion
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
         return "\(short) (\(build))"
     }
@@ -78,6 +78,13 @@ struct SettingsAndQuotasSheet: View {
             store.refreshCloudSyncStatus()
             if store.activeHost != nil {
                 store.refreshQuotas()
+            }
+        }
+        .onChange(of: store.cloudSyncStatus?.state) { nextState in
+            if nextState == .ready {
+                cloudPassphraseInput = ""
+                cloudConfirmPassphraseInput = ""
+                cloudGeneratedKey = nil
             }
         }
     }
@@ -344,7 +351,7 @@ struct SettingsAndQuotasSheet: View {
                             .buttonStyle(.plain)
                             .disabled(store.cloudSyncBusy)
                         } else {
-                            SecureField("GitHub Token (`gist` scope)", text: $cloudTokenInput)
+                            SecureField("GitHub Token (gist scope)", text: $cloudTokenInput)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                                 .font(OrbitTypography.code(.regular))
@@ -458,9 +465,6 @@ struct SettingsAndQuotasSheet: View {
                             }
                             let pass = cloudPassphraseInput
                             store.unlockCloudSyncWithPassphrase(pass)
-                            cloudPassphraseInput = ""
-                            cloudConfirmPassphraseInput = ""
-                            cloudGeneratedKey = nil
                         } label: {
                             Text(store.cloudSyncBusy ? "Unlocking…" : (status.remoteVaultExists ? "Unlock & Sync" : "Encrypt & Sync"))
                                 .font(OrbitTypography.subhead(.semibold))
@@ -619,10 +623,7 @@ struct SettingsAndQuotasSheet: View {
 
                 Button {
                     store.hapticLight()
-                    dismiss()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-                        store.activeSheet = .qrPair
-                    }
+                    store.presentSheetSafely(.qrPair)
                 } label: {
                     HStack(spacing: OrbitSpacing.sm + 2) {
                         Image(systemName: "qrcode.viewfinder")

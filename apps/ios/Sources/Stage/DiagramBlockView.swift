@@ -117,6 +117,7 @@ struct DiagramBlockView: View {
     let language: String
     let rawCode: String
     let lines: [FfiHighlightedLine]
+    var isStreaming: Bool = false
 
     @Environment(\.orbitPalette) private var palette
     @Environment(\.orbitDiagramRenderer) private var diagramRenderer
@@ -222,7 +223,19 @@ struct DiagramBlockView: View {
 
             OrbitHairline()
 
-            if !showCode, let rendered, rendered.error == nil, let svg = rendered.svg {
+            if isStreaming {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.mini)
+                        Text("Streaming \(kindTitle) source…")
+                            .font(OrbitTypography.meta(.regular))
+                            .foregroundStyle(palette.fgMuted)
+                    }
+                    rawDiagramSourceBody
+                }
+                .padding(OrbitSpacing.sm)
+            } else if !showCode, let rendered, rendered.error == nil, let svg = rendered.svg {
                 let ratio = max(0.35, min(3.0, CGFloat(rendered.width) / max(1.0, CGFloat(rendered.height))))
                 let maxInlineHeight = min(max(CGFloat(rendered.height) * 1.15, 140), 420)
                 OrbitSvgWebCanvas(svg: svg, isDark: palette.isDark, allowZoomScroll: false)
@@ -243,8 +256,8 @@ struct DiagramBlockView: View {
                 }
                 .frame(maxWidth: .infinity, minHeight: 96)
             } else {
-                CodeBlockView(language: language, rawCode: rawCode, lines: lines)
-                    .padding(OrbitSpacing.xs)
+                rawDiagramSourceBody
+                    .padding(OrbitSpacing.sm)
             }
         }
         .background(palette.code)
@@ -253,7 +266,11 @@ struct DiagramBlockView: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(palette.hairline, lineWidth: 0.5)
         )
-        .task(id: taskKey) {
+        .task(id: "\(taskKey)::\(isStreaming)") {
+            guard !isStreaming else {
+                isLoading = false
+                return
+            }
             isLoading = true
             let result = await diagramRenderer?(kind, rawCode, palette.isDark)
             guard !Task.isCancelled else { return }
@@ -284,6 +301,16 @@ struct DiagramBlockView: View {
                         }
                 }
             }
+        }
+    }
+
+    private var rawDiagramSourceBody: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Text(rawCode)
+                .font(OrbitTypography.code(.regular))
+                .foregroundStyle(palette.fgSecondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 

@@ -720,38 +720,11 @@ public enum OrbitFormatters {
     }
 
     public static func stripWorkspacePrefix(_ rawPath: String, cwd: String) -> String {
-        var normPath = compactPath(rawPath)
-        var normCwd = compactPath(cwd)
-        while normPath.count > 1 && normPath.hasSuffix("/") {
-            normPath.removeLast()
-        }
-        while normCwd.count > 1 && normCwd.hasSuffix("/") {
-            normCwd.removeLast()
-        }
-        if !normCwd.isEmpty && normCwd != "~" {
-            let prefix = normCwd == "/" ? "/" : normCwd + "/"
-            if normPath.hasPrefix(prefix) {
-                let rel = String(normPath.dropFirst(prefix.count))
-                if !rel.isEmpty {
-                    return rel
-                }
-            }
-        }
-        return shortPath(rawPath)
+        OrbitPathLogic.stripWorkspacePrefix(rawPath, cwd: cwd)
     }
 
     public static func decisionLabel(_ raw: String) -> String {
-        let lower = raw.lowercased()
-        if lower == "allow" || lower == "accept" {
-            return "Allow"
-        } else if lower == "allow_always" || lower == "always_allow" || lower == "allow_session" {
-            return "Always Allow"
-        } else if lower == "deny" || lower == "reject" {
-            return "Deny"
-        }
-        return raw
-            .replacingOccurrences(of: "_", with: " ")
-            .capitalized
+        OrbitDecisionLogic.decisionLabel(raw)
     }
 
     private static let lockfileNames: Set<String> = [
@@ -810,27 +783,8 @@ public enum OrbitFormatters {
         }
     }
 
-    private static let genericHandlePrefixes: [String] = [
-        "claude", "codex", "antigravity", "agy", "agent", "peer", "session", "worker"
-    ]
-
     public static func isGenericHarnessHandle(_ raw: String?) -> Bool {
-        guard let raw else { return true }
-        let clean = raw
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
-            .lowercased()
-        if clean.isEmpty { return true }
-        for prefix in genericHandlePrefixes {
-            if clean == prefix { return true }
-            if clean.hasPrefix("\(prefix)-") || clean.hasPrefix("\(prefix)_") {
-                let suffix = String(clean.dropFirst(prefix.count + 1))
-                if suffix.allSatisfy({ $0.isNumber }) {
-                    return true
-                }
-            }
-        }
-        return false
+        OrbitAgentLogic.isGenericHarnessHandle(raw)
     }
 
     public static func semanticAgentTabLabel(
@@ -886,7 +840,27 @@ public enum OrbitFormatters {
     }
 
     public static func shortFileLabel(_ path: String, rootCwd: String) -> String {
-        stripWorkspacePrefix(path, cwd: rootCwd)
+        OrbitPathLogic.shortFileLabel(path, rootCwd: rootCwd)
+    }
+
+    public static func formatDurationCompact(_ milliseconds: UInt64) -> String {
+        OrbitTimeLogic.formatDurationCompact(milliseconds)
+    }
+
+    public static func isAgentForegroundRunning(statusRaw: String?, hasActiveTurn: Bool) -> Bool {
+        OrbitAgentLogic.isAgentForegroundRunning(statusRaw: statusRaw, hasActiveTurn: hasActiveTurn)
+    }
+
+    public static func isAgentBackgroundWaiting(statusRaw: String?, hasActiveTurn: Bool, hasBackgroundTasks: Bool) -> Bool {
+        OrbitAgentLogic.isAgentBackgroundWaiting(
+            statusRaw: statusRaw,
+            hasActiveTurn: hasActiveTurn,
+            hasBackgroundTasks: hasBackgroundTasks
+        )
+    }
+
+    public static func iconName(forSlashCommandId id: String) -> String {
+        OrbitComposerLogic.iconName(forSlashCommandId: id)
     }
 
     public static func relativeTimeFromRfc3339(_ rfc3339: String?) -> String {
@@ -1108,22 +1082,10 @@ public extension View {
 
 public extension Color {
     init(hex: String) {
-        let clean = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-        var rgb: UInt64 = 0
-        Scanner(string: clean).scanHexInt64(&rgb)
-
-        switch clean.count {
-        case 8:
-            let a = Double((rgb >> 24) & 0xFF) / 255.0
-            let r = Double((rgb >> 16) & 0xFF) / 255.0
-            let g = Double((rgb >> 8) & 0xFF) / 255.0
-            let b = Double(rgb & 0xFF) / 255.0
-            self.init(red: r, green: g, blue: b, opacity: a)
-        default:
-            let r = Double((rgb >> 16) & 0xFF) / 255.0
-            let g = Double((rgb >> 8) & 0xFF) / 255.0
-            let b = Double(rgb & 0xFF) / 255.0
-            self.init(red: r, green: g, blue: b)
+        if let parsed = OrbitTimeLogic.parseHexColor(hex) {
+            self.init(red: parsed.red, green: parsed.green, blue: parsed.blue, opacity: parsed.alpha)
+        } else {
+            self.init(red: 0, green: 0, blue: 0)
         }
     }
 }

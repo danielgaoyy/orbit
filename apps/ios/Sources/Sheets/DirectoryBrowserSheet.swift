@@ -8,6 +8,7 @@ struct DirectoryBrowserSheet: View {
     @State private var manualPathInput = ""
     @State private var isEditingPath = false
     @State private var filterQuery = ""
+    @State private var didRequestInitialListing = false
     @FocusState private var isPathFieldFocused: Bool
 
     private var groupedBackground: Color {
@@ -141,7 +142,12 @@ struct DirectoryBrowserSheet: View {
         }
         .onAppear {
             manualPathInput = store.activeCwd
-            store.listRemoteDirectory(store.activeCwd == "~" ? nil : store.activeCwd)
+            if !didRequestInitialListing {
+                didRequestInitialListing = true
+                if listing == nil {
+                    store.listRemoteDirectory(store.activeCwd == "~" ? nil : store.activeCwd)
+                }
+            }
         }
         .onChange(of: listing?.currentPath) { newPath in
             if let path = newPath, !path.isEmpty {
@@ -553,6 +559,9 @@ struct DirectoryBrowserSheet: View {
 
                     Button {
                         store.hapticLight()
+                        if pinnedProjectForCurrentPath == nil && currentPath != "~" {
+                            store.addProjectDirectory(name: currentFolderName, path: currentPath)
+                        }
                         store.startNewSessionDraft(cwd: currentPath)
                         dismiss()
                     } label: {

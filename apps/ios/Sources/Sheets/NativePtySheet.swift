@@ -527,22 +527,28 @@ struct NativePtySheet: View {
         .background(palette.elevated)
     }
 
-    private func handleLiveModifierIfArmed(_ text: String) {
-        guard (isCtrlArmed || isAltArmed), let firstChar = text.first else { return }
+    private func handleLiveModifierIfArmed(_ newText: String) {
+        guard isCtrlArmed || isAltArmed else { return }
+        let addedChar = newText.last
+        guard let ch = addedChar else { return }
         if isCtrlArmed {
-            if let ascii = firstChar.asciiValue {
+            if let ascii = ch.asciiValue {
                 let ctrlByte = ascii & 0x1F
                 store.sendTerminalBytes(Data([ctrlByte]))
             } else {
-                store.sendTerminalKeys(String(firstChar))
+                store.sendTerminalKeys(String(ch))
             }
             isCtrlArmed = false
         } else if isAltArmed {
-            store.sendTerminalKeys("\u{001B}" + String(firstChar))
+            store.sendTerminalKeys("\u{001B}" + String(ch))
             isAltArmed = false
         }
         store.hapticLight()
-        commandBuffer = ""
+        if commandBuffer.count <= 1 {
+            commandBuffer = ""
+        } else {
+            commandBuffer.removeLast()
+        }
     }
 
     private func sendRawKey(_ seq: String) {

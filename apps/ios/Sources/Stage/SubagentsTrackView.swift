@@ -1,5 +1,172 @@
 import SwiftUI
 
+/// Approval banner surfaced whenever same-host managed subagents are waiting for permission.
+struct SubagentApprovalBanner: View {
+    @ObservedObject var store: OrbitIosStore
+    @Environment(\.orbitPalette) private var palette
+
+    private var pendingChildren: [FfiAgentCard] {
+        store.activePendingSubagentApprovals
+    }
+
+    var body: some View {
+        if !pendingChildren.isEmpty && !store.isDraftNewSession {
+            VStack(spacing: 6) {
+                ForEach(pendingChildren, id: \.agentId) { child in
+                    HStack(spacing: OrbitSpacing.sm) {
+                        Circle()
+                            .fill(palette.warning)
+                            .frame(width: 7, height: 7)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(child.title.isEmpty ? "Subagent awaiting approval" : child.title)
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                                .lineLimit(1)
+                            Text("\(child.providerLabel) · Needs permission")
+                                .font(.system(size: 11, weight: .regular))
+                                .foregroundStyle(palette.warning)
+                                .lineLimit(1)
+                        }
+
+                        Spacer(minLength: 4)
+
+                        Button {
+                            store.subagentInspectorTarget = OrbitSubagentInspectorTarget(
+                                hostId: store.selectedHostId ?? "",
+                                parentAgentId: store.selectedAgentId ?? "",
+                                childAgentId: child.agentId,
+                                title: child.title.isEmpty ? "Subagent" : child.title
+                            )
+                        } label: {
+                            Text("Inspect")
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(palette.fgPrimary)
+                                .padding(.horizontal, 10)
+                                .frame(height: 26)
+                                .background(palette.subtleFill, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            if let hid = store.selectedHostId {
+                                store.selectAgent(hostId: hid, agentId: child.agentId)
+                            }
+                        } label: {
+                            Text("Open")
+                                .font(OrbitTypography.meta(.semibold))
+                                .foregroundStyle(palette.warning)
+                                .padding(.horizontal, 10)
+                                .frame(height: 26)
+                                .background(palette.warning.opacity(0.14), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, OrbitSpacing.md)
+                    .padding(.vertical, 8)
+                    .background(palette.warning.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .strokeBorder(palette.warning.opacity(0.35), lineWidth: 0.5)
+                    )
+                }
+            }
+            .padding(.horizontal, OrbitSpacing.lg)
+            .padding(.top, 4)
+        }
+    }
+}
+
+/// Structured detail sheet for inspecting either a managed child agent or provider native subagent timeline.
+struct SubagentInspectorSheet: View {
+    @ObservedObject var store: OrbitIosStore
+    let target: OrbitSubagentInspectorTarget
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.orbitPalette) private var palette
+
+    private var managedChild: FfiAgentCard? {
+        guard let childId = target.childAgentId else { return nil }
+        return store.detail(forHostId: target.hostId)?.agents.first(where: { $0.agentId == childId })
+    }
+
+    private var nativeEvents: [FfiProviderSubagentEvent] {
+        guard let subId = target.providerSubagentId else { return [] }
+        return store.providerSubagentEvents(parentAgentId: target.parentAgentId, subagentId: subId)
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: OrbitSpacing.md) {
+                    if let child = managedChild {
+                        HStack(spacing: OrbitSpacing.sm) {
+                            OrbitProviderIcon(provider: child.provider, size: 16)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(child.title.isEmpty ? "Subagent" : child.title)
+                                    .font(OrbitTypography.subhead(.semibold))
+                                    .foregroundStyle(palette.fgPrimary)
+                                Text("\(child.providerLabel) · \(child.statusLabel)")
+                                    .font(OrbitTypography.meta(.regular))
+                                    .foregroundStyle(child.isAwaitingPermission ? palette.warning : palette.fgMuted)
+                            }
+                            Spacer()
+                            Button("Open Thread") {
+                                dismiss()
+                                store.selectAgent(hostId: target.hostId, agentId: child.agentId)
+                            }
+                            .font(OrbitTypography.meta(.semibold))
+                            .foregroundStyle(palette.primary)
+                        }
+                        .padding(OrbitSpacing.md)
+                        .background(palette.elevated)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    } else if let subId = target.providerSubagentId {
+                        if nativeEvents.isEmpty {
+                            Text("No recorded subagent events yet for \(subId).")
+                                .font(OrbitTypography.meta(.regular))
+                                .foregroundStyle(palette.fgMuted)
+                                .padding(OrbitSpacing.md)
+                        } else {
+                            ForEach(nativeEvents, id: \.seq) { ev in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(ev.summaryText)
+                                        .font(OrbitTypography.subhead(.regular))
+                                        .foregroundStyle(palette.fgPrimary)
+                                    Text(ev.timestampRfc3339)
+                                        .font(OrbitTypography.meta(.regular))
+                                        .foregroundStyle(palette.fgMuted)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(OrbitSpacing.md)
+                                .background(palette.elevated)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            }
+                        }
+                    }
+                }
+                .padding(OrbitSpacing.lg)
+            }
+            .background((palette.isDark ? palette.canvas : palette.drawer).ignoresSafeArea())
+            .navigationTitle(target.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                        .font(OrbitTypography.subhead(.semibold))
+                        .foregroundStyle(palette.primary)
+                }
+            }
+            .onAppear {
+                if let subId = target.providerSubagentId {
+                    store.openProviderSubagentTimeline(parentAgentId: target.parentAgentId, subagentId: subId)
+                }
+            }
+        }
+    }
+}
+
 /// Floating Liquid Glass Subagents pill docked above the composer + detail sheet
 /// for both Orbit Managed Subagents and Provider Native Subagents.
 struct SubagentsTrackPill: View {
@@ -102,6 +269,7 @@ struct SubagentsListSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.orbitPalette) private var palette
     @State private var expandedNativeIds: Set<String> = []
+    @State private var localInspectorTarget: OrbitSubagentInspectorTarget? = nil
 
     private var managed: [FfiAgentCard] { store.visibleManagedSubagents }
     private var native: [FfiProviderSubagentDescriptor] { store.visibleProviderSubagents }
@@ -166,6 +334,12 @@ struct SubagentsListSheet: View {
                         .foregroundStyle(palette.primary)
                 }
             }
+            .sheet(item: $localInspectorTarget) { target in
+                SubagentInspectorSheet(store: store, target: target)
+                    .environment(\.orbitPalette, palette)
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
+            }
         }
     }
 
@@ -206,6 +380,23 @@ struct SubagentsListSheet: View {
                 }
 
                 Spacer(minLength: 4)
+
+                Button {
+                    localInspectorTarget = OrbitSubagentInspectorTarget(
+                        hostId: store.selectedHostId ?? "",
+                        parentAgentId: store.selectedAgentId ?? "",
+                        childAgentId: child.agentId,
+                        title: child.title.isEmpty ? "Subagent" : child.title
+                    )
+                } label: {
+                    Text("Inspect")
+                        .font(OrbitTypography.meta(.semibold))
+                        .foregroundStyle(palette.fgSecondary)
+                        .padding(.horizontal, 10)
+                        .frame(height: 28)
+                        .background(palette.subtleFill, in: Capsule())
+                }
+                .buttonStyle(.plain)
 
                 Button {
                     dismiss()

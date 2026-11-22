@@ -101,6 +101,16 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+          xcodebuild \
+            -project apps/ios/OrbitMobile.xcodeproj \
+            -scheme OrbitMobile \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=$SIM_UDID" \
+            -derivedDataPath apps/ios/build/SimDerivedData \
+            -only-testing:OrbitMobileLogicTests \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
           APP_PATH="apps/ios/build/SimDerivedData/Build/Products/Debug-iphonesimulator/OrbitMobile.app"
           BUNDLE_ID="dev.orbit.app"
           xcrun simctl install "$SIM_UDID" "$APP_PATH"
@@ -126,6 +136,13 @@ jobs:
             fi
             sleep 3
             xcrun simctl io "$SIM_UDID" screenshot "/tmp/ios-sim-screenshots/${mode}.png"
+          done
+
+          for demo_theme in dark light; do
+            xcrun simctl terminate "$SIM_UDID" "$BUNDLE_ID" >/dev/null 2>&1 || true
+            xcrun simctl launch "$SIM_UDID" "$BUNDLE_ID" -orbitTheme "$demo_theme" -orbitDemoChat
+            sleep 3
+            xcrun simctl io "$SIM_UDID" screenshot "/tmp/ios-sim-screenshots/demo-chat-${demo_theme}.png"
           done
           ls -la /tmp/ios-sim-screenshots
       - uses: actions/upload-artifact@v4

@@ -1122,6 +1122,8 @@ const SubagentCallChips = memo(function SubagentCallChips({
               <OrbitSpinner size={11} className="text-foreground/70" />
             ) : subagent.status === "failed" ? (
               <AlertTriangle className="size-3 text-rose-500" />
+            ) : subagent.status === "canceled" ? (
+              <span className="bg-muted-foreground/45 size-[6px] rounded-full" />
             ) : (
               <Check className="size-3 stroke-[2.2] text-emerald-600/85 dark:text-emerald-400/85" />
             )}

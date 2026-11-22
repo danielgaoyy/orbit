@@ -227,7 +227,7 @@ export const OmniComposer = memo(function OmniComposer({
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const mirrorTextareaRef = useRef<HTMLDivElement | null>(null);
-  const lastTextareaHeightRef = useRef<number>(46);
+  const lastTextareaHeightRef = useRef<number>(38);
   const [composerWidthPx, setComposerWidthPx] = useState(0);
   const [isCompactBar, setIsCompactBar] = useState(false);
   const draftTextRef = useRef<string>(draftText);
@@ -361,8 +361,8 @@ export const OmniComposer = memo(function OmniComposer({
     return () => window.clearTimeout(timer);
   }, [selectedHostId, selectedCwd]);
 
-  const minTextareaHeight = 46;
-  const maxTextareaHeight = 220;
+  const minTextareaHeight = 38;
+  const maxTextareaHeight = 212;
 
   useLayoutEffect(() => {
     if (!slashDirective) {
@@ -403,9 +403,9 @@ export const OmniComposer = memo(function OmniComposer({
     if (!el) return;
 
     if (draftText.length === 0 && !slashDirective) {
-      if (lastTextareaHeightRef.current !== minTextareaHeight || el.style.height !== "46px") {
+      if (lastTextareaHeightRef.current !== minTextareaHeight || el.style.height !== "38px") {
         lastTextareaHeightRef.current = minTextareaHeight;
-        el.style.height = "46px";
+        el.style.height = "38px";
       }
       if (el.style.overflowY !== "hidden") {
         el.style.overflowY = "hidden";
@@ -415,11 +415,21 @@ export const OmniComposer = memo(function OmniComposer({
 
     const mirror = mirrorTextareaRef.current;
     if (!mirror) return;
-    const measured = Math.max(mirror.offsetHeight, mirror.scrollHeight);
-    const nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
+    let measured = Math.max(mirror.offsetHeight, mirror.scrollHeight);
+    let nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
     if (lastTextareaHeightRef.current !== nextHeight || el.style.height !== `${nextHeight}px`) {
       lastTextareaHeightRef.current = nextHeight;
       el.style.height = `${nextHeight}px`;
+    }
+    // Guard against subtle WKWebView wrapping differences between the off-flow div mirror and
+    // native textarea (e.g. CJK line breaks) so wrapped lines never clip while overflow-y is hidden.
+    if (measured <= maxTextareaHeight && el.scrollHeight > nextHeight + 1) {
+      measured = el.scrollHeight;
+      nextHeight = Math.min(maxTextareaHeight, Math.max(minTextareaHeight, measured));
+      if (lastTextareaHeightRef.current !== nextHeight || el.style.height !== `${nextHeight}px`) {
+        lastTextareaHeightRef.current = nextHeight;
+        el.style.height = `${nextHeight}px`;
+      }
     }
     const nextOverflow = measured > maxTextareaHeight ? "auto" : "hidden";
     if (el.style.overflowY !== nextOverflow) {
@@ -1231,7 +1241,7 @@ export const OmniComposer = memo(function OmniComposer({
             <ContextTray contexts={contexts} quotes={quotes} pastes={pastes} />
 
             {/* Auto-growing Prose Textarea + Off-Flow Mirror Sizer + Inline Slash Token + Placeholder */}
-            <div className="relative">
+            <div className="relative overflow-hidden">
               {slashDirective && (
                 <span
                   ref={directivePrefixRef}
@@ -1280,7 +1290,7 @@ export const OmniComposer = memo(function OmniComposer({
                     ? { textIndent: `${directiveIndentPx}px` }
                     : undefined
                 }
-                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] py-[13px] text-[15px] leading-[20px] whitespace-pre-wrap break-words"
+                className="pointer-events-none invisible absolute top-0 right-0 left-0 -z-10 block w-full px-[14px] pt-[13px] pb-[5px] text-[15px] leading-[20px] whitespace-pre-wrap break-words"
               >
                 {draftText}
                 {"\u200b"}
@@ -1325,12 +1335,12 @@ export const OmniComposer = memo(function OmniComposer({
                 {...ime.compositionProps}
                 onKeyDown={handleKeyDown}
                 rows={1}
-                className="text-foreground block min-h-[46px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] py-[13px] text-[15px] leading-[20px] outline-none"
+                className="text-foreground block min-h-[38px] w-full resize-none overflow-y-hidden bg-transparent px-[14px] pt-[13px] pb-[5px] text-[15px] leading-[20px] outline-none"
               />
             </div>
 
             {/* Bottom Control Bar (`34px` uniform control rhythm) */}
-            <div className="flex items-center justify-between gap-2 px-2.5 pt-0 pb-2">
+            <div className="flex items-center justify-between gap-2 px-2.5 pt-2 pb-2">
               <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden">
                 {/* 1. `[+]` Add Context Menu (`34×34` -> Files, Mentions, Actions) */}
                 <DropdownMenu>

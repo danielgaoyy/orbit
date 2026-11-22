@@ -8,7 +8,12 @@ import type {
   TimelineItemView,
 } from "@/lib/orbit-ipc";
 
-export type ResolvedSubagentStatus = "awaiting_permission" | "running" | "failed" | "completed";
+export type ResolvedSubagentStatus =
+  | "awaiting_permission"
+  | "running"
+  | "failed"
+  | "canceled"
+  | "completed";
 
 export interface ResolvedSubagentItem {
   /** Stable unique key for React lists */
@@ -41,16 +46,26 @@ const STATUS_PRIORITY: Record<ResolvedSubagentStatus, number> = {
   awaiting_permission: 0,
   running: 1,
   failed: 2,
-  completed: 3,
+  canceled: 3,
+  completed: 4,
 };
 
 function mapManagedStatus(agent: AgentCardView, fallbackStatus?: string): ResolvedSubagentStatus {
   if (agent.is_awaiting_permission) return "awaiting_permission";
   if (agent.is_running || agent.has_background_tasks) return "running";
+  const lowerLabel = agent.status_label.toLowerCase();
+  if (
+    lowerLabel.includes("cancel") ||
+    lowerLabel.includes("interrupt") ||
+    lowerLabel.includes("stopped")
+  ) {
+    return "canceled";
+  }
   if (
     fallbackStatus === "failed" ||
     fallbackStatus === "denied" ||
-    agent.status_label.toLowerCase().includes("error")
+    lowerLabel.includes("error") ||
+    lowerLabel.includes("fail")
   ) {
     return "failed";
   }
@@ -62,6 +77,7 @@ function mapProviderSubagentStatus(
 ): ResolvedSubagentStatus {
   if (status === "running") return "running";
   if (status === "completed") return "completed";
+  if (status === "canceled" || status === "stopped") return "canceled";
   return "failed";
 }
 

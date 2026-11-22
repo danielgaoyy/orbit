@@ -224,11 +224,11 @@ export const ReviewTab = memo(function ReviewTab({
     if (isRefreshing) return;
     setIsRefreshing(true);
     try {
-      await orbitActions.refreshGit(selectedHostId, selectedCwd, selectedDiffPath, diffStaged);
+      await orbitActions.refreshGit(selectedHostId, selectedCwd, null, diffStaged);
     } finally {
       setIsRefreshing(false);
     }
-  }, [isRefreshing, selectedHostId, selectedCwd, selectedDiffPath, diffStaged]);
+  }, [isRefreshing, selectedHostId, selectedCwd, diffStaged]);
 
   const showApplyToLocal = Boolean(activeWorkspace?.is_worktree);
   const showMoveToWorktree = Boolean(

@@ -745,6 +745,7 @@ export function SidePanelLaunchpad({
                         const isAwaiting = subagent.status === "awaiting_permission";
                         const isRunning = subagent.status === "running";
                         const isFailed = subagent.status === "failed";
+                        const isCanceled = subagent.status === "canceled";
                         return (
                           <button
                             key={subagent.key}
@@ -773,6 +774,8 @@ export function SidePanelLaunchpad({
                                 <Loader2 className="text-muted-foreground h-[14px] w-[14px] shrink-0 animate-spin" />
                               ) : isFailed ? (
                                 <AlertCircle className="h-[14px] w-[14px] shrink-0 text-red-500" />
+                              ) : isCanceled ? (
+                                <span className="bg-muted-foreground/45 size-[6.5px] shrink-0 rounded-full" />
                               ) : (
                                 <CheckCircle2 className="h-[14px] w-[14px] shrink-0 text-emerald-600 dark:text-emerald-400" />
                               )}

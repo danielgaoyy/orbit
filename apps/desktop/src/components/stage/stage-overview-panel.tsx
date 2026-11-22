@@ -43,6 +43,7 @@ import {
   orbitIpc,
 } from "@/lib/orbit-ipc";
 import { type ResolvedSubagentItem, resolveSessionSubagents } from "@/lib/subagents";
+import { normalizeCwdForCompare } from "@/lib/stage-cache";
 import { formatDurationCompact } from "@/lib/timeline-coalesce";
 import {
   type OverviewSectionId,
@@ -227,9 +228,20 @@ const StageOverviewBody = memo(function StageOverviewBody({
   const hostDetails = useOrbitSelector((s) => s.hostDetails);
   const fleetHosts = useOrbitSelector((s) => s.fleet.hosts);
   const hostDetail = hostDetails[hostId] ?? null;
-  const gitReview = useOrbitSelector((s) =>
-    cwd ? (s.gitReviews[`${hostId}::${cwd}`] ?? null) : null,
-  );
+  const gitReview = useOrbitSelector((s) => {
+    if (!cwd) return null;
+    const exact = s.gitReviews[`${hostId}::${cwd}`];
+    if (exact) return exact;
+    const norm = normalizeCwdForCompare(cwd);
+    if (!norm) return null;
+    const prefix = `${hostId}::`;
+    for (const [key, val] of Object.entries(s.gitReviews)) {
+      if (key.startsWith(prefix) && normalizeCwdForCompare(key.slice(prefix.length)) === norm) {
+        return val;
+      }
+    }
+    return null;
+  });
   const terminalTabs = useOrbitSelector((s) => s.terminalTabs);
   const [expandedTasks, setExpandedTasks] = useState<Record<string, boolean>>({});
   const [stoppingBg, setStoppingBg] = useState(false);
@@ -610,6 +622,8 @@ const StageOverviewBody = memo(function StageOverviewBody({
                       <OrbitSpinner size={13.5} className="text-foreground/70" />
                     ) : sa.status === "completed" ? (
                       <CircleCheck className="size-[14px] shrink-0 text-emerald-600/85 dark:text-emerald-400/85" />
+                    ) : sa.status === "canceled" ? (
+                      <span className="bg-muted-foreground/45 size-[6.5px] rounded-full" />
                     ) : (
                       <AlertCircle className="size-[14px] shrink-0 text-rose-500/85" />
                     )}

@@ -11,10 +11,36 @@ import {
 } from "@/components/stage/stream-stage";
 import { OrbitSpinner } from "@/components/ui/orbit-spinner";
 import { type StageTurnView, orbitIpc } from "@/lib/orbit-ipc";
+import { computeSubagentTurnsFingerprint } from "@/lib/stage-cache";
 import { type SidePanelTab, orbitActions, useOrbitSelector } from "@/state/orbit-store";
 
-const NOOP_THINKING_DURATION = () => null;
 const NOOP_REWIND = () => {};
+
+interface ThinkingTimingRecord {
+  startedAtMs: number;
+  completedAtMs: number | null;
+  durationMs: number | null;
+}
+
+function buildSubagentTurnThinkingSignature(
+  turn: StageTurnView,
+  agentId: string,
+  thinkingTimings: Record<string, ThinkingTimingRecord>,
+): string {
+  let sig = "";
+  for (const seg of turn.live_segments) {
+    if (seg.kind !== "step_group") continue;
+    for (const it of seg.items) {
+      if (it.item_type !== "assistant_thinking") continue;
+      const key = `${agentId}::think::${it.item_id || it.seq}`;
+      const dur = thinkingTimings[key]?.durationMs;
+      if (dur !== null && dur !== undefined) {
+        sig += `${it.seq}:${dur};`;
+      }
+    }
+  }
+  return sig;
+}
 
 function buildFallbackPromptTurn(callId: string, text: string): StageTurnView {
   return {
@@ -110,6 +136,20 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
       ? s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state === "disconnected"
       : false,
   );
+  const parentHostConnected = useOrbitSelector((s) => {
+    if (!parentHostId) return false;
+    const conn =
+      s.fleet.hosts.find((h) => h.host_id === parentHostId)?.connection_state ??
+      s.hostDetails[parentHostId]?.host.connection_state;
+    return conn === "online_direct" || conn === "online_relay";
+  });
+  const managedHostConnected = useOrbitSelector((s) => {
+    if (!hostId) return false;
+    const conn =
+      s.fleet.hosts.find((h) => h.host_id === hostId)?.connection_state ??
+      s.hostDetails[hostId]?.host.connection_state;
+    return conn === "online_direct" || conn === "online_relay";
+  });
   const childAgent = useOrbitSelector((s) =>
     hostId && tab.childAgentId
       ? (s.hostDetails[hostId]?.agents.find((a) => a.agent_id === tab.childAgentId) ?? null)
@@ -134,21 +174,32 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   });
 
   const isManaged = Boolean(hostId && tab.childAgentId && childAgent);
-  const status = childAgent
+  const childStatusLabel = childAgent?.status_label.toLowerCase() ?? "";
+  const status: "awaiting_permission" | "running" | "completed" | "canceled" | "failed" = childAgent
     ? childAgent.is_awaiting_permission
       ? "awaiting_permission"
-      : childAgent.is_running
+      : childAgent.is_running || childAgent.has_background_tasks
         ? "running"
-        : childAgent.status_label.toLowerCase().includes("error")
-          ? "failed"
-          : "completed"
+        : childStatusLabel.includes("cancel") ||
+            childStatusLabel.includes("interrupt") ||
+            childStatusLabel.includes("stopped")
+          ? "canceled"
+          : childStatusLabel.includes("error") || childStatusLabel.includes("fail")
+            ? "failed"
+            : "completed"
     : providerSubagent
       ? providerSubagent.status === "running"
         ? "running"
         : providerSubagent.status === "completed"
           ? "completed"
-          : "failed"
-      : (parentSubagent?.status ?? "completed");
+          : providerSubagent.status === "canceled" || providerSubagent.status === "stopped"
+            ? "canceled"
+            : "failed"
+      : parentSubagent?.status === "running"
+        ? "running"
+        : parentSubagent?.status === "failed" || parentSubagent?.status === "denied"
+          ? "failed"
+          : "completed";
 
   const resolvedPrompt = tab.subagentPrompt || providerSubagent?.subtitle || "";
   const [providerTurns, setProviderTurns] = useState<StageTurnView[]>([]);
@@ -156,6 +207,13 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
   providerTurnsRef.current = providerTurns;
   const refetchMissGuardRef = useRef<string | null>(null);
   const lastFingerprintRef = useRef<string>("");
+  const prevProviderSubKeyRef = useRef<string | null>(null);
+  const wasParentHostConnectedRef = useRef<boolean>(parentHostConnected);
+  const wasManagedHostConnectedRef = useRef<boolean>(managedHostConnected);
+  const isActiveTab = useOrbitSelector((s) => s.sidePanelOpen && s.activeSidePanelTabId === tab.id);
+  const wasActiveTabRef = useRef<boolean>(isActiveTab);
+  const thinkingTimingsRef = useRef<Record<string, ThinkingTimingRecord>>({});
+  const [, setThinkingTick] = useState(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef<boolean>(true);
   const holdViewport = useViewportAnchorHold(viewportRef, stickToBottomRef);
@@ -163,12 +221,42 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     useState<PromptImagePreviewTarget | null>(null);
   const handleCloseImagePreview = useCallback(() => setImagePreviewTarget(null), []);
 
-  // Ensure daemon hydrates & subscribes the provider subagent timeline on open or reconnect
+  const getThinkingDurationMs = useCallback((thinkKey: string): number | null => {
+    return thinkingTimingsRef.current[thinkKey]?.durationMs ?? null;
+  }, []);
+
+  // Ensure daemon hydrates & subscribes the provider subagent timeline on open, tab activation, or WS reconnect
   useEffect(() => {
-    refetchMissGuardRef.current = null;
+    const subKey =
+      parentHostId && parentAgentId && tab.providerSubagentId
+        ? `${parentHostId}::${parentAgentId}::${tab.providerSubagentId}`
+        : null;
+    const targetChanged = prevProviderSubKeyRef.current !== subKey;
+    const reconnected = parentHostConnected && !wasParentHostConnectedRef.current;
+    const reactivated = isActiveTab && !wasActiveTabRef.current;
+    prevProviderSubKeyRef.current = subKey;
+    wasParentHostConnectedRef.current = parentHostConnected;
+    wasActiveTabRef.current = isActiveTab;
+
     if (!parentHostId || !parentAgentId || !tab.providerSubagentId) return;
-    void orbitIpc.openProviderSubagentTimeline(parentHostId, parentAgentId, tab.providerSubagentId);
-  }, [parentHostId, parentAgentId, tab.providerSubagentId]);
+    if (targetChanged || reconnected || reactivated) {
+      refetchMissGuardRef.current = null;
+      void orbitActions.openProviderSubagentTimeline(
+        parentHostId,
+        parentAgentId,
+        tab.providerSubagentId,
+      );
+    }
+  }, [parentHostId, parentAgentId, tab.providerSubagentId, parentHostConnected, isActiveTab]);
+
+  // Also re-subscribe managed child timeline on host WS reconnect while the tab is open
+  useEffect(() => {
+    const reconnected = managedHostConnected && !wasManagedHostConnectedRef.current;
+    wasManagedHostConnectedRef.current = managedHostConnected;
+    if (!reconnected || !hostId || !tab.childAgentId) return;
+    void orbitIpc.openAgentTimeline(hostId, tab.childAgentId);
+    void orbitActions.pullStageDelta(hostId, tab.childAgentId, true);
+  }, [managedHostConnected, hostId, tab.childAgentId]);
 
   // Project provider subagent events through the exact same Rust stage pipeline reactively
   // whenever `parentHostRevision` ticks (Catchup / Live events bump host revision immediately).
@@ -206,13 +294,12 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
           // trigger one automatic re-subscribe recovery and preserve existing rendered turns.
           if (refetchMissGuardRef.current !== subKey) {
             refetchMissGuardRef.current = subKey;
-            void orbitIpc.openProviderSubagentTimeline(parentHostId, parentAgentId, subId);
+            void orbitActions.openProviderSubagentTimeline(parentHostId, parentAgentId, subId);
           }
           return;
         }
-        const lastTurn = turns[turns.length - 1];
-        const fp = `${turns.length}:${lastTurn?.key ?? ""}:${lastTurn?.live_segments.length ?? 0}:${lastTurn?.folded_steps.length ?? 0}:${lastTurn?.work_counts.total_steps ?? 0}:${Boolean(lastTurn?.terminal_reply)}:${Boolean(lastTurn?.has_active_item)}:${lastTurn?.completed_at_ms ?? 0}`;
-        if (fp !== lastFingerprintRef.current || turns.length !== providerTurns.length) {
+        const fp = computeSubagentTurnsFingerprint(turns);
+        if (fp !== lastFingerprintRef.current || turns.length !== providerTurnsRef.current.length) {
           lastFingerprintRef.current = fp;
           setProviderTurns(turns);
         }
@@ -254,9 +341,81 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
     return [];
   }, [childStage, providerTurns, resolvedPrompt, tab.id, tab.subagentCallId]);
 
-  const contentVersion = `${childStage?.revision ?? 0}:${providerTurns.length}:${parentHostRevision}:${displayTurns[displayTurns.length - 1]?.live_segments.length ?? 0}`;
+  const displayTurnsFingerprint = useMemo(
+    () => computeSubagentTurnsFingerprint(displayTurns),
+    [displayTurns],
+  );
+  const contentVersion = `${childStage?.revision ?? 0}:${parentHostRevision}:${displayTurnsFingerprint}`;
   const effectiveAgentId = tab.childAgentId ?? tab.providerSubagentId ?? parentAgentId ?? "";
   const effectiveHostId = isManaged ? (hostId ?? "") : (parentHostId ?? "");
+
+  const latestTurn = displayTurns[displayTurns.length - 1] ?? null;
+  const isLatestTurnActive = Boolean(latestTurn && status === "running");
+
+  // Track live per-thinking-block start/completion durations matching StreamStage
+  useEffect(() => {
+    if (!effectiveAgentId) return;
+    let changed = false;
+    const now = Date.now();
+    const activeThinkKeys = new Set<string>();
+
+    if (latestTurn) {
+      const lastSeg = latestTurn.live_segments[latestTurn.live_segments.length - 1] ?? null;
+      const lastSegItem =
+        lastSeg?.kind === "step_group" ? (lastSeg.items[lastSeg.items.length - 1] ?? null) : null;
+
+      for (const seg of latestTurn.live_segments) {
+        if (seg.kind !== "step_group") continue;
+        for (const item of seg.items) {
+          if (item.item_type !== "assistant_thinking") continue;
+
+          const thinkKey = `${effectiveAgentId}::think::${item.item_id || item.seq}`;
+          const isCurrentlyThinking =
+            isLatestTurnActive &&
+            lastSegItem?.item_type === "assistant_thinking" &&
+            lastSegItem.seq === item.seq;
+          const prevThink = thinkingTimingsRef.current[thinkKey];
+
+          if (isCurrentlyThinking) {
+            activeThinkKeys.add(thinkKey);
+            if (!prevThink) {
+              const seededStartMs =
+                item.timestamp_ms != null && item.timestamp_ms <= now ? item.timestamp_ms : now;
+              thinkingTimingsRef.current[thinkKey] = {
+                startedAtMs: seededStartMs,
+                completedAtMs: null,
+                durationMs: null,
+              };
+              changed = true;
+            }
+          } else if (prevThink && prevThink.completedAtMs === null) {
+            thinkingTimingsRef.current[thinkKey] = {
+              ...prevThink,
+              completedAtMs: now,
+              durationMs: Math.max(0, now - prevThink.startedAtMs),
+            };
+            changed = true;
+          }
+        }
+      }
+    }
+
+    const prefix = `${effectiveAgentId}::think::`;
+    for (const [k, rec] of Object.entries(thinkingTimingsRef.current)) {
+      if (k.startsWith(prefix) && rec.completedAtMs === null && !activeThinkKeys.has(k)) {
+        thinkingTimingsRef.current[k] = {
+          ...rec,
+          completedAtMs: now,
+          durationMs: Math.max(0, now - rec.startedAtMs),
+        };
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      setThinkingTick((n) => n + 1);
+    }
+  }, [effectiveAgentId, latestTurn, isLatestTurnActive]);
 
   const viewportResetKey = `${tab.id}:${tab.childAgentId ?? tab.providerSubagentId ?? tab.subagentCallId ?? ""}`;
 
@@ -319,6 +478,11 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                       ? "Working..."
                       : null
                   : null;
+                const thinkingSignature = buildSubagentTurnThinkingSignature(
+                  turn,
+                  effectiveAgentId,
+                  thinkingTimingsRef.current,
+                );
                 return (
                   <TurnStageSection
                     key={turn.key}
@@ -330,8 +494,8 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
                     hostId={effectiveHostId}
                     cwd={cwd}
                     agentId={effectiveAgentId}
-                    thinkingSignature=""
-                    getThinkingDurationMs={NOOP_THINKING_DURATION}
+                    thinkingSignature={thinkingSignature}
+                    getThinkingDurationMs={getThinkingDurationMs}
                     holdViewport={holdViewport}
                     onRequestRewind={NOOP_REWIND}
                     onPreviewImage={setImagePreviewTarget}
@@ -345,7 +509,9 @@ export const SubagentTab = memo(function SubagentTab({ tab }: { tab: SidePanelTa
               <span>
                 {status === "running"
                   ? "Running in an isolated context…"
-                  : "Subagent outputs were folded into the main conversation."}
+                  : status === "canceled"
+                    ? "Subagent run was canceled."
+                    : "Subagent outputs were folded into the main conversation."}
               </span>
             </div>
           )}

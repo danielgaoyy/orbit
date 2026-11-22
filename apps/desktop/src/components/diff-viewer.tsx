@@ -11,6 +11,7 @@ import {
   X,
 } from "lucide-react";
 import { adaptTokenColor } from "@/lib/code-highlight";
+import { useImeCompositionGuard } from "@/lib/ime";
 import type {
   DiffFileView,
   DiffLineView,
@@ -280,6 +281,7 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
   onSave: (comment: string) => void;
 }) {
   const [text, setText] = useState("");
+  const commentIme = useImeCompositionGuard();
   const submit = () => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -307,8 +309,9 @@ const InlineCommentComposer = memo(function InlineCommentComposer({
         rows={2}
         value={text}
         onChange={(e) => setText(e.target.value)}
+        {...commentIme.compositionProps}
         onKeyDown={(e) => {
-          if (e.nativeEvent.isComposing) return;
+          if (commentIme.shouldIgnoreKeyDown(e)) return;
           if (e.key === "Escape") {
             e.preventDefault();
             onCancel();

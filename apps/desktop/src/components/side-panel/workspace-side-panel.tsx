@@ -106,6 +106,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
   const tabs = useOrbitSelector((s) => s.sidePanelTabs);
   const fileEditorDrafts = useOrbitSelector((s) => s.fileEditorDrafts);
   const panelElRef = useRef<HTMLElement | null>(null);
+  const tabStripRef = useRef<HTMLDivElement | null>(null);
   const activeTabId = useOrbitSelector((s) => s.activeSidePanelTabId);
   const hasStreamingSideQuestion = useOrbitSelector((s) => {
     const scope = sideQuestionScopeKey(s);
@@ -139,6 +140,13 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
       resizeCleanupRef.current?.();
     };
   }, []);
+
+  // Keep the active side-panel tab scrolled into view when multiple tabs (e.g., subagents) overflow horizontally
+  useEffect(() => {
+    if (!activeTabId || !tabStripRef.current) return;
+    const activeEl = tabStripRef.current.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+    activeEl?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeTabId, tabs.length]);
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const hasTerminalTabInBar = tabs.some((t) => t.kind === "terminal");
@@ -250,6 +258,7 @@ const WorkspaceSidePanelInner = memo(function WorkspaceSidePanelInner({
       >
         {tabs.length > 0 ? (
           <div
+            ref={tabStripRef}
             className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             {tabs.map((tab) => {

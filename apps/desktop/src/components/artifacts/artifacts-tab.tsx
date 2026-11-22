@@ -29,6 +29,7 @@ import { DiagramBlock } from "@/components/diagram-block";
 import { MarkdownBlocksView, MarkdownLinkProvider } from "@/components/markdown-blocks";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { adaptTokenColor } from "@/lib/code-highlight";
+import { useImeCompositionGuard } from "@/lib/ime";
 import {
   type ArtifactDetail,
   type ArtifactKind,
@@ -240,6 +241,7 @@ const InlineArtifactCommentComposer = memo(function InlineArtifactCommentCompose
   onSave: (comment: string) => void;
 }) {
   const [text, setText] = useState("");
+  const commentIme = useImeCompositionGuard();
   const submit = () => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -270,8 +272,9 @@ const InlineArtifactCommentComposer = memo(function InlineArtifactCommentCompose
         rows={2}
         value={text}
         onChange={(e) => setText(e.target.value)}
+        {...commentIme.compositionProps}
         onKeyDown={(e) => {
-          if (e.nativeEvent.isComposing) return;
+          if (commentIme.shouldIgnoreKeyDown(e)) return;
           if (e.key === "Escape") {
             e.preventDefault();
             onCancel();

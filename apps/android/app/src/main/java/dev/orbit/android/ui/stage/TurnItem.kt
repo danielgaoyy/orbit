@@ -62,7 +62,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -112,7 +111,7 @@ fun TurnItem(
     onQuoteAssistantReply: (String) -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
-    val active = isTurnActive || turn.hasActiveItem
+    val active = isTurnActive
     val userPrompt = turn.userPrompt as? FfiTimelineItem.UserPrompt
     val isCompactionOnly = turn.isCompactionCommand ||
         (userPrompt != null && isBareCompactionPrompt(userPrompt))
@@ -129,9 +128,10 @@ fun TurnItem(
         }
 
         // 2. Live Running Trajectory OR Settled Collapsible Trajectory
-        if (active) {
+        if (active || (turn.liveSegments.isNotEmpty() && turn.foldedSteps.isEmpty())) {
             LiveTurnSegments(
                 turn = turn,
+                isTurnActive = active,
                 activeCwd = activeCwd,
                 describeStep = describeStep,
                 onOpenDiffFile = onOpenDiffFile,
@@ -161,7 +161,7 @@ fun TurnItem(
         }
 
         // 3. Single TurnChangesBar (per-turn changed file summary)
-        if (turn.turnDiffs.isNotEmpty()) {
+        if (!active && turn.turnDiffs.isNotEmpty()) {
             TurnChangesBar(
                 diffs = turn.turnDiffs,
                 activeCwd = activeCwd,
@@ -169,12 +169,11 @@ fun TurnItem(
             )
         }
 
-        // 4. Restrained TurnFooter (Live timer while running; icon-only Copy + relative time when settled)
-        val terminalReply = turn.terminalReply as? FfiTimelineItem.AssistantMessage
-        if (active || (!isCompactionOnly && (terminalReply != null || turn.foldedSteps.isNotEmpty() || turn.completedAtMs != null))) {
+        // 4. Restrained TurnFooter (Hidden while active; icon-only Copy + relative time when settled)
+        val terminalReply = (turn.terminalReply ?: turn.lastAssistantReply) as? FfiTimelineItem.AssistantMessage
+        if (!active && !isCompactionOnly && (terminalReply != null || turn.foldedSteps.isNotEmpty() || turn.completedAtMs != null)) {
             AssistantTurnFooter(
                 turn = turn,
-                isTurnActive = active,
                 replyText = terminalReply?.let { extractAssistantReplyText(it) },
                 onCopy = onCopyAssistantReply,
             )
@@ -437,7 +436,6 @@ private fun PromptBadgePill(badge: FfiPromptBadge) {
 @Composable
 private fun AssistantTurnFooter(
     turn: FfiStageTurn,
-    isTurnActive: Boolean,
     replyText: String?,
     onCopy: (String) -> Unit,
 ) {
@@ -453,23 +451,6 @@ private fun AssistantTurnFooter(
         }
     }
 
-    var nowMs by remember(turn.key) { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(isTurnActive, turn.key) {
-        while (isTurnActive) {
-            nowMs = System.currentTimeMillis()
-            delay(1000L)
-        }
-    }
-
-    val elapsedSeconds = remember(isTurnActive, nowMs, turn.startedAtMs, turn.turnDurationMs) {
-        if (isTurnActive) {
-            val start = turn.startedAtMs ?: nowMs
-            ((nowMs - start).coerceAtLeast(0L) / 1000L)
-        } else {
-            (turn.turnDurationMs ?: 0L) / 1000L
-        }
-    }
-
     val timestampSecs = ((turn.completedAtMs ?: turn.startedAtMs ?: 0L) / 1000L)
     val relTime = remember(timestampSecs) {
         if (timestampSecs > 0L) OrbitFormatters.relativeTimeLabel(timestampSecs) else ""
@@ -482,43 +463,32 @@ private fun AssistantTurnFooter(
         horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (isTurnActive) {
-            BreathingDot(color = colors.fgMuted)
-            val mins = elapsedSeconds / 60L
-            val secs = elapsedSeconds % 60L
+        if (!replyText.isNullOrBlank()) {
+            Box(
+                modifier = Modifier
+                    .size(28.dp)
+                    .clip(CircleShape)
+                    .clickable {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        onCopy(replyText)
+                        copied = true
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = if (copied) Icons.Outlined.Check else OrbitCopyIcon,
+                    contentDescription = "Copy response",
+                    tint = if (copied) colors.directAdded else colors.fgMuted,
+                    modifier = Modifier.size(14.dp),
+                )
+            }
+        }
+        if (relTime.isNotEmpty()) {
             Text(
-                text = String.format("%d:%02d", mins, secs),
+                text = relTime,
                 style = typography.meta,
                 color = colors.fgMuted,
             )
-        } else {
-            if (!replyText.isNullOrBlank()) {
-                Box(
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .clickable {
-                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onCopy(replyText)
-                            copied = true
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Icon(
-                        imageVector = if (copied) Icons.Outlined.Check else OrbitCopyIcon,
-                        contentDescription = "Copy response",
-                        tint = if (copied) colors.directAdded else colors.fgMuted,
-                        modifier = Modifier.size(14.dp),
-                    )
-                }
-            }
-            if (relTime.isNotEmpty()) {
-                Text(
-                    text = relTime,
-                    style = typography.meta,
-                    color = colors.fgMuted,
-                )
-            }
         }
     }
 }
@@ -634,9 +604,17 @@ private fun SettledWorkTrajectory(
     }
 }
 
+private fun isHiddenWakeupLabel(label: String): Boolean {
+    val lower = label.trim().lowercase()
+    return lower.isEmpty()
+        || lower.startsWith("waiting for ")
+        || lower.startsWith("resumed from background task")
+}
+
 @Composable
 private fun LiveTurnSegments(
     turn: FfiStageTurn,
+    isTurnActive: Boolean,
     activeCwd: String,
     describeStep: (FfiTimelineItem) -> FfiToolStepDescriptor?,
     onOpenDiffFile: (String) -> Unit,
@@ -645,18 +623,34 @@ private fun LiveTurnSegments(
     val colors = OrbitTheme.colors
     val typography = OrbitTheme.typography
     val haptics = LocalHapticFeedback.current
+    val visibleSegments = remember(turn.liveSegments) {
+        buildList {
+            for (seg in turn.liveSegments) {
+                if (seg is FfiTurnLiveSegment.Wakeup) {
+                    val trimmed = seg.label.trim()
+                    if (isHiddenWakeupLabel(trimmed)) continue
+                    val prev = lastOrNull() as? FfiTurnLiveSegment.Wakeup
+                    if (prev != null && prev.label.trim().equals(trimmed, ignoreCase = true)) continue
+                }
+                add(seg)
+            }
+        }
+    }
 
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(OrbitSpacing.sm),
     ) {
-        turn.liveSegments.forEach { seg ->
+        visibleSegments.forEachIndexed { segIdx, seg ->
             when (seg) {
                 is FfiTurnLiveSegment.StepGroup -> {
+                    val isLastVisible = segIdx == visibleSegments.lastIndex
+                    val isTrailingFailed = !seg.hasRunningStep && seg.summary.counts.unrecoveredFailureCount > 0u
+                    val isSegLiveActive = isTurnActive && !seg.hasFollowingContent && (seg.hasRunningStep || (isLastVisible && !isTrailingFailed))
                     val rollUpThreshold = 5
-                    val shouldRollUp = seg.items.size >= rollUpThreshold
-                    var groupExpanded by rememberSaveable("${turn.key}:${seg.key}") {
-                        mutableStateOf(!shouldRollUp)
+                    val shouldRollUp = isSegLiveActive && seg.items.size >= rollUpThreshold
+                    var groupExpanded by rememberSaveable("${turn.key}:${seg.key}:${isSegLiveActive}") {
+                        mutableStateOf(isSegLiveActive && !shouldRollUp)
                     }
                     val chevronRotation by animateFloatAsState(
                         targetValue = if (groupExpanded) 90f else 0f,
@@ -676,8 +670,8 @@ private fun LiveTurnSegments(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(OrbitSpacing.xs),
                         ) {
-                            if (seg.hasRunningStep) {
-                                BreathingDot(color = colors.fgSecondary)
+                            if (isSegLiveActive) {
+                                BreathingDot(color = colors.primary)
                             } else {
                                 Icon(
                                     imageVector = Icons.Outlined.ChevronRight,
@@ -689,10 +683,10 @@ private fun LiveTurnSegments(
                                 )
                             }
                             Text(
-                                text = if (seg.hasRunningStep) {
+                                text = if (isSegLiveActive) {
                                     seg.summary.liveLabel.ifBlank { seg.summary.label }
                                 } else {
-                                    seg.summary.label
+                                    seg.summary.label.ifBlank { "Completed ${seg.items.size} ${if (seg.items.size == 1) "step" else "steps"}" }
                                 },
                                 style = typography.subheadMedium,
                                 color = if (seg.summary.labelIncludesFailure) colors.dangerRemoved else colors.fgSecondary,
@@ -721,7 +715,7 @@ private fun LiveTurnSegments(
                             )
                         }
 
-                        // When rolled up on >= 5 steps and collapsed, keep newest running/latest step visible below header
+                        // When rolled up on >= 5 steps and collapsed while live, keep newest step visible below header
                         if (shouldRollUp && !groupExpanded && seg.items.isNotEmpty()) {
                             HairlineStepRail(
                                 steps = listOf(seg.items.last()),

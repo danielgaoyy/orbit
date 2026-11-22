@@ -77,6 +77,7 @@ import dev.orbit.android.store.OrbitFormatters
 import dev.orbit.android.store.OrbitSidebarProjectSort
 import dev.orbit.android.store.OrbitSidebarThreadFilter
 import dev.orbit.android.store.OrbitUiState
+import dev.orbit.android.store.isForegroundRunning
 import dev.orbit.android.ui.theme.OrbitCompactDropdownMenu
 import dev.orbit.android.ui.theme.OrbitComposeIcon
 import dev.orbit.android.ui.theme.OrbitCopyIcon
@@ -357,7 +358,7 @@ fun FleetDrawerContent(
                         ConversationTreeRow(
                             agent = agent,
                             selected = isSelected,
-                            isUnread = conv.isUnread && !isSelected && !agent.isRunning,
+                            isUnread = conv.isUnread && !isSelected && !agent.isForegroundRunning(),
                             isPinned = conv.isPinned,
                             showWorkspaceHint = true,
                             indentStart = 12.dp,
@@ -389,7 +390,7 @@ fun FleetDrawerContent(
                         ConversationTreeRow(
                             agent = agent,
                             selected = isSelected,
-                            isUnread = conv.isUnread && !isSelected && !agent.isRunning,
+                            isUnread = conv.isUnread && !isSelected && !agent.isForegroundRunning(),
                             isPinned = true,
                             showWorkspaceHint = true,
                             indentStart = 12.dp,
@@ -587,7 +588,7 @@ fun FleetDrawerContent(
                                 ConversationTreeRow(
                                     agent = agent,
                                     selected = isSelected,
-                                    isUnread = conv.isUnread && !isSelected && !agent.isRunning,
+                                    isUnread = conv.isUnread && !isSelected && !agent.isForegroundRunning(),
                                     isPinned = conv.isPinned,
                                     showWorkspaceHint = false,
                                     indentStart = 20.dp,
@@ -1083,7 +1084,7 @@ private fun ConversationTreeRow(
                         )
                     }
 
-                    agent.isRunning -> {
+                    agent.isForegroundRunning() -> {
                         CircularProgressIndicator(
                             modifier = Modifier.size(13.dp),
                             strokeWidth = 1.75.dp,

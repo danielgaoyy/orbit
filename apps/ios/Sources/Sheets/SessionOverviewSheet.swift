@@ -439,7 +439,7 @@ struct SessionOverviewPanel: View {
     // MARK: - 4. Subagents Section
 
     private var subagentsSection: some View {
-        let hasFinished = managedSubagents.contains { !$0.isRunning && !$0.isAwaitingPermission }
+        let hasFinished = managedSubagents.contains { !$0.isForegroundRunning && !$0.isAwaitingPermission }
             || nativeSubagents.contains { $0.status != .running }
 
         return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
@@ -464,7 +464,7 @@ struct SessionOverviewPanel: View {
                     HStack(spacing: 10) {
                         if child.isAwaitingPermission {
                             Circle().fill(palette.warning).frame(width: 7, height: 7)
-                        } else if child.isRunning {
+                        } else if child.isForegroundRunning {
                             OrbitSpinnerRingView(color: palette.primary, size: 12)
                         } else {
                             OrbitProviderIcon(provider: child.provider, size: 13)

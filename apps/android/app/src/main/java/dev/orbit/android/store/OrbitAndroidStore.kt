@@ -247,7 +247,10 @@ data class OrbitUiState(
         get() = if (selectedAgentId == null) {
             null
         } else {
-            agentStage?.agent ?: hostDetail?.agents?.firstOrNull { it.agentId == selectedAgentId }
+            // Prefer freshly updated `HostChanged` host-detail cards over `agentStage?.agent`
+            // so `Running -> Idle / waiting` transitions take effect immediately.
+            hostDetail?.agents?.firstOrNull { it.agentId == selectedAgentId }
+                ?: agentStage?.agent
         }
 
     val activeQueuedPrompts: List<QueuedPromptItem>
@@ -279,9 +282,7 @@ data class OrbitUiState(
         }
 
     val isActiveAgentRunning: Boolean
-        get() = !isNewSessionMode && (
-            agentStage?.agent?.isRunning ?: (agentStage?.turns?.any { it.hasActiveItem } == true)
-            )
+        get() = !isNewSessionMode && (activeAgent?.isForegroundRunning() == true)
 
     val otherHostsPendingApprovals: UInt
         get() = hosts
@@ -320,7 +321,7 @@ data class OrbitUiState(
         if (selectedHostId == hostId && !isNewSessionMode && selectedAgentId == agent.agentId) {
             return false
         }
-        if (agent.isRunning || agent.isAwaitingPermission) {
+        if (agent.isForegroundRunning() || agent.isAwaitingPermission) {
             return false
         }
         sidebarView?.pinnedConversations.orEmpty()
@@ -488,6 +489,17 @@ object OrbitFormatters {
     }
 }
 
+fun FfiAgentCard.isBackgroundWaiting(): Boolean {
+    if (hasBackgroundTasks) return true
+    val lower = statusLabel.trim().lowercase()
+    return lower.startsWith("waiting for ")
+        || lower == "waiting_background"
+        || lower == "background task"
+        || (lower.contains("background task") && lower.startsWith("running ("))
+}
+
+fun FfiAgentCard.isForegroundRunning(): Boolean = isRunning && !isBackgroundWaiting()
+
 class OrbitAndroidStore(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val runningAgentKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
@@ -624,9 +636,8 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
                         }.getOrNull()
                         if (bgDelta != null) {
                             val ag = bgDelta.agent
-                            val busy = (ag?.isRunning == true) ||
-                                (ag?.isAwaitingPermission == true) ||
-                                bgDelta.changedTurns.any { it.hasActiveItem }
+                            val busy = (ag?.isForegroundRunning() == true) ||
+                                (ag?.isAwaitingPermission == true)
                             if (busy) {
                                 runningAgentKeys.add(queueKey)
                             } else if (runningAgentKeys.remove(queueKey)) {
@@ -1058,7 +1069,7 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
 
         detail.agents.forEach { ag ->
             val qKey = agentQueueKey(hostId, ag.agentId)
-            val busy = ag.isRunning || ag.isAwaitingPermission
+            val busy = ag.isForegroundRunning() || ag.isAwaitingPermission
             if (busy) {
                 runningAgentKeys.add(qKey)
             } else if (ag.agentId != activeAgentId && runningAgentKeys.remove(qKey)) {
@@ -1141,16 +1152,15 @@ class OrbitAndroidStore(application: Application) : AndroidViewModel(application
         if (!curAfter.isNewSessionMode && curAfter.selectedHostId == hostId && curAfter.selectedAgentId == agentId) {
             val seenSeq = maxOf(stage.agent?.latestSeq ?: 0uL, stage.latestSeq)
             runCatching { core?.markAgentSeen(hostId, agentId, seenSeq) }
-            if (stage.agent?.isRunning != true) {
+            if (stage.agent?.isForegroundRunning() != true) {
                 refreshSidebarInternal()
             }
         }
 
         val queueKey = agentQueueKey(hostId, agentId)
         val ag = stage.agent
-        val isBusy = (ag?.isRunning == true) ||
-            (ag?.isAwaitingPermission == true) ||
-            stage.turns.any { it.hasActiveItem }
+        val isBusy = (ag?.isForegroundRunning() == true) ||
+            (ag?.isAwaitingPermission == true)
         if (isBusy) {
             runningAgentKeys.add(queueKey)
         } else if (runningAgentKeys.remove(queueKey)) {

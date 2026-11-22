@@ -253,8 +253,17 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
         try checkFalse(
             OrbitAgentLogic.isAgentForegroundRunning(statusRaw: "waiting_background", hasActiveTurn: false)
         )
+        try checkFalse(
+            OrbitAgentLogic.isAgentForegroundRunning(statusRaw: "Waiting for 2 background tasks", hasActiveTurn: false)
+        )
+        try checkFalse(
+            OrbitAgentLogic.isAgentForegroundRunning(statusRaw: "Running (2 background tasks)", hasActiveTurn: true)
+        )
         try checkTrue(
             OrbitAgentLogic.isAgentBackgroundWaiting(statusRaw: "waiting_background", hasActiveTurn: false, hasBackgroundTasks: true)
+        )
+        try checkTrue(
+            OrbitAgentLogic.isAgentBackgroundWaiting(statusRaw: "Waiting for 2 background tasks", hasActiveTurn: false, hasBackgroundTasks: true)
         )
         try checkTrue(
             OrbitAgentLogic.isAgentForegroundRunning(statusRaw: "working", hasActiveTurn: false)
@@ -264,6 +273,44 @@ final class OrbitIosLogicTests: OrbitLogicTestCase {
         )
         try checkTrue(
             OrbitAgentLogic.isAgentForegroundRunning(statusRaw: "idle", hasActiveTurn: true)
+        )
+    }
+
+    func testWakeupFilteringAndSettledStepGroupDisclosure() throws {
+        try checkTrue(OrbitAgentLogic.isHiddenWakeupLabel("Resumed from background task"))
+        try checkTrue(OrbitAgentLogic.isHiddenWakeupLabel("Waiting for 2 background tasks"))
+        try checkTrue(OrbitAgentLogic.isHiddenWakeupLabel("   "))
+        try checkFalse(OrbitAgentLogic.isHiddenWakeupLabel("Waking from cron schedule"))
+
+        // Pre-reply step group containing a running background `Schedule` must settle once prose follows.
+        try checkFalse(
+            OrbitAgentLogic.isStepGroupLiveActive(
+                isTurnActive: true,
+                hasFollowingContent: true,
+                hasRunningStep: true,
+                isLastVisibleSegment: false,
+                unrecoveredFailureCount: 0
+            )
+        )
+        // Finished turn (e.g. background-waiting) must NEVER keep a trailing step group live.
+        try checkFalse(
+            OrbitAgentLogic.isStepGroupLiveActive(
+                isTurnActive: false,
+                hasFollowingContent: false,
+                hasRunningStep: true,
+                isLastVisibleSegment: true,
+                unrecoveredFailureCount: 0
+            )
+        )
+        // Genuinely active foreground turn with trailing step group stays live.
+        try checkTrue(
+            OrbitAgentLogic.isStepGroupLiveActive(
+                isTurnActive: true,
+                hasFollowingContent: false,
+                hasRunningStep: false,
+                isLastVisibleSegment: true,
+                unrecoveredFailureCount: 0
+            )
         )
     }
 

@@ -110,10 +110,7 @@ fun StreamStageScreen(
 
     val stage = if (ui.isNewSessionMode) null else ui.agentStage
     val turns = stage?.turns.orEmpty()
-    val isActiveAgentRunning = !ui.isNewSessionMode && (
-        ui.activeAgent?.isRunning == true ||
-            turns.any { it.hasActiveItem }
-    )
+    val isActiveAgentRunning = ui.isActiveAgentRunning
     val listState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -285,8 +282,7 @@ fun StreamStageScreen(
                                 items = turns,
                                 key = { _, it -> it.key },
                             ) { index, turn ->
-                                val isTurnActive = turn.hasActiveItem ||
-                                    (isActiveAgentRunning && index == turns.lastIndex)
+                                val isTurnActive = isActiveAgentRunning && index == turns.lastIndex
                                 TurnItem(
                                     turn = turn,
                                     isTurnActive = isTurnActive,

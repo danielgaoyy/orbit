@@ -372,13 +372,28 @@ public enum OrbitAgentLogic {
         "busy", "executing", "initializing", "connecting", "resuming"
     ]
 
+    /// True when a status label describes a background-only waiting state (matching Desktop `isAgentBackgroundWaiting`).
+    public static func isBackgroundWaitingStatusLabel(_ statusRaw: String?) -> Bool {
+        let normalized = (statusRaw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.isEmpty { return false }
+        if normalized == "waiting_background"
+            || normalized == "background task"
+            || normalized.hasPrefix("waiting for ") {
+            return true
+        }
+        return normalized.range(of: #"^running\s*\(.*background task"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
     /// True only when the agent has an active foreground turn/execution, excluding idle background-waiting states.
     public static func isAgentForegroundRunning(
         statusRaw: String?,
         hasActiveTurn: Bool
     ) -> Bool {
         let normalized = (statusRaw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized == "waiting_background" || normalized == "idle" || normalized == "completed" || normalized == "failed" || normalized == "error" || normalized == "stopped" {
+        if isBackgroundWaitingStatusLabel(normalized) {
+            return false
+        }
+        if normalized == "idle" || normalized == "completed" || normalized == "failed" || normalized == "error" || normalized == "stopped" || normalized == "closed" {
             return hasActiveTurn
         }
         if hasActiveTurn { return true }
@@ -391,8 +406,44 @@ public enum OrbitAgentLogic {
         hasActiveTurn: Bool,
         hasBackgroundTasks: Bool
     ) -> Bool {
+        if isBackgroundWaitingStatusLabel(statusRaw) {
+            return hasBackgroundTasks || !hasActiveTurn
+        }
         guard hasBackgroundTasks else { return false }
         return !isAgentForegroundRunning(statusRaw: statusRaw, hasActiveTurn: hasActiveTurn)
+    }
+
+    /// Returns true when a wakeup segment represents a transient `Waiting for ...` state.
+    public static func isWaitingWakeupLabel(_ label: String?) -> Bool {
+        guard let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return false
+        }
+        return trimmed.range(of: #"^waiting for\b"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    /// Returns true when a wakeup segment should be hidden from the main conversation stream
+    /// (matching Desktop `isHiddenWakeupLabel`: hides `Waiting for ...` and `Resumed from background task`).
+    public static func isHiddenWakeupLabel(_ label: String?) -> Bool {
+        guard let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return true
+        }
+        return isWaitingWakeupLabel(trimmed)
+            || trimmed.range(of: #"^resumed from background task\b"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    /// Single source of truth for whether a step group is actively executing in the foreground
+    /// (matching Desktop `TurnStageSection`: once prose/notice follows, or the foreground turn settles,
+    /// the group folds cleanly even if it spawned a background `Schedule` / `Shell` task).
+    public static func isStepGroupLiveActive(
+        isTurnActive: Bool,
+        hasFollowingContent: Bool,
+        hasRunningStep: Bool,
+        isLastVisibleSegment: Bool,
+        unrecoveredFailureCount: UInt32
+    ) -> Bool {
+        guard isTurnActive && !hasFollowingContent else { return false }
+        let isTrailingFailedGroup = !hasRunningStep && unrecoveredFailureCount > 0
+        return hasRunningStep || (isLastVisibleSegment && !isTrailingFailedGroup)
     }
 
     /// Provider switching is permitted only for brand-new drafts (no bound `selectedAgentId`)

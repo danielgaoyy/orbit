@@ -33,8 +33,6 @@ struct SessionOverviewPanel: View {
 
     @Environment(\.orbitPalette) private var palette
     @State private var expandedTaskIds: Set<String> = []
-    @State private var expandedNativeSubagentIds: Set<String> = []
-    @State private var localInspectorTarget: OrbitSubagentInspectorTarget? = nil
 
     private var insights: FfiSessionInsights? {
         store.agentStage?.insights
@@ -46,14 +44,6 @@ struct SessionOverviewPanel: View {
 
     private var touchedFiles: [FfiSessionTouchedFile] {
         insights?.touchedFiles ?? []
-    }
-
-    private var managedSubagents: [FfiAgentCard] {
-        store.visibleManagedSubagents
-    }
-
-    private var nativeSubagents: [FfiProviderSubagentDescriptor] {
-        store.visibleProviderSubagents
     }
 
     var body: some View {
@@ -69,10 +59,6 @@ struct SessionOverviewPanel: View {
                     backgroundTasksSection
                 }
 
-                if !managedSubagents.isEmpty || !nativeSubagents.isEmpty {
-                    subagentsSection
-                }
-
                 if !touchedFiles.isEmpty {
                     touchedFilesSection
                 }
@@ -81,9 +67,6 @@ struct SessionOverviewPanel: View {
             .padding(.vertical, OrbitSpacing.md)
         }
         .background((palette.isDark ? palette.canvas : palette.drawer).ignoresSafeArea())
-        .sheet(item: $localInspectorTarget) { target in
-            SubagentInspectorSheet(store: store, target: target)
-        }
     }
 
     // MARK: - 1. Session Summary + AI Sparkle
@@ -436,168 +419,7 @@ struct SessionOverviewPanel: View {
         )
     }
 
-    // MARK: - 4. Subagents Section
-
-    private var subagentsSection: some View {
-        let hasFinished = managedSubagents.contains { !$0.isForegroundRunning && !$0.isAwaitingPermission }
-            || nativeSubagents.contains { $0.status != .running }
-
-        return VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
-            HStack {
-                Text("Subagents (\(managedSubagents.count + nativeSubagents.count))")
-                    .font(OrbitTypography.meta(.semibold))
-                    .foregroundStyle(palette.fgMuted)
-                Spacer()
-                if hasFinished {
-                    Button("Archive Finished") {
-                        store.archiveFinishedSubagents()
-                    }
-                    .font(OrbitTypography.meta(.semibold))
-                    .foregroundStyle(palette.fgSecondary)
-                }
-            }
-            .padding(.horizontal, 4)
-
-            VStack(spacing: 0) {
-                ForEach(Array(managedSubagents.enumerated()), id: \.element.agentId) { idx, child in
-                    if idx > 0 { OrbitHairline().padding(.leading, 40) }
-                    HStack(spacing: 10) {
-                        if child.isAwaitingPermission {
-                            Circle().fill(palette.warning).frame(width: 7, height: 7)
-                        } else if child.isForegroundRunning {
-                            OrbitSpinnerRingView(color: palette.primary, size: 12)
-                        } else {
-                            OrbitProviderIcon(provider: child.provider, size: 13)
-                        }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(child.title.isEmpty ? "Subagent" : child.title)
-                                .font(OrbitTypography.subhead(.medium))
-                                .foregroundStyle(palette.fgPrimary)
-                                .lineLimit(1)
-                            Text(child.statusLabel)
-                                .font(OrbitTypography.meta(.regular))
-                                .foregroundStyle(palette.fgMuted)
-                        }
-                        Spacer(minLength: 4)
-                        if let hid = store.selectedHostId {
-                            Button("Inspect") {
-                                localInspectorTarget = OrbitSubagentInspectorTarget(
-                                    hostId: hid,
-                                    parentAgentId: child.parentAgentId ?? store.selectedAgentId ?? "",
-                                    childAgentId: child.agentId,
-                                    title: child.title.isEmpty ? "Subagent" : child.title
-                                )
-                            }
-                            .font(OrbitTypography.meta(.semibold))
-                            .foregroundStyle(palette.fgSecondary)
-                        }
-                        Button("Open") {
-                            onNavigateAction?()
-                            store.selectAgent(child.agentId)
-                        }
-                        .font(OrbitTypography.meta(.semibold))
-                        .foregroundStyle(palette.primary)
-
-                        Button {
-                            store.archiveManagedSubagent(child.agentId)
-                        } label: {
-                            Image(systemName: "archivebox")
-                                .font(.system(size: 12))
-                                .foregroundStyle(palette.fgMuted)
-                                .frame(width: 28, height: 28)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, OrbitSpacing.md)
-                    .padding(.vertical, 9)
-                }
-
-                ForEach(Array(nativeSubagents.enumerated()), id: \.element.subagentId) { idx, sub in
-                    if idx > 0 || !managedSubagents.isEmpty { OrbitHairline().padding(.leading, 40) }
-                    let isExpanded = expandedNativeSubagentIds.contains(sub.subagentId)
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 10) {
-                            if sub.status == .running {
-                                OrbitSpinnerRingView(color: palette.primary, size: 12)
-                            } else {
-                                Image(systemName: sub.status == .failed ? "exclamationmark.triangle" : "checkmark.circle")
-                                    .font(.system(size: 12.5))
-                                    .foregroundStyle(sub.status == .failed ? palette.danger : palette.direct)
-                            }
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(sub.title.isEmpty ? sub.subagentId : sub.title)
-                                    .font(OrbitTypography.subhead(.medium))
-                                    .foregroundStyle(palette.fgPrimary)
-                                    .lineLimit(1)
-                                if let subtitle = sub.subtitle, !subtitle.isEmpty {
-                                    Text(subtitle)
-                                        .font(OrbitTypography.meta(.regular))
-                                        .foregroundStyle(palette.fgMuted)
-                                        .lineLimit(1)
-                                }
-                            }
-                            Spacer(minLength: 4)
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.16)) {
-                                    if isExpanded {
-                                        expandedNativeSubagentIds.remove(sub.subagentId)
-                                    } else {
-                                        expandedNativeSubagentIds.insert(sub.subagentId)
-                                        store.openProviderSubagentTimeline(
-                                            parentAgentId: sub.parentAgentId,
-                                            subagentId: sub.subagentId
-                                        )
-                                    }
-                                }
-                            } label: {
-                                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(palette.fgMuted)
-                                    .frame(width: 26, height: 26)
-                            }
-                            .buttonStyle(.plain)
-
-                            if sub.status != .running {
-                                Button {
-                                    store.archiveNativeSubagent(sub.subagentId)
-                                } label: {
-                                    Image(systemName: "archivebox")
-                                        .font(.system(size: 12))
-                                        .foregroundStyle(palette.fgMuted)
-                                        .frame(width: 26, height: 26)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-
-                        if isExpanded {
-                            let events = store.providerSubagentEvents(
-                                parentAgentId: sub.parentAgentId,
-                                subagentId: sub.subagentId
-                            )
-                            ForEach(Array(events.suffix(8)), id: \.seq) { ev in
-                                Text("• \(ev.summaryText)")
-                                    .font(OrbitTypography.meta(.regular))
-                                    .foregroundStyle(palette.fgSecondary)
-                                    .lineLimit(2)
-                                    .padding(.leading, 22)
-                            }
-                        }
-                    }
-                    .padding(.horizontal, OrbitSpacing.md)
-                    .padding(.vertical, 9)
-                }
-            }
-            .background(palette.elevated)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(palette.hairline, lineWidth: 0.5)
-            )
-        }
-    }
-
-    // MARK: - 5. Touched Files Section
+    // MARK: - 4. Touched Files Section
 
     private var touchedFilesSection: some View {
         VStack(alignment: .leading, spacing: OrbitSpacing.xs + 2) {
